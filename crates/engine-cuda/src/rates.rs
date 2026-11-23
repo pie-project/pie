@@ -128,27 +128,35 @@ pub fn provenance(device: &str) -> (&'static str, String) {
 /// budget leaves on the device: where it holds less than the step lays at
 /// most (`engine::rates::step_bytes`) the load is refused by name, never
 /// left to wait for memory.
+#[allow(clippy::too_many_arguments)]
 pub fn ensure(
     chip: profile::Profile,
     ordinal: i32,
     device: &str,
-    facts: &profile::Facts,
+    keys: &crate::stored::Keys,
     profiles: Option<&std::path::Path>,
     cache: Option<&std::path::Path>,
     room: u64,
+    measuring: engine::rates::Measuring,
 ) -> Result<profile::Profile, String> {
-    ensure_by(chip, device, facts, profiles, room, |chip| {
+    ensure_by(chip, device, keys, profiles, room, measuring, |chip| {
         measure(ordinal, chip, cache).map(|m| m.rates)
     })
 }
 
-/// [`ensure`] with the measurement `measure`.
+/// [`ensure`] with the measurement `measure`. What it measures is keyed by
+/// `keys` (the device and what measured each rate) before it is saved, so a
+/// later load takes it where the keys still match
+/// ([`engine::rates::resolve_at_load`]); under [`engine::rates::Measuring::Skip`]
+/// nothing is timed and each rate no layer states is served by the
+/// estimate, by name.
 fn ensure_by(
     chip: profile::Profile,
     device: &str,
-    _facts: &profile::Facts,
+    keys: &crate::stored::Keys,
     profiles: Option<&std::path::Path>,
     room: u64,
+    measuring: engine::rates::Measuring,
     measure: impl FnOnce(&profile::Profile) -> Result<Rates, String>,
 ) -> Result<profile::Profile, String> {
     let save = profiles.map(|profiles| engine::rates::SaveTo {
@@ -157,12 +165,20 @@ fn ensure_by(
         registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
-    engine::rates::rates_at_load(chip, &KEYS, save, Some(room), None, |_max_submit| {
-        Ok(engine::rates::Measured {
-            rates: measure(&measure_chip)?,
-            unsettled: false,
-        })
-    })
+    engine::rates::resolve_at_load(
+        chip,
+        &KEYS,
+        save,
+        Some(room),
+        None,
+        measuring,
+        |_max_submit| {
+            Ok(engine::rates::Measured {
+                rates: keys.stamp(measure(&measure_chip)?),
+                unsettled: false,
+            })
+        },
+    )
 }
 
 /// What a load measured of its decode products (`Shell::routes_by_body`):
@@ -171,48 +187,45 @@ fn ensure_by(
 pub type ProductTimes = Vec<(kernels_cuda::linear::routes::Shape, u32, f64, f64)>;
 
 /// `measured` saved in device `device`'s user profile under `profiles`
-/// (`[rates] product_ns`, joining what it holds), with its provenance; the
-/// path, or `None` where the load names no profile directory.
+/// (`[rates] product_ns`, joining `held`, what the load's profile states
+/// under a matching key: each newly measured entry in place of one of the
+/// same key), keyed by `keys` (the device, and what measured the table) so
+/// a later load takes it where they still match; the path, or `None` where
+/// the load names no profile directory.
 pub fn save_product_times(
     profiles: Option<&std::path::Path>,
     device: &str,
+    keys: &crate::stored::Keys,
+    held: &[profile::fire::ProductTime],
     measured: &ProductTimes,
 ) -> Result<Option<String>, String> {
     let Some(profiles) = profiles else {
         return Ok(None);
     };
-    let path = crate::chip::SHELF.user_path(profiles, device);
-    let registry = crate::chip::registry();
-    let existing = std::fs::read_to_string(&path).ok().map(|text| registry.prune(&text).0);
-    // What the profile held, each newly measured entry in place of one of
-    // the same key: entries accumulate load to load.
     let fresh = kernels_cuda::linear::routes::product_times(measured);
-    let mut joined: Vec<profile::fire::ProductTime> = existing
-        .as_deref()
-        .and_then(|text| registry.parse(text, "the device's profile", profile::Strict::User).ok())
-        .and_then(|file| file.tuned.rates.product_ns)
-        .unwrap_or_default()
-        .into_iter()
+    let mut joined: Vec<profile::fire::ProductTime> = held
+        .iter()
         .filter(|old| fresh.iter().all(|new| new.key() != old.key()))
+        .cloned()
         .collect();
     joined.extend(fresh);
-    let rates = Rates {
+    let rates = keys.stamp(Rates {
         product_ns: Some(joined),
         ..Rates::default()
+    });
+    let save = engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, device),
+        provenance: (
+            "product_ns",
+            format!(
+                "\"measured in place at load, {}\"",
+                engine::rates::build_commit()
+            ),
+        ),
+        registry: crate::chip::registry(),
     };
-    let how = (
-        "product_ns",
-        format!("\"measured in place at load, {}\"", engine::rates::build_commit()),
-    );
-    let text = engine::rates::saved_text(existing.as_deref(), &rates, &how);
-    registry
-        .parse(&text, "the measured product times", profile::Strict::User)
-        .map_err(|why| format!("{}: the product times would not read back: {why}", path.display()))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Some(path.display().to_string()))
+    engine::rates::save_rates(&save, &rates)?;
+    Ok(Some(save.path.display().to_string()))
 }
 
 /// The rows `few_row_tflops` is timed at: the most the backend's few-rows
@@ -605,7 +618,7 @@ mod on_device {
                 attn_tflops_by_rows_keys: None,
                 product_ns: None,
                 kernel_tflops_by_shape: None,
-                dense_settled: None,
+                dense_settled: Vec::new(),
                 measured_on: None,
                 measured_by: None,
             },
@@ -1205,7 +1218,7 @@ mod ensure_tests {
             attn_tflops_by_rows_keys: None,
             product_ns: None,
             kernel_tflops_by_shape: None,
-            dense_settled: None,
+            dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
         }
@@ -1217,30 +1230,48 @@ mod ensure_tests {
         let _ = std::fs::remove_dir_all(&home);
         let device = "Roofline Test Card";
         let facts = crate::chip::facts(8, 9, 142);
+        let keys = crate::stored::Keys::of(0, device);
         let room = engine::rates::step_bytes();
-        let (chip, _) = crate::chip::resolve(device, &facts, Some(&home));
+        let (chip, _) = crate::chip::resolve_keyed(device, &facts, Some(&home), &keys);
         assert!(
             !chip.rates().complete(&KEYS),
             "no file states this card's rates"
         );
         let mut times = 0;
-        let first = ensure_by(chip, device, &facts, Some(&home), room, |_| {
-            times += 1;
-            Ok(measured())
-        })
+        let first = ensure_by(
+            chip,
+            device,
+            &keys,
+            Some(&home),
+            room,
+            engine::rates::Measuring::Time,
+            |_| {
+                times += 1;
+                Ok(measured())
+            },
+        )
         .unwrap();
-        assert_eq!((times, first.rates()), (1, measured()));
+        // What it measured is kept keyed: the device and what measured each.
+        assert_eq!((times, first.rates()), (1, keys.stamp(measured())));
         assert!(first.tuned().measured_this_load);
         // The second load resolves the user's profile the first wrote, and
         // measures nothing.
-        let (chip, _) = crate::chip::resolve(device, &facts, Some(&home));
-        let second = ensure_by(chip, device, &facts, Some(&home), room, |_| {
-            times += 1;
-            Ok(measured())
-        })
+        let (chip, _) = crate::chip::resolve_keyed(device, &facts, Some(&home), &keys);
+        let second = ensure_by(
+            chip,
+            device,
+            &keys,
+            Some(&home),
+            room,
+            engine::rates::Measuring::Time,
+            |_| {
+                times += 1;
+                Ok(measured())
+            },
+        )
         .unwrap();
         std::fs::remove_dir_all(&home).unwrap();
-        assert_eq!((times, second.rates()), (1, measured()));
+        assert_eq!((times, second.rates()), (1, keys.stamp(measured())));
         assert!(!second.tuned().measured_this_load);
     }
 
@@ -1248,11 +1279,18 @@ mod ensure_tests {
     fn a_budget_short_of_the_step_is_refused_by_name_and_measures_nothing() {
         let device = "Roofline Test Card";
         let facts = crate::chip::facts(8, 9, 142);
-        let (chip, _) = crate::chip::resolve(device, &facts, None);
+        let keys = crate::stored::Keys::of(0, device);
+        let (chip, _) = crate::chip::resolve_keyed(device, &facts, None, &keys);
         let short = engine::rates::step_bytes() - 1;
-        let err = ensure_by(chip, device, &facts, None, short, |_| {
-            panic!("nothing is measured past a short budget")
-        })
+        let err = ensure_by(
+            chip,
+            device,
+            &keys,
+            None,
+            short,
+            engine::rates::Measuring::Time,
+            |_| panic!("nothing is measured past a short budget"),
+        )
         .unwrap_err();
         assert!(err.contains("measuring them needs"), "{err}");
     }
@@ -1292,7 +1330,8 @@ mod kept_routes_tests {
                 noted.candidates.iter().map(|&kernel| (*shape, kernel, 1000.0, 10.0))
             })
             .collect();
-        let saved = super::save_product_times(Some(&dir), "test-device", &measured)
+        let keys = crate::stored::Keys::of(0, "test-device");
+        let saved = super::save_product_times(Some(&dir), "test-device", &keys, &[], &measured)
             .expect("the times save")
             .expect("a profile directory was named");
 

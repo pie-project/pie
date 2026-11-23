@@ -145,6 +145,34 @@ pub fn route(tuning: &Tuning, rows: u32, columns: u32, contraction: u32, f32_out
     }
 }
 
+thread_local! {
+    /// The shapes [`act_x_wt`] dispatched on this thread since
+    /// [`record_shapes`] started recording, `(columns, contraction, f32
+    /// columns)` and the most rows each took; `None` while not recording
+    /// (serving: one borrow a matmul). Per thread, not per process: a load
+    /// walks on its own thread, so two loads walking at once keep their own.
+    static RECORDED: std::cell::RefCell<Option<Recorded>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Recorded shapes, `(columns, contraction, f32 columns)`, to the most rows
+/// each took.
+type Recorded = std::collections::BTreeMap<(u32, u32, bool), u32>;
+
+/// Starts (`true`) or stops (`false`) keeping every shape [`act_x_wt`]
+/// dispatches on this thread, and returns what was kept since the last
+/// start, `(columns, contraction, f32 columns, most rows)`: what a load's
+/// walk checks the kernels it built against ([`route`] at every row count
+/// up to the most).
+pub fn record_shapes(on: bool) -> Vec<(u32, u32, bool, u32)> {
+    RECORDED.with(|recorded| {
+        let kept = recorded.replace(on.then(std::collections::BTreeMap::new));
+        kept.unwrap_or_default()
+            .into_iter()
+            .map(|((columns, contraction, f32_out), rows)| (columns, contraction, f32_out, rows))
+            .collect()
+    })
+}
+
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     tuning: &Tuning,
@@ -158,6 +186,14 @@ pub fn act_x_wt(
     if rows == 0 {
         return Ok(());
     }
+    RECORDED.with(|recorded| {
+        if let Some(recorded) = recorded.borrow_mut().as_mut() {
+            let most = recorded
+                .entry((columns, contraction, y.dtype == dtype::Dtype::F32))
+                .or_insert(0);
+            *most = (*most).max(rows);
+        }
+    });
     let (entry, grid) = if y.dtype == dtype::Dtype::F32 {
         // f32 columns (`matmul_f32`), a threadgroup each.
         (KSPLIT_F32_ENTRY, ksplit_grid(op, rows, columns)?)

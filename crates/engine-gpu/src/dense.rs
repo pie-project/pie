@@ -170,6 +170,104 @@ impl Dense {
     }
 }
 
+/// A tier as a number, as a settle's rows state it.
+fn tier_code(tier: kernels_slang::Tier) -> u32 {
+    match tier {
+        kernels_slang::Tier::Baseline => 0,
+        kernels_slang::Tier::Subgroup => 1,
+        kernels_slang::Tier::Fp16 => 2,
+        kernels_slang::Tier::Coopmat => 3,
+    }
+}
+
+impl Dense {
+    /// This choice in canonical words: each run of rows and its kernel as
+    /// numbers, the planes' own picks sorted by plane. Content alone, so a
+    /// key built from it is the same whatever order the choice was built in.
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        let rows = |by: &[(u32, Tactic)]| {
+            by.iter()
+                .map(|&(r, t)| format!("{r}:{}.{}.{}", t.vector, u8::from(t.wide), tier_code(t.tier)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut planes: Vec<&((u32, u32), Vec<(u32, Tactic)>)> = self.planes.iter().collect();
+        planes.sort_by_key(|(at, _)| *at);
+        let mut out = format!("all[{}]", rows(&self.by_rows));
+        for ((n, k), by) in planes {
+            out.push_str(&format!(" {n}x{k}[{}]", rows(by)));
+        }
+        out
+    }
+}
+
+/// What a dense settle weighed, keyed (`profile::fire::DenseSettled::of`):
+/// a fingerprint of its content in canonical words, each list sorted and
+/// every number written as it reads back from a profile (the shortest form
+/// of each float), so the key is the same whatever order a layer listed the
+/// curves in and whatever layer (a load's own, a user's file, a committed
+/// export) stated them, and whatever other model's curves the device
+/// stores beside them. The curves at the model's planes (each one's id,
+/// points, spreads and stop; not its stored key, which says what measured
+/// it), the model's
+/// dense planes, the dense choice, the load's lanes, its top rows and the
+/// target.
+#[must_use]
+pub fn settle_of(
+    curves: Option<&[profile::fire::KernelCurve]>,
+    planes: &[(u32, u32, u32, f64)],
+    dense: &Dense,
+    lanes: u32,
+    top: u32,
+    target: Target,
+) -> u32 {
+    let points = |list: &[(u32, f64)]| {
+        list.iter()
+            .map(|&(r, v)| format!("{r}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    // The curves at the model's own planes alone: another model's curves,
+    // stored on the same device, weigh nothing this settle weighed.
+    let mut curves: Vec<String> = curves
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| planes.iter().any(|&(n, k, ..)| (n, k) == (c.n, c.k)))
+        .map(|c| {
+            format!(
+                "{}/{}@{}x{}[{}]s[{}]{}",
+                c.kind,
+                c.key,
+                c.n,
+                c.k,
+                points(&c.curve),
+                points(&c.spread),
+                c.stop.map_or_else(String::new, |(at, why)| format!("stop{at}:{why}"))
+            )
+        })
+        .collect();
+    curves.sort();
+    let mut planes: Vec<String> = planes
+        .iter()
+        .map(|&(n, k, count, bytes)| format!("{n}x{k}*{count}:{bytes}"))
+        .collect();
+    planes.sort();
+    let target = match target {
+        Target::Spirv => "spirv",
+        Target::Wgsl => "wgsl",
+    };
+    profile::fire::fingerprint(
+        format!(
+            "curves {}|planes {}|dense {}|lanes {lanes}|top {top}|{target}",
+            curves.join(" "),
+            planes.join(" "),
+            dense.canonical()
+        )
+        .as_bytes(),
+    )
+}
+
 /// The name a kernel is said by.
 pub(crate) fn name(tactic: &Tactic) -> String {
     match (tactic.vector, tactic.tier, tactic.wide) {
@@ -409,7 +507,44 @@ pub fn choose(
     records: bool,
     full: Option<u32>,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
-    let (by_rows, weighed) = pick(target, rungs, &tiled, rates, planes, records, full, None)?;
+    let launch_ns = Constants::of(rates)?.launch_ns;
+    weigh(target, rungs, &tiled, rates, launch_ns, planes, records, full)
+}
+
+/// [`choose`] where no roofline is stated, under a load that skips
+/// measuring (`engine::rates::Measuring::Skip`): the kernels are weighed by
+/// the curves stated (a committed profile's, or the user's) as [`choose`]
+/// weighs them, each plane's launch at `[rates] launch_ns` where stated,
+/// else none, alike for every kernel a plane takes (a launch a plane, the
+/// same whichever kernel runs it). [`UNREACHED`] where no curve is stated.
+pub fn choose_unrated(
+    target: Target,
+    rungs: &[u32],
+    tiled: impl Fn(u32) -> Tactic,
+    rates: &profile::fire::Rates,
+    planes: &[(u32, u32, u32, f64)],
+    records: bool,
+    full: Option<u32>,
+) -> Result<(Dense, Vec<Weighed>), &'static str> {
+    let launch_ns = rates.launch_ns.map_or(0.0, |ns| ns as f64);
+    weigh(target, rungs, &tiled, rates, launch_ns, planes, records, full)
+}
+
+/// [`choose`] at `launch_ns` a plane.
+#[allow(clippy::too_many_arguments)]
+fn weigh(
+    target: Target,
+    rungs: &[u32],
+    tiled: &dyn Fn(u32) -> Tactic,
+    rates: &profile::fire::Rates,
+    launch_ns: f64,
+    planes: &[(u32, u32, u32, f64)],
+    records: bool,
+    full: Option<u32>,
+) -> Result<(Dense, Vec<Weighed>), &'static str> {
+    let (by_rows, weighed) = pick(
+        target, rungs, tiled, rates, launch_ns, planes, records, full, None,
+    )?;
     // What each plane's own pick must beat, and what a plane no kernel was
     // timed at keeps: the one kernel a rung (or a row count) weighed over
     // every plane together, as a load picked before planes picked their own.
@@ -425,8 +560,9 @@ pub fn choose(
         if let Ok((by_rows, _)) = pick(
             target,
             rungs,
-            &tiled,
+            tiled,
             rates,
+            launch_ns,
             &[*plane],
             records,
             full,
@@ -449,17 +585,18 @@ pub fn choose(
 /// over every plane together, for one plane's own), the pick replaces it
 /// only past the two kernels' measured spread, and a rung no kernel was
 /// timed at keeps it.
+#[allow(clippy::too_many_arguments)]
 fn pick(
     target: Target,
     rungs: &[u32],
     tiled: &dyn Fn(u32) -> Tactic,
     rates: &profile::fire::Rates,
+    launch_ns: f64,
     planes: &[(u32, u32, u32, f64)],
     records: bool,
     full: Option<u32>,
     incumbent: Option<&dyn Fn(u32) -> Tactic>,
 ) -> Result<(Vec<(u32, Tactic)>, Vec<Weighed>), &'static str> {
-    let c = Constants::of(rates)?;
     let curves = rates.kernel_tflops_by_shape.as_deref().ok_or(UNREACHED)?;
     // The candidates at `kernel_rows` (a rung's, or a fire's own): each
     // vector kernel, and each tiled one.
@@ -568,7 +705,7 @@ fn pick(
             if !weighed_at(among, n, k, rows) {
                 continue;
             }
-            ns += f64::from(count) * (c.launch_ns + time_at(tactic, n, k, rows)?);
+            ns += f64::from(count) * (launch_ns + time_at(tactic, n, k, rows)?);
             weighed = true;
         }
         weighed.then_some(ns)
@@ -725,6 +862,213 @@ fn pick(
     Ok((by_rows, weighed))
 }
 
+/// The work a kernel does over the model's dense planes at some rows, from
+/// its shape alone ([`gemm::tile_for`]): the weight bytes it reads (a plane
+/// once a workgroup's rows, [`gemm::Kernel::rows_a_read`]) and the flops it
+/// computes (the rows padded to its row tile, [`gemm::Kernel::row_tile`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shaped {
+    pub bytes: f64,
+    pub flops: f64,
+}
+
+impl Shaped {
+    /// `tactic`'s work at `rows` over `planes` on `target`.
+    #[must_use]
+    pub fn of(target: Target, tactic: Tactic, planes: &[(u32, u32, u32, f64)], rows: u32) -> Shaped {
+        let mut work = Shaped {
+            bytes: 0.0,
+            flops: 0.0,
+        };
+        for &(n, k, count, bytes) in planes {
+            let kernel = gemm::tile_for(target, tactic, n, k);
+            let reads = rows.max(1).div_ceil(kernel.rows_a_read().max(1));
+            let tile = kernel.row_tile().max(1);
+            let computed = rows.max(1).div_ceil(tile) * tile;
+            work.bytes += f64::from(count) * f64::from(reads) * bytes;
+            work.flops += f64::from(count) * 2.0 * f64::from(computed) * f64::from(n) * f64::from(k);
+        }
+        work
+    }
+
+    /// No more of either than `other`.
+    fn within(self, other: Shaped) -> bool {
+        self.bytes <= other.bytes && self.flops <= other.flops
+    }
+}
+
+/// [`choose`] where no kernel's curve is stated, under a load that skips
+/// measuring (`engine::rates::Measuring::Skip`): each rung's kernel
+/// estimated from the work's shape ([`Shaped`]) at its bottom and top rows
+/// (each row count's own on an eager backend).
+///
+/// - With the device's roofline stated (`roofline`): each candidate's cost
+///   a plane its launch and the longer of its weight reads at the stated
+///   bandwidth and its padded flops at the stated matmul rate at the rows
+///   it computes, the least regret taken as [`choose`] takes it.
+/// - With none: the candidate whose reads and flops are each no more than
+///   every other's at both ends (by the roofline, `max(bytes / bandwidth,
+///   flops / rate)`, it is no slower on any device); ties to the fewest
+///   rows a workgroup. A vector kernel reads each plane once for the rows
+///   one workgroup carries ([`gemm::VECTOR_ROWS`]) and pads none, so it is
+///   that kernel up to the most rows a vector workgroup carries. Past them
+///   it reads more often and a tile pads more: which is faster turns on the
+///   bandwidth and flops no layer states, and the rung keeps the profile
+///   path's kernel (`tiled`).
+///
+/// Each rung's estimate, in words, beside the choice.
+pub fn by_shape(
+    target: Target,
+    rungs: &[u32],
+    tiled: impl Fn(u32) -> Tactic,
+    roofline: Option<&Constants>,
+    planes: &[(u32, u32, u32, f64)],
+    records: bool,
+    full: Option<u32>,
+) -> (Dense, Vec<String>) {
+    let candidates = |rows: u32| -> Vec<Tactic> {
+        let base = tiled(rows);
+        let mut all: Vec<Tactic> = gemm::VECTOR_ROWS
+            .iter()
+            .map(|&vector| Tactic { vector, ..base })
+            .collect();
+        all.extend(tiled_kernels(target, base));
+        all
+    };
+    let rows_of = |t: &Tactic| rows_a_workgroup(target, t);
+    // The roofline's cost of `t` at `rows`, ns: a launch a plane and the
+    // longer of the plane's reads and its padded compute.
+    let cost = |c: &Constants, t: Tactic, rows: u32| -> f64 {
+        planes
+            .iter()
+            .map(|&(n, k, count, bytes)| {
+                let one = Shaped::of(target, t, &[(n, k, 1, bytes)], rows);
+                let computed = (one.flops / (2.0 * f64::from(n) * f64::from(k))) as u32;
+                let read = one.bytes / c.bytes_per_ns.max(f64::MIN_POSITIVE);
+                let compute = one.flops / c.gemm_rate(computed.max(1), n, k).max(f64::MIN_POSITIVE);
+                f64::from(count) * (c.launch_ns + read.max(compute))
+            })
+            .sum()
+    };
+    // The kernel taken over `bottom..=top` rows, and why.
+    let decide = |bottom: u32, top: u32| -> (Tactic, String) {
+        let among = candidates(top);
+        match roofline {
+            Some(c) => {
+                let costs: Vec<(Tactic, f64, f64)> = among
+                    .iter()
+                    .map(|&t| (t, cost(c, t, bottom), cost(c, t, top)))
+                    .collect();
+                let taken = Weighed::least_regret(&costs, &rows_of);
+                let at = |pick: fn(&(Tactic, f64, f64)) -> f64| {
+                    costs
+                        .iter()
+                        .map(|c| format!("{} {:.1} µs", name(&c.0), pick(c) / 1e3))
+                        .collect::<Vec<_>>()
+                        .join(" vs ")
+                };
+                (
+                    costs[taken].0,
+                    format!(
+                        "{} by the stated roofline over the work's shape ({top} rows: {}; \
+                         {bottom} rows: {})",
+                        name(&costs[taken].0),
+                        at(|c| c.2),
+                        at(|c| c.1)
+                    ),
+                )
+            }
+            None => {
+                let work = |t: Tactic| {
+                    (
+                        Shaped::of(target, t, planes, bottom),
+                        Shaped::of(target, t, planes, top),
+                    )
+                };
+                let no_worse = |t: Tactic| {
+                    let (b, p) = work(t);
+                    among.iter().all(|&o| {
+                        let (ob, op) = work(o);
+                        b.within(ob) && p.within(op)
+                    })
+                };
+                let said = |t: Tactic| {
+                    let (b, p) = work(t);
+                    format!(
+                        "{} {:.1} MB read, {:.2} GFLOP at {top} rows ({:.1} MB, {:.2} GFLOP at \
+                         {bottom})",
+                        name(&t),
+                        p.bytes / 1e6,
+                        p.flops / 1e9,
+                        b.bytes / 1e6,
+                        b.flops / 1e9
+                    )
+                };
+                match among
+                    .iter()
+                    .copied()
+                    .filter(|&t| no_worse(t))
+                    .min_by_key(|t| rows_of(t))
+                {
+                    Some(t) => (
+                        t,
+                        format!(
+                            "{} by the work's shape: it reads no more weight and computes no \
+                             more rows than any other kernel, so no bandwidth or flops makes \
+                             another faster ({})",
+                            name(&t),
+                            said(t)
+                        ),
+                    ),
+                    None => {
+                        let path = tiled(top);
+                        (
+                            path,
+                            format!(
+                                "{} the profile path's: no kernel reads and computes no more \
+                                 than every other (fewer weight reads trade against fewer \
+                                 padded rows, which the device's bandwidth and flops weigh, and \
+                                 no layer states them: {})",
+                                name(&path),
+                                among.iter().map(|&t| said(t)).collect::<Vec<_>>().join("; ")
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    };
+    let mut by_rows: Vec<(u32, Tactic)> = Vec::new();
+    let mut said = Vec::with_capacity(rungs.len());
+    let mut below = 0;
+    for &rung in rungs {
+        let bottom = if full == Some(rung) {
+            rung
+        } else {
+            (below + 1).min(rung)
+        };
+        if records {
+            let (t, why) = decide(bottom, rung);
+            by_rows.push((rung, t));
+            said.push(format!("rung {rung} (rows {bottom}-{rung}): {why}"));
+        } else {
+            for rows in bottom..=rung {
+                by_rows.push((rows, decide(rows, rows).0));
+            }
+            let (_, why) = decide(rung, rung);
+            said.push(format!("rows {bottom}-{rung}: at {rung} rows, {why}"));
+        }
+        below = rung;
+    }
+    (
+        Dense {
+            by_rows,
+            planes: Vec::new(),
+        },
+        said,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +1174,173 @@ mod tests {
             vector: 0,
             wide: true,
         }
+    }
+
+    /// Under skip with no curve and no roofline stated, each rung's kernel
+    /// is read off the work's shape: a vector kernel reads each plane once
+    /// for every rung up to the most rows a vector workgroup carries, pads
+    /// none, and is taken there (the fewest rows a workgroup among those
+    /// that tie); past them no kernel reads and computes no more than every
+    /// other, and the rung keeps the profile path's tile. The same on an
+    /// eager backend, row count by row count, on WGSL's kernels too.
+    #[test]
+    fn without_curves_or_roofline_the_work_shape_takes_the_vector_kernel_to_its_rows() {
+        let rungs = [1, 2, 4, 8, 16, 32, 64, 128];
+        let most = gemm::VECTOR_ROWS[gemm::VECTOR_ROWS.len() - 1];
+        let (dense, said) = by_shape(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            None,
+            &planes(&counts(), None),
+            true,
+            Some(128),
+        );
+        assert_eq!(said.len(), rungs.len());
+        for &rows in &rungs {
+            let t = dense.at(rows, 4096, 4096);
+            if rows <= most {
+                assert_eq!(t.vector, gemm::vector_rows(rows), "{rows}: {said:#?}");
+            } else {
+                assert_eq!(t, coopmat(rows), "{rows}: {said:#?}");
+            }
+        }
+        assert!(said[0].contains("gemv x1 by the work's shape"), "{}", said[0]);
+        assert!(said[5].contains("the profile path's"), "{}", said[5]);
+        let wgsl = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: true,
+        };
+        let (eager, _) = by_shape(
+            Target::Wgsl,
+            &rungs,
+            wgsl,
+            None,
+            &planes(&counts(), None),
+            false,
+            Some(128),
+        );
+        for rows in 1..=128 {
+            let t = eager.at(rows, 4096, 4096);
+            if rows <= most {
+                assert_eq!(t.vector, gemm::vector_rows(rows), "{rows}");
+            } else {
+                assert_eq!(t.vector, 0, "{rows}");
+            }
+        }
+    }
+
+    /// With the roofline stated and no curve, each rung weighs the work's
+    /// shape at the stated bandwidth and matmul rate: the vector kernel
+    /// where a step reads its weight (few rows), a tile where the rows make
+    /// it compute-bound.
+    #[test]
+    fn without_curves_the_stated_roofline_weighs_the_work_shape() {
+        let rungs = [1, 4, 16, 64, 256, 1024, 2048];
+        let mut r = rates(None, Vec::new());
+        r.kernel_tflops_by_shape = None;
+        let c = Constants::of(&r).unwrap();
+        let (dense, said) = by_shape(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            Some(&c),
+            &planes(&counts(), None),
+            true,
+            None,
+        );
+        assert!(dense.at(1, 4096, 4096).vector > 0, "{said:#?}");
+        assert!(dense.at(4, 4096, 4096).vector > 0, "{said:#?}");
+        assert_eq!(dense.at(2048, 4096, 4096), coopmat(2048), "{said:#?}");
+        assert!(said[0].contains("by the stated roofline"), "{}", said[0]);
+    }
+
+    /// Under skip with curves stated but no roofline, the curves weigh the
+    /// kernels as a measured load's do; [`choose`] refuses the same profile
+    /// by the roofline's key.
+    #[test]
+    fn stated_curves_weigh_the_kernels_without_a_roofline() {
+        let rungs = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+        let mut r = rates(Some(5.0), coopmat_tiles());
+        r.launch_ns = None;
+        r.hbm_gbps = None;
+        r.gemm_tflops_by_rows = None;
+        assert!(choose(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            &r,
+            &planes(&counts(), None),
+            true,
+            None
+        )
+        .is_err());
+        let (dense, weighed) = choose_unrated(
+            Target::Spirv,
+            &rungs,
+            coopmat,
+            &r,
+            &planes(&counts(), None),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(dense.at(1, 4096, 4096).vector > 0, "{weighed:?}");
+        assert_eq!(dense.at(2048, 4096, 4096).vector, 0, "{weighed:?}");
+        r.kernel_tflops_by_shape = None;
+        assert_eq!(
+            choose_unrated(
+                Target::Spirv,
+                &rungs,
+                coopmat,
+                &r,
+                &planes(&counts(), None),
+                true,
+                None
+            )
+            .unwrap_err(),
+            UNREACHED
+        );
+    }
+
+    /// A settle's key is its content: the same under any order of the
+    /// curves, and the same once the curves are written to a profile and
+    /// read back (an export from one build, a committed profile read by
+    /// another); a curve whose point moves keys anew.
+    #[test]
+    fn the_settle_key_is_stable_under_curve_order_and_a_round_trip() {
+        let mut r = rates(Some(5.0), coopmat_tiles());
+        for (i, c) in r.kernel_tflops_by_shape.iter_mut().flatten().enumerate() {
+            c.spread = c.curve.iter().map(|&(m, _)| (m, 0.01 * (i as f64 + 1.0))).collect();
+        }
+        let planes = planes(&counts(), None);
+        let rungs = [1, 2, 4, 8, 16, 32, 64];
+        let (dense, _) = choose(Target::Spirv, &rungs, coopmat, &r, &planes, true, None).unwrap();
+        let key = |r: &profile::fire::Rates| {
+            settle_of(r.kernel_tflops_by_shape.as_deref(), &planes, &dense, 4, 64, Target::Spirv)
+        };
+        let first = key(&r);
+        let mut reversed = r.clone();
+        reversed.kernel_tflops_by_shape.as_mut().unwrap().reverse();
+        assert_eq!(key(&reversed), first, "the curves' order keys nothing");
+        let registry = profile::Registry::new("test", &[], &[]);
+        let read = registry
+            .load_user(&format!("api = 1\n{}", r.toml()), "round trip")
+            .expect("the curves read back");
+        assert_eq!(
+            key(&read.rates()),
+            first,
+            "a profile written and read back keys the same"
+        );
+        let mut other = r.clone();
+        let mut elsewhere = other.kernel_tflops_by_shape.as_ref().unwrap()[0].clone();
+        elsewhere.n = 777;
+        other.kernel_tflops_by_shape.as_mut().unwrap().push(elsewhere);
+        assert_eq!(key(&other), first, "another model's curve keys nothing");
+        let mut moved = r.clone();
+        moved.kernel_tflops_by_shape.as_mut().unwrap()[0].curve[0].1 *= 1.5;
+        assert_ne!(key(&moved), first, "a point that moves keys anew");
     }
 
     /// A rung takes the vector kernels where the tiled one's measured rate

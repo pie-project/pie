@@ -33,7 +33,18 @@ seeded!(
     "imagination.toml",
     "nvidia.toml",
     "nvidia/nvidia-rtx-pro-4500-blackwell.toml",
+    // Committed measured profiles (`pie tune export --engine vulkan`).
+    "nvidia-rtx-pro-4500-blackwell.measured.toml",
+    "adreno-tm-840.measured.toml",
 );
+
+/// The host covers committed for this backend's devices
+/// (`profiles/<device>.covers.json`, `pie tune export --engine vulkan`),
+/// each listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[include_str!(
+    "../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"
+)];
 
 /// What a device no family file applies to runs.
 pub const DERIVED: &str = include_str!("derived.toml");
@@ -97,9 +108,18 @@ pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Pr
 
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
-    let context =
-        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
-            .ok()?;
+    probe_at(0)
+}
+
+/// [`probe`] of the device `index` names, in the order the engine numbers
+/// them (`vulkan:<n>`).
+#[must_use]
+pub fn probe_at(index: u32) -> Option<(String, Facts)> {
+    let boot = crate::api::DeviceBoot {
+        device_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
     let device = context.chip();
     Some((device.name.clone(), device.facts()))
 }
@@ -298,6 +318,9 @@ mod tests {
             [
                 Source::Seeded("nvidia.toml".to_string()),
                 Source::Seeded("nvidia/nvidia-rtx-pro-4500-blackwell.toml".to_string()),
+                // Its stored measurements, committed: taken under the
+                // decision files, entry by entry.
+                Source::Committed("nvidia-rtx-pro-4500-blackwell.measured.toml".to_string()),
             ]
         );
         let t = tuning(&pro);

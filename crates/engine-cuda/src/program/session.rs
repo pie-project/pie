@@ -204,6 +204,16 @@ impl Session {
         self.rings.rebase(place)
     }
 
+    /// Each ring's cell at `place`, pointing nothing ([`Rings::cells`]).
+    pub fn ring_cells(&self, place: &super::launch::Place) -> Result<Vec<u64>> {
+        self.rings.cells(place)
+    }
+
+    /// The rings pointed at `place`, their `cells` there.
+    pub fn rebase_to(&mut self, place: &super::launch::Place, cells: Vec<u64>) {
+        self.rings.rebase_to(place, cells);
+    }
+
     #[must_use]
     pub fn channels(&self) -> usize {
         self.shapes.len()

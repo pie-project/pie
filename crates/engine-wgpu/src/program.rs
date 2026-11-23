@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
+use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{
     BoundInstance, InstanceBinding, InstanceId, ProgramFacts, ProgramId, Rebind, RingFacts,
 };
@@ -26,6 +26,12 @@ struct Instance {
     channels: Vec<ChannelId>,
 
     poisoned: Arc<AtomicBool>,
+    /// Ring cells a pass on the queue has yet to land.
+    landing: Arc<engine_gpu::guest::defer::Owed>,
+    /// The channels whose device cells this instance holds itself (none
+    /// registered covers them), in its `ring_slots`.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+    own_cells: Vec<ChannelId>,
 
     #[cfg(feature = "wgpu")]
     half: Arc<std::sync::Mutex<Half>>,
@@ -55,6 +61,11 @@ pub(crate) struct Tally {
 
 use engine_gpu::serve::InputCell;
 
+/// One attachment's pass the step's deferred frame carries.
+#[cfg(feature = "wgpu")]
+pub type DeferredPass<'a> =
+    engine_gpu::guest::defer::DeferredPass<Vec<Vec<crate::guest::run::Readout<'a>>>>;
+
 #[cfg(feature = "wgpu")]
 pub(crate) struct Half {
     id: InstanceId,
@@ -69,7 +80,13 @@ pub(crate) struct Half {
     /// another owner's until a rebind names where it lies, so nothing of
     /// it is repointed, claimed or fired meanwhile.
     parked: bool,
+    /// Its park kept its tables in place (`Rebind::Parked { kept }`): they
+    /// stay claimed, and an evacuation moves their claim as a bound
+    /// instance's.
+    kept: bool,
     poisoned: Arc<AtomicBool>,
+    /// Ring cells a pass on the queue has yet to land (its instance's).
+    landing: Arc<engine_gpu::guest::defer::Owed>,
 }
 
 #[cfg(feature = "wgpu")]
@@ -77,6 +94,16 @@ pub(crate) struct Pass<'a> {
     /// What the fire read out for the pass's lane `k`, at `k`.
     pub seats: Vec<Vec<crate::guest::run::Readout<'a>>>,
     pub at: Stage,
+}
+
+/// A fire naming an instance whose process parked, before a rebind named
+/// where it lies (`engine::Rebind::Parked`): the runtime's ordering broke.
+#[cfg(feature = "wgpu")]
+fn parked_fire(instance: InstanceId) -> Refusal {
+    Refusal::Program(format!(
+        "instance {instance} is fired while parked: its slots are another owner's until a \
+         rebind names where it lies"
+    ))
 }
 
 #[cfg(feature = "wgpu")]
@@ -90,10 +117,7 @@ impl Half {
     ) -> Result<(), Refusal> {
         let instance = self.id;
         if self.parked {
-            return Err(Refusal::Program(format!(
-                "instance {instance} is fired while parked: its slots are another owner's until \
-                 a rebind names where it lies"
-            )));
+            return Err(parked_fire(instance));
         }
         let inputs = PassInputs::none();
         let mut runner =
@@ -344,6 +368,11 @@ pub struct Plane {
     #[cfg(feature = "wgpu")]
     takings: engine_gpu::guest::state::Takings,
 
+    /// The cells channels keep on the device between fires, one set for the
+    /// engine (`engine_gpu::guest::defer`).
+    #[cfg(feature = "wgpu")]
+    kept: engine_gpu::guest::defer::Kept<crate::device::Api>,
+
     tally: Arc<Tally>,
 }
 
@@ -396,6 +425,7 @@ impl Plane {
     pub fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<RegisteredChannel, Refusal> {
         if self.channels.contains_key(&registration.id) {
             return Err(Refusal::Program(format!(
@@ -403,10 +433,35 @@ impl Plane {
                 registration.id
             )));
         }
-        if !registration.slots.is_empty() {
+        // The cell a pass may keep on the device for the channel, in the
+        // slots its registration names.
+        if let Some(place) = place
+            && let Some(bytes) = engine_gpu::guest::defer::device_cell_bytes(
+                &registration.shape,
+                registration.dtype,
+                registration.host_role,
+            )
+        {
+            #[cfg(feature = "wgpu")]
+            {
+                let cell = engine_gpu::guest::defer::Cell::of(
+                    place.pools,
+                    place.device,
+                    registration.id,
+                    bytes,
+                    &registration.slots,
+                )?;
+                self.kept
+                    .lock()
+                    .expect("kept cells lock poisoned")
+                    .insert(registration.id, cell);
+            }
+            #[cfg(not(feature = "wgpu"))]
+            let _ = (place, bytes);
+        } else if !registration.slots.is_empty() {
             return Err(Refusal::Program(format!(
-                "channel {} names {} channel slot(s), and this engine keeps every cell of a \
-                 ring on the host",
+                "channel {} keeps no cell on the device and its registration names {} channel \
+                 slot(s)",
                 registration.id,
                 registration.slots.len()
             )));
@@ -417,25 +472,25 @@ impl Plane {
             numel,
             registration.capacity.max(1) as usize,
         ));
-        let mirror = (registration.host_role != eta_ir::container::HostRole::None
-            && registration.capacity > 0)
-            .then(|| HostMirror {
-                mirror: ring.cells_ptr() as u64,
-                words: ring.words_ptr() as u64,
-                cell_bytes: u32::try_from(ring.cell_bytes()).unwrap_or(u32::MAX),
-                capacity: registration.capacity,
-            });
         self.channels.insert(registration.id, ring);
+        // No mirror of the ring: a pass on the queue holds a cell in it
+        // before its value lands, which only a take waits for
+        // (`engine_gpu::guest::defer::Owed`).
         Ok(RegisteredChannel {
             id: registration.id,
 
             reader_wait_id: 0,
             writer_wait_id: 0,
-            mirror,
+            mirror: None,
         })
     }
 
     pub fn close_channel(&mut self, id: ChannelId) -> Result<(), Refusal> {
+        #[cfg(feature = "wgpu")]
+        self.kept
+            .lock()
+            .expect("kept cells lock poisoned")
+            .remove(&id);
         self.channels
             .remove(&id)
             .map(|_| ())
@@ -451,13 +506,6 @@ impl Plane {
         place: Option<&Place<'_, crate::device::Api>>,
         layout: &engine_gpu::guest::state::GuestLayout,
     ) -> Result<BoundInstance, Refusal> {
-        if !binding.ring_slots.is_empty() {
-            return Err(Refusal::Program(format!(
-                "program {} binds channel slots, and this engine keeps every cell of a ring on \
-                 the host",
-                binding.program
-            )));
-        }
         let plan = self
             .programs
             .get(&binding.program)
@@ -535,9 +583,52 @@ impl Plane {
                 )));
             }
         }
+        // The device cells of the channels this instance holds itself.
+        #[cfg_attr(not(feature = "wgpu"), allow(unused_mut))]
+        let mut own_cells = Vec::new();
+        #[cfg(feature = "wgpu")]
+        if let Some(place) = place {
+            let mut cells = Vec::new();
+            for (dense, decl) in plan.package.channels.iter().enumerate() {
+                let id = binding.channels[dense];
+                if self.channels.contains_key(&id)
+                    || !engine_gpu::guest::defer::puts_into(&plan, dense as u32)
+                {
+                    continue;
+                }
+                let Some(bytes) = engine_gpu::guest::defer::device_cell_bytes(
+                    &decl.shape,
+                    decl.dtype,
+                    decl.host_role,
+                ) else {
+                    continue;
+                };
+                let slots = binding
+                    .ring_slots
+                    .iter()
+                    .find(|ring| ring.channel == dense as u32)
+                    .map_or(&[][..], |ring| ring.slots.as_slice());
+                cells.push((
+                    id,
+                    engine_gpu::guest::defer::Cell::of(
+                        place.pools,
+                        place.device,
+                        id,
+                        bytes,
+                        slots,
+                    )?,
+                ));
+            }
+            let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+            for (id, cell) in cells {
+                own_cells.push(id);
+                kept.insert(id, cell);
+            }
+        }
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
         let poisoned = Arc::new(AtomicBool::new(false));
+        let landing = Arc::new(engine_gpu::guest::defer::Owed::default());
         #[cfg(feature = "wgpu")]
         let scores = session.scores();
         self.instances.insert(
@@ -552,7 +643,9 @@ impl Plane {
                     session,
                     pair_generation: binding.pair_generation,
                     parked: false,
+                    kept: false,
                     poisoned: Arc::clone(&poisoned),
+                    landing: Arc::clone(&landing),
                 })),
                 #[cfg(feature = "wgpu")]
                 gate: Arc::default(),
@@ -563,6 +656,8 @@ impl Plane {
                 geometry: binding.geometry,
                 channels: binding.channels.clone(),
                 poisoned,
+                landing,
+                own_cells,
             },
         );
         Ok(BoundInstance {
@@ -594,6 +689,10 @@ impl Plane {
                 self.takings
                     .give(half.session.pair_place(), half.pair_generation);
             }
+            let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+            for channel in &seat.own_cells {
+                kept.remove(channel);
+            }
         }
         #[cfg(not(feature = "wgpu"))]
         drop(seat);
@@ -622,6 +721,20 @@ impl Plane {
         #[cfg(feature = "wgpu")]
         seat.gate.settle(instance)?;
         let ring = &seat.inst.channels[dense];
+        let dtype = eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype);
+        // The forward reads the oldest cell; the kept device cell is the
+        // newest, so it is read only when the ring holds no other.
+        #[cfg(feature = "wgpu")]
+        if ring.size() <= 1
+            && let Some(cell) = seat
+                .half
+                .lock()
+                .expect("half lock poisoned")
+                .session
+                .kept_cell(dense as u32)
+        {
+            return Ok(InputCell::Device { cell, dtype });
+        }
         #[cfg(feature = "wgpu")]
         if ring.is_empty() {
             self.settle_writers(id)?;
@@ -635,10 +748,7 @@ impl Plane {
         let value = ring.front();
         let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
         eta_exec::encode_wire(&value, &mut bytes);
-        Ok(InputCell::Host {
-            bytes,
-            dtype: eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype),
-        })
+        Ok(InputCell::Host { bytes, dtype })
     }
 
     pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
@@ -662,24 +772,13 @@ impl Plane {
         if ring.is_empty() {
             self.settle_writers(seat.channels[binding.channel as usize])?;
         }
-        if ring.is_empty() {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: the `fold` ring is empty at the fire"
-            )));
-        }
-        let len = match ring.front() {
-            Value::U32(cells) => cells.first().copied(),
-            Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
-            other => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance}: `fold` holds {:?}, not a count",
-                    other.dtype()
-                )));
-            }
-        };
-        len.map(Some).ok_or_else(|| {
-            Refusal::Program(format!("instance {instance}: `fold` holds an empty cell"))
-        })
+        engine_gpu::guest::defer::fold_count(
+            instance,
+            binding.channel,
+            ring,
+            &seat.landing,
+            &seat.poisoned,
+        )
     }
 
     #[cfg(feature = "wgpu")]
@@ -784,7 +883,19 @@ impl Plane {
         })?;
         let plan = Arc::clone(&seat.plan);
         match eta_exec::host_put(seat.host(), &plan, channel, &value) {
-            HostOp::Ok => Ok(true),
+            HostOp::Ok => {
+                // The host's cell supersedes any the device kept.
+                #[cfg(feature = "wgpu")]
+                {
+                    seat.gate.settle(instance)?;
+                    seat.half
+                        .lock()
+                        .expect("half lock poisoned")
+                        .session
+                        .forget(channel);
+                }
+                Ok(true)
+            }
             HostOp::WouldBlock => Ok(false),
             HostOp::Poisoned => Err(Refusal::Program(format!("instance {instance} is poisoned"))),
             HostOp::WrongRole => Err(Refusal::Program(format!(
@@ -802,6 +913,13 @@ impl Plane {
             return Err(Refusal::Program(format!(
                 "instance {instance} carries no channel {channel}"
             )));
+        }
+        if seat.poisoned.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        let head = seat.inst.channels[channel as usize].head();
+        if seat.landing.owes((channel, head)) {
+            return Ok(None);
         }
         let plan = Arc::clone(&seat.plan);
         match eta_exec::host_take(seat.host(), &plan, channel) {
@@ -935,6 +1053,13 @@ impl Plane {
         if ring.is_empty() {
             self.settle_writers(seat.channels[binding.channel as usize])?;
         }
+        // A mask a deferred pass on the queue puts holds its placeholder in
+        // the ring until that pass lands.
+        seat.landing
+            .wait((binding.channel, ring.head()), &seat.poisoned);
+        if seat.poisoned.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
                 "instance {instance}: the `attn_mask` ring is empty at the fire"
@@ -1008,6 +1133,7 @@ impl Plane {
             },
             [instance, pair],
             layout,
+            engine_gpu::guest::defer::Cells::new(binding.channels.clone(), Arc::clone(&self.kept)),
         )
         .map_err(|why| format!("its device half did not build: {why}"))
     }
@@ -1017,8 +1143,157 @@ impl Plane {
         self.tally.device.load(Ordering::Acquire)
     }
 
+    /// Whether `instance`'s pass can be recorded to land later: one stage,
+    /// its device half built, not poisoned.
+    #[cfg(feature = "wgpu")]
+    #[must_use]
+    pub fn defers(&self, instance: InstanceId) -> bool {
+        self.widen.is_some()
+            && self.instances.get(&instance).is_some_and(|seat| {
+                seat.plan.package.plans.len() == 1
+                    && !seat.poisoned.load(Ordering::Acquire)
+                    && seat.gate.airborne() == 0
+            })
+    }
+
+    /// The device cell holding lane `lane_at`'s one token, where the device
+    /// keeps the instance's `embed_tokens` cell.
+    #[cfg(feature = "wgpu")]
+    #[must_use]
+    pub fn token_feed(
+        &self,
+        instance: InstanceId,
+        lane_at: usize,
+    ) -> Option<engine_gpu::serve::DeviceCell<crate::device::Api>> {
+        let seat = self.instances.get(&instance)?;
+        let half = seat.half.lock().expect("half lock poisoned");
+        engine_gpu::guest::defer::token_feed(
+            &seat.plan,
+            &seat.inst,
+            seat.geometry,
+            half.session.cells(),
+            lane_at,
+        )
+    }
+
+    /// Runs the step's passes behind its forward on the queue, all in one
+    /// frame with one submit, and returns before any lands
+    /// (`engine_gpu::guest::defer::fire_deferred`).
+    #[cfg(feature = "wgpu")]
+    pub fn fire_deferred(
+        &mut self,
+        passes: Vec<DeferredPass<'_>>,
+        device: &crate::device::Context,
+        done: Option<engine_gpu::settle::Done>,
+    ) -> Result<(), Refusal> {
+        use engine_gpu::guest::defer::{Recorded, Recording, outcome_of};
+        // A pass of a parked instance refuses the whole fire, before any
+        // pass is recorded.
+        if let Some(pass) = passes.iter().find(|pass| {
+            self.instances
+                .get(&pass.instance)
+                .is_some_and(|seat| seat.half.lock().expect("half lock poisoned").parked)
+        }) {
+            return Err(parked_fire(pass.instance));
+        }
+        let widen = Arc::clone(self.widen.as_ref().ok_or_else(|| {
+            Refusal::Program(
+                "a deferred guest pass has a device half, but the plane built no readout widen"
+                    .to_owned(),
+            )
+        })?);
+        let instances = &self.instances;
+        let tally = &self.tally;
+        let mut departs: Vec<(InstanceId, crate::device::Pending)> = Vec::new();
+        let record = |pass: DeferredPass<'_>, frame: Option<crate::device::ctx::Frame>| {
+            let DeferredPass {
+                instance,
+                lanes,
+                seats,
+            } = pass;
+            let Some(seat) = instances.get(&instance) else {
+                return Recording {
+                    frame,
+                    pass: Err(format!("instance {instance} is closed")),
+                };
+            };
+            let mut half = seat.half.lock().expect("half lock poisoned");
+            let Half {
+                program,
+                plan,
+                inst,
+                session,
+                poisoned,
+                landing,
+                ..
+            } = &mut *half;
+            let program = *program;
+            let unread = engine_gpu::guest::run::unread_seat(
+                &plan.package,
+                |at, local| session.span(at, local).map(|(_, held)| held),
+                &seats,
+            );
+            match unread {
+                Ok(None) => {}
+                Ok(Some((output, lane))) => {
+                    return Recording {
+                        frame,
+                        pass: Err(engine_gpu::program::unread(instance, &output, lane).to_string()),
+                    };
+                }
+                Err(fault) => {
+                    return Recording {
+                        frame,
+                        pass: Err(fault.to_string()),
+                    };
+                }
+            }
+            let inputs = PassInputs::none();
+            let mut runner =
+                crate::guest::run::OnDevice::new(device, session, &widen, seats).deferred(frame);
+            let outcome = eta_exec::step_with(inst, plan, &inputs, &mut runner, Stage::Epilogue);
+            let crate::guest::run::Deferral {
+                frame,
+                pass,
+                landings,
+            } = runner.take_deferral().unwrap_or_default();
+            if inst.poisoned {
+                poisoned.store(true, Ordering::Release);
+            }
+            if matches!(outcome, StepOutcome::Committed) {
+                tally.device.fetch_add(1, Ordering::AcqRel);
+            }
+            let rings = inst.channels.clone();
+            let pass = outcome_of(outcome, instance, program, || {
+                pass.map(|pass| {
+                    Recorded::of(
+                        instance, program, lanes, pass, landings, &rings, landing, poisoned,
+                    )
+                })
+            });
+            Recording { frame, pass }
+        };
+        engine_gpu::guest::defer::fire_deferred::<crate::device::Api, _, _>(
+            passes,
+            record,
+            done,
+            |instance, pending| departs.push((instance, pending)),
+        )?;
+        for (instance, pending) in departs {
+            if let Some(seat) = self.instances.get(&instance) {
+                seat.half
+                    .lock()
+                    .expect("half lock poisoned")
+                    .session
+                    .depart(pending);
+            }
+        }
+        Ok(())
+    }
+
     /// What an instance of `program` holds in the pool: its stages' tables
-    /// in `Instance` slots. Its rings lie on the host.
+    /// in `Instance` slots, and a `Channel` cell for each channel it holds
+    /// itself that a pass may keep on the device.
     pub fn facts(
         &self,
         program: ProgramId,
@@ -1067,8 +1342,26 @@ impl Plane {
             place.align,
         )
         .map_err(Refusal::fault)?;
+        let mut rings = Vec::new();
+        for (dense, decl) in plan.package.channels.iter().enumerate() {
+            let channel = dense as u32;
+            if !engine_gpu::guest::defer::puts_into(plan, channel) {
+                continue;
+            }
+            if let Some(facts) = engine_gpu::guest::defer::cell_facts(
+                channel,
+                &decl.shape,
+                decl.dtype,
+                decl.capacity,
+                decl.host_role,
+                place.pools,
+            )? {
+                rings.push(facts);
+            }
+        }
         Ok(ProgramFacts {
             instance,
+            rings,
             ..ProgramFacts::default()
         })
     }
@@ -1085,17 +1378,51 @@ impl Plane {
     /// Points every instance's tables at the chunks their slots sit in now.
     pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
-        for seat in self.instances.values_mut() {
-            let mut half = seat.half.lock().expect("half lock poisoned");
-            // A parked instance's slots are another owner's: repointed and
-            // claimed at its rebind, not here.
-            if half.parked {
-                continue;
+        {
+            // Every holder's runs where the evacuation left them, claimed
+            // in one step before a record is written there. A parked
+            // instance that shed its state holds nothing here: repointed
+            // and claimed at its rebind. One whose park kept its tables in
+            // place holds them, where the evacuation moved them.
+            let mut moved: Vec<(engine::guest_claims::Holder, Vec<engine::guest_claims::Run>)> =
+                Vec::new();
+            for seat in self.instances.values() {
+                let mut half = seat.half.lock().expect("half lock poisoned");
+                if half.parked && !half.kept {
+                    continue;
+                }
+                let parked = half.parked;
+                for (holder, runs) in half
+                    .session
+                    .relocate(pools, parked)
+                    .map_err(Refusal::fault)?
+                {
+                    // A pair's members each name its runs: claimed once.
+                    if !moved.iter().any(|(held, _)| *held == holder) {
+                        moved.push((holder, runs));
+                    }
+                }
             }
-            half.session
-                .rebind(pools)
-                .map_err(Refusal::fault)?;
-            seat.scores = half.session.scores();
+            if let Some(library) = &self.library {
+                library.claim_moved(&moved).map_err(Refusal::fault)?;
+            }
+            for seat in self.instances.values_mut() {
+                let half = seat.half.lock().expect("half lock poisoned");
+                if half.parked {
+                    continue;
+                }
+                half.session.repoint().map_err(Refusal::fault)?;
+                seat.scores = half.session.scores();
+            }
+        }
+        #[cfg(feature = "wgpu")]
+        for cell in self
+            .kept
+            .lock()
+            .expect("kept cells lock poisoned")
+            .values_mut()
+        {
+            cell.rebind(pools).map_err(Refusal::fault)?;
         }
         #[cfg(not(feature = "wgpu"))]
         let _ = pools;
@@ -1118,12 +1445,6 @@ impl Plane {
                 pair_generation,
                 ..
             } => {
-                if !rings.is_empty() {
-                    return Err(Refusal::Program(format!(
-                        "instance {id} rebinds channel slots, and this engine keeps every cell \
-                         of a ring on the host"
-                    )));
-                }
                 let seat = self.instances.get_mut(id).ok_or(Refusal::Closed {
                     what: "instance",
                     id: id.0,
@@ -1153,13 +1474,62 @@ impl Plane {
                     }
                     half.pair_generation = *pair_generation;
                     half.parked = false;
+                    half.kept = false;
                     half.session
                         .clear(fresh_pair)
                         .map_err(Refusal::fault)?;
                     seat.scores = half.session.scores();
+                    drop(half);
+                    let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+                    for ring in rings {
+                        let channel =
+                            seat.channels.get(ring.channel as usize).ok_or_else(|| {
+                                Refusal::Program(format!(
+                                    "instance {id} rebinds ring {}, past its channels",
+                                    ring.channel
+                                ))
+                            })?;
+                        kept.get_mut(channel)
+                            .ok_or_else(|| {
+                                Refusal::Program(format!(
+                                    "instance {id} holds no device cell for channel {channel}"
+                                ))
+                            })?
+                            .retarget(pools, &ring.slots)
+                            .map_err(Refusal::fault)?;
+                    }
                 }
                 #[cfg(not(feature = "wgpu"))]
-                let _ = (seat, pools, instance, scratch, pair, pair_generation);
+                let _ = (seat, pools, instance, scratch, pair, pair_generation, rings);
+                Ok(())
+            }
+            Rebind::Channel { id, slots } => {
+                #[cfg(feature = "wgpu")]
+                {
+                    // The passes reading it land first.
+                    for (&instance, seat) in &self.instances {
+                        if seat.channels.contains(id) {
+                            seat.gate.settle(instance)?;
+                            seat.half
+                                .lock()
+                                .expect("half lock poisoned")
+                                .session
+                                .settle()
+                                .map_err(Refusal::fault)?;
+                        }
+                    }
+                    self.kept
+                        .lock()
+                        .expect("kept cells lock poisoned")
+                        .get_mut(id)
+                        .ok_or_else(|| {
+                            Refusal::Program(format!("channel {id} holds no device cell"))
+                        })?
+                        .retarget(pools, slots)
+                        .map_err(Refusal::fault)?;
+                }
+                #[cfg(not(feature = "wgpu"))]
+                let _ = (id, slots);
                 Ok(())
             }
             Rebind::Parked { id, kept } => {
@@ -1173,6 +1543,7 @@ impl Plane {
                     let mut half = seat.half.lock().expect("half lock poisoned");
                     // Said again by a move down of its tables: kept nowhere now.
                     half.session.park(*kept);
+                    half.kept = *kept;
                     if !half.parked {
                         // It leaves its pair's taking as it leaves the group.
                         self.takings
@@ -1184,10 +1555,6 @@ impl Plane {
                 let _ = (seat, kept);
                 Ok(())
             }
-            Rebind::Channel { id, .. } => Err(Refusal::Program(format!(
-                "channel {id} rebinds channel slots, and this engine keeps every cell of a ring \
-                 on the host"
-            ))),
         }
     }
 
@@ -1214,10 +1581,10 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     ) -> Result<(), Refusal> {
         #[cfg(feature = "wgpu")]
         {
-            // A stage's collect reads back through its thread's buffer, a
-            // chunk of the pool each (a program whose stage reads back more
-            // is refused at registration). The buffers, and the widen's
-            // table, are the shelf's: reserved before the pool was sized.
+            // A frame's passes read back through a readback buffer of the
+            // shelf's, a chunk each (a program whose stage reads back more is
+            // refused at registration). The buffers, and the widen's table,
+            // are the shelf's: reserved before the pool was sized.
             let (outboxes, table) = &place.shelf.guest;
             let library = crate::guest::session::Library::build(
                 place.device,
@@ -1286,18 +1653,26 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
     /// No channel keeps a cell on the device here.
     fn ring_facts(
         &self,
-        _registration: &ChannelRegistration,
-        _place: &Place<'_, crate::device::Api>,
+        registration: &ChannelRegistration,
+        place: &Place<'_, crate::device::Api>,
     ) -> Result<Option<RingFacts>, Refusal> {
-        Ok(None)
+        // The `Channel` slots a registered channel's device cell takes.
+        engine_gpu::guest::defer::cell_facts(
+            0,
+            &registration.shape,
+            registration.dtype,
+            registration.capacity,
+            registration.host_role,
+            place.pools,
+        )
     }
 
     fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
-        _place: Option<&Place<'_, crate::device::Api>>,
+        place: Option<&Place<'_, crate::device::Api>>,
     ) -> Result<RegisteredChannel, Refusal> {
-        Plane::register_channel(self, registration)
+        Plane::register_channel(self, registration, place)
     }
 
     fn quiesce(&mut self) -> Result<(), Refusal> {

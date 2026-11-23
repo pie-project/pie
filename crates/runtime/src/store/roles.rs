@@ -676,6 +676,9 @@ pub struct Taken {
     chunk_slots: u32,
     /// The process whose bind took it ([`Roles::binds_on_way`]).
     holder: Option<Holder>,
+    /// The bytes it took for itself, counted on its way in
+    /// [`Roles::footprint`] until it is bound or given back.
+    bytes: u64,
 }
 
 /// A bind's guest state taken before it registered anything
@@ -960,6 +963,10 @@ pub struct Roles {
     binding: HashMap<Holder, u32>,
     /// Told each time one of those lands ([`Self::bind_landed`]).
     bind_landed: Arc<tokio::sync::Notify>,
+    /// The bytes the binds on their way took for themselves
+    /// ([`Taken::bytes`]): held, in no item yet. By the process each is
+    /// for, and together.
+    on_way: (HashMap<Option<Holder>, u64>, u64),
 }
 
 /// Device room given back: a count of the gives, and their event.
@@ -1031,6 +1038,7 @@ impl Roles {
             freed: Arc::default(),
             binding: HashMap::new(),
             bind_landed: Arc::default(),
+            on_way: (HashMap::new(), 0),
             guest_waiter: None,
             generations: 0,
             leaked: 0,
@@ -2359,7 +2367,27 @@ impl Roles {
                         || format!("{pair}'s state"),
                         heads,
                     ) {
-                        Ok(part) => Some((pair, part, true, self.next_generation())),
+                        // Its item from the take on, held by the binds on
+                        // their way ([`Self::pin_shared`]) and then by its
+                        // instances: a second bind of the pair taken before
+                        // this one bound joins it. Taken fresh again, two
+                        // binds of one pair each named a taking of its own,
+                        // the engine laid the group at one under the other's
+                        // member, and the first bound left the other's chunk
+                        // held by no item for good (the simulation's field
+                        // mix, seed 20: pair 3 at chunk 6 for instance 16, at
+                        // chunk 19 for 15 and 17, at one generation; seed
+                        // 115: a beam pair's chunk out of service from step 0).
+                        Ok(part) => {
+                            let generation = self.next_generation();
+                            let mut item = Item::new(None, vec![part.clone()]);
+                            // Held by its instances alone: freed at the last
+                            // close, or with its last bind given back.
+                            item.open = false;
+                            item.generation = generation;
+                            self.items.insert(Owner::Pair(pair), item);
+                            Some((pair, part, true, generation))
+                        }
                         Err(error) => {
                             self.untake_guest(taken);
                             return Err(error.asking(whole));
@@ -2437,6 +2465,7 @@ impl Roles {
 
     /// The bind of `taken` failed: its slots go back.
     pub fn untake(&mut self, taken: Taken) {
+        self.off_way(&taken);
         self.bind_ended_for(taken.holder);
         self.pin_shared(&taken, false);
         let shared = [
@@ -2447,9 +2476,8 @@ impl Roles {
         if let Some((_, part, true)) = taken.adapter {
             self.give(&self.device, &[part]);
         }
-        if let Some((_, part, true, _)) = taken.pair {
-            self.give(&self.device, &[part]);
-        }
+        // A pair taken fresh is an item from its take ([`Self::take_guest`]):
+        // it goes below with its last bind, unless another joined it.
         // What the bind held and no one else holds goes now: a pair whose
         // members all parked while the bind was on its way, an adapter or
         // pair with none attached.
@@ -2515,13 +2543,16 @@ impl Roles {
         if let Some(part) = &guest.scratch {
             self.give(&self.device, std::slice::from_ref(part));
         }
-        if let Some((_, part, true, _)) = guest.pair {
-            self.give(&self.device, &[part]);
+        // A pair it took fresh is an item from its take: gone with it
+        // unless another bind joined it meanwhile.
+        if let Some((key, _, true, _)) = guest.pair {
+            self.free_if_done(Owner::Pair(key));
         }
     }
 
     /// The engine bound `taken` as instance `id`, for `holder`.
     pub fn bound(&mut self, id: InstanceId, holder: Option<Holder>, taken: Taken) {
+        self.off_way(&taken);
         self.bind_ended_for(taken.holder);
         self.pin_shared(&taken, false);
         for &channel in &taken.channels {
@@ -3085,6 +3116,139 @@ impl Roles {
         }
     }
 
+    /// The whole chunks `part` takes on the device: a guest part its runs
+    /// of chunks (a run of slots, one), any other part its slots in whole
+    /// chunks of its shape.
+    fn part_chunks(&self, device: &super::shared::SharedPool, part: &Part) -> u64 {
+        if part.shaped() {
+            let (run, pieces) = part.chunk_runs();
+            u64::from(run) * u64::from(pieces)
+        } else {
+            let per_chunk = self
+                .shapes
+                .of(part.role)
+                .and_then(|shape| device.pool().shape(shape.pool))
+                .map_or(1, |shape| shape.slots_per_chunk.max(1));
+            (part.refs.len() as u64).div_ceil(u64::from(per_chunk))
+        }
+    }
+
+    /// The bytes `part` holds wherever it lies, one figure on every tier
+    /// (a move of it changes no count): a guest part in runs of whole
+    /// chunks those chunks, any other part (a run of guest slots, tables,
+    /// a ring, an adapter) its slots, dead guest scratch included (given
+    /// back at a park, taken fresh at the restore: the process's still).
+    fn part_bytes(&self, device: &super::shared::SharedPool, part: &Part) -> u64 {
+        let pool = device.pool();
+        if part.pieces > 0 {
+            return u64::from(part.chunks) * u64::from(part.pieces) * pool.chunk_bytes();
+        }
+        let slot_bytes = self
+            .shapes
+            .of(part.role)
+            .and_then(|shape| pool.shape(shape.pool))
+            .map_or(0, |shape| shape.slot_bytes);
+        let slots = if part.run > 0 { part.run as usize } else { part.refs.len() };
+        slots as u64 * slot_bytes
+    }
+
+    /// The bytes every item holds together, wherever each lies
+    /// ([`Self::part_bytes`]), and those the binds on their way took: what
+    /// the capacity gate counts guest state and tables by
+    /// (`planner::PoolPort::capacity_census`). One figure on every tier: a
+    /// move of an item changes no count.
+    #[must_use]
+    pub fn footprint(&self) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + self.on_way.1
+    }
+
+    /// The bytes the items parked on the disk tier hold
+    /// ([`Self::footprint`]'s share of them): what of the disk chunks they
+    /// take is theirs.
+    #[must_use]
+    pub fn footprint_on_disk(&self) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .filter(|item| matches!(item.tier, Tier::Disk))
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum()
+    }
+
+    /// The bytes the roles' shapes hold open on the device and on the host
+    /// tier that no slot uses: a chunk of small slots (tables, rings) or of
+    /// runs of one class is room no other shape takes until it empties.
+    /// No item's state: the capacity gate counts it beside the state it
+    /// holds, as room that is not free (`planner::PoolPort::capacity_census`).
+    #[must_use]
+    pub fn slack(&self) -> u64 {
+        let shapes: Vec<_> = [SlotRole::Instance, SlotRole::Channel, SlotRole::Adapter]
+            .into_iter()
+            .filter_map(|role| self.shapes.of(role).map(|shape| shape.pool))
+            .collect();
+        let device = self.device.lock().unwrap().pool().slack_of(&shapes);
+        let host = self
+            .host
+            .as_ref()
+            .map_or(0, |host| host.lock().unwrap().pool().slack_of(&shapes));
+        device + host
+    }
+
+    /// [`Self::footprint`] of what `holder`'s binds took: its items, and
+    /// its binds on their way.
+    #[must_use]
+    pub fn footprint_of(&self, holder: Holder) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .filter(|item| item.holder == Some(holder))
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + self.on_way.0.get(&Some(holder)).copied().unwrap_or(0)
+    }
+
+    /// `taken` is off its way (bound or given back): its bytes are an
+    /// item's now, or free.
+    fn off_way(&mut self, taken: &Taken) {
+        if let Some(bytes) = self.on_way.0.get_mut(&taken.holder) {
+            *bytes = bytes.saturating_sub(taken.bytes);
+            if *bytes == 0 {
+                self.on_way.0.remove(&taken.holder);
+            }
+        }
+        self.on_way.1 = self.on_way.1.saturating_sub(taken.bytes);
+    }
+
+    /// The bytes `taken` took for itself: its own parts, and an adapter's
+    /// or a pair's taken for it (another's are their item's).
+    fn taken_bytes(&self, taken: &Taken) -> u64 {
+        let device = self.device.lock().unwrap();
+        let fresh = |part: &Part, fresh: bool| if fresh { self.part_bytes(&device, part) } else { 0 };
+        taken
+            .parts
+            .iter()
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + taken.adapter.as_ref().map_or(0, |(_, part, own)| fresh(part, *own))
+            // A pair taken fresh is an item from its take: counted there.
+    }
+
+    /// `taken` is on its way: its bytes are counted until it is bound or
+    /// given back.
+    fn on_way_take(&mut self, taken: &mut Taken) {
+        taken.bytes = self.taken_bytes(taken);
+        *self.on_way.0.entry(taken.holder).or_default() += taken.bytes;
+        self.on_way.1 += taken.bytes;
+    }
+
     /// The whole chunks of `on` the live parts of `parts` take.
     fn chunks_on(&self, on: &Shared, parts: &[Part]) -> u64 {
         let pool = on.lock().unwrap();
@@ -3107,22 +3271,11 @@ impl Roles {
     /// eviction can make.
     fn fits_budget(&self, owners: &[Owner]) -> bool {
         let device = self.device.lock().unwrap();
-        let mut chunks = 0u64;
-        for owner in owners {
-            for part in &self.items[owner].parts {
-                chunks += if part.shaped() {
-                    let (run, pieces) = part.chunk_runs();
-                    u64::from(run) * u64::from(pieces)
-                } else {
-                    let per_chunk = self
-                        .shapes
-                        .of(part.role)
-                        .and_then(|shape| device.pool().shape(shape.pool))
-                        .map_or(1, |shape| shape.slots_per_chunk.max(1));
-                    (part.refs.len() as u64).div_ceil(u64::from(per_chunk))
-                };
-            }
-        }
+        let chunks: u64 = owners
+            .iter()
+            .flat_map(|owner| &self.items[owner].parts)
+            .map(|part| self.part_chunks(&device, part))
+            .sum();
         chunks <= u64::from(device.state_chunks_now())
     }
 
@@ -3308,6 +3461,91 @@ impl Roles {
         leaked
     }
 
+    /// Every device slot the items hold in slots of their shape (tables,
+    /// rings, channels, adapters: not guest runs of chunks), checked
+    /// against the pool and each other: each held by one item, and handed
+    /// out in the pool. What is said is a slot two items hold, or one an
+    /// item holds that the pool counts free: the store's double give that
+    /// handed one ref to a restore and a fresh bind together.
+    #[cfg(test)]
+    #[must_use]
+    pub fn audit_device_slots(&self) -> Vec<String> {
+        let device = self.device.lock().unwrap();
+        let mut seen: HashMap<(SlotRole, u32), Owner> = HashMap::new();
+        let mut said = Vec::new();
+        for (owner, item) in &self.items {
+            if item.tier != Tier::Device {
+                continue;
+            }
+            for part in item.parts.iter().filter(|part| !part.shaped()) {
+                let Some(shape) = self.shapes.of(part.role) else {
+                    continue;
+                };
+                for &slot_ref in &part.refs {
+                    if let Some(other) = seen.insert((part.role, slot_ref), *owner) {
+                        said.push(format!(
+                            "{:?} slot {slot_ref} held by {other:?} and {owner:?}",
+                            part.role
+                        ));
+                    }
+                    if !device.pool().is_held(shape.pool, device.slot(shape.pool, slot_ref)) {
+                        said.push(format!(
+                            "{:?} slot {slot_ref} held by {owner:?} is free in the pool",
+                            part.role
+                        ));
+                    }
+                }
+            }
+        }
+        drop(device);
+        // Nothing moving and no bind on its way: every slot the pool holds
+        // out of a role's shape is one an item names (a fresh pair taken by
+        // a bind no item recorded held its chunk for good).
+        let settled = self.on_way.1 == 0
+            && self.binding.is_empty()
+            && self.items.values().all(|item| item.tier != Tier::Moving);
+        if settled {
+            for (role, used, named) in self.audit_held() {
+                if used != named {
+                    said.push(format!(
+                        "{role:?}: the pool holds {used} slots out, the items name {named}"
+                    ));
+                }
+            }
+        }
+        said
+    }
+
+    /// The device slots of each role's shape the pool holds out, beside the
+    /// slots the items on the device (and moving) name: `(role, pool,
+    /// items)`. Equal, nothing is held that no item names.
+    #[cfg(test)]
+    #[must_use]
+    pub fn audit_held(&self) -> Vec<(SlotRole, u64, u64)> {
+        let device = self.device.lock().unwrap();
+        let pool = device.pool();
+        let mut out = Vec::new();
+        for role in [SlotRole::Instance, SlotRole::Channel, SlotRole::Adapter] {
+            let Some(shape) = self.shapes.of(role) else {
+                continue;
+            };
+            let used: u64 = (0..pool.total_chunks())
+                .filter(|&chunk| pool.chunk_shape(chunk) == Some(shape.pool))
+                .map(|chunk| u64::from(pool.chunk_used(chunk)))
+                .sum();
+            let named: u64 = self
+                .items
+                .values()
+                .filter(|item| matches!(item.tier, Tier::Device | Tier::Moving))
+                .flat_map(|item| &item.parts)
+                .filter(|part| part.role == role)
+                .map(|part| part.refs.len() as u64)
+                .sum();
+            out.push((role, used, named));
+        }
+        out
+    }
+
     /// Role slots out of service for good: taken by moves whose copies an
     /// engine could not settle ([`Self::abandon`]).
     #[must_use]
@@ -3325,10 +3563,17 @@ impl Roles {
         let mut channels: BTreeSet<ChannelId> = BTreeSet::new();
         for (owner, item) in &self.items {
             match *owner {
-                Owner::Channel(id) if item.stale && item.holder == Some(holder) => {
+                // Only what lies on the device now: one moved off since its
+                // restore (parked again while its rebinds waited) names no
+                // slots the engine may claim.
+                Owner::Channel(id)
+                    if item.stale && item.holder == Some(holder) && item.tier == Tier::Device =>
+                {
                     channels.insert(id);
                 }
-                Owner::Instance(id) if item.stale && item.holder == Some(holder) => {
+                Owner::Instance(id)
+                    if item.stale && item.holder == Some(holder) && item.tier == Tier::Device =>
+                {
                     instances.insert(id);
                 }
                 // Its holders on the device; a parked one is rebound when it
@@ -3515,6 +3760,52 @@ impl Roles {
             Owner::Instance(_) => item.open,
             _ => true,
         })
+    }
+
+    /// Whether `rebind`, read off the roles before the lane ran it, still
+    /// says where its item lies: a park of an instance not closed since; a
+    /// rebind of an item that is on the device, not parked where it lies,
+    /// at the slots it names. One whose item has moved since (parked again
+    /// by an eviction or a bind's suspension while its restore waited on
+    /// its rebinds, its device slots given back at that park's commit) is
+    /// cancelled: sent, the engine claimed slots the store had handed out
+    /// again, and the next bind there was refused (the L40S and the M1 on
+    /// batch 3: instance slot 12537 rebound 4 ms after its park, the same
+    /// refs, then bound to another instance 1 ms later). The move that
+    /// brings it back names it anew.
+    #[must_use]
+    pub fn rebind_stands(&self, rebind: &Rebind) -> bool {
+        let owner = Owner::of(rebind);
+        if !self.rebinds(owner) {
+            return false;
+        }
+        let Some(item) = self.items.get(&owner) else {
+            return false;
+        };
+        match rebind {
+            Rebind::Parked { .. } => true,
+            Rebind::Instance { instance, .. } => {
+                item.tier == Tier::Device
+                    && !item.shed
+                    && item.parts.first().map_or(instance.is_empty(), |part| part.refs == *instance)
+            }
+            Rebind::Channel { slots, .. } => item.tier == Tier::Device && item.refs() == *slots,
+        }
+    }
+
+    /// Instances `ids` were said parked to the engine and their park was
+    /// taken back: each on the device where it lay, not parked where it
+    /// lies, is rebound at its slots ([`Self::stale`]) before its process
+    /// fires again, so the engine never believes a park the runtime undid.
+    pub fn park_undone(&mut self, ids: &[InstanceId]) {
+        for id in ids {
+            if let Some(item) = self.items.get_mut(&Owner::Instance(*id))
+                && item.tier == Tier::Device
+                && !item.shed
+            {
+                item.stale = true;
+            }
+        }
     }
 
     /// The engine took `owner`'s new slots.
@@ -3706,7 +3997,7 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let taken = take_bind(roles, engine, binding, registered, holder, |_| true)?;
+    let taken = take_bind(roles, engine, binding, registered, holder, |_| true, |_, _| false)?;
     bind_taken(roles, engine, binding, holder, taken)
 }
 
@@ -3725,6 +4016,7 @@ pub fn take_bind(
     registered: impl Fn(ChannelId) -> bool,
     holder: Option<Holder>,
     resident: impl Fn(Holder) -> bool,
+    gated: impl Fn(Holder, u32) -> bool,
 ) -> anyhow::Result<Option<Taken>> {
     let Some(roles) = roles else {
         return Ok(None);
@@ -3741,6 +4033,7 @@ pub fn take_bind(
         extents: binding.extents,
     };
     let mut roles = roles.lock().unwrap();
+    let free_before = roles.device.lock().unwrap().pool().free_chunks();
     let guest = roles.take_guest(&binding.channels, (pair, state), holder)?;
     let fresh = guest.fresh_runs();
     let mut taken = roles
@@ -3754,7 +4047,34 @@ pub fn take_bind(
         .map_err(|(error, opened)| roles.bind_short(error, fresh, opened))?;
     taken.holder = holder;
     roles.bind_taken_for(holder);
+    roles.on_way_take(&mut taken);
+    let added = free_before.saturating_sub(roles.device.lock().unwrap().pool().free_chunks());
     drop(roles);
+    // What it added: the fresh chunks it opened, its new state
+    // ([`Roles::footprint`]) and the room those chunks hold open past it
+    // ([`Roles::slack`]); slots it took in chunks open already add state
+    // and take as much slack, so none. Past what every tier keeps for the
+    // finisher (`gated`), the take goes back and the bind waits in the
+    // planner for the gate
+    // ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
+    if let Some(holder) = holder
+        && added > 0
+        && gated(holder, added)
+    {
+        roles_handle.lock().unwrap().untake(taken);
+        return Err(RolesError::BindShort(Box::new(RolesError::GuestShort {
+            what: format!(
+                "its {added} new chunks of state, past what every tier keeps for the finisher"
+            ),
+            bytes: 0,
+            room: GuestRoom::Slots {
+                slots: 0,
+                committable: 0,
+                chunks: added,
+            },
+        }))
+        .into());
+    }
     // Read again past the take: a park that began since the first read
     // either saw this bind on its way and waits for it, or parked before
     // it was taken, and then the holder reads parked here and the take
@@ -4132,11 +4452,11 @@ pub fn rebind(
     // its rebinds: a closed instance is the engine's no longer, and the
     // runtime never rebinds what it closed.
     if let Some(roles) = roles
-        && !roles.lock().unwrap().rebinds(owner)
+        && !roles.lock().unwrap().rebind_stands(&rebind)
     {
         tracing::debug!(
             ?owner,
-            "a restore's rebind cancelled: closed since it was read"
+            "a rebind cancelled: its item closed or moved since it was read"
         );
         return Ok(());
     }

@@ -717,3 +717,420 @@ fn a_parked_instance_s_shed_room_is_another_s_and_its_unpark_claims_again() {
             .expect("the instance closes");
     }
 }
+
+/// An evacuation under a kept park (`engine::Rebind::Parked { kept }`):
+/// instance A parks with its tables kept in place, and the chunk holding
+/// them moves. A's claim moves with them: an instance bound at A's own refs
+/// (now the new bytes) is refused by name, and one bound in the chunk now
+/// lying on A's old bytes binds. A's unpark rebinds it at the same refs and
+/// it answers as before the move. Unmoved, A's claim would stand on the old
+/// bytes: the first bind would pass over A's tables and the second be
+/// refused on a stale claim.
+#[test]
+fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-kept-evac", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4261).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![vec![11]];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let committed = segments * facts.segment_chunks;
+    let mut guest = crate::guest::Guest::of(&facts, committed);
+    let per_chunk = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.role == engine::chunk::SlotRole::Instance)
+        .expect("the load states the Instance shape")
+        .slots_per_chunk;
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let bind = |shell: &mut Shell,
+                instance: Vec<u32>,
+                rings: Vec<engine::program::RingSlots>,
+                scratch: &engine::ScratchPlace,
+                pair: &engine::ScratchPlace,
+                generation: u64| {
+        shell.bind_program(
+            program,
+            &[],
+            extents,
+            GeometryClass::Host,
+            PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            engine_cuda::program::Slots {
+                instance,
+                rings,
+                scratch: scratch.clone(),
+                pair: pair.clone(),
+                pair_generation: generation,
+            },
+        )
+    };
+    let attach = |instance| {
+        [Attached {
+            lane: 0,
+            lanes: 1,
+            instance,
+            adapter_only: false,
+        }]
+    };
+    let argmax = |shell: &mut Shell, instance| {
+        let cell = shell
+            .program_instance(instance)
+            .expect("the instance settles")
+            .expect("the instance")
+            .take(0)
+            .expect("its channel reads")
+            .expect("its epilogue put a cell");
+        i32::from_le_bytes(cell[..4].try_into().expect("an i32 cell"))
+    };
+
+    let (scratch, pair) = guest.places((program, extents), &state);
+    let a_slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let a = bind(&mut shell, a_slots.0.clone(), a_slots.1.clone(), &scratch, &pair, 1)
+        .expect("A binds");
+    let before = fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+    let put = argmax(&mut shell, a);
+
+    shell.park_program(a, true).expect("A parks, its tables kept in place");
+    // A's tables' chunk onto the last chunk backed: the chunk that lay
+    // there takes the bytes A's tables left.
+    let tables = a_slots.0[0] / per_chunk;
+    // The last chunk of state backed (chunk 0 is the null chunk).
+    let onto = committed.min(facts.state_chunks() + 1) - 1;
+    assert_ne!(tables, onto);
+    shell
+        .evacuate(&engine::chunk::Evacuation {
+            moves: vec![(tables, onto)],
+        })
+        .expect("the chunk moves under the kept park");
+
+    // At A's own refs, the new bytes: A's.
+    let (c_scratch, c_pair) = guest.places((program, "c"), &state);
+    let c_rings = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let refused = bind(&mut shell, a_slots.0.clone(), c_rings.1.clone(), &c_scratch, &c_pair, 4);
+    let why = refused.expect_err("an instance at A's refs overlaps A's kept tables where they moved");
+    assert!(
+        why.to_string().contains(&format!("instance {}", a.0)),
+        "refused naming A: {why}"
+    );
+    // In the chunk now lying on A's old bytes: free of A.
+    let displaced: Vec<u32> = a_slots.0.iter().map(|&r| onto * per_chunk + r % per_chunk).collect();
+    let (b_scratch, b_pair) = guest.places((program, "b"), &state);
+    let b = bind(&mut shell, displaced, c_rings.1, &b_scratch, &b_pair, 5)
+        .expect("B binds on the bytes A's tables left, no stale claim");
+
+    let (fresh, fresh_pair) = guest.places((program, "unparked"), &state);
+    shell
+        .rebind_program(
+            a,
+            engine_cuda::program::Slots {
+                instance: a_slots.0,
+                rings: a_slots.1,
+                scratch: fresh,
+                pair: fresh_pair,
+                pair_generation: 3,
+            },
+        )
+        .expect("A's unpark claims its moved tables");
+    let after = fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+    assert_eq!(after, before, "A answers as before the move");
+    assert_eq!(argmax(&mut shell, a), put, "A's epilogue puts what it put");
+    for instance in [a, b] {
+        shell
+            .close_program_instance(instance)
+            .expect("the instance closes");
+    }
+}
+
+/// A pair whose every member is parked while an evacuation moves its runs
+/// is laid again where they lie now: instance A parks (its pair's members
+/// all parked), the chunk holding the pair moves, and another chunk moves
+/// onto the bytes it left. B then binds at the same pair and taking, and A
+/// comes back at it; both fire and answer as A did before the move.
+/// Unmoved, the pair's tables would stand at the old bytes, another chunk's
+/// now, and the fires would read them.
+#[test]
+fn a_pair_whose_members_are_all_parked_is_laid_again_where_a_move_left_it() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-pair-relay", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4271).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![vec![13]];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let committed = segments * facts.segment_chunks;
+    let mut guest = crate::guest::Guest::of(&facts, committed);
+    let per_chunk = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.role == engine::chunk::SlotRole::Instance)
+        .expect("the load states the Instance shape")
+        .slots_per_chunk;
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let bind = |shell: &mut Shell,
+                slots: (Vec<u32>, Vec<engine::program::RingSlots>),
+                scratch: &engine::ScratchPlace,
+                pair: &engine::ScratchPlace| {
+        shell.bind_program(
+            program,
+            &[],
+            extents,
+            GeometryClass::Host,
+            PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            engine_cuda::program::Slots {
+                instance: slots.0,
+                rings: slots.1,
+                scratch: scratch.clone(),
+                pair: pair.clone(),
+                pair_generation: 1,
+            },
+        )
+    };
+    let attach = |instance| {
+        [Attached {
+            lane: 0,
+            lanes: 1,
+            instance,
+            adapter_only: false,
+        }]
+    };
+    // The cell the instance's epilogue put: what reads the pair's tables.
+    let put = |shell: &mut Shell, instance| {
+        let cell = shell
+            .program_instance(instance)
+            .expect("the instance settles")
+            .expect("the instance")
+            .take(0)
+            .expect("its channel reads")
+            .expect("its epilogue put a cell");
+        i32::from_le_bytes(cell[..4].try_into().expect("an i32 cell"))
+    };
+
+    let (scratch, pair) = guest.places((program, extents), &state);
+    let engine::ScratchPlace::Run { first, .. } = pair else {
+        panic!("a small guest's pair lies in a run of Instance slots: {pair:?}");
+    };
+    let a_slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let a = bind(&mut shell, a_slots.clone(), &scratch, &pair).expect("A binds");
+    let want = fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+    let wanted = put(&mut shell, a);
+
+    shell.park_program(a, false).expect("A parks: every member of its pair parked");
+    // The pair's chunk onto the last chunk of state backed, then another
+    // chunk onto the bytes it left: the old bytes are another chunk's.
+    let held = first / per_chunk;
+    let last = committed.min(facts.state_chunks() + 1) - 1;
+    let other = last - 1;
+    assert!(held != last && held != other, "the pair's chunk is not a test's spare");
+    shell
+        .evacuate(&engine::chunk::Evacuation { moves: vec![(held, last)] })
+        .expect("the pair's chunk moves while every member is parked");
+    shell
+        .evacuate(&engine::chunk::Evacuation { moves: vec![(other, held)] })
+        .expect("another chunk moves onto the bytes it left");
+
+    // B joins the pair at its taking; A comes back at it.
+    let (b_scratch, _) = guest.places((program, "b"), &state);
+    let b_slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let b = bind(&mut shell, b_slots, &b_scratch, &pair).expect("B binds at the pair's taking");
+    let got_b = fire(&mut shell, word, &tokens, &attach(b));
+    shell.drain().expect("the device drains");
+    let b_put = put(&mut shell, b);
+    let (a_scratch, _) = guest.places((program, "a again"), &state);
+    shell
+        .rebind_program(
+            a,
+            engine_cuda::program::Slots {
+                instance: a_slots.0,
+                rings: a_slots.1,
+                scratch: a_scratch,
+                pair: pair.clone(),
+                pair_generation: 1,
+            },
+        )
+        .expect("A comes back at the pair's taking");
+    let got_a = fire(&mut shell, word, &tokens, &attach(a));
+    shell.drain().expect("the device drains");
+    assert_eq!(got_b, want, "B's logits are A's before the move");
+    assert_eq!(got_a, want, "A's logits are its own before the move");
+    assert_eq!(b_put, wanted, "B's epilogue reads the pair where the move left it");
+    assert_eq!(put(&mut shell, a), wanted, "A's epilogue reads the pair where the move left it");
+    for instance in [a, b] {
+        shell
+            .close_program_instance(instance)
+            .expect("the instance closes");
+    }
+}
+
+/// An evacuation is all or nothing (`Engine::evacuate`): one whose last
+/// check fails moves nothing. Instance A's state chunk is evacuated, and
+/// the evacuation also names a channel whose slots cannot be spanned, the
+/// check that once ran after the copy and the table change. It is refused,
+/// and A's state lies where it lay, its bytes as they were; the same moves
+/// with no such channel then go through, the bytes with them, and A fires
+/// where they went.
+#[test]
+fn an_evacuation_refused_late_moves_nothing() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("guest-evacuation-atomic", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 4257).write(dir.path());
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let tokens: Vec<Vec<u32>> = vec![vec![7]];
+
+    let mut shell = shell(trace, &path);
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let committed = (segments * facts.segment_chunks).min(facts.state_chunks() + 1);
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let program = register(&mut shell);
+    let extents = Extents {
+        row_count: 1,
+        sampled_rows: 1,
+        query_len: 1,
+        ..Extents::default()
+    };
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
+    let (scratch, pair) = guest.places((program, extents), &state);
+    let engine::ScratchPlace::Run { first, slots } = scratch else {
+        panic!("a small guest's state lies in a run of Instance slots: {scratch:?}");
+    };
+    let refs: Vec<u32> = (first..first + slots).collect();
+    let bytes = state.instance_bytes();
+    let span = |shell: &Shell| {
+        shell
+            .guest_span(engine::chunk::SlotRole::Instance, &refs, bytes)
+            .expect("A's scratch spans")
+    };
+    let read = |shell: &mut Shell| {
+        shell.drain().expect("the device drains");
+        let mut out = vec![0u8; usize::try_from(bytes).expect("bytes")];
+        engine_cuda::device::alloc::copy_d2h(span(shell), &mut out).expect("the scratch reads");
+        out
+    };
+
+    let (instance, rings) = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let a = shell
+        .bind_program(
+            program,
+            &[],
+            extents,
+            GeometryClass::Host,
+            PortMask::NONE,
+            &[None],
+            &[engine::ChannelId(1)],
+            engine_cuda::program::Slots {
+                instance,
+                rings,
+                scratch: scratch.clone(),
+                pair,
+                pair_generation: 1,
+            },
+        )
+        .expect("A binds");
+    let attach = [Attached {
+        lane: 0,
+        lanes: 1,
+        instance: a,
+        adapter_only: false,
+    }];
+    fire(&mut shell, word, &tokens, &attach);
+    shell.drain().expect("the device drains");
+    // A's state, marked: what an evacuation copies, or leaves.
+    let marked: Vec<u8> = (0..bytes).map(|at| (at % 251) as u8 ^ 0x3C).collect();
+    engine_cuda::device::alloc::stage_raw(shell.stream(), span(&shell), &marked)
+        .expect("A's state is marked");
+
+    let per_chunk = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.role == engine::chunk::SlotRole::Instance)
+        .expect("an Instance shape")
+        .slots_per_chunk;
+    let held = first / per_chunk;
+    let free = committed - 1;
+    assert_ne!(held, free, "A's chunk and the free one differ");
+    let evacuation = engine::chunk::Evacuation {
+        moves: vec![(held, free)],
+    };
+    let before = span(&shell);
+    let refused = shell.evacuate_with(&evacuation, &[(vec![u32::MAX - 1], 64)]);
+    assert!(refused.is_err(), "a channel with no span refuses the evacuation");
+    assert_eq!(span(&shell), before, "the refused evacuation left the table");
+    assert_eq!(read(&mut shell), marked, "and A's bytes where they lay");
+
+    shell
+        .evacuate_with(&evacuation, &[])
+        .expect("the same moves go through alone");
+    assert_ne!(span(&shell), before, "A's state chunk moved");
+    assert_eq!(read(&mut shell), marked, "its bytes with it");
+    fire(&mut shell, word, &tokens, &attach);
+    shell.drain().expect("A fires where its state went");
+    shell.close_program_instance(a).expect("A closes");
+}

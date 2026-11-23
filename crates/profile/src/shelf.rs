@@ -12,11 +12,27 @@ use crate::registry::{File, Registry, Strict, Target};
 pub struct Shelf {
     pub backend: &'static str,
     /// `(path, text)` of each checked-in profile: `apple9.toml` is a family
-    /// file, `apple9/apple-m4-pro.toml` a device file of that family.
+    /// file, `apple9/apple-m4-pro.toml` a device file of that family, and
+    /// `<device>.measured.toml` a committed measured profile of a device
+    /// ([`MEASURED_SUFFIX`]): its stored measurements, as `pie tune export`
+    /// writes them.
     pub seeded: &'static [(&'static str, &'static str)],
     /// The profile a device no family file applies to runs, from its name
     /// and facts.
     pub derived: Option<fn(&str, &Facts) -> String>,
+}
+
+/// What a committed measured profile's file name ends in:
+/// `<id>.measured.toml`, at the top of the backend's `profiles/`, `<id>` the
+/// device's ([`id_of`]). It holds a device's stored measurements in the user
+/// file's format, each keyed ([`crate::Strict::Measured`]), apart from the
+/// hand-written decision profiles.
+pub const MEASURED_SUFFIX: &str = ".measured.toml";
+
+/// The file name a committed measured profile of `device` is filed under.
+#[must_use]
+pub fn measured_name(device: &str) -> String {
+    format!("{}{MEASURED_SUFFIX}", id_of(device))
 }
 
 /// The id a device's profiles are filed under: its name, lower-cased, with
@@ -114,6 +130,7 @@ impl Shelf {
                 }
             }
         }
+        layers.extend(self.committed(device));
         layers.extend(self.user(device, profiles));
         match now {
             Some(now) => registry.resolve_keyed(&layers, facts, now),
@@ -142,6 +159,7 @@ impl Shelf {
             }
             layers.push(seeded(path, text));
         }
+        layers.extend(self.committed(device));
         layers.extend(self.user(device, profiles));
         registry.read(&layers)
     }
@@ -150,7 +168,26 @@ impl Shelf {
         self.seeded
             .iter()
             .copied()
-            .filter(|(path, _)| !path.contains('/'))
+            .filter(|(path, _)| !path.contains('/') && !path.ends_with(MEASURED_SUFFIX))
+    }
+
+    /// Each committed measured profile ([`MEASURED_SUFFIX`]).
+    fn measured(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+        self.seeded
+            .iter()
+            .copied()
+            .filter(|(path, _)| path.ends_with(MEASURED_SUFFIX))
+    }
+
+    /// The committed measured profile of `device`, where pie carries one.
+    fn committed(&self, device: &str) -> Option<Candidate> {
+        let name = measured_name(device);
+        self.measured()
+            .find(|(path, _)| *path == name)
+            .map(|(path, text)| Candidate {
+                source: Source::Committed(path.to_string()),
+                text: text.to_string(),
+            })
     }
 
     fn devices(&self, family: &str) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
@@ -258,7 +295,26 @@ impl Shelf {
             }
             families.push((name, file));
         }
-        for (name, _) in self.seeded.iter().filter(|(n, _)| n.contains('/')) {
+        // A committed measured profile: at the top, filed by its device's
+        // id, its measurements alone, each keyed.
+        for (name, text) in self.measured() {
+            if name.contains('/') {
+                return Err(format!(
+                    "{name} is a measured profile, filed at the top as <device>{MEASURED_SUFFIX}"
+                ));
+            }
+            let file = registry
+                .parse(text, name, Strict::Measured)
+                .map_err(|e| e.to_string())?;
+            if file.tuned.rates == crate::fire::Rates::default() {
+                return Err(format!("{name} is a measured profile, and states no measurement"));
+            }
+        }
+        for (name, _) in self
+            .seeded
+            .iter()
+            .filter(|(n, _)| n.contains('/') && !n.ends_with(MEASURED_SUFFIX))
+        {
             let (dir, _) = name.split_once('/').expect("a device file");
             let filed = dir == DERIVED_DIR || families.iter().any(|(f, _)| stem(f) == dir);
             if name.matches('/').count() > 1 || !filed {
@@ -304,6 +360,47 @@ impl Shelf {
         }
         Ok(())
     }
+}
+
+/// What `pie tune export` writes of a device's stored measurements: the
+/// `[rates]` of `user` (the device's user file, read from `origin`) in
+/// committed form ([`crate::Strict::Measured`], filed as
+/// [`measured_name`]): each entry with its key, in a fixed order
+/// ([`crate::fire::Rates::ordered`]), no date, path or decision. An entry
+/// stored without a key, or a file naming no device it was measured on, is
+/// refused by name; so is a file that does not read, or states no
+/// measurement. The text reads back to the same entries.
+pub fn export(registry: &Registry, device: &str, user: &str, origin: &str) -> Result<String, String> {
+    let file = registry
+        .parse(user, origin, Strict::User)
+        .map_err(|e| e.to_string())?;
+    let rates = file.tuned.rates.ordered();
+    if rates == crate::fire::Rates::default() {
+        return Err(format!("{origin}: stores no measurement of `{device}`"));
+    }
+    if let Some(why) = rates.unkeyed() {
+        return Err(format!(
+            "{origin}: {why}: a committed profile takes keyed entries alone; a load of this pie \
+             measures it again under its key (or remove it), then export"
+        ));
+    }
+    let text = format!(
+        "api = 1\n\n# The stored measurements of {device}, each under its key: what a load of \
+         this device\n# takes where the user's own file stores none under a matching key. \
+         Written by\n# `pie tune export`; not edited by hand.\n{}\n[provenance]\nrates = \
+         \"pie tune export: {}'s stored measurements, each under its key\"\n",
+        rates.toml(),
+        device.replace('"', "'"),
+    );
+    let read = registry
+        .parse(&text, &measured_name(device), Strict::Measured)
+        .map_err(|e| format!("the export of {origin} would not read back: {e}"))?;
+    if read.tuned.rates != rates {
+        return Err(format!(
+            "the export of {origin} reads back other entries than it stores"
+        ));
+    }
+    Ok(text)
 }
 
 fn seeded(path: &str, text: &str) -> Candidate {

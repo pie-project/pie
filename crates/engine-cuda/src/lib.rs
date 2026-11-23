@@ -41,6 +41,7 @@ pub mod sizing;
 pub mod split_arm;
 pub mod staged_h2d;
 pub mod store;
+pub mod stored;
 pub mod synth;
 pub mod tap;
 pub mod top;

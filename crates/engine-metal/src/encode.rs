@@ -125,8 +125,34 @@ pub(crate) fn record_kernel(name: &str, seconds: f64) {
     row.1 += 1;
 }
 
+thread_local! {
+    /// The Metal source files fired on this thread since [`record_fired`]
+    /// started recording; `None` while not recording.
+    static FIRED: std::cell::RefCell<Option<std::collections::BTreeSet<&'static str>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts (`true`) or stops (`false`) keeping the source file of every fire
+/// a [`Sink`] encodes on this thread, and returns what was kept since the
+/// last start: what a measurement fired, its key's kernels
+/// ([`crate::stored::by`]).
+pub fn record_fired(on: bool) -> Vec<&'static str> {
+    FIRED.with(|fired| {
+        fired
+            .replace(on.then(std::collections::BTreeSet::new))
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    })
+}
+
 impl Encode for Sink<'_> {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
+        FIRED.with(|fired| {
+            if let Some(fired) = fired.borrow_mut().as_mut() {
+                fired.insert(fire.file);
+            }
+        });
         #[cfg(target_vendor = "apple")]
         {
             let pipeline = self

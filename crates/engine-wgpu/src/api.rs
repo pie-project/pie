@@ -25,6 +25,11 @@ pub struct DeviceBoot {
     /// `$PIE_HOME/profiles`, where a native user's adapter profiles live.
     pub profiles: Option<PathBuf>,
 
+    /// Whether the load times what no stored or committed profile states
+    /// under a matching key (`[engine] measure`, `pie serve --no-measure`):
+    /// skipped, each rate, curve and settle is served by the estimate, named.
+    pub measure: engine::rates::Measuring,
+
     /// Diagnostics: the chunk size the pool's recipe aims at, in place of
     /// the profile's (a small one cuts records into pieces).
     pub chunk_bytes: Option<u64>,
@@ -51,6 +56,7 @@ impl Default for DeviceBoot {
             backends: None,
             power_preference: crate::boot::DEFAULT_POWER_PREFERENCE.to_string(),
             profiles: None,
+            measure: engine::rates::Measuring::Time,
             chunk_bytes: None,
             #[cfg(feature = "test-limits")]
             max_buffer: None,
@@ -91,7 +97,20 @@ impl Host for Api {
         step: &Step,
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
-        gpu.fire_step(step, at, false, None)
+        let defers = defers(gpu, step);
+        let (ticket, mut step_pending) = gpu.fire_step(step, at, defers, None)?;
+        if defers {
+            // The passes land on their own and report the step; the next
+            // frame's forward reads their tokens on the device, so nothing
+            // here waits.
+            let wrote = std::mem::take(&mut step_pending.wrote);
+            let faulted = std::mem::take(&mut step_pending.faulted);
+            let fed = step_pending.fed.take();
+            let landed = step_pending.landed;
+            defer_attachments(gpu, step, at, &landed, wrote, faulted, fed)?;
+            step_pending.rows = Some(Vec::new());
+        }
+        Ok((ticket, step_pending))
     }
 
     fn run_prologues(
@@ -129,6 +148,29 @@ impl Host for Api {
                         step.lanes.len()
                     )));
                 };
+                #[cfg(feature = "wgpu")]
+                if lane.tokens.len() == 1
+                    && let Some(cell) = gpu.programs.token_feed(attachment.instance, lane_at)
+                {
+                    // A pass still on the queue wrote this lane's token; the
+                    // forward copies it in behind that pass.
+                    envelope.tokens[lane_index] = Some(vec![0; lane.tokens.len()]);
+                    envelope.feeds[lane_index] = Some(cell);
+                    if lane.mask.is_none() {
+                        match gpu.programs.envelope_mask(
+                            attachment.instance,
+                            lane.tokens.len(),
+                            lane_at,
+                        ) {
+                            Ok(mask) => envelope.masks[lane_index] = mask,
+                            Err(refused) => {
+                                envelope.refused(step, attachment, &refused.to_string(), faulted);
+                                continue 'attachments;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let resolved = gpu
                     .programs
                     .envelope_tokens(attachment.instance, lane.tokens.len(), lane_at)
@@ -162,6 +204,98 @@ impl Host for Api {
 
     fn guests(gpu: &mut Wgpu, step: &Step) -> EngineResult<Option<crate::landing::Guests>> {
         deferred_guests(gpu, step)
+    }
+}
+
+/// Whether `step`'s attachments can run behind its forward, all in one
+/// frame, without the host waiting for any of them: each reads its outputs
+/// on the device and records one stage.
+fn defers(gpu: &Wgpu, step: &Step) -> bool {
+    #[cfg(feature = "wgpu")]
+    {
+        gpu.sink.is_some()
+            && program_attachments(step).next().is_some()
+            && program_attachments(step).all(|attachment| gpu.programs.defers(attachment.instance))
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let _ = (gpu, step);
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn defer_attachments(
+    gpu: &mut Wgpu,
+    step: &Step,
+    at: engine::StepDone,
+    landed: &engine_gpu::serve::Landed,
+    wrote: Vec<engine::KvWrites>,
+    faulted: Vec<engine::LaneFault>,
+    fed: Option<engine_gpu::settle::FedCheck>,
+) -> EngineResult<()> {
+    #[cfg(feature = "wgpu")]
+    {
+        let Wgpu {
+            shell,
+            programs,
+            sink,
+            ..
+        } = gpu;
+        let shell = shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the wgpu engine has no model loaded".into()))?;
+        let passes: Vec<crate::program::DeferredPass<'_>> = program_attachments(step)
+            .map(|attachment| crate::program::DeferredPass {
+                instance: attachment.instance,
+                lanes: engine_gpu::api::attachment_lanes(attachment),
+                seats: (attachment.lane..attachment.lane + attachment.lanes.max(1))
+                    .map(|lane| {
+                        let mut seats: Vec<crate::guest::run::Readout<'_>> = shell
+                            .flight_seats(landed, lane)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(
+                                |(seat, at, width, dtype, output)| crate::guest::run::Readout {
+                                    output,
+                                    seat,
+                                    at,
+                                    width,
+                                    dtype,
+                                },
+                            )
+                            .collect();
+                        if let Some((seat, at, width, output)) = shell.pixels_row(landed, lane) {
+                            seats.push(crate::guest::run::Readout {
+                                output,
+                                seat,
+                                at,
+                                width,
+                                dtype: eta_ir::Dtype::Bf16,
+                            });
+                        }
+                        seats
+                    })
+                    .collect(),
+            })
+            .collect();
+        let done = sink.clone().map(|sink| engine_gpu::settle::Done {
+            at,
+            sink,
+            wrote,
+            lanes: u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
+            faulted,
+            meet: None,
+            fed,
+        });
+        programs
+            .fire_deferred(passes, shell.device(), done)
+            .map_err(refusal)
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        let _ = (gpu, step, at, landed, wrote, faulted, fed);
+        Err(Error::unsupported("wgpu", "a deferred guest pass"))
     }
 }
 
