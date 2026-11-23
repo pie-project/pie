@@ -150,6 +150,21 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     of a shared record is the record's `[run, cow]` with `cow != run`, the whole record.
     `Capabilities.windowed_state` (serde default false; `Serves.windowed_state`): a lane stating `window` to an
     engine without it is refused by name.
+    **Recipe.** An engine stating `windowed_state` takes `poem_compiler::chunk::plan_windowed(trace, budgets,
+    profile, &dyn RingLayout)` (`plan` keeps window lists for the others until the integration commit). The recipe
+    states the windowed layers (`WindowedRow { layer, rows, window, sinks, per_token }`, per_token the layer's K + V
+    bytes of one row) and asks the engine's required hook `RingLayout::ring_region(layers, &WindowBufferSlot {
+    tokens, bytes, rows })` for one ring region a record: `RingRegion { bytes, atom, placement, layer_bytes }`, cut
+    only between atoms, `layer_bytes` the per-layer shares summing to `bytes` (what the engine states as
+    `WindowedLayer.bytes`), `placement` either `Aligned(a)` (inside the state record, its first row, at offset 0
+    of the record's first slot, the record's rows aligned to a) or `ChunkStart` (its own fixed shape of one slot a
+    chunk, every piece starting at a chunk boundary; the record names the ring pieces first, its state pieces
+    after). The layout inside the region is the engine's: an engine indexing per-layer rings takes
+    `plain_rings(layers, align)` (W + S rows a layer, one after another, the offsets stated); Metal answers pages
+    laid like window-buffer slots on the slot grid, `(ceil(W/P) + 1)` pages of the buffer slot's bytes,
+    `ChunkStart`. The window buffer is `ChunkRecipe.windowed.buffer` (a `SlotLayout::List { tokens: T, window: None
+    }` of the kv page's T rows of every windowed layer, layer-major, each layer's runs in its rows); `recipe.list()`
+    never returns it, `recipe.fixed()` never returns the ring shape. A kv-only window model gets a record.
 22. **Host and disk tiers of shared shapes (fills in the tiers part of 12).** `ChunkFacts.host_chunks`: host chunks
     of `chunk_bytes`, ids from 0, none reserved, no ChunkTable (a host ref names its own place); any state shape
     (weights excepted) may open any host chunk; a host ref of shape s is `chunk * s.slots_per_chunk + index` at

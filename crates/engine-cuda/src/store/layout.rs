@@ -236,14 +236,14 @@ impl SlotShape {
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Cache(row) => Some((row, run.offset)),
-                    RowId::Rs(_) | RowId::Pool(_) => None,
+                    RowId::Rs(_) | RowId::Pool(_) | RowId::Ring => None,
                 })
                 .collect(),
             pools: runs
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Pool(row) => Some((row, run.offset)),
-                    RowId::Cache(_) | RowId::Rs(_) => None,
+                    RowId::Cache(_) | RowId::Rs(_) | RowId::Ring => None,
                 })
                 .collect(),
         })
@@ -976,7 +976,7 @@ impl FixedShape {
                         "an rs row in the fixed record: the rs buffer is a list shape",
                     ));
                 }
-                RowId::Pool(_) => {}
+                RowId::Pool(_) | RowId::Ring => {}
             }
         }
         Ok(FixedShape {
