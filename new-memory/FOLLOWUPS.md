@@ -1189,3 +1189,16 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F64
+
+The harmony chat decoding leaves channel headers in an OpenAI chat completion's `content`, on main (ecfd6ed57)
+as on the windowed-state line: gpt-oss-20b served greedy through `/v1/chat/completions` answers `content`
+`"<|channel|>analysis"` beside its `reasoning_content`, and, once it reaches its final channel,
+`"<|channel|>analysis<|start|>assistant<|channel|>final<|message|>**17 × 23** …"`. The reasoning is split
+out (`ThinkingDecoder` on `analysis_prefix`, `chat-template/src/harmony.rs:236`), but the tokens before its
+`<|message|>` stay in the content, and nothing strips the `<|end|><|start|>assistant<|channel|>final<|message|>`
+header that opens the final channel: the chat decoder is the generic one (`GenericChatDecoder`, :229), which
+knows only the stop ids. Open: a harmony chat decoder that drops every header a channel opens with (and keeps
+only the final channel's text as content), checked through compat-openai on gpt-oss-20b. Formatting only: the
+tokens drawn are the model's.
