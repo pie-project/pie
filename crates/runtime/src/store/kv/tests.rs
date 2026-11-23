@@ -94,6 +94,7 @@ fn tests_every_case() {
     idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted();
     on_the_host_the_lower_set_goes_first();
     a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host();
+    the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1365,6 +1366,35 @@ fn a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host() {
             }
         }
     }
+}
+
+/// The conform shape after earlier turns: the host full of fillers (15),
+/// B (10) idle on the device, A (20) too. B finds no room below (it may
+/// displace nothing keyed higher), so no demote moves A or anything else
+/// ahead of it: B is dropped first, by the reclaim that follows.
+fn the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves() {
+    let mut store = KvStore::new_with_swap(16, 4, 0, h(49));
+    store.set_page_size(16);
+    let (a, b, f) = (ProcessId::from_u128(57), ProcessId::from_u128(58), ProcessId::from_u128(59));
+    let (a_tokens, b_tokens, f_tokens) = (prompt(29, 4), prompt(30, 4), prompt(31, 4));
+    let keys = move |owner: Option<ProcessId>| match owner {
+        Some(o) if o == a => 20,
+        Some(o) if o == b => 10,
+        _ => 15,
+    };
+    sealed_and_gone(&mut store, &f_tokens, f);
+    let txn = store.prepare_demote(16, keys).unwrap().expect("the filler to the host");
+    store.commit_suspend(txn).unwrap();
+    assert_eq!(store.host_swap_available(), 0, "the host is full");
+    sealed_and_gone(&mut store, &b_tokens, b);
+    sealed_and_gone(&mut store, &a_tokens, a);
+    assert!(
+        store.prepare_demote(16, keys).unwrap().is_none(),
+        "B, the lowest, finds no room: nothing above it moves"
+    );
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), keys), 4, "B goes");
+    assert_eq!(on_device(&mut store, &b_tokens), 0);
+    assert_eq!(on_device(&mut store, &a_tokens), 4, "A stays");
 }
 
 /// Rows of one key and one tier set for every owner, as a test's table.

@@ -1248,8 +1248,13 @@ impl KvStore {
                     }
                 }
                 let free = self.host_pool.available() + self.disk_pool.available();
-                if free == 0 || pages.is_empty() {
+                if pages.is_empty() {
                     continue;
+                }
+                // The lowest group finds no room below: it is dropped (the
+                // caller's reclaim) before anything keyed above it moves down.
+                if free == 0 {
+                    return Ok(None);
                 }
                 pages.truncate(room.min(free));
                 tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
