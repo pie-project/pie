@@ -747,7 +747,8 @@ impl KvStore {
             sealed += u32::from(page_hash.is_some());
             pages.push((hashes, page_hash));
         }
-        self.table.commit_hashes(ws, first, pages)?;
+        let published = self.shares(ws);
+        self.table.commit_hashes(ws, first, pages, published)?;
         if sealed > 0 {
             // Passes waiting on these pages look again.
             self.note_cached();

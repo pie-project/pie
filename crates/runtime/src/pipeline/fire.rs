@@ -4137,7 +4137,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         });
         let reach = held + full.lanes[0].tokens.len() as u64;
         // Only on a set that shares: a later pass resumes from one only
-        // through its scope.
+        // through its scope. Asking on one that never did is refused at the
+        // ask; one whose scope moved past its rows keeps none.
         let checkpoints: Vec<u64> = match state {
             Some(_) if shares => checkpoint_rows(
                 &ctx.resources().get(&fwd)?.bindings.checkpoints,

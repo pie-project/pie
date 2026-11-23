@@ -1940,3 +1940,24 @@ fn a_release_with_nothing_in_flight_frees_its_pages_at_once() {
     store.release_working_set(ws, store.current_epoch());
     assert_eq!(store.available_pages(), before + 3, "free now, no retire asked");
 }
+
+/// The directory hears of a shared set's sealed pages, never a private
+/// set's: their keys are unmatchable, and their count would tell of it.
+#[test]
+fn only_a_shared_sets_sealed_keys_are_published() {
+    let mut store = KvStore::new(16, h(43));
+    let tokens: Vec<u32> = (0..32).map(|t| 4100 + t).collect();
+    let shared = store.create_shared_working_set();
+    commit_opaque(&mut store, shared, 2);
+    assert_eq!(seal(&mut store, shared, 0, &tokens), 2);
+    let private = store.create_working_set();
+    commit_opaque(&mut store, private, 2);
+    assert_eq!(seal(&mut store, private, 0, &tokens), 2, "it seals as any set does");
+    let published: HashSet<Hash256> = store.sealed_key_list(&store.node_ids()).into_iter().collect();
+    let keys = |store: &KvStore, ws| keys_ahead(store, ws, 0, &tokens);
+    let shared_keys = keys(&store, shared);
+    let private_keys = keys(&store, private);
+    assert!(shared_keys.iter().all(|key| published.contains(key)));
+    assert!(private_keys.iter().all(|key| !published.contains(key)));
+    assert_eq!(published.len(), 2, "the shared set's two pages, nothing more");
+}
