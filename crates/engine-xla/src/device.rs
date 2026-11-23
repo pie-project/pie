@@ -27,6 +27,14 @@ pub struct Program {
 /// owns them.
 pub struct Device {
     cache: Mutex<HashMap<[u8; 32], Arc<Program>>>,
+    /// A gate a program's disk load holds ([`Device::load_named`]).
+    loading: Mutex<HashMap<[u8; 32], Arc<Mutex<()>>>>,
+    /// Records dropped because their program did not load ([`Device::mend_record`]).
+    mended: std::sync::atomic::AtomicU64,
+    /// The loads a fire waits on, under way or waiting ([`Device::load_named`]):
+    /// loading behind serving starts none while any is ([`Device::wait_demand`]).
+    demand: Mutex<usize>,
+    quiet: std::sync::Condvar,
     /// Set once the warm ladder ran (`seal`): a program wanted after that is
     /// a serving fire missing the ladder.
     sealed: std::sync::atomic::AtomicBool,
@@ -105,6 +113,10 @@ impl Device {
             limit,
             held,
             cache: Mutex::new(HashMap::new()),
+            loading: Mutex::new(HashMap::new()),
+            mended: std::sync::atomic::AtomicU64::new(0),
+            demand: Mutex::new(0),
+            quiet: std::sync::Condvar::new(),
             sealed: std::sync::atomic::AtomicBool::new(false),
             misses: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::OnceLock::new(),
@@ -145,6 +157,10 @@ impl Device {
             limit: None,
             held: 0,
             cache: Mutex::new(HashMap::new()),
+            loading: Mutex::new(HashMap::new()),
+            mended: std::sync::atomic::AtomicU64::new(0),
+            demand: Mutex::new(0),
+            quiet: std::sync::Condvar::new(),
             sealed: std::sync::atomic::AtomicBool::new(false),
             misses: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::OnceLock::new(),
@@ -482,14 +498,16 @@ impl Device {
         file.file_name()?.to_str().map(str::to_string)
     }
 
-    /// Whether the disk cache holds the program `code` names.
+    /// Whether the disk cache holds the program `code` names: for one a
+    /// record names, its file as long as the record kept it.
     pub fn code_on_disk(&self, code: &Code) -> bool {
         match code {
             Code::Text(text) => self.on_disk(text),
-            Code::Cached { name, .. } => self
+            Code::Cached { name, file_len, .. } => self
                 .disk
                 .as_ref()
-                .is_some_and(|dir| dir.join(name).exists()),
+                .and_then(|dir| std::fs::metadata(dir.join(name)).ok())
+                .is_some_and(|meta| meta.len() == *file_len),
         }
     }
 
@@ -498,15 +516,47 @@ impl Device {
     pub fn prepare_code(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
         match code {
             Code::Text(text) => self.prepare(text, sig).map(Some),
-            Code::Cached { hash, name, len } => self.load_named(hash, name, *len, sig, false),
+            Code::Cached {
+                hash, name, len, ..
+            } => self.load_named(hash, name, *len, sig, false),
         }
     }
 
-    /// [`Device::load_parked`] of `code`.
+    /// [`Device::load_parked`] of `code`: what the first fire of its shape
+    /// waits on (the loader's load of it under way, or its own), said with
+    /// the wait.
     pub fn load_parked_code(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
+        let started = std::time::Instant::now();
+        let program = self.load_parked_inner(code, sig);
+        tracing::info!(
+            waited_ms = started.elapsed().as_secs_f64() * 1e3,
+            bytes = code.len(),
+            "xla a fire took its program from the disk cache"
+        );
+        program
+    }
+
+    fn load_parked_inner(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
         match code {
             Code::Text(text) => self.load_parked(text, sig),
-            Code::Cached { hash, name, len } => self.load_named(hash, name, *len, sig, true),
+            Code::Cached {
+                hash, name, len, ..
+            } => self.load_named(hash, name, *len, sig, true),
+        }
+    }
+
+    /// `code`'s program loaded from the disk cache behind serving (not a
+    /// fire's load, so not counted as one); `None` where its file is gone
+    /// or does not load.
+    pub fn load_behind(&self, code: &Code, sig: Signature) -> Result<Option<Arc<Program>>> {
+        match code {
+            Code::Cached {
+                hash, name, len, ..
+            } => self.load_named(hash, name, *len, sig, false),
+            Code::Text(text) => match self.cached_name(text) {
+                Some(name) => self.load_named(&code.hash(), &name, text.len(), sig, false),
+                None => Ok(None),
+            },
         }
     }
 
@@ -526,6 +576,22 @@ impl Device {
         sig: Signature,
         parked: bool,
     ) -> Result<Option<Arc<Program>>> {
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(hash) {
+            return Ok(Some(Arc::clone(hit)));
+        }
+        // A fire waits on this load: loading behind serving starts no other
+        // until it is done.
+        let _demand = parked.then(|| Demand::on(self));
+        // One load a program: a fire's load of one loading behind waits for
+        // it and takes it from the cache rather than loading it twice.
+        let gate = Arc::clone(
+            self.loading
+                .lock()
+                .expect("loading lock poisoned")
+                .entry(*hash)
+                .or_default(),
+        );
+        let _one = gate.lock().expect("a program's load gate poisoned");
         if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(hash) {
             return Ok(Some(Arc::clone(hit)));
         }
@@ -584,6 +650,68 @@ impl Device {
     pub fn trace_record(&self, scope: &str, key: &[u8; 32]) -> Option<Vec<u8>> {
         let dir = self.traces_dir(scope)?;
         std::fs::read(dir.join(hex(key))).ok()
+    }
+
+    /// [`Device::drop_trace_record`] of a record whose program would not
+    /// load, counted where the record was still kept, with a WARN naming it.
+    pub fn mend_record(&self, scope: &str, key: &[u8; 32], name: &str) {
+        let kept = self
+            .traces_dir(scope)
+            .is_some_and(|dir| dir.join(hex(key)).exists());
+        if !kept {
+            return;
+        }
+        tracing::warn!(
+            record = %hex(key),
+            scope,
+            file = %name,
+            "xla traced-fire record names a program that does not load from the disk cache: \
+             dropped with the file; its fire builds the program and the next load records it"
+        );
+        self.drop_trace_record(scope, key, name);
+        self.mended
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Waits while a fire waits on a load ([`Device::load_named`]): what
+    /// loads behind serving starts a load only when no fire waits on one.
+    pub fn wait_demand(&self) {
+        let mut demand = self.demand.lock().expect("demand lock poisoned");
+        while *demand > 0 {
+            demand = self.quiet.wait(demand).expect("demand lock poisoned");
+        }
+    }
+
+    /// Counts a record the ladder found its file gone or changed for.
+    pub fn note_mended(&self) {
+        self.mended
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The length of the disk cache's program file `name`, if it is there.
+    #[must_use]
+    pub fn cached_len(&self, name: &str) -> Option<u64> {
+        std::fs::metadata(self.disk.as_ref()?.join(name))
+            .ok()
+            .map(|meta| meta.len())
+    }
+
+    /// The records [`Device::mend_record`] dropped.
+    #[must_use]
+    pub fn records_mended(&self) -> u64 {
+        self.mended.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drops the record under fire `key` in `scope`, and the disk cache's
+    /// program file `name` it named: a program that would not load, which
+    /// the fire's trace builds and keeps again.
+    pub fn drop_trace_record(&self, scope: &str, key: &[u8; 32], name: &str) {
+        if let Some(dir) = self.traces_dir(scope) {
+            let _ = std::fs::remove_file(dir.join(hex(key)));
+        }
+        if let Some(dir) = self.disk.as_ref() {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
     }
 
     /// Keeps `record` under fire `key` in `scope` for later loads.
@@ -1310,6 +1438,10 @@ pub enum Code {
         name: String,
         /// The text's length.
         len: usize,
+        /// What compiling the text takes of the host (`compile_need`).
+        need: u64,
+        /// The program file's length as it was kept.
+        file_len: u64,
     },
 }
 
@@ -1330,6 +1462,15 @@ impl Code {
         }
     }
 
+    /// What compiling the program's text takes of the host.
+    #[must_use]
+    pub fn need(&self) -> u64 {
+        match self {
+            Code::Text(text) => compile_need(text),
+            Code::Cached { need, .. } => *need,
+        }
+    }
+
     #[must_use]
     pub fn text(&self) -> Option<&str> {
         match self {
@@ -1339,6 +1480,28 @@ impl Code {
     }
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A load a fire waits on, counted while it lasts ([`Device::wait_demand`]).
+struct Demand<'d> {
+    device: &'d Device,
+}
+
+impl<'d> Demand<'d> {
+    fn on(device: &'d Device) -> Demand<'d> {
+        *device.demand.lock().expect("demand lock poisoned") += 1;
+        Demand { device }
+    }
+}
+
+impl Drop for Demand<'_> {
+    fn drop(&mut self) {
+        let mut demand = self.device.demand.lock().expect("demand lock poisoned");
+        *demand -= 1;
+        if *demand == 0 {
+            self.device.quiet.notify_all();
+        }
+    }
 }

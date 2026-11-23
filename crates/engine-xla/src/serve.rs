@@ -267,6 +267,9 @@ pub(crate) struct Parked {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
+    /// Where it loads behind serving: (its ladder part's rank, the fire's
+    /// lanes, its rows), ascending (`warm::use_rank`).
+    order: (u8, u32, u32),
 }
 
 pub(crate) struct Deferred {
@@ -275,6 +278,26 @@ pub(crate) struct Deferred {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
+    rows: u32,
+    /// Set by the ladder as it traces the fire (`Parked::order`).
+    order: (u8, u32, u32),
+}
+
+/// The cached programs loading behind serving (`Shell::load_behind`): the
+/// loader's thread, stopped and joined before the shell's other fields drop.
+#[derive(Default)]
+pub(crate) struct Behind {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Behind {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// What a ladder fire's key traced to, kept for this build's later loads
@@ -282,17 +305,25 @@ pub(crate) struct Deferred {
 /// length, signature and probed values. A load whose fire finds its record
 /// and its program on disk builds no text.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct TraceRecord {
-    hash: [u8; 32],
-    name: String,
-    len: usize,
-    sig: crate::trace::Signature,
-    probed: Vec<ValueId>,
+pub(crate) struct TraceRecord {
+    pub(crate) hash: [u8; 32],
+    pub(crate) name: String,
+    pub(crate) len: usize,
+    /// The program file's length in the disk cache as it was kept: a file
+    /// of another length (or none) is no record's, and its fire is traced
+    /// and built again before ready.
+    pub(crate) file_len: u64,
+    /// What compiling the text takes of the host (`device::compile_need`).
+    pub(crate) need: u64,
+    pub(crate) sig: crate::trace::Signature,
+    pub(crate) probed: Vec<ValueId>,
 }
 
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
+    /// First, so it stops before anything it loads into drops.
+    behind: Behind,
     tuning: kernels_xla::tuning::Tuning,
     pad: crate::chip::Pad,
     /// `chip::Engine::seats`.
@@ -1231,6 +1262,7 @@ impl Shell {
             record_checked: false,
             records_hold: true,
             records_used: 0,
+            behind: Behind::default(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
@@ -1831,11 +1863,29 @@ impl Shell {
             return Ok(None);
         };
         let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
+            // Not loading from the disk cache though its file stood as it
+            // was kept at the ladder (corrupt within its length): nothing is
+            // built after ready, so the fire is refused; its record is
+            // dropped with the file, and the next load builds it before ready.
+            let file = match &parked.code {
+                crate::device::Code::Cached { name, .. } => {
+                    if let Some(scope) = self.trace_scope.as_deref() {
+                        self.device.mend_record(scope, &at, name);
+                    }
+                    name.clone()
+                }
+                crate::device::Code::Text(text) => {
+                    self.device.cached_name(text).unwrap_or_default()
+                }
+            };
             return Err(Fault::Program {
                 at: "serve::ladder",
-                why: "a program the warm ladder parked in the disk cache is gone from it: the \
-                      cache was cleared under the load"
-                    .to_string(),
+                why: format!(
+                    "the program record {} names does not load from the disk cache (file {file}): \
+                     nothing is built after ready, so this fire is refused; the record is \
+                     dropped and the next load builds the program before ready",
+                    crate::device::hex(&at)
+                ),
             });
         };
         self.probed.insert(at, parked.probed);
@@ -3330,10 +3380,26 @@ impl Shell {
                         hash: r.hash,
                         name: r.name,
                         len: r.len,
+                        need: r.need,
+                        file_len: r.file_len,
                     };
                     (code, r.sig, r.probed)
                 })
-                .filter(|(code, ..)| self.device.code_on_disk(code));
+                // a record whose file is gone or of another length: its fire
+                // is traced and built here, before ready
+                .filter(|(code, ..)| {
+                    let kept = self.device.code_on_disk(code);
+                    if !kept && let crate::device::Code::Cached { name, .. } = code {
+                        self.device.note_mended();
+                        tracing::warn!(
+                            record = %crate::device::hex(&full),
+                            file = %name,
+                            "xla traced-fire record's program file is gone from the disk cache or \
+                             not as it was kept: its fire is traced and built again before ready"
+                        );
+                    }
+                    kept
+                });
             // The load's first record is traced again and checked: the
             // scope's hash must cover all a program's text depends on, and a
             // record its text parts from stops the records for this load.
@@ -3372,20 +3438,6 @@ impl Shell {
                             );
                         }
                     }
-                    if let (Some(scope), Some(name)) =
-                        (scope.as_deref(), self.device.cached_name(&text))
-                    {
-                        let record = TraceRecord {
-                            hash: *blake3::hash(text.as_bytes()).as_bytes(),
-                            name,
-                            len: text.len(),
-                            sig: sig.clone(),
-                            probed: probed.clone(),
-                        };
-                        if let Ok(bytes) = serde_json::to_vec(&record) {
-                            self.device.keep_trace_record(scope, &full, &bytes);
-                        }
-                    }
                     (crate::device::Code::Text(text), sig, probed)
                 }
             };
@@ -3396,6 +3448,8 @@ impl Shell {
                     code,
                     sig,
                     probed,
+                    rows: descriptor.rows,
+                    order: (u8::MAX, 0, descriptor.rows),
                 });
             }
             // A fire returning the readout entries: its row count's readout
@@ -4970,7 +5024,7 @@ fn normal_exports(trace: &poem_ir::Trace, exports: &[poem_exec::feeds::ClassOutp
 
 /// The version of the traced-fire records' method: a change to what a
 /// record holds or how its scope is made bumps it.
-const TRACE_RECORDS: &str = "xla-traced-fires-1";
+const TRACE_RECORDS: &str = "xla-traced-fires-3";
 
 impl Shell {
     /// The scope a load's traced fires' records lie in: a hash of all a
@@ -4980,12 +5034,17 @@ impl Shell {
     /// chip, the pool's and the streamed weights' layouts, the staging and
     /// the compiler's flags. Not the pie version: an upgrade that changes
     /// none of these reuses every record.
-    /// This load's traced-fire records: the fires taken from them, and
-    /// whether they held (`false`: one parted from its trace, and the load
-    /// traced every fire).
+    /// This load's traced-fire records: the fires taken from them, whether
+    /// they held (`false`: one parted from its trace, and the load traced
+    /// every fire), and how many named a program that would not load (each
+    /// traced and built again).
     #[must_use]
-    pub fn trace_records(&self) -> (u64, bool) {
-        (self.records_used, self.records_hold)
+    pub fn trace_records(&self) -> (u64, bool, u64) {
+        (
+            self.records_used,
+            self.records_hold,
+            self.device.records_mended(),
+        )
     }
 
     /// The folder this load's traced-fire records lie in, if it keeps any.
