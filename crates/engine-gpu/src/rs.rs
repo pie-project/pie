@@ -31,6 +31,14 @@ pub enum Role {
     /// the value its delta rule writes, landed once, when the row is a
     /// fire's own.
     U,
+
+    /// A gated-delta row's per-head scalars (f32, `v_heads` log-gates then
+    /// `v_heads` key-norm inverses, `poem_compiler::rs::gdn_scalars_bytes`),
+    /// which the recipe's rs row lays after its corrected values. This
+    /// shell recomputes them from the row's `[b | a]` and keys: it lays the
+    /// plane (a beam's fork copies it with the rest) and neither writes nor
+    /// reads it.
+    Scalars,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -345,6 +353,14 @@ impl Layout {
                             *y,
                             at,
                             Some((v_heads * v_dim, Dtype::F32)),
+                        )?;
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::Scalars,
+                            *gates,
+                            at,
+                            Some((2 * v_heads, Dtype::F32)),
                         )?;
                     }
                     let elems = u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim);
