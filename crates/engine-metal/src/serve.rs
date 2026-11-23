@@ -1207,7 +1207,7 @@ impl PreparedLoad<'_> {
         // Each rung's rs scratch: a fire of the rung's tokens and lanes
         // replays its own rows and the rows its lanes carry in, which the
         // contract holds to the rung's tokens summed over the lanes
-        // ([`engine::fire::rung_rows`]): its own rows and as many again.
+        // ([`engine::fire::rung_holds`]): its own rows and as many again.
         let rs_room: Vec<u64> = rungs
             .iter()
             .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
@@ -1803,7 +1803,13 @@ impl Shell {
     /// The chunk pool as the runtime counts it.
     #[must_use]
     pub fn pool_chunk_facts(&self) -> engine::chunk::ChunkFacts {
-        self.pools.chunk_facts()
+        let mut facts = self.pools.chunk_facts();
+        // A load whose recurrent ops all run on the paged forms over an rs
+        // page table replays only the carried rows a rung counts
+        // (`engine::fire::lane_carried`); its fires' scratch counts so too.
+        facts.rs_compact = self.rs_layout.as_ref().is_some_and(|layout| layout.compact)
+            && self.rs_buffers.is_some();
+        facts
     }
 
     /// Backs every seat's run, its pages and its record: what a caller
@@ -5622,30 +5628,6 @@ impl Shell {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        // The rows the lanes carry in, counted as the runtime counts them
-        // toward the rung (`engine::fire::lane_carried`: a decode lane's
-        // none, its step reading them in place through its page table; a
-        // wider lane's all), are no more than the tokens of the rung the
-        // fire stages in (`engine::fire::rung_rows`). Where the device
-        // places a lane's rows only the engine counts them; a count past the
-        // rung is a wrong count, refused by name before anything is
-        // encoded. The rs scratch's own bound is checked at the seat.
-        let counted = rs_plans
-            .iter()
-            .zip(&rs_own)
-            .map(|(plan, &own)| engine::fire::lane_carried(own, plan.replay))
-            .sum::<u32>();
-        let rung_tokens = self.arena.current_tokens();
-        if rs_active && counted > rung_tokens {
-            return Err(Fault::program(
-                "serve::rs",
-                format!(
-                    "this fire's lanes carry {counted} recurrent rows into it toward the rung, \
-                     past the {rung_tokens} tokens of the rung it stages in \
-                     (engine::fire::rung_rows); the fire is refused and writes nothing"
-                ),
-            ));
-        }
         let rs_page_ints = self.inputs[self.arena.current()][0].rs_page_ints();
         let rs_pages = match (rs_active, self.rs_buffers.as_ref()) {
             (true, Some(buffers)) => {
@@ -5673,6 +5655,35 @@ impl Shell {
                 }
             })
             .collect();
+        // The fire's rows against what its rung's rs scratch holds, by the
+        // one function the runtime's rung choice also calls
+        // (`engine::fire::rung_holds` over the bounds this load states,
+        // `store::Layout`'s `act_replay`: own T, carried T, together 2T).
+        // A fire past them was cut or chosen wrong: refused by name before
+        // anything is encoded.
+        if rs_active {
+            let tokens = self.arena.current_tokens();
+            let rung = engine::RungReplay {
+                own_max: Some(tokens),
+                carried_max: Some(tokens),
+                total_max: Some(tokens.saturating_mul(2)),
+            };
+            let held = engine::ReplayRows::of_lanes(
+                rs_plans.iter().zip(&rs_own).map(|(plan, &own)| (own, plan.replay)),
+                compact,
+            );
+            if let Err(past) = engine::fire::rung_holds(&rung, held) {
+                return Err(Fault::program(
+                    "serve::rs",
+                    format!(
+                        "this fire's lanes carry {} recurrent rows into it ({} own, {} in its \
+                         rs scratch), past the {tokens} tokens of the rung it stages in: {past} \
+                         (engine::fire::rung_holds); the fire is refused and writes nothing",
+                        held.carried, held.own, held.scratch
+                    ),
+                ));
+            }
+        }
         let rows_ext = crate::rs::scratch_rows(rows, rs_ext_replay.iter().sum::<u32>());
         let rs_ext_replay_i32: Vec<i32> = rs_ext_replay.iter().map(|&n| n as i32).collect();
         // A beam lane whose group folds first replays from the fold: its

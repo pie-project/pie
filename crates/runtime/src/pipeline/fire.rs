@@ -759,7 +759,7 @@ fn device_rs_plan(
 /// A lane's rows in a fire, or a fire's (its lanes' summed): its own, and
 /// the recurrent rows it carries in unfolded, which earlier fires wrote and
 /// nothing has folded, and which it replays ahead of its own
-/// ([`::engine::fire::rung_rows`]).
+/// ([`::engine::fire::rung_holds`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FireRows {
     own: u32,
@@ -767,10 +767,11 @@ struct FireRows {
 }
 
 impl FireRows {
-    /// What a fire of these rows asks the activation rung for: a rung
-    /// holds its tokens of own rows and as many carried ones.
+    /// The rows a rung of the contract's floor ([`::engine::RungReplay::floor`])
+    /// must hold for these: its own and its carried rows each.
+    #[cfg(test)]
     fn ask(self) -> u32 {
-        ::engine::fire::rung_rows(self.own, self.carried)
+        self.own.max(self.carried)
     }
 
     fn of(lanes: impl IntoIterator<Item = FireRows>) -> FireRows {
@@ -806,7 +807,7 @@ fn lane_rows(start: u32, end: u32, frozen: Option<u32>) -> FireRows {
 /// here; it replays no more than the rows standing unfolded in its set
 /// then: those written past `frozen`, up to the set's written end, by
 /// fires that settled, and every row of its fires staged and still to
-/// settle ([`::engine::fire::rung_rows`], device geometry).
+/// settle ([`::engine::fire::rung_holds`], device geometry).
 fn device_lane_rows(
     own: u32,
     cursor: &crate::inferlet::host::working_set::Cursor,
@@ -877,56 +878,90 @@ fn piece_rows(
     )
 }
 
-/// Whether `engine`'s rung holds a decode lane's replayed rows too: where
-/// it states no bound of its own on a fire's replayed rows
-/// ([`::engine::FireLimits::replayed_rows`] 0, "no bound past each lane's
-/// rung"), a decode lane's replay rides the rung's replay scratch beside
-/// every other lane's, so a fire asks the rung for every lane's carried
-/// rows summed ([`::engine::fire::rung_rows`]); where it states one, a
-/// decode lane's are held to that bound by the step instead
-/// ([`::engine::fire::lane_carried`]).
-fn replay_in_rung(engine: usize) -> bool {
-    crate::engine::get_spec(engine).map_or(true, |spec| spec.limits.max_replayed_rows == 0)
+/// The rung a fire of `rows` asks, `replayed` every lane's carried rows (a
+/// decode lane's included): the rows of the smallest activation rung whose
+/// stated replay scratch holds it ([`::engine::fire::rung_holds`] against
+/// each rung's [`::engine::RungReplay`], its replay scratch rows counted as
+/// the load lays them, [`::engine::ReplayRows::of_sums`]), or its own and
+/// carried rows where the first rung that wide holds it already. Where the
+/// pool states no rung, one fire's tokens at the contract's floor. Refused
+/// by name, naming the bound that binds, where no rung holds it: before any
+/// step. Own rows past every rung are not this check's (a fire's capacity,
+/// refused where the pass is cut).
+fn replay_rung(
+    stores: &crate::store::registry::Stores,
+    engine: usize,
+    rows: FireRows,
+    replayed: u32,
+) -> Result<u32, String> {
+    let holds = crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
+        u32::try_from(spec.limits.max_forward_tokens).unwrap_or(u32::MAX)
+    });
+    let (mut rungs, compact) = stores.shared.as_ref().map_or((Vec::new(), false), |shared| {
+        let pool = shared.lock().unwrap();
+        (pool.rung_replays(), pool.rs_compact())
+    });
+    rungs.retain(|&(tokens, _)| tokens <= holds);
+    if rungs.is_empty() {
+        rungs.push((holds, ::engine::RungReplay::floor(holds)));
+    }
+    let count = ::engine::ReplayRows::of_sums(rows.own, rows.carried, replayed, compact);
+    let floor = rows.own.max(rows.carried);
+    let mut first = true;
+    let mut past = None;
+    for &(tokens, bound) in &rungs {
+        if tokens < floor {
+            continue;
+        }
+        match ::engine::fire::rung_holds(&bound, count) {
+            Ok(()) => return Ok(if first { floor } else { tokens }),
+            Err(why) => past = Some((tokens, why)),
+        }
+        first = false;
+    }
+    let (tokens, why) = match past {
+        Some(past) => past,
+        None => {
+            let &(tokens, bound) = rungs.last().expect("one rung at least");
+            match ::engine::fire::rung_holds(&bound, count) {
+                Ok(()) => return Ok(tokens),
+                Err(why) => (tokens, why),
+            }
+        }
+    };
+    if why.bound == ::engine::ReplayBound::Own {
+        return Ok(tokens);
+    }
+    Err(format!(
+        "pipeline: no activation rung holds this fire's replay: at the largest, of {tokens} \
+         tokens, it has {why}; fold what its lanes have written before they write more"
+    ))
 }
 
-/// What a fire of `rows` asks the rung for, `replayed` its every lane's
-/// replayed rows (a decode lane's included). On an engine whose rung holds
-/// them all ([`replay_in_rung`]) a rung of `T` tokens holds `T` own rows
-/// and as many again ("its own rows and as many again",
-/// [`::engine::fire::rung_rows`]): its replay scratch takes the fire's
-/// composed own rows and every lane's carried rows together, up to `2T`
-/// (Metal: `scratch_rows(own + carried)`, laid for `T + T`). Such a fire
-/// fits rung `T` where its own rows are at most `T` and its own and
-/// carried rows together at most `2T`: it counts as carrying half of them
-/// together (rounded up), so the rung asked ([`FireRows::ask`]), the
-/// largest rung's check ([`check_largest_rung`]) and a step's sum of its
-/// fires ([`crate::engine::FireRequest::carried`]) each hold it to that.
-/// `own` is every row the fire's lanes compute in it, never its lane count.
-fn rung_counted(rows: FireRows, replayed: u32, in_rung: bool) -> FireRows {
-    if !in_rung {
-        return rows;
-    }
-    let together = rows.own.saturating_add(rows.carried.max(replayed));
-    FireRows {
-        own: rows.own,
-        carried: together.div_ceil(2),
-    }
-}
-
-/// One piece of a host pass as its rung counts it ([`piece_rows`],
-/// [`rung_counted`]).
-fn piece_rung_rows(
+/// The widest rung a host pass's pieces ask, each piece as it is cut
+/// ([`replay_rung`]: its own rows and the rows it carries in, against every
+/// rung's stated bounds); refused by name where some piece no rung holds.
+/// The uncut pass's own rows are no piece's.
+fn pieces_rung(
+    stores: &crate::store::registry::Stores,
+    engine: usize,
     full: &crate::engine::FireRequest,
-    piece: &[Option<(u32, u32)>],
+    cuts: &[Vec<Option<(u32, u32)>>],
     frozen: &[Option<u32>],
-    folded_behind: bool,
-    in_rung: bool,
-) -> FireRows {
-    rung_counted(
-        piece_rows(full, piece, frozen, folded_behind),
-        piece_replayed(full, piece, frozen, folded_behind),
-        in_rung,
-    )
+    folds_each: bool,
+) -> Result<u32, String> {
+    let mut widest = 0u32;
+    for (at, piece) in cuts.iter().enumerate() {
+        let behind = folds_each && at > 0;
+        let rows = replay_rung(
+            stores,
+            engine,
+            piece_rows(full, piece, frozen, behind),
+            piece_replayed(full, piece, frozen, behind),
+        )?;
+        widest = widest.max(rows);
+    }
+    Ok(widest)
 }
 
 /// The buffered recurrent rows one piece of a host pass replays, summed
@@ -953,32 +988,6 @@ fn piece_replayed(
         .fold(0u32, u32::saturating_add)
 }
 
-/// The most carried rows a fire holds on `engine`: the tokens of the
-/// largest activation rung fires may take, whose replay scratch holds as
-/// many; what one fire holds where the pool states no rung.
-fn largest_rung(stores: &crate::store::registry::Stores, engine: usize) -> u32 {
-    let holds = crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
-        u32::try_from(spec.limits.max_forward_tokens).unwrap_or(u32::MAX)
-    });
-    stores.shared.as_ref().map_or(holds, |shared| {
-        shared.lock().unwrap().rung_for(u32::MAX).min(holds)
-    })
-}
-
-/// A fire carrying more recurrent rows than the largest rung's tokens is
-/// refused by name, before anything is submitted: no rung's replay scratch
-/// holds them. Up to there it raises the rung as a wider fire does.
-fn check_largest_rung(rows: FireRows, largest: u32) -> Result<(), String> {
-    if rows.carried <= largest {
-        return Ok(());
-    }
-    Err(format!(
-        "pipeline: a fire of {} own rows would carry {} recurrent rows unfolded into it (as \
-         its rung counts them), past the {largest} tokens of the largest activation rung, whose \
-         replay scratch holds as many; fold what its lanes have written before they write more",
-        rows.own, rows.carried
-    ))
-}
 
 fn group_fold(fold: &geometry::Fold, first: usize, frozen: u32, end: u32) -> rs::GroupFold {
     match fold.of(first) {
@@ -4515,10 +4524,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .iter()
             .map(|lane| Some((0, u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX))))
             .collect();
-        let in_rung = replay_in_rung(engine);
-        let carried = piece_rung_rows(&full, &whole, &frozen, false, in_rung).carried;
-        let largest = largest_rung(&stores, engine);
-        if let Err(refusal) = check_largest_rung(FireRows { own: 0, carried }, largest) {
+        // What no cut removes: the rows the pass carries in, checked with no
+        // own row (a piece as small as the rules allow); its own rows and
+        // carried rows together are each piece's, checked as it is cut.
+        let carried = piece_rows(&full, &whole, &frozen, false).carried;
+        let replayed = piece_replayed(&full, &whole, &frozen, false);
+        if let Err(refusal) = replay_rung(&stores, engine, FireRows { own: 0, carried }, replayed) {
             return Ok(Err(refusal));
         }
         let wanted = prefill_want(rows_total, engine).max(carried);
@@ -4546,16 +4557,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let pieces: Vec<FireRows> = cuts
             .iter()
             .enumerate()
-            .map(|(at, piece)| {
-                piece_rung_rows(&full, piece, &frozen, folds_each && at > 0, in_rung)
-            })
+            .map(|(at, piece)| piece_rows(&full, piece, &frozen, folds_each && at > 0))
             .collect();
-        for rows in &pieces {
-            if let Err(refusal) = check_largest_rung(*rows, largest) {
-                return Ok(Err(refusal));
-            }
-        }
-        let widest = pieces.iter().map(|rows| rows.ask()).max().unwrap_or(0);
+        let widest = match pieces_rung(&stores, engine, &full, &cuts, &frozen, folds_each) {
+            Ok(widest) => widest,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
         let (wanted, rung_ask) = if widest > wanted {
             // The wider ask stands before the narrower goes.
             let taken = taken.max(widest as usize);
@@ -4730,12 +4737,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // for the raise its pass funds, or fails with what the planner
             // said: it never waits on a rung that does not come. A piece
             // cut again once a raise landed is counted as it is cut now.
-            let counted =
-                piece_rung_rows(&full, piece, &frozen, folds_each && at > 0, in_rung);
-            if let Err(refusal) = check_largest_rung(counted, largest) {
-                return Ok(Err(refusal));
-            }
-            let width = counted.ask();
+            let counted = piece_rows(&full, piece, &frozen, folds_each && at > 0);
+            let width = match replay_rung(
+                &stores,
+                engine,
+                counted,
+                piece_replayed(&full, piece, &frozen, folds_each && at > 0),
+            ) {
+                Ok(width) => width,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
             if let Some(ask) = rung_ask.as_ref()
                 && let Err(refusal) = ask.wait(width).await
             {
@@ -6275,11 +6286,10 @@ async fn fire_device_geometry<C: FireContext>(
             }
         })
     }));
-    let counted = rung_counted(counted, replayed, replay_in_rung(ws.engine));
-    if let Err(refusal) = check_largest_rung(counted, largest_rung(&stores, ws.engine)) {
-        return Ok(Err(refusal));
-    }
-    let rows = counted.ask();
+    let rows = match replay_rung(&stores, ws.engine, counted, replayed) {
+        Ok(rows) => rows,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     let rung_ask = ask_rung(
         &stores,
         ws.engine,
@@ -11152,38 +11162,25 @@ mod unfolded_tests {
         assert_eq!(crate::store::shared::wanted_rows(ENGINE), 0);
     }
 
-    /// No rung's replay scratch holds more carried rows than the largest
-    /// rung's tokens: a fire carrying more is refused by name, before
-    /// anything is submitted, whatever its own rows.
+    /// At the contract's floor (a rung stating nothing holds its tokens of
+    /// own rows and as many carried) no rung's replay scratch holds more
+    /// carried rows than the largest rung's tokens: a fire carrying more is
+    /// refused by name, naming the bound, before anything is submitted;
+    /// own rows past it are another refusal's (the capacity of a fire).
     #[test]
     fn a_fire_carrying_past_the_largest_rung_is_refused_by_name() {
+        let (_, stores) = pool_with_rungs_of(vec![(256, 2), (2048, 8)]);
         let carrying = |carried| FireRows { own: 5, carried };
-        assert!(check_largest_rung(carrying(0), 2048).is_ok());
-        assert!(check_largest_rung(carrying(2048), 2048).is_ok());
-        let host = check_largest_rung(carrying(2049), 2048).unwrap_err();
+        assert_eq!(replay_rung(&stores, 56, carrying(0), 0), Ok(5));
+        assert_eq!(replay_rung(&stores, 56, carrying(2048), 2048), Ok(2048));
+        let host = replay_rung(&stores, 56, carrying(2049), 2049).unwrap_err();
         assert!(
-            host.contains("carry 2049 recurrent rows unfolded")
-                && host.contains("past the 2048 tokens of the largest activation rung")
+            host.contains("of 2048 tokens")
+                && host.contains("2049 carried recurrent rows")
                 && host.contains("fold what its lanes have written before they write more"),
             "{host}"
         );
-        // Own rows past it are another refusal's (the capacity of a fire).
-        assert!(
-            check_largest_rung(
-                FireRows {
-                    own: 4096,
-                    carried: 0
-                },
-                2048
-            )
-            .is_ok()
-        );
-        // The pool's largest rung is what is asked against.
-        let stores = pool_of_one_row_rs_pages();
-        let largest = largest_rung(&stores, 56);
-        let pool = stores.shared.as_ref().unwrap().lock().unwrap();
-        assert_eq!(largest, pool.rung_for(u32::MAX));
-        assert!(pool.rungs().last().is_none_or(|&last| largest <= last));
+        assert!(replay_rung(&stores, 56, FireRows { own: 4096, carried: 0 }, 0).is_ok());
     }
 
     /// A pass cut into pieces: one folding all it writes folds piece by
@@ -11227,45 +11224,126 @@ mod unfolded_tests {
         );
     }
 
-    /// A beam verifier's replay on an engine whose rung holds every lane's
-    /// replay (it states no bound of its own, `replayed_rows` 0): a rung of
-    /// `T` holds `T` own rows and as many again, own and carried together.
-    /// A w8-like fire (8 own rows, 1052 carried) fits the 1024 rung
-    /// (1060 <= 2048) and is served there. A w11-like replay whose composed
-    /// own rows (929, its beams' rows, not its 11 lanes) and 1144 carried
-    /// pass 2048 is refused by name before any step, however few its lanes.
-    /// On an engine stating its own bound a decode lane's replay counts
-    /// none toward the rung, as before.
+    /// The rung a fire asks is the smallest whose stated replay scratch
+    /// holds it, each bound counted by the engine crate's functions:
+    ///
+    /// - Metal-shaped (own T, carried T counted the `lane_carried` way, total
+    ///   2T of scratch rows; an rs scratch laying every carried row): a w8
+    ///   replay (8 decode lanes, 8 own rows, 1052 carried, a decode lane's
+    ///   counting none toward carried) is served at the 1024 rung; a w11
+    ///   replay of 929 composed own rows and 1144 carried (2073 scratch rows)
+    ///   is refused by name at the top rung, its total binding, though its
+    ///   lanes are few.
+    /// - CUDA-shaped (own T, carried the widest bucket's tokens, no total):
+    ///   both are held to their own and carried rows alone.
+    /// - Each bound binds alone, the refusal naming it.
     #[test]
-    fn a_beam_replay_asks_the_rung_for_its_own_and_carried_rows_together() {
-        let stores = pool_with_rungs(vec![(16, 1), (1024, 8)]);
-        let pool = stores.shared.as_ref().unwrap().lock().unwrap();
-        // w8: eight decode lanes on one set, their replay 1052 rows in all.
-        let w8 = rung_counted(FireRows { own: 8, carried: 0 }, 1052, true);
-        assert_eq!(w8.ask(), 530, "half of 1060 rows together");
-        assert!(pool.rung_for(w8.ask()) <= 1024 && pool.rung_for(w8.ask()) >= 530);
-        assert!(check_largest_rung(w8, 1024).is_ok(), "served at the 1024 rung");
-        // w11: 929 composed own rows and 1144 carried, 2073 together.
-        let w11 = rung_counted(FireRows { own: 929, carried: 0 }, 1144, true);
-        let refused = check_largest_rung(w11, 1024).unwrap_err();
-        assert!(refused.contains("929 own rows"), "{refused}");
-        drop(pool);
-        // The host pass counts every lane's replayed rows the same way: four
-        // decode lanes each replaying 300 rows.
-        let mut full = lane(400, 1);
-        for _ in 1..4 {
-            let more = full.lanes[0].clone();
-            full.lanes.push(more);
+    fn a_fire_s_rung_holds_its_stated_replay_bounds() {
+        use ::engine::RungReplay;
+        let metal = |tokens: u32| RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            total_max: Some(2 * tokens),
+        };
+        let rungs = vec![(256, 2), (1024, 8)];
+        let (_, stores) = pool_stating(rungs.clone(), vec![metal(256), metal(1024)], false);
+        // Eight decode lanes, each replaying its share of 1052 rows.
+        let w8 = FireRows { own: 8, carried: 0 };
+        assert_eq!(replay_rung(&stores, 56, w8, 1052), Ok(1024), "served at the 1024 rung");
+        let w11 = FireRows { own: 929, carried: 0 };
+        let refused = replay_rung(&stores, 56, w11, 1144).unwrap_err();
+        assert!(
+            refused.contains("of 1024 tokens") && refused.contains("2073 replay scratch rows"),
+            "{refused}"
+        );
+        // On a compact rs scratch a decode lane's rows take none of it.
+        let (_, compact) = pool_stating(rungs.clone(), vec![metal(256), metal(1024)], true);
+        assert_eq!(replay_rung(&compact, 56, w11, 1144), Ok(929));
+
+        // CUDA-shaped: carried held to the widest bucket's tokens, no total.
+        let cuda = |tokens: u32| RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(1024),
+            total_max: None,
+        };
+        let (_, cuda_stores) = pool_stating(rungs.clone(), vec![cuda(256), cuda(1024)], false);
+        assert_eq!(replay_rung(&cuda_stores, 56, w8, 1052), Ok(8));
+        assert_eq!(replay_rung(&cuda_stores, 56, w11, 1144), Ok(929), "no total bound: its own rows ask");
+
+        // Each bound alone.
+        let only = |bound: RungReplay| pool_stating(vec![(64, 1)], vec![bound], false).1;
+        let none = RungReplay::default();
+        let own = only(RungReplay {
+            own_max: Some(64),
+            ..none
+        });
+        assert!(replay_rung(&own, 56, FireRows { own: 65, carried: 0 }, 0).is_ok(), "own past: capacity's");
+        let carried = only(RungReplay {
+            carried_max: Some(64),
+            ..none
+        });
+        let why = replay_rung(&carried, 56, FireRows { own: 2, carried: 65 }, 65).unwrap_err();
+        assert!(why.contains("65 carried recurrent rows"), "{why}");
+        let total = only(RungReplay {
+            total_max: Some(64),
+            ..none
+        });
+        let why = replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 61).unwrap_err();
+        assert!(why.contains("65 replay scratch rows"), "{why}");
+        assert!(replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 60).is_ok());
+    }
+
+    /// A host pass whose uncut own rows and carried rows together pass the
+    /// widest rung's replay scratch, but whose pieces each fit, is served in
+    /// pieces: the whole-pass check counts no own row, each piece its own
+    /// as it is cut. A piece that no cut brings under a rung is refused by
+    /// name.
+    #[test]
+    fn a_pass_too_wide_uncut_is_served_in_pieces_that_fit() {
+        let metal = |tokens: u32| ::engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            total_max: Some(2 * tokens),
+        };
+        let (_, stores) = pool_stating(vec![(256, 2), (1024, 8)], vec![metal(256), metal(1024)], false);
+        // Folded through 100, 300 rows buffered since, 2000 more to write
+        // folding all: uncut, 2000 own and 300 carried pass 2048.
+        let full = lane(400, 2000);
+        let frozen = [Some(100)];
+        let whole = vec![Some((0, 2000))];
+        assert!(
+            replay_rung(
+                &stores,
+                56,
+                piece_rows(&full, &whole, &frozen, false),
+                piece_replayed(&full, &whole, &frozen, false)
+            )
+            .is_ok(),
+            "own rows past every rung are the cut's, not a refusal"
+        );
+        let cuts: Vec<Vec<Option<(u32, u32)>>> = host_cuts(&full, true, 512, 16, &[], 0)
+            .into_iter()
+            .map(|cut| vec![Some(cut)])
+            .collect();
+        assert!(cuts.len() > 1, "the pass is cut");
+        assert_eq!(
+            pieces_rung(&stores, 56, &full, &cuts, &frozen, true),
+            Ok(512),
+            "every piece fits: the widest asks its 512 rows, the 1024 rung, the first \
+             carrying the 300 rows beside them"
+        );
+        // A piece of eleven lanes, 929 own rows, replaying 1144: refused by
+        // name, whatever its lane count.
+        let mut eleven = lane(1244, 84);
+        for _ in 1..11 {
+            let more = eleven.lanes[0].clone();
+            eleven.lanes.push(more);
         }
-        let frozen = [Some(100); 4];
-        let whole = vec![Some((0, 1)); 4];
-        let stated = piece_rung_rows(&full, &whole, &frozen, false, false);
-        assert_eq!(stated, FireRows { own: 4, carried: 0 }, "a stated bound holds them");
-        let in_rung = piece_rung_rows(&full, &whole, &frozen, false, true);
-        assert_eq!(in_rung.ask(), 602, "1204 rows together");
-        assert_eq!(rung_counted(FireRows { own: 4, carried: 0 }, 1200, false).ask(), 4);
-        // Own rows past the rung are still the rung's own bound.
-        assert_eq!(rung_counted(FireRows { own: 900, carried: 0 }, 10, true).ask(), 900);
+        eleven.lanes[0].tokens = vec![0; 89];
+        let frozen = [Some(1140); 11];
+        let one = vec![(0..11).map(|at| Some((0, if at == 0 { 89 } else { 84 }))).collect()];
+        let refused = pieces_rung(&stores, 56, &eleven, &one, &frozen, false).unwrap_err();
+        assert!(refused.contains("of 1024 tokens"), "{refused}");
     }
 
     pub(super) fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
@@ -11281,6 +11359,16 @@ mod unfolded_tests {
     /// [`pool_with_rungs`], with the model it is registered as.
     pub(super) fn pool_with_rungs_of(
         act_chunks: Vec<(u32, u32)>,
+    ) -> (usize, crate::store::registry::Stores) {
+        pool_stating(act_chunks, Vec::new(), false)
+    }
+
+    /// [`pool_with_rungs_of`], each rung's replay scratch stated
+    /// (`act_replay`) and the load's rs scratch `rs_compact` or not.
+    pub(super) fn pool_stating(
+        act_chunks: Vec<(u32, u32)>,
+        act_replay: Vec<::engine::RungReplay>,
+        rs_compact: bool,
     ) -> (usize, crate::store::registry::Stores) {
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
@@ -11322,6 +11410,8 @@ mod unfolded_tests {
                 shape(2, SlotKind::Fixed { pieces: 1 }, SlotRole::State),
             ],
             act_chunks,
+            act_replay,
+            rs_compact,
             ..ChunkFacts::default()
         };
         let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();
