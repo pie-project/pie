@@ -135,8 +135,25 @@ pub(crate) fn permute_act(f: &mut Func, x: Val, groups: i64, per: i64) -> Result
 }
 
 /// `Σ_g factor[n, g] · (x_g · w_gᵀ)` for `xp: [m, G, group]`, `w: [n, G,
-/// group]` (exact bf16 values), `factor: f32 [n, G]`: f32 `[m, n]`.
-pub(crate) fn grouped_dot(f: &mut Func, xp: Val, w: Val, factor: Val) -> Result<Val, Error> {
+/// group]` (exact bf16 values), `factor: f32 [n, G]`: f32 `[m, n]`. With an
+/// affine `bias: f32 [n, G]` each group also adds `bias[n, g] · Σ_{k ∈ g}
+/// x[m, k]` in the same pass (the sum over a group is the same in `xp`'s
+/// order as in the row's).
+///
+/// XLA workaround: the offset joins the partials' per-group sum rather than
+/// being its own `[m, G] · [n, G]ᵀ` dot. As a dot, libtpu 0.0.48 (jax 0.11.2)
+/// miscompiles it inside gpt-oss's multi-lane decode: fused as a convolution
+/// over the bf16 biases with the in-place update of the logits it lands in,
+/// the head's rows come out wrong (up to 0.7 at rms 0.3), while the same
+/// program returning the offset's operands computes them right. Repro and
+/// status: FOLLOWUPS F61.
+pub(crate) fn grouped_dot(
+    f: &mut Func,
+    xp: Val,
+    w: Val,
+    factor: Val,
+    bias: Option<Val>,
+) -> Result<Val, Error> {
     // Fewer than 8 rows run as 8: a 1-row `[G, 1, n]` partial wastes the
     // sublanes and is slower than 8 rows (v6e).
     let rows = f.dims(xp)[0];
@@ -155,24 +172,21 @@ pub(crate) fn grouped_dot(f: &mut Func, xp: Val, w: Val, factor: Val) -> Result<
         dot_split(f, xp, w, 3, &[1], &[1], &[2], &[2])?
     };
     let fq = f.broadcast(factor, &[g, m, n], &[2, 0])?;
-    let p = f.mul(p, fq)?;
+    let mut p = f.mul(p, fq)?;
+    if let Some(b) = bias {
+        let xs = f.convert(xp, Elem::F32);
+        let xs = f.reduce(xs, &[2], Fold::Sum)?;
+        let xs = f.broadcast(xs, &[g, m, n], &[1, 0])?;
+        let bq = f.broadcast(b, &[g, m, n], &[2, 0])?;
+        let o = f.mul(xs, bq)?;
+        p = f.add(p, o)?;
+    }
     let out = f.reduce(p, &[0], Fold::Sum)?;
     Ok(if rows < m {
         f.slice_axis(out, 0, 0, rows)?
     } else {
         out
     })
-}
-
-/// `Σ_g bias[n, g] · Σ_{k ∈ g} x[m, k]`, the affine offset's share: f32
-/// `[m, n]` for `x: [m, G · group]`, `bias: f32 [n, G]`.
-pub(crate) fn offset_dot(f: &mut Func, x: Val, bias: Val) -> Result<Val, Error> {
-    let (m, k) = (f.dims(x)[0], f.dims(x)[1]);
-    let g = f.dims(bias)[1];
-    let xs = f.convert(x, Elem::F32);
-    let xs = f.reshape(xs, &[m, g, k / g])?;
-    let xs = f.reduce(xs, &[2], Fold::Sum)?;
-    Ok(f.dot_general(xs, bias, &[], &[], &[1], &[1], Elem::F32)?)
 }
 
 /// Group planes `w: [n, G, group]` ([`code_planes`] order) decoded to f32
@@ -217,12 +231,7 @@ pub(crate) fn contract_codes(
     let w = decode(f, w)?;
     let xp = permute_act(f, x, groups, per)?;
     if grouped(tuning, m, groups) {
-        let mut out = grouped_dot(f, xp, w, factor)?;
-        if let Some(b) = bias {
-            let o = offset_dot(f, x, b)?;
-            out = f.add(out, o)?;
-        }
-        return Ok(out);
+        return grouped_dot(f, xp, w, factor, bias);
     }
     let wv = materialize(f, w, factor, bias)?;
     let k = f.dims(wv)[1];
@@ -477,12 +486,7 @@ pub(crate) fn contract_native(
     // scale the `[G, m, n]` partials, so only a free convert feeds the MXU.
     if m <= tuning.grouped.max_rows {
         let xp = f.reshape(x, &[m, groups, k / groups])?;
-        let mut out = grouped_dot(f, xp, q, factor)?;
-        if let Some(b) = bias {
-            let o = offset_dot(f, x, b)?;
-            out = f.add(out, o)?;
-        }
-        return Ok(out);
+        return grouped_dot(f, xp, q, factor, bias);
     }
     let w = materialize(f, q, factor, bias)?;
     // mxfp4 decodes exactly into bf16; an affine weight is `s · c + b` in f32.

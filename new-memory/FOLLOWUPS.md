@@ -1201,3 +1201,19 @@ state the bound its static scratch shape holds (`rs_compact = false` where it la
 row; `carried_max` / `total_max` as laid) and check by `rung_holds` too, so nothing the runtime
 chose is refused after. Predates that branch (the runtime never counted decode lanes' replay for
 XLA); after the beam-line merge.
+
+## F61. libtpu miscompiles the affine offset as a dot in gpt-oss's multi-lane decode (found 2026-11-23)
+
+Served gptoss-20b-u4g64 answered garbage to concurrent requests and sense to one at a time. The
+u4g64 head's affine offset (`Σ_g bias[n, g] · Σ_{k∈g} x[m, k]`, a `dot_general` f32 [m, 45] ·
+[201088, 45]ᵀ at HIGHEST) came out wrong in every decode of 2+ lanes: XLA fuses it as a
+convolution over the bf16 biases with the add, the bf16 round trip and the in-place
+dynamic-update-slice into the aliased f32 [32, 201088] logits output. The same op is right
+standalone, in the 1-lane decode (where XLA makes it a reduce) and in the 2-lane prefill; the
+same program returning the offset's operands as extra outputs computes it right. kernels-xla
+`linear::quant::grouped_dot` now adds each group's offset in the partials' own per-group sum, with
+no dot of its own (a workaround, named there; as fast as the dot it replaces, ABBA); the engine test `a_batched_decode_answers_what_each_lane_answers_alone` holds every
+u4g64 mini's multi-lane decode to its single-lane runs. Repro (StableHLO only, two programs one op
+apart, a JAX runner; libtpu 0.0.48, jax 0.11.2): v6e host `/workspace/tpu-tools/repro`. Filing
+upstream is the user's call. Drop the workaround once a libtpu computes `decode2_dot.mlir` as it
+computes `decode2_reduce.mlir`.
