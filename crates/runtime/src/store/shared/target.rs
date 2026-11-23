@@ -1207,7 +1207,11 @@ mod tests {
         let moves = Arc::new(std::sync::Mutex::new(Vec::new()));
         let told = moves.clone();
         let mut grow = SharedGrow::new(model, ENGINE, shared.clone()).with_lane(move |op| {
-            told.lock().unwrap().push(format!("{op:?}"));
+            // The walk's own check of the engine's table after a move is no
+            // move the engine is told.
+            if !matches!(op, PoolOp::CheckTable(_)) {
+                told.lock().unwrap().push(format!("{op:?}"));
+            }
             Ok(())
         });
 
