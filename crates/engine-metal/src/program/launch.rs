@@ -1559,6 +1559,20 @@ impl Prepared {
     /// readout row. Returns whether the stage reads the seat; one it does
     /// not is let go here, and the session refuses a seat no stage reads.
     #[allow(clippy::too_many_arguments)]
+    /// Whether this stage reads output `name` at `lane` (what
+    /// [`Self::bind_output`] would bind), without binding it.
+    #[must_use]
+    pub fn reads_output(&self, name: &str, lane: u32) -> bool {
+        let Some(named) = self.names.iter().position(|named| named == name) else {
+            return false;
+        };
+        let slot = named + (self.output_slots * lane) as usize;
+        match self.reads.get(slot).copied().flatten() {
+            Some(_) => true,
+            None => matches!(self.reads.get(named).copied().flatten(), Some(_) if lane > 0 && lane < self.read_rows[named]),
+        }
+    }
+
     pub fn bind_output(
         &mut self,
         name: &str,

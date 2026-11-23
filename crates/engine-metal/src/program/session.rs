@@ -629,8 +629,21 @@ impl Session {
         rows_held: u32,
     ) -> Result<()> {
         let mut read = false;
+        // Every set but one a pass in flight reads: rebinding an airborne
+        // set's output would move the plane its epilogue, still to run on
+        // the device, reads (the address table is device memory), and a
+        // pass staged at depth two would point its predecessor's sampler
+        // at another lane's row of the forward. A set binds again when a
+        // pass stages in it.
+        let airborne: Vec<usize> = self.airborne.iter().map(|pass| pass.set).collect();
         for (set, prepared) in self.sets.iter_mut().enumerate() {
+            let flying = airborne.contains(&set);
             for prepared in prepared.iter_mut().flatten() {
+                if flying {
+                    // Whether the stage reads it, without writing.
+                    read |= set == 0 && prepared.reads_output(name, lane);
+                    continue;
+                }
                 let here = prepared.bind_output(name, lane, base, offset, dtype, width, stride, rows_held)?;
                 if set == 0 {
                     read |= here;
