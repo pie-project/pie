@@ -126,6 +126,7 @@ pub(super) fn run(
         read_bytes: 0,
         arena_runs_kernels,
         consume,
+        split: Split::default(),
     };
     executor.execute()?;
     executor.arena.finish()?;
@@ -179,6 +180,54 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
     Ok(last)
 }
 
+/// How a read is split across threads, learned from the walk's own reads.
+/// `k` threads take about `k * spawn + len / (k * rate)`: each costs a
+/// spawn on the reading thread, and the bytes divide among them. That is
+/// least at `k = sqrt(len / (rate * spawn))`, rounded, at most the
+/// machine's threads. `spawn` is timed once; `rate` is the fastest a
+/// thread has read so far (a first read is one thread's, to learn it).
+#[derive(Default)]
+struct Split {
+    spawn: std::cell::Cell<Option<f64>>,
+    rate: std::cell::Cell<f64>,
+}
+
+impl Split {
+    fn workers(&self, len: usize) -> usize {
+        let rate = self.rate.get();
+        if rate <= 0.0 {
+            return 1;
+        }
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let spawn = self.spawn();
+        let best = (len as f64 / (rate * spawn)).sqrt().round();
+        (best as usize).clamp(1, threads)
+    }
+
+    /// A read of `len` bytes by `workers` threads took `took`.
+    fn observe(&self, len: usize, workers: usize, took: std::time::Duration) {
+        let seconds = took.as_secs_f64();
+        if seconds > 0.0 && len > 0 {
+            let per_thread = len as f64 / workers.max(1) as f64 / seconds;
+            self.rate.set(self.rate.get().max(per_thread));
+        }
+    }
+
+    /// What one thread's spawn and join cost on this machine.
+    fn spawn(&self) -> f64 {
+        if let Some(spawn) = self.spawn.get() {
+            return spawn;
+        }
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {});
+        });
+        let spawn = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+        self.spawn.set(Some(spawn));
+        spawn
+    }
+}
+
 struct Walk<'a, 'p> {
     plan: &'a LoadPlan,
     index: PlanIndex,
@@ -193,6 +242,7 @@ struct Walk<'a, 'p> {
     read_bytes: u64,
     arena_runs_kernels: bool,
     consume: Option<&'p SourceLedger>,
+    split: Split,
 }
 
 /// AWQ's nibble order: the `j`th nibble of a word, from the low end, holds
@@ -908,16 +958,10 @@ impl Walk<'_, '_> {
             .open(path)
             .map_err(|err| invalid(format!("open {}: {err}", path.display())))?;
 
+        let started = std::time::Instant::now();
         #[cfg(unix)]
         {
-            // A read is split across threads in pieces of at least this:
-            // one thread copies out of the page cache at a few GB/s, below
-            // what the file system serves several at once.
-            const PARALLEL_READ_PIECE: usize = 4 << 20;
-            let workers = std::thread::available_parallelism()
-                .map_or(1, std::num::NonZero::get)
-                .min(16)
-                .min(len / PARALLEL_READ_PIECE);
+            let workers = self.split.workers(len);
             if workers > 1 {
                 use std::os::unix::fs::FileExt;
                 let chunk = len.div_ceil(workers);
@@ -938,6 +982,7 @@ impl Walk<'_, '_> {
                 for failure in failures {
                     failure.map_err(|err| invalid(format!("read {}: {err}", path.display())))?;
                 }
+                self.split.observe(len, workers, started.elapsed());
                 self.release_if_spent(&file, path, offset, span);
                 return Ok(());
             }
@@ -954,6 +999,7 @@ impl Walk<'_, '_> {
             file.read_exact(chunk)
                 .map_err(|err| invalid(format!("read {}: {err}", path.display())))?;
         }
+        self.split.observe(len, 1, started.elapsed());
         self.release_if_spent(&file, path, offset, span);
         Ok(())
     }

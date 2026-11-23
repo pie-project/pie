@@ -627,10 +627,13 @@ impl Weights {
                     Ok(ring) => {
                         eprintln!(
                             "engine-cuda: the weights cross by a pinned ring of 2 x {} KiB: the \
-                             copy rate measured {:.1} GB/s past a {:.1} us latency",
+                             link moves {:.1} GB/s from {} KiB copies past a {:.1} us latency; \
+                             a slot fills at {:.1} GB/s",
                             ring.slot_bytes() >> 10,
-                            ring.rate.bytes_per_second / 1e9,
-                            ring.rate.latency * 1e6,
+                            ring.rates.copy / 1e9,
+                            ring.rates.saturated >> 10,
+                            ring.rates.latency * 1e6,
+                            ring.rates.fill / 1e9,
                         );
                         Some(ring)
                     }
