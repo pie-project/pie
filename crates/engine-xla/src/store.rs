@@ -206,9 +206,11 @@ pub struct ReadoutRing {
     at: usize,
 }
 
-/// The bytes one adapter's largest plane takes in whole pool rows: a
-/// registered bank `[slots, ..]` holds one plane of `..` an adapter. 0 where
-/// the model registers none.
+/// The bytes one adapter's largest plane takes in whole tiles of pool rows
+/// (a maintenance program slices a slot by whole tiles: gpt-oss-20b's
+/// 2880-wide rank-16 plane, 180 rows, refused "sublane slicing size not
+/// multiple of chunk sublane size"): a registered bank `[slots, ..]` holds
+/// one plane of `..` an adapter. 0 where the model registers none.
 fn adapter_slot_bytes(trace: &Trace) -> u64 {
     trace
         .params
@@ -217,7 +219,7 @@ fn adapter_slot_bytes(trace: &Trace) -> u64 {
         .map(|p| {
             let cells: u64 = p.shape.get(1..).unwrap_or(&[]).iter().product();
             let bytes = cells * poem_compiler::arena::elem_bytes(p.dtype).unwrap_or(0);
-            bytes.div_ceil(ROW_BYTES) * ROW_BYTES
+            bytes.div_ceil(layout::TILE_BYTES) * layout::TILE_BYTES
         })
         .max()
         .unwrap_or(0)
@@ -551,7 +553,7 @@ impl Pools {
         // The own-row pages of the windowed state (CONTRACT-BC 19): a fire's
         // rows past its window buffer the ring cannot take whole while the
         // fire reads them, each laid as a window-buffer slot, after the
-        // staged inputs at a page's grain: a fire's pages and a page a lane.
+        // staged inputs at a page's grain.
         let (own_pages, page_rows) = match (layout.ring(), layout.window(), paging.window) {
             (Some(_), Some(window), Some(w)) => {
                 if layout.chunk_bytes % window.slot_bytes != 0 {
@@ -564,7 +566,12 @@ impl Pools {
                         ),
                     });
                 }
-                (w.fire_pages + w.lanes.max(1), window.slot_bytes / ROW_BYTES)
+                // a lane's own rows `r` span at most `ceil(r / T) + 1`
+                // pages, `r / T + 2`: the fire's rows over `T`, two a lane
+                (
+                    (w.fire_pages - 1) + 2 * w.lanes.max(1),
+                    window.slot_bytes / ROW_BYTES,
+                )
             }
             _ => (0, 1),
         };

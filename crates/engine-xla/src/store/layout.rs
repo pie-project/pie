@@ -360,6 +360,22 @@ impl Layout {
                 ),
             });
         }
+        // The rings' pages lie on the window buffer's grain: a chunk is whole
+        // window pages (gpt-oss-20b mini's 96 KiB page beside a 13 MiB chunk).
+        if let Some(ring) = shapes.iter().find(|s| matches!(s.kind, Kind::Ring { .. })) {
+            grain = lcm(grain, ring.slot_bytes);
+            if grain > MOST_CHUNK {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "a windowed pool whose window page of {} bytes shares no chunk size \
+                         under {} MiB with its plane runs (their least common multiple is \
+                         {grain} bytes)",
+                        ring.slot_bytes,
+                        MOST_CHUNK >> 20
+                    ),
+                });
+            }
+        }
         let kv_slot = shapes
             .iter()
             .find(|s| s.kind == Kind::Kv)
