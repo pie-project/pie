@@ -463,6 +463,96 @@ async fn acquire_grant<C: FireContext>(
     }
 }
 
+/// A beam search's finish of kv set `ws` from page `f0` by `order`
+/// (`KvStore::relist_beam_with`): once the set is out of any move (a
+/// suspend or a sweep in flight pins its old tail: waited on, never a
+/// refusal), and with each chosen page something else still reads copied
+/// first onto a page the planner grants (copy-on-write, the rule every
+/// shared page a set changes keeps), so no page ends up named twice.
+pub(crate) async fn relist_beam<C: FireContext>(
+    ctx: &mut C,
+    model: usize,
+    engine: usize,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    f0: u64,
+    order: &[u32],
+) -> Result<(), String> {
+    let stores = crate::store::registry::get(model, engine);
+    loop {
+        let needs = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.relist_beam_needs(ws, f0, order)
+        })
+        .map_err(|error| error.to_string())?;
+        let shared = match needs {
+            crate::store::kv::RelistNeeds::MoveEnd(ended) => {
+                let notified = ended.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.set_in_move(ws)
+                }) {
+                    notified.await;
+                }
+                continue;
+            }
+            crate::store::kv::RelistNeeds::Copies(shared) => shared,
+        };
+        let mut copies = Vec::new();
+        let mut grant = None;
+        if !shared.is_empty() {
+            let demand = crate::planner::Demand {
+                kv_pages: u32::try_from(shared.len()).unwrap_or(u32::MAX),
+                rs: crate::store::rs::RsUnits::default(),
+            };
+            let pid = ctx.process_id();
+            let Some(mut granted) = acquire_grant(ctx, pid, demand, false, || Ok(vec![demand])).await? else {
+                continue;
+            };
+            let pages: Vec<crate::store::kv::page_table::PhysicalKvPageId> =
+                granted.lend_kv().drain(..shared.len()).collect();
+            grant = Some(granted);
+            let shape = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.list_shape());
+            let copy = crate::scheduler::TierMove {
+                kind: crate::scheduler::TierKind::kv(shape),
+                tier: crate::scheduler::device_domain(engine),
+                out: true,
+                device: shared.iter().map(|page| page.0).collect(),
+                slots: pages.iter().map(|page| page.0).collect(),
+                source: None,
+            };
+            let copied = match crate::scheduler::copy_tier_tracked(engine, &copy) {
+                Ok(completion) => completion.wait().await.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = copied {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(pages);
+                });
+                return Err(format!("a beam's finish copying the chosen pages another reads: {error}"));
+            }
+            copies = shared.into_iter().zip(pages).collect::<Vec<_>>();
+        }
+        let done = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            kv.relist_beam_with(ws, f0, order, &copies)
+        });
+        drop(grant);
+        match done {
+            Ok(true) => return Ok(()),
+            // A move began while the copies ran: they go back, and the
+            // finish waits for its end.
+            Ok(false) => crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+            }),
+            Err(error) => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                });
+                return Err(error.to_string());
+            }
+        }
+    }
+}
+
 /// Awaits `ask` (a windowed planner ask) while finalizing the process's
 /// pending fires as each lands, `drained` told when any did (their window
 /// slots are back): never waits on the tail whole before the ask, since the
@@ -5545,16 +5635,20 @@ pub async fn pipeline_retract<C: FireContext>(
     }
     let refused = match ends {
         Err(why) => Some(why),
-        Ok(ends) => ends.iter().find_map(|end| {
-            let stores = crate::store::registry::get(end.model, end.engine);
-            match take_back(&stores, end) {
-                Ok(()) => {
-                    retract_cursor(&end.cursor, end.start);
-                    None
+        Ok(ends) => {
+            let mut refused = None;
+            for end in &ends {
+                let stores = crate::store::registry::get(end.model, end.engine);
+                match take_back(&stores, end).await {
+                    Ok(()) => retract_cursor(&end.cursor, end.start),
+                    Err(why) => {
+                        refused = Some(why);
+                        break;
+                    }
                 }
-                Err(why) => Some(why),
             }
-        }),
+            refused
+        }
     };
     if let Some(why) = refused {
         let mut failure = failure.lock().unwrap();
@@ -5567,12 +5661,26 @@ pub async fn pipeline_retract<C: FireContext>(
     Ok(Ok(()))
 }
 
+/// Returns once kv set `ws` is in no move, waiting on each move's end.
+async fn kv_out_of_move(stores: &crate::store::registry::Stores, ws: crate::store::kv::page_table::WorkingSetId) {
+    loop {
+        let ended = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.moves_ended());
+        let notified = ended.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.set_in_move(ws)) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 /// Takes `end`'s set back to where the retracted fires began writing it:
 /// its unaccepted run-ahead rows first (refused where the run-ahead bound
 /// accepted rows past the cut), then its recurrent state's buffer or its
 /// windows' head (refused where a fold reached past the cut), then its KV.
 /// Under the lagged fold none of these touches a folded row.
-fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<(), String> {
+async fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<(), String> {
     let cut = u32::try_from(end.start).unwrap_or(u32::MAX);
     end.cursor.lock().unwrap().take_back(cut)?;
     if let Some(rs) = end.rs {
@@ -5582,14 +5690,21 @@ fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<
             Err(error) => return Err(error.to_string()),
         }
     }
-    match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-        kv.truncate(end.kv, end.start)
-    }) {
-        Ok(())
-        | Err(crate::store::kv::KvStoreError::Table(
-            crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
-        )) => Ok(()),
-        Err(error) => Err(error.to_string()),
+    // A set in a move (a suspend or a sweep pins its pages) is cut once
+    // the move ends: cut under it, the pages it freed went back again as
+    // the move committed (the M1's beam line: a kv page released twice).
+    loop {
+        kv_out_of_move(stores, end.kv).await;
+        match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+            kv.truncate(end.kv, end.start)
+        }) {
+            Ok(())
+            | Err(crate::store::kv::KvStoreError::Table(
+                crate::store::kv::page_table::KvTableError::UnknownWorkingSet,
+            )) => return Ok(()),
+            Err(crate::store::kv::KvStoreError::MoveInFlight) => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 

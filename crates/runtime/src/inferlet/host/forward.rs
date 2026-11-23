@@ -1594,9 +1594,10 @@ impl ProcessCtx {
                 list.len()
             )));
         };
-        if let Err(error) = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
-            s.relist_beam(kv.id, u64::from(f0), order)
-        }) {
+        let order = order.to_vec();
+        if let Err(error) =
+            crate::pipeline::fire::relist_beam(self, kv.model, kv.engine, kv.id, u64::from(f0), &order).await
+        {
             return Ok(Err(format!("adopt-beam: kv: {error}")));
         }
         if let Some(rs_rep) = rs_rep {
@@ -1605,7 +1606,7 @@ impl ProcessCtx {
                     .table
                     .get(&Resource::<crate::store::rs::working_set::RsWorkingSet>::new_borrow(rs_rep))?
                     .clone();
-            if let Err(error) = stores.rs.lock().unwrap().relist_beam(rs.id, f0, page, order, end) {
+            if let Err(error) = stores.rs.lock().unwrap().relist_beam(rs.id, f0, page, &order, end) {
                 return Ok(Err(format!("adopt-beam: recurrent rows: {error}")));
             }
         }
