@@ -2633,6 +2633,12 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     /// Its own retake (`own`, single chunks) takes its chunks first; what
     /// is short is the rest of `need` (the head's need as the planner reads
     /// it, its own retake's single chunks among them), laid in what that

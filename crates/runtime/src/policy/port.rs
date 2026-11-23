@@ -525,6 +525,14 @@ impl Port {
                     proc.cached_tokens = Some(proc.cached_tokens.unwrap_or(0) + tokens);
                 }
             }
+            Event::Waiting(pid, tokens) => {
+                let id = schedule::plex_id(pid);
+                if let Some(proc) = self.procs.get_mut(&id)
+                    && proc.state == State::Waiting
+                {
+                    proc.cached_tokens = Some(tokens);
+                }
+            }
             Event::Started(pid) | Event::Resumed(pid) => {
                 let id = schedule::plex_id(pid);
                 if let Some(proc) = self.procs.get_mut(&id) {
