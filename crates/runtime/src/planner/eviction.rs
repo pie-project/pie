@@ -855,8 +855,8 @@ impl ResidencyPlanner {
             if !asked_again {
                 self.note_short(victims.head, deficit, host);
             }
-            // The policy asked with nothing in flight while the map of every
-            // process names moves for the head: a quiet wait too, said with
+            // The policy asked with nothing in flight while the map of what
+            // a step moves names moves for the head: a quiet wait too, said with
             // who those moves name and why this pass moved none of them
             // (the L40S at 3 GiB on f623134fc: kv resident 0, need_moves 7,
             // "no pick: the policy is asked", 185 s with no serve).
@@ -865,16 +865,16 @@ impl ResidencyPlanner {
                 && let Some(need) = shape.as_ref()
                 && self.with_inner(|inner| inner.nothing_in_flight())
             {
-                // Every process but the head: its own parts are no move
-                // made for it.
-                let everyone: Vec<ProcessId> = self.with_inner(|inner| {
-                    inner
-                        .procs
-                        .keys()
-                        .copied()
-                        .filter(|pid| *pid != victims.head_pid)
-                        .collect()
-                });
+                // Only moves a step can make: the victim set's members (the
+                // head's own parts, a process in a fire, one the finisher's
+                // gate or its request keeps, are no move made for it) and
+                // parked state's moves down. Read over every process, the
+                // map named residents no step moves (the M1 at beam x40:
+                // guest channels packed in one chunk beside firing
+                // processes'; the simulation's Metal mix, residents kept in
+                // their requests), and a wait on them was said as a bug.
+                let everyone: Vec<ProcessId> =
+                    victims.members.iter().map(|victim| victim.pid).collect();
                 let mut all = self.occupants(&everyone);
                 all.merge(self.parked_map(victims.head_pid));
                 // A named one whose move found no room below (or nothing to

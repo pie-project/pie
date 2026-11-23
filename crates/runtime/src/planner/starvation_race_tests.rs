@@ -9767,10 +9767,12 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
 /// The L40S at 3 GiB on f623134fc: kv resident 0, the stall's map naming 7
 /// moves for a restore head, the pass ending "no pick: the policy is
 /// asked", nothing in flight, 185 s with no serve. Such an end is a quiet
-/// wait and is counted and said with who the moves name (here a holder no
-/// rule lets the pass move).
+/// wait (a planner bug: no step found) only where the moves named are moves
+/// a step makes: here the map names a holder on its way into its process,
+/// which no rule lets the pass move, and the wait is no bug and not said as
+/// one (the M1 at beam x40: 53 such lines over residents no step moves).
 #[tokio::test(flavor = "current_thread")]
-async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait() {
+async fn a_wait_on_moves_no_step_makes_is_no_quiet_wait() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
     pool.free.lock().extend([0, 1, 2, 3]);
@@ -9808,8 +9810,13 @@ async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait
     }
     let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
     assert!(
-        planner.stats.quiet_waits.load(Ordering::Relaxed) > 0,
-        "counted and said as a quiet wait ({end:?})"
+        end.is_some_and(|end| end.contains("the policy is asked")),
+        "the policy asked ({end:?})"
+    );
+    assert_eq!(
+        planner.stats.quiet_waits.load(Ordering::Relaxed),
+        0,
+        "a holder no step moves: no quiet wait ({end:?})"
     );
 }
 
