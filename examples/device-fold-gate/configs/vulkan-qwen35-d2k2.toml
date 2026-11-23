@@ -9,7 +9,6 @@ source = "Qwen/Qwen3.5-0.8B"
 [engine]
 type = "vulkan"
 device = ["vulkan:0"]
-activation_dtype = "bfloat16"
 
 [runtime]
 frame_dispatch_depth = 2

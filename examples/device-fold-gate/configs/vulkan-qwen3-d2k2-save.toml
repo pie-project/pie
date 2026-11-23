@@ -9,7 +9,6 @@ source = "Qwen/Qwen3-0.6B"
 [engine]
 type = "vulkan"
 device = ["vulkan:0"]
-activation_dtype = "bfloat16"
 
 [engine.memory]
 # The save stages the set's pages on the host tier: give it room.
