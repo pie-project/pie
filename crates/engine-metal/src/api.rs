@@ -731,7 +731,9 @@ impl Engine for Metal {
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
-            windowed_state: false,
+            // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): a load
+            // with any states the rings and the window buffer in its facts.
+            windowed_state: shell.pool_ring().is_some(),
             rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: true,
             adapter_attachments: false,
