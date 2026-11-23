@@ -6,7 +6,11 @@
 //! from a checkpoint seeded by plane name over a fixed script of prefills
 //! and greedy decodes, and each step's logits hashed bit for bit. A change
 //! that must not move a logit (a memory layout, an address) is proven by
-//! the same hashes before and after it.
+//! the same hashes before and after it. Every model is served once first,
+//! so the cache's profile holds every product shape the set meets before
+//! any logit is hashed; the hashes are then taken under that profile held
+//! fixed, and the output names its md5 (`golden profile md5 <md5>`): a run
+//! under another profile may pick other kernels, which a check says.
 //!
 //! A dense product's kernel is chosen by its shape alone (a streaming
 //! skeleton for few rows, else cuBLASLt's first heuristic); nothing is timed
@@ -1476,7 +1480,20 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
         return;
     }
     let cache = cache_dir();
-    let mut lines = Vec::new();
+    // The measuring pass: every model served once, so each product shape any
+    // of them meets is measured and kept in the cache's profile before a
+    // logit is hashed. A model hashed while a later model still measured
+    // shapes it shares would hash picks the next run no longer makes.
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        let _ = served(&fixture, &cache);
+    }
+    // The profile the hashes are taken under, held fixed from here: its
+    // md5 names the picks, so a change of them shows as a new profile, not
+    // as a moved logit.
+    let profile = profile_md5(&cache);
+    let mut lines = vec![format!("golden profile md5 {profile}")];
+    println!("{}", lines[0]);
     for model in models() {
         let fixture = fixture(&model, &cache);
         // The warming serving: every product's algorithm picked and kept.
@@ -1510,7 +1527,17 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
             })
             .collect();
         let mut moved = Vec::new();
-        for line in &lines {
+        let wanted_profile = text
+            .lines()
+            .find_map(|line| line.strip_prefix("golden profile md5 "))
+            .unwrap_or("not stated");
+        if wanted_profile != profile {
+            eprintln!(
+                "golden: the profile the hashes were taken under is {profile}, the file's \
+                 {wanted_profile}: the picks may differ, and with them the logits"
+            );
+        }
+        for line in lines.iter().filter(|line| !line.starts_with("golden profile ")) {
             let words: Vec<&str> = line.split_whitespace().collect();
             let key = (words[1].to_string(), words[2].to_string());
             match want.get(&key) {
@@ -1523,6 +1550,50 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
         }
         assert!(moved.is_empty(), "logits moved:\n  {}", moved.join("\n  "));
     }
+}
+
+/// The md5 of the profile the probe's loads keep their measurements in
+/// (`knobs`: the cache's `profiles`), every file of it in path order, by
+/// `md5sum`; "none" where there is no file.
+fn profile_md5(cache: &Path) -> String {
+    let mut files = Vec::new();
+    let mut dirs = vec![cache.join("profiles")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return "none".to_string();
+    }
+    let mut bytes = Vec::new();
+    for file in &files {
+        bytes.extend(std::fs::read(file).unwrap_or_default());
+    }
+    let mut child = std::process::Command::new("md5sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("md5sum runs");
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .expect("md5sum's stdin")
+        .write_all(&bytes)
+        .expect("the profile reaches md5sum");
+    let out = child.wait_with_output().expect("md5sum answers");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("none")
+        .to_string()
 }
 
 /// The rows a page of the load's rs buffer holds: the rs list's tokens.
