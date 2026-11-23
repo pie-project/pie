@@ -260,7 +260,8 @@ struct Staged {
     pool_buf: u32,
 }
 
-fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid) -> Staged {
+/// `to`: each lane's folded index after the fire, which the fold reads.
+fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize]) -> Staged {
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
     let (pool_buf, _) = gpu.up(&laid.pool);
     let mut indptr = vec![0u32];
@@ -271,7 +272,10 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid) -> Staged {
     }
     let ring_lanes: Vec<i32> = lanes
         .iter()
-        .flat_map(|lane| [lane.folded as i32, lane.base as i32, lane.first as i32])
+        .zip(to)
+        .flat_map(|(lane, &to)| {
+            [lane.folded as i32, lane.base as i32, lane.first as i32, to as i32]
+        })
         .collect();
     let rows: usize = lanes.iter().map(|lane| lane.rows).sum();
     let mut positions = Vec::new();
@@ -316,6 +320,7 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid) -> Staged {
             slots: t(rs, laid.records.len(), 1, Dtype::I32),
             rows: g.r as u32,
             piece: PIECE as u32,
+            values_piece: PIECE as u32,
             pieces: PIECES as u32,
             keys: RING_AT as u32,
             values: (RING_AT + g.r * g.row / 2) as u32,
@@ -375,7 +380,8 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
         for (what, lanes, prefilling) in [("decode", decodes(), false), ("prefill", prefills(), true)] {
             let g = Geometry::of(hd, 64, lanes.len());
             let laid = lay(&g, &lanes, hd as u64);
-            let staged = stage(&mut gpu, &g, &lanes, &laid);
+            let folded: Vec<usize> = lanes.iter().map(|lane| lane.folded).collect();
+            let staged = stage(&mut gpu, &g, &lanes, &laid, &folded);
             let rows = staged.tables.rows as usize;
             let (q, qr) = gpu.up(&noise(hd as u64 + 3, rows * QH * hd));
             let qr: Vec<f64> = qr.iter().map(|x| f64::from(*x)).collect();
@@ -506,9 +512,10 @@ fn fold_jobs(
                 (table[buffered + (r - lane.first) / PAGE], (r - lane.first) % PAGE)
             }
         };
-        for r in lane.folded.max(to[l].saturating_sub(R))..to[l] {
+        // Rows a wider ring would take too: this ring drops them.
+        for r in lane.folded.max(to[l].saturating_sub(R + 5))..to[l] {
             let (unit, row) = source(r);
-            jobs.extend([unit as i32, row as i32, -1 - l as i32, (r % R) as i32]);
+            jobs.extend([unit as i32, row as i32, -1 - l as i32, r as i32]);
         }
         // The rows of the fire it leaves unfolded, into buffer slots of
         // their own from the slot holding row `to` on.
@@ -546,7 +553,7 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
     let to = [70, 64 + 40, 21, 70, 100];
     let g = Geometry::of(hd, 64, lanes.len());
     let laid = lay(&g, &lanes, 9);
-    let staged = stage(&mut gpu, &g, &lanes, &laid);
+    let staged = stage(&mut gpu, &g, &lanes, &laid, &to);
     let (jobs, moved) = fold_jobs(&lanes, &to, &laid);
     let most = (jobs.len() as u32 - 1) / ring::JOB_INTS + 3;
     let mut padded = jobs.clone();
@@ -636,7 +643,8 @@ fn a_ring_decode_costs_what_a_paged_window_does() {
     for (what, ringed, ring) in [("table", false, false), ("ring kernel, table", false, true), ("ring", true, true)] {
         let lanes = lanes(ringed);
         let laid = lay(&g, &lanes, 5);
-        let mut staged = stage(&mut gpu, &g, &lanes, &laid);
+        let folded: Vec<usize> = lanes.iter().map(|lane| lane.folded).collect();
+        let mut staged = stage(&mut gpu, &g, &lanes, &laid, &folded);
         if !ring {
             staged.pool.ring = None;
         }

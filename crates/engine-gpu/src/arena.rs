@@ -44,6 +44,11 @@ pub struct Rung {
     capacity: Vec<u32>,
     /// Where the rooms start, past the carve.
     rooms_at: u64,
+    /// The fire's own windowed rows' slots ([`crate::ring`]), past the
+    /// rooms: where they start (a unit short of their place at most, the
+    /// first slot on the next unit), and how many.
+    fire_at: u64,
+    fire_slots: u32,
     /// The carve and the rooms.
     bytes: u64,
 }
@@ -167,8 +172,26 @@ impl Rung {
             map,
             rooms,
             rooms_at,
+            fire_at: bytes,
+            fire_slots: 0,
             bytes,
         })
+    }
+
+    /// This rung with room for its fires' own windowed rows: the slots a
+    /// fire of its tokens and lanes takes, `slot_bytes` each, the first on
+    /// a `unit` (CONTRACT-BC 19: a fire's activation holds its own folded
+    /// rows' K/V for its reads).
+    fn with_fire_slots(&mut self, tokens_a_slot: u32, lanes: u32, slot_bytes: u64, unit: u64) {
+        // A lane's rows from a slot's first row: one slot more a lane.
+        let slots = self
+            .tokens
+            .div_ceil(tokens_a_slot.max(1))
+            .saturating_add(self.tokens.min(lanes));
+        let at = self.bytes.next_multiple_of(ALIGN);
+        self.fire_at = at;
+        self.fire_slots = slots;
+        self.bytes = (at + u64::from(slots) * slot_bytes + unit).next_multiple_of(ALIGN);
     }
 
     /// The carve and the rooms, aligned.
@@ -338,6 +361,27 @@ impl<B: Backend> Span<B> {
     pub fn base(&self, rung: usize) -> Result<u64> {
         let (_, end) = self.placed()?;
         Ok(end - self.rungs[rung].bytes)
+    }
+
+    /// Room in every rung for its fires' own windowed rows
+    /// ([`Rung::with_fire_slots`]); before the pool sizes the span.
+    pub fn with_fire_slots(&mut self, tokens_a_slot: u32, lanes: u32, slot_bytes: u64, unit: u64) {
+        for rung in &mut self.rungs {
+            rung.with_fire_slots(tokens_a_slot, lanes, slot_bytes, unit);
+        }
+    }
+
+    /// The tokens rung `rung`'s fires bring at most.
+    #[must_use]
+    pub fn rung_tokens(&self, rung: usize) -> u32 {
+        self.rungs.get(rung).map_or(0, |at| at.tokens)
+    }
+
+    /// Rung `rung`'s fire slots: the byte of the span's buffer they start
+    /// at (before the unit's rounding) and how many.
+    pub fn fire_slots(&self, rung: usize) -> Result<(u64, u32)> {
+        let at = &self.rungs[rung];
+        Ok((self.base(rung)? + at.fire_at, at.fire_slots))
     }
 
     /// A fire's slots at rung `rung`: its carve at its place and, where a

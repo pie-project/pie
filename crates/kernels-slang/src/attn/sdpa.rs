@@ -292,7 +292,7 @@ fn ring_params(op: &'static str, pool: &KvPool) -> Result<Vec<ArgValue>, Error> 
             "a ring's lane and record tables are i32".to_string(),
         ));
     }
-    if ring.pieces == 0 || ring.piece >= ring.pieces {
+    if ring.pieces == 0 || ring.piece >= ring.pieces || ring.values_piece >= ring.pieces {
         return Err(refuse(
             op,
             format!(
@@ -304,6 +304,7 @@ fn ring_params(op: &'static str, pool: &KvPool) -> Result<Vec<ArgValue>, Error> 
     Ok(vec![
         nonzero(op, "the ring's rows", ring.rows)?.arg(),
         ring.piece.arg(),
+        ring.values_piece.arg(),
         ring.pieces.arg(),
         ring.keys.arg(),
         ring.values.arg(),

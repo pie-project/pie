@@ -7,7 +7,33 @@ use crate::run::{Run, StructSlot};
 
 impl<B: Backend> DispatchAttn for Run<'_, B> {
     fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
-        self.attention(op).map_err(crate::error::kernel)
+        self.attention(op).map_err(crate::error::kernel)?;
+        self.fold_ring(op).map_err(crate::error::kernel)
+    }
+}
+
+impl<B: Backend> Run<'_, B> {
+    /// A windowed layer's fold into its ring (CONTRACT-BC 19, 21), after its
+    /// attention's last run of the fire reads it: the rows each lane folds
+    /// into its ring, the fire's rows it leaves unfolded into its buffer.
+    fn fold_ring(&self, op: &Attn) -> Result<(), kernels_slang::Error> {
+        let (Attn::Decode { cache, .. } | Attn::Prefill { cache, .. }) = op else {
+            return Ok(());
+        };
+        let pool = self.pool(*cache);
+        if pool.ring.is_none() {
+            return Ok(());
+        }
+        if self.run_index() + 1 < self.region_runs() {
+            return Ok(());
+        }
+        let Some((jobs, most)) = self.bindings().ring_jobs else {
+            return Err(kernels_slang::Error::Backend {
+                op: "attn.ring_fold",
+                detail: "a fire reading a ring staged no fold table".to_string(),
+            });
+        };
+        kernels_slang::attn::ring::fold(self.ctx, pool, jobs, most)
     }
 }
 

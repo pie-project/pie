@@ -1085,7 +1085,8 @@ where
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
-            windowed_state: false,
+            // Windowed layers are ring + buffer (CONTRACT-BC 19, 21).
+            windowed_state: shell.pools().rings().is_some(),
             // The prompt scans land the state as of rows inside a lane, a
             // record a snapshot in pieces (CONTRACT-BC 16).
             rs_snapshots: crate::rs::snapshots(shell.trace()),
@@ -2090,6 +2091,7 @@ impl<B: Host> Gpu<B> {
                 rs_snapshots: &lane.rs_snapshots,
                 refs: true,
                 windows: &lane.tables,
+                window: lane.window,
                 record: record_of[at].as_deref(),
                 record_run: run_of[at].as_deref(),
                 feed: feeds[at].as_ref(),

@@ -155,6 +155,11 @@ pub struct Handles {
     pub voxels: Option<VoxelHandles>,
     /// The fire's capture table, where a lane of it captures scores.
     pub capture: Option<Tensor>,
+    /// Where the load has windowed rows (CONTRACT-BC 19, 21): four ints a
+    /// lane (folded, base, first, folded after; `kernels_slang::Ring::lanes`), and the
+    /// fold's job table, bound whole (`kernels_slang::attn::ring::fold`).
+    pub ring_lanes: Tensor,
+    pub ring_jobs: Option<(Tensor, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -221,6 +226,10 @@ pub struct Fire<'a> {
     pub voxels: Option<VoxelFire<'a>>,
     /// The capture table (`Scored::table`), empty where no lane captures.
     pub capture: &'a [i32],
+    /// The windowed rows' lane table and fold jobs ([`crate::ring::Staged`]);
+    /// empty where the load has none.
+    pub ring_lanes: &'a [i32],
+    pub ring_jobs: &'a [i32],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,6 +288,9 @@ pub struct Laid {
     /// The capture table's ints, laid where the trace captures scores:
     /// `TABLE_INTS` for each of a fire's lanes at most.
     capture: Option<(u64, u64)>,
+    /// The windowed rows' lane table, and the fold's job table and the most
+    /// jobs it holds, where the load has windowed rows.
+    ring: Option<(u64, u64, u32)>,
     /// The store's bytes.
     total: u64,
 }
@@ -322,6 +334,7 @@ impl Laid {
         voxel: Option<VoxelSeat>,
         pieces: u32,
         capture: bool,
+        ring: bool,
         binding: u64,
     ) -> Laid {
         let pieces = pieces.max(1);
@@ -430,9 +443,16 @@ impl Laid {
             let ints = lanes * u64::from(kernels_slang::attn::score::TABLE_INTS);
             (take(ints * 4), ints)
         });
+        let ring = ring.then(|| {
+            let most = crate::ring::most_jobs(budget.max_tokens, budget.max_tokens);
+            let lanes_at = take(lanes * 4 * 4);
+            let jobs_at = take((1 + 4 * u64::from(most)) * 4);
+            (lanes_at, jobs_at, most)
+        });
         let total = at;
 
         Laid {
+            ring,
             rooms,
             total,
             tokens,
@@ -664,6 +684,49 @@ impl<B: Backend> Inputs<B> {
                 u32::try_from(fire.capture.len()).unwrap_or(u32::MAX),
                 self.laid.room(at)?,
             )?)
+        };
+        let ring_jobs = match self.laid.ring {
+            Some((lanes_at, jobs_at, most)) => {
+                if fire.ring_lanes.len() > 4 * lanes as usize
+                    || fire.ring_jobs.len() > 1 + 4 * most as usize
+                {
+                    return Err(Fault::Ceiling {
+                        what: "ints of a fire's windowed lane and fold tables",
+                        need: (fire.ring_lanes.len() + fire.ring_jobs.len()) as u64,
+                        have: 4 * u64::from(lanes) + 1 + 4 * u64::from(most),
+                    });
+                }
+                self.store.write(lanes_at, bytes_of(fire.ring_lanes))?;
+                let none = [0i32];
+                let jobs = if fire.ring_jobs.is_empty() {
+                    &none[..]
+                } else {
+                    fire.ring_jobs
+                };
+                self.store.write(jobs_at, bytes_of(jobs))?;
+                let room = self.laid.room(jobs_at)?;
+                Some((
+                    i32s(
+                        handles,
+                        &self.store,
+                        jobs_at,
+                        u32::try_from(room / 4).unwrap_or(u32::MAX),
+                        room,
+                    )?,
+                    most,
+                ))
+            }
+            None => None,
+        };
+        let ring_lanes = match self.laid.ring {
+            Some((lanes_at, _, _)) => i32s(
+                handles,
+                &self.store,
+                lanes_at,
+                (4 * lanes).max(1),
+                self.laid.room(lanes_at)?,
+            )?,
+            None => Tensor::new(kernels_slang::ABSENT, 0, 1, Dtype::I32),
         };
         let rs_tables = match (fire.rs_replay, fire.rs_commit) {
             (Some(replay), Some(commit)) => {
@@ -1193,6 +1256,8 @@ impl<B: Backend> Inputs<B> {
             inputs,
             voxels,
             capture,
+            ring_lanes,
+            ring_jobs,
         })
     }
 
@@ -1221,6 +1286,7 @@ impl<B: Backend> Inputs<B> {
                 .collect(),
             slot_ids: views.slot_ids,
             slot_of_row: views.slot_of_row,
+            ring_lanes: views.ring_lanes,
         }
     }
 }
@@ -1314,6 +1380,7 @@ mod tests {
             2,
             None,
             2,
+            true,
             true,
             1 << 30,
         );

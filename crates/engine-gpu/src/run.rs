@@ -207,6 +207,11 @@ pub struct FireBindings {
     /// a geometry input states (CONTRACT-BC 21); any other reads table 0.
     pub window_tables: Vec<(u32, usize)>,
 
+    /// The fold's job table of the fire's windowed rows and the most jobs
+    /// its grid takes (`kernels_slang::attn::ring::fold`), where the load
+    /// has them.
+    pub ring_jobs: Option<(Tensor, u32)>,
+
     pub tables: FireTables,
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
@@ -434,6 +439,11 @@ impl<'c, B: Backend> Run<'c, B> {
             }
         }
         split.layer = Some(layer);
+    }
+
+    /// The runs this fire cuts the current region into.
+    pub fn region_runs(&self) -> u32 {
+        self.windows.runs(self.place.region.get()).max(1)
     }
 
     pub fn window(&self) -> &'c Window {

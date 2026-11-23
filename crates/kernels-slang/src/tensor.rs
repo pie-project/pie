@@ -141,23 +141,26 @@ pub struct KvPool {
 }
 
 /// Where a windowed layer's rows lie beside its page table ([`KvPool::ring`]).
-/// The ring holds `rows` rows of the layer's keys, then as many of its
-/// values (each row `seq_stride` elements), row `r` at place `r % rows`, at
-/// u32 word `keys` (`values`) of piece `piece` of each lane's record, a
-/// record's piece `slots[lane * pieces + piece]` units of `slot_stride`
-/// words into the pool.
+/// The ring holds `rows` rows of the layer's keys and as many of its values
+/// (each row `seq_stride` elements), row `r` at place `r % rows`, at u32
+/// word `keys` of piece `piece` (`values` of piece `values_piece`) of each
+/// lane's record, a record's piece `slots[lane * pieces + piece]` units of
+/// `slot_stride` words into the pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ring {
-    /// Three i32 a lane: its folded index (keys below it lie in the ring),
+    /// Four i32 a lane: its folded index (keys below it lie in the ring),
     /// its buffer base (a page's first row: entry `i` of its table holds
-    /// rows `[base + i * page, base + (i + 1) * page)`) and its first row in
+    /// rows `[base + i * page, base + (i + 1) * page)`), its first row in
     /// the fire (keys from it on lie in the fire's own slots, the page
-    /// table's after the lane's buffer slots of the rows below it).
+    /// table's after the lane's buffer slots of the rows below it), and its
+    /// folded index after the fire (the fold's).
     pub lanes: Tensor,
     /// The fire's record table: `pieces` units a lane.
     pub slots: Tensor,
     pub rows: u32,
+    /// The record's pieces the keys and the values lie in.
     pub piece: u32,
+    pub values_piece: u32,
     pub pieces: u32,
     pub keys: u32,
     pub values: u32,

@@ -196,8 +196,9 @@ uint mask_byte(uint i) {
 // row of the fire in its window-buffer slots, entry `i` rows `[base + i T,
 // base + (i + 1) T)`; the fire's own rows in the fire's slots, laid as
 // buffer slots, the lane's first row of the fire at row 0 of its first.
-// `ring_lanes` holds three ints a lane: its folded index, its buffer base
-// (a slot's first row) and its first row of the fire. The page table holds,
+// `ring_lanes` holds four ints a lane: its folded index, its buffer base
+// (a slot's first row), its first row of the fire, and its folded index
+// after the fire (the fold's). The page table holds,
 // a lane, its buffer slots of rows below its first row of the fire, then
 // its fire slots. `ring_slots` holds the lane's record, `pieces` units a
 // lane (the fire's slot table).
@@ -240,11 +241,13 @@ struct Params {
     int min_keys;
 #endif
 #if defined(PIE_RING)
-    // The rows the ring holds; the record's piece the layer's ring lies in
-    // and the pieces a record takes; the ring's keys and values, in u32
-    // words past that piece's first; u32 words a record unit.
+    // The rows the ring holds; the record's pieces the layer's ring keys
+    // and values lie in and the pieces a record takes; the ring's keys and
+    // values, in u32 words past their piece's first; u32 words a record
+    // unit.
     uint ring_rows;
     uint ring_piece;
+    uint ring_piece_v;
     uint pieces;
     uint ring_k;
     uint ring_v;
@@ -280,12 +283,13 @@ struct Keys {
 Keys keys_of(int req) {
     Keys at;
 #if defined(PIE_RING)
-    at.folded = ring_lanes[3u * uint(req)];
-    at.base = ring_lanes[3u * uint(req) + 1u];
-    at.first = ring_lanes[3u * uint(req) + 2u];
-    uint rec = uint(ring_slots[uint(req) * params.pieces + params.ring_piece]) * params.slot_stride;
-    at.ring_k = 2u * (rec + params.ring_k);
-    at.ring_v = 2u * (rec + params.ring_v);
+    at.folded = ring_lanes[4u * uint(req)];
+    at.base = ring_lanes[4u * uint(req) + 1u];
+    at.first = ring_lanes[4u * uint(req) + 2u];
+    uint rec_k = uint(ring_slots[uint(req) * params.pieces + params.ring_piece]) * params.slot_stride;
+    uint rec_v = uint(ring_slots[uint(req) * params.pieces + params.ring_piece_v]) * params.slot_stride;
+    at.ring_k = 2u * (rec_k + params.ring_k);
+    at.ring_v = 2u * (rec_v + params.ring_v);
 #else
     at.folded = 0;
     at.base = 0;

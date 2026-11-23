@@ -687,10 +687,14 @@ pub struct Seated<'a, B: Serve> {
     /// its seat's runs in the pool.
     pub refs: bool,
 
-    /// The lane's window list tables (CONTRACT-BC 21): each window list's
-    /// shape and its slot refs in its own token order, 0 where trimmed.
-    /// Read where `refs` holds; a list it names not is seat-addressed.
+    /// The lane's tables (`Lane::tables`): the window buffer's, its slot
+    /// refs from its window fold's base (CONTRACT-BC 19, 21). Read where
+    /// `refs` holds.
     pub windows: &'a [(engine::chunk::ShapeId, Vec<u32>)],
+
+    /// How the lane's windowed layers fold this fire (`Lane::window`);
+    /// `None` on a seat-addressed lane, which folds every row it brings.
+    pub window: Option<engine::fire::WindowFold>,
 
     /// The lane's record, one fixed slot ref a piece, the side it writes
     /// (the copy-on-write side where the runtime names two).
@@ -731,6 +735,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             rs_snapshots: &[],
             refs: false,
             windows: &[],
+            window: None,
             record: None,
             record_run: None,
             feed: None,
@@ -1367,20 +1372,14 @@ impl<B: Serve> Shell<B> {
                 .context()
                 .div_ceil(rs_tokens.max(1))
                 .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-        }) + rows
-            .windows
-            .iter()
-            .map(|w| {
-                let per = u32::try_from(chunk / w.bytes.max(1)).unwrap_or(1).max(1);
-                asked.context().div_ceil(w.tokens.max(1)).div_ceil(per)
-            })
-            .sum::<u32>();
-        // The most pages a lane's table takes: the narrowest slot's.
-        let table_pages = rows
-            .windows
-            .iter()
-            .map(|w| asked.context().div_ceil(w.tokens.max(1)))
-            .fold(asked.pages_per_slot, u32::max);
+        }) + rows.buffer.map_or(0, |b| {
+            let per = u32::try_from(chunk / b.bytes.max(1)).unwrap_or(1).max(1);
+            asked.context().div_ceil(b.tokens.max(1)).div_ceil(per)
+        });
+        // The most pages a lane's table takes: its context's, of the kv
+        // page or the window buffer's (as many rows a slot), and as many
+        // fire slots past them.
+        let table_pages = asked.pages_per_slot + 2 * u32::from(rows.buffer.is_some());
         let least = Paging {
             pages: u64::from(asked.pages_per_slot),
             ..asked
@@ -1476,6 +1475,7 @@ impl<B: Serve> Shell<B> {
                 voxel_seat,
                 rows.pieces,
                 capture,
+                rows.buffer.is_some(),
                 binding,
             )
         };
@@ -1704,6 +1704,17 @@ impl<B: Serve> Shell<B> {
                 least,
                 &tuning,
             )?;
+            // A fire's own windowed rows lie in slots of its activation
+            // span, laid as the window buffer's (CONTRACT-BC 19).
+            let mut span = span;
+            if let Some(buffer) = rows.buffer {
+                span.with_fire_slots(
+                    buffer.tokens,
+                    budgets.tokens.max_lanes,
+                    buffer.bytes,
+                    crate::store::layout::gcd(rows.chunk_bytes, buffer.bytes),
+                );
+            }
             // A capturing lane's row is as wide as the load's context, in its
             // pages: the widths the span lays its rows at.
             let class_outputs = poem_exec::feeds::class_outputs(
@@ -2636,19 +2647,10 @@ impl<B: Serve> Shell<B> {
         )?
         .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
         .with_guests(B::CHANNEL_CELLS)?;
-        let layout = rows
-            .windows
-            .iter()
-            .enumerate()
-            .try_fold(layout, |layout, (k, w)| {
-                layout.with_window(
-                    k,
-                    w.bytes,
-                    w.window,
-                    w.tokens,
-                    asked.context().div_ceil(w.tokens.max(1)),
-                )
-            })?;
+        let layout = match rows.buffer {
+            Some(buffer) => layout.with_buffer(buffer.bytes, asked.pages_per_slot)?,
+            None => layout,
+        };
         layout.seats_within(total.saturating_sub(act_chunks.last().map_or(0, |&(_, c)| c)))?;
         let pages =
             u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total - unindexed);
@@ -5688,9 +5690,8 @@ impl<B: Serve> Shell<B> {
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
-        // Each window list's tables, a lane each, by the fire's page tables.
-        let mut window_tables: Vec<Vec<Vec<u32>>> =
-            vec![Vec::with_capacity(lanes.len()); self.pools.tables().len()];
+        // Each lane's windowed rows, where the load has them.
+        let mut ring_lanes: Vec<crate::ring::Seat> = Vec::new();
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -5860,42 +5861,88 @@ impl<B: Serve> Shell<B> {
                     Some((lane.slot, u32::try_from(pages).unwrap_or(u32::MAX))),
                 )?
             }));
-            for (at, &paged) in self.pools.tables().iter().enumerate() {
-                let Some(k) = paged.window() else {
-                    continue;
-                };
-                let shape = crate::store::layout::window_shape(k);
-                let named = seated
-                    .windows
-                    .iter()
-                    .find(|(id, _)| *id == shape)
-                    .map(|(_, refs)| refs.as_slice())
-                    .filter(|_| seated.refs);
-                let table = match named {
-                    _ if seated.kv_less => Vec::new(),
-                    Some(refs) => self.pools.list_pages(paged, refs, None)?,
-                    None if seated.refs => {
+            // The lane's windowed rows (CONTRACT-BC 19, 21): its fold, and
+            // its window-buffer slots from the table's base. A seat-addressed
+            // lane folds every row it brings, its buffer its seat's run.
+            if self.pools.rings().is_some() && seated.kv_less {
+                // A kv-less lane carries no attention rows: its rows land in
+                // its fire slots, read by nothing past the fire.
+                ring_lanes.push(crate::ring::Seat {
+                    folded: have,
+                    fold: 0,
+                    base: have,
+                    first: have,
+                    rows: row.rows,
+                    buffer: Vec::new(),
+                    record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
+                    keeps: false,
+                });
+            } else if self.pools.rings().is_some() {
+                let tokens = self.pools.paging().page_size.max(1);
+                let window = match (seated.window, seated.refs) {
+                    (Some(window), _) => window,
+                    (None, true) => {
                         return Err(program(
                             "serve::stage",
                             format!(
-                                "lane {source} names its slots by ref and no table of window \
-                                 list {shape}"
+                                "lane {source} names its slots by ref and states no window \
+                                 fold on a load with windowed layers"
                             ),
                         ));
                     }
-                    None => {
-                        let tokens = self.pools.paging_of(paged).page_size.max(1);
-                        let pages = (u64::from(have) + u64::from(row.rows))
-                            .div_ceil(u64::from(tokens))
-                            .max(1);
-                        self.pools.list_pages(
-                            paged,
-                            &[],
-                            Some((lane.slot, u32::try_from(pages).unwrap_or(u32::MAX))),
-                        )?
-                    }
+                    (None, false) => engine::fire::WindowFold {
+                        base: (have + row.rows) / tokens * tokens,
+                        fold: engine::fire::FoldLen::Host(row.rows),
+                        lineage: engine::fire::Lineage::Set,
+                    },
                 };
-                window_tables[at].push(table);
+                let folded = if seated.refs { seated.folded } else { have };
+                let engine::fire::FoldLen::Host(fold) = window.fold else {
+                    return Err(program(
+                        "serve::stage",
+                        format!(
+                            "lane {source} folds its windowed layers by a count its program \
+                             makes on the device, which this load's rings do not take"
+                        ),
+                    ));
+                };
+                let end = have + row.rows;
+                let to = folded.saturating_add(fold);
+                // The slots a seat's table names: of the rows read from it
+                // and of the fire's rows left unfolded.
+                let high = end.max(to);
+                let pages = if high > window.base {
+                    (high - window.base).div_ceil(tokens)
+                } else {
+                    0
+                };
+                let named = seated
+                    .windows
+                    .iter()
+                    .find(|(id, _)| *id == crate::store::layout::WINDOW)
+                    .map(|(_, refs)| refs.as_slice());
+                let buffer = match named {
+                    Some(refs) if seated.refs => {
+                        self.pools.list_pages(crate::store::Paged::Buffer, refs, None)?
+                    }
+                    _ if seated.refs => Vec::new(),
+                    _ => self.pools.list_pages(
+                        crate::store::Paged::Buffer,
+                        &[],
+                        Some((lane.slot, window.base / tokens, pages)),
+                    )?,
+                };
+                ring_lanes.push(crate::ring::Seat {
+                    folded,
+                    fold,
+                    base: window.base,
+                    first: have,
+                    rows: row.rows,
+                    buffer,
+                    // The lane's entry of the fire's record table.
+                    record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
+                    keeps: true,
+                });
             }
 
             // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
@@ -6105,28 +6152,110 @@ impl<B: Serve> Shell<B> {
         };
         self.pools.admit(demand)?;
 
+        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
+        // The lanes whose class captures, compacted in lane order: a key row
+        // each, and a page row each of those whose program reads pages.
+        let scored = Scored::of(composition.lanes().iter().map(|row| {
+            let captures = self.captures(row.class as usize);
+            let pages = captures
+                && lanes[row.source as usize]
+                    .reads
+                    .iter()
+                    .any(|name| name == SCORE_PAGES);
+            (captures, pages)
+        }));
+        let (readout_rows, readout_layout) = readout_table(
+            &composition,
+            lanes,
+            &self.readouts,
+            &scored,
+            |class| self.readout_for(class),
+            |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
+        )?;
+        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
+        let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        if readouts > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for",
+                need: readouts,
+                have: readouts_ceiling,
+            });
+        }
+        let fire_rows = FireRows {
+            tokens: u64::from(rows),
+            lanes: u64::from(lane_count),
+            patches: u64::from(composition.patch_rows()),
+            images: u64::from(composition.images()),
+            voxels: u64::from(composition.voxel_widest()),
+            clips: u64::from(composition.clips()),
+            readouts,
+        };
+        // The narrowest rung that holds the fire: its carve at its fixed
+        // place under the span's end.
+        // Rows carried: the recurrent rows a fire replays, and the windowed
+        // rows its lanes fold from their buffers (CONTRACT-BC 19: a fire
+        // carries at most its rung's tokens).
+        let window_carried: u32 = ring_lanes
+            .iter()
+            .filter(|seat| seat.keeps)
+            .map(|seat| seat.first.saturating_sub(seat.folded))
+            .sum();
+        let rung = self.span.rung_of(
+            fire_rows,
+            if rs_active { rows_ext - rows } else { 0 }.max(window_carried),
+        );
+        // The fire's windowed rows (CONTRACT-BC 19, 21): its own rows in
+        // its rung's fire slots, read and folded as the ring kernels say.
+        let ring = self.stage_rings(&ring_lanes, rung)?;
+        if let Some(staged) = &ring {
+            let most = crate::ring::most_jobs(self.span.rung_tokens(rung), self.span.rung_tokens(rung));
+            let jobs = u32::try_from(staged.jobs.first().copied().unwrap_or(0)).unwrap_or(0);
+            if jobs > most {
+                return Err(Fault::Ceiling {
+                    what: "rows a fire folds into its rings and buffers, its rung's own rows and \
+                           as many carried",
+                    need: u64::from(jobs),
+                    have: u64::from(most),
+                });
+            }
+        }
+        let page_size_u32 = self.pools.paging().page_size;
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let mut geometries = Vec::with_capacity(self.page_tables);
         for (at, &paged) in self.pools.tables().iter().enumerate() {
             geometries.push(match paged {
                 crate::store::Paged::List => kv::geometry_with(&paging, &seats, &table_refs)?,
-                crate::store::Paged::Window(_) => {
-                    let refs: Vec<&[u32]> = window_tables[at].iter().map(Vec::as_slice).collect();
-                    let list = self.pools.paging_of(paged);
-                    // A fire of kv-less lanes reads no geometry.
-                    let list = if kv_free {
-                        Paging {
-                            page_size: list.page_size,
-                            pages_per_slot: paging
-                                .pages_per_slot
-                                .saturating_mul((paging.page_size / list.page_size.max(1)).max(1)),
-                            ..paging
-                        }
-                    } else {
-                        list
+                // The window buffer's table as the ring kernels read it: each
+                // lane's buffer slots of its carried rows, then its fire
+                // slots; every row of the fire written to its fire slot.
+                crate::store::Paged::Buffer => {
+                    let _ = at;
+                    let staged = ring.as_ref();
+                    let lanes = seats.len();
+                    let mut geometry = kv::Geometry {
+                        indptr: staged.map_or_else(|| vec![0; lanes + 1], |s| s.indptr.clone()),
+                        indices: staged.map_or_else(Vec::new, |s| s.indices.clone()),
+                        last_page_len: vec![narrow(u64::from(page_size_u32)); lanes],
+                        kv_len: seats
+                            .iter()
+                            .map(|seat| narrow(u64::from(seat.have) + u64::from(seat.rows)))
+                            .collect(),
+                        write_page: staged.map_or_else(Vec::new, |s| s.write_page.clone()),
+                        write_offset: staged.map_or_else(Vec::new, |s| s.write_offset.clone()),
                     };
-                    kv::geometry_with(&list, &seats, &refs)?
+                    // Kv-less lanes write no windowed row: their rows point at
+                    // the first fire slot, never read.
+                    if geometry.write_page.len() < rows as usize {
+                        let filler = geometry.indices.first().copied().unwrap_or(0);
+                        geometry.write_page.resize(rows as usize, filler);
+                        geometry.write_offset.resize(rows as usize, 0);
+                    }
+                    if geometry.indptr.len() < lanes + 1 {
+                        let last = geometry.indptr.last().copied().unwrap_or(0);
+                        geometry.indptr.resize(lanes + 1, last);
+                    }
+                    geometry
                 }
             });
         }
@@ -6282,7 +6411,6 @@ impl<B: Serve> Shell<B> {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
 
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
@@ -6362,30 +6490,11 @@ impl<B: Serve> Shell<B> {
             })
             .collect();
 
-        // The lanes whose class captures, compacted in lane order: a key row
-        // each, and a page row each of those whose program reads pages.
-        let scored = Scored::of(composition.lanes().iter().map(|row| {
-            let captures = self.captures(row.class as usize);
-            let pages = captures
-                && lanes[row.source as usize]
-                    .reads
-                    .iter()
-                    .any(|name| name == SCORE_PAGES);
-            (captures, pages)
-        }));
         // Each capturing lane's rows by their bases in the score room's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
         let capture_table = self.span.capture().map_or_else(Vec::new, |rows| {
             scored.table(&indptr_host, rows.keys, rows.pages)
         });
-        let (readout_rows, readout_layout) = readout_table(
-            &composition,
-            lanes,
-            &self.readouts,
-            &scored,
-            |class| self.readout_for(class),
-            |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
-        )?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -6419,6 +6528,8 @@ impl<B: Serve> Shell<B> {
                     payload: &voxel_payload,
                 }),
                 capture: &capture_table,
+                ring_lanes: ring.as_ref().map_or(&[], |staged| staged.lanes.as_slice()),
+                ring_jobs: ring.as_ref().map_or(&[], |staged| staged.jobs.as_slice()),
             },
         )?;
         let group_masks =
@@ -6450,29 +6561,6 @@ impl<B: Serve> Shell<B> {
             }
         }
 
-        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
-        let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
-        if readouts > readouts_ceiling {
-            return Err(Fault::Ceiling {
-                what: "rows one fire reads logits for",
-                need: readouts,
-                have: readouts_ceiling,
-            });
-        }
-        let fire_rows = FireRows {
-            tokens: u64::from(rows),
-            lanes: u64::from(lane_count),
-            patches: u64::from(composition.patch_rows()),
-            images: u64::from(composition.images()),
-            voxels: u64::from(composition.voxel_widest()),
-            clips: u64::from(composition.clips()),
-            readouts,
-        };
-        // The narrowest rung that holds the fire: its carve at its fixed
-        // place under the span's end.
-        let rung = self
-            .span
-            .rung_of(fire_rows, if rs_active { rows_ext - rows } else { 0 });
         // A fire's capturing lanes' rows lie in the score room of its first
         // capturing lane's pair, laid for the most lanes a fire carries.
         let room = composition
@@ -6596,6 +6684,16 @@ impl<B: Serve> Shell<B> {
             mrope_positions: bound.mrope_positions,
             geometry,
             window_tables: self.pools.window_tables(),
+            // The fold's grid a rung's: its own rows and as many carried.
+            ring_jobs: bound.ring_jobs.map(|(jobs, most)| {
+                (
+                    jobs,
+                    most.min(crate::ring::most_jobs(
+                        self.span.rung_tokens(rung),
+                        self.span.rung_tokens(rung),
+                    )),
+                )
+            }),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 mask: bound.mask,
@@ -6688,6 +6786,43 @@ impl<B: Serve> Shell<B> {
             demand,
             guests,
         })
+    }
+
+    /// The fire's windowed lanes staged for the ring kernels at rung
+    /// `rung`: each lane's rows in fire slots of the rung's own, from a
+    /// slot's first row; `None` where the load has no windowed rows.
+    fn stage_rings(
+        &self,
+        seats: &[crate::ring::Seat],
+        rung: usize,
+    ) -> Result<Option<crate::ring::Staged>> {
+        let Some((rows, _)) = self.pools.rings() else {
+            return Ok(None);
+        };
+        let tokens = self.pools.paging().page_size.max(1);
+        let (at, held) = self.span.fire_slots(rung)?;
+        let wants: Vec<u32> = seats.iter().map(|seat| seat.rows.div_ceil(tokens)).collect();
+        let need: u32 = wants.iter().sum();
+        if need > held {
+            return Err(Fault::Ceiling {
+                what: "fire slots of the fire's own windowed rows",
+                need: u64::from(need),
+                have: u64::from(held),
+            });
+        }
+        let units = self.pools.fire_units(at, need)?;
+        let mut from = 0usize;
+        let mut owned = Vec::with_capacity(seats.len());
+        for want in &wants {
+            owned.push(&units[from..from + *want as usize]);
+            from += *want as usize;
+        }
+        let lanes: Vec<crate::ring::Lane<'_>> = seats
+            .iter()
+            .zip(owned)
+            .map(|(seat, fire)| seat.with(fire))
+            .collect();
+        crate::ring::stage(&lanes, tokens, rows).map(Some)
     }
 
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {

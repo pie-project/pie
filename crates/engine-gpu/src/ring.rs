@@ -34,12 +34,48 @@ pub struct Lane<'a> {
     pub fire: &'a [u32],
     /// Which lane of the fire's record table the lane's ring is.
     pub record: u32,
+    /// Whether the lane keeps its rows: a kv-less lane's rows land in its
+    /// fire slots and fold nowhere.
+    pub keeps: bool,
+}
+
+/// A lane of a fire as the shell seats it, before its fire slots are
+/// known ([`Lane`] once they are).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seat {
+    pub folded: u32,
+    pub fold: u32,
+    pub base: u32,
+    pub first: u32,
+    pub rows: u32,
+    pub buffer: Vec<u32>,
+    pub record: u32,
+    pub keeps: bool,
+}
+
+impl Seat {
+    /// The lane with its fire slots.
+    #[must_use]
+    pub fn with<'a>(&'a self, fire: &'a [u32]) -> Lane<'a> {
+        Lane {
+            folded: self.folded,
+            fold: self.fold,
+            base: self.base,
+            first: self.first,
+            rows: self.rows,
+            buffer: &self.buffer,
+            fire,
+            record: self.record,
+            keeps: self.keeps,
+        }
+    }
 }
 
 /// What a fire stages for its windowed layers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
-    /// Three ints a lane: folded, base, first (`Ring::lanes`).
+    /// Four ints a lane: folded, base, first, folded after the fire
+    /// (`Ring::lanes`).
     pub lanes: Vec<i32>,
     /// The page table: a lane's buffer slots of its rows below its first,
     /// then its fire slots.
@@ -68,16 +104,16 @@ pub fn most_jobs(rows: u32, carried: u32) -> u32 {
     rows.saturating_add(carried)
 }
 
-/// Stages `lanes` for a ring of `ring_rows` rows read through a window of
-/// `window`, slots of `tokens` rows.
-pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, window: u32) -> Result<Staged> {
+/// Stages `lanes` for rings of at most `ring_rows` rows (a narrower layer's
+/// fold drops the rows past its own), slots of `tokens` rows.
+pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32) -> Result<Staged> {
     let bad = |why: String| Fault::Program {
         at: "ring::stage",
         why,
     };
-    if tokens == 0 || ring_rows < window {
+    if tokens == 0 || ring_rows == 0 {
         return Err(bad(format!(
-            "a ring of {ring_rows} rows read through a window of {window} in slots of {tokens}"
+            "rings of {ring_rows} rows in slots of {tokens}"
         )));
     }
     let mut out = Staged {
@@ -111,7 +147,12 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, window: u32) -> Re
                 lane.folded, lane.base
             )));
         }
-        let buffered = lane.first.saturating_sub(lane.base).div_ceil(tokens);
+        // Its buffer as the kernels read it: the rows `[folded, first)` it
+        // carries, from `base`; none where it carries none (the kernels
+        // read their base as its first row then).
+        let carries = lane.first > lane.folded;
+        let read_base = if carries { lane.base } else { lane.first };
+        let buffered = lane.first.saturating_sub(read_base).div_ceil(tokens);
         let entry = |row: u32| -> Result<u32> {
             let i = (row - lane.base) / tokens;
             lane.buffer.get(i as usize).copied().ok_or_else(|| {
@@ -133,8 +174,9 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, window: u32) -> Re
         };
         out.lanes.extend([
             lane.folded as i32,
-            lane.base as i32,
+            read_base as i32,
             lane.first as i32,
+            if lane.keeps { to as i32 } else { lane.folded as i32 },
         ]);
         for i in 0..buffered {
             out.indices.push(entry(lane.base + i * tokens)? as i32);
@@ -148,7 +190,11 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, window: u32) -> Re
             out.write_offset.push(offset as i32);
         }
         out.indptr.push(out.indices.len() as i32);
-        // The fold: the last `ring_rows` of `[folded, to)` into the ring.
+        if !lane.keeps {
+            continue;
+        }
+        // The fold: the last `ring_rows` of `[folded, to)` into the ring, a
+        // row by its index (each layer's ring at its own place).
         let source = |row: u32| -> Result<(u32, u32)> {
             if row < lane.first {
                 Ok((entry(row)?, (row - lane.base) % tokens))
@@ -157,7 +203,7 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, window: u32) -> Re
             }
         };
         for row in lane.folded.max(to.saturating_sub(ring_rows))..to {
-            if !landed.insert((lane.record, row % ring_rows)) {
+            if !landed.insert((lane.record, row)) {
                 continue;
             }
             let (unit, at_row) = source(row)?;
@@ -165,7 +211,7 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, window: u32) -> Re
                 unit as i32,
                 at_row as i32,
                 -1 - lane.record as i32,
-                (row % ring_rows) as i32,
+                row as i32,
             ]);
         }
         // The fire's rows it leaves unfolded, into its buffer slots.
@@ -207,16 +253,17 @@ mod tests {
             buffer: &[7, 9],
             fire: &[30],
             record: 0,
+            keeps: true,
         };
-        let s = stage(&[lane], 16, 40, 32).unwrap();
-        assert_eq!(s.lanes, [50, 48, 55]);
+        let s = stage(&[lane], 16, 40).unwrap();
+        assert_eq!(s.lanes, [50, 48, 55, 56]);
         assert_eq!(s.indices, [7, 30]);
         assert_eq!(s.indptr, [0, 2]);
         assert_eq!((s.write_page, s.write_offset), (vec![30], vec![0]));
         // Rows 50..55 from buffer slot 7 (rows 2..7 of it), row 55 from the fire slot.
         assert_eq!(s.jobs[0], 6);
-        assert_eq!(&s.jobs[1..5], &[7, 2, -1, 10]);
-        assert_eq!(&s.jobs[21..25], &[30, 0, -1, 15]);
+        assert_eq!(&s.jobs[1..5], &[7, 2, -1, 50]);
+        assert_eq!(&s.jobs[21..25], &[30, 0, -1, 55]);
     }
 
     /// A prefill folding most of its rows: its table starts past its first
@@ -233,12 +280,13 @@ mod tests {
             buffer: &[3],
             fire: &[10, 11, 12, 13, 14, 15, 16],
             record: 2,
+            keeps: true,
         };
-        let s = stage(&[lane], 16, 40, 32).unwrap();
+        let s = stage(&[lane], 16, 40).unwrap();
         assert_eq!(s.indices, [10, 11, 12, 13, 14, 15, 16]);
         assert_eq!(s.jobs[0], 40 + 10);
         // Row 60 is fire slot 3 row 12, ring place 20 of lane 2's record.
-        assert_eq!(&s.jobs[1..5], &[13, 12, -3, 20]);
+        assert_eq!(&s.jobs[1..5], &[13, 12, -3, 60]);
         // Row 100 is fire slot 6 row 4, into buffer slot 3 row 4.
         assert_eq!(&s.jobs[161..165], &[16, 4, 3, 4]);
     }
@@ -255,14 +303,15 @@ mod tests {
             buffer: &[5],
             fire,
             record: 0,
+            keeps: true,
         };
-        let s = stage(&[lane(&[1]), lane(&[2])], 16, 40, 32).unwrap();
+        let s = stage(&[lane(&[1]), lane(&[2])], 16, 40).unwrap();
         let ring_jobs = s.jobs[1..].chunks(4).filter(|j| j[2] < 0).count();
         assert_eq!(ring_jobs, 1);
     }
 
     #[test]
-    fn a_ring_narrower_than_its_window_is_refused() {
-        assert!(stage(&[], 16, 31, 32).is_err());
+    fn a_ring_of_no_rows_is_refused() {
+        assert!(stage(&[], 16, 0).is_err());
     }
 }

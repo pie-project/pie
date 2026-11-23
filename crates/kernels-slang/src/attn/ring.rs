@@ -16,8 +16,11 @@ pub const JOB_INTS: u32 = 4;
 
 /// Moves the rows `jobs` names (its count, then [`JOB_INTS`] a job: source
 /// slot unit and row, destination slot unit or `-1 - lane` for that lane's
-/// ring, and row) for the layer `pool` reads, at most `most` jobs: a fire
-/// dispatches the same grid whatever its jobs, so a recording replays it.
+/// ring, and the slot's row or the ring row's index) for the layer `pool`
+/// reads, at most `most` jobs: a fire dispatches the same grid whatever its
+/// jobs, so a recording replays it. A ring row lands at its index modulo the
+/// layer's ring rows, those `rows` or more below the lane's folded index
+/// after the fire (`Ring::lanes`' fourth int) dropped.
 pub fn fold(ctx: &Ctx<'_>, pool: &KvPool, jobs: Tensor, most: u32) -> Result<(), Error> {
     const OP: &str = "attn.ring_fold";
     let Some(ring) = &pool.ring else {
@@ -57,7 +60,7 @@ pub fn fold(ctx: &Ctx<'_>, pool: &KvPool, jobs: Tensor, most: u32) -> Result<(),
     ctx.fire(
         Fire::at(RING, "attn_ring_fold").apply(Grid::of([2 * row_words, most, 1], [64, 1, 1])),
         &[
-            &[jobs.arg(), ring.slots.arg()][..],
+            &[jobs.arg(), ring.slots.arg(), ring.lanes.arg()][..],
             &pool.pool.args(true),
             &[
                 pool.pool.words.arg(),
@@ -66,10 +69,12 @@ pub fn fold(ctx: &Ctx<'_>, pool: &KvPool, jobs: Tensor, most: u32) -> Result<(),
                 pool.page_stride[0].arg(),
                 row_words.arg(),
                 ring.piece.arg(),
+                ring.values_piece.arg(),
                 ring.pieces.arg(),
                 ring.keys.arg(),
                 ring.values.arg(),
                 ring.slot_stride.arg(),
+                ring.rows.arg(),
             ],
         ]
         .concat(),
