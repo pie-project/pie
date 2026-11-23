@@ -1292,6 +1292,46 @@ impl<B: Backend> Pools<B> {
         self.pool.committed_bytes()
     }
 
+    /// Each ring's geometry as the fold reads it (`attn/ring.slang`'s
+    /// layer entries), its rows in order: its keys' and values' origins,
+    /// its slot unit and row words, the pieces and the words its ring's keys
+    /// and values lie at, and its ring rows, every word a u32 of the pool.
+    /// [`Self::table`] binds the same rows in the same order.
+    pub fn ring_layers(&self) -> Result<Vec<i32>> {
+        let mut out = Vec::new();
+        for row in &self.rows {
+            let Row::Kv {
+                paged,
+                head_dim,
+                kv_heads,
+                keys,
+                values,
+                ring: Some(ring),
+                ..
+            } = *row
+            else {
+                continue;
+            };
+            let word = |v: u64| {
+                i32::try_from(v).map_err(|_| Fault::Unbound {
+                    what: format!("ring word {v}, which passes the fold's int"),
+                })
+            };
+            out.extend([
+                word(keys / 4)?,
+                word(values / 4)?,
+                word(self.unit(paged.shape())? / 4)?,
+                word(u64::from(kv_heads) * u64::from(head_dim) / 2)?,
+                word(u64::from(ring.piece))?,
+                word(u64::from(ring.values_piece))?,
+                word(ring.keys / 4)?,
+                word(ring.values / 4)?,
+                word(u64::from(ring.rows))?,
+            ]);
+        }
+        Ok(out)
+    }
+
     /// The cache table one fire binds.
     pub fn table(&self, handles: &Handles<B>, seats: &Seats) -> Result<CacheTable> {
         let segments = self.pool.bind(handles)?;

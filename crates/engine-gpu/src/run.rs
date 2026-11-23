@@ -1279,6 +1279,11 @@ impl<'c, B: Backend> Run<'c, B> {
             .unwrap_or(0)
     }
 
+    /// Every row's pool the fire binds, in the pools' row order.
+    pub fn cache_pools(&self) -> &'c [CachePool] {
+        &self.caches.0
+    }
+
     pub fn pool(&self, id: ValueId) -> &KvPool {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,

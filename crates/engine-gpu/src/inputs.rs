@@ -230,6 +230,9 @@ pub struct Fire<'a> {
     /// empty where the load has none.
     pub ring_lanes: &'a [i32],
     pub ring_jobs: &'a [i32],
+    /// Each ring's geometry the fold table opens with
+    /// (`Pools::ring_layers`), as many entries as the load has rings.
+    pub ring_layers: &'a [i32],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -288,9 +291,10 @@ pub struct Laid {
     /// The capture table's ints, laid where the trace captures scores:
     /// `TABLE_INTS` for each of a fire's lanes at most.
     capture: Option<(u64, u64)>,
-    /// The windowed rows' lane table, and the fold's job table and the most
-    /// jobs it holds, where the load has windowed rows.
-    ring: Option<(u64, u64, u32)>,
+    /// The windowed rows' lane table, the fold's table (its rings'
+    /// entries, then its jobs) and the most jobs it holds, and its rings,
+    /// where the load has windowed rows.
+    ring: Option<(u64, u64, u32, u32)>,
     /// The store's bytes.
     total: u64,
 }
@@ -334,7 +338,7 @@ impl Laid {
         voxel: Option<VoxelSeat>,
         pieces: u32,
         capture: bool,
-        ring: bool,
+        rings: Option<u32>,
         binding: u64,
     ) -> Laid {
         let pieces = pieces.max(1);
@@ -443,11 +447,12 @@ impl Laid {
             let ints = lanes * u64::from(kernels_slang::attn::score::TABLE_INTS);
             (take(ints * 4), ints)
         });
-        let ring = ring.then(|| {
+        let ring = rings.map(|rings| {
             let most = crate::ring::most_jobs(budget.max_tokens, budget.max_tokens);
             let lanes_at = take(lanes * (crate::ring::LANE_INTS as u64 + u64::from(pieces)) * 4);
-            let jobs_at = take((1 + 4 * u64::from(most)) * 4);
-            (lanes_at, jobs_at, most)
+            let layer_ints = u64::from(rings) * u64::from(kernels_slang::attn::ring::LAYER_INTS);
+            let jobs_at = take((layer_ints + 1 + 4 * u64::from(most)) * 4);
+            (lanes_at, jobs_at, most, rings)
         });
         let total = at;
 
@@ -686,14 +691,19 @@ impl<B: Backend> Inputs<B> {
             )?)
         };
         let ring_jobs = match self.laid.ring {
-            Some((lanes_at, jobs_at, most)) => {
+            Some((lanes_at, jobs_at, most, rings)) => {
+                let layer_ints = rings as usize * kernels_slang::attn::ring::LAYER_INTS as usize;
                 if fire.ring_lanes.len() > (crate::ring::LANE_INTS as u32 + self.laid.pieces) as usize * lanes as usize
                     || fire.ring_jobs.len() > 1 + 4 * most as usize
+                    || fire.ring_layers.len() != layer_ints
                 {
                     return Err(Fault::Ceiling {
                         what: "ints of a fire's windowed lane and fold tables",
-                        need: (fire.ring_lanes.len() + fire.ring_jobs.len()) as u64,
-                        have: u64::from(crate::ring::LANE_INTS as u32 + self.laid.pieces) * u64::from(lanes) + 1 + 4 * u64::from(most),
+                        need: (fire.ring_lanes.len() + fire.ring_jobs.len() + fire.ring_layers.len()) as u64,
+                        have: u64::from(crate::ring::LANE_INTS as u32 + self.laid.pieces) * u64::from(lanes)
+                            + layer_ints as u64
+                            + 1
+                            + 4 * u64::from(most),
                     });
                 }
                 self.store.write(lanes_at, bytes_of(fire.ring_lanes))?;
@@ -703,7 +713,8 @@ impl<B: Backend> Inputs<B> {
                 } else {
                     fire.ring_jobs
                 };
-                self.store.write(jobs_at, bytes_of(jobs))?;
+                self.store.write(jobs_at, bytes_of(fire.ring_layers))?;
+                self.store.write(jobs_at + 4 * layer_ints as u64, bytes_of(jobs))?;
                 let room = self.laid.room(jobs_at)?;
                 Some((
                     i32s(
@@ -719,7 +730,7 @@ impl<B: Backend> Inputs<B> {
             None => None,
         };
         let ring_lanes = match self.laid.ring {
-            Some((lanes_at, _, _)) => i32s(
+            Some((lanes_at, _, _, _)) => i32s(
                 handles,
                 &self.store,
                 lanes_at,
@@ -1381,7 +1392,7 @@ mod tests {
             None,
             2,
             true,
-            true,
+            Some(2),
             1 << 30,
         );
         let rooms: Vec<(u64, u64)> = laid.rooms.iter().map(|(&at, &room)| (at, room)).collect();

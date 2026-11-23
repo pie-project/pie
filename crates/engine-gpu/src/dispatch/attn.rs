@@ -12,37 +12,33 @@ impl<B: Backend> DispatchAttn for Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
-    /// Each windowed layer's fold into its ring (CONTRACT-BC 19, 21), once
-    /// a fire, after its walk: every attention reading the layer's ring
-    /// (its own and a shared tail's, which reads its owner's) reads the
+    /// Every windowed layer's fold into its ring (CONTRACT-BC 19, 21), one
+    /// dispatch a fire, after its walk: every attention reading a ring (its
+    /// own layer's and a shared tail's, which reads its owner's) reads the
     /// ring the fire found, its early rows' windows reaching rows the fold
     /// drops. The rows each lane folds go into its ring, the fire's rows it
-    /// leaves unfolded into its buffer.
+    /// leaves unfolded into its buffer; the fold table opens with each
+    /// ring's geometry in the pools' row order (`Pools::ring_layers`), the
+    /// order the cache table binds them in.
     pub fn fold_rings(&self) -> Result<(), kernels_slang::Error> {
-        let mut folded: Vec<poem_ir::ValueId> = Vec::new();
-        for node in self.nodes() {
-            let poem_ir::Operation::Attn(Attn::Decode { cache, .. } | Attn::Prefill { cache, .. }) =
-                &node.op
-            else {
-                continue;
-            };
-            if folded.contains(cache) {
-                continue;
-            }
-            folded.push(*cache);
-            let pool = self.pool(*cache);
-            if pool.ring.is_none() {
-                continue;
-            }
-            let Some((jobs, most)) = self.bindings().ring_jobs else {
-                return Err(kernels_slang::Error::Backend {
-                    op: "attn.ring_fold",
-                    detail: "a fire reading a ring staged no fold table".to_string(),
-                });
-            };
-            kernels_slang::attn::ring::fold(self.ctx, pool, jobs, most)?;
+        let layers: Vec<&kernels_slang::KvPool> = self
+            .cache_pools()
+            .iter()
+            .filter_map(|pool| match pool {
+                crate::run::CachePool::Kv(pool) if pool.ring.is_some() => Some(pool),
+                _ => None,
+            })
+            .collect();
+        if layers.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let Some((jobs, most)) = self.bindings().ring_jobs else {
+            return Err(kernels_slang::Error::Backend {
+                op: "attn.ring_fold",
+                detail: "a fire reading a ring staged no fold table".to_string(),
+            });
+        };
+        kernels_slang::attn::ring::fold(self.ctx, &layers, jobs, most)
     }
 }
 

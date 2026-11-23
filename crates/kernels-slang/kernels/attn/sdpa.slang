@@ -283,6 +283,9 @@ struct Keys {
     int run_at;
     uint ring_k;
     uint ring_v;
+    // A fire row's place in the lane's page table counted in rows: its
+    // buffer's whole pages, then its own (`kp + fire_at` from `first` on).
+    int fire_at;
 };
 
 Keys keys_of(int req) {
@@ -298,6 +301,8 @@ Keys keys_of(int req) {
     uint rec_v = uint(ring_lanes[lane + 6u + params.ring_piece_v]) * params.slot_stride;
     at.ring_k = rec_k + params.ring_k;
     at.ring_v = rec_v + params.ring_v;
+    int buffered = max(at.first - at.base + params.page_size - 1, 0) / params.page_size;
+    at.fire_at = buffered * params.page_size - at.first;
 #else
     at.folded = 0;
     at.base = 0;
@@ -306,6 +311,7 @@ Keys keys_of(int req) {
     at.run_at = 0;
     at.ring_k = 0u;
     at.ring_v = 0u;
+    at.fire_at = 0;
 #endif
     return at;
 }
@@ -318,13 +324,11 @@ int key_page(Keys at, int kp, out uint row) {
         row = uint(kp) % params.ring_rows;
         return -1;
     }
-    if (kp >= at.first) {
-        int buffered = max(at.first - at.base + params.page_size - 1, 0) / params.page_size;
-        row = uint((kp - at.first) % params.page_size);
-        return buffered + (kp - at.first) / params.page_size;
-    }
-    row = uint((kp - at.base) % params.page_size);
-    return (kp - at.base) / params.page_size;
+    // The row's place in the table: past the buffer's rows, the fire's.
+    int idx = kp >= at.first ? kp + at.fire_at : kp - at.base;
+    int page = idx / params.page_size;
+    row = uint(idx - page * params.page_size);
+    return page;
 #else
     row = uint(kp % params.page_size);
     return kp / params.page_size;
@@ -492,6 +496,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // there (a page lies in one segment): found once a page, not a key.
     int page_at = -1;
     uint k_seg = 0u, k_page = 0u, v_seg = 0u, v_page = 0u;
+#if defined(PIE_RING) && !defined(PIE_ONE_SEGMENT)
+    // The lane's ring lies in its record's one chunk, so in one segment:
+    // found once, its rows' words then past its first.
+    uint ring_k_seg = 0u, ring_k_at = 0u, ring_v_seg = 0u, ring_v_at = 0u;
+    pie_pool_at(SDPA_KV_SCALE * ring.ring_k, ring_k_seg, ring_k_at);
+    pie_pool_at(SDPA_KV_SCALE * ring.ring_v, ring_v_seg, ring_v_at);
+#endif
     for (int kp = 0; kp <= last; kp++) {
         bool take = live && keeps(row, origin, kp, q_pos, start);
         float partial = 0.0;
@@ -510,8 +521,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 k_page = SDPA_KV_SCALE * (ring.ring_k + cell_words);
                 v_page = SDPA_KV_SCALE * (ring.ring_v + cell_words);
 #else
-                pie_pool_at(SDPA_KV_SCALE * (ring.ring_k + cell_words), k_seg, k_page);
-                pie_pool_at(SDPA_KV_SCALE * (ring.ring_v + cell_words), v_seg, v_page);
+                k_seg = ring_k_seg;
+                v_seg = ring_v_seg;
+                k_page = ring_k_at + SDPA_KV_SCALE * cell_words;
+                v_page = ring_v_at + SDPA_KV_SCALE * cell_words;
 #endif
                 page_at = -1;
                 in_page = 0u;

@@ -1475,7 +1475,9 @@ impl<B: Serve> Shell<B> {
                 voxel_seat,
                 rows.pieces,
                 capture,
-                rows.buffer.is_some(),
+                rows.buffer
+                    .is_some()
+                    .then(|| u32::try_from(rows.windowed.len()).unwrap_or(u32::MAX)),
                 binding,
             )
         };
@@ -6223,6 +6225,11 @@ impl<B: Serve> Shell<B> {
         // The fire's windowed rows (CONTRACT-BC 19, 21): its own rows in
         // its rung's fire slots, read and folded as the ring kernels say.
         let ring = self.stage_rings(&ring_lanes, &slot_ids, rung)?;
+        let ring_layers = if self.pools.rings().is_some() {
+            self.pools.ring_layers()?
+        } else {
+            Vec::new()
+        };
         if let Some(staged) = &ring {
             let most = crate::ring::most_jobs(self.span.rung_tokens(rung), self.span.rung_tokens(rung));
             let jobs = u32::try_from(staged.jobs.first().copied().unwrap_or(0)).unwrap_or(0);
@@ -6546,6 +6553,7 @@ impl<B: Serve> Shell<B> {
                 capture: &capture_table,
                 ring_lanes: ring.as_ref().map_or(&[], |staged| staged.lanes.as_slice()),
                 ring_jobs: ring.as_ref().map_or(&[], |staged| staged.jobs.as_slice()),
+                ring_layers: &ring_layers,
             },
         )?;
         let group_masks =

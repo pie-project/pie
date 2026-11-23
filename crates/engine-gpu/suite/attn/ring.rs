@@ -586,13 +586,28 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
     let staged = stage(&mut gpu, &g, &lanes, &laid, &to);
     let (jobs, moved) = fold_jobs(&lanes, &to, &laid);
     let most = (jobs.len() as u32 - 1) / ring::JOB_INTS + 3;
-    let mut padded = jobs.clone();
-    padded.resize(1 + most as usize * 4, 0);
-    let jt = gpu.up_i32(&padded);
-    let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
     // Past 8 GiB of the pool's words, as the fire's own slots lie at a big
     // pool's top.
-    gpu.run(|c| ring::fold(c, &high(&staged.pool), job_table, most));
+    let pool = high(&staged.pool);
+    let at = pool.ring.expect("the pool holds a ring");
+    // The table opens with the layer's geometry (`Pools::ring_layers`).
+    let mut padded = vec![
+        pool.origin[0] as i32,
+        pool.origin[1] as i32,
+        pool.page_stride[0] as i32,
+        (pool.seq_stride / 2) as i32,
+        at.piece as i32,
+        at.values_piece as i32,
+        at.keys as i32,
+        at.values as i32,
+        at.rows as i32,
+    ];
+    assert_eq!(padded.len(), ring::LAYER_INTS as usize);
+    padded.extend(&jobs);
+    padded.resize(ring::LAYER_INTS as usize + 1 + most as usize * 4, 0);
+    let jt = gpu.up_i32(&padded);
+    let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
+    gpu.run(|c| ring::fold(c, &[&pool], job_table, most));
     let after = gpu.down(staged.pool_buf, g.elems);
     let mut want: Vec<f64> = laid.pool.iter().map(|x| f64::from(*x)).collect();
     for (l, lane) in lanes.iter().enumerate() {
@@ -636,6 +651,11 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
 /// page table (no ring: the old window list), from the ring, and through
 /// the ring kernel's table alone. Prints each arm's best of a few rounds
 /// and the ring's ratio to the table's; the gate is the serving decode.
+/// What the ring forms cost against the paged window's: a decode at a
+/// short context (the served bench's, one lane and eight) and a long one,
+/// and a prefill fire past the ring (its second fire's rows reading the
+/// folded ones), each read through its page table (`table`), the ring
+/// kernel reading the same table, and the ring.
 #[test]
 fn a_ring_decode_costs_what_a_paged_window_does() {
     let Some(mut gpu) = Gpu::open() else {
@@ -643,19 +663,7 @@ fn a_ring_decode_costs_what_a_paged_window_does() {
         return;
     };
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
-    let (hd, ctx, window, reps) = (256usize, 2048usize, 1024usize, 64);
-    let lanes = |ringed: bool| -> Vec<Lane> {
-        (0..4)
-            .map(|_| Lane {
-                folded: if ringed { ctx } else { 0 },
-                base: if ringed { ctx } else { 0 },
-                first: ctx,
-                rows: 1,
-                masked: false,
-            })
-            .collect()
-    };
-    let g = Geometry::ringed(hd, 4 * 2 * (ctx / PAGE + 2), 4, window, window);
+    let hd = 256usize;
     let subgroup = crate::backend::SPIRV && gpu.subgroup() >= 32;
     let tactic = sdpa::Tactic {
         tier: if subgroup {
@@ -671,54 +679,90 @@ fn a_ring_decode_costs_what_a_paged_window_does() {
         split_min_keys: 64,
         prefill_work: 0,
     };
-    let mut arms = Vec::new();
-    for (what, ringed, ring) in [("table", false, false), ("ring kernel, table", false, true), ("ring", true, true)] {
-        let lanes = lanes(ringed);
-        let laid = lay(&g, &lanes, 5);
-        let folded: Vec<usize> = lanes.iter().map(|lane| lane.folded).collect();
-        let mut staged = stage(&mut gpu, &g, &lanes, &laid, &folded);
-        if !ring {
-            staged.pool.ring = None;
+    // (what, lanes, context, rows a lane, window, reps)
+    let shapes: [(&str, usize, usize, usize, usize, usize); 4] = [
+        ("decode 1 lane at 160", 1, 160, 1, 512, 64),
+        ("decode 8 lanes at 160", 8, 160, 1, 512, 64),
+        ("decode 4 lanes at 2048", 4, 2048, 1, 1024, 64),
+        ("prefill 1024 rows past 1024", 1, 1024, 1024, 512, 4),
+    ];
+    for (shape, n, ctx, rows_a, window, reps) in shapes {
+        let lanes = |ringed: bool| -> Vec<Lane> {
+            (0..n)
+                .map(|_| Lane {
+                    folded: if ringed { ctx } else { 0 },
+                    base: if ringed { ctx } else { 0 },
+                    first: ctx,
+                    rows: rows_a,
+                    masked: false,
+                })
+                .collect()
+        };
+        let g = Geometry::ringed(hd, n * 2 * ((ctx + rows_a) / PAGE + 2), n, window, window);
+        let mut arms = Vec::new();
+        for (what, ringed, ring) in [("table", false, false), ("ring kernel, table", false, true), ("ring", true, true)] {
+            let lanes = lanes(ringed);
+            let laid = lay(&g, &lanes, 5);
+            let folded: Vec<usize> = lanes.iter().map(|lane| lane.folded).collect();
+            let mut staged = stage(&mut gpu, &g, &lanes, &laid, &folded);
+            if !ring {
+                staged.pool.ring = None;
+            }
+            let rows = n * rows_a;
+            let (q, _) = gpu.up(&noise(77, rows * QH * hd));
+            let qt = t(q, rows, QH * hd, Dtype::Bf16);
+            let o = gpu.zeros(rows * QH * hd);
+            let ot = t(o, rows, QH * hd, Dtype::Bf16);
+            arms.push((what, staged, qt, ot));
         }
-        let rows = 4;
-        let (q, _) = gpu.up(&noise(77, rows * QH * hd));
-        let qt = t(q, rows, QH * hd, Dtype::Bf16);
-        let o = gpu.zeros(rows * QH * hd);
-        let ot = t(o, rows, QH * hd, Dtype::Bf16);
-        arms.push((what, staged, qt, ot));
-    }
-    let mut best = vec![f64::INFINITY; arms.len()];
-    for _ in 0..5 {
-        for (at, (_, staged, qt, ot)) in arms.iter().enumerate() {
-            let ns = gpu.timed(|c| {
-                for _ in 0..reps {
-                    sdpa::decode(
-                        c,
-                        tactic,
-                        *qt,
-                        &staged.tables,
-                        &staged.pool,
-                        Some(window as u32),
-                        hd as u32,
-                        0.0625,
-                        *ot,
-                        None,
-                        None,
-                    )?;
-                }
-                Ok(())
-            });
-            best[at] = best[at].min(ns / reps as f64);
+        let mut best = vec![f64::INFINITY; arms.len()];
+        for _ in 0..5 {
+            for (at, (_, staged, qt, ot)) in arms.iter().enumerate() {
+                let ns = gpu.timed(|c| {
+                    for _ in 0..reps {
+                        if rows_a > 1 {
+                            sdpa::prefill(
+                                c,
+                                tactic,
+                                *qt,
+                                &staged.tables,
+                                &staged.pool,
+                                Some(window as u32),
+                                hd as u32,
+                                0.0625,
+                                *ot,
+                                None,
+                            )?;
+                        } else {
+                            sdpa::decode(
+                                c,
+                                tactic,
+                                *qt,
+                                &staged.tables,
+                                &staged.pool,
+                                Some(window as u32),
+                                hd as u32,
+                                0.0625,
+                                *ot,
+                                None,
+                                None,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                });
+                best[at] = best[at].min(ns / reps as f64);
+            }
         }
+        for ((what, ..), ns) in arms.iter().zip(&best) {
+            eprintln!("ring cost: {shape}: {what}: {:.1} us", ns / 1000.0);
+        }
+        eprintln!(
+            "ring cost: {shape}: ring / table {:.3}, ring kernel's table / table {:.3}",
+            best[2] / best[0],
+            best[1] / best[0]
+        );
     }
-    for ((what, ..), ns) in arms.iter().zip(&best) {
-        eprintln!("ring cost: {what}: {:.1} us a decode", ns / 1000.0);
-    }
-    eprintln!(
-        "ring cost: ring / table {:.3}, ring kernel's table / table {:.3}",
-        best[2] / best[0],
-        best[1] / best[0]
-    );
 }
 
 /// Beam siblings sharing one set read along their own lineages
