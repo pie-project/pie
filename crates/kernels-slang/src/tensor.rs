@@ -132,6 +132,36 @@ pub struct KvPool {
 
     /// u32 words from the pool's origin to page 0's keys, then its values.
     pub origin: [u32; 2],
+
+    /// A windowed layer served as state + buffer (CONTRACT-BC 19, 21): the
+    /// keys below each lane's buffer base lie in its record's ring, and the
+    /// page table holds its buffer slots, then the fire's slots of its own
+    /// rows. `None`: every key through the page table.
+    pub ring: Option<Ring>,
+}
+
+/// Where a windowed layer's rows lie beside its page table ([`KvPool::ring`]).
+/// The ring holds `rows` rows of the layer's keys, then as many of its
+/// values (each row `seq_stride` elements), row `r` at place `r % rows`, at
+/// u32 word `keys` (`values`) of piece `piece` of each lane's record, a
+/// record's piece `slots[lane * pieces + piece]` units of `slot_stride`
+/// words into the pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Ring {
+    /// Three i32 a lane: its folded index (keys below it lie in the ring),
+    /// its buffer base (a page's first row: entry `i` of its table holds
+    /// rows `[base + i * page, base + (i + 1) * page)`) and its first row in
+    /// the fire (keys from it on lie in the fire's own slots, the page
+    /// table's after the lane's buffer slots of the rows below it).
+    pub lanes: Tensor,
+    /// The fire's record table: `pieces` units a lane.
+    pub slots: Tensor,
+    pub rows: u32,
+    pub piece: u32,
+    pub pieces: u32,
+    pub keys: u32,
+    pub values: u32,
+    pub slot_stride: u32,
 }
 
 impl KvPool {
@@ -175,6 +205,7 @@ impl KvPool {
                 stride(values, u64::from(values.width)),
             ],
             origin: [0, if shared { 0 } else { words }],
+            ring: None,
         }
     }
 }

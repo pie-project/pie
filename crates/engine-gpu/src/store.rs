@@ -1135,6 +1135,7 @@ impl<B: Backend> Pools<B> {
                             u32::try_from(keys / 4).unwrap_or(u32::MAX),
                             u32::try_from(values / 4).unwrap_or(u32::MAX),
                         ],
+                        ring: None,
                     })
                 }
                 Row::State {
