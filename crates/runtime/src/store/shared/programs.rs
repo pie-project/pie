@@ -762,7 +762,11 @@ pub async fn check_moved(shared: &Shared, mover: &impl Mover, what: &str) {
 async fn check_refused(shared: &Shared, mover: &impl Mover) {
     if cfg!(debug_assertions) {
         let runtime = shared.lock().unwrap().pool().chunk_table().to_vec();
-        if let Err(apart) = mover.check_table(runtime).await {
+        // Only the tables apart is a fault: an engine gone (teardown, "no
+        // scheduler") or stating no table answers nothing to check.
+        if let Err(apart) = mover.check_table(runtime).await
+            && (apart.contains("lies on physical") || apart.contains("chunk table holds"))
+        {
             panic!(
                 "engine {}: a refused raise left the engine's chunk table apart from the \
                  runtime's: {apart}",
