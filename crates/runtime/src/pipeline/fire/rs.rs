@@ -86,8 +86,15 @@ pub struct WindowRow {
 
 /// What a fire writes of a working set's state: whether the state, to a
 /// fresh slot (other lanes read the one it holds), the count it freezes on
-/// publish, and the buffered slots.
-type GroupWrite = (bool, bool, Option<u32>, Option<std::ops::Range<u32>>);
+/// publish, and the buffered slots: the rs list's (or a store's one
+/// buffer) and a hybrid's window buffer's ([`RsStore::split_writes`]).
+type GroupWrite = (
+    bool,
+    bool,
+    Option<u32>,
+    Option<std::ops::Range<u32>>,
+    Option<std::ops::Range<u32>>,
+);
 
 impl GroupPlan {
     fn write(&self, store: &RsStore, ws: RsWorkingSetId) -> Result<GroupWrite, String> {
@@ -109,10 +116,10 @@ impl GroupPlan {
         let write_state = folds || held.is_none();
         let fresh = folds && held.is_some() && self.lanes.len() > 1;
         // A window buffer holds no row a lone lane folds itself.
-        let writes = store
-            .own_folds_unbuffered(ws, self.lanes.len() == 1, fold, self.writes.clone())
+        let (writes, wwrites) = store
+            .split_writes(ws, self.lanes.len() == 1, fold, self.writes.clone())
             .map_err(|error| error.to_string())?;
-        Ok((write_state, fresh, fold, writes))
+        Ok((write_state, fresh, fold, writes, wwrites))
     }
 }
 
@@ -135,10 +142,10 @@ pub fn demand(
         RsPlan::Groups(groups) => {
             for group in groups {
                 let ws = working_sets[group.lanes[0]];
-                let (write_state, fresh, _, writes) = group.write(store, ws)?;
+                let (write_state, fresh, _, writes, wwrites) = group.write(store, ws)?;
                 total = total.add(
                     store
-                        .group_demand(ws, write_state, fresh, writes)
+                        .group_demand_split(ws, write_state, fresh, writes, wwrites)
                         .map_err(|e| e.to_string())?,
                 );
                 total.slots += group.snapshots.len() as u32;
@@ -174,10 +181,10 @@ pub fn demand_of_lanes(
         RsPlan::Groups(groups) => {
             for group in groups.iter().filter(|group| lanes.contains(&group.lanes[0])) {
                 let ws = working_sets[group.lanes[0]];
-                let (write_state, fresh, _, writes) = group.write(store, ws)?;
+                let (write_state, fresh, _, writes, wwrites) = group.write(store, ws)?;
                 total = total.add(
                     store
-                        .group_demand(ws, write_state, fresh, writes)
+                        .group_demand_split(ws, write_state, fresh, writes, wwrites)
                         .map_err(|e| e.to_string())?,
                 );
                 total.slots += group.snapshots.len() as u32;
@@ -208,6 +215,15 @@ pub struct PreparedRs {
     /// (CONTRACT-BC 19, 21), else the pre-launch copy's windowed pages.
     pub window: Vec<Vec<Vec<u32>>>,
     pub window_copies: Vec<(usize, usize, u32, u32)>,
+    /// Each lane's window-buffer table as the fire found it and the row
+    /// its entry 0 holds, where the store buffers windowed layers' rows
+    /// (CONTRACT-BC 19, 21); `None` for a lane that buffers nothing.
+    pub window_tables: Vec<Option<(u32, Vec<u32>)>>,
+    /// The window buffer is a pool beside the rs list (a hybrid): its tail
+    /// copies are `wpage_copies`, `(lane, src, dst)` slot refs, apart from
+    /// the rs list's `page_copies`.
+    pub window_buffer_apart: bool,
+    pub wpage_copies: Vec<(usize, u32, u32)>,
     pub snapshots: Vec<RsSnapshot>,
     pub txn: Option<RsTxn>,
     /// The state slots are a shared pool's records: a lane names them by
@@ -377,6 +393,21 @@ pub fn apply_shared(
                     .into_iter()
                     .filter(|(_, pairs)| !pairs.is_empty()),
             )
+            .chain(
+                // A hybrid's window-buffer tail copies, under its shape.
+                rs.filter(|rs| rs.shared && rs.window_buffer_apart)
+                    .zip(pool.window_buffer())
+                    .map(|(rs, list)| {
+                        let pairs: Vec<[u32; 2]> = rs
+                            .wpage_copies
+                            .iter()
+                            .filter(|&&(at, ..)| at == row)
+                            .map(|&(_, src, dst)| [src, dst])
+                            .collect();
+                        (list.id, pairs)
+                    })
+                    .filter(|(_, pairs)| !pairs.is_empty()),
+            )
             .collect();
         if records.is_some() {
             for snap in &mut lane.rs_snapshots {
@@ -386,58 +417,63 @@ pub fn apply_shared(
             }
         }
         if let Some(buffer) = pool.window_buffer() {
-            lower_window(&mut lane.lane, buffer);
+            let table = rs.and_then(|rs| rs.window_tables.get(row).cloned().flatten());
+            lower_window(&mut lane.lane, buffer, table, pool.rs_list().is_some());
         }
     }
 }
 
 /// A lane of a load whose engine serves windowed layers as ring + buffer
-/// (CONTRACT-BC 19, 21), its recurrent-state verb lowered to them: the rs
-/// store keeps the set's folded window as its record and its unfolded rows
-/// in the window buffer's slots, the buffer pages
-/// ([`crate::store::rs::RsStore::shared`]). A buffering lane's pages become
-/// its window-buffer table in `Lane::tables` from `base`, its `folded`,
-/// `fold` and `lineage` its `Lane::window`; a lane that folds every row it
-/// writes from where its set is folded ([`engine::fire::RsVerb::Fold`])
-/// buffers nothing: its rows' K/V live in the fire, its table is empty and
-/// its window folds them all. The lane carries no recurrent verb (the load
-/// has no recurrent layer: a hybrid of both buffers is refused at load,
-/// [`crate::store::shared::SharedError::TwoBuffers`]). A kv-less lane
-/// states no window.
-fn lower_window(lane: &mut engine::Lane, buffer: crate::store::shared::TokenShape) {
+/// (CONTRACT-BC 19, 21): the rs store keeps the set's folded window in its
+/// record and its unfolded window rows in the window buffer's slots (the
+/// pages of a store of windowed layers alone, a pool beside the rs list on
+/// a hybrid, [`crate::store::rs::RsStore::shared`]). `table` is the lane's
+/// window-buffer table as the fire found it and the row its entry 0 holds
+/// ([`PreparedRs::window_tables`]): stated in `Lane::tables`, and with the
+/// lane's `fold` and `lineage` (those of its recurrent verb, one fold for
+/// both) its `Lane::window`. A lane whose table is empty buffers nothing:
+/// its own folded rows' K/V live in the fire, and its base is the folded
+/// index after the fire rounded down. A lane of no recurrent layer
+/// (`recurrent` false) carries no recurrent verb; a hybrid's keeps its
+/// own. A kv-less lane states no window.
+fn lower_window(
+    lane: &mut engine::Lane,
+    buffer: crate::store::shared::TokenShape,
+    table: Option<(u32, Vec<u32>)>,
+    recurrent: bool,
+) {
     if lane.kv_less {
         lane.window = None;
         return;
     }
-    let verb = std::mem::take(&mut lane.rs);
     let tokens = buffer.tokens.max(1);
-    lane.window = Some(match verb {
-        engine::fire::RsVerb::Buffer {
-            pages,
-            base,
-            fold,
-            lineage,
-            ..
-        } => {
-            if !pages.is_empty() {
-                lane.tables.push((buffer.id, pages));
-            }
-            engine::fire::WindowFold {
-                base,
-                fold,
-                lineage,
-            }
+    let (fold, lineage) = match &lane.rs {
+        engine::fire::RsVerb::Buffer { fold, lineage, .. } => (*fold, *lineage),
+        // Folds every row it writes, from where its set is folded.
+        engine::fire::RsVerb::Fold => (
+            engine::fire::FoldLen::Host(u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX)),
+            engine::fire::Lineage::Set,
+        ),
+    };
+    let after = match fold {
+        engine::fire::FoldLen::Host(rows) => lane.kv.folded.saturating_add(rows),
+        engine::fire::FoldLen::Device => lane.kv.folded,
+    };
+    let base = match table {
+        Some((base, pages)) if !pages.is_empty() => {
+            lane.tables.push((buffer.id, pages));
+            base
         }
-        engine::fire::RsVerb::Fold => {
-            let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
-            let after = lane.kv.folded.saturating_add(rows);
-            engine::fire::WindowFold {
-                base: after - after % tokens,
-                fold: engine::fire::FoldLen::Host(rows),
-                lineage: engine::fire::Lineage::Set,
-            }
-        }
+        _ => after - after % tokens,
+    };
+    lane.window = Some(engine::fire::WindowFold {
+        base,
+        fold,
+        lineage,
     });
+    if !recurrent {
+        lane.rs = engine::fire::RsVerb::Fold;
+    }
 }
 
 /// Names each lane's kv pages by the slot refs of `pinned`, the kv run an
@@ -509,6 +545,18 @@ fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {
         .filter(live)
         .map(RsSlotId)
         .collect();
+    let window_buffer: Vec<RsSlotId> = if out.window_buffer_apart {
+        out.window_tables
+            .iter()
+            .flatten()
+            .flat_map(|(_, table)| table.iter().copied())
+            .chain(out.wpage_copies.iter().map(|&(_, src, _)| src))
+            .filter(live)
+            .map(|slot| store.wpage_id(slot))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let windows: Vec<RsSlotId> = out
         .window
         .iter()
@@ -526,6 +574,7 @@ fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {
         .filter(live)
         .map(|page| store.page_id(page))
         .chain(windows)
+        .chain(window_buffer)
         .collect();
     store.note_reads(seq, slots.into_iter().chain(pages));
 }
@@ -619,6 +668,8 @@ pub fn prepare_many(
         slot_flags: vec![0; lanes],
         shared: store.is_shared(),
         bound: vec![false; lanes],
+        window_tables: vec![None; lanes],
+        window_buffer_apart: store.window_buffer_apart(),
         ..PreparedRs::default()
     };
     let mut prepared: Vec<RsPreparedWrite> = Vec::with_capacity(groups.len());
@@ -627,9 +678,17 @@ pub fn prepare_many(
         let held = store.folded_slot(ws).map_err(|error| error.to_string())?;
         let write = group
             .write(store, ws)
-            .and_then(|(write_state, fresh, fold, writes)| {
+            .and_then(|(write_state, fresh, fold, writes, wwrites)| {
                 let mut write = store
-                    .prepare_group(ws, write_state, fresh, fold, writes, granted.as_deref_mut())
+                    .prepare_group_split(
+                        ws,
+                        write_state,
+                        fresh,
+                        fold,
+                        writes,
+                        wwrites,
+                        granted.as_deref_mut(),
+                    )
                     .map_err(|error| error.to_string())?;
                 if let Err(error) =
                     store.prepare_snapshots(&mut write, &group.snapshots, granted.as_deref_mut())
@@ -678,6 +737,11 @@ pub fn prepare_many(
         for target in write.buffer_targets() {
             out.buffer_slot_ids.push(target.dst().0);
             if let crate::store::rs::write::RsBufferTarget::Cow { src, dst, .. } = *target {
+                if store.is_window_page(dst) && out.window_buffer_apart {
+                    out.wpage_copies
+                        .push((group.lanes[0], store.engine_id(src), store.engine_id(dst)));
+                    continue;
+                }
                 out.page_copies.0.push(store.engine_id(src));
                 out.page_copies.1.push(store.engine_id(dst));
                 out.page_copy_lanes.push(group.lanes[0]);
@@ -718,12 +782,23 @@ pub fn prepare_many(
         } else {
             engine::fire::Lineage::Set
         };
+        // The window buffer's table as the fire found it, where the store
+        // buffers windowed layers' rows (CONTRACT-BC 19, 21).
+        let window = match store.window_table(ws) {
+            Ok(window) => window,
+            Err(error) => {
+                store.commit_folds(folds);
+                store.settle(published);
+                return Err(error.to_string());
+            }
+        };
         for (at, &lane) in group.lanes.iter().enumerate() {
             let fold = match (at, group.fold) {
                 (0, GroupFold::Host(count)) => engine::fire::FoldLen::Host(count),
                 (0, GroupFold::Device) => engine::fire::FoldLen::Device,
                 _ => engine::fire::FoldLen::Host(0),
             };
+            out.window_tables[lane] = window.clone();
             out.verbs[lane] = engine::fire::RsVerb::Buffer {
                 pages: pages.clone(),
                 base,

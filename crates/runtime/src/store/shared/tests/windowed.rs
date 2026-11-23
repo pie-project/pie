@@ -560,10 +560,11 @@ fn a_fire_too_wide_for_the_free_buffer_slots_is_cut_not_refused() {
 }
 
 /// The stores read a window buffer as the rs store's buffer, never as a
-/// second kv list, and state no window list for it; a load buffering both
-/// recurrent rows and windowed layers' rows is refused by name.
+/// second kv list, and state no window list for it; beside an rs list (a
+/// hybrid) the rs list stays the buffer and the window buffer is a pool of
+/// its own.
 #[test]
-fn the_window_buffer_is_the_buffer_and_a_load_of_two_buffers_is_refused() {
+fn the_window_buffer_is_the_buffer_or_a_pool_beside_the_rs_list() {
     let facts = windowed_facts();
     let pools = crate::store::chunks::StorePools::of(&facts).unwrap();
     assert!(pools.shared);
@@ -571,29 +572,13 @@ fn the_window_buffer_is_the_buffer_and_a_load_of_two_buffers_is_refused() {
     assert_eq!(pools.buffer.slot_bytes, MIB / 4, "the window buffer's slots");
     assert_eq!(pools.window_tokens, 0, "no window list");
 
-    let mut both = windowed_facts();
-    both.shapes.push(Facts {
-        role: SlotRole::RsBuffer,
-        ..shape(
-            RS,
-            SlotKind::List {
-                tokens: RS_TOKENS,
-                rate: 1,
-                window: None,
-            },
-            MIB / 4,
-        )
-    });
-    both.validate().unwrap();
-    let refused = SharedPool::new(&both, 256).err().expect("refused");
-    assert_eq!(
-        refused,
-        SharedError::TwoBuffers {
-            rs_list: RS.0,
-            window_buffer: WB.0,
-        }
-    );
-    assert!(refused.to_string().contains("not served yet"), "{refused}");
+    let facts = hybrid_facts();
+    let pools = crate::store::chunks::StorePools::of(&facts).unwrap();
+    assert_eq!(pools.buffer.slot_bytes, MIB / 8, "the rs list's slots");
+    let pool = SharedPool::new(&facts, 256).unwrap();
+    assert_eq!(pool.rs_list().map(|list| list.id), Some(RS));
+    assert_eq!(pool.window_buffer().map(|list| list.id), Some(WB));
+    assert_eq!(pool.buffer_list().map(|list| list.id), Some(RS));
 }
 
 /// A lone lane carrying no buffered row that folds part of what it writes
@@ -681,4 +666,411 @@ fn a_windowed_record_is_one_unit_over_its_shapes() {
         .collect();
     assert!(moved.contains(&(GDN, 3)) && moved.contains(&(CONV, 1)), "{moved:?}");
     rs.abort_suspend(txn);
+}
+
+/// A ring at chunk starts (CONTRACT-BC 21, `SlotRole::Ring`): one slot a
+/// chunk.
+const RINGS: EngineShape = EngineShape(7);
+/// A hybrid's window buffer holds 8 rows a slot, its rs list 4.
+const HY_WB_TOKENS: u32 = 8;
+
+/// A hybrid of recurrent and windowed layers: the kv list, the ring shape
+/// (before the state's), the recurrent state (`CONV`), the rs list (4 rows
+/// a slot) and the window buffer (8 rows a slot).
+fn hybrid_facts() -> ChunkFacts {
+    let mut facts = facts();
+    facts.shapes.retain(|shape| shape.id == LIST || shape.id == CONV);
+    facts.shapes.insert(
+        1,
+        Facts {
+            role: SlotRole::Ring,
+            ..shape(RINGS, SlotKind::Fixed { pieces: 1 }, CHUNK)
+        },
+    );
+    facts.shapes.push(Facts {
+        role: SlotRole::RsBuffer,
+        ..shape(
+            RS,
+            SlotKind::List {
+                tokens: RS_TOKENS,
+                rate: 1,
+                window: None,
+            },
+            MIB / 8,
+        )
+    });
+    facts.shapes.push(Facts {
+        role: SlotRole::WindowBuffer,
+        ..shape(
+            WB,
+            SlotKind::List {
+                tokens: HY_WB_TOKENS,
+                rate: 1,
+                window: None,
+            },
+            MIB / 4,
+        )
+    });
+    facts.windowed = vec![WindowedLayer {
+        layer: 1,
+        window: 8,
+        bytes: 8 * 256,
+        ..WindowedLayer::default()
+    }];
+    facts.record_bytes = facts.ring_bytes() + 4096;
+    facts.validate().unwrap();
+    facts
+}
+
+/// The slots of engine shape `id` the pool holds now.
+fn live_of(shared: &Shared, id: EngineShape) -> u64 {
+    let pool = shared.lock().unwrap();
+    let shape = pool.pool_shape(id).expect("a shape of the pool");
+    pool.pool().shape_demand(shape).live
+}
+
+/// A hybrid's lane the engine takes: its recurrent verb and its window
+/// fold both stated, one fold.
+fn hybrid_valid(lane: &::engine::Lane, facts: &ChunkFacts) {
+    let serves = Serves {
+        windowed_state: true,
+        rs_verbs: true,
+        chunks: true,
+        ..Serves::NONE
+    };
+    lane.validate_for(serves).unwrap();
+    lane.validate_chunks(facts).unwrap();
+}
+
+/// The lane's rs list pages, base and folded index.
+fn rs_buffer(lane: &::engine::Lane) -> (Vec<u32>, u32, u32) {
+    match &lane.rs {
+        ::engine::fire::RsVerb::Buffer {
+            pages,
+            base,
+            folded,
+            ..
+        } => (pages.clone(), *base, *folded),
+        ::engine::fire::RsVerb::Fold => (Vec::new(), 0, 0),
+    }
+}
+
+/// A hybrid buffers its recurrent rows in its rs list and its windowed
+/// layers' rows in its window buffer, two slot lists of their own sizes and
+/// bases sharing one folded index and one fold: a fold frees what each
+/// holds wholly below it; the rows a lone lane folds itself take no window
+/// slot (the rs list buffers them all, as an rs load does); its record is
+/// the ring shape's pieces first, then the state's.
+#[test]
+fn a_hybrid_buffers_rs_and_window_rows_apart_and_folds_them_once() {
+    let facts = hybrid_facts();
+    let (shared, stores) = stores_of(&facts);
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: facts.record_bytes,
+        buffer_page_tokens: 16,
+    });
+    let out = prepare(&mut rs, ws, 6).unwrap();
+    let lane = lanes_of(&out, &shared, &[(0, 6)], 0).remove(0);
+    hybrid_valid(&lane, &facts);
+    let ::engine::LaneRecord::Pieces(pieces) = &lane.record else {
+        panic!("a record")
+    };
+    let shapes: Vec<EngineShape> = pieces.iter().map(|(shape, _)| *shape).collect();
+    assert_eq!(shapes, vec![RINGS, CONV], "the ring's pieces first");
+    assert_eq!(lane.window.map(|window| window.base), Some(0));
+    settle(&mut rs, out.txn);
+
+    // Rows 6..13 unfolded: rs slots of 4..8, 8..12, 12..16; window slots of
+    // 0..8, 8..16.
+    let plan = one(vec![0], 6..13, GroupFold::None);
+    assert_eq!(
+        demand(&rs, &[ws], &plan),
+        Ok(RsUnits {
+            pages: 5,
+            wbuf: 2,
+            ..RsUnits::default()
+        })
+    );
+    let out = prepare_many(&mut rs, &[ws], &plan, None).unwrap();
+    let lane = lanes_of(&out, &shared, &[(6, 7)], 6).remove(0);
+    hybrid_valid(&lane, &facts);
+    let (pages, base, folded) = rs_buffer(&lane);
+    assert_eq!((pages.len(), base, folded), (3, 4, 6));
+    assert_eq!(
+        lane.window,
+        Some(WindowFold {
+            base: 0,
+            fold: FoldLen::Host(0),
+            lineage: Lineage::Set,
+        })
+    );
+    assert_eq!(table(&lane).len(), 2, "the window rows in their own list");
+    settle(&mut rs, out.txn);
+    assert_eq!((live_of(&shared, RS), live_of(&shared, WB)), (3, 2));
+
+    // One fold through 12: each list gives back what lies wholly below.
+    let out = prepare_many(&mut rs, &[ws], &one(vec![0], 13..14, GroupFold::Host(6)), None)
+        .unwrap();
+    let lane = lanes_of(&out, &shared, &[(13, 1)], 6).remove(0);
+    hybrid_valid(&lane, &facts);
+    assert_eq!(lane.window.map(|window| window.fold), Some(FoldLen::Host(6)));
+    settle(&mut rs, out.txn);
+    rs.retire_idle();
+    assert_eq!(rs.frozen(ws), Ok(12));
+    assert_eq!((live_of(&shared, RS), live_of(&shared, WB)), (1, 1));
+
+    // A lone lane folding part of what it writes: the rs list buffers it
+    // all; the window buffer only the rows past the fold.
+    let fresh = rs.create_working_set(RsGeometry {
+        state_size: facts.record_bytes,
+        buffer_page_tokens: 16,
+    });
+    let out = prepare(&mut rs, fresh, 6).unwrap();
+    settle(&mut rs, out.txn);
+    let plan = one(vec![0], 6..30, GroupFold::Host(20));
+    assert_eq!(
+        demand(&rs, &[fresh], &plan).map(|units| (units.pages - units.wbuf, units.wbuf)),
+        Ok((7, 1)),
+        "rs 4..32; window 24..32"
+    );
+    let out = prepare_many(&mut rs, &[fresh], &plan, None).unwrap();
+    let lane = lanes_of(&out, &shared, &[(6, 24)], 6).remove(0);
+    hybrid_valid(&lane, &facts);
+    assert_eq!(lane.window.map(|window| window.base), Some(24));
+    assert_eq!(table(&lane).len(), 1);
+    settle(&mut rs, out.txn);
+
+    for set in [ws, fresh] {
+        rs.release_working_set(set);
+    }
+    rs.retire_idle();
+    assert_eq!((live_of(&shared, RS), live_of(&shared, WB)), (0, 0));
+}
+
+/// A hybrid's fork shares both lists: a write into a shared partly filled
+/// slot of either copies it first, each under its own shape; a beam group
+/// on one set names one record, one rs buffer and one window table.
+#[test]
+fn a_hybrid_fork_copies_each_list_s_shared_tail_and_a_beam_shares_both() {
+    let facts = hybrid_facts();
+    let (shared, stores) = stores_of(&facts);
+    let mut rs = stores.rs.lock().unwrap();
+    let geom = RsGeometry {
+        state_size: facts.record_bytes,
+        buffer_page_tokens: 16,
+    };
+    let parent = rs.create_working_set(geom);
+    let out = prepare(&mut rs, parent, 6).unwrap();
+    settle(&mut rs, out.txn);
+    let out = prepare_many(&mut rs, &[parent], &one(vec![0], 6..10, GroupFold::None), None)
+        .unwrap();
+    let theirs = lanes_of(&out, &shared, &[(6, 4)], 6).remove(0);
+    settle(&mut rs, out.txn);
+    let child = rs.fork(parent).unwrap();
+    let out = prepare_many(&mut rs, &[child], &one(vec![0], 10..11, GroupFold::None), None)
+        .unwrap();
+    let lane = lanes_of(&out, &shared, &[(10, 1)], 6).remove(0);
+    hybrid_valid(&lane, &facts);
+    let pairs = |id: EngineShape| -> Vec<[u32; 2]> {
+        lane.slot_copies
+            .iter()
+            .find(|(shape, _)| *shape == id)
+            .map(|(_, pairs)| pairs.clone())
+            .unwrap_or_default()
+    };
+    // rs: 8..12 holds 8..10, shared; window: 8..16 holds 8..10, shared.
+    assert_eq!(pairs(RS), vec![[rs_buffer(&theirs).0[1], rs_buffer(&lane).0[1]]]);
+    assert_eq!(pairs(WB), vec![[table(&theirs)[1], table(&lane)[1]]]);
+    assert_eq!(table(&lane)[0], table(&theirs)[0], "a full slot stays shared");
+    settle(&mut rs, out.txn);
+
+    // Beams on the parent.
+    let plan = one(vec![0, 1], 10..14, GroupFold::None);
+    let out = prepare_many(&mut rs, &[parent; 2], &plan, None).unwrap();
+    let lanes = lanes_of(&out, &shared, &[(10, 2), (12, 2)], 6);
+    for lane in &lanes {
+        hybrid_valid(lane, &facts);
+        assert_eq!(table(lane), table(&lanes[0]));
+        assert_eq!(rs_buffer(lane), rs_buffer(&lanes[0]));
+        assert_eq!(record(lane), record(&lanes[0]));
+        assert_eq!(lane.window.map(|window| window.lineage), Some(Lineage::Admitted));
+    }
+    settle(&mut rs, out.txn);
+    for set in [parent, child] {
+        rs.release_working_set(set);
+    }
+    rs.retire_idle();
+}
+
+/// A hybrid parks whole: its record (ring and state pieces), its rs list
+/// slots and its window-buffer slots each to host rows of their own shape,
+/// and back; an export names both buffers.
+#[test]
+fn a_hybrid_parks_both_buffers_and_its_whole_record() {
+    let mut facts = hybrid_facts();
+    facts.host_chunks = 8;
+    let tiers = Tiers::of(&facts).unwrap();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut rs = RsStore::shared(&shared, tiers.host.as_ref());
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: facts.record_bytes,
+        buffer_page_tokens: 16,
+    });
+    let out = prepare(&mut rs, ws, 6).unwrap();
+    settle(&mut rs, out.txn);
+    let out = prepare_many(&mut rs, &[ws], &one(vec![0], 6..10, GroupFold::None), None).unwrap();
+    settle(&mut rs, out.txn);
+    let export = rs.export(ws).unwrap();
+    assert_eq!(export.buffer.iter().flatten().count(), 2, "rs 4..8, 8..12");
+    assert_eq!(export.wbuffer.iter().flatten().count(), 2, "window 0..8, 8..16");
+    let sets = HashSet::from([ws]);
+    let held = rs.suspendable(&sets);
+    assert_eq!(
+        held,
+        RsUnits {
+            slots: 1,
+            pages: 4,
+            wbuf: 2,
+            ..RsUnits::default()
+        }
+    );
+    let txn = rs.prepare_suspend(&sets).expect("the host takes it");
+    let moved: Vec<EngineShape> = txn
+        .copy_plan()
+        .shared
+        .iter()
+        .map(|(shape, _)| *shape)
+        .collect();
+    for shape in [RINGS, CONV, RS, WB] {
+        assert!(moved.contains(&shape), "{shape:?} in {moved:?}");
+    }
+    assert_eq!(rs.commit_suspend(txn), held);
+    let mut grant = rs.reserve(rs.swapped_units(&sets)).expect("room to come back");
+    let txn = rs.prepare_restore(&sets, &mut grant).expect("it comes back");
+    rs.commit_restore(txn);
+    assert_eq!(rs.suspendable(&sets), held, "on the device again");
+}
+
+/// A model whose state is its windowed layers alone states only the ring
+/// shape: its record is the ring's pieces.
+#[test]
+fn a_kv_only_window_model_s_record_is_its_ring() {
+    let mut facts = windowed_facts();
+    facts.shapes.retain(|shape| shape.id != CONV);
+    facts.shapes.insert(
+        1,
+        Facts {
+            role: SlotRole::Ring,
+            ..shape(RINGS, SlotKind::Fixed { pieces: 1 }, CHUNK)
+        },
+    );
+    facts.validate().unwrap();
+    let (shared, stores) = stores_of(&facts);
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = warm(&mut rs, 6);
+    let out = prepare_many(&mut rs, &[ws], &one(vec![0], 6..7, GroupFold::Host(1)), None)
+        .unwrap();
+    let lane = lanes_of(&out, &shared, &[(6, 1)], 6).remove(0);
+    valid(&lane, &facts);
+    let ::engine::LaneRecord::Pieces(pieces) = &lane.record else {
+        panic!("a record")
+    };
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].0, RINGS);
+    settle(&mut rs, out.txn);
+}
+
+/// A beam group's long prompt on a windowed-only load (four beams of 792
+/// rows, wider together than the 2897 a fire holds) is cut as kv lanes
+/// are: its lanes replay nothing, so several lanes are cuttable
+/// ([`crate::pipeline::fire::window_only`]); a hybrid's are not, its
+/// recurrent layers keeping their bound. The cut run buffers the same rows
+/// in the same slots' worth, folds to the same index and leaves the record
+/// where the uncut run does: what the engine reads is the same rows either
+/// way.
+#[test]
+fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
+    const BEAMS: usize = 4;
+    const ROWS: u32 = 792;
+    const HOLDS: usize = 2897;
+    let facts = windowed_facts();
+    let (_shared, stores) = stores_of(&facts);
+    assert!(crate::pipeline::fire::window_only(&stores, true));
+    let (_, hybrid) = stores_of(&hybrid_facts());
+    assert!(!crate::pipeline::fire::window_only(&hybrid, true), "a hybrid keeps the rs bound");
+
+    // The pass, cut as the host pass cuts a window-only load's lanes.
+    let req = crate::engine::FireRequest {
+        lanes: (0..BEAMS)
+            .map(|at| {
+                let mut lane = crate::engine::fire::lane_of(
+                    at as u32,
+                    vec![7; ROWS as usize],
+                    5 + at as u32 * ROWS,
+                    Vec::new(),
+                );
+                lane.lane.readout = ::engine::Readout::Last;
+                lane
+            })
+            .collect(),
+        boundary_program: true,
+        ..crate::engine::FireRequest::default()
+    };
+    let pieces = crate::pipeline::fire::pass_pieces(&req, true, true, 1024, 16, &[], &[]);
+    assert!(pieces.len() > 1, "the pass is cut");
+    for piece in &pieces {
+        let rows: u32 = piece.iter().flatten().map(|(from, to)| to - from).sum();
+        assert!(rows as usize <= HOLDS, "a piece of {rows} rows fits a fire");
+    }
+
+    // Uncut and cut, the set ends holding the same rows.
+    let run = |cut: bool| {
+        let (shared, stores) = stores_of(&facts);
+        let mut rs = stores.rs.lock().unwrap();
+        let ws = warm(&mut rs, 5);
+        let spans: Vec<Vec<(u32, u32)>> = if cut {
+            pieces
+                .iter()
+                .map(|piece| {
+                    piece
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(at, cut)| {
+                            cut.map(|(from, to)| {
+                                let held = 5 + at as u32 * ROWS;
+                                (held + from, held + to)
+                            })
+                        })
+                        .collect()
+                })
+                .collect()
+        } else {
+            vec![(0..BEAMS as u32).map(|at| (5 + at * ROWS, 5 + (at + 1) * ROWS)).collect()]
+        };
+        for spans in spans {
+            let low = spans.iter().map(|&(from, _)| from).min().unwrap();
+            let high = spans.iter().map(|&(_, to)| to).max().unwrap();
+            let lanes: Vec<usize> = (0..spans.len()).collect();
+            let ids = vec![ws; spans.len()];
+            let plan = one(lanes, low..high, GroupFold::None);
+            demand(&rs, &ids, &plan).expect("counted, never refused");
+            let out = prepare_many(&mut rs, &ids, &plan, None).unwrap();
+            let rows: Vec<(u32, u32)> = spans.iter().map(|&(from, to)| (from, to - from)).collect();
+            for lane in lanes_of(&out, &shared, &rows, 5) {
+                valid(&lane, &facts);
+            }
+            settle(&mut rs, out.txn);
+        }
+        let held = (
+            rs.frozen(ws),
+            rs.base(ws),
+            rs.buffer_size(ws),
+            rs.folded_slot(ws).map(|slot| slot.is_some()),
+            wb_live(&shared),
+        );
+        rs.release_working_set(ws);
+        held
+    };
+    assert_eq!(run(true), run(false), "the same rows, folded the same");
 }
