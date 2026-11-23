@@ -62,7 +62,28 @@ fn main() {
     if skip {
         println!("cargo:warning=PIE_BUILTINS=skip: this pie embeds no built-in inferlets");
     }
-    let mut generated = String::new();
+    // What the built-ins are built from, by content: every file of the
+    // inputs above (the inferlets' and policies' workspaces, their manifests
+    // and lockfiles, the guest crates they build on), each by its path
+    // under the repository and its bytes, sorted. Two trees of the same
+    // source give the same fingerprint, where the built bytes differ (cargo
+    // keys a path crate's symbols by where it lies), so a key on a
+    // built-in's behaviour (a committed host cover's) takes this, not the
+    // component's hash.
+    let mut inputs: Vec<PathBuf> = vec![inferlets.clone(), policies.clone()];
+    for dep in [
+        "crates/inferlet/src",
+        "crates/inferlet/wit",
+        "crates/client-api/src",
+        "crates/inferlet-macros/src",
+        "crates/eta-dsl/src",
+        "crates/policy/src",
+        "crates/policy/wit",
+    ] {
+        inputs.push(root.join(dep));
+    }
+    let source = source_fingerprint(&root, &inputs);
+    let mut generated = format!("/// What the built-ins are built from, by content.\npub const SOURCE: &str = {source:?};\n");
     for (name, workspace, set) in [
         ("ALL", &inferlets, &builtins),
         ("POLICIES", &policies, &policy_builtins),
@@ -83,7 +104,7 @@ fn main() {
                 fs::copy(&wasm, &staged)
                     .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
                 generated.push_str(&format!(
-                    "    Builtin {{ name: {:?}, component: include_bytes!({:?}) }},\n",
+                    "    Builtin {{ name: {:?}, component: include_bytes!({:?}), source: SOURCE }},\n",
                     builtin.name,
                     staged.display().to_string(),
                 ));
@@ -92,6 +113,55 @@ fn main() {
         generated.push_str("];\n");
     }
     fs::write(out_dir.join("builtins.rs"), generated).expect("write builtins.rs");
+}
+
+/// A fingerprint of every file under `inputs` (no `target` directory),
+/// each by its path relative to `root` and its bytes, in sorted order.
+fn source_fingerprint(root: &Path, inputs: &[PathBuf]) -> String {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut walk: Vec<PathBuf> = inputs.to_vec();
+    while let Some(at) = walk.pop() {
+        let Ok(entries) = fs::read_dir(&at) else {
+            if at.is_file() {
+                files.push(at);
+            }
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target" || n == ".git") {
+                    continue;
+                }
+                walk.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    let mut keyed: Vec<(String, PathBuf)> = files
+        .into_iter()
+        .map(|p| {
+            let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            (rel, p)
+        })
+        .collect();
+    keyed.sort();
+    keyed.dedup_by(|a, b| a.0 == b.0);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (rel, path) in &keyed {
+        eat(rel.as_bytes());
+        eat(&[0]);
+        eat(&fs::read(path).unwrap_or_default());
+        eat(&[0]);
+    }
+    format!("{hash:016x}")
 }
 
 fn find_builtins(workspace: &Path) -> Vec<Builtin> {
@@ -151,31 +221,11 @@ fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
         "CARGO_BUILD_TARGET",
         "CARGO_TARGET_DIR",
         "RUSTC_WORKSPACE_WRAPPER",
-        "CARGO_TARGET_WASM32_WASIP3_RUSTFLAGS",
     ] {
         command.env_remove(var);
     }
     command.env("CARGO_TARGET_DIR", target_dir);
-    // Reproducible: no checkout's, home's or target's path is written into a
-    // component (panic locations, debug strings), so one source builds the
-    // same bytes, and the same program hash, in any tree on any machine.
-    // What a component's hash keys (a host cover, `runtime::bootstrap`) is
-    // then its source, not where it was built.
-    let root = workspace
-        .join("../../..")
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let cargo_home = env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
-        env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo"))
-    });
-    let mut remaps = vec![
-        format!("--remap-path-prefix={}=/pie", root.display()),
-        format!("--remap-path-prefix={}=/target", target_dir.display()),
-    ];
-    if let Some(cargo_home) = cargo_home {
-        remaps.push(format!("--remap-path-prefix={}=/cargo", cargo_home.display()));
-    }
-    command.env("CARGO_TARGET_WASM32_WASIP3_RUSTFLAGS", remaps.join(" "));
+
     let output = command
         .output()
         .unwrap_or_else(|e| panic!("running cargo for {}: {e}", workspace.display()));

@@ -57,6 +57,7 @@ pub fn builtins() -> Vec<runtime::bootstrap::BuiltinProgram> {
         .map(|b| runtime::bootstrap::BuiltinProgram {
             name: b.name,
             component: b.component,
+            source: b.source,
         })
         .collect()
 }

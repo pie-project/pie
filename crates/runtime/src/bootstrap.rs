@@ -112,6 +112,9 @@ pub struct Config {
 pub struct BuiltinProgram {
     pub name: &'static str,
     pub component: &'static [u8],
+    /// What it was built from, by content (`builtins::SOURCE`): the same in
+    /// any tree of the same source, where `component`'s bytes are not.
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -761,6 +764,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             dir,
             engines: prints.join(";"),
             deployment: model_id.clone(),
+            sampler_builtin: config
+                .builtin_programs
+                .iter()
+                .find(|b| b.name == "compat-openai")
+                .map(|b| (program::ProgramHash::of(b.component), b.source)),
             committed: engine_configs
                 .iter()
                 .flat_map(|d| d.engine_backend.committed_covers().iter().copied())
@@ -1107,11 +1115,16 @@ async fn host_cover(
     };
     let reference = program::ProgramRef::parse("compat-openai")?;
     let built = program::resolve(None, &reference).await?;
+    // The sampler by what it was built from where it is the built-in (its
+    // bytes differ tree to tree, its source does not), else by its hash.
+    let sampler = match &cache.sampler_builtin {
+        Some((hash, source)) if *hash == built.hash => format!("source {source}"),
+        _ => built.hash.to_string(),
+    };
     let key = format!(
-        "{}|{}|sampler {}|frame {}|depth {}|context {context}",
+        "{}|{}|sampler {sampler}|frame {}|depth {}|context {context}",
         cache.engines,
         cache.deployment,
-        built.hash,
         crate::scheduler::configured_frame_size().max(1),
         crate::scheduler::configured_dispatch_depth(),
     );
@@ -1178,6 +1191,9 @@ struct CoverCache {
     deployment: String,
     /// The covers committed for the engines' devices: each file's text.
     committed: Vec<&'static str>,
+    /// The built-in sampler's hash and source fingerprint, where it is
+    /// installed: the key names its source where the resolved sampler is it.
+    sampler_builtin: Option<(program::ProgramHash, &'static str)>,
 }
 
 /// One kept host cover, as the cache and a committed file state it.
