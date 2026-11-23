@@ -106,6 +106,12 @@ pub const CHANNEL: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 1
 /// only in the load's facts, as `CHANNEL` is.
 pub const ADAPTER: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 2);
 
+/// The pool's `Instance` slots (`SlotRole::Instance`): what a bound
+/// instance keeps on the device from its bind to its unbind (a beam group's
+/// state, `BEAM-PAGE-LISTS.md` §4), 1 KiB a slot as `CHANNEL`'s, an item one
+/// run of them. Stated only in the load's facts, as `CHANNEL` is.
+pub const INSTANCE: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 3);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// The kv list.

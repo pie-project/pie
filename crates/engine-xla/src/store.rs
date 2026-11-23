@@ -18,6 +18,7 @@
 //! before anything traces); the table still moves chunks when the runtime
 //! asks ([`Pools::evacuate`]), which it does not for a fixed pool.
 
+pub mod beam;
 pub mod kv;
 pub mod layout;
 pub mod stage;
@@ -164,6 +165,13 @@ pub struct Pools {
     /// Each streamed weight plane's view of the pool: `(width, view)`,
     /// bf16 rows of `width`.
     weight_views: Vec<(u32, Tensor)>,
+    /// Each width rung's beam head program, laid at load
+    /// ([`beam::Head`]): a fire stages its inputs and runs it, never traces
+    /// it again.
+    beam_heads: Vec<(
+        kernels_xla::beam::Layout,
+        std::sync::Arc<crate::device::Program>,
+    )>,
     /// Each streamed bank's miss copy in pinned host memory: `(param, pool
     /// rows an expert's plane takes, root, buffer)`.
     host_banks: Vec<(u32, u32, Tensor, Buffer)>,
@@ -694,6 +702,7 @@ impl Pools {
             bytes: total,
             weight_chunks,
             weight_views: Vec::new(),
+            beam_heads: Vec::new(),
             host_banks: Vec::new(),
             slab: (slab_row, staging.rows),
             act_chunks,
@@ -989,6 +998,16 @@ impl Pools {
                 pinned: None,
                 role: SlotRole::Channel,
             }))
+            .chain(std::iter::once(SlotShape {
+                id: layout::INSTANCE,
+                kind: SlotKind::Fixed { pieces: 1 },
+                slot_bytes: crate::guest::CHANNEL_SLOT,
+                slots_per_chunk: narrow(self.layout.chunk_bytes / crate::guest::CHANNEL_SLOT),
+                sets_per_working_set: 1,
+                rows: Vec::new(),
+                pinned: None,
+                role: SlotRole::Instance,
+            }))
             .chain((self.adapter_slot > 0).then(|| SlotShape {
                 id: layout::ADAPTER,
                 kind: SlotKind::Fixed { pieces: 1 },
@@ -1129,6 +1148,13 @@ impl Pools {
     /// ([`layout::CHANNEL`], 1 KiB slots).
     #[must_use]
     pub fn channel_row(&self, slot: u32) -> Option<u32> {
+        self.carved_row(crate::guest::CHANNEL_SLOT, slot)
+    }
+
+    /// The pool row `Instance` slot ref `slot` starts at
+    /// ([`layout::INSTANCE`], 1 KiB slots as `Channel`'s).
+    #[must_use]
+    pub fn instance_row(&self, slot: u32) -> Option<u32> {
         self.carved_row(crate::guest::CHANNEL_SLOT, slot)
     }
 
@@ -1571,7 +1597,7 @@ impl Pools {
     /// Pool rows a slot of shape `id` takes: a state shape's, or a
     /// `Channel` slot's ([`layout::CHANNEL`]).
     fn slot_rows(&self, id: ShapeId) -> Result<u64> {
-        if id == layout::CHANNEL {
+        if id == layout::CHANNEL || id == layout::INSTANCE {
             return Ok(crate::guest::CHANNEL_SLOT / ROW_BYTES);
         }
         if id == layout::ADAPTER && self.adapter_slot > 0 {
@@ -1586,6 +1612,14 @@ impl Pools {
             return self.channel_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
                 what: format!("Channel slot {slot}, which lies past the pool"),
             });
+        }
+        if id == layout::INSTANCE {
+            return self
+                .instance_row(slot)
+                .map(i64::from)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("Instance slot {slot}, which lies past the pool"),
+                });
         }
         if id == layout::ADAPTER {
             return self.adapter_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {

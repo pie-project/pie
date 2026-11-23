@@ -46,6 +46,9 @@ struct Instance {
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
+    /// Its beam group's state on the device, where its program states each
+    /// beam's parent (`BEAM-PAGE-LISTS.md`).
+    beam: Option<crate::beam::Seat>,
 
     channels: Vec<ChannelId>,
     /// The `Channel` slots of the rings the instance holds itself, as its
@@ -177,6 +180,23 @@ impl Latch {
         }
     }
 
+    /// Lane `lane` (attached to `instance`) faulted for `why`; the rest of
+    /// the step commits.
+    pub(crate) fn fault_lane(&self, lane: u32, instance: InstanceId, why: &str) {
+        let mut faults = self.lane_faults.lock().expect("lane faults lock poisoned");
+        faults.fault_lanes(lane..lane + 1, Some(instance), why);
+    }
+
+    /// Beam group `instance`'s common slot as the step's head step left it
+    /// (`BEAM-PAGE-LISTS.md` §11.3): told with its landing.
+    pub(crate) fn beam_common(&self, instance: InstanceId, slot: u32) {
+        self.lane_faults
+            .lock()
+            .expect("lane faults lock poisoned")
+            .beam_common
+            .push((instance, slot));
+    }
+
     /// The step's reported lanes wrote `writes`: told with its landing.
     pub(crate) fn report(&self, writes: Vec<engine::KvWrites>) {
         self.writes
@@ -212,13 +232,10 @@ impl Latch {
                         let mut outcome = engine::StepOutcome::wrote(std::mem::take(
                             &mut *self.writes.lock().expect("writes lock poisoned"),
                         ));
-                        outcome.faulted = std::mem::take(
-                            &mut self
-                                .lane_faults
-                                .lock()
-                                .expect("lane faults lock poisoned")
-                                .faulted,
-                        );
+                        let mut held = self.lane_faults.lock().expect("lane faults lock poisoned");
+                        outcome.faulted = std::mem::take(&mut held.faulted);
+                        outcome.beam_common = std::mem::take(&mut held.beam_common);
+                        drop(held);
                         outcome
                     }
                     Some(why) => engine::StepOutcome::lost(self.lanes, why),
@@ -673,6 +690,61 @@ impl Plane {
         Ok(())
     }
 
+    /// Instance `id`'s beam group on the device, if its program states
+    /// parents.
+    #[must_use]
+    pub fn beam_seat(&self, id: InstanceId) -> Option<crate::beam::Seat> {
+        self.instances.get(&id).and_then(|seat| seat.beam)
+    }
+
+    /// Where instance `id`'s beams' parents lie for its next head: its
+    /// carried cell's pool row. A group's first fire primes it and reads no
+    /// parents; a later one whose last epilogue ran on the host (its cell in
+    /// a host ring, not the pool) is refused by name: the parents are read
+    /// on the device only (BEAM-PAGE-LISTS §2).
+    pub fn parents_row(&self, id: InstanceId) -> Result<u32, Refusal> {
+        let held = self.instances.get(&id).ok_or(Refusal::Closed {
+            what: "instance",
+            id: id.0,
+        })?;
+        let Some(seat) = held.beam else {
+            return Err(Refusal::Program(format!("instance {id} states no parents")));
+        };
+        let cell = held
+            .cells
+            .iter()
+            .find(|&&(channel, _)| channel == seat.group.channel);
+        match cell {
+            Some(&(_, row)) if held.on_device => Ok(row),
+            _ if seat.fires == 0 => Ok(seat.row),
+            _ => Err(Refusal::Program(format!(
+                "instance {id}'s parents are in a host ring (its last epilogue ran on the \
+                 host); a beam group reads its parents on the device only"
+            ))),
+        }
+    }
+
+    /// Counts a head run for instance `id`'s group; returns the fire's
+    /// index (its fault set's).
+    pub fn beam_fired(&mut self, id: InstanceId) -> Option<u64> {
+        let seat = self.instances.get_mut(&id)?.beam.as_mut()?;
+        let at = seat.fires;
+        seat.fires += 1;
+        Some(at)
+    }
+
+    /// Instance `id`'s beam state moved to the `Instance` run at `row`
+    /// (`Engine::rebind_slots`: the runtime copied it there).
+    pub fn rebind_beam(&mut self, id: InstanceId, row: u32) {
+        if let Some(seat) = self
+            .instances
+            .get_mut(&id)
+            .and_then(|seat| seat.beam.as_mut())
+        {
+            seat.row = row;
+        }
+    }
+
     #[must_use]
     pub fn package(
         &self,
@@ -932,6 +1004,7 @@ impl Plane {
         &mut self,
         binding: &InstanceBinding,
         cell_row: &dyn Fn(u32) -> Option<u32>,
+        beam: Option<crate::beam::Seat>,
     ) -> Result<BoundInstance, Refusal> {
         let plan = self
             .programs
@@ -992,6 +1065,7 @@ impl Plane {
                 plan,
                 inst,
                 geometry: binding.geometry,
+                beam,
                 channels: binding.channels.clone(),
                 own_rings: binding.ring_slots.clone(),
                 poisoned,

@@ -189,6 +189,10 @@ pub struct Seated<'a> {
     /// of the ones this shell derives from the extent and the page table.
     pub writes: Option<(&'a [u32], &'a [u32])>,
 
+    /// The lane is a beam of a group whose head resolved its page entries
+    /// past `f0` and its write page this fire (`BEAM-PAGE-LISTS.md` §6.5).
+    pub beam: Option<crate::beam::BeamLane>,
+
     pub first: Option<u32>,
 
     /// The lane's slot refs of the window list, in its token order (its
@@ -227,6 +231,7 @@ impl<'a> Seated<'a> {
             group: None,
             kv_less: false,
             writes: None,
+            beam: None,
             first: None,
             window: &[],
             fixed: &[],
@@ -2978,6 +2983,56 @@ impl Shell {
                 write_offset: Some(inputs.i32s(handles, &g.write_offset, 1)),
             });
         }
+        // Each beam lane's entries past `f0` and its write page, where its
+        // group's head resolved them (BEAM-PAGE-LISTS §6.5); -1 elsewhere.
+        // Staged at every fire, so a beam fire is the plain fire's program.
+        let beam_words = {
+            let padded = geometries
+                .first()
+                .map_or(0, |_| (lane_count as usize) * (max_pages as usize));
+            let first = geometries.first();
+            let entries_n = first.map_or(0, |g| g.indices.len().max(padded)).max(1);
+            let mut entry_rows = vec![-1i32; entries_n];
+            let mut entry_lanes = vec![0i32; entries_n];
+            let mut write_rows = vec![-1i32; rows as usize];
+            let mut write_lanes = vec![0i32; rows as usize];
+            if let Some(g) = first
+                && lanes.iter().any(|s| s.beam.is_some())
+            {
+                if table_windowed.first() == Some(&true) {
+                    return Err(Fault::Program {
+                        at: "serve::beam",
+                        why: "a beam group's lists resolve over full-context tables, and this \
+                              load's first table is windowed"
+                            .to_string(),
+                    });
+                }
+                for (seat, row) in composition.lanes().iter().enumerate() {
+                    let Some(beam) = lanes.get(row.source as usize).and_then(|s| s.beam) else {
+                        continue;
+                    };
+                    let from = g.indptr[seat] as usize;
+                    let to = g.indptr[seat + 1] as usize;
+                    for (j, at) in (from..to).enumerate() {
+                        if let Some((r, l)) = beam.entry(j as u32) {
+                            entry_rows[at] = r;
+                            entry_lanes[at] = l;
+                        }
+                    }
+                    let (r, l) = beam.write();
+                    for at in row.row_offset..row.row_offset + row.rows {
+                        write_rows[at as usize] = r;
+                        write_lanes[at as usize] = l;
+                    }
+                }
+            }
+            (
+                inputs.i32s(handles, &entry_rows, 1),
+                inputs.i32s(handles, &entry_lanes, 1),
+                inputs.i32s(handles, &write_rows, 1),
+                inputs.i32s(handles, &write_lanes, 1),
+            )
+        };
         if geometry.is_empty() {
             // A plan with no kv row still reads the All axis's token tables
             // (`request_of_token`, `row_valid`): table 0 binds them alone.
@@ -3090,6 +3145,7 @@ impl Shell {
         let bindings = FireBindings {
             tokens: tokens_t,
             token_words,
+            beam_words,
             positions: positions_t,
             cache_rows: cache_rows_t,
             readout_rows: readout_t,
@@ -3907,6 +3963,7 @@ impl Shell {
         let bindings = FireBindings {
             tokens: none,
             token_words: (none, none),
+            beam_words: (none, none, none, none),
             positions: none,
             cache_rows: none,
             readout_rows: pick_t,
@@ -4151,6 +4208,55 @@ impl Shell {
                 let v = cx.reshape(v, &[i64::from(tokens.rows), i64::from(tokens.width)])?;
                 cx.write(tokens, v)
             })?;
+        }
+        // A beam lane's entries past `f0` and its write page, as its group's
+        // head resolved them (the head ran on the pool before this fire).
+        if let Some(cache) = bindings.geometry.first() {
+            use crate::emit::Emit as _;
+            let (entry_rows, entry_lanes, write_rows, write_lanes) = bindings.beam_words;
+            let root = self.pools.root();
+            let picks: Vec<(Tensor, Tensor, Tensor)> = [
+                cache.indices.map(|t| (t, entry_rows, entry_lanes)),
+                cache.write_page.map(|t| (t, write_rows, write_lanes)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            for (staged, rows_t, lanes_t) in picks {
+                tracer.emit(&mut |cx| {
+                    use kernels_xla::hlo::{Cmp, Elem};
+                    let pool = cx.read(root)?;
+                    let n = i64::from(staged.rows) * i64::from(staged.width);
+                    let at = cx.read(rows_t)?;
+                    let at = cx.reshape(at, &[n])?;
+                    let col = cx.read(lanes_t)?;
+                    let col = cx.reshape(col, &[n])?;
+                    let zero = cx.const_i(Elem::I32, 0, &[n]);
+                    let fed = cx.compare(Cmp::Ge, at, zero)?;
+                    let row = cx.max(at, zero)?;
+                    let row = cx.reshape(row, &[n, 1])?;
+                    let col = cx.reshape(col, &[n, 1])?;
+                    let idx = cx.concat(&[row, col], 1)?;
+                    let got = cx.gather(
+                        pool,
+                        idx,
+                        &kernels_xla::hlo::GatherDims {
+                            offset_dims: vec![],
+                            collapsed_slice_dims: vec![0, 1],
+                            start_index_map: vec![0, 1],
+                            index_vector_dim: 1,
+                            ..kernels_xla::hlo::GatherDims::default()
+                        },
+                        &[1, 1],
+                    )?;
+                    let got = cx.bitcast(got, Elem::I32)?;
+                    let was = cx.read(staged)?;
+                    let was = cx.reshape(was, &[n])?;
+                    let v = cx.select(fed, got, was)?;
+                    let v = cx.reshape(v, &[i64::from(staged.rows), i64::from(staged.width)])?;
+                    cx.write(staged, v)
+                })?;
+            }
         }
         let probed = {
             let mut run = Run::new(
