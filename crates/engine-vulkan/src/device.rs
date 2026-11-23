@@ -23,7 +23,9 @@ mod stub;
 
 #[cfg(not(feature = "vulkan"))]
 pub mod ctx {
-    pub use super::stub::{Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations};
+    pub use super::stub::{
+        Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations, trailing,
+    };
 }
 #[cfg(not(feature = "vulkan"))]
 pub mod alloc {

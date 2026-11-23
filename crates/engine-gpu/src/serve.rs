@@ -7421,6 +7421,7 @@ impl<B: Serve> Shell<B> {
             })
             .find_map(|(_, row)| lanes[row.source as usize].scores)
             .map(|cell| (&cell.buffer, cell.at, cell.bytes));
+        let score_room = room.map(|(buffer, at, _)| (buffer.clone(), at));
         // A naming walk fires nothing: its capturing classes' rows bind the
         // span's buffer, which no kernel writes.
         let named = match (room, B::NAMES) {
@@ -7598,6 +7599,7 @@ impl<B: Serve> Shell<B> {
         }
         Ok(Prepared {
             lanes,
+            score_room,
             done,
             wrote,
             left: merged(left),
@@ -7892,6 +7894,9 @@ pub struct StepView<'a, B: Serve> {
 
 pub struct Prepared<'a, B: Serve> {
     pub lanes: &'a [Seated<'a, B>],
+    /// The score room the fire's capturing lanes lay their rows in (its
+    /// first capturing lane's pair's): its buffer and byte.
+    pub score_room: Option<(B::Buffer, u64)>,
     pub done: Option<Done>,
     /// The fold reports of a step whose completion another pass reports
     /// (`done` is `None`): its lanes' reports, for that pass to carry.
@@ -9348,9 +9353,10 @@ impl<B: Serve> Shell<B> {
         let mut decoding = vec![false; table.classes.len()];
         let mut prefilling = vec![false; table.classes.len()];
         for request in facts.requests() {
-            if let Some(class) = table.class_of(facts.word(&request) & table.mask)
-                && request.plain()
-            {
+            // Every request the trace serves, plain or not: a class whose
+            // lanes carry a mask, an adapter or a guest input is a body of
+            // its own (its lanes are walked carrying them, `naming_lane`).
+            if let Some(class) = table.class_of(facts.word(&request) & table.mask) {
                 if request.query_len() == 1 {
                     decoding[class] = true;
                 } else {
@@ -9379,7 +9385,15 @@ impl<B: Serve> Shell<B> {
         let tile_from = self.tuning.sdpa_tile_rows_per_request();
         // Each lane's (class, rows).
         let mut shapes: Vec<Vec<(usize, u32)>> = Vec::new();
-        let classes: Vec<usize> = (0..decoding.len()).filter(|&class| !self.captures(class)).collect();
+        // Every class, a capturing one too: its lanes lay their score rows
+        // in a room laid as a pair's is (a run of chunks under the span),
+        // which a replay binds where the fire's room lies.
+        let classes: Vec<usize> = (0..decoding.len()).collect();
+        let arming_room = if classes.iter().any(|&class| self.captures(class)) {
+            self.arming_room()?
+        } else {
+            None
+        };
         let pow2_lanes = |most: u32| {
             std::iter::successors(Some(1u32), |lanes| lanes.checked_mul(2))
                 .take_while(move |&lanes| lanes <= most && lanes <= cap)
@@ -9598,6 +9612,9 @@ impl<B: Serve> Shell<B> {
                     if *fed && rows == 1 && decoding[class] {
                         lane.feed = Some(&cell);
                     }
+                    if self.captures(class) {
+                        lane.scores = arming_room.as_ref();
+                    }
                 }
                 // The fire stages on the first free arm: the ones before
                 // `arm` are held while it fires.
@@ -9650,6 +9667,32 @@ impl<B: Serve> Shell<B> {
             "the recorded bodies' host memory against the allowance"
         );
         Ok(recorded)
+    }
+
+    /// The score room the arm walk's capturing lanes lay their rows in: as
+    /// a pair's is laid, a run of whole chunks right under the span, in one
+    /// segment. `None` where the load captures no scores.
+    fn arming_room(&self) -> Result<Option<DeviceCell<B>>> {
+        let Some(rows) = self.span.capture() else {
+            return Ok(None);
+        };
+        let lanes = self.budgets.tokens.max_lanes;
+        let bytes = rows.region(lanes, lanes).1;
+        let layout = self.pools.layout();
+        let run = u32::try_from(bytes.div_ceil(layout.chunk_bytes.max(1))).unwrap_or(u32::MAX);
+        let Some(first) = layout
+            .total_chunks
+            .checked_sub(self.pools.span_chunks())
+            .and_then(|below| below.checked_sub(run))
+        else {
+            return Ok(None);
+        };
+        let (buffer, at) = self.pools.chunk_place(first)?;
+        Ok(Some(DeviceCell {
+            buffer: buffer.clone(),
+            at,
+            bytes,
+        }))
     }
 
     /// One fire of `lanes`, each `(class, rows)`, staged and walked

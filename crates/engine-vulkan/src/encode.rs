@@ -154,12 +154,19 @@ struct Scratch {
     /// Each binding's pool segment, where it binds one (below the span's),
     /// and whether it binds the buffer whole.
     segments: Vec<Option<(u32, bool)>>,
+    /// Each binding's place in the frame's score room, where it binds the
+    /// room at a binding laid for it: the bytes past the room's byte.
+    rooms: Vec<Option<u64>>,
 }
 
 /// What stands for a pool segment's buffer in a frame's hash: its place,
 /// never the buffer, which a commit or a release changes under a recording
 /// that is rebound ([`crate::device::Context::rebind_segments`]).
 const SEGMENT_TAG: u64 = 0xffff_ffff_0000_0000;
+
+/// What stands for a score room's buffer in a frame's hash: the room's place
+/// is the fire's ([`crate::device::Kept::bind_room`]).
+const ROOM_TAG: u64 = 0xffff_fffe_0000_0000;
 
 #[cfg(feature = "vulkan")]
 pub struct Sink<'a> {
@@ -341,12 +348,14 @@ impl Sink<'_> {
         scratch.reads.clear();
         scratch.writes.clear();
         scratch.segments.clear();
-        let (infos, writes_at, extents, push, segments) = (
+        scratch.rooms.clear();
+        let (infos, writes_at, extents, push, segments, rooms) = (
             &mut scratch.infos,
             &mut scratch.writes_at,
             &mut scratch.extents,
             &mut scratch.push,
             &mut scratch.segments,
+            &mut scratch.rooms,
         );
         for arg in args {
             match *arg {
@@ -362,6 +371,7 @@ impl Sink<'_> {
                         writes_at.push(false);
                         extents.push(0);
                         segments.push(None);
+                        rooms.push(None);
                         continue;
                     }
                     let binding = self.handles.get(handle).ok_or_else(|| {
@@ -394,15 +404,28 @@ impl Sink<'_> {
                     writes_at.push(mutable);
                     extents.push(binding.extent());
                     let slab = binding.buffer().slab();
-                    let segment = self.segments.get(&ash::vk::Handle::as_raw(slab.buffer)).map(|&at| {
-                        (at, binding.offset() == 0 && binding.extent() == binding.buffer().bytes())
-                    });
+                    // The score room at a binding laid for it is the fire's
+                    // (a replay binds the room it lays its rows in); a pool
+                    // segment is bound by its place.
+                    let at = infos.len() - 1;
+                    let room = (at < 64 && pipeline.rooms & (1 << at) != 0)
+                        .then_some(self.frame.room)
+                        .flatten()
+                        .filter(|&(room, _)| room == slab.buffer)
+                        .map(|(_, at)| binding.offset().saturating_sub(at));
+                    let segment = room.is_none().then(|| {
+                        self.segments.get(&ash::vk::Handle::as_raw(slab.buffer)).map(|&at| {
+                            (at, binding.offset() == 0 && binding.extent() == binding.buffer().bytes())
+                        })
+                    }).flatten();
                     segments.push(segment);
-                    // A recording does not hold a pool segment's buffer: its
-                    // release gives the memory back, and the recording is
-                    // rebound to the segment's stand-in first. A walk run
-                    // once holds it until it lands.
-                    if segment.is_none() || !self.frame.kept() {
+                    rooms.push(room);
+                    // A recording holds neither a pool segment's buffer nor
+                    // its room's: a segment's release gives the memory back
+                    // (the recording rebound to its stand-in first), and a
+                    // room is its pair's. A walk run once holds them until
+                    // it lands.
+                    if (segment.is_none() && room.is_none()) || !self.frame.kept() {
                         self.frame.retain(slab);
                     }
                 }
@@ -480,6 +503,7 @@ impl Sink<'_> {
                 writes_at.resize(at, false);
                 extents.resize(at, 0);
                 segments.resize(at, None);
+                rooms.resize(at, None);
                 infos.push(
                     vk::DescriptorBufferInfo::default()
                         .buffer(buffer)
@@ -489,6 +513,7 @@ impl Sink<'_> {
                 writes_at.push(false);
                 extents.push(0);
                 segments.push(None);
+                rooms.push(None);
                 Some((place, &block.words))
             }
             None => None,
@@ -540,12 +565,19 @@ impl Sink<'_> {
                     .enumerate()
                     .take(declared)
                     .filter(|&(at, _)| pipeline.used[at] && Some(at) != params_at)
-                    .map(|(at, info)| match scratch.segments.get(at).copied().flatten() {
-                        Some((segment, true)) => (SEGMENT_TAG | u64::from(segment), 0, u64::MAX),
-                        Some((segment, false)) => {
-                            (SEGMENT_TAG | u64::from(segment), info.offset, info.range)
+                    .map(|(at, info)| {
+                        if let Some(past) = scratch.rooms.get(at).copied().flatten() {
+                            return (ROOM_TAG, past, info.range);
                         }
-                        None => (info.buffer.as_raw(), info.offset, info.range),
+                        match scratch.segments.get(at).copied().flatten() {
+                            Some((segment, true)) => {
+                                (SEGMENT_TAG | u64::from(segment), 0, u64::MAX)
+                            }
+                            Some((segment, false)) => {
+                                (SEGMENT_TAG | u64::from(segment), info.offset, info.range)
+                            }
+                            None => (info.buffer.as_raw(), info.offset, info.range),
+                        }
                     }),
             );
             let mut pushed = push.clone();
@@ -593,12 +625,16 @@ impl Sink<'_> {
         // elsewhere it stands only while the segments do.
         if self.frame.kept() {
             for (at, info) in infos.iter().enumerate().take(declared) {
-                let Some((segment, whole)) = scratch.segments.get(at).copied().flatten() else {
-                    continue;
-                };
                 if !pipeline.used[at] {
                     continue;
                 }
+                if let Some(past) = scratch.rooms.get(at).copied().flatten() {
+                    self.frame.room_binds(set, at as u32, past, info.range);
+                    continue;
+                }
+                let Some((segment, whole)) = scratch.segments.get(at).copied().flatten() else {
+                    continue;
+                };
                 if at < 64 && pipeline.segments & (1 << at) != 0 {
                     let bytes = if whole { u64::MAX } else { info.range };
                     self.frame.rebinds(set, at as u32, segment, info.offset, bytes);

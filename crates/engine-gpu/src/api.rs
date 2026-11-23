@@ -1065,8 +1065,8 @@ where
                 engine = B::KIND,
                 "stated eager at load, each fire walked and never recorded: a fire past the \
                  bodies' allowance (named above where one is), one with a group mask, one \
-                 landing a recurrent snapshot, one whose token table streams with no ring, a \
-                 split step"
+                 landing a recurrent snapshot, one whose token table streams with no ring, one \
+                 whose lanes capture scores, a split step"
             );
         } else {
             tracing::info!(

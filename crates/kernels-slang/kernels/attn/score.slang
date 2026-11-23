@@ -10,8 +10,8 @@
 //
 // A fire's capturing lanes are compacted: `capture` holds five ints for
 // each, in lane order: the lane, its first and end query row in the fire,
-// and the f32 its key row starts at in `scores` and its page row in
-// `pages_row` (-1 where its program reads no pages). A lane's rows are
+// and the f32 its key row starts at in `pie_room_scores` and its page row in
+// `pie_room_pages` (-1 where its program reads no pages). A lane's rows are
 // addressed through those bases alone, wherever the host lays them.
 //
 // Two dispatches a layer, wide over the keys, deterministic (no atomics, one
@@ -31,8 +31,11 @@
 #if defined(PIE_PAGES)
 
 [[vk::binding(0)]] StructuredBuffer<int> capture;
-[[vk::binding(1)]] StructuredBuffer<float> keys_row;
-[[vk::binding(2)]] RWStructuredBuffer<float> pages_row;
+// A pair's score room, which an unpark or an evacuation moves: bindings named
+// `pie_room_*`, which engine-vulkan lays update-after-bind and rewrites in a
+// recording as the room moves.
+[[vk::binding(1)]] StructuredBuffer<float> pie_room_keys;
+[[vk::binding(2)]] RWStructuredBuffer<float> pie_room_pages;
 
 struct Params {
     int context;
@@ -55,9 +58,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     int hi = min(lo + params.page_size, params.context);
     float sum = 0.0;
     for (int j = lo; j < hi; j++) {
-        sum += keys_row[uint(keys_at + j)];
+        sum += pie_room_keys[uint(keys_at + j)];
     }
-    pages_row[uint(pages_at + p)] = sum;
+    pie_room_pages[uint(pages_at + p)] = sum;
 }
 
 // pie:instantiate attn_score_pages PIE_PAGES=1
@@ -79,7 +82,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #define PIE_PARAMS_AT 10
 #else
 [[vk::binding(5)]] StructuredBuffer<float> stats;
-[[vk::binding(6)]] RWStructuredBuffer<float> scores;
+[[vk::binding(6)]] RWStructuredBuffer<float> pie_room_scores;
 #define PIE_SEG_AT 7
 #define PIE_PARAMS_AT 11
 #endif
@@ -348,8 +351,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         int j = first + int(tid);
         if (tid < tile && j < params.context) {
             uint dst = uint(keys_at + j);
-            float prior = params.into != 0 ? scores[dst] : 0.0;
-            scores[dst] = prior + acc * share;
+            float prior = params.into != 0 ? pie_room_scores[dst] : 0.0;
+            pie_room_scores[dst] = prior + acc * share;
         }
     }
 }

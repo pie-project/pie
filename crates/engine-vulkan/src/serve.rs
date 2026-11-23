@@ -449,9 +449,26 @@ impl Serve for Api {
             else {
                 unreachable!("the fill replayed a line ago");
             };
+            // The fire's score room, where its recording's descriptors bind
+            // another: the arm is held, its last fire landed.
+            let room = prepared
+                .score_room
+                .as_ref()
+                .map(|(buffer, at)| (buffer, *at));
+            let roomed = recording.kept.bind_room(room).and_then(|replays| {
+                if replays {
+                    Ok(())
+                } else {
+                    Err(Fault::Unbound {
+                        what: "a recording that copies its score room's rows, replayed at \
+                               another room"
+                            .to_string(),
+                    })
+                }
+            });
             // The fire's own scalars and group counts, where the recording's
             // commands read them.
-            let filled = recording.kept.stage(&fill.image);
+            let filled = roomed.and_then(|()| recording.kept.stage(&fill.image));
             // The segments an expert stage cut, each landed before its stage.
             let staged = filled.and_then(|()| {
                 if recording.cuts.is_empty() {
@@ -538,10 +555,17 @@ impl Serve for Api {
                 Plan::Fill
             }
         };
-        // The walk lays in its arm's fire block.
+        // The walk lays in its arm's fire block, and its capturing lanes'
+        // rows in the fire's score room, which a recording binds by place.
         shell
             .device
             .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
+        shell.device.room_next(
+            prepared
+                .score_room
+                .as_ref()
+                .map(|(buffer, at)| (buffer, *at)),
+        );
         // A decode (padded to its bucket) or a fire no wider than the vector
         // GEMM's widest row tile carries its rows in its commands; a wider
         // one reads them from the fire block, one body for every row count
@@ -573,6 +597,9 @@ impl Serve for Api {
         let fill = frame.into_fill();
         let shape = record_key(shell, prepared);
         let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
+        if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
+            nearest(shell, &fill.trail, prepared);
+        }
         let Some(held) = shell.shelf.recorder.family(family) else {
             tracing::debug!(
                 arm = prepared.arm,
@@ -895,6 +922,37 @@ fn fill_body(
         crate::record::Fill::new(family, groups, image, layout, launches),
     );
     Ok(())
+}
+
+/// Says where a fill walk whose commands match no armed family parts from
+/// the nearest one (the most commands alike from the first): the command of
+/// each there, rendered (`PIE_VK_BAKE_TRAIL`).
+fn nearest(shell: &Shell<Api>, trail: &[String], prepared: &Prepared<'_, Api>) {
+    let best = shell
+        .shelf
+        .recorder
+        .families()
+        .map(|(_, recording)| {
+            let held = recording.kept.trail();
+            let alike = held.iter().zip(trail).take_while(|(a, b)| a == b).count();
+            (alike, held)
+        })
+        .max_by_key(|(alike, _)| *alike);
+    let at = |list: &[String], i: usize| list.get(i).cloned().unwrap_or_else(|| "<end>".into());
+    match best {
+        Some((alike, held)) => eprintln!(
+            "[vk-bake] arm {} rung {} rows {:?}: the fill walk parts from the nearest armed family \
+             after {alike} of {} commands ({} held)\n  walk: {}\n  held: {}",
+            prepared.arm,
+            prepared.rung,
+            prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
+            trail.len(),
+            held.len(),
+            at(trail, alike),
+            at(held, alike),
+        ),
+        None => eprintln!("[vk-bake] no family is armed"),
+    }
 }
 
 /// A family's key: what its walk's commands carry, hashed

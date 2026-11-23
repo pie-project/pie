@@ -303,6 +303,14 @@ impl Recorder {
         self.bodies.clear();
     }
 
+    /// Every family held: its key and recording.
+    pub(crate) fn families(&self) -> impl Iterator<Item = (&Key, &Recording)> {
+        self.families
+            .by_key
+            .iter()
+            .map(|(key, family)| (key, &family.recording))
+    }
+
     /// Drops every family whose recording binds a pool segment where no
     /// rebind writes it ([`crate::device::Kept::pinned`]), and the fills and
     /// bodies naming it: the segments it binds changed. What pinned each.

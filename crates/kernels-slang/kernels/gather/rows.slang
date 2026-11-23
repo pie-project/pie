@@ -44,7 +44,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 #elif defined(PIE_COPY_REGIONS)
 
-[[vk::binding(0)]] StructuredBuffer<uint> src;
+// `src` may be a pair's score room, which an unpark or an evacuation moves:
+// named `pie_room_*`, engine-vulkan lays it update-after-bind and a replay
+// binds the fire's room there.
+[[vk::binding(0)]] StructuredBuffer<uint> pie_room_src;
 [[vk::binding(1)]] RWStructuredBuffer<uint> dst;
 [[vk::binding(2)]] StructuredBuffer<uint4> regions;
 
@@ -61,7 +64,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
     uint4 run = regions[gid.y];
     for (uint w = gid.x; w < run.z; w += PIE_GROUP_X * 65535u) {
-        dst[run.y + w] = src[run.x + w];
+        dst[run.y + w] = pie_room_src[run.x + w];
     }
 }
 

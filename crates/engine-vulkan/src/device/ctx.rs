@@ -611,6 +611,9 @@ pub struct Context {
     indirect_next: Mutex<Option<Arc<Vec<bool>>>>,
     /// The fire block the next frame opened lays in ([`Context::arm_next`]).
     arm_next: Mutex<Option<Arc<super::block::ArmBlock>>>,
+    /// The score room the next frame's capturing lanes lay their rows in
+    /// ([`Context::room_next`]): its buffer and byte.
+    room_next: Mutex<Option<(vk::Buffer, u64)>>,
     /// Whether the next frame's rows are constants of its commands
     /// ([`Context::fixed_next`]).
     fixed_next: Mutex<Option<bool>>,
@@ -1322,6 +1325,7 @@ impl Context {
             copier,
             indirect_next: Mutex::new(None),
             arm_next: Mutex::new(None),
+            room_next: Mutex::new(None),
             fixed_next: Mutex::new(None),
             resident: std::sync::OnceLock::new(),
         })
@@ -1729,6 +1733,14 @@ impl Context {
         *self.arm_next.lock().expect("arm lock poisoned") = arm;
     }
 
+    /// The score room (`room`'s buffer at byte `at`) the next frame opened
+    /// lays its capturing lanes' rows in: a recording binds it by place
+    /// ([`Kept::bind_room`]).
+    pub fn room_next(&self, room: Option<(&Buffer, u64)>) {
+        *self.room_next.lock().expect("room lock poisoned") =
+            room.map(|(buffer, at)| (buffer.slab().buffer, at));
+    }
+
     /// Whether the next frame opened carries its rows as constants of its
     /// commands (a decode body, a fire no wider than a row tile) or reads
     /// them from the fire block (a body every row count of a rung shares).
@@ -1967,8 +1979,12 @@ impl Context {
                 most_waiters: std::sync::atomic::AtomicU32::new(0),
                 rebinds: Mutex::new(Vec::new()),
                 pinned: Mutex::new(None),
+                room_binds: Mutex::new(Vec::new()),
+                room_bound: Mutex::new(None),
+                room_fixed: std::sync::atomic::AtomicBool::new(false),
             }),
             open: true,
+            room: self.room_next.lock().expect("room lock poisoned").take(),
             dry: false,
             kept: !one_time,
             hazards: std::cell::RefCell::new(Hazards::default()),
@@ -1998,6 +2014,7 @@ impl Context {
             groups: std::cell::RefCell::new(Vec::new()),
             copies: std::cell::RefCell::new(Vec::new()),
             baked: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
+            trail: std::cell::RefCell::new(Vec::new()),
         })
     }
 }
@@ -2076,6 +2093,15 @@ pub(crate) struct Inner {
     /// command): it stands only while the segments do, the name of what
     /// pinned it beside.
     pub(crate) pinned: Mutex<Option<String>>,
+    /// A kept frame's descriptors that bind its score room: the set, the
+    /// binding, the view's byte past the room's and its bytes
+    /// ([`Kept::bind_room`]).
+    pub(crate) room_binds: Mutex<Vec<(vk::DescriptorSet, u32, u64, u64)>>,
+    /// The room its descriptors bind now: its buffer and byte.
+    pub(crate) room_bound: Mutex<Option<(vk::Buffer, u64)>>,
+    /// A command of it names the room directly (a copy of its rows): it
+    /// replays only at the room it was recorded at.
+    pub(crate) room_fixed: std::sync::atomic::AtomicBool,
 }
 
 impl Inner {
@@ -2275,9 +2301,20 @@ impl Hazards {
     }
 }
 
+/// Whether frames keep what each command carried, rendered
+/// (`PIE_VK_BAKE_TRAIL`): to tell a fill walk that matches no armed family
+/// apart from the nearest one.
+pub(crate) fn trailing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_VK_BAKE_TRAIL").is_some())
+}
+
 pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
+    /// The score room its capturing lanes lay their rows in: its buffer and
+    /// byte ([`Context::room_next`]).
+    pub(crate) room: Option<(vk::Buffer, u64)>,
     /// A fill walk's frame ([`Context::frame_dry`]): it lays what a fire
     /// writes in its block and hashes what its commands carry, and records
     /// no command; it is never submitted.
@@ -2299,6 +2336,11 @@ pub struct Frame {
     /// Everything the frame's commands carry, hashed: two walks whose
     /// commands hash alike differ only in what their fire blocks hold.
     baked: std::cell::RefCell<std::collections::hash_map::DefaultHasher>,
+
+    /// What each command folded into `baked` carried, rendered, where
+    /// `PIE_VK_BAKE_TRAIL` asks ([`trailing`]): what a fill walk that
+    /// matches no armed family is told apart from the nearest by.
+    trail: std::cell::RefCell<Vec<String>>,
 
     copier: Arc<super::pipelines::Pipeline>,
 
@@ -2494,6 +2536,30 @@ impl Frame {
             .push((set, binding, segment, offset, bytes));
     }
 
+    /// Notes descriptor `binding` of `set`, a kept frame's, as binding its
+    /// score room `past` bytes past the room's byte, for `bytes`.
+    pub(crate) fn room_binds(&self, set: vk::DescriptorSet, binding: u32, past: u64, bytes: u64) {
+        *self.inner.room_bound.lock().expect("room lock poisoned") = self.room;
+        self.inner
+            .room_binds
+            .lock()
+            .expect("room lock poisoned")
+            .push((set, binding, past, bytes));
+    }
+
+    /// Whether `buffer` is the frame's score room's.
+    pub(crate) fn is_room(&self, buffer: vk::Buffer) -> bool {
+        self.room.is_some_and(|(room, _)| room == buffer)
+    }
+
+    /// A command copies `buffers`: one the frame's score room is makes a
+    /// kept frame replay only at that room.
+    fn fix_room(&self, buffers: &[vk::Buffer]) {
+        if self.kept && buffers.iter().any(|&buffer| self.is_room(buffer)) {
+            self.inner.room_fixed.store(true, Ordering::Release);
+        }
+    }
+
     /// What a dry walk laid ([`Context::frame_dry`]): the hash of what its
     /// commands would carry, each dispatch's group counts, each readout
     /// copy's regions hashed, the block's image, and the cuts it made.
@@ -2502,6 +2568,7 @@ impl Frame {
         use std::hash::Hasher;
         Fill {
             baked: self.baked.borrow().finish(),
+            trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             image: self.block.borrow().image().sealed(),
@@ -2515,6 +2582,9 @@ impl Frame {
             tracing::trace!(target: "vkbakeall", what = ?what, "bake");
         }
         what.hash(&mut *self.baked.borrow_mut());
+        if trailing() {
+            self.trail.borrow_mut().push(format!("{what:?}"));
+        }
     }
 
     pub(crate) fn core(&self) -> &Arc<Core> {
@@ -2661,6 +2731,7 @@ impl Frame {
             self.bake(&("copy", source.buffer.as_raw(), into.buffer.as_raw(), spans));
         }
         self.pin_copied(&[source.buffer, into.buffer], "a buffer copy");
+        self.fix_room(&[source.buffer, into.buffer]);
         if self.dry {
             return Ok(());
         }
@@ -2731,7 +2802,17 @@ impl Frame {
         let range = u64::from(limits.max_storage_buffer_range);
         let (src, dst) = (source.slab(), into.slab());
         let (src_range, dst_range) = (src.size.min(range), dst.size.min(range));
-        self.copies.borrow_mut().push(crate::record::rows_signature(regions));
+        // Rows copied out of the fire's score room move with it: their
+        // regions are the copier's table (data), and the room is bound where
+        // the fire's lies ([`Kept::bind_room`]), so a fire at any room is the
+        // same commands.
+        let room_src = self.is_room(src.buffer);
+        let signature = if room_src {
+            [u32::MAX, u32::MAX, u32::try_from(most).unwrap_or(u32::MAX)]
+        } else {
+            crate::record::rows_signature(regions)
+        };
+        self.copies.borrow_mut().push(signature);
         let words = |n: u64| n.is_multiple_of(4);
         let movable = regions.len() <= most
             && most as u64 <= u64::from(limits.max_compute_work_group_count[1])
@@ -2782,13 +2863,13 @@ impl Frame {
         // family whose shapes move the same regions copies them as carried
         // commands; one whose shapes differ moves them with the copier, from
         // the table.
-        let indirect = self.dispatched(crate::record::rows_signature(regions));
+        let indirect = self.dispatched(signature) || room_src;
         // The count is read from the fire block alone: the push block
         // carries none of it.
         let pushed = vec![0u8; self.copier.push_bytes as usize];
         self.bake(&(
             "rows",
-            src.buffer.as_raw(),
+            if room_src { u64::MAX } else { src.buffer.as_raw() },
             dst.buffer.as_raw(),
             table_place,
             params_place,
@@ -2798,11 +2879,18 @@ impl Frame {
         if !indirect {
             return self.copy_regions_baked(source, into, regions, false);
         }
+        // The copier reads its regions from the table: a room it copies from
+        // is bound whole, by its buffer (which the frame's hash carries).
         self.pin_copied(&[src.buffer, dst.buffer], "a readout copier's binding");
         if self.dry {
             return Ok(());
         }
         let set = self.descriptor_set(self.copier.set_layout)?;
+        if room_src && self.kept && self.copier.rooms & 1 != 0 {
+            self.room_binds(set, 0, 0, u64::MAX);
+        } else if room_src && self.kept {
+            self.inner.room_fixed.store(true, Ordering::Release);
+        }
         let infos = [
             vk::DescriptorBufferInfo::default()
                 .buffer(src.buffer)
@@ -3269,6 +3357,7 @@ impl Frame {
             inner: Arc::clone(&self.inner),
             block: std::mem::take(&mut *self.block.borrow_mut()),
             baked: self.baked.borrow().finish(),
+            trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             indirect: self.indirect.clone(),
@@ -3307,6 +3396,8 @@ impl Drop for Frame {
 #[derive(Debug)]
 pub struct Fill {
     pub baked: u64,
+    /// What each command carried, rendered ([`trailing`]); empty elsewhere.
+    pub trail: Vec<String>,
     pub groups: Vec<[u32; 3]>,
     pub copies: Vec<[u32; 3]>,
     pub image: super::block::Image,
@@ -3328,6 +3419,8 @@ pub struct Kept {
 
     baked: u64,
 
+    trail: Vec<String>,
+
     groups: Vec<[u32; 3]>,
 
     copies: Vec<[u32; 3]>,
@@ -3346,6 +3439,69 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
+    /// Binds the score room `room` (its buffer at byte `at`) in every
+    /// descriptor that binds its recording's room, where it moved: written
+    /// with the arm staged, whose last fire has landed, so no submission in
+    /// flight reads the set. Whether the recording replays at it: one whose
+    /// commands name the room it was recorded at (a copy of its rows)
+    /// replays only there.
+    pub fn bind_room(&self, room: Option<(&Buffer, u64)>) -> Result<bool> {
+        let binds = self.inner.room_binds.lock().expect("room lock poisoned");
+        let mut bound = self.inner.room_bound.lock().expect("room lock poisoned");
+        let now = room.map(|(buffer, at)| (buffer.slab().buffer, at));
+        if binds.is_empty() || now == *bound {
+            return Ok(true);
+        }
+        if self.inner.room_fixed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let Some((buffer, at)) = room else {
+            return Ok(false);
+        };
+        // A copier binds its source buffer whole, which may hold another
+        // plane's rows beside the room's: it follows a room within its
+        // buffer, never into another.
+        let whole = binds.iter().any(|&(_, _, _, bytes)| bytes == u64::MAX);
+        if whole && bound.is_some_and(|(held, _)| held != buffer.slab().buffer) {
+            return Ok(false);
+        }
+        let range = u64::from(self.inner.core.limits.max_storage_buffer_range);
+        let infos: Vec<vk::DescriptorBufferInfo> = binds
+            .iter()
+            .map(|&(_, _, past, bytes)| {
+                // `u64::MAX` bytes: the room's buffer whole (a copier's
+                // source, its regions the fire's table).
+                let (offset, bytes) = if bytes == u64::MAX {
+                    (0, buffer.bytes())
+                } else {
+                    (at + past, bytes)
+                };
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.slab().buffer)
+                    .offset(offset)
+                    .range(bytes.min(buffer.bytes().saturating_sub(offset)).min(range))
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = binds
+            .iter()
+            .zip(&infos)
+            .map(|(&(set, binding, _, _), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        // SAFETY: every set is this kept frame's, each binding laid
+        // update-after-bind (only those are noted), and no submission in
+        // flight reads them: the caller holds the arm, whose last fire
+        // landed. The room's buffer is live, held by its pair.
+        unsafe { self.inner.core.device.update_descriptor_sets(&writes, &[]) };
+        *bound = now;
+        Ok(true)
+    }
+
     /// What binds a pool segment in it where no rebind writes it, if any: it
     /// stands only while the segments do.
     #[must_use]
@@ -3354,6 +3510,11 @@ impl Kept {
     }
 
     /// What its commands carry, hashed ([`Frame::bake`]).
+    #[must_use]
+    pub fn trail(&self) -> &[String] {
+        &self.trail
+    }
+
     #[must_use]
     pub fn baked(&self) -> u64 {
         self.baked

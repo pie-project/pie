@@ -187,6 +187,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn room_next(&self, _room: Option<(&Buffer, u64)>) {
+        match self.never {}
+    }
+
     pub fn rebind_segments(&self, _segments: &[(Option<&Buffer>, &Buffer)]) -> Result<u64> {
         match self.never {}
     }
@@ -226,10 +230,17 @@ pub struct Frame {
 #[derive(Clone, Debug)]
 pub enum Stamps {}
 
+/// No frame keeps a trail with no device.
+#[must_use]
+pub fn trailing() -> bool {
+    false
+}
+
 /// What a fill walk laid: none, with no device.
 #[derive(Debug)]
 pub struct Fill {
     pub baked: u64,
+    pub trail: Vec<String>,
     pub groups: Vec<[u32; 3]>,
     pub copies: Vec<[u32; 3]>,
     pub image: Image,
@@ -356,6 +367,15 @@ impl ArmBlock {
 }
 
 impl Kept {
+    pub fn bind_room(&self, _room: Option<(&Buffer, u64)>) -> Result<bool> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn trail(&self) -> &[String] {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn pinned(&self) -> Option<String> {
         match self.never {}

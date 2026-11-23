@@ -28,6 +28,9 @@ pub struct Pipeline {
     /// the segment is backed or given back
     /// ([`super::Context::rebind_segments`]); 0 on a device that lays none.
     pub segments: u64,
+    /// The bindings laid update-after-bind for a pair's score room, which a
+    /// replay rewrites as the room moves ([`super::Kept::bind_room`]).
+    pub rooms: u64,
     pub local: [u32; 3],
 }
 
@@ -188,14 +191,14 @@ pub(crate) fn build(
     // A pool segment's bindings are written after a recording binds them:
     // laid update-after-bind where the device lets them be, and only those
     // (a binding laid so is read slower).
-    let segments = if core.update_after_bind {
-        declared.segments
+    let (segments, rooms) = if core.update_after_bind {
+        (declared.segments, declared.rooms & !declared.segments)
     } else {
-        0
+        (0, 0)
     };
     let flags: Vec<vk::DescriptorBindingFlags> = (0..declared.bindings)
         .map(|i| {
-            if i < 64 && segments & (1 << i) != 0 {
+            if i < 64 && (segments | rooms) & (1 << i) != 0 {
                 vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
             } else {
                 vk::DescriptorBindingFlags::empty()
@@ -205,7 +208,7 @@ pub(crate) fn build(
     let mut binding_flags =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
     let mut layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    if segments != 0 {
+    if segments | rooms != 0 {
         layout_info = layout_info
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
             .push_next(&mut binding_flags);
@@ -275,6 +278,7 @@ pub(crate) fn build(
                 push_bytes: declared.push_bytes,
                 fire: declared.fire,
                 segments,
+                rooms,
                 local: declared.local,
             }),
             Err((_, e)) => {

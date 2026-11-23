@@ -53,6 +53,17 @@ pub struct Declared {
     /// these are written after a recording binds them (a segment backed or
     /// given back), so only these are laid update-after-bind.
     pub segments: u64,
+
+    /// The bindings a pair's score room sits at (`kernels/attn/score.slang`,
+    /// its variables named `pie_room_*`): bit `i` binding `i`. Written in a
+    /// recording as the room moves (an unpark, an evacuation), so laid
+    /// update-after-bind.
+    pub rooms: u64,
+}
+
+/// Whether a variable of `name` is a score room's.
+fn is_room(name: &str) -> bool {
+    name.starts_with("pie_room_")
 }
 
 /// Whether a variable of `name` is a pool segment's (`kernels/prim/pool.slang`).
@@ -157,6 +168,8 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut strides: HashMap<u32, (Option<u32>, Option<u32>)> = HashMap::new();
     // The ids named as a pool segment's variable.
     let mut segment_names: Vec<u32> = Vec::new();
+    // The ids named as a score room's variable.
+    let mut room_names: Vec<u32> = Vec::new();
 
     let mut i = 5;
     while i < words.len() {
@@ -171,8 +184,13 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         }
         let w = &words[i..end];
         match op {
-            OP_NAME if count >= 3 && is_segment(&literal(&w[2..])) => {
-                segment_names.push(w[1]);
+            OP_NAME if count >= 3 => {
+                let name = literal(&w[2..]);
+                if is_segment(&name) {
+                    segment_names.push(w[1]);
+                } else if is_room(&name) {
+                    room_names.push(w[1]);
+                }
             }
             OP_EXECUTION_MODE if count >= 6 && w[2] == MODE_LOCAL_SIZE => {
                 local = Some([w[3], w[4], w[5]]);
@@ -247,6 +265,10 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let segments = bound
         .iter()
         .filter(|&&(variable, binding)| binding < 64 && segment_names.contains(&variable))
+        .fold(0u64, |mask, &(_, binding)| mask | 1 << binding);
+    let rooms = bound
+        .iter()
+        .filter(|&&(variable, binding)| binding < 64 && room_names.contains(&variable))
         .fold(0u64, |mask, &(_, binding)| mask | 1 << binding);
     for &(variable, binding) in &bound {
         let var = variables.get(&variable).copied();
@@ -352,6 +374,7 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         push_bytes,
         fire,
         segments,
+        rooms,
     })
 }
 

@@ -116,6 +116,13 @@ fn apart(got: &[f32], want: &[f32]) -> f32 {
 }
 
 fn served(context: u32, pattern: &[Reads]) {
+    served_with(context, pattern, None);
+}
+
+/// [`served`]; where `moved` is given, the load arms its bodies and serves
+/// from them, and before that step its room moves one room's run down the
+/// pool (its bytes with it, as an unpark or an evacuation moves them).
+fn served_with(context: u32, pattern: &[Reads], moved: Option<usize>) {
     let fixture = fixture(MODEL, None);
     let trace = &fixture.trace;
     assert!(
@@ -128,7 +135,15 @@ fn served(context: u32, pattern: &[Reads]) {
     let Some(mut shell) = load(&fixture, context) else {
         return;
     };
-    let room = room(&shell);
+    let first = room(&shell);
+    let mut room = first.clone();
+    if moved.is_some() {
+        shell.record_bodies(None).expect("the load arms its bodies");
+        shell.recorded_serving();
+        shell.unkept_serving();
+        shell.eager_serving();
+        shell.serving = true;
+    }
     let lanes = lanes(pattern);
     let n = lanes.len();
     let reads: Vec<Vec<String>> = lanes
@@ -164,6 +179,28 @@ fn served(context: u32, pattern: &[Reads]) {
     };
     let mut held = vec![0u32; n];
     for step in 0..=DECODE.len() {
+        if moved == Some(step) {
+            // One room's run down: whole chunks in the same segment.
+            let chunk = shell.pools().layout().chunk_bytes;
+            let run = first.bytes.div_ceil(chunk) * chunk;
+            assert!(first.at >= run, "a room's run lies below the first in its segment");
+            let to = DeviceCell {
+                at: first.at - run,
+                ..first.clone()
+            };
+            let mut frame = engine_gpu::backend::Context::frame(shell.device()).expect("a frame");
+            engine_gpu::backend::Frame::copy(
+                &mut frame,
+                &first.buffer,
+                first.at,
+                &to.buffer,
+                to.at,
+                first.bytes,
+            )
+            .expect("the room's bytes move");
+            engine_gpu::backend::Frame::commit(frame).expect("the move lands");
+            room = to;
+        }
         let tokens: Vec<Vec<u32>> = lanes
             .iter()
             .map(|(prompt, ..)| if step == 0 { prompt.clone() } else { vec![DECODE[step - 1]] })
@@ -236,6 +273,25 @@ fn served(context: u32, pattern: &[Reads]) {
             held[lane] += tokens[lane].len() as u32;
         }
     }
+    if moved.is_some() {
+        assert_eq!(shell.recorded_serving(), 0, "a fire after ready recorded a body");
+        if <crate::backend::Api as engine_gpu::serve::Serve>::RECORDS {
+            assert_eq!(
+                shell.unkept_serving(),
+                0,
+                "a fire after ready walked with no armed body: the moved room is the fire's"
+            );
+        }
+    }
+}
+
+/// A pair's room moved (an unpark, an evacuation) between two replays of
+/// one armed body: the replay after reads the rows where the room now lies,
+/// the oracle's, and nothing records or walks unarmed.
+#[test]
+fn an_armed_body_reads_its_room_where_it_moved() {
+    use Reads::{Keys, Nothing, Pages};
+    served_with(256, &[Nothing, Pages, Nothing, Keys], Some(DECODE.len()));
 }
 
 /// Two capturing lanes among four, one reading pages, at two contexts.
