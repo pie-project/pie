@@ -1,19 +1,30 @@
 # plex-host: provenance
 
-Vendored from the PLEX repository:
+Vendored from the PLEX repository (`plex`), with the user's approval.
 
-- `src/` from `host-1.1/src` at plex `128380ff884b9419070a6cce623b359e6eb39e43`;
-- `wit/` from `wit-1.1/` at the same commit (the normative PLEX 1.1 contract).
+Base: plex `d32445219` (the commit the 1.1 contract and
+paper are stated against):
+- `wit/` is `wit-1.1/` at `d32445219`, byte for byte. It is normative and
+  frozen: pie never edits it.
+- `src/` is `host-1.1/src` at `d32445219`, plus these plex host commits:
+  - `84c1b989a` typed `poll_delta` and an event sequence with `heard()`
+    (the two additions the pie design asked of the host);
+  - `128380ff8` clippy-clean (column macro bindings, a `Counter` alias);
+  - `ee2f99186` lazy snapshot and tracked exits, a round costs O(changes);
+  - `779667cfa` `host_build` in the stats.
 
-Changes against that commit:
+  Not taken: `ae6029d8f` (evaluation tooling: call and age percentiles).
 
-- wasmtime 47.0.3 to the workspace's 49.0.2, and pyo3 0.29 to 0.30;
-- `bindgen!` reads `wit/` here instead of `../wit-1.1`;
+Pie-local changes:
+- wasmtime 47.0.3 to the workspace's 49.0.2;
+- `bindgen!` reads `wit/` (and `wit-ext/`) here, not `../wit-1.1`;
+- the pyo3 module (`py.rs`, the `python` feature, the cdylib) is not
+  vendored: pie links the rlib;
 - formatted with pie's rustfmt;
-- plex `ee2f99186` (lazy snapshot and tracked exits) and `779667cfa`
-  (`host_build` in the stats), applied by hand; plex `ae6029d8f` (call and
-  age percentiles, between the vendored commit and those) is not.
+- the pie extension `wit-ext/` (`pie:plex-ext`), and its column in
+  `tables.rs` and `runtime.rs` (see `EXTENSION.md`).
 
-To sync, copy both directories again and reapply these changes. A fix to
-the host goes to plex first, so the vLLM and SGLang ports and pie run the
-same host.
+Nothing else from plex is vendored (no paper, docs, policies, ports, traces
+or results). To sync, copy `src/` and `wit/` again and reapply the pie-local
+changes. A fix to the host goes to plex first, so the vLLM and SGLang ports
+and pie run the same host.

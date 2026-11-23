@@ -7,17 +7,11 @@ license = "Apache-2.0"
 
 [lib]
 name = "plex_host"
-crate-type = ["rlib", "cdylib"]
-
-[features]
-# The pyo3 module the plex vLLM and SGLang ports load; pie links the rlib.
-python = ["dep:pyo3"]
 
 [dependencies]
 wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "std", "cranelift", "component-model", "parallel-compilation"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-pyo3 = { version = "0.30", features = ["extension-module", "abi3-py310"], optional = true }
 imbl = "5"
 
 [lints]
