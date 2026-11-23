@@ -478,6 +478,16 @@ pub(crate) async fn relist_beam<C: FireContext>(
     order: &[u32],
 ) -> Result<(), String> {
     let stores = crate::store::registry::get(model, engine);
+    // Every fire the process submitted lands first, a frame the scheduler
+    // holds out under the rung's cap among them: built before the finish,
+    // its lanes name the set's tail as it stood (each lane's reserve is the
+    // set's whole table at its submit), and fired after it, it read the
+    // pages the finish let go (the M1, race5 run 6: a fire 79 s after the
+    // finish named a freed page of the old tail, the swap since putting it
+    // on a released segment).
+    ctx.settle_pipeline_tail()
+        .await
+        .map_err(|error| format!("a beam's finish waiting for its fires to land: {error:#}"))?;
     loop {
         let needs = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
             kv.relist_beam_needs(ws, f0, order)
