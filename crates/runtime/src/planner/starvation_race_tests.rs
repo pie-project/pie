@@ -2817,10 +2817,11 @@ impl PoolPort for BindRoomPool {
         (0..).take_while(|&k| self.runs_free(run, k + 1)).count() as u32
     }
     /// A rung here is the free chunks its raise takes, anywhere.
-    fn rise_room(&self, rung: u32) -> super::pool::RiseRoom {
+    fn rise_room(&self, _pid: ProcessId, rung: u32) -> super::pool::RiseRoom {
         if rung > self.total {
             return super::pool::RiseRoom::Past {
                 need: rung,
+                own: 0,
                 total: self.total,
             };
         }
@@ -3238,6 +3239,7 @@ async fn a_raise_past_the_whole_pool_is_refused_by_name_at_once() {
         PlannerError::PastRung {
             rung: 9,
             need: 9,
+            own: 0,
             total: 8
         }
     );

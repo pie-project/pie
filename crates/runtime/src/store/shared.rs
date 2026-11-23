@@ -99,6 +99,11 @@ struct RungGate {
     /// raise to it is funded under in the planner, short of room
     /// ([`crate::planner::ResidencyPlanner::fund_rise`]).
     owed_by: Mutex<Option<uuid::Uuid>>,
+    /// A raise to held frames refused by name (it never fits the pool
+    /// beside its owner's own state, [`crate::planner::PlannerError::PastRung`]):
+    /// the owner and why, for the scheduler to fail the frames held for it
+    /// rather than hold them for good ([`refuse_owed`]).
+    refused: Mutex<Option<(uuid::Uuid, String)>>,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -162,6 +167,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 held: std::sync::atomic::AtomicU32::new(u32::MAX),
                 owed: std::sync::atomic::AtomicU32::new(0),
                 owed_by: Mutex::new(None),
+                refused: Mutex::new(None),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
                 walk_waiting: Mutex::new(None),
@@ -184,6 +190,22 @@ pub fn owe_cut_rows(engine: usize, rows: u32, by: Option<uuid::Uuid>) {
     if rows > 0 && rows != was {
         ask_walk(engine);
     }
+}
+
+/// The raise to `by`'s held frames is refused by name (`why`): it never
+/// fits. The scheduler fails those frames' fires with it
+/// ([`take_refused_owed`]); the gate's event wakes what waits on the rung.
+pub fn refuse_owed(engine: usize, by: uuid::Uuid, why: String) {
+    let gate = rung_gate(engine);
+    *gate.refused.lock().unwrap() = Some((by, why));
+    gate.event.notify_waiters();
+}
+
+/// The owner and reason of a raise refused by name ([`refuse_owed`]),
+/// taken: told once.
+#[must_use]
+pub fn take_refused_owed(engine: usize) -> Option<(uuid::Uuid, String)> {
+    rung_gate(engine).refused.lock().unwrap().take()
 }
 
 /// The process whose held frame the walk's owed raise is for
@@ -2114,13 +2136,14 @@ impl SharedPool {
     }
 
     /// Where a raise to `rung` stands for the planner
-    /// ([`crate::planner::PoolPort::rise_room`]): past the pool, short of
-    /// the chunks it lacks (its pieces those free now and those to empty),
-    /// or fitting, a raise's copy under way included (nothing to fund).
+    /// ([`crate::planner::PoolPort::rise_room`]): past the pool beside the
+    /// `own` chunks its owner's state takes at that rung, short of the
+    /// chunks it lacks (its pieces those free now and those to empty), or
+    /// fitting, a raise's copy under way included (nothing to fund).
     #[must_use]
-    pub fn rise_room(&self, rung: u32) -> crate::planner::RiseRoom {
-        if let Some((need, total)) = self.pool.rung_past(rung) {
-            return crate::planner::RiseRoom::Past { need, total };
+    pub fn rise_room(&self, rung: u32, own: u32) -> crate::planner::RiseRoom {
+        if let Some((need, total)) = self.pool.rung_past(rung, own) {
+            return crate::planner::RiseRoom::Past { need, own, total };
         }
         if self.copying.is_some() {
             return crate::planner::RiseRoom::Fits;

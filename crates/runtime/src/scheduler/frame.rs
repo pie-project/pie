@@ -379,6 +379,28 @@ impl FramePolicy {
             .map_or((0, None), |(rows, pid)| (rows, Some(pid)))
     }
 
+    /// A raise to the frames held out under the cap for `owner` refused by
+    /// name (it never fits beside the owner's own state,
+    /// [`crate::store::shared::refuse_owed`]): its lanes' next frames that
+    /// hold a fire wider than the cap leave, and their fires are returned,
+    /// for the scheduler to fail by that name rather than hold for good.
+    pub fn refuse_held(&mut self, owner: ProcessId) -> Vec<u64> {
+        let cap = self.fire_cap;
+        let mut fires = Vec::new();
+        for (&lane_id, lane) in &mut self.lanes {
+            if lane.owner.unwrap_or(lane_id) != owner {
+                continue;
+            }
+            let held = lane.frames.front().is_some_and(|front| {
+                front.is_complete() && front.fires.iter().any(|fire| fire.rung_rows > cap)
+            });
+            if held && let Some(frame) = lane.frames.pop_front() {
+                fires.extend(frame.fires.iter().filter_map(|fire| fire.fire_id));
+            }
+        }
+        fires
+    }
+
     /// The widest rung rows any fire queued in a lane's frames takes,
     /// complete or still gathering: the rung is not lowered under them
     /// (a frame still gathering when the lower was granted completed wider
@@ -2955,6 +2977,23 @@ mod tests {
         // Gone, the cap is the seal, and once granted nothing wider seals.
         assert_eq!(seal_rows(16, 64, None, policy.queued_widest()), 16);
         assert_eq!(seal_rows(16, 64, Some(16), 64), 16, "past the grant");
+    }
+
+    /// A frame held out under the cap whose raise is refused by name (it
+    /// never fits beside its owner's own state) leaves with its fires, for
+    /// the scheduler to fail: nothing is held for it after, and another
+    /// owner's held frame is kept.
+    #[test]
+    fn a_held_frame_whose_raise_is_refused_leaves_with_its_fires() {
+        let mut policy = FramePolicy::new(2, 4096, 1 << 20, None);
+        let (lane, other) = (pid(), pid());
+        policy.cap_fires(128);
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 7, 512, 1);
+        policy.on_fire_enqueued(stamp(other, 0, 0, 1), Some(other), 8, 256, 1);
+        assert_eq!(policy.cut_owed(), 512, "held, owed");
+        assert_eq!(policy.refuse_held(lane), vec![7], "its fires, to fail");
+        assert_eq!(policy.cut_owed(), 256, "the other's still held");
+        assert!(policy.refuse_held(lane).is_empty(), "nothing held for it after");
     }
 
     /// The soak's stall as the scheduler's turns meet the walk: the cap

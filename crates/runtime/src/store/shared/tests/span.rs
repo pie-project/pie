@@ -748,7 +748,7 @@ fn a_rising_rung_reclaims_the_lent_span() {
     let short = pool.pool().rung_short(top);
     assert!(short > 0, "no free chunk below: the raise is short");
     assert!(matches!(
-        pool.rise_room(top),
+        pool.rise_room(top, 0),
         crate::planner::RiseRoom::Short { .. }
     ));
     // The planner frees room below (here: records that lay below go, as

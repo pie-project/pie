@@ -1755,6 +1755,14 @@ impl BatchScheduler {
                 &mut slot_buffer,
                 stopping,
             );
+            // A raise to held frames refused by name (it never fits beside
+            // its owner's own state): the frames held for it leave, their
+            // fires failed by that name, never held for good.
+            if let Some((owner, why)) = crate::store::shared::take_refused_owed(engine_id) {
+                let fires = frame_policy.refuse_held(owner);
+                Self::reject_fires_queued(&mut pending, &fires, &why);
+                progress |= !fires.is_empty();
+            }
             // Frames held out under the cap are owed a raise: the cap's
             // owner is told, its walk raising the rung to them (a hold with
             // nothing in flight waited on a raise nothing asked for).
@@ -2354,6 +2362,24 @@ impl BatchScheduler {
                 }
             }
         }
+    }
+
+    /// Fails the queued launches of `fires` by `why`, unsubmitted: a raise
+    /// to the frames they were held in was refused by name.
+    fn reject_fires_queued(pending: &mut PendingQueue, fires: &[u64], why: &str) {
+        if fires.is_empty() {
+            return;
+        }
+        let mut kept = VecDeque::with_capacity(pending.len());
+        while let Some(item) = pending.pop_front() {
+            match item {
+                QueuedItem::Launch(request) if fires.contains(&request.fire_id) => {
+                    request.completion.reject_unsubmitted(format!("scheduler: {why}"));
+                }
+                item => kept.push_back(item),
+            }
+        }
+        pending.replace(kept);
     }
 
     fn reject_pipeline_queued(

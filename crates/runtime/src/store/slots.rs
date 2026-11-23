@@ -1444,8 +1444,11 @@ impl SlotPool {
     /// the pool, even with all state moved off it: the chunks they take
     /// and the pool's total.
     #[must_use]
-    pub fn rung_past(&self, rung: u32) -> Option<(u32, u32)> {
-        let need = self.reserved.saturating_add(self.act_chunks(rung));
+    pub fn rung_past(&self, rung: u32, own: u32) -> Option<(u32, u32)> {
+        let need = self
+            .reserved
+            .saturating_add(self.act_chunks(rung))
+            .saturating_add(own);
         (need > self.total).then_some((need, self.total))
     }
 

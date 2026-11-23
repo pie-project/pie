@@ -694,9 +694,9 @@ impl ResidencyPlanner {
     where
         F: std::future::Future<Output = T>,
     {
-        let pieces = match self.port.rise_room(rung) {
-            super::pool::RiseRoom::Past { need, total } => {
-                return Err(PlannerError::PastRung { rung, need, total });
+        let pieces = match self.port.rise_room(pid, rung) {
+            super::pool::RiseRoom::Past { need, own, total } => {
+                return Err(PlannerError::PastRung { rung, need, own, total });
             }
             super::pool::RiseRoom::Fits => return Ok(Some(take().await)),
             super::pool::RiseRoom::Short { pieces } => pieces,
@@ -707,8 +707,8 @@ impl ResidencyPlanner {
             return Ok(None);
         }
         // Served: it fits, or (the pool shrank under it) never will.
-        if let super::pool::RiseRoom::Past { need, total } = self.port.rise_room(rung) {
-            return Err(PlannerError::PastRung { rung, need, total });
+        if let super::pool::RiseRoom::Past { need, own, total } = self.port.rise_room(pid, rung) {
+            return Err(PlannerError::PastRung { rung, need, own, total });
         }
         let taken = take().await;
         // Off the queue: the heads behind it are planned again.

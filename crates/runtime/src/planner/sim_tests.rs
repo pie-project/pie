@@ -2513,18 +2513,20 @@ fn new_set(
 /// lifts to it, as the scheduler holds the frame out unsealed. A pool with
 /// one rung, or no walk, has nothing to raise. Its owner parks and comes
 /// back meanwhile as any process: the raise's moves carry its parked
-/// state.
-async fn owe_raise(ctx: &Ctx, pid: ProcessId) {
+/// state. A raise refused by name (it never fits beside the owner's own
+/// state) fails the frame with it, as the scheduler fails the fires held
+/// for it.
+async fn owe_raise(ctx: &Ctx, pid: ProcessId) -> Result<(), String> {
     let Some(shared) = ctx.stores.shared.clone() else {
-        return;
+        return Ok(());
     };
     let rungs = shared.lock().unwrap().rungs();
     let (Some(&widest), true) = (rungs.last(), rungs.len() > 1 && ctx.walks) else {
-        return;
+        return Ok(());
     };
     // Cut no wider than the cap: its frame goes as it is.
     if crate::store::shared::fire_cap(0) >= widest {
-        return;
+        return Ok(());
     }
     ctx.at(pid, "raise owed");
     ctx.log.lock().unwrap().raises_owed += 1;
@@ -2533,7 +2535,13 @@ async fn owe_raise(ctx: &Ctx, pid: ProcessId) {
         if crate::store::shared::owed_by(0).is_none_or(|by| by == pid) {
             crate::store::shared::owe_cut_rows(0, widest, Some(pid));
             if crate::store::shared::fire_cap(0) >= widest {
-                return;
+                return Ok(());
+            }
+        }
+        if let Some((by, why)) = crate::store::shared::take_refused_owed(0) {
+            if by == pid {
+                crate::store::shared::owe_cut_rows(0, 0, None);
+                return Err(format!("raise: {why}"));
             }
         }
         ctx.next_step().await;
@@ -2606,7 +2614,7 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
             }
             let pages = u64::from((at + 1) % script.grow_every == 0);
             if script.raise == Some(at) {
-                owe_raise(&ctx, pid).await;
+                owe_raise(&ctx, pid).await?;
             }
             fire(&ctx, pid, &mut sets, &instances, pages).await?;
             if script.raise == Some(at) {
@@ -4296,6 +4304,97 @@ fn a_bind_beside_a_pair_in_place_is_served_where_a_fresh_pair_would_not_fit() {
             "seed {seed}: a bind refused as never fitting: {failures:?}"
         );
     }
+}
+
+/// A pool of 18 chunks with rungs of 1 and 5 activation chunks (12 for
+/// kv and state below the widest rung's span), its segment walk moving
+/// the rung, and `scripts`: kv past the 12 is held while the rung is
+/// down, a frame then owed the raise back to the widest rung (the L40S's
+/// sweeper at kv_device_tokens 16384: a prompt that fills the pool, then
+/// its raise).
+fn raise_beside_own_workload(scripts: Vec<Script>) -> Workload {
+    let pool = PoolShape {
+        total: 18,
+        segment: 3,
+        host_chunks: 0,
+        disk_chunks: 64,
+        // An instance's state held across fires: a chunk beside its kv.
+        programs: vec![Program {
+            run: 1,
+            scratch: 0,
+            resident: MIB,
+            per_pair: 0,
+        }],
+        // The segment walk moves the rung (no target: the pool whole), and
+        // a lowered rung lends its span to state.
+        governed: true,
+        span_on_demand: true,
+        act: vec![(16, 1), (256, 5)],
+    };
+    Workload {
+        seed: 0,
+        pool,
+        scripts,
+        tier_full: Vec::new(),
+        late: 0,
+        target: Vec::new(),
+        ring: None,
+        landing_fails: None,
+    }
+}
+
+/// A decoder from step `at`: a prompt of `prompt` chunks of kv, a page a
+/// step for `decode` steps, a raise owed at decode step `raise`.
+fn raise_script(at: u32, prompt: u32, decode: u32, raise: Option<u32>, bound: bool) -> Script {
+    Script {
+        at,
+        prompt: prompt * PAGES_PER_CHUNK,
+        decode,
+        grow_every: 1,
+        beams: 1,
+        bind: if bound { vec![(0, false)] } else { Vec::new() },
+        idle: None,
+        rescore: None,
+        raise,
+        verify: None,
+    }
+}
+
+/// A raise whose rung, beside the raising process's own kv at that rung,
+/// is past the pool: with every other process gone it still never fits,
+/// and it is refused by name, never waited on. One that fits beside its
+/// own is served, and the process ends.
+#[test]
+fn a_raise_past_the_pool_beside_its_own_kv_is_refused_by_name() {
+    // 11 chunks of prompt and 60 pages: 15 chunks of kv, the reserved
+    // chunk and the rung's 5, 21 of 18.
+    let (failures, coverage) = run(&raise_beside_own_workload(vec![raise_script(0, 10, 70, Some(68), false)]), None);
+    for failure in &failures {
+        eprintln!("SIM raise past step {}: [{}] {}", failure.step, failure.kind, failure.line);
+    }
+    eprintln!("SIM raise past: {coverage:?}");
+    assert!(coverage.raises_owed > 0, "the raise was owed: {coverage:?}");
+    assert!(
+        failures.iter().all(|failure| failure.kind == "refused" && failure.line.contains("rung")),
+        "only its refusal, by name: {failures:?}"
+    );
+    assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
+    // Beside another whose kv has the rung lowered and which then ends: 8
+    // chunks of kv beside the rung's 5 and the reserved chunk, 14 of 18.
+    // It fits alone: it waits, and is served.
+    let (failures, coverage) = run(
+        &raise_beside_own_workload(vec![raise_script(0, 6, 30, Some(28), false), raise_script(0, 7, 8, None, true)]),
+        None,
+    );
+    for failure in &failures {
+        eprintln!("SIM raise fits step {}: [{}] {}", failure.step, failure.kind, failure.line);
+    }
+    eprintln!("SIM raise fits: {coverage:?}");
+    assert!(failures.is_empty(), "fits alone: served, {failures:?}");
+    assert!(
+        coverage.raises_owed > 0 && coverage.rung_raises > 0,
+        "owed and raised: {coverage:?}"
+    );
 }
 
 /// A bind of a run of seven adjacent chunks in a pool of segments of six:
