@@ -2233,6 +2233,18 @@ impl Pools {
                 _ => None,
             })
             .flatten()
+            // The compressor states the windowed pages key lie in them a
+            // row each too (two planes a state): they fold with the rows.
+            .chain(
+                self.pooled
+                    .iter()
+                    .filter(|row| row.windowed)
+                    .flat_map(|row| {
+                        let plane = row.plane_bytes(self.paging.page_size);
+                        let per_row = row.width * u64::from(elem_size(POOL_STATE));
+                        [(row.offset, per_row), (row.offset + plane, per_row)]
+                    }),
+            )
             .collect()
     }
 
