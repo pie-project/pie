@@ -33,7 +33,6 @@ use poem::Request;
 
 use super::outputs::{Loaded, Rows, VOCAB, WIDTH, loaded_flight, output_decls, registration_of};
 use super::slots::Slots;
-use crate::backend;
 
 /// The lanes the one program owns.
 const LANES: u32 = 8;
@@ -239,56 +238,38 @@ fn one_program_driving_eight_lanes_settles_every_step() {
         }
     });
 
-    // A step settles where its forward and its passes have landed; a hang
-    // there is the failure, so the wait is bounded and names it.
-    let mut seen: Vec<(StepDone, StepOutcome)> = Vec::new();
-    let mut outcome_of = |ticket: &FrameTicket| -> Option<StepOutcome> {
-        loop {
-            if let Some((_, outcome)) = seen.iter().find(|(at, _)| at.frame == ticket.id) {
-                return Some(outcome.clone());
-            }
-            if !asynchronous {
-                seen.extend(heard.try_iter());
-                return seen
-                    .iter()
-                    .find(|(at, _)| at.frame == ticket.id)
-                    .map(|(_, outcome)| outcome.clone());
-            }
-            let heard = heard.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|_| {
-                panic!(
-                    "frame {:?}: no completion two minutes on; the step hung (eight lanes of \
-                     one program)",
-                    ticket.id
-                )
-            });
-            seen.push(heard);
-        }
-    };
-    // Two in flight: the next fired before the last is settled.
-    let mut flying: Option<FrameTicket> = None;
-    let mut settle = |engine: &mut backend::Engine, mut ticket: FrameTicket| {
-        engine.settle_frame(&mut ticket).expect("the frame settles");
-        if let Some(outcome) = outcome_of(&ticket) {
-            assert!(
-                outcome.faulted.is_empty(),
-                "frame {:?}: lanes faulted: {:?}",
-                ticket.id,
-                outcome.faulted
-            );
-        }
-    };
+    // As the runtime fires them: each frame submitted while the last is in
+    // flight, none settled by the host but the last; each step is told
+    // through the completion sink once its forward and its passes landed. A
+    // hang there is the failure, so the wait is bounded and names it.
+    let mut fired = Vec::new();
+    let mut last: Option<FrameTicket> = None;
     for _ in 0..STEPS {
         for lanes in [0..WIDE, WIDE..LANES] {
             let ticket = engine
                 .submit(&FrameSubmission::of(step(lanes)))
                 .expect("the frame fires");
-            if let Some(last) = flying.replace(ticket) {
-                settle(&mut engine, last);
-            }
+            fired.push(ticket.id);
+            last = Some(ticket);
         }
     }
-    if let Some(last) = flying.take() {
-        settle(&mut engine, last);
+    let mut last = last.expect("frames were fired");
+    engine.settle_frame(&mut last).expect("the last frame settles");
+    let mut seen: Vec<(StepDone, StepOutcome)> = heard.try_iter().collect();
+    for id in &fired {
+        while asynchronous && !seen.iter().any(|(at, _)| at.frame == *id) {
+            let told = heard.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|_| {
+                panic!("frame {id:?}: no completion two minutes on; the step hung")
+            });
+            seen.push(told);
+        }
+    }
+    for (at, outcome) in &seen {
+        assert!(
+            outcome.faulted.is_empty(),
+            "{at:?}: lanes faulted: {:?}",
+            outcome.faulted
+        );
     }
     drop(finished);
 
