@@ -61,13 +61,19 @@ pub fn read(peer: u64, remote: Vec<u32>, local: Vec<u32>) -> BoxFuture<'static, 
 #[cfg(any(feature = "nixl", test))]
 mod transfers {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
     use anyhow::{Result, anyhow, bail};
 
-    /// How long a transfer is left between looks at its status: the agent
-    /// reports completion only when asked.
+    /// How long a transfer is left between looks at its status. NIXL tells
+    /// the side that posts a transfer of its end only when asked
+    /// (`nixl_capi_get_xfer_status`): its notifications (`gen_notif`,
+    /// `get_notifs`, a transfer's `has_notif`) are delivered to the remote
+    /// agent, here the peer whose pages are read, and are themselves polled;
+    /// its progress thread (`enable_prog_thread`) advances the backend but
+    /// signals nothing. No fd, event or callback wakes the poster, so a look
+    /// is the only way to learn a transfer ended.
     pub(super) const POLL: Duration = Duration::from_micros(200);
 
     /// Where one transfer stands, as its agent reports it.
@@ -87,6 +93,9 @@ mod transfers {
 
     pub(super) struct Transfers<A> {
         state: Mutex<State<A>>,
+        /// Signalled when closing has dropped the agent, and when a read's
+        /// wait ends: closing sleeps on it while reads still drive the looks.
+        changed: Condvar,
     }
 
     struct State<A> {
@@ -96,8 +105,46 @@ mod transfers {
         closing: bool,
         /// Posted and not yet reported final.
         inflight: HashSet<u64>,
-        /// Final statuses closing collected, for the reads that posted them.
+        /// Final statuses a look collected for a transfer other than its
+        /// own, kept for the read that posted it.
         settled: HashMap<u64, Status>,
+        /// Reads waiting on a transfer now: each looks once a [`POLL`].
+        waiting: usize,
+    }
+
+    impl<A: Agent> State<A> {
+        /// Asks the agent about `id`, moving it out of flight once final.
+        fn ask(&mut self, id: u64) {
+            let Some(agent) = self.agent.as_ref() else {
+                return;
+            };
+            let status = match agent.status(id) {
+                Ok(Status::Pending) => return,
+                Ok(status) => status,
+                Err(error) => Status::Failed(format!("{error:#}")),
+            };
+            self.inflight.remove(&id);
+            self.settled.insert(id, status);
+        }
+
+        /// One look on the transfer progress path: `id`'s, and while closing
+        /// every transfer in flight (a read whose future was dropped has no
+        /// one else to look at it). The agent drops the moment closing finds
+        /// nothing in flight.
+        fn progress(&mut self, id: Option<u64>) {
+            if let Some(id) = id.filter(|id| self.inflight.contains(id)) {
+                self.ask(id);
+            }
+            if self.closing {
+                let ids: Vec<u64> = self.inflight.iter().copied().collect();
+                for id in ids {
+                    self.ask(id);
+                }
+                if self.inflight.is_empty() {
+                    drop(self.agent.take());
+                }
+            }
+        }
     }
 
     impl<A: Agent> Transfers<A> {
@@ -108,7 +155,9 @@ mod transfers {
                     closing: false,
                     inflight: HashSet::new(),
                     settled: HashMap::new(),
+                    waiting: 0,
                 }),
+                changed: Condvar::new(),
             }
         }
 
@@ -137,27 +186,30 @@ mod transfers {
             Ok(id)
         }
 
-        /// Where transfer `id` stands; a final status is taken once, from the
-        /// agent or, if closing collected it, from what closing kept.
+        /// One look for transfer `id`'s read: its final status, taken once,
+        /// or `Pending`.
         fn look(&self, id: u64) -> Result<Status> {
             let mut state = self.state();
+            state.progress(Some(id));
             if let Some(status) = state.settled.remove(&id) {
                 return Ok(status);
             }
-            let agent = state
-                .agent
-                .as_ref()
-                .ok_or_else(|| anyhow!("kv transfer {id} is not in flight"))?;
-            let status = agent.status(id);
-            if !matches!(status, Ok(Status::Pending)) {
-                state.inflight.remove(&id);
+            if !state.inflight.contains(&id) {
+                bail!("kv transfer {id} is not in flight");
             }
-            status
+            let dropped = state.agent.is_none();
+            drop(state);
+            if dropped {
+                self.changed.notify_all();
+            }
+            Ok(Status::Pending)
         }
 
         /// Waits transfer `id`, a read of `peer`'s pages, to its end; a
-        /// failure names the peer.
+        /// failure names the peer. Its looks are the progress path closing
+        /// rides on.
         pub async fn wait(&self, peer: u64, id: u64) -> Result<()> {
+            let _waiting = Waiting::new(self);
             loop {
                 match self.look(id) {
                     Ok(Status::Done) => return Ok(()),
@@ -177,37 +229,49 @@ mod transfers {
         /// Closes: no transfer posts after, every one in flight is waited
         /// out to the status its agent reports final, and then the agent
         /// drops. A read whose future was dropped still counts: its transfer
-        /// is in flight until the agent says otherwise.
+        /// is in flight until the agent says otherwise. While reads are
+        /// waiting, their looks progress every transfer and closing sleeps
+        /// until they end or the agent drops; with none, closing looks
+        /// itself, once a [`POLL`], since nothing else will.
         pub fn close(&self) {
-            self.state().closing = true;
+            let mut state = self.state();
+            state.closing = true;
             loop {
-                {
-                    let mut state = self.state();
-                    let State {
-                        agent,
-                        inflight,
-                        settled,
-                        ..
-                    } = &mut *state;
-                    let Some(open) = agent.as_ref() else {
-                        return;
-                    };
-                    inflight.retain(|&id| {
-                        let status = match open.status(id) {
-                            Ok(Status::Pending) => return true,
-                            Ok(status) => status,
-                            Err(error) => Status::Failed(format!("{error:#}")),
-                        };
-                        settled.insert(id, status);
-                        false
-                    });
-                    if inflight.is_empty() {
-                        drop(agent.take());
-                        return;
-                    }
+                state.progress(None);
+                if state.agent.is_none() {
+                    return;
                 }
-                std::thread::sleep(POLL);
+                if state.waiting > 0 {
+                    state = self
+                        .changed
+                        .wait_while(state, |state| state.agent.is_some() && state.waiting > 0)
+                        .expect("kv transfers lock poisoned");
+                } else {
+                    drop(state);
+                    std::thread::sleep(POLL);
+                    state = self.state();
+                }
             }
+        }
+    }
+
+    /// A read counted as waiting while its wait runs, its future dropped
+    /// or not.
+    struct Waiting<'a, A>(&'a Transfers<A>);
+
+    impl<'a, A> Waiting<'a, A> {
+        fn new(transfers: &'a Transfers<A>) -> Self {
+            transfers.state.lock().expect("kv transfers lock poisoned").waiting += 1;
+            Self(transfers)
+        }
+    }
+
+    impl<A> Drop for Waiting<'_, A> {
+        fn drop(&mut self) {
+            if let Ok(mut state) = self.0.state.lock() {
+                state.waiting -= 1;
+            }
+            self.0.changed.notify_all();
         }
     }
 
