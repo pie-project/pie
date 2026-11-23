@@ -354,6 +354,10 @@ pub struct Shell {
     /// ([`Pools::fold_window_rows`]): planned as the fire is prepared,
     /// encoded after its forward in its own frame.
     window_folds: Vec<(usize, Vec<(u32, u32, u32, u32)>)>,
+    /// The own-row pages' chunks at the range's top, `(first, count)`: a
+    /// windowed lane's rows past what its ring keeps for its queries, read
+    /// as pages of the window slot each fire from these chunks.
+    own_top: (u32, u32),
     landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
     /// Steps let go before they landed ([`Shell::forget`]): their rows are
     /// dropped as they land rather than held.
@@ -1245,7 +1249,24 @@ impl PreparedLoad<'_> {
             )
             .with_streamable(weights.filed_bytes())
         };
-        let act = crate::arena::act_chunks(
+        // A windowed load's own-row pages (CONTRACT-BC 19; `store::windowed`):
+        // a fire's own rows past what its ring keeps for its queries lie in
+        // window-slot pages at the range's very top, whole chunks every
+        // rung's carve holds, so the page grid runs from each chunk's start.
+        // As many as the widest rung's rows take, a boundary page a lane, an
+        // arm each.
+        let own_chunks: u32 = match (&rows.ring, rows.windows.first()) {
+            (Some(_), Some(window)) if window.bytes > 0 => {
+                let per_chunk = (rows.chunk_bytes / window.bytes).max(1);
+                let widest = rungs.last().map_or(0, |(tokens, _)| *tokens);
+                let lanes = u64::from(widest.min(boot.budget.max_lanes));
+                let pages = (u64::from(widest).div_ceil(u64::from(window.tokens.max(1))) + lanes)
+                    * arms as u64;
+                u32::try_from(pages.div_ceil(per_chunk)).unwrap_or(u32::MAX)
+            }
+            _ => 0,
+        };
+        let mut act = crate::arena::act_chunks(
             &rungs,
             scratch.bytes(),
             &io,
@@ -1253,6 +1274,9 @@ impl PreparedLoad<'_> {
             arms as u64,
             rows.chunk_bytes,
         );
+        for (_, chunks) in &mut act {
+            *chunks = chunks.saturating_add(own_chunks);
+        }
         // The top rung (`crate::top`): of the rungs the requested fire size
         // offers, the one the ruling picks by the estimate from the device's
         // rates, over the live range kv and activation share at load. A
@@ -1560,9 +1584,15 @@ impl PreparedLoad<'_> {
             }
         }
         let (span_view, span_at, span_bytes) = pools.span_view();
+        // The arena ends below the own-row pages at the range's top.
+        let own_bytes = u64::from(own_chunks) * pools.chunk_bytes();
+        let own_top = (
+            pools.layout().total_chunks.saturating_sub(own_chunks),
+            own_chunks,
+        );
         let mut arena = Arena::over(
             span_view.clone(),
-            (span_at, span_bytes),
+            (span_at, span_bytes.saturating_sub(own_bytes)),
             scratch.bytes(),
             rungs,
             io,
@@ -1717,6 +1747,7 @@ impl PreparedLoad<'_> {
             inflight: VecDeque::new(),
             grafted: None,
             window_folds: Vec::new(),
+            own_top,
             landed: BTreeMap::new(),
             forgotten: std::collections::BTreeSet::new(),
             host_rows: crate::diag::on().host_rows,
