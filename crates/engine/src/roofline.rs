@@ -549,6 +549,7 @@ mod tests {
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,

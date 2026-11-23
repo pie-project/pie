@@ -499,6 +499,15 @@ impl Client {
         Ok(unsafe { text(a.platform_name, a.platform_name_size) })
     }
 
+    /// The plugin's build, as it names it (libtpu: its version and build).
+    pub fn platform_version(&self) -> Result<String> {
+        let mut a = args!(PJRT_Client_PlatformVersion_Args { client: self.raw });
+        call!(&self.api, PJRT_Client_PlatformVersion, &mut a)?;
+        // SAFETY: the version is owned by the client, which `&self` keeps
+        // alive, and is `platform_version_size` bytes long; `text` copies it.
+        Ok(unsafe { text(a.platform_version, a.platform_version_size) })
+    }
+
     pub fn device_kind(&self, device: Device<'_>) -> Result<String> {
         let mut d = args!(PJRT_Device_GetDescription_Args { device: device.raw });
         call!(&self.api, PJRT_Device_GetDescription, &mut d)?;

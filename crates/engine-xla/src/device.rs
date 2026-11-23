@@ -49,6 +49,9 @@ pub struct Device {
     sealed_temp: std::sync::atomic::AtomicU64,
     ordinal: usize,
     kind: String,
+    /// The PJRT plugin's build (`Client::platform_version`): what the
+    /// device's stored measurements are keyed by beside its kind.
+    platform: String,
     limit: Option<u64>,
     /// What the plugin reported in use when the device opened, before this
     /// load landed anything; zero when it reports nothing.
@@ -98,6 +101,7 @@ impl Device {
             ),
         })?;
         let kind = client.device_kind(device).unwrap_or_default();
+        let platform = client.platform_version().unwrap_or_default();
         let stats = client.memory_stats(device).ok();
         let limit = stats
             .as_ref()
@@ -109,6 +113,7 @@ impl Device {
             client: Some(client),
             dry: None,
             ordinal,
+            platform,
             kind,
             limit,
             held,
@@ -149,10 +154,15 @@ impl Device {
             .and_then(|c| c.device(ordinal).and_then(|d| c.device_kind(d).ok()))
             // Without a client, the v6e the defaults were measured on.
             .unwrap_or_else(|| "TPU v6 lite".to_string());
+        let platform = client
+            .as_ref()
+            .and_then(|c| c.platform_version().ok())
+            .unwrap_or_default();
         Ok(Device {
             client,
             dry: Some(Mutex::new(Vec::new())),
             ordinal,
+            platform,
             kind,
             limit: None,
             held: 0,
@@ -207,6 +217,12 @@ impl Device {
     #[must_use]
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    /// The PJRT plugin's build (`Client::platform_version`).
+    #[must_use]
+    pub fn platform(&self) -> &str {
+        &self.platform
     }
 
     #[must_use]
