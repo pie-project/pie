@@ -43,9 +43,14 @@ pub fn validate_count(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RsPlan {
+    /// Recurrent state, and windowed layers an engine serves as ring +
+    /// buffer (CONTRACT-BC 19, 21): lanes sharing a set (a beam group)
+    /// share its folded window and fold it once.
     Groups(Vec<GroupPlan>),
     /// The model's state is window lists: each row lands its rows in each
-    /// list's slots, then moves its windows.
+    /// list's slots, then moves its windows. Removed by the windowed-state
+    /// change: the integration commit deletes it, once every engine states
+    /// `Capabilities::windowed_state`.
     Window(Vec<WindowRow>),
 }
 
@@ -103,7 +108,11 @@ impl GroupPlan {
         }
         let write_state = folds || held.is_none();
         let fresh = folds && held.is_some() && self.lanes.len() > 1;
-        Ok((write_state, fresh, fold, self.writes.clone()))
+        // A window buffer holds no row a lone lane folds itself.
+        let writes = store
+            .own_folds_unbuffered(ws, self.lanes.len() == 1, fold, self.writes.clone())
+            .map_err(|error| error.to_string())?;
+        Ok((write_state, fresh, fold, writes))
     }
 }
 
@@ -350,7 +359,7 @@ pub fn apply_shared(
         };
         lane.slot_copies = rs
             .filter(|rs| rs.shared)
-            .zip(pool.rs_list())
+            .zip(pool.buffer_list())
             .map(|(rs, list)| {
                 let pairs: Vec<[u32; 2]> = rs
                     .page_copy_lanes
@@ -376,7 +385,59 @@ pub fn apply_shared(
                 snap.slot = pool.snapshot_ref(snap.slot);
             }
         }
+        if let Some(buffer) = pool.window_buffer() {
+            lower_window(&mut lane.lane, buffer);
+        }
     }
+}
+
+/// A lane of a load whose engine serves windowed layers as ring + buffer
+/// (CONTRACT-BC 19, 21), its recurrent-state verb lowered to them: the rs
+/// store keeps the set's folded window as its record and its unfolded rows
+/// in the window buffer's slots, the buffer pages
+/// ([`crate::store::rs::RsStore::shared`]). A buffering lane's pages become
+/// its window-buffer table in `Lane::tables` from `base`, its `folded`,
+/// `fold` and `lineage` its `Lane::window`; a lane that folds every row it
+/// writes from where its set is folded ([`engine::fire::RsVerb::Fold`])
+/// buffers nothing: its rows' K/V live in the fire, its table is empty and
+/// its window folds them all. The lane carries no recurrent verb (the load
+/// has no recurrent layer: a hybrid of both buffers is refused at load,
+/// [`crate::store::shared::SharedError::TwoBuffers`]). A kv-less lane
+/// states no window.
+fn lower_window(lane: &mut engine::Lane, buffer: crate::store::shared::TokenShape) {
+    if lane.kv_less {
+        lane.window = None;
+        return;
+    }
+    let verb = std::mem::take(&mut lane.rs);
+    let tokens = buffer.tokens.max(1);
+    lane.window = Some(match verb {
+        engine::fire::RsVerb::Buffer {
+            pages,
+            base,
+            fold,
+            lineage,
+            ..
+        } => {
+            if !pages.is_empty() {
+                lane.tables.push((buffer.id, pages));
+            }
+            engine::fire::WindowFold {
+                base,
+                fold,
+                lineage,
+            }
+        }
+        engine::fire::RsVerb::Fold => {
+            let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+            let after = lane.kv.folded.saturating_add(rows);
+            engine::fire::WindowFold {
+                base: after - after % tokens,
+                fold: engine::fire::FoldLen::Host(rows),
+                lineage: engine::fire::Lineage::Set,
+            }
+        }
+    });
 }
 
 /// Names each lane's kv pages by the slot refs of `pinned`, the kv run an
@@ -535,6 +596,10 @@ pub fn prepare_many(
     }
     let groups = match plan {
         RsPlan::Window(rows) => {
+            // The window-list path's own refusal: removed by the
+            // windowed-state change with `RsPlan::Window`. An engine that
+            // states `windowed_state` plans `RsPlan::Groups`, its beams
+            // sharing one folded window.
             for (index, ws) in working_sets.iter().enumerate() {
                 if working_sets[..index].contains(ws) {
                     return Err(format!(

@@ -784,7 +784,15 @@ impl StorePools {
             match shape.kind {
                 // The rs buffer's list (CONTRACT-BC 18): its tokens are
                 // the rs store's, not the kv page size.
-                SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::RsBuffer => {
+                // The window buffer (CONTRACT-BC 21) is the rs store's
+                // buffer as the rs list is: a load states one of them.
+                SlotKind::List { .. }
+                    if matches!(
+                        shape.role,
+                        ::engine::chunk::SlotRole::RsBuffer
+                            | ::engine::chunk::SlotRole::WindowBuffer
+                    ) =>
+                {
                     pools.buffer = run;
                 }
                 SlotKind::List {
@@ -795,6 +803,8 @@ impl StorePools {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
+                // Window lists: removed by the windowed-state change (the
+                // integration commit deletes this arm).
                 SlotKind::List {
                     tokens,
                     window: Some(window),
