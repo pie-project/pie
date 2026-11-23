@@ -1,6 +1,7 @@
 //! engine-xla's integration tests, one binary: each module was a test file.
 
 mod a_batched_decode_answers_what_each_lane_answers_alone;
+mod an_output_less_run_fences_the_slot_it_read;
 mod common;
 mod common_dit;
 mod common_llm;

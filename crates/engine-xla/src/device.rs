@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use dtype::Dtype;
 
 use crate::error::{Fault, Result};
-use crate::pjrt::{self, Api, Arg, Buffer, Client, ElementType, Executable};
+use crate::pjrt::{self, Api, Arg, Buffer, Client, ElementType, Event, Executable};
 use crate::trace::{Signature, storage};
 
 /// A compiled program and the signature it was traced with.
@@ -830,19 +830,35 @@ impl Device {
     /// Runs `program` over `args` (in its parameter order); returns its
     /// results, and waits for the device when `wait`.
     pub fn run(&self, program: &Program, args: Vec<Arg<'_>>, wait: bool) -> Result<Vec<Buffer>> {
+        self.run_fenced(program, args, wait).map(|(outs, _)| outs)
+    }
+
+    /// [`Device::run`], and the event that fires once the program has run on
+    /// the device (whatever it outputs, none included): what a buffer it
+    /// reads, a staging slot, is free again by. `None` where the run was
+    /// already waited for, or ran nothing (a dry device).
+    pub fn run_fenced(
+        &self,
+        program: &Program,
+        args: Vec<Arg<'_>>,
+        wait: bool,
+    ) -> Result<(Vec<Buffer>, Option<Event>)> {
         if self.is_dry() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let exe = program.exe.as_ref().ok_or(Fault::Deviceless)?;
         let at = profile::before(self.api());
         let (outs, done) = exe.execute(self.device()?, args)?;
-        if wait || at.is_some() {
+        let done = if wait || at.is_some() {
             done.wait()?;
-        }
+            None
+        } else {
+            Some(done)
+        };
         if let Some(at) = at {
             profile::after(at, program.text_bytes);
         }
-        Ok(outs)
+        Ok((outs, done))
     }
 }
 

@@ -2049,6 +2049,7 @@ impl Xla {
                 fixed: lane.record.pieces(),
                 window_fold: lane.window,
                 copies: &lane.slot_copies,
+                replay_stated: lane.replay_stated,
             })
             .collect();
         let clips: Vec<crate::serve::Clips<'_>> = submission

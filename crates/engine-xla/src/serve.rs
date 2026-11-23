@@ -207,6 +207,11 @@ pub struct Seated<'a> {
     /// Whole-slot copies `[src, dst]` of list shapes made before the fire
     /// (`engine::fire::Lane::slot_copies`).
     pub copies: &'a [(engine::chunk::ShapeId, Vec<[u32; 2]>)],
+
+    /// The lane's replay as the runtime counted it
+    /// (`engine::fire::Lane::replay_stated`), held against this shell's own
+    /// count at prepare (`engine::fire::replay_agrees`).
+    pub replay_stated: Option<engine::fire::LaneReplay>,
 }
 
 const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
@@ -236,6 +241,7 @@ impl<'a> Seated<'a> {
             window_fold: None,
             fixed: &[],
             copies: &[],
+            replay_stated: None,
         }
     }
 }
@@ -2275,8 +2281,9 @@ impl Shell {
         // record piece, its rs verb's pages.
         let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_verbs: Vec<engine::fire::RsVerb> = Vec::with_capacity(lanes.len());
-        // Carried rows the fire's lanes replay, summed over them.
-        let mut carried: u32 = 0;
+        // Each lane's own rows and the buffered rows it replays ahead of them
+        // (a decode lane's included).
+        let mut replays: Vec<(u32, u32)> = Vec::with_capacity(lanes.len());
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // The windowed state (CONTRACT-BC 19, 21): each windowed lane's
@@ -2445,7 +2452,7 @@ impl Shell {
                 }
                 engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
             });
-            if let engine::fire::RsVerb::Buffer {
+            let replayed = if let engine::fire::RsVerb::Buffer {
                 folded, lineage, ..
             } = seated.rs
             {
@@ -2455,33 +2462,42 @@ impl Shell {
                         at: "serve::rs",
                         why: format!("lane {at}: {e}"),
                     })?;
-                carried += reads.iter().map(|r| r.len() as u32).sum::<u32>();
-            }
+                reads.iter().map(|r| r.len() as u32).sum::<u32>()
+            } else {
+                0
+            };
+            replays.push((seated.lane.tokens.len() as u32, replayed));
         }
-        // A fire carries at most its rung's tokens of carried rows, summed
-        // over its lanes (its rung's `carried_max`, `ChunkFacts::act_replay`,
-        // checked by `engine::fire::rung_holds` as the runtime chose the
-        // rung by): one past it is refused here, before the fire writes
-        // anything.
-        let holds = engine::RungReplay {
-            carried_max: Some(crate::rs::carried_room(descriptor.bucket)),
-            own_max: None,
-            scratch: engine::ScratchBytes {
-                slot_bytes: Vec::new(),
-                lane_bytes: 0,
-                room_bytes: 0,
-                pad: 1,
-            },
-        };
-        let count = engine::ReplayRows {
-            carried,
-            ..engine::ReplayRows::default()
-        };
-        if let Err(past) = engine::fire::rung_holds(&holds, count) {
+        // The fire's replay against its rung's, as the load stated it and the
+        // runtime chose the rung by (`crate::rs::rung_replay`,
+        // `engine::fire::rung_holds`): every lane's replayed rows lie in the
+        // window scratch, so it is never compact. One past it is refused
+        // here, before the fire writes anything.
+        let rung = crate::rs::rung_replay(descriptor.bucket);
+        let count = engine::ReplayRows::of_lanes(replays.iter().copied(), false);
+        if engine::fire::replay_check_on() {
+            engine::fire::replay_agrees(
+                lanes
+                    .iter()
+                    .zip(&replays)
+                    .map(|(seated, &(own, _))| (own, seated.replay_stated)),
+                &rung,
+                count,
+                false,
+                false,
+                false,
+                false,
+            )
+            .map_err(|why| Fault::Program {
+                at: "serve::rs",
+                why,
+            })?;
+        }
+        if let Err(past) = engine::fire::rung_holds(&rung, count) {
             return Err(Fault::Ceiling {
-                what: "carried rows a fire's lanes replay (the tokens of the rung it runs at)",
-                need: u64::from(past.rows),
-                have: u64::from(past.max),
+                what: "rows a fire's lanes own and replay (its rung's own rows and carried room)",
+                need: past.rows,
+                have: past.max,
             });
         }
         if !copies.is_empty() {
@@ -3107,7 +3123,7 @@ impl Shell {
                 // A fire that replays lays each window's scratch for the
                 // rung's own rows and its carried room; one that replays
                 // nothing, for its own rows alone.
-                let replays = carried > 0;
+                let replays = replays.iter().any(|&(_, replayed)| replayed > 0);
                 let mut maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {
