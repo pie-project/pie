@@ -381,7 +381,6 @@ pub fn seats() -> (usize, usize) {
     (running, live - running)
 }
 
-const UNCAPPED_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -456,13 +455,11 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
-    // Only the first gate, prewarm, holds below the floor.
+    // Only the first gate, prewarm, holds below the floor. With no count
+    // stated it counts nothing: what a newcomer may take is the capacity
+    // gate's, read at each gate ([`wait_for_room`]).
     let sem = limit.map(|n| OrderedSemaphore::new("execution", n, false));
-    let prewarm = Some(OrderedSemaphore::new(
-        "prewarm",
-        limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
-        true,
-    ));
+    let prewarm = Some(OrderedSemaphore::new("prewarm", limit.unwrap_or(usize::MAX / 2), true));
     const STAGED_COHORTS: usize = 1;
     let bind_ahead = limit.map(|n| OrderedSemaphore::new("bind", n, false));
     BIND_STAGED_RESERVE.store(
@@ -554,10 +551,21 @@ pub(crate) fn regrant_admission() {
     }
 }
 
+/// Holds a newcomer before a gate while the capacity gate's last place has
+/// no room for any first ask ([`crate::planner::ResidencyPlanner::admits`]):
+/// it waits there holding nothing it took for that ask, and the read that
+/// raises the room wakes it.
+async fn wait_for_room(pid: ProcessId) {
+    if let Some(planner) = crate::planner::planner_of(pid) {
+        planner.admitted_to_ask(pid).await;
+    }
+}
+
 pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
     }
+    wait_for_room(ctx.id()).await;
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => Some(Arc::clone(semaphore).acquire_owned(ctx.id()).await),
         None => None,
@@ -575,6 +583,7 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         return;
     }
     let started = Instant::now();
+    wait_for_room(ctx.id()).await;
     let seated = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
             let _queued = AdmissionQueued::enter(ctx.id());
@@ -1006,6 +1015,7 @@ impl Process {
         if let Some(planner) = crate::planner::planner_of(process_id) {
             planner.admit(process_id).await;
         }
+        wait_for_room(process_id).await;
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
             Some(sem) => Some(Arc::clone(sem).acquire_owned(process_id).await),
             None => None,
