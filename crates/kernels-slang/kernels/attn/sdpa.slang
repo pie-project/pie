@@ -442,6 +442,7 @@ uint row_base(uint row, uint q_head) {
 groupshared float sdpa_part[PIE_TILE_ROWS][PIE_TILE_LANES];
 #endif
 groupshared int sdpa_last;
+groupshared int sdpa_first;
 
 [shader("compute")]
 [numthreads(PIE_TILE_LANES, PIE_TILE_ROWS, 1)]
@@ -467,20 +468,30 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint q_base = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
-    // The tile's last position, read once and uniformly: it bounds the key
-    // loop, whose every step holds barriers.
+    // The tile's first and last keys, read once and uniformly: they bound
+    // the key loop, whose every step holds barriers. No row keeps a key
+    // below its window's first, so the loop starts at the earliest row's.
     if (lane == 0u && slot_y == 0u) {
         int last = -1;
+        int first = 0x7fffffff;
         for (uint r = 0u; r < uint(PIE_TILE_ROWS); r++) {
             uint at = tile * uint(PIE_TILE_ROWS) + r;
             if (at < uint(params.n_rows)) {
-                last = max(last, position_ids[fire_row(at)]);
+                int pos = position_ids[fire_row(at)];
+                last = max(last, pos);
+#if defined(PIE_RING)
+                first = min(first, ring_start(keys_of(req_of_token[fire_row(at)]), pos));
+#else
+                first = min(first, window_start(pos));
+#endif
             }
         }
         sdpa_last = last;
+        sdpa_first = max(min(first, last + 1), 0);
     }
     GroupMemoryBarrierWithGroupSync();
     int last = workgroupUniformLoad(sdpa_last);
+    int first_key = workgroupUniformLoad(sdpa_first);
 
     float2 qv[PAIRS_PER_LANE];
     float2 acc[PAIRS_PER_LANE];
@@ -503,7 +514,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     pie_pool_at(SDPA_KV_SCALE * ring.ring_k, ring_k_seg, ring_k_at);
     pie_pool_at(SDPA_KV_SCALE * ring.ring_v, ring_v_seg, ring_v_at);
 #endif
-    for (int kp = 0; kp <= last; kp++) {
+    for (int kp = first_key; kp <= last; kp++) {
         bool take = live && keeps(row, origin, kp, q_pos, start);
         float partial = 0.0;
         uint k_at = 0u, v_at = 0u;
