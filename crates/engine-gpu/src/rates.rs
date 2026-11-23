@@ -2311,6 +2311,47 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         ));
         attn.push((keys, rate));
     }
+    // Not one square point fit the bound: the narrowest square halved until
+    // one fire does (a rate a flop, which a smaller square of the same heads
+    // reads); a 16-key square past it refuses by name.
+    if want.attn && attn.is_empty() {
+        let mut keys = engine::rates::ATTN_KEYS[0];
+        loop {
+            keys /= 2;
+            let shape = engine::rates::ATTN_SHAPE.at(keys);
+            let rate = repeated(|| {
+                let rate = attention(
+                    &mut rig,
+                    tactics,
+                    tier,
+                    timer,
+                    shape,
+                    launch,
+                    Kind::Attention,
+                );
+                rig.release();
+                rate
+            });
+            if let Some(rate) = dropped(&rig, rate, say)? {
+                say(&format!(
+                    "[rates]: attention {keys} keys d 128: {:.1} TFLOP/s (the most keys whose \
+                     fire fits the bound)",
+                    rate / 1e3
+                ));
+                attn.push((keys, rate));
+                break;
+            }
+            if keys <= 16 {
+                return Err(Fault::Device {
+                    call: "rates",
+                    why: format!(
+                        "a {keys}-key attention is past the device's bound on one submission: \
+                         no attention can run under it"
+                    ),
+                });
+            }
+        }
+    }
     let longest = attn
         .last()
         .map_or(engine::rates::ATTN_KEYS[0], |&(keys, _)| keys);
@@ -2394,6 +2435,53 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
             }
             if !curve.is_empty() {
                 prefixed.push((rows, curve));
+            }
+        }
+        // Not one point fit the bound: the fewest keys past the narrowest
+        // rows, at fewer rows (halved) until one fire fits; a step of one
+        // row against them past the bound refuses by name (no prompt step
+        // could run under it).
+        if prefixed.is_empty() {
+            let keys = engine::rates::ATTN_KEYS[0];
+            let mut rows = PREFIX_ROWS[0];
+            loop {
+                rows = (rows / 2).max(1);
+                let shape = engine::rates::AttnShape {
+                    rows,
+                    keys,
+                    ..engine::rates::ATTN_SHAPE
+                };
+                let rate = repeated(|| {
+                    let rate = attention(
+                        &mut rig,
+                        tactics,
+                        tier,
+                        timer,
+                        shape,
+                        launch,
+                        Kind::Prefixed,
+                    );
+                    rig.release();
+                    rate
+                });
+                if let Some(rate) = dropped(&rig, rate, say)? {
+                    say(&format!(
+                        "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s (the \
+                         fewest rows whose fire fits the bound)",
+                        rate / 1e3
+                    ));
+                    prefixed.push((rows, vec![(keys, rate / 1e3)]));
+                    break;
+                }
+                if rows == 1 {
+                    return Err(Fault::Device {
+                        call: "rates",
+                        why: format!(
+                            "one row's attention against {keys} keys is past the device's bound \
+                             on one submission: no prompt step can run under it"
+                        ),
+                    });
+                }
             }
         }
     }

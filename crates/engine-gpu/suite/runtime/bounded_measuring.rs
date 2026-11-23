@@ -17,7 +17,7 @@ const TOKENS: u32 = 256;
 
 #[test]
 fn a_load_with_no_measurement_under_a_stated_bound_runs_no_frame_past_it() {
-    let bound = std::time::Duration::from_millis(150);
+    let bound = std::time::Duration::from_millis(25);
     let profiles = std::env::temp_dir().join(format!(
         "pie-{}-bounded-measuring-{}",
         backend::NAME,
