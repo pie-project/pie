@@ -890,16 +890,26 @@ fn replay_in_rung(engine: usize) -> bool {
 }
 
 /// What a fire of `rows` asks the rung for, `replayed` its every lane's
-/// replayed rows (a decode lane's included): on an engine whose rung holds
-/// them all ([`replay_in_rung`]) its carried rows are those.
+/// replayed rows (a decode lane's included). On an engine whose rung holds
+/// them all ([`replay_in_rung`]) a rung of `T` tokens holds `T` own rows
+/// and as many again ("its own rows and as many again",
+/// [`::engine::fire::rung_rows`]): its replay scratch takes the fire's
+/// composed own rows and every lane's carried rows together, up to `2T`
+/// (Metal: `scratch_rows(own + carried)`, laid for `T + T`). Such a fire
+/// fits rung `T` where its own rows are at most `T` and its own and
+/// carried rows together at most `2T`: it counts as carrying half of them
+/// together (rounded up), so the rung asked ([`FireRows::ask`]), the
+/// largest rung's check ([`check_largest_rung`]) and a step's sum of its
+/// fires ([`crate::engine::FireRequest::carried`]) each hold it to that.
+/// `own` is every row the fire's lanes compute in it, never its lane count.
 fn rung_counted(rows: FireRows, replayed: u32, in_rung: bool) -> FireRows {
+    if !in_rung {
+        return rows;
+    }
+    let together = rows.own.saturating_add(rows.carried.max(replayed));
     FireRows {
         own: rows.own,
-        carried: if in_rung {
-            rows.carried.max(replayed)
-        } else {
-            rows.carried
-        },
+        carried: together.div_ceil(2),
     }
 }
 
@@ -963,10 +973,10 @@ fn check_largest_rung(rows: FireRows, largest: u32) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "pipeline: a fire would carry {} recurrent rows unfolded into it, past the {largest} \
-         tokens of the largest activation rung, whose replay scratch holds as many; fold \
-         what its lanes have written before they write more",
-        rows.carried
+        "pipeline: a fire of {} own rows would carry {} recurrent rows unfolded into it (as \
+         its rung counts them), past the {largest} tokens of the largest activation rung, whose \
+         replay scratch holds as many; fold what its lanes have written before they write more",
+        rows.own, rows.carried
     ))
 }
 
@@ -11217,17 +11227,31 @@ mod unfolded_tests {
         );
     }
 
-    /// A beam verifier's replay: four decode lanes (one own row each) on
-    /// one set folded through 100, each replaying its 300 buffered rows. On
-    /// an engine whose rung holds every lane's replay (it states no bound of
-    /// its own, `replayed_rows` 0) the fire asks for the 1200 rows its
-    /// lanes carry, not the 4 it owns: a rung covering them is picked, never
-    /// one whose replay scratch the engine refuses at submit; past the
-    /// largest rung it is refused by name before any step. On an engine
-    /// stating its own bound a decode lane's replay counts none toward the
-    /// rung, as before.
+    /// A beam verifier's replay on an engine whose rung holds every lane's
+    /// replay (it states no bound of its own, `replayed_rows` 0): a rung of
+    /// `T` holds `T` own rows and as many again, own and carried together.
+    /// A w8-like fire (8 own rows, 1052 carried) fits the 1024 rung
+    /// (1060 <= 2048) and is served there. A w11-like replay whose composed
+    /// own rows (929, its beams' rows, not its 11 lanes) and 1144 carried
+    /// pass 2048 is refused by name before any step, however few its lanes.
+    /// On an engine stating its own bound a decode lane's replay counts
+    /// none toward the rung, as before.
     #[test]
-    fn a_beam_replay_asks_the_rung_for_every_lane_s_carried_rows() {
+    fn a_beam_replay_asks_the_rung_for_its_own_and_carried_rows_together() {
+        let stores = pool_with_rungs(vec![(16, 1), (1024, 8)]);
+        let pool = stores.shared.as_ref().unwrap().lock().unwrap();
+        // w8: eight decode lanes on one set, their replay 1052 rows in all.
+        let w8 = rung_counted(FireRows { own: 8, carried: 0 }, 1052, true);
+        assert_eq!(w8.ask(), 530, "half of 1060 rows together");
+        assert!(pool.rung_for(w8.ask()) <= 1024 && pool.rung_for(w8.ask()) >= 530);
+        assert!(check_largest_rung(w8, 1024).is_ok(), "served at the 1024 rung");
+        // w11: 929 composed own rows and 1144 carried, 2073 together.
+        let w11 = rung_counted(FireRows { own: 929, carried: 0 }, 1144, true);
+        let refused = check_largest_rung(w11, 1024).unwrap_err();
+        assert!(refused.contains("929 own rows"), "{refused}");
+        drop(pool);
+        // The host pass counts every lane's replayed rows the same way: four
+        // decode lanes each replaying 300 rows.
         let mut full = lane(400, 1);
         for _ in 1..4 {
             let more = full.lanes[0].clone();
@@ -11238,20 +11262,10 @@ mod unfolded_tests {
         let stated = piece_rung_rows(&full, &whole, &frozen, false, false);
         assert_eq!(stated, FireRows { own: 4, carried: 0 }, "a stated bound holds them");
         let in_rung = piece_rung_rows(&full, &whole, &frozen, false, true);
-        assert_eq!(in_rung, FireRows { own: 4, carried: 1200 });
-        assert_eq!(in_rung.ask(), 1200, "the rung covers every lane's replay");
-        let stores = pool_with_rungs(vec![(16, 1), (2048, 8)]);
-        let pool = stores.shared.as_ref().unwrap().lock().unwrap();
-        assert!(pool.rung_for(in_rung.ask()) >= 1200, "a wider rung than the 4 own rows'");
-        assert!(pool.rung_for(stated.ask()) < 1200);
-        drop(pool);
-        assert!(check_largest_rung(in_rung, 2048).is_ok());
-        let refused = check_largest_rung(in_rung, 1024).unwrap_err();
-        assert!(refused.contains("1200 recurrent rows"), "{refused}");
-        // The device-placed fire counts the same way.
-        let device = rung_counted(FireRows { own: 4, carried: 0 }, 1200, true);
-        assert_eq!(device.ask(), 1200);
+        assert_eq!(in_rung.ask(), 602, "1204 rows together");
         assert_eq!(rung_counted(FireRows { own: 4, carried: 0 }, 1200, false).ask(), 4);
+        // Own rows past the rung are still the rung's own bound.
+        assert_eq!(rung_counted(FireRows { own: 900, carried: 0 }, 10, true).ask(), 900);
     }
 
     pub(super) fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
