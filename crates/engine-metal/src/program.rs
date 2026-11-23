@@ -287,17 +287,11 @@ impl Plane {
                  a run never spans segments",
                 state.run, state.scratch, state.resident
             );
-            // A beam group's scratch grows with its beams (its rows): the
-            // widest group whose place fits a segment, at this scratch a beam.
+            // A beam group's width is named, not a width it would fit at: its
+            // scratch a beam moves with the bind's extents (Mac Pro: 6.7 MB a
+            // beam at w32, 3.4 MB at w20), so no one figure bounds it.
             if let Some(layout) = self.beam_of(program) {
-                let per_beam = state.scratch.div_ceil(u64::from(layout.lanes.max(1)));
-                let fits = (u64::from(segment) * chunk / per_beam.max(1))
-                    .min(u64::from(self.beam_max_lanes));
-                why.push_str(&format!(
-                    "; a group of {} beams, and this load holds about {fits} a group at \
-                     {per_beam} bytes of scratch a beam",
-                    layout.lanes
-                ));
+                why.push_str(&format!("; a beam group of {} beams", layout.lanes));
             }
             return Err(Fault::program("program::plane", why));
         }
@@ -4765,7 +4759,7 @@ mod tests {
 
     /// A guest state whose place needs a run past a segment is refused by
     /// name at guest_state, naming the run, the segment and (for a beam
-    /// group) the widest group this load holds, never asked of the pool,
+    /// group) its beams, never asked of the pool,
     /// where a restore waited on a run that can never open (Mac Pro's w32
     /// on the M5). The same program over a pool whose segment holds its run
     /// is stated as before.

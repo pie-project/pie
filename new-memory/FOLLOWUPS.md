@@ -1167,3 +1167,31 @@ the bf16 roundings), and the reductions' three dependent levels. That needs the 
 (Metal System Trace / Instruments: occupancy, ALU and memory utilization per dispatch), which a
 headless session cannot capture. The M5 meets the beam rule already (beam-4 / 4-lane 1.023x), so
 this is the M1's and a general guest-codegen item, not a gate.
+
+## F?? Chunked lane scratch through the eta scratch ABI (post-PR)
+
+A guest instance's value scratch lies whole in one run of adjacent chunks inside one segment: the eta
+scratch ABI (`eta-compiler` codegen/lane_scratch.rs) has a grouped kernel address every value of a lane
+from its one base (`scratch = lane_scratch[l]`, value `v` at `scratch + offsets[v]`), so a lane's stage
+scratch is one contiguous run, and a place whose run is past a segment is refused by name (engine-metal
+`Plane::guest_state`). A beam group's scratch grows with its beams (Qwen3-0.6B at 4K context on the M5:
+113 MB at w17, 215 MB at w32, ~6.7 MB a beam of peak-live log-softmax-wide values; liveness packing is
+already on), so its width is bounded by the segment: Metal's 64 MiB (35 chunks of 1.9 MB on the M5) holds
+about w17-w19 at 4K context, CUDA's 1 GiB w96.
+
+Raising Metal's segment to CUDA's 1 GiB (ChunkProfile::ON_DEVICE_METAL.segment_bytes, which
+engine-metal's pool reads) was tried and kept out of the PR: Metal's segment is the elastic pool's grow
+and release step (the governor would yield in 1 GiB steps on unified memory), and the activation span is
+placed against segment boundaries (pool::top_first), so a small pool's span landed on unmapped top heaps
+("mapped bytes of an elastic buffer's top"); two integration tests also assume several segments. Doing it
+means placing the span at heap granularity whatever the segment, with the governor's step decoupled.
+
+`eta_exec::lay_out_chunked` already packs a stage's values into pieces of at most a segment (lifetimes
+shared, each item whole in one piece); no kernel reads that layout. Removing the bound for every engine:
+- the lane table carries a base a (lane, piece), or a per-lane piece table;
+- each value's place is (piece, offset), not one offset;
+- every emitter's value addressing follows: Metal's grouped, streamed and fused forms, CUDA / HIP's SIMT
+  (one ABI), the emitter versions bumped;
+- each engine lays `lay_out_chunked`'s pieces in the place the runtime took (`GuestState::run` the
+  piece run, pieces of a segment at most), and `FireFacts` follow.
+Estimate for Metal and the shared eta change: ~2 days, plus CUDA / HIP's emitter side.
