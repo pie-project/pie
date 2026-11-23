@@ -324,53 +324,27 @@ struct Port {
     /// The policy loaded, to load again if its successor does not load.
     loaded: Option<(String, Vec<u8>)>,
     version: u64,
-    /// The schedule and retention columns as the rows left them.
-    columns: Columns,
 }
 
-/// The worker's columns: each process's row (by its client's id), and the
-/// column's default.
-#[derive(Default)]
-struct Columns {
-    priority: HashMap<ProcessId, i64>,
-    priority_default: Option<i64>,
-    hold: HashMap<ProcessId, bool>,
-    hold_default: Option<bool>,
-    retention: HashMap<(ProcessId, Option<u32>), i64>,
-    retention_default: Option<i64>,
-    tiers: HashMap<(ProcessId, Option<u32>), u8>,
-    tiers_default: Option<u8>,
-}
-
-/// A column's rows and default into `rows` and `default`; keys that name
-/// no process this worker could hold are passed over.
-fn apply<K, V, R: std::hash::Hash + Eq>(
+/// A column's rows and default as a table change: rows by the keys this
+/// worker can name, `None` where deleted; keys naming nothing it could hold
+/// are passed over.
+fn rows<K, V, R, W>(
     column: usize,
     delta: plex_host::host::ColumnDelta<K, V>,
-    rows: &mut HashMap<R, V>,
-    default: &mut Option<V>,
     key: impl Fn(K) -> Option<R>,
-) -> bool {
-    let changed = !delta.rows.is_empty() || delta.default.is_some();
+    value: impl Fn(V) -> W,
+) -> (Vec<(R, Option<W>)>, Option<Option<W>>) {
+    let mut out = Vec::with_capacity(delta.rows.len());
     for (k, row) in delta.rows {
         let Some(k) = key(k) else {
             super::ROWS_PASSED_OVER[column].fetch_add(1, Ordering::Relaxed);
             continue;
         };
         super::ROWS_ENACTED[column].fetch_add(1, Ordering::Relaxed);
-        match row {
-            Some(v) => {
-                rows.insert(k, v);
-            }
-            None => {
-                rows.remove(&k);
-            }
-        }
+        out.push((k, row.map(&value)));
     }
-    if let Some(d) = delta.default {
-        *default = d;
-    }
-    changed
+    (out, delta.default.map(|d| d.map(&value)))
 }
 
 fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
@@ -387,7 +361,6 @@ fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
         offloaded: HashMap::new(),
         loaded,
         version: 0,
-        columns: Columns::default(),
     };
     loop {
         let first = match events.recv_timeout(LOOK) {
@@ -741,6 +714,12 @@ impl Port {
             "pie/batch-size",
             Some(Value::Int(crate::scheduler::last_batch_size() as i64)),
         );
+        // Runtime-derived facts a policy may pace starts by; absent (not 0)
+        // until learned.
+        let (lanes, spread) = crate::planner::to_end_facts();
+        let int = |n: Option<u64>| n.map(|n| Value::Int(i64::try_from(n).unwrap_or(i64::MAX)));
+        self.host.attr(Subject::Worker(WORKER.to_string()), "pie/lanes-to-end", int(lanes));
+        self.host.attr(Subject::Worker(WORKER.to_string()), "pie/starts-spread", int(spread));
         self.host.put_worker(
             WORKER,
             false,
@@ -859,73 +838,23 @@ impl Port {
             super::publish(key, value);
         }
         let pid = |id: String| ProcessId::from_str(&id).ok();
-        let c = &mut self.columns;
-        let scheduled = apply(
-            0,
-            delta.schedule_priority,
-            &mut c.priority,
-            &mut c.priority_default,
-            pid,
-        ) | apply(
-            1,
-            delta.schedule_hold,
-            &mut c.hold,
-            &mut c.hold_default,
-            pid,
-        );
-        if scheduled {
-            tracing::debug!(
-                priority = c.priority.len(),
-                hold = c.hold.len(),
-                hold_default = ?c.hold_default,
-                "schedule rows installed"
-            );
-            schedule::install(Some(schedule::Table::new(
-                c.priority.clone(),
-                c.priority_default,
-                c.hold.clone(),
-                c.hold_default,
-            )));
-        }
-        let prefix = |(id, tokens): (String, Option<u32>)| Some((pid(id)?, tokens));
-        let kept = apply(
-            2,
-            delta.retention_priority,
-            &mut c.retention,
-            &mut c.retention_default,
-            prefix,
-        ) | apply(
-            3,
-            delta.retention_tiers,
-            &mut c.tiers,
-            &mut c.tiers_default,
-            prefix,
-        );
-        if kept {
-            tracing::debug!(
-                priority = c.retention.len(),
-                tiers = c.tiers.len(),
-                "retention rows installed"
-            );
-            let mut steps: HashMap<ProcessId, Vec<(Option<u64>, i64)>> = HashMap::new();
-            for (&(owner, tokens), &key) in &c.retention {
-                steps
-                    .entry(owner)
-                    .or_default()
-                    .push((tokens.map(u64::from), key));
-            }
-            let mut tiers: HashMap<ProcessId, Vec<(Option<u64>, u8)>> = HashMap::new();
-            for (&(owner, tokens), &set) in &c.tiers {
-                tiers
-                    .entry(owner)
-                    .or_default()
-                    .push((tokens.map(u64::from), set));
-            }
-            retention::install(Some(
-                retention::Table::new(steps, c.retention_default)
-                    .with_tiers(tiers, c.tiers_default),
-            ));
-        }
+        let (keys, key_default) = rows(0, delta.schedule_priority, pid, |v| v);
+        let (holds, hold_default) = rows(1, delta.schedule_hold, pid, |v| v);
+        schedule::apply(schedule::Change {
+            keys,
+            key_default,
+            holds,
+            hold_default,
+        });
+        let prefix = |(id, tokens): (String, Option<u32>)| Some((pid(id)?, tokens.map(u64::from)));
+        let (keys, key_default) = rows(2, delta.retention_priority, prefix, |v| v);
+        let (tiers, tiers_default) = rows(3, delta.retention_tiers, prefix, |v| v);
+        retention::apply(retention::Change {
+            keys,
+            key_default,
+            tiers,
+            tiers_default,
+        });
         for (id, reason) in delta.terminate {
             let Some(proc) = pid(id).and_then(|id| self.procs.get(&id)) else {
                 continue;

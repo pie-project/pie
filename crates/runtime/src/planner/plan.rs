@@ -1267,17 +1267,15 @@ impl ResidencyPlanner {
                         self.plan_stopped("short of kv: waits on a grow the walk makes");
                         return true;
                     }
-                    // Idle cache a policy keys above the floor moves down
-                    // a tier before any is dropped; the rest is dropped.
+                    // Idle cache its tiers let below the device moves down
+                    // a tier before any is dropped; what cannot move now is
+                    // dropped, lowest key first.
                     if self.demote_idle(count) {
                         self.plan_stopped("short of kv: idle cache moves down");
                         return false;
                     }
                     if self.reclaim_idle_once() {
                         continue;
-                    }
-                    if self.demote_idle(count) {
-                        return false;
                     }
                     if self.sweep_stranded(count, false) {
                         self.plan_stopped("short of kv: stranded tails swept");
@@ -1321,8 +1319,8 @@ impl ResidencyPlanner {
                         return true;
                     }
                     // On a shared pool the chunks idle cache holds open for
-                    // state too: what is keyed above the floor moves down a
-                    // tier before any is dropped.
+                    // state too: what its tiers let below the device moves
+                    // down a tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle(as_pages) {
                         self.plan_stopped("short of state: idle cache moves down");
@@ -1330,9 +1328,6 @@ impl ResidencyPlanner {
                     }
                     if self.reclaim_idle_once() || self.reclaim_head_sharing() {
                         continue;
-                    }
-                    if as_pages > 0 && self.demote_idle(as_pages) {
-                        return false;
                     }
                     // And the tails of sets at rest past what their keys
                     // keep, lowest key first, before any set moves whole

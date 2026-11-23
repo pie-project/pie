@@ -181,7 +181,7 @@ impl PoolPort for RacePool {
         self.with_rs(|rs| rs.release_reservation(grant));
     }
     fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets))
             .unwrap_or(0)
     }
     fn prepare_sweep(
@@ -9157,9 +9157,9 @@ async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
     );
 }
 
-/// The policy's schedule floor (the test-pause policy of sc/amd-beam-pages
-/// holds a process below it for a while, then lifts it): a process held
-/// below the floor and parked stays parked while room stands free and its
+/// A policy's hold (the test-pause policy of sc/amd-beam-pages
+/// holds a process for a while, then lifts it): a process held
+/// and parked stays parked while room stands free and its
 /// own lanes wait to be resident, and, taking sets that are off the
 /// device, owes them parked; its restore is queued once the policy lifts
 /// it, never before.
@@ -9175,7 +9175,7 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
         rs: RsUnits::default(),
     };
     planner.with_inner(|inner| {
-        inner.reschedule(|_| (0, true));
+        inner.reschedule(None, |_| (0, true));
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Evicted;
         proc.parked = Some(demand);
@@ -9211,7 +9211,7 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
         "parked with what it owes"
     );
     // The policy lifts it: its restore goes.
-    planner.with_inner(|inner| inner.reschedule(|_| (1, false)));
+    planner.with_inner(|inner| inner.reschedule(None, |_| (1, false)));
     assert!(restore_queued(&planner), "lifted: its restore is queued");
     waiting.abort();
 }

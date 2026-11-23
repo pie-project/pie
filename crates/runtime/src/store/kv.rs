@@ -885,22 +885,19 @@ impl KvStore {
     /// [`Self::reclaim_droppable`]; this drops whatever the keys order.
     #[cfg(test)]
     pub fn reclaim_cache(&mut self, epoch: u64, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, keys, |_| true)
+        self.reclaim_cache_where(epoch, keys)
     }
 
-    /// [`Self::reclaim_cache`] as the runtime may run it unasked: it drops
-    /// only entries whose key says they may go (`pressure::may_drop`). One
-    /// keyed higher may still settle on its disk copy, which drops nothing.
+    /// [`Self::reclaim_cache`] as the runtime runs it, once a demote had
+    /// nothing to move (`prepare_demote` goes first where the planner
+    /// demotes): cached KV yields to running work, whatever its key, lowest
+    /// key first, then least recently used. Any may still settle on its disk
+    /// copy, which drops nothing.
     pub fn reclaim_droppable(&mut self, epoch: u64, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, keys, crate::policy::pressure::may_drop)
+        self.reclaim_cache_where(epoch, keys)
     }
 
-    fn reclaim_cache_where(
-        &mut self,
-        epoch: u64,
-        keys: impl Keys,
-        drops: fn(i64) -> bool,
-    ) -> usize {
+    fn reclaim_cache_where(&mut self, epoch: u64, keys: impl Keys) -> usize {
         self.split_at_steps(&keys);
         self.split_persisted();
         let mut freed = 0;
@@ -920,8 +917,8 @@ impl KvStore {
                 }
                 let before = freed;
                 freed += self.settle_on_disk(&ids, key, &keys, epoch);
-                if freed == before && drops(key) {
-                    let ids = ids
+                if freed == before {
+                    let ids: Vec<u64> = ids
                         .into_iter()
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
                         .collect();
@@ -1126,9 +1123,8 @@ impl KvStore {
     /// Moves idle cache off the device, host first and what the host
     /// cannot take to disk (as a suspend's pages go), lowest retention key
     /// first: one group, up to `room` pages. A persistent disk tier keeps
-    /// what lands on disk as its copies, journaled. Only cache keyed above
-    /// the retention floor ([`retention::above_floor`]) moves: the rest is
-    /// dropped when its room is wanted, never copied down.
+    /// what lands on disk as its copies, journaled. Only cache whose tiers
+    /// name the host moves: the rest is dropped when its room is wanted.
     pub fn prepare_demote(
         &mut self,
         room: usize,
@@ -1211,9 +1207,6 @@ impl KvStore {
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
-                if !now && !retention::above_floor(key) {
-                    continue;
-                }
                 if !last && !self.table.frees_device_pages(&self.roots(&ids)) {
                     later.push((key, ids));
                     continue;
@@ -1340,9 +1333,9 @@ impl KvStore {
     /// tier a group goes whole or not at all (a run split over host and
     /// disk would leave its disk tail an orphan at restart), so more than
     /// `wanted` may go; what lands is journaled. Only a shared pool's kv
-    /// list moves host -> disk (CONTRACT-BC 22), and only cache keyed above
-    /// the retention floor is copied: floor-keyed cache on the host is
-    /// dropped when the host's room is wanted (`prepare_suspend`). `None`
+    /// list moves host -> disk (CONTRACT-BC 22), and only cache whose tiers
+    /// name the disk is copied: the rest on the host is dropped when the
+    /// host's room is wanted (`prepare_suspend`). `None`
     /// when nothing is left to copy.
     pub fn prepare_spill(&mut self, wanted: usize, keys: impl Keys) -> Option<KvSpillTxn> {
         let shape = self.shape?;
@@ -1356,12 +1349,21 @@ impl KvStore {
             if pages.len() >= wanted || room == 0 {
                 break;
             }
+            // Only what its tiers let on disk goes there: the rest is dropped
+            // when the host's room is wanted.
+            let ids: Vec<u64> = ids
+                .into_iter()
+                .filter(|&id| self.tiers_of(id, &keys) & retention::DISK != 0)
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
             // What a higher key also covers stays with it.
             let above = self.above(key, &keys);
             let mut group = self.table.cache_only_host_slots(&self.roots(&ids), &above);
             group.retain(|(location, _)| !taken.contains(location));
             self.settle_host_on_disk(&mut group);
-            if group.is_empty() || !retention::above_floor(key) {
+            if group.is_empty() {
                 continue;
             }
             let kept = self.demote_records(&ids, group.iter().map(|&(at, _)| at), key);

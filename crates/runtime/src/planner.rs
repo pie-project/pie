@@ -44,7 +44,7 @@ pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};
 pub use global::{
     assign, engine_of, init_planner, persist_run, place, planner, planner_for, planner_of,
-    planners, rekey_holders, release, wake,
+    planners, rekey_holders, release, to_end_facts, wake,
 };
 pub use grant::{AllocationGrant, Demand};
 pub use in_flight::FireInFlight;

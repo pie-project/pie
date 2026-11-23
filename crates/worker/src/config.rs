@@ -805,8 +805,8 @@ pub struct RuntimeConfig {
     /// engine's fire lanes, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
-    /// The worker-plane PLEX policy: a built-in policy's name (`noop`,
-    /// `priority`) or a component path; omit to run none. The cluster
+    /// The worker-plane PLEX 1.1 policy: a built-in policy's name (`noop`)
+    /// or a component path; omit to run none. The cluster
     /// plane's are `[cluster] cluster_policies`.
     #[serde(default)]
     pub worker_policy: Option<String>,

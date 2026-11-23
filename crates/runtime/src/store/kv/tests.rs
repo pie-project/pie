@@ -91,7 +91,7 @@ fn tests_every_case() {
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
-    floor_keyed_idle_cache_is_dropped_not_demoted();
+    idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -1286,36 +1286,47 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
 }
 
-/// Idle cache no policy keys above the floor is not copied down a tier
-/// when the device wants its room: it is dropped, as without tiers. Keyed
-/// above the floor, the same cache goes to the host.
-fn floor_keyed_idle_cache_is_dropped_not_demoted() {
-    use crate::policy::retention::FLOOR;
+/// Rows of one key and one tier set for every owner, as a test's table.
+struct Rows(i64, u8);
+
+impl crate::policy::retention::Keys for Rows {
+    fn key_at(&self, _owner: Option<ProcessId>, _at: u64) -> i64 {
+        self.0
+    }
+
+    fn tiers_at(&self, _owner: Option<ProcessId>, _at: u64) -> u8 {
+        self.1
+    }
+}
+
+/// Whether idle cache can move down a tier when the device wants its room
+/// is the tiers row's say, whatever its key: a row without the host keeps
+/// it there to be dropped; every tier (no row) moves it to the host.
+fn idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted() {
+    use crate::policy::retention::{ALL_TIERS, DEVICE};
     let mut store = KvStore::new_with_swap(8, 8, 8, h(37));
     let owner = ProcessId::from_u128(45);
     let tokens = kept_and_gone(&mut store, 18, 3, owner);
-    assert!(
-        store.prepare_demote(8, |_| FLOOR).unwrap().is_none(),
-        "nothing moves at the floor"
-    );
-    assert!(
-        store.prepare_demote(8, |_| FLOOR - 1).unwrap().is_none(),
-        "nor below it"
-    );
+    for key in [-1, 0, 100] {
+        assert!(
+            store.prepare_demote(8, Rows(key, DEVICE)).unwrap().is_none(),
+            "nothing moves at key {key}: its row keeps it off the host"
+        );
+    }
     assert_eq!(store.host_swap_available(), 8, "the host is untouched");
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), Rows(100, DEVICE)),
         3,
-        "it is dropped"
+        "it is dropped, however high its key"
     );
     assert_eq!(on_device(&mut store, &tokens), 0);
     assert!(store.cached_working_sets().is_empty());
 
     let tokens = kept_and_gone(&mut store, 19, 3, owner);
     let txn = store
-        .prepare_demote(8, |_| FLOOR + 1)
+        .prepare_demote(8, Rows(0, ALL_TIERS))
         .unwrap()
-        .expect("keyed above the floor, it moves");
+        .expect("at the default key, with every tier, it moves");
     use ::engine::transfer::MemoryDomain::HostPinned;
     let tiers: Vec<_> = txn
         .copy_plans()
@@ -1747,13 +1758,11 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
 }
 
 /// How long idle cache is kept is the policy's (KEEP_CACHE moved to PLEX):
-/// a key above the floor keeps it from a reclaim the runtime runs unasked,
-/// and once the policy lowers the key (its keep over, on its alarm) the next
-/// demand reclaims it. With no policy, idle cache has no expiry: it stays
+/// a demand takes the lowest key first, so a key the policy states keeps
+/// cache past the rest. With no policy, idle cache has no expiry: it stays
 /// whatever time passes, and only a demand for its room (the planner's
 /// reclaim) takes it, lowest key then least recently used first.
 fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand() {
-    use crate::policy::retention::FLOOR;
     let mut store = KvStore::new(8, h(43));
     let (kept, unkept) = (ProcessId::from_u128(47), ProcessId::from_u128(48));
     let kept_tokens = kept_and_gone(&mut store, 22, 3, kept);
@@ -1764,18 +1773,14 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
     }
     assert_eq!(on_device(&mut store, &kept_tokens), 3);
     assert_eq!(on_device(&mut store, &unkept_tokens), 3);
-    // The policy keeps one: a demand reclaims only the other.
-    let keep = move |owner: Option<ProcessId>| {
-        if owner == Some(kept) { FLOOR + 1 } else { FLOOR }
-    };
+    // The policy keys one higher: a demand reclaims the lower first.
+    let keep = move |owner: Option<ProcessId>| i64::from(owner == Some(kept));
     assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 3);
-    assert_eq!(on_device(&mut store, &unkept_tokens), 0, "unkept: reclaimed");
-    assert_eq!(on_device(&mut store, &kept_tokens), 3, "the keep is honoured");
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 0);
-    assert_eq!(on_device(&mut store, &kept_tokens), 3, "still kept");
-    // The keep is over: the policy lowers the key, and the next demand
-    // reclaims it.
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), |_| FLOOR), 3);
+    assert_eq!(on_device(&mut store, &unkept_tokens), 0, "the lower key goes first");
+    assert_eq!(on_device(&mut store, &kept_tokens), 3, "the higher stays");
+    // No lower tier to move to: cached KV yields to the next demand,
+    // whatever its key.
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 3);
     assert_eq!(on_device(&mut store, &kept_tokens), 0);
 }
 
@@ -1784,7 +1789,6 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
 /// what a set last read before the fires in flight began is free at once,
 /// and what a reader read in one of them waits for that one.
 fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
-    use crate::policy::retention::FLOOR;
     let mut store = KvStore::new(8, h(41));
     let owner = ProcessId::from_u128(46);
     kept_and_gone(&mut store, 20, 3, owner);
@@ -1793,7 +1797,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     let busy = store.begin_fire();
     let other = store.begin_fire();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), |_| 0),
         3,
         "dropped"
     );
@@ -1812,7 +1816,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     store.release_working_set(ws, read);
     store.retire_idle();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), |_| 0),
         3,
         "dropped"
     );

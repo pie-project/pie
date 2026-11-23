@@ -1066,8 +1066,8 @@ impl ResidencyPlanner {
     }
 
     /// Idle cache the device is short of room for moves down a tier, host
-    /// first then disk, rather than being dropped, where a policy keys it
-    /// above the retention floor (the stores gate it: floor-keyed cache is
+    /// first then disk, rather than being dropped, where its tiers row lets
+    /// it on the host (the stores gate it: what a row keeps off the host is
     /// dropped by [`Self::reclaim_idle_once`] instead, never copied): whether
     /// a move is on its way (its landing frees the pages and pokes the
     /// planner). Only under
@@ -1734,10 +1734,14 @@ impl ResidencyPlanner {
         self.poke();
     }
 
-    /// Reads each holder's retention key again: the table has changed.
-    pub fn rekey_holders(&self) {
+    /// Reads each holder's retention key again, of those `only` names (by
+    /// PLEX id) or all: the table has changed.
+    pub fn rekey_holders(&self, only: Option<&std::collections::HashSet<ProcessId>>) {
         self.with_inner(|inner| {
-            for (pid, proc) in inner.procs.iter_mut().filter(|(_, proc)| proc.holder) {
+            for (pid, proc) in inner.procs.iter_mut().filter(|(pid, proc)| {
+                proc.holder
+                    && only.is_none_or(|only| only.contains(&crate::policy::schedule::plex_id(**pid)))
+            }) {
                 proc.kept = holder_key(*pid);
             }
         });
@@ -1995,6 +1999,17 @@ impl ResidencyPlanner {
         }
     }
 
+    /// What this planner has learned of its processes' footprints: the
+    /// lanes its pools hold to their end at once, and a process's life past
+    /// the gate. `None` until one has finished.
+    pub fn to_end_facts(&self) -> Option<(u64, Option<std::time::Duration>)> {
+        let (_, kv_total) = self.port.device_stats();
+        let (_, rs_total) = self.port.rs_stats();
+        self.with_inner(|inner| {
+            Some((inner.to_end.lanes_to_end(kv_total, rs_total)?, inner.to_end.life()))
+        })
+    }
+
     /// Holds `pid` back, oldest first, until the pools hold it to the end
     /// beside the processes already started.
     async fn admit_to_end(&self, pid: ProcessId) {
@@ -2112,14 +2127,24 @@ impl ResidencyPlanner {
     }
 
     pub fn reschedule(self: &Arc<Self>) {
+        self.reschedule_only(None);
+    }
+
+    /// [`Self::reschedule`] for the processes `only` names (by PLEX id), or
+    /// all: nothing else is read again, and a change that moves no key and
+    /// no hold here reorders nothing.
+    pub fn reschedule_only(self: &Arc<Self>, only: Option<&std::collections::HashSet<ProcessId>>) {
         let schedule = crate::policy::schedule::current();
-        self.with_inner(|inner| {
-            inner.reschedule(|pid| {
+        let changed = self.with_inner(|inner| {
+            inner.reschedule(only, |pid| {
                 schedule
                     .as_ref()
                     .map_or((0, false), |s| (s.key(*pid), s.held(*pid)))
-            });
+            })
         });
+        if !changed {
+            return;
+        }
         self.vacate_held_seats();
         self.pause_due.store(true, Ordering::Release);
         self.poke();

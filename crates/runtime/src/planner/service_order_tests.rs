@@ -300,7 +300,7 @@ fn a_key_outranks_age_in_the_queue_and_among_victims() {
     let young_key = park_allocation(&mut inner, young, 4);
     assert_eq!(inner.unmet_head().unwrap().1.pid, old, "no schedule: age");
 
-    inner.reschedule(|pid| (if *pid == young { 5 } else { 0 }, false));
+    inner.reschedule(None, |pid| (if *pid == young { 5 } else { 0 }, false));
     let (head, waiter) = inner.unmet_head().unwrap();
     assert_eq!(waiter.pid, young, "the higher key takes the head");
     assert!(
@@ -316,7 +316,7 @@ fn a_key_outranks_age_in_the_queue_and_among_victims() {
         );
     }
 
-    inner.reschedule(|_| (0, false));
+    inner.reschedule(None, |_| (0, false));
     assert_eq!(
         inner.unmet_head().unwrap().1.pid,
         old,
@@ -334,7 +334,7 @@ fn the_floor_parks_a_restore_and_lifting_it_queues_the_restore_again() {
     park_restore(&mut inner, paused, 3);
     let running_key = park_allocation(&mut inner, running, 2);
 
-    inner.reschedule(|pid| (0, *pid == paused || *pid == running));
+    inner.reschedule(None, |pid| (0, *pid == paused || *pid == running));
     assert!(
         inner.queue.values().all(|w| w.pid != paused),
         "a held process is not restored"
@@ -348,7 +348,7 @@ fn the_floor_parks_a_restore_and_lifting_it_queues_the_restore_again() {
     assert_eq!(head, running_key);
     assert!(inner.procs[&running].held, "held, so a victim at any rank");
 
-    inner.reschedule(|_| (0, false));
+    inner.reschedule(None, |_| (0, false));
     assert!(inner.procs[&paused].parked.is_none());
     assert!(
         inner
@@ -372,7 +372,7 @@ fn a_preempted_process_holds_back_only_what_it_outranks() {
         "no schedule: the newcomer waits for the older preempted process"
     );
 
-    inner.reschedule(|pid| (if *pid == newcomer { 5 } else { 0 }, false));
+    inner.reschedule(None, |pid| (if *pid == newcomer { 5 } else { 0 }, false));
     let floor = inner.preempted_floor().unwrap();
     assert!(
         inner.procs[&newcomer].rank() <= floor,

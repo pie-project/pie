@@ -1314,50 +1314,33 @@ impl RsStore {
         freed
     }
 
-    /// Drops the snapshots sharing a slot with `working_sets` whose retention
-    /// key lets the runtime drop them unasked (`pressure::may_drop`), so the
-    /// sets' next write lands in place instead of copying to a slot the pool
-    /// lacks. One a policy keyed higher stays: room for it is asked for with
-    /// tier pressure. Returns how many were dropped.
-    pub fn reclaim_sharing(
-        &mut self,
-        working_sets: &[RsWorkingSetId],
-        keys: impl crate::policy::retention::Keys,
-    ) -> usize {
+    /// Drops the snapshots sharing a slot with `working_sets`, so the sets'
+    /// next write lands in place instead of copying to a slot the pool
+    /// lacks: cached state yields to running work, whatever its key, and a
+    /// checkpoint has no lower tier to move to. Returns how many were
+    /// dropped.
+    pub fn reclaim_sharing(&mut self, working_sets: &[RsWorkingSetId]) -> usize {
         let sharing = self.sharing_checkpoints(&working_sets.iter().copied().collect());
         let droppable: HashSet<RsWorkingSetId> = self
             .checkpoints
             .values()
             .filter(|entry| sharing.contains(&entry.snapshot))
-            .filter(|entry| {
-                self.working_sets.get(entry.snapshot).is_some_and(|ws| {
-                    let at = u64::from(Self::position(ws)).saturating_sub(1);
-                    crate::policy::pressure::may_drop(keys.key_at(entry.owner, at))
-                })
-            })
+            .filter(|entry| self.working_sets.get(entry.snapshot).is_some())
             .map(|entry| entry.snapshot)
             .collect();
         self.drop_checkpoints(|_, snapshot| droppable.contains(&snapshot))
     }
 
-    /// The rs half of idle reclaim, in the kv half's order. The runtime runs
-    /// it only as [`Self::reclaim_droppable`].
+    /// The rs half of idle reclaim, in the kv half's order.
     #[cfg(test)]
     pub fn reclaim_cache(&mut self, keys: impl crate::policy::retention::Keys) -> usize {
-        self.reclaim_cache_where(keys, |_| true)
+        self.reclaim_droppable(keys)
     }
 
-    /// [`Self::reclaim_cache`] as the runtime may run it unasked: only
-    /// checkpoints whose key says they may go (`pressure::may_drop`).
+    /// Drops the idle checkpoints of one group, lowest retention key first,
+    /// then least recently used: a checkpoint has no lower tier to move to,
+    /// and cached state yields to running work whatever its key.
     pub fn reclaim_droppable(&mut self, keys: impl crate::policy::retention::Keys) -> usize {
-        self.reclaim_cache_where(keys, crate::policy::pressure::may_drop)
-    }
-
-    fn reclaim_cache_where(
-        &mut self,
-        keys: impl crate::policy::retention::Keys,
-        drops: fn(i64) -> bool,
-    ) -> usize {
         if self.checkpoints.is_empty() {
             return 0;
         }
@@ -1388,7 +1371,6 @@ impl RsStore {
         }
         let mut order: Vec<_> = groups
             .into_iter()
-            .filter(|((_, key), _)| drops(*key))
             .map(|((_, key), (keys, last_use))| ((key, last_use), keys))
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);

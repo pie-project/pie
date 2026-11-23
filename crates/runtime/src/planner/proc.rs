@@ -47,7 +47,7 @@ pub(super) struct Proc {
     pub(super) rebind_waiting: Option<String>,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     pub(super) parked: Option<Demand>,
-    /// Parked below the floor, it gave its execution seat back: it takes
+    /// Held (`schedule/hold`) and parked, it gave its execution seat back: it takes
     /// one again before its restore is queued.
     pub(super) seatless: bool,
     pub(super) reseating: bool,

@@ -593,9 +593,8 @@ pub trait PoolPort: Send + Sync + 'static {
         self.chunk_stats().rs
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits);
-    /// Drops idle cache, but only what its retention key lets the runtime
-    /// drop unasked (`pressure::may_drop`); room past that is asked of the
-    /// policy with tier pressure.
+    /// Drops idle cache, lowest retention key first, then least recently
+    /// used: the planner runs it once a demote had nothing to move.
     fn reclaim_idle(&self) -> u32;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
@@ -1961,7 +1960,7 @@ impl PoolPort for RegistryPool {
     }
 
     fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets))
     }
 
     fn prepare_sweep(
