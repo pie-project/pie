@@ -476,6 +476,7 @@ impl Engine for Xla {
             residency,
             ordinal,
             frames_in_flight,
+            steps,
         } = request;
         let mut boot = self.boot.clone();
         // A fire's inputs wait in the staging ring until it runs: one slot
@@ -619,7 +620,27 @@ impl Engine for Xla {
             frames_in_flight: engine::stated_frames(
                 (shell.staging_facts().ring_slots as usize).saturating_sub(1),
             )?,
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the warm ladder keys
+        // on it in its own branch (its laid mixed rungs, `mixed_lanes`, are
+        // narrower than the set's mixed shapes).
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts {
+                landing: engine::ReadoutLanding::InSpan,
+                store_rows: Shell::readout_store_rows(&shell),
+            }),
+        );
+        tracing::info!(
+            "engine-xla: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
         let (rows, sink_row) = shell.pool_geometry();

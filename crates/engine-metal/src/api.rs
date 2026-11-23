@@ -477,6 +477,7 @@ impl Engine for Metal {
             residency,
             ordinal,
             frames_in_flight,
+            steps,
         } = request;
 
         if ordinal > 0 {
@@ -747,7 +748,23 @@ impl Engine for Metal {
             host_ops: engine::HostOps { beam_list: true },
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the warm walk takes
+        // its readout rows per rung from it in its own branch.
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
+        tracing::info!(
+            "engine-metal: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
 
         // Every pipeline the load's rungs dispatch is built now, before
         // ready; a key met after is refused by name and tallied.

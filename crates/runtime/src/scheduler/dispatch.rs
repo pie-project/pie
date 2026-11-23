@@ -312,6 +312,7 @@ mod tests {
                 max_readouts: 0,
                 readout_store: 0,
                 max_replayed_rows: 0,
+                shapes: None,
             },
             device_geometry_port_mask: PortMask::NONE,
             device_domain: ::engine::MemoryDomain::HostPinned,
