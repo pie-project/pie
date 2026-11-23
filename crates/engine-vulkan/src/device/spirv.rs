@@ -14,6 +14,9 @@ const OP_TYPE_STRUCT: u32 = 30;
 const OP_TYPE_POINTER: u32 = 32;
 const OP_CONSTANT: u32 = 43;
 const OP_VARIABLE: u32 = 59;
+const OP_LOAD: u32 = 61;
+const OP_ACCESS_CHAIN: u32 = 65;
+const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
 const OP_DECORATE: u32 = 71;
 const OP_MEMBER_DECORATE: u32 = 72;
 
@@ -26,6 +29,7 @@ const DECORATION_OFFSET: u32 = 35;
 const STORAGE_PUSH_CONSTANT: u32 = 9;
 const STORAGE_UNIFORM: u32 = 2;
 const STORAGE_STORAGE_BUFFER: u32 = 12;
+const DECORATION_BLOCK: u32 = 2;
 const DECORATION_BUFFER_BLOCK: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +42,20 @@ pub struct Declared {
     pub writable: Vec<bool>,
 
     pub push_bytes: u32,
+
+    /// The fire block's uniform (`PIE_PARAMS_FIRED`), where the module reads
+    /// some of its scalars.
+    pub fire: Option<Fire>,
+}
+
+/// The scalars a module reads from the fire block: the uniform's binding,
+/// its bytes (the scalars', as pushed), and the byte runs of the scalars it
+/// reads there and never from the push block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fire {
+    pub binding: u32,
+    pub bytes: u32,
+    pub words: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +67,11 @@ pub enum Malformed {
     /// A binding the module declares as something other than a storage
     /// buffer, which every layout here binds it as.
     NotStorage {
+        binding: u32,
+    },
+    /// A second uniform block, or one whose size the parser cannot read:
+    /// the fire block is one (`PIE_PARAMS_FIRED`).
+    Fire {
         binding: u32,
     },
 }
@@ -63,6 +86,11 @@ impl std::fmt::Display for Malformed {
             Self::NotStorage { binding } => write!(
                 f,
                 "binding {binding} is not a storage buffer, and its pipeline layout binds one"
+            ),
+            Self::Fire { binding } => write!(
+                f,
+                "binding {binding} is a uniform block beside another, or of a size not read; \
+                 a kernel reads its fire block from one (`PIE_PARAMS_FIRED`)"
             ),
         }
     }
@@ -94,6 +122,11 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
     let mut constants: HashMap<u32, u32> = HashMap::new();
     let mut pointers: HashMap<u32, u32> = HashMap::new();
     let mut push_variables: Vec<u32> = Vec::new();
+    let mut blocks: Vec<u32> = Vec::new();
+    let mut push_variable: Option<u32> = None;
+    // Each access chain's base and first index (a constant's id), and each
+    // whole load's pointer (no index).
+    let mut chains: Vec<(u32, Option<u32>)> = Vec::new();
     // Each variable's pointer type and storage class; types decorated
     // BufferBlock (a storage buffer in the Uniform class, older SPIR-V).
     let mut variables: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -124,6 +157,9 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
             OP_DECORATE if count >= 3 && w[2] == DECORATION_BUFFER_BLOCK => {
                 buffer_blocks.push(w[1]);
             }
+            OP_DECORATE if count >= 3 && w[2] == DECORATION_BLOCK => {
+                blocks.push(w[1]);
+            }
             OP_DECORATE if count >= 4 => match w[2] {
                 DECORATION_BINDING => {
                     highest = Some(highest.map_or(w[3], |h| h.max(w[3])));
@@ -141,6 +177,13 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
             }
             OP_VARIABLE if count >= 4 && w[3] == STORAGE_PUSH_CONSTANT => {
                 push_variables.push(w[1]);
+                push_variable = Some(w[2]);
+            }
+            OP_ACCESS_CHAIN | OP_IN_BOUNDS_ACCESS_CHAIN if count >= 5 => {
+                chains.push((w[3], Some(w[4])));
+            }
+            OP_LOAD if count >= 4 => {
+                chains.push((w[3], None));
             }
             OP_VARIABLE if count >= 4 => {
                 variables.insert(w[2], (w[1], w[3]));
@@ -165,17 +208,38 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         i = end;
     }
 
+    let graph = Graph {
+        types: &types,
+        strides: &strides,
+        constants: &constants,
+        offsets: &offsets,
+    };
     let bindings = highest.map_or(0, |h| h + 1);
     let mut used = vec![false; bindings as usize];
     let mut writable = vec![false; bindings as usize];
+    let mut fire_at: Option<(u32, u32, u32)> = None;
     for &(variable, binding) in &bound {
-        let storage = variables.get(&variable).is_none_or(|&(pointer, class)| {
+        let var = variables.get(&variable).copied();
+        let storage = var.is_none_or(|(pointer, class)| {
             class == STORAGE_STORAGE_BUFFER
                 || (class == STORAGE_UNIFORM
                     && pointers
                         .get(&pointer)
                         .is_some_and(|block| buffer_blocks.contains(block)))
         });
+        let uniform = var.and_then(|(pointer, class)| {
+            let block = *pointers.get(&pointer)?;
+            (class == STORAGE_UNIFORM && blocks.contains(&block)).then_some(block)
+        });
+        if let Some(block) = uniform {
+            let bytes = size_of(block, &graph, 0).ok_or(Malformed::Fire { binding })?;
+            if fire_at.is_some() {
+                return Err(Malformed::Fire { binding });
+            }
+            fire_at = Some((variable, binding, bytes));
+            used[binding as usize] = true;
+            continue;
+        }
         if !storage {
             return Err(Malformed::NotStorage { binding });
         }
@@ -185,18 +249,69 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         }
     }
 
-    let graph = Graph {
-        types: &types,
-        strides: &strides,
-        constants: &constants,
-        offsets: &offsets,
-    };
-    let push_bytes = if push_variables.is_empty() {
-        0
+    let push = if push_variables.is_empty() {
+        None
     } else {
         push_block(words, &pointers, &offsets)
-            .and_then(|block| size_of(block, &graph, 0))
-            .unwrap_or(0)
+    };
+    let push_bytes = push
+        .and_then(|block| size_of(block, &graph, 0))
+        .unwrap_or(0);
+
+    // The members a variable's chains reach; every member where one loads it
+    // whole.
+    let members = |variable: u32, all: usize| -> Vec<u32> {
+        let mut reached: Vec<u32> = Vec::new();
+        for &(base, index) in &chains {
+            if base != variable {
+                continue;
+            }
+            match index.and_then(|id| constants.get(&id)) {
+                Some(&member) => reached.push(member),
+                None => reached.extend(0..all as u32),
+            }
+        }
+        reached.sort_unstable();
+        reached.dedup();
+        reached
+    };
+    // The fire block's fields lie as the push block's; a module that reads
+    // every scalar from the fire block keeps no push block, and the fire
+    // block's own struct gives them.
+    let fire_struct = fire_at.and_then(|(variable, _, _)| {
+        variables
+            .get(&variable)
+            .and_then(|&(pointer, _)| pointers.get(&pointer).copied())
+    });
+    let fire = match (fire_at, push.or(fire_struct)) {
+        (Some((variable, binding, bytes)), Some(block)) => {
+            let layout = offsets.get(&block).cloned().unwrap_or_default();
+            let (_, fields) = types.get(&block).cloned().unwrap_or((0, Vec::new()));
+            let pushed = push_variable.map_or_else(Vec::new, |v| members(v, fields.len()));
+            let words = members(variable, fields.len())
+                .into_iter()
+                .filter(|member| !pushed.contains(member))
+                .map(|member| {
+                    let at = layout
+                        .iter()
+                        .find(|&&(m, _)| m == member)
+                        .map(|&(_, at)| at)
+                        .ok_or(Malformed::Fire { binding })?;
+                    let ty = *fields
+                        .get(member as usize)
+                        .ok_or(Malformed::Fire { binding })?;
+                    let len = size_of(ty, &graph, 0).ok_or(Malformed::Fire { binding })?;
+                    Ok((at, len))
+                })
+                .collect::<Result<Vec<_>, Malformed>>()?;
+            Some(Fire {
+                binding,
+                bytes,
+                words,
+            })
+        }
+        (Some((_, binding, _)), None) => return Err(Malformed::Fire { binding }),
+        (None, _) => None,
     };
 
     Ok(Declared {
@@ -205,6 +320,7 @@ pub fn declared(words: &[u32]) -> Result<Declared, Malformed> {
         used,
         writable,
         push_bytes,
+        fire,
     })
 }
 

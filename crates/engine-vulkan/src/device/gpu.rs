@@ -133,6 +133,16 @@ impl engine_gpu::backend::Frame<Api> for Frame {
         Frame::copy_regions(self, source, into, regions)
     }
 
+    fn copy_rows(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+        most: usize,
+    ) -> Result<()> {
+        Frame::copy_rows(self, source, into, regions, most)
+    }
+
     fn fill_zero(&mut self, into: &Buffer, at: u64, len: u64) -> Result<()> {
         Frame::fill_zero(self, into, at, len)
     }
@@ -194,6 +204,14 @@ fn copy_unretained(
     source.span(source_at, len)?;
     into.span(into_at, len)?;
     let (source, into) = (source.slab(), into.slab());
+    frame.bake(&(
+        "copy",
+        ash::vk::Handle::as_raw(source.buffer),
+        ash::vk::Handle::as_raw(into.buffer),
+        source_at,
+        into_at,
+        len,
+    ));
     let d = &frame.core().device;
     let cmd = frame.cmd();
 

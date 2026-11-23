@@ -64,10 +64,11 @@ struct Params {
     int q_heads;
     int head_dim;
     // The fire row the window's row 0 is: `o` and the LSE are the fire's
-    // whole planes, the partials the window's own.
+    // whole planes, the partials the window's own. Fired: it moves with the
+    // rows of the classes before the window.
     uint row0;
 };
-PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
 
 bool finite_(float x) {
     return abs(x) < 3.0e38;
@@ -81,19 +82,19 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint width = uint(params.q_heads) * hd;
     uint e = 2u * gid.x;
     uint row = gid.y;
-    if (e >= width || row >= uint(params.n_rows)) {
+    if (e >= width || row >= uint(PIE_FIRE(n_rows))) {
         return;
     }
     uint head = e / hd;
     uint d = e - head * hd;
-    uint rows = uint(params.n_rows);
+    uint rows = uint(PIE_FIRE(n_rows));
     uint heads = uint(params.q_heads);
     // A row one split covered whole was written by the walker already.
     if (part_lse[row * heads + head] > 3.0e38) {
         return;
     }
     float top = NEG_INF;
-    for (int s = 0; s < params.splits; s++) {
+    for (int s = 0; s < PIE_FIRE(splits); s++) {
         float l = part_lse[(uint(s) * rows + row) * heads + head];
         if (finite_(l)) {
             top = max(top, l);
@@ -102,7 +103,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     float2 acc = float2(0.0, 0.0);
     float total = 0.0;
     if (finite_(top)) {
-        for (int s = 0; s < params.splits; s++) {
+        for (int s = 0; s < PIE_FIRE(splits); s++) {
             uint col = (uint(s) * rows + row) * heads + head;
             float l = part_lse[col];
             if (finite_(l)) {
@@ -113,7 +114,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
         }
     }
     float2 v = total == 0.0 ? float2(0.0, 0.0) : acc / total;
-    uint at = params.row0 + row;
+    uint at = uint(PIE_FIRE(row0)) + row;
     o[(at * width + e) >> 1] = pack_bf16(v.x, v.y);
 #if defined(PIE_LSE)
     if (d == 0u) {
@@ -204,6 +205,7 @@ struct Params {
     // The fire row the window's row 0 is: the queries, the output, the LSE,
     // the tables and the selection are the fire's whole, bound once at load
     // whatever window a fire cuts; a dispatch's `row` is the window's.
+    // Fired: it moves with the rows of the classes before the window.
     uint row0;
 #if defined(PIE_SELECTED)
     int top_k;
@@ -219,12 +221,12 @@ struct Params {
     int min_keys;
 #endif
 };
-PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
 
 // The fire row a window's row `row` is.
 uint fire_row(uint row) {
-    return params.row0 + row;
+    return uint(PIE_FIRE(row0)) + row;
 }
 
 // The bf16 element key `kp` of request `req` starts at in its plane: its
@@ -297,7 +299,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint slot_y = local.y;
     uint tile = group.y + uint(params.first_tile);
     uint row = tile * uint(PIE_TILE_ROWS) + slot_y;
-    bool live = row < uint(params.n_rows);
+    bool live = row < uint(PIE_FIRE(n_rows));
 
     int req = live ? req_of_token[fire_row(row)] : 0;
     int q_pos = live ? position_ids[fire_row(row)] : -1;
@@ -312,7 +314,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         int last = -1;
         for (uint r = 0u; r < uint(PIE_TILE_ROWS); r++) {
             uint at = tile * uint(PIE_TILE_ROWS) + r;
-            if (at < uint(params.n_rows)) {
+            if (at < uint(PIE_FIRE(n_rows))) {
                 last = max(last, position_ids[fire_row(at)]);
             }
         }
@@ -605,8 +607,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #if defined(PIE_SPLIT)
     uint split = group.z;
     int keys = q_pos - start + 1;
-    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, params.splits);
-    uint slice = (split * uint(params.n_rows) + row) * uint(params.n_q_heads) + q_head;
+    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, PIE_FIRE(splits));
+    uint slice = (split * uint(PIE_FIRE(n_rows)) + row) * uint(params.n_q_heads) + q_head;
     if (int(split) >= usable) {
         if (tid == 0u) {
             part_lse[slice] = neg_inf();
@@ -831,8 +833,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #if defined(PIE_SPLIT)
     uint split = group.z;
     int keys = q_pos - start + 1;
-    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, params.splits);
-    uint slice = (split * uint(params.n_rows) + row) * uint(params.n_q_heads) + q_head;
+    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, PIE_FIRE(splits));
+    uint slice = (split * uint(PIE_FIRE(n_rows)) + row) * uint(params.n_q_heads) + q_head;
     // Uniform across the workgroup: every lane of it reads the same row.
     if (int(split) >= usable) {
         if (tid == 0u) {

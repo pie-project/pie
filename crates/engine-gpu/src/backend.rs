@@ -192,6 +192,21 @@ pub trait Frame<B: Backend>: 'static {
         Ok(())
     }
 
+    /// [`Frame::copy_regions`] for the rows a fire reads out, which move
+    /// by the fire's lanes: at most `most` regions for any fire of the
+    /// frame's shape. A backend whose recordings keep what a fire changes
+    /// apart from their commands moves them so.
+    fn copy_rows(
+        &mut self,
+        source: &B::Buffer,
+        into: &B::Buffer,
+        regions: &[(u64, u64, u64)],
+        most: usize,
+    ) -> Result<()> {
+        let _ = most;
+        self.copy_regions(source, into, regions)
+    }
+
     fn fill_zero(&mut self, into: &B::Buffer, at: u64, len: u64) -> Result<()>;
 
     /// Writes `bytes` at `at` of `into` in the frame's order: no work in

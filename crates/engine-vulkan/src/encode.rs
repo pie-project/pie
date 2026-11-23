@@ -150,6 +150,7 @@ struct Scratch {
     reads: Vec<crate::device::ctx::Span>,
     writes: Vec<crate::device::ctx::Span>,
     sets: Vec<ash::vk::WriteDescriptorSet<'static>>,
+    baked: Vec<(u64, u64, u64)>,
 }
 
 #[cfg(feature = "vulkan")]
@@ -248,6 +249,10 @@ impl Encode for Sink<'_> {
 
     fn target(&self) -> Target {
         Target::Spirv
+    }
+
+    fn fixed_rows(&self) -> bool {
+        self.frame.fixed_rows()
     }
 
     fn comm(&self, op: &'static str) -> Result<kernels_slang::Comm, Error> {
@@ -375,8 +380,9 @@ impl Sink<'_> {
         }
 
         let declared = pipeline.bindings as usize;
+        let params_at = pipeline.fire.as_ref().map(|fire| fire.binding as usize);
         for at in infos.len()..declared {
-            if pipeline.used[at] {
+            if pipeline.used[at] && Some(at) != params_at {
                 return Err(Sink::backend(
                     fire,
                     format!(
@@ -397,16 +403,67 @@ impl Sink<'_> {
                 ));
             }
         }
-        if push.len() != pipeline.push_bytes as usize {
+        // A module that reads every scalar from the fire block pushes none.
+        let scalars = pipeline
+            .fire
+            .as_ref()
+            .map_or(0, |fire| fire.bytes)
+            .max(pipeline.push_bytes);
+        if push.len() != scalars as usize {
             return Err(Sink::backend(
                 fire,
                 format!(
-                    "the entry pushes {} bytes of scalars but the module declares a {}-byte push block",
+                    "the entry passes {} bytes of scalars but the module declares a {}-byte block",
                     push.len(),
-                    pipeline.push_bytes
+                    scalars
                 ),
             ));
         }
+        // The scalars the kernel reads from the fire block lie there, at a
+        // place the commands name; the rest are pushed and kept with the
+        // recording. The group counts lie there too, for an indirect
+        // dispatch where the frame's shapes differ in them.
+        let limits = &self.device.core.limits;
+        let fired = match pipeline.fire.as_ref() {
+            Some(block) => {
+                let at = block.binding as usize;
+                if at < infos.len() {
+                    return Err(Sink::backend(
+                        fire,
+                        format!("argument {at} is a buffer at the module's fire block"),
+                    ));
+                }
+                let (buffer, place) = self
+                    .frame
+                    .lay(push, limits.min_uniform_buffer_offset_alignment)
+                    .map_err(|fault| Sink::refuse(fire, fault))?;
+                infos.resize(
+                    at,
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(dummy.buffer)
+                        .offset(0)
+                        .range(dummy.size),
+                );
+                writes_at.resize(at, false);
+                extents.resize(at, 0);
+                infos.push(
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buffer)
+                        .offset(place.1)
+                        .range(u64::from(block.bytes)),
+                );
+                writes_at.push(false);
+                extents.push(0);
+                Some((place, &block.words))
+            }
+            None => None,
+        };
+        let group_words: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+        let (indirect, groups_place) = self
+            .frame
+            .lay(&group_words, 4)
+            .map_err(|fault| Sink::refuse(fire, fault))?;
+        let indirect = self.frame.dispatched(groups).then_some(indirect);
         let stated = fire.group.iter().product::<u32>();
         if stated > 1 && fire.group != pipeline.local {
             return Err(Sink::backend(
@@ -420,7 +477,7 @@ impl Sink<'_> {
 
         let (reads, writes) = (&mut scratch.reads, &mut scratch.writes);
         for (at, info) in infos.iter().enumerate().take(declared) {
-            if !pipeline.used[at] || info.buffer == dummy.buffer {
+            if !pipeline.used[at] || info.buffer == dummy.buffer || Some(at) == params_at {
                 continue;
             }
             let span = crate::device::ctx::Span::new(info.buffer, info.offset, extents[at]);
@@ -434,6 +491,48 @@ impl Sink<'_> {
         let owed = self.frame.barrier_owed(reads, writes);
         if owed {
             BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        {
+            // What the commands carry, but what a fire changes: the kernel,
+            // every binding but the block's (which lies at its place in every
+            // walk laid alike), the pushed scalars the kernel reads, the
+            // barrier. The group counts are the frame's to weigh.
+            use ash::vk::Handle;
+            scratch.baked.clear();
+            scratch.baked.extend(
+                infos
+                    .iter()
+                    .enumerate()
+                    .take(declared)
+                    .filter(|&(at, _)| pipeline.used[at] && Some(at) != params_at)
+                    .map(|(_, info)| (info.buffer.as_raw(), info.offset, info.range)),
+            );
+            let mut pushed = push.clone();
+            if let Some((_, words)) = fired {
+                for &(at, len) in words {
+                    pushed[at as usize..(at + len) as usize].fill(0);
+                }
+            }
+            if tracing::enabled!(target: "vkbake", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target: "vkbake",
+                    key,
+                    baked = ?scratch.baked,
+                    fired = ?fired.map(|(place, _)| place),
+                    groups = ?groups_place,
+                    owed,
+                    pushed = ?pushed,
+                    "bake"
+                );
+            }
+            self.frame.bake(&(
+                key,
+                &scratch.baked,
+                fired.map(|(place, _)| place),
+                groups_place,
+                owed,
+                pushed,
+            ));
         }
 
         let core = self.frame.core();
@@ -455,11 +554,16 @@ impl Sink<'_> {
             // while `infos` is untouched; `sets` is cleared before `infos`
             // changes again on the next fire, and no one reads it in between.
             let info: &'static vk::DescriptorBufferInfo = unsafe { std::mem::transmute(info) };
+            let ty = if Some(at) == params_at {
+                vk::DescriptorType::UNIFORM_BUFFER
+            } else {
+                vk::DescriptorType::STORAGE_BUFFER
+            };
             scratch.sets.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(at as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_type(ty)
                     .buffer_info(std::slice::from_ref(info)),
             );
         }
@@ -468,8 +572,11 @@ impl Sink<'_> {
         // further sync; every buffer it names is a live slab the frame retains,
         // with offsets and ranges from bound views. `cmd` is the open frame's
         // buffer, recorded only by this sink's thread (`Frame` is not `Sync`).
-        // The push block's length was checked against the layout's range,
-        // and a timestamp index stays below the pool's `capacity * 2`.
+        // The push block's length was checked against the layout's range;
+        // the fire block's uniform and group counts lie in chunks the frame
+        // retains, made with the uniform and indirect usages, at offsets the
+        // device's alignments allow; a timestamp index stays below the
+        // pool's `capacity * 2`.
         unsafe {
             if !scratch.sets.is_empty() {
                 d.update_descriptor_sets(&scratch.sets, &[]);
@@ -485,8 +592,14 @@ impl Sink<'_> {
                     &[],
                 );
             }
-            if !push.is_empty() {
-                d.cmd_push_constants(cmd, pipeline.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+            if pipeline.push_bytes > 0 {
+                d.cmd_push_constants(
+                    cmd,
+                    pipeline.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push[..pipeline.push_bytes as usize],
+                );
             }
 
             if owed {
@@ -522,7 +635,10 @@ impl Sink<'_> {
             if let Some((pool, at)) = timed {
                 d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, at * 2);
             }
-            d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+            match indirect {
+                Some(buffer) => d.cmd_dispatch_indirect(cmd, buffer, groups_place.1),
+                None => d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]),
+            }
             if let Some((pool, at)) = timed {
                 d.cmd_write_timestamp(
                     cmd,

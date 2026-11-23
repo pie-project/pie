@@ -182,6 +182,28 @@ impl Context {
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn indirect_next(&self, _at: Option<std::sync::Arc<Vec<bool>>>) {
+        match self.never {}
+    }
+
+    pub fn arm_next(&self, _arm: Option<std::sync::Arc<ArmBlock>>) {
+        match self.never {}
+    }
+
+    pub fn fixed_next(&self, _fixed: bool) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fire_alignments(&self) -> (u64, u64) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn copier_scalars(&self) -> u32 {
+        match self.never {}
+    }
 }
 
 pub struct Frame {
@@ -250,6 +272,16 @@ impl Frame {
         match self.never {}
     }
 
+    pub fn copy_rows(
+        &mut self,
+        _source: &Buffer,
+        _into: &Buffer,
+        _regions: &[(u64, u64, u64)],
+        _most: usize,
+    ) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn fill_zero(&mut self, _into: &Buffer, _at: u64, _len: u64) -> Result<()> {
         match self.never {}
     }
@@ -268,9 +300,70 @@ pub struct Kept {
     never: std::convert::Infallible,
 }
 
+/// What a walk laid in a fire block: none, with no device.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Image;
+
+impl Image {
+    #[must_use]
+    pub fn sealed(&self) -> Image {
+        Image
+    }
+}
+
+/// An arm's fire block: none, with no device.
+pub struct ArmBlock {
+    never: std::convert::Infallible,
+}
+
+impl ArmBlock {
+    pub fn new(device: &Context, _bytes: u64) -> Result<std::sync::Arc<ArmBlock>> {
+        match device.never {}
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        match self.never {}
+    }
+}
+
 impl Kept {
     #[must_use]
     pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn baked(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn image(&self) -> &Image {
+        match self.never {}
+    }
+
+    pub fn stage(&self, _image: &Image) -> Result<()> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn copies(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fixed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn indirect(&self, _at: usize) -> bool {
         match self.never {}
     }
 
@@ -480,6 +573,11 @@ impl Pipelines {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.compiles.get()
+    }
+
+    #[must_use]
+    pub fn most_scalars(&self) -> u32 {
+        0
     }
 
     /// The kernels built after `from`: none, since a device-less build
