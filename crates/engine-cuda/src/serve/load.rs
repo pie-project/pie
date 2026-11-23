@@ -1655,6 +1655,7 @@ impl Shell {
             .flatten();
         let mut shell = Shell {
             ring_runs: None,
+            ring_seen: crate::serve::RingSeen::default(),
             weighed,
             device,
             accounting,

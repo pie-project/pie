@@ -68,6 +68,17 @@ use crate::window::Windows;
 use enqueue::{GuestBatch, GuestFault, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
+/// What a load's windowed fires have done ([`Shell::ring_seen`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingSeen {
+    /// Fires' own pages written on their ring directly.
+    pub direct: u64,
+    /// Own-row pages taken.
+    pub own: u64,
+    /// Ring pages a fire both read and then folded rows onto.
+    pub read_then_folded: u64,
+}
+
 pub struct Shell {
     /// The rungs the load weighed its top by and the estimate it weighed
     /// them with (`None` where the profile states no rates).
@@ -75,6 +86,10 @@ pub struct Shell {
     /// A windowed fire's ring-fold runs as the device reads them, grown to
     /// the most a fire has folded (`serve::ring`).
     ring_runs: Option<crate::device::alloc::Buffer>,
+    /// What the windowed fires served have done since load: pages they
+    /// wrote on their rings directly, own-row pages they took, and the ring
+    /// pages they folded onto that their own reads had read.
+    ring_seen: RingSeen,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,
@@ -805,6 +820,18 @@ impl Shell {
     #[must_use]
     pub fn record_bytes(&self) -> u64 {
         self.pools.record_bytes()
+    }
+
+    /// What this load's windowed fires have done since it loaded.
+    #[must_use]
+    pub fn ring_seen(&self) -> RingSeen {
+        self.ring_seen
+    }
+
+    /// The side streams this load's fires fork regions onto.
+    #[must_use]
+    pub fn side_streams(&self) -> usize {
+        self.device.side_streams().len()
     }
 
     /// The windowed layers the record holds the rings of; none where the

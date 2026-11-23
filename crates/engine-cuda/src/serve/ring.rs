@@ -56,6 +56,10 @@ pub struct Composed {
     pub folds: Vec<(u64, Source, u32, u32)>,
     /// The own-row pages it took.
     pub own: u32,
+    /// Its own pages written on the ring directly.
+    pub direct: u32,
+    /// Ring pages it reads that its fold then writes.
+    pub read_then_folded: u32,
 }
 
 /// The widest window's rows below `row` the fire's first row reads from:
@@ -129,6 +133,7 @@ pub fn compose(
             out.table.push(slot.0);
             sources.push(Source::At(slot.1));
         } else if direct {
+            out.direct += 1;
             out.table.push(ring.0);
             sources.push(Source::Ring);
         } else {
@@ -154,6 +159,9 @@ pub fn compose(
         let stop = ((n + 1) * page).min(to);
         if let Source::At(at) = sources[n as usize] {
             let ring = lane.ring[(n % ring_pages) as usize];
+            if out.table.iter().take(base_page as usize).any(|&id| id == ring.0) {
+                out.read_then_folded += 1;
+            }
             out.folds.push((ring.1, Source::At(at), row % page, stop - row));
         }
         row = stop;

@@ -12,8 +12,20 @@ const DEPLOYMENT: &str = "gemma4-e4b-mini-l6-bf16-kv-bf16";
 const CHUNK: u32 = 256;
 
 fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32, ringed: bool) -> Vec<Vec<f32>> {
-    let deployment =
-        poem_compiler::catalog::deployment(DEPLOYMENT).expect("the catalog ships the mini gemma");
+    served(DEPLOYMENT, trace, path, prompt, decodes, ringed).0
+}
+
+/// `deployment`'s logits over `prompt` in chunks and `decodes` greedy-free
+/// decodes, and what its windowed fires did and the side streams it forks.
+fn served(
+    name: &str,
+    trace: Trace,
+    path: &Path,
+    prompt: &[u32],
+    decodes: u32,
+    ringed: bool,
+) -> (Vec<Vec<f32>>, engine_cuda::serve::RingSeen, usize) {
+    let deployment = poem_compiler::catalog::deployment(name).expect("the catalog ships the mini");
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
         voxels: None,
@@ -67,7 +79,8 @@ fn logits(trace: Trace, path: &Path, prompt: &[u32], decodes: u32, ringed: bool)
     for step in 0..decodes {
         out.push(fire(&[(step * 7919) % 4096]));
     }
-    out
+    drop(fire);
+    (out, shell.ring_seen(), shell.side_streams())
 }
 
 // #699: a windowed row keeps only its window, every page behind it reading
@@ -144,4 +157,46 @@ fn a_ringed_window_reads_what_the_window_list_reads() {
             .count();
         assert_eq!(apart, 0, "fire {step}: {apart} logits apart from the window list's");
     }
+}
+
+// CONTRACT-BC 19: a fire's fold lands after every read its lanes' attention
+// makes, on every stream it forks: a fire whose lanes read ring pages that
+// its own fold then overwrites (its own rows past its ring on own-row pages,
+// folded onto ring pages it read) and fires that write their rows on their
+// ring directly answer what the window lists answer, bit for bit, on loads
+// whose fires fork regions onto side streams.
+#[test]
+fn a_ring_fold_lands_after_every_read_of_its_fire() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let mut forked = 0usize;
+    for name in [DEPLOYMENT] {
+        let trace = poem_compiler::catalog::deployment(name)
+            .expect("the mini")
+            .trace(Platform::Cuda);
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = Weights::random(&trace, 701).write(dir.path());
+        let prompt: Vec<u32> = (0..3 * CHUNK).map(|at| (at * 31 + 5) % 4096).collect();
+        let (want, _, _) = served(name, trace.clone(), &path, &prompt, 64, false);
+        let (got, seen, sides) = served(name, trace, &path, &prompt, 64, true);
+        eprintln!("{name}: {seen:?}, {sides} side stream(s)");
+        assert!(seen.direct > 0, "{name}: some fire writes its ring directly");
+        assert!(seen.own > 0, "{name}: some fire takes own-row pages");
+        assert!(
+            seen.read_then_folded > 0,
+            "{name}: some fire folds onto ring pages it read"
+        );
+        forked += sides;
+        for (step, (got, want)) in got.iter().zip(&want).enumerate() {
+            let apart = got
+                .iter()
+                .zip(want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(apart, 0, "{name} fire {step}: {apart} logits apart from the window list's");
+        }
+    }
+    assert!(forked > 0, "a load whose fires fork regions onto side streams");
 }

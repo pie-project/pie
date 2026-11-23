@@ -1636,11 +1636,12 @@ impl Shell {
                     composed_tables.push(tables[lane].to_vec());
                     continue;
                 }
+                let buffer_empty = window_ids[lane].is_empty();
                 let (base, folded, fold) = match (&seated.window_fold, window_folds[lane]) {
                     // A lane with no buffer slot reads every row below its
                     // fire from its ring: its buffer starts at its fold's
                     // page, whatever base it states.
-                    (Some(_), Some((folded, fold))) if window_ids[lane].is_empty() => {
+                    (Some(_), Some((folded, fold))) if buffer_empty => {
                         (folded / page * page, folded, fold)
                     }
                     (Some(stated), Some((folded, fold))) => (stated.base, folded, fold),
@@ -1651,14 +1652,20 @@ impl Shell {
                     }
                 };
                 let ring = self.pools.ring_pages(keys[lane])?;
+                // A lane no runtime states a fold for (a runtimeless or an
+                // arming lane) buffers nothing: it folds every row it
+                // writes, on a record of its own.
+                let stated = seated.window_fold.is_some();
                 let buffer = window_ids[lane]
                     .iter()
+                    .filter(|_| stated)
                     .map(|&slot| {
                         ring_buffers.push(u64::from(slot));
                         self.pools.window_slot(slot)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let alone = keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
+                let alone =
+                    !stated || keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
                 if !alone && folded + fold > seat.have {
                     return Err(Fault::program(
                         "serve::ring",
@@ -1671,7 +1678,7 @@ impl Shell {
                         ),
                     ));
                 }
-                let first_fold = match record_folds.get(&keys[lane]) {
+                let first_fold = match record_folds.get(&keys[lane]).filter(|_| stated) {
                     None => {
                         record_folds.insert(keys[lane], (folded, fold));
                         true
@@ -1709,6 +1716,9 @@ impl Shell {
                     null,
                     &mut own,
                 )?;
+                self.ring_seen.direct += u64::from(composed.direct);
+                self.ring_seen.own += u64::from(composed.own);
+                self.ring_seen.read_then_folded += u64::from(composed.read_then_folded);
                 // The group's fold is its first lane's; the others read.
                 if first_fold {
                     ring_work.add(&composed, &planes);
