@@ -145,6 +145,7 @@ seeded!(
     "apple10/apple-m5-pro.toml",
     // Committed measured profiles (`pie tune export --engine metal`).
     "apple-m5-pro.measured.toml",
+    "apple-m1-max.measured.toml",
 );
 
 pub static SHELF: Shelf = Shelf {
