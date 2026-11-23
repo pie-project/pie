@@ -914,6 +914,12 @@ pub struct SharedPool {
     /// The engine whose rung gate this pool publishes the rung it holds
     /// to ([`Self::steers`], [`engine_rows`]).
     engine: Option<usize>,
+    /// What each rung's replay scratch holds, by its tokens, ascending
+    /// (`ChunkFacts::act_replay`, or each rung's floor).
+    replay: Vec<(u32, ::engine::RungReplay)>,
+    /// The load's rs scratch lays only the carried rows a rung counts
+    /// (`ChunkFacts::rs_compact`).
+    rs_compact: bool,
 }
 
 /// The fence epoch a raise's moved-off chunks wait on until the engine has
@@ -1168,6 +1174,13 @@ impl SharedPool {
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
+            replay: facts
+                .act_chunks
+                .iter()
+                .enumerate()
+                .map(|(at, &(tokens, _))| (tokens, facts.rung_replay(at)))
+                .collect(),
+            rs_compact: facts.rs_compact,
         };
         // The engine holds the rung the pool starts at.
         shared.told = shared.pool.rung();
@@ -2212,6 +2225,24 @@ impl SharedPool {
             .or_else(|| rungs.last().copied())
             .unwrap_or(u32::MAX);
         goal.min(self.fit_rung())
+    }
+
+    /// What each activation rung's replay scratch holds, by its tokens,
+    /// ascending, up to the widest a fire may take ([`Self::rung_for`]).
+    #[must_use]
+    pub fn rung_replays(&self) -> Vec<(u32, ::engine::RungReplay)> {
+        let widest = self.rung_for(u32::MAX);
+        self.replay
+            .iter()
+            .copied()
+            .filter(|&(tokens, _)| tokens <= widest)
+            .collect()
+    }
+
+    /// The load's rs scratch lays only the carried rows a rung counts.
+    #[must_use]
+    pub fn rs_compact(&self) -> bool {
+        self.rs_compact
     }
 
     /// Every activation rung's tokens, ascending.

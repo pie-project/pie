@@ -2327,14 +2327,23 @@ impl Shell {
             }
         }
         // A fire carries at most its rung's tokens of carried rows, summed
-        // over its lanes (`engine::fire::rung_rows`): one past it is refused
-        // here, before the fire writes anything.
-        let rung = crate::rs::carried_room(descriptor.bucket);
-        if carried > rung {
+        // over its lanes (its rung's `carried_max`, `ChunkFacts::act_replay`,
+        // checked by `engine::fire::rung_holds` as the runtime chose the
+        // rung by): one past it is refused here, before the fire writes
+        // anything.
+        let holds = engine::RungReplay {
+            carried_max: Some(crate::rs::carried_room(descriptor.bucket)),
+            ..engine::RungReplay::default()
+        };
+        let count = engine::ReplayRows {
+            carried,
+            ..engine::ReplayRows::default()
+        };
+        if let Err(past) = engine::fire::rung_holds(&holds, count) {
             return Err(Fault::Ceiling {
                 what: "carried rows a fire's lanes replay (the tokens of the rung it runs at)",
-                need: u64::from(carried),
-                have: u64::from(rung),
+                need: u64::from(past.rows),
+                have: u64::from(past.max),
             });
         }
         if !copies.is_empty() {

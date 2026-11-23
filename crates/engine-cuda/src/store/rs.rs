@@ -116,7 +116,7 @@ impl Planes {
 /// The extended run's scratch: a run of the activation's span, a fire's
 /// rows and the buffered rows its lanes replay ahead of them, a row each
 /// at the widest recurrence's width. The contract's floor is a rung's
-/// tokens of each ([`::engine::fire::rung_rows`]); this engine lays the
+/// tokens of each ([`::engine::fire::rung_holds`]); this engine lays the
 /// widest bucket's of each ([`Buffers::rows_ext`]), whatever the fire's
 /// bucket. Its reach is that ([`Buffers::lay_reach`]), backed when the
 /// first fire replays.

@@ -1716,10 +1716,11 @@ impl Shell {
             })
             .collect();
         // A fire's extended run holds the widest bucket's tokens of
-        // replayed rows (`store::rs::Buffers::rows_ext`), the most the
-        // runtime lets one carry (`engine::fire::rung_rows`): one that
-        // replays more is refused here, before a page is committed or a
-        // row written.
+        // replayed rows (`store::rs::Buffers::rows_ext`), what each rung
+        // states it holds (`ChunkFacts::act_replay`'s `carried_max`, the
+        // runtime choosing a rung by the same `engine::fire::rung_holds`):
+        // one that replays more is refused here, before a page is committed
+        // or a row written.
         // A decoding lane's carried rows take none of the run: its decode
         // steps read them as a linear attention.
         let in_run = |fire_lane: usize| {
@@ -1734,11 +1735,19 @@ impl Shell {
             .filter(|(fire_lane, _)| in_run(*fire_lane))
             .map(|(_, reads)| crate::run::replayed(reads))
             .sum();
-        if replayed > self.budget.max_tokens {
+        let holds = engine::RungReplay {
+            carried_max: Some(self.budget.max_tokens),
+            ..engine::RungReplay::default()
+        };
+        let count = engine::ReplayRows {
+            carried: replayed,
+            ..engine::ReplayRows::default()
+        };
+        if let Err(past) = engine::fire::rung_holds(&holds, count) {
             return Err(Fault::Ceiling {
                 what: "buffered recurrent rows a fire replays ahead of its own",
-                need: u64::from(replayed),
-                have: u64::from(self.budget.max_tokens),
+                need: u64::from(past.rows),
+                have: u64::from(past.max),
             });
         }
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;

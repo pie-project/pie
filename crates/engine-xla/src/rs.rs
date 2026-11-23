@@ -307,7 +307,7 @@ pub struct WindowMap {
 pub const DROP: i32 = i32::MAX;
 
 /// The carried rows a fire of a `rung`-token rung replays at most, summed
-/// over its lanes (`engine::fire::rung_rows`): its rung's tokens. The one
+/// over its lanes (`engine::fire::rung_holds`): its rung's tokens. The one
 /// place the bound is read: a fire past it is refused at prepare, and a
 /// fire that replays lays each window's scratch for it.
 #[must_use]

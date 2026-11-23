@@ -1884,7 +1884,7 @@ impl Xla {
         }
         // What each reported lane wrote, told when the step lands: one past
         // the last slot its rows landed at (the runtime bounds what a
-        // device-placed lane carries by it, `engine::fire::rung_rows`), and
+        // device-placed lane carries by it, `engine::fire::rung_holds`), and
         // where its fold length was the device's, the slots this fire's fold
         // froze, clamped to its rows' end as the plan clamps it
         // (`engine::rs::LanePlan::of`).

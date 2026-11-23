@@ -25,7 +25,7 @@ pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_tokens: usize,
     /// The recurrent rows the request carries unfolded into its fire: a
     /// step carries no more than its rung's tokens of them, as of its own
-    /// rows ([`::engine::fire::rung_rows`]).
+    /// rows ([`::engine::fire::rung_holds`]).
     pub(crate) carried_rows: usize,
     /// The buffered recurrent rows its lanes replay, a decode lane's
     /// included ([`crate::engine::FireRequest::replayed`]).

@@ -56,8 +56,8 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
-    LaneReadout, LaneRecord, ListKind, Mask, Masking, MediaEncode, Readout, RsReset, RsSnapshot,
-    RsVerb, Serves, Step,
+    LaneReadout, LaneRecord, ListKind, Mask, Masking, MediaEncode, Readout, ReplayBound,
+    ReplayPast, ReplayRows, RsReset, RsSnapshot, RsVerb, RungReplay, Serves, Step,
 };
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use memory::SAFETY_FLOOR_BYTES;

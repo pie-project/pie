@@ -182,7 +182,7 @@ impl Cursor {
     /// No more than this many rows stand unfolded in the set's buffer when
     /// a fire staged now runs, its recurrent state folded through `frozen`:
     /// those written past `frozen` by fires that settled, and every row of
-    /// the fires still to settle ([`engine::fire::rung_rows`], device
+    /// the fires still to settle ([`engine::fire::rung_holds`], device
     /// geometry).
     pub fn unfolded(&self, frozen: u32) -> u32 {
         let (written, staged) = self.standing();

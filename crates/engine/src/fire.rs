@@ -742,49 +742,179 @@ pub enum Lineage {
     Admitted,
 }
 
-/// The rows a fire asks its activation rung for: `own` rows of its lanes,
-/// and `carried` recurrent rows, those earlier fires wrote and nothing has
-/// folded yet, which the fire replays ahead of its own.
+/// What one activation rung's replay scratch holds, as the engine states it
+/// for that rung ([`crate::chunk::ChunkFacts::act_replay`]): each bound
+/// `None` where it does not bind. A fire's rows are counted by
+/// [`ReplayRows`]; it runs at a rung that holds them ([`rung_holds`]), the
+/// smallest such rung the runtime finds, and one no rung holds is refused by
+/// name before anything is submitted. An engine's own check at submit calls
+/// the same [`rung_holds`] against the rung it stages the fire in.
 ///
-/// The contract on carried rows, with no stated limit: a rung's replay
-/// scratch holds at least the rung's tokens of carried rows; a fire carries
-/// at most its rung's tokens; the runtime asks the rung for max(own,
-/// carried) and refuses past the largest rung.
+/// - `own_max`: the fire's own rows, every row its lanes compute in it.
+/// - `carried_max`: its carried rows counted as a rung counts them
+///   ([`lane_carried`]: a decode lane's none, a wider lane's all), summed.
+/// - `total_max`: its replay scratch rows ([`rs_scratch_rows`]): its own
+///   rows and every lane's carried rows as the load's scratch lays them.
 ///
-/// - The engine: at rung `r` a fire's replay scratch holds at least `r` own
-///   rows and `r` carried rows, in extended rows (the recurrent layers' rows
-///   only). It is a floor, what the runtime relies on (a fire granted rung
-///   `r` may carry `r`); an engine may lay more.
-/// - The runtime: a fire carrying more than its rung's tokens raises the
-///   rung as a wider fire does; one carrying more than the largest rung's
-///   tokens is refused by name, before anything is submitted. The counts
-///   are a fire's, summed over its lanes.
-/// - Device geometry: a lane's carried rows are the buffered slots between
-///   its state and its first row that its mask admits (`folded..first`,
-///   [`buffered_reads`]). Where the device says where a lane's rows land,
-///   both ends are its program's (`fold` and `slots`), resolved at the
-///   engine's prepare, after the lane's earlier fires have run: no count
-///   exists when the runtime asks. The runtime states a bound in its place,
-///   the rows that can stand unfolded in the lane's working set when the
-///   fire runs: those between the state's frozen length and the set's
-///   written end (one past the highest slot a settled fire wrote; a lane
-///   that rewinds leaves the rows past it buffered, so the end only
-///   rises), and every row of the set's device-placed fires staged and not
-///   yet settled. It asks the rung for max(own, that bound) summed over the
-///   fire's lanes, and refuses past the largest rung as for any fire. An
-///   engine that takes such fires reports where each lane's rows ended
-///   when the fire settles ([`crate::KvWrites::end`]); a fire that reports
-///   none is taken to have written as far as its set reserved. The
-///   engine's check where the count resolves is a fault for a wrong count
-///   only (a mask admitting slots nobody wrote): a fire whose lanes replay
-///   more than the tokens of the rung it runs at, summed over them, is
-///   refused by name at prepare and writes nothing.
-#[must_use]
-pub fn rung_rows(own: u32, carried: u32) -> u32 {
-    own.max(carried)
+/// Device geometry: a lane's carried rows are the buffered slots between its
+/// state and its first row that its mask admits (`folded..first`,
+/// [`buffered_reads`]). Where the device says where a lane's rows land, no
+/// count exists when the runtime asks: it states a bound in its place, the
+/// rows that can stand unfolded in the lane's working set when the fire runs
+/// (those between the state's frozen length and the set's written end, and
+/// every row of the set's device-placed fires staged and not yet settled).
+/// The engine's check where the count resolves is a fault for a wrong count
+/// only: a fire whose resolved rows its rung does not hold is refused by
+/// name at prepare and writes nothing. An engine that takes such fires
+/// reports where each lane's rows ended when the fire settles
+/// ([`crate::KvWrites::end`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RungReplay {
+    #[serde(default)]
+    pub own_max: Option<u32>,
+    #[serde(default)]
+    pub carried_max: Option<u32>,
+    #[serde(default)]
+    pub total_max: Option<u32>,
 }
 
-/// The carried rows a lane of `own` rows counts toward [`rung_rows`]: a
+impl RungReplay {
+    /// The floor an engine stating nothing for a rung of `tokens` holds:
+    /// that many own rows and as many carried, no total bound.
+    #[must_use]
+    pub const fn floor(tokens: u32) -> RungReplay {
+        RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            total_max: None,
+        }
+    }
+}
+
+/// A fire's rows as a rung's replay scratch counts them ([`RungReplay`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayRows {
+    /// Every row the fire's lanes compute in it.
+    pub own: u32,
+    /// Its lanes' carried rows, each counted by [`lane_carried`], summed.
+    pub carried: u32,
+    /// Its replay scratch rows ([`rs_scratch_rows`]).
+    pub scratch: u32,
+}
+
+impl ReplayRows {
+    /// The rows of a fire whose lanes compute `(own, carried)` rows each,
+    /// `carried` every buffered row a lane replays ahead of its own (a
+    /// decode lane's included), on a load whose rs scratch is `compact`.
+    #[must_use]
+    pub fn of_lanes(lanes: impl IntoIterator<Item = (u32, u32)> + Clone, compact: bool) -> ReplayRows {
+        let own = lanes
+            .clone()
+            .into_iter()
+            .fold(0u32, |sum, (own, _)| sum.saturating_add(own));
+        ReplayRows {
+            own,
+            carried: lanes
+                .clone()
+                .into_iter()
+                .fold(0u32, |sum, (own, carried)| {
+                    sum.saturating_add(lane_carried(own, carried))
+                }),
+            scratch: rs_scratch_rows(own, lanes, compact),
+        }
+    }
+
+    /// The same counts from a fire's sums: `own` rows, `carried` counted by
+    /// [`lane_carried`] lane by lane, and `replayed` every lane's carried
+    /// rows (a decode lane's included). [`rs_scratch_rows`] summed.
+    #[must_use]
+    pub fn of_sums(own: u32, carried: u32, replayed: u32, compact: bool) -> ReplayRows {
+        ReplayRows {
+            own,
+            carried,
+            scratch: own.saturating_add(if compact { carried } else { replayed }),
+        }
+    }
+
+    /// Two fires' rows in one: each count summed.
+    #[must_use]
+    pub fn add(self, other: ReplayRows) -> ReplayRows {
+        ReplayRows {
+            own: self.own.saturating_add(other.own),
+            carried: self.carried.saturating_add(other.carried),
+            scratch: self.scratch.saturating_add(other.scratch),
+        }
+    }
+}
+
+/// The replay scratch rows a fire of `own` rows takes, its lanes carrying
+/// `(lane own, carried)` rows each: its own rows, and each lane's carried
+/// rows as the load's scratch lays them: on a `compact` load only those a
+/// rung counts ([`lane_carried`]: a decode lane's none), else every one, a
+/// decode lane's included.
+#[must_use]
+pub fn rs_scratch_rows(own: u32, lanes: impl IntoIterator<Item = (u32, u32)>, compact: bool) -> u32 {
+    lanes.into_iter().fold(own, |sum, (lane_own, carried)| {
+        sum.saturating_add(if compact {
+            lane_carried(lane_own, carried)
+        } else {
+            carried
+        })
+    })
+}
+
+/// Which of a rung's stated bounds a fire passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayBound {
+    Own,
+    Carried,
+    Total,
+}
+
+/// A fire's rows past one of its rung's bounds: which, the fire's count of
+/// it and the rung's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPast {
+    pub bound: ReplayBound,
+    pub rows: u32,
+    pub max: u32,
+}
+
+impl std::fmt::Display for ReplayPast {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.bound {
+            ReplayBound::Own => "own rows",
+            ReplayBound::Carried => "carried recurrent rows (a decode lane's counting none)",
+            ReplayBound::Total => "replay scratch rows (its own rows and its lanes' carried rows)",
+        };
+        write!(f, "{} {what}, past the {} the rung's replay scratch holds", self.rows, self.max)
+    }
+}
+
+/// Whether `rung` holds a fire of `rows`: each bound it states, own,
+/// carried and total in that order, the first it passes named. What the
+/// runtime picks a fire's rung by and an engine checks a fire at submit by.
+pub fn rung_holds(rung: &RungReplay, rows: ReplayRows) -> std::result::Result<(), ReplayPast> {
+    for (bound, count, max) in [
+        (ReplayBound::Own, rows.own, rung.own_max),
+        (ReplayBound::Carried, rows.carried, rung.carried_max),
+        (ReplayBound::Total, rows.scratch, rung.total_max),
+    ] {
+        if let Some(max) = max
+            && count > max
+        {
+            return Err(ReplayPast {
+                bound,
+                rows: count,
+                max,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The carried rows a lane of `own` rows counts toward a rung's
+/// `carried_max` ([`RungReplay`]): a
 /// decode lane's (one own row, a one-token class's) none, since its decode
 /// step replays them in the step's own kernels, a lane's buffered rows a
 /// kernel input and no rows of the fire (at most the run-ahead window of

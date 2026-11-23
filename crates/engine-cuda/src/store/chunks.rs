@@ -1055,6 +1055,23 @@ impl Chunks {
                 .copied()
                 .chain(std::iter::once((max_tokens, self.act)))
                 .collect(),
+            // Each rung's replay scratch: its tokens of own rows; the
+            // extended run holds the widest bucket's tokens of replayed
+            // rows whatever the fire's bucket (`store::rs::Buffers::rows_ext`),
+            // a decoding lane's taking none (`serve::prepare`'s check); no
+            // bound on the two together.
+            act_replay: rungs
+                .iter()
+                .filter(|&&(tokens, chunks)| tokens < max_tokens && chunks < self.act)
+                .map(|&(tokens, _)| tokens)
+                .chain(std::iter::once(max_tokens))
+                .map(|tokens| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(max_tokens),
+                    total_max: None,
+                })
+                .collect(),
+            rs_compact: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,
