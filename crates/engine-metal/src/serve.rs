@@ -373,6 +373,7 @@ pub struct Shell {
     own_arm: u32,
     /// `PIE_WINDOW_WATCH`: each complete ring page's hash, by (ring ref, page).
     page_watch: std::collections::HashMap<(u32, u32), u64>,
+    alt_arm: bool,
     /// A ring load's frames in order on the GPU: each waits for the one
     /// before to end (`PIE_WINDOW_CHAIN`, a test of frame overlap).
     #[cfg(target_vendor = "apple")]
@@ -1789,6 +1790,7 @@ impl PreparedLoad<'_> {
             own_arms: u32::try_from(arms).unwrap_or(1).max(1),
             own_arm: 0,
             page_watch: std::collections::HashMap::new(),
+            alt_arm: false,
             #[cfg(target_vendor = "apple")]
             chain,
             landed: BTreeMap::new(),
@@ -3707,7 +3709,8 @@ impl Shell {
         let held = u64::from(fold.base) + buffer.len() as u64 * u64::from(page);
         // The fire's own rows past the buffer: their ring rows, or own pages.
         let shared = pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow));
-        let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window)
+        let direct = (crate::store::windowed::direct_allowed(shared, rows, ring_rows, window)
+            && std::env::var_os("PIE_WINDOW_NO_DIRECT").is_none())
             || std::env::var_os("PIE_WINDOW_NO_OWN").is_some();
         // Rows of the fire no buffer slot holds: below the buffer's base (the
         // rows it folds itself) or past its last slot.
@@ -4599,7 +4602,8 @@ impl Shell {
             done,
         } = step;
 
-        while self.inflight.len() >= self.arms.depth() {
+        let serial = std::env::var_os("PIE_WINDOW_SERIAL").is_some();
+        while self.inflight.len() >= if serial { 1 } else { self.arms.depth() } {
             self.harvest_one()?;
         }
         let arm = self.arms.free().ok_or(Fault::Ceiling {
@@ -4607,6 +4611,14 @@ impl Shell {
             need: self.arms.depth() as u64 + 1,
             have: self.arms.depth() as u64,
         })?;
+        // `PIE_WINDOW_ALT` (with `PIE_WINDOW_SERIAL`): every other fire on
+        // arm 1 though nothing is in flight.
+        let arm = if serial && std::env::var_os("PIE_WINDOW_ALT").is_some() && self.arms.depth() > 1 {
+            self.alt_arm = !self.alt_arm;
+            usize::from(self.alt_arm)
+        } else {
+            arm
+        };
         if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
             let current = self.arena.current();
             let ((inputs_at, inputs_bytes), _) = self.arena.regions(current, arm as u64);
@@ -6531,10 +6543,12 @@ impl Shell {
         }
         // The windowed boundary pages' fills, before anything reads them (a
         // dry walk encodes for no fire; a fill again is the same bytes).
-        if !dry {
+        if !dry && !self.window_fills.is_empty() {
             for (k, fills) in &self.window_fills {
                 self.pools.copy_window_slots(&mut frame, *k, fills)?;
             }
+            #[cfg(target_vendor = "apple")]
+            frame.next_pass()?;
         }
         self.feed_inputs(&mut frame, p)?;
         self.feed_tokens(&mut frame, p)?;
@@ -6944,8 +6958,13 @@ impl engine::frame::Shell for Shell {
         };
         // The windowed lanes' folds, after the forward that read their rows:
         // queue order lands them before any later fire reads the rings.
-        for (k, copies) in std::mem::take(&mut self.window_folds) {
-            self.pools.fold_window_rows(&mut frame, k, &copies)?;
+        let folds = std::mem::take(&mut self.window_folds);
+        for (k, copies) in &folds {
+            self.pools.fold_window_rows(&mut frame, *k, copies)?;
+        }
+        #[cfg(target_vendor = "apple")]
+        if !folds.is_empty() {
+            frame.next_pass()?;
         }
         if self.own_used > 0 {
             self.own_arm = (self.own_arm + 1) % self.own_arms;

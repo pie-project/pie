@@ -1528,6 +1528,9 @@ impl Metal {
                 }
             }
         }
+        if !ring_forks.is_empty() {
+            eprintln!("ringfork {} pair(s), first {:?}", ring_forks.len(), ring_forks.first());
+        }
         if !forks.is_empty() || !ring_forks.is_empty() {
             shell.copy_records(&forks, &ring_forks).map_err(fault)?;
         }
