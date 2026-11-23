@@ -691,6 +691,14 @@ impl SimEngine {
 }
 
 impl Engine for SimEngine {
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn settle_copies(&mut self) -> ::engine::Result<()> {
         Ok(())
     }

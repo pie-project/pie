@@ -3625,6 +3625,14 @@ mod tests {
     struct PanickingEngine;
 
     impl engine::Engine for PanickingEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4315,6 +4323,14 @@ mod tests {
     }
 
     impl engine::Engine for ExhaustedEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4429,6 +4445,14 @@ mod tests {
     }
 
     impl engine::Engine for InlineEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4573,6 +4597,14 @@ mod tests {
     }
 
     impl engine::Engine for LaneFaultEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4837,6 +4869,14 @@ mod tests {
     }
 
     impl engine::Engine for LaneRefusalEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -5296,6 +5336,14 @@ mod tests {
     struct HoldingEngine;
 
     impl engine::Engine for HoldingEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())

@@ -2301,21 +2301,17 @@ impl Shell {
     }
 
     /// What the runtime's host cover depends on here
-    /// (`engine::Engine::cover_fingerprint`): the device and its OS, the
-    /// guest emitter's version, the kernel sources a fire dispatches, and
-    /// the tuning that routes among them. Not the binary: a build that
-    /// changes none of these reuses an earlier boot's cover.
+    /// (`engine::Engine::cover_fingerprint`): the device and its OS release
+    /// (`crate::stored::measured_on`, the part a committed cover is filed
+    /// under), the guest emitter's version, the kernel sources a fire
+    /// dispatches, and the picks that route among them. Not the binary or
+    /// the OS's build: a build or update that changes none of these reuses
+    /// an earlier boot's cover, or the device's committed one.
     #[must_use]
     pub fn cover_fingerprint(&self) -> String {
         let fnv = |bytes: &[u8]| {
             bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
         };
-        #[cfg(target_vendor = "apple")]
-        let os = objc2_foundation::NSProcessInfo::processInfo()
-            .operatingSystemVersionString()
-            .to_string();
-        #[cfg(not(target_vendor = "apple"))]
-        let os = String::new();
         let kernels = kernels_metal::sources::SOURCES.iter().fold(
             0xcbf2_9ce4_8422_2325u64,
             |h, (name, text)| {
@@ -2337,10 +2333,19 @@ impl Shell {
             .map(|(spec, rungs, _)| format!("{}={rungs:?};", spec.id))
             .collect();
         format!(
-            "metal|{}|{os}|emitter {}|kernels {kernels:016x}|tuning {:016x}|picks {:016x}",
+            "metal|{}|emitter {}|kernels {kernels:016x}|tuning {:016x}|picks {:016x}",
             crate::stored::measured_on(self.device.name()),
             eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION,
-            fnv(format!("{:?}", self.tuning).as_bytes()),
+            // What routes beside the picks: not the tuning's Debug, which
+            // names the profile's source, so a measured boot and the
+            // committed boot of the same picks would key apart.
+            fnv(format!(
+                "wide {} cores {:?} family {}",
+                self.tuning.wide_range(),
+                self.tuning.cores(),
+                self.device.family()
+            )
+            .as_bytes()),
             fnv(decisions.as_bytes()),
         )
     }

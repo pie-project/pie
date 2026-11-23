@@ -334,6 +334,8 @@ struct Model {
     asynchronous: bool,
     heard: mpsc::Receiver<(StepDone, StepOutcome)>,
     seen: Vec<(StepDone, StepOutcome)>,
+    /// What the load states a guest stage is costed by under a bound.
+    guest_cost: ::engine::GuestCost,
 }
 
 impl Model {
@@ -591,6 +593,7 @@ fn load_on(
         asynchronous,
         heard,
         seen: Vec::new(),
+        guest_cost: loaded.caps.guest_cost,
     };
     Some((model, instance))
 }
@@ -982,6 +985,15 @@ fn under_skip_with_a_bound_and_no_rates_a_long_prompt_is_held_and_cut() {
         .expect("a skipping load holds its steps to the stated bound")
         .clone();
     assert_eq!(held.worst, 1.0, "no ratio is measured under skip");
+    // A guest program binds against the bound at the rates the load states
+    // (the runtime's `guest_budget` refuses a bound with neither).
+    let cost = model.guest_cost;
+    assert!(cost.submit_bound_ns.is_some(), "{cost:?}");
+    assert!(cost.launch_ns.is_some(), "a guest stage's launch is stated: {cost:?}");
+    assert!(
+        cost.elementwise_gbps.is_some_and(|gbps| gbps > 0.0),
+        "a guest stage's bandwidth is stated: {cost:?}"
+    );
     assert!(
         matches!(held.admit(step), Admitted::Whole { .. }),
         "within 2 s the step goes whole: {:?}",

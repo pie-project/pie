@@ -99,6 +99,17 @@ impl Spatial {
 const DEFAULT_STATE_SLOTS: u32 = 4;
 
 impl Engine for Spatial {
+    /// Unsupported on Cerebras, by name: it keys no host cover (no committed
+    /// covers) and has no keyed load-time measurements to skip (out of scope
+    /// for this work), so it never skips.
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> &'static str {
         "cerebras-spatial"
     }

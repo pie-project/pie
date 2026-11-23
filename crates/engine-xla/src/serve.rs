@@ -4810,6 +4810,36 @@ fn normal_exports(trace: &poem_ir::Trace, exports: &[poem_exec::feeds::ClassOutp
         .collect()
 }
 
+impl Shell {
+    /// What the runtime's host cover depends on here
+    /// (`engine::Engine::cover_fingerprint`): the TPU, the kernels its
+    /// fires' programs lower through (kernels-xla's sources, fingerprinted
+    /// at build), the tuning and chip they are laid by, and the compiler's
+    /// flags. Not the binary: a build that changes none of these reuses an
+    /// earlier boot's cover, and a cover committed for the device
+    /// (`chip::COVERS`) holds while they are unchanged.
+    #[must_use]
+    pub fn cover_fingerprint(&self) -> String {
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+            })
+        };
+        let flags: String = crate::device::COMPILER_ENV
+            .iter()
+            .map(|var| format!("{var}={};", std::env::var(var).unwrap_or_default()))
+            .collect();
+        format!(
+            "xla|{}|kernels {}|tuning {:016x}|chip {:016x}|flags {:016x}",
+            self.device.kind(),
+            kernels_xla::SOURCE_FINGERPRINT,
+            fnv(format!("{:?}", self.tuning).as_bytes()),
+            fnv(format!("{:?}|{:?}", self.tpu, self.pad).as_bytes()),
+            fnv(flags.as_bytes()),
+        )
+    }
+}
+
 /// The version of the traced-fire records' method: a change to what a
 /// record holds or how its scope is made bumps it.
 const TRACE_RECORDS: &str = "xla-traced-fires-1";

@@ -2827,16 +2827,11 @@ impl<B: Serve> Shell<B> {
                     "its method is version {SETTLE_METHOD} now, {} when stored",
                     stored.method
                 ))
-            } else if stored.of != of {
-                Some(format!(
-                    "what it weighed changed (the curves, the model's planes, the rungs, lanes or \
-                     kernel choice: {:#010x} stored, {of:#010x} now)",
-                    stored.of
-                ))
             } else if stored.code != code {
                 Some(format!(
-                    "the code of the kernels its steps fire changed ({:#010x} stored, \
-                     {code:#010x} now)",
+                    "what its ranges were weighed against changed (the code of the kernels its \
+                     steps fire, or the kernel the curves pick at a range: {:#010x} stored, \
+                     {code:#010x} now); settled again, its entry replaced",
                     stored.code
                 ))
             } else {
@@ -3211,26 +3206,26 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, a
-    /// fingerprint of what it weighs (the curves, the model's planes, the
-    /// kernels the choice took by them, the rungs and lanes it fires, the
-    /// backend); and `code`, a fingerprint of the code of every kernel the
-    /// load's fires can ask for (`crate::stored::code_of_all`), which each
-    /// weighed step ran. Nothing of the build but its kernels keys it.
+    /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, which
+    /// model's settle it is (`crate::dense::settle_of`: its planes, the
+    /// load's lanes and rows, the backend), one entry a model; and `code`,
+    /// what its ranges were weighed against (`crate::dense::settle_code`:
+    /// the code of every kernel the load's fires can ask for, and the
+    /// kernel the curves picked at each range). Nothing of the build but its
+    /// kernels keys it.
     fn settle_key(&self, lanes: u32) -> Result<(u32, u32)> {
-        // In canonical words: the same content keys the same whatever
-        // layer stated it and in what order (`crate::dense::settle_of`).
         let of = crate::dense::settle_of(
-            self.dense_rates.kernel_tflops_by_shape.as_deref(),
             &self.dense_planes,
-            &self.dense,
             lanes,
             self.budgets.tokens.max_tokens,
             B::TARGET,
         );
         let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
             self.asks.kernels.iter().copied().collect();
-        let code = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        let code = crate::dense::settle_code(
+            crate::stored::code_of_all(B::TARGET, &kernels)?,
+            &self.dense,
+        );
         Ok((of, code))
     }
 

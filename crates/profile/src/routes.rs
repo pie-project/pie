@@ -142,6 +142,25 @@ impl Routes {
             .map_or(stated, |&(kernel, ..)| kernel)
     }
 
+    /// A fingerprint of what every [`Routes::pick`] answers by: each
+    /// measured time (its shape, kernel, kind, time and spread, in a fixed
+    /// order), the one kernel a test's table answers and every forced bank.
+    /// Two tables with the same fingerprint pick alike.
+    #[must_use]
+    pub fn fingerprint(&self) -> u32 {
+        let mut times: Vec<_> = self
+            .times
+            .iter()
+            .map(|(&(shape, kernel), &(kind, ns, spread))| {
+                (shape, kernel, kind as u32, ns.to_bits(), spread.to_bits())
+            })
+            .collect();
+        times.sort_unstable();
+        let mut forced: Vec<_> = self.forced.iter().map(|(&shape, &k)| (shape, k)).collect();
+        forced.sort_unstable();
+        crate::fire::fingerprint(format!("{times:?}|{:?}|{forced:?}", self.all).as_bytes())
+    }
+
     /// The shapes [`Routes::pick`] met unmeasured since the last call, with
     /// their weights and candidates; the notes are cleared.
     pub fn wanted(&self) -> BTreeMap<Shape, Wanted> {

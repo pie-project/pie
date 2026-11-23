@@ -1178,8 +1178,15 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (entries whose key names the device's `measured_on`), listed in the backend's `COVERS`
   (`Engine::committed_covers`); looked up home cache > committed > measured. Under `measure = false` (every engine)
   the dispatch depth is taken by name in place of the warm runs (a cover too large costs window, never a result).
-  Open: only engine-gpu lists committed covers; engine-cuda / engine-xla / engine-cerebras state no fingerprint
-  (`Engine::cover_fingerprint` default None): measured every boot, nothing kept.
+  engine-cuda states one too (the device and its kernel libraries' code, the guest emitter's version, the decode
+  products' routes table, a fire's lanes and tokens) and lists its committed covers in `chip::COVERS`; a CUDA
+  group or lockstep rank states none (measured every boot). Open: engine-xla / engine-cerebras state no
+  fingerprint (`Engine::cover_fingerprint` default None): measured every boot, nothing kept.
+- **engine-cuda, open (accepted)**: an evacuation is all or nothing on one shell (sc/l40s-evac-atomic: every check
+  a dry run before the copy, nothing past it fails but the device), but a tensor-parallel group (`group.rs`) and
+  the expert-parallel lockstep (`lockstep.rs`) evacuate rank by rank. Every logical check is the same on each rank,
+  so a refusal comes from the first rank before anything moves; only a device fault on a later rank could leave
+  the ranks split, and a device fault poisons the context anyway.
 - **engine-gpu, closed on sc/gpu-committed-profiles-2**: under `measure = false` on a platform stating a submit
   bound (Android, Windows TDR) with no roofline stated or committed, the load times only what the bound's estimate
   reads (`engine_gpu::rates::for_bound`: a short launch chain, a one-row and a widest-rung matmul over the model's
@@ -1189,3 +1196,16 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+
+## F57. Metal's kernel.dense fit turns agreeing curves into different ladders (found 2026-11-22)
+The load's ladder is `tune::dense::fit_at` over the per-shape curves (`profile::tune::fit`, `Options::default()`:
+`min_gain` 1% of the floor, up to 8 rungs). A rung that fixes the 8-row pick alone saves under 1% (one row count of
+six in the decode band), so whether it is kept turns on noise. Two clean measuring boots of Gemma 4 E4B on an M5 Pro
+(sc/macpro-metal-covers, each point the fastest of 7 rounds, a point slower than both neighbours re-timed over 21)
+measured curves that agree (153 points at rows 6-12: median 0.25%, max 1.88% apart; no row count where the fastest
+kernel differs) and fitted a 4-rung ladder serving c8 at 177.8 tok/s and a 5-rung one serving 199.8. A committed
+profile exported from either freezes its ladder. `min_gain` is a chosen threshold, and a fit that serves c8 slower
+than another candidate ladder must never be picked. sc/macpro-dense-fit (held) replaces the fit with the curves'
+per-point winners (no threshold, no cap; ties settled by the neighbouring row count, else the profile's pick): on
+the M5 it served Gemma c8 at 200.0 / 199.9 / 200.1 over three fresh measurements; on an M1 Max it served c8 7.5%
+under 8ed8f8679 with its 8-row fires faster on the device (the loss off the device, unexplained).

@@ -1936,6 +1936,14 @@ mod landing_tests {
     }
 
     impl Engine for LateCopies {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         fn kind(&self) -> &'static str {
             "fake-late-copies"
         }

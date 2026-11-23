@@ -710,7 +710,7 @@ pub(crate) fn create_engine_backend(
         #[cfg(feature = "xla")]
         EngineOptions::Xla(opts) => {
             let mut boot_doc = format!(
-                "[xla]\ndevice = {}\nprofiles = {}\n",
+                "[xla]\ndevice = {}\nprofiles = {}\nmeasure = {measure}\n",
                 opts.device_index,
                 toml::Value::String(home.join("profiles").display().to_string()),
             );

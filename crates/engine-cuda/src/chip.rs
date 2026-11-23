@@ -224,6 +224,12 @@ shelved!(
     ],
 );
 
+/// The host covers committed for this backend's devices
+/// (`profiles/<device>.covers.json`, `pie tune export --engine cuda`), each
+/// listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[];
+
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
     seeded: SEEDED,
@@ -452,7 +458,13 @@ mod tests {
     #[cfg(not(feature = "rocm"))]
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
-        for (name, text) in SEEDED {
+        // A committed measured profile is a device's keyed measurements, read
+        // as such (`profile::Strict::Measured`, the shelf's check), not a
+        // decision profile.
+        for (name, text) in SEEDED
+            .iter()
+            .filter(|(name, _)| !name.ends_with(profile::MEASURED_SUFFIX))
+        {
             let p = registry()
                 .load(text, name)
                 .unwrap_or_else(|e| panic!("{e}"));
@@ -1073,7 +1085,8 @@ mod tests {
             report.layers,
             [
                 profile::Source::Seeded("sm89.toml".into()),
-                profile::Source::Seeded("sm89/nvidia-l40s.toml".into())
+                profile::Source::Seeded("sm89/nvidia-l40s.toml".into()),
+                profile::Source::Committed("nvidia-l40s.measured.toml".into())
             ]
         );
         assert!(!report.untuned());

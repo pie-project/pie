@@ -599,6 +599,23 @@ impl Engine for Cuda {
         "cuda"
     }
 
+    fn cover_fingerprint(&self) -> Option<String> {
+        let print = self.shell.as_ref()?.cover_fingerprint();
+        eprintln!(
+            "engine-cuda: the host cover's key: {print} (the device, its kernels' code, the \
+             guest emitter's version, the decode products' picks and a fire's lanes and tokens)"
+        );
+        Some(print)
+    }
+
+    fn committed_covers(&self) -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    fn skips_measuring(&self) -> bool {
+        self.boot.knobs.measuring == engine::rates::Measuring::Skip
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }

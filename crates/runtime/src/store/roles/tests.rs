@@ -191,6 +191,14 @@ impl FakeEngine {
 }
 
 impl Engine for FakeEngine {
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     /// A test engine's copies land inside the call: nothing to wait for.
     fn settle_copies(&mut self) -> ::engine::Result<()> {
         Ok(())
