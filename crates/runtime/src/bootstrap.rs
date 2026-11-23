@@ -194,6 +194,10 @@ pub struct EngineConfig {
     /// a program needing another is refused at its bind.
     pub host_ops: ::engine::HostOps,
     pub limits: crate::engine::SchedulerLimits,
+    /// The step compositions the engine computed before its arm walk and
+    /// those it runs eager ([`::engine::Capabilities::steps`]): held to the
+    /// set the runtime's rules form over the load's stated facts.
+    pub steps: ::engine::StatedSteps,
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
     pub inputs: Vec<poem_ir::InputDecl>,
@@ -418,6 +422,25 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .readout_facts()
                 .map_err(|error| anyhow::anyhow!("engine readout facts: {error}"))?;
             d.limits = d.limits.read_out_by(&facts);
+            // The step compositions the step builder forms (CONTRACT-BC 24):
+            // the runtime's rules over the load's stated facts, the set the
+            // engine walked before ready, or the load is refused by name.
+            let rules = ::engine::StepRules::runtime();
+            let step_facts = d.limits.step_facts(
+                &d.chunks,
+                ::engine::Attachments::served(d.has_lora, !d.inputs.is_empty(), d.rs_snapshots > 0),
+            );
+            d.steps.agrees(&rules, &step_facts).map_err(|why| {
+                anyhow::anyhow!("engine {}: step shapes: {why}", d.engine_backend.kind())
+            })?;
+            tracing::info!(
+                engine = d.engine_backend.kind(),
+                eager = d.steps.eager.len(),
+                "the step builder forms {}; each is armed before ready or stated eager",
+                d.steps.shapes.census()
+            );
+            // One set a load, shared by every step it builds for its life.
+            d.limits.shapes = Some(Box::leak(Box::new(d.steps.shapes.clone())));
             Ok(facts)
         })
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;

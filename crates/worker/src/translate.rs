@@ -176,8 +176,10 @@ fn build_model(
                     prefill_lanes: g.caps.limits.prefill_lanes as usize,
                     max_readouts: g.caps.limits.max_readouts as usize,
                     max_replayed_rows: g.caps.limits.replayed_rows as usize,
+                    shapes: None,
                     readout_store: 0,
                 },
+                steps: g.caps.steps.clone(),
                 engine_backend: g.backend,
             }
         })

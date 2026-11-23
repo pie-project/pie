@@ -633,6 +633,7 @@ impl Engine for Cuda {
             residency,
             ordinal,
             frames_in_flight,
+            steps,
         } = request;
 
         // A rank of an expert-parallel group of `size` holds part of a bank
@@ -878,7 +879,24 @@ impl Engine for Cuda {
             frames_in_flight: u32::from(
                 engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
             ),
+            steps: engine::StatedSteps::default(),
         };
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are, after
+        // the arm walk, which does not take its targets from them yet; the
+        // shapes it leaves unwalked are stated by name.
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &readout_facts()),
+        );
+        let gaps = shell.walk_gaps(&caps.steps.shapes);
+        eprintln!(
+            "engine-cuda: step set: {}; the arm walk leaves {} of them unwalked{}",
+            caps.steps.shapes.census(),
+            gaps.len(),
+            if gaps.is_empty() { String::new() } else { format!(": {}", gaps.join("; ")) },
+        );
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
         // decode wave seats at most `max_lanes` lanes.

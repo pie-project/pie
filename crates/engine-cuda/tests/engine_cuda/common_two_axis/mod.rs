@@ -389,6 +389,7 @@ impl Rig {
                 },
                 ordinal: 0,
                 frames_in_flight: 1,
+                steps: Default::default(),
             })
             .expect("the two-axis miniature loads");
         Rig {

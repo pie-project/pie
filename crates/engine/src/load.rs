@@ -201,6 +201,12 @@ pub struct LoadRequest {
     pub residency: Residency,
     pub ordinal: i32,
     pub frames_in_flight: u8,
+    /// The runtime's step builder's rules ([`crate::StepRules`]): the engine
+    /// computes the set of step compositions it will be sent from them and
+    /// its own facts before its arm walk, and walks that set
+    /// ([`crate::StepShapes::of`], CONTRACT-BC 24).
+    #[serde(default)]
+    pub steps: crate::StepRules,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

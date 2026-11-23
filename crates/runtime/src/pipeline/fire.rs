@@ -7963,6 +7963,7 @@ mod static_admission_tests {
             max_readouts: 0,
             readout_store: 0,
             max_replayed_rows: 0,
+            shapes: None,
         };
         for (case, submissions) in cases {
             let ring = channel(HostRole::None, 4, false);

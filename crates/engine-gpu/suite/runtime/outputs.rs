@@ -320,6 +320,7 @@ pub(super) fn loaded_boot(
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     Some(Loaded {

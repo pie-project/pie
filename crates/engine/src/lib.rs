@@ -35,6 +35,7 @@ pub mod rates;
 pub mod roofline;
 pub mod rs;
 pub mod runahead;
+pub mod shapes;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};
@@ -61,6 +62,10 @@ pub use fire::{
 };
 pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use memory::SAFETY_FLOOR_BYTES;
+pub use shapes::{
+    Attachments, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,
+    Treatment,
+};
 pub use program::{
     BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestState, GuestTerm,
     InstanceBinding, InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration,

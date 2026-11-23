@@ -950,6 +950,7 @@ where
             residency,
             ordinal,
             frames_in_flight,
+            steps,
         } = request;
 
         if ordinal > 0 {
@@ -1169,7 +1170,23 @@ where
             host_ops: engine::HostOps { beam_list: true },
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the walk's own branch
+        // (sc/gpu-arm-before-ready) consumes it before ready.
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
+        tracing::info!(
+            "engine-gpu: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
 
         self.shell = Some(shell);
         self.caps = Some(caps.clone());

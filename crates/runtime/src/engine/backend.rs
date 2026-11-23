@@ -33,6 +33,13 @@ pub struct SchedulerLimits {
     /// summed ([`::engine::FireLimits::replayed_rows`]; 0: no bound past
     /// each fire's rung).
     pub max_replayed_rows: usize,
+    /// The step compositions the load stated (CONTRACT-BC 24): the step
+    /// builder forms none outside them, a member whose joining would leave
+    /// the set going in a later step and a lone member outside it refused at
+    /// admission by name. Every served load states one (bootstrap computes
+    /// it from the load's facts and holds the engine's to it); `None` only
+    /// where a test builds limits by hand.
+    pub shapes: Option<&'static ::engine::StepShapes>,
 }
 
 impl SchedulerLimits {
@@ -47,6 +54,26 @@ impl SchedulerLimits {
         self.max_readouts = readouts.fire_rows(ceiling) as usize;
         self.readout_store = readouts.store_rows.map_or(0, |rows| rows.max(1) as usize);
         self
+    }
+
+    /// The facts of a load stating `chunks` under these limits, as the step
+    /// set is computed from them ([`::engine::StepFacts::of`]): the limits
+    /// after [`Self::read_out_by`], so the readout bound is the one fires
+    /// are cut to, its lanes carrying `attachments` ([`::engine::Attachments::served`]).
+    #[must_use]
+    pub fn step_facts(
+        &self,
+        chunks: &::engine::ChunkFacts,
+        attachments: ::engine::Attachments,
+    ) -> ::engine::StepFacts {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        ::engine::StepFacts::of(
+            chunks,
+            count(self.max_forward_requests),
+            count(self.max_forward_tokens),
+            count(self.max_readouts),
+            attachments,
+        )
     }
 }
 
@@ -324,6 +351,7 @@ mod tests {
             max_readouts: 0,
             readout_store: 0,
             max_replayed_rows: 0,
+            shapes: None,
         };
         assert_eq!(smallest_fire(std::iter::empty()), None, "no engine yet");
         assert_eq!(

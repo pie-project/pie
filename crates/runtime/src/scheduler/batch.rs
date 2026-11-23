@@ -96,7 +96,66 @@ impl AdmissionLimits {
                 usage.page_refs, self.limits.max_page_refs
             ));
         }
+        // A request whose lanes alone make a step outside the set the load
+        // stated: no step the builder forms seats it (it cuts no member), and
+        // the engine recorded nothing for it.
+        if let Some(shapes) = self.limits.shapes
+            && let Err(gap) = shapes.holds(&composition(req))
+        {
+            return Some(format!(
+                "forward request of instance {} alone is a step outside the set the load \
+                 stated: {gap}",
+                req.instance_id.0
+            ));
+        }
         None
+    }
+}
+
+/// The step composition `request`'s lanes make ([`::engine::StepComposition`]).
+fn composition(request: &PendingRequest) -> ::engine::StepComposition {
+    ::engine::StepComposition::of(request.request.lanes.iter().map(|lane| &lane.lane))
+}
+
+/// The set a step is checked against under the contract check: the load's
+/// stated one; in a test building its limits by hand, the one the runtime's
+/// rules form over those limits, every rung one fire wide, buffering.
+fn checked_shapes(limits: &SchedulerLimits) -> Option<std::borrow::Cow<'static, ::engine::StepShapes>> {
+    if let Some(shapes) = limits.shapes {
+        return Some(std::borrow::Cow::Borrowed(shapes));
+    }
+    #[cfg(test)]
+    {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let facts = ::engine::StepFacts {
+            rungs: Vec::new(),
+            max_lanes: count(limits.max_forward_requests),
+            max_tokens: count(limits.max_forward_tokens),
+            max_readouts: count(limits.max_readouts),
+            buffers: true,
+            attachments: ::engine::Attachments::served(true, true, true),
+        };
+        Some(std::borrow::Cow::Owned(::engine::StepShapes::of(
+            &::engine::StepRules::runtime(),
+            &facts,
+        )))
+    }
+    #[cfg(not(test))]
+    None
+}
+
+/// The contract check on a formed step ([`::engine::shapes::check_on`]):
+/// a composition outside the stated set is a contract bug, named with the
+/// composition and the nearest stated shapes.
+fn check_step(lanes: &[::engine::Lane], limits: &SchedulerLimits) {
+    if !::engine::shapes::check_on() {
+        return;
+    }
+    let Some(shapes) = checked_shapes(limits) else {
+        return;
+    };
+    if let Err(gap) = shapes.holds(&::engine::StepComposition::of(lanes)) {
+        panic!("{gap}");
     }
 }
 
@@ -144,6 +203,9 @@ pub(crate) struct StepGroup {
     /// together fit that rung's replay scratch.
     incompact: bool,
     replay_rungs: Option<crate::store::shared::Replays>,
+    /// The composition its members make ([`::engine::StepComposition`]): a
+    /// member joins only where the step stays inside the load's stated set.
+    composition: ::engine::StepComposition,
 }
 
 /// Whether `request` has a lane decoding (a row of its own, or none the
@@ -216,6 +278,15 @@ impl StepGroup {
         // pick (the step's own rung, by width as ever): a fire whose rs
         // scratch that rung would not hold goes in a later step.
         if self.forward_requests > 0 && !self.replay_holds(request) {
+            return false;
+        }
+        // The step it would make is one the load stated: else it goes in a
+        // later step, and this one is formed without it.
+        if let Some(shapes) = limits.shapes
+            && shapes
+                .shape_of(&self.composition.with(composition(request)))
+                .is_none()
+        {
             return false;
         }
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
@@ -293,6 +364,7 @@ impl StepGroup {
             self.incompact |= !request.request.scratch_compact;
         }
         self.lanes = self.lanes.saturating_add(request.request.lanes.len());
+        self.composition = self.composition.with(composition(request));
         self.decoding |= decodes(request);
         (limits.prefill_lanes > 0 && !self.decoding && self.lanes >= limits.prefill_lanes)
             || self.forward_requests >= limits.max_forward_requests
@@ -566,6 +638,7 @@ pub(crate) fn build_frame_submission(
         }
         let mut attachments = Vec::new();
         let lanes = build.lanes;
+        check_step(&lanes, &limits);
         for (member, &instance) in build.instance_ids.iter().enumerate() {
             // Only the fire ending a pass runs its program; earlier fires carry the adapter alone.
             let adapter_only = !build.boundary_programs[member];
@@ -646,6 +719,7 @@ mod tests {
             max_readouts: 0,
             readout_store: 0,
             max_replayed_rows: 0,
+            shapes: None,
         }
     }
 
@@ -1210,6 +1284,7 @@ mod tests {
     fn a_step_replays_no_more_rows_than_the_engine_states() {
         let stated = SchedulerLimits {
             max_replayed_rows: 1024,
+            shapes: None,
             ..limits()
         };
         let replaying = |instance: u64, replayed: u32| {
@@ -1247,7 +1322,7 @@ mod tests {
 
     /// A frame's wave of prompts past what one fire carries is cut into
     /// fires each within it; the lanes' first decode rows, the next wave,
-    /// are one fire. A prompt past one fire alone takes a fire of its own,
+    /// are one fire. A prompt past one fire alone is refused at admission,
     /// and no member is dropped.
     fn a_wave_of_prompts_past_one_fire_is_cut_and_its_decode_wave_is_one_fire() {
         let limits = limits();
@@ -1319,15 +1394,21 @@ mod tests {
         assert_eq!(step_tokens(&frame.steps[0]), short * lanes as usize);
         assert_eq!(frame.steps[1].submission.lanes.len(), lanes as usize);
 
-        // A prompt past one fire alone still takes a fire of its own.
+        // A prompt past one fire alone is no step of the load's stated set
+        // (CONTRACT-BC 24): it is refused at admission by name, never
+        // formed; the prompts beside it share a fire as before.
         let wide = limits.max_forward_tokens + 1;
-        let prompts = vec![prompt(1, short), prompt(2, wide), prompt(3, short)];
+        let admission = AdmissionLimits::new(limits, 16);
+        let refused = admission
+            .single_request_limit_error(&prompt(2, wide))
+            .expect("a prompt past one fire is refused");
+        assert!(refused.contains("forward tokens"), "{refused}");
+        let prompts = vec![prompt(1, short), prompt(3, short)];
         let (frame, flattened) =
             build_frame_submission(vec![prompts], limits, 16, &SchedulerStats::default());
-        assert_eq!(flattened.len(), 3, "no member is dropped");
-        let mut sizes: Vec<usize> = frame.steps.iter().map(step_tokens).collect();
-        sizes.sort_unstable();
-        assert_eq!(sizes, vec![2 * short, wide]);
+        assert_eq!(flattened.len(), 2, "no member is dropped");
+        let sizes: Vec<usize> = frame.steps.iter().map(step_tokens).collect();
+        assert_eq!(sizes, vec![2 * short]);
     }
 
     /// The engine holds a body for no more than `prefill_lanes` lanes of
@@ -1607,6 +1688,146 @@ mod tests {
             cells.iter().collect::<std::collections::HashSet<_>>().len(),
             cells.len(),
             "no cell is owned by two members"
+        );
+    }
+
+    /// The set the runtime's rules form over `limits` at `rungs`, as a load
+    /// states it.
+    fn stated(limits: SchedulerLimits, rungs: &[u32], buffers: bool) -> ::engine::StepShapes {
+        ::engine::StepShapes::of(
+            &::engine::StepRules::runtime(),
+            &::engine::StepFacts {
+                rungs: rungs.to_vec(),
+                max_lanes: limits.max_forward_requests as u32,
+                max_tokens: limits.max_forward_tokens as u32,
+                max_readouts: limits.max_readouts as u32,
+                buffers,
+                attachments: ::engine::Attachments::served(true, true, true),
+            },
+        )
+    }
+
+    fn holding(limits: SchedulerLimits, shapes: ::engine::StepShapes) -> SchedulerLimits {
+        SchedulerLimits {
+            shapes: Some(Box::leak(Box::new(shapes))),
+            ..limits
+        }
+    }
+
+    fn prompt(instance: u64, rows: u32) -> Box<PendingRequest> {
+        let lane = crate::engine::fire::lane_of(0, (0..rows).collect(), 0, vec![1]);
+        pending(FireRequest::one(lane), InstanceId(instance))
+    }
+
+    fn buffered_decode(instance: u64) -> Box<PendingRequest> {
+        let mut request = decode(1, 1);
+        request.lanes[0].lane.rs = ::engine::RsVerb::Buffer {
+            pages: vec![1],
+            base: 0,
+            folded: 0,
+            fold: ::engine::fire::FoldLen::Host(0),
+            lineage: ::engine::fire::Lineage::Set,
+        };
+        pending(request, InstanceId(instance))
+    }
+
+    fn compositions(frame: &FrameFire) -> Vec<::engine::StepComposition> {
+        frame
+            .steps
+            .iter()
+            .map(|step| ::engine::StepComposition::of(&step.submission.lanes))
+            .collect()
+    }
+
+    /// Waves of decodes (folded and buffered), prompts of every width and
+    /// both together, on a load of rungs 4, 16 and 64: every step the
+    /// builder forms is a composition of the set the load stated, and
+    /// every lane is served.
+    #[test]
+    fn every_step_the_builder_forms_is_in_the_stated_set() {
+        let base = limits();
+        let shapes = stated(base, &[4, 16, 64], true);
+        let limits = holding(base, shapes.clone());
+        let mut instance = 0u64;
+        let mut next = || {
+            instance += 1;
+            instance
+        };
+        for decodes in [0usize, 1, 3, 7, 12] {
+            for prompts in [0u32, 2, 5, 30, 63] {
+                for buffered in [false, true] {
+                    let mut wave: Vec<Box<PendingRequest>> = (0..decodes)
+                        .map(|_| {
+                            if buffered {
+                                buffered_decode(next())
+                            } else {
+                                pending(decode(1, 1), InstanceId(next()))
+                            }
+                        })
+                        .collect();
+                    if prompts > 1 {
+                        wave.push(prompt(next(), prompts));
+                        wave.push(prompt(next(), 2));
+                    }
+                    let lanes: usize = wave.iter().map(|r| r.request.lanes.len()).sum();
+                    if lanes == 0 {
+                        continue;
+                    }
+                    let (frame, flattened) =
+                        build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+                    assert_eq!(flattened.len(), frame.steps.iter().map(|s| s.fire_stamps.len()).sum::<usize>());
+                    let served: usize = frame.steps.iter().map(|s| s.submission.lanes.len()).sum();
+                    assert_eq!(served, lanes, "every lane is served");
+                    for step in compositions(&frame) {
+                        shapes.holds(&step).unwrap_or_else(|gap| panic!("{gap}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A load that states no mixed step: decodes and a prompt in one wave
+    /// are never formed together, the prompt going in a step of its own,
+    /// and every lane still served.
+    #[test]
+    fn a_composition_outside_the_stated_set_is_split_never_formed() {
+        let base = limits();
+        let mut shapes = stated(base, &[64], false);
+        shapes.shapes.retain(|shape| shape.kind != ::engine::StepKind::Mixed);
+        let limits = holding(base, shapes.clone());
+        let mut wave: Vec<Box<PendingRequest>> =
+            (0..3).map(|i| pending(decode(1, 1), InstanceId(i))).collect();
+        wave.push(prompt(10, 8));
+        wave.extend((20..22).map(|i| pending(decode(1, 1), InstanceId(i))));
+        let (frame, _) = build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+        let steps = compositions(&frame);
+        assert!(
+            steps.iter().all(|step| step.kind() != ::engine::StepKind::Mixed),
+            "no mixed step is formed: {steps:?}"
+        );
+        assert_eq!(steps.len(), 2, "the decodes together, the prompt apart: {steps:?}");
+        assert_eq!(steps.iter().map(|s| s.decode_lanes).sum::<u32>(), 5);
+        for step in &steps {
+            assert!(shapes.holds(step).is_ok());
+        }
+    }
+
+    /// A load stating no buffered step: a buffered decode is deferred from a
+    /// folded step and, alone outside the set, refused at admission by name.
+    #[test]
+    fn a_lone_request_outside_the_stated_set_is_refused_by_name() {
+        let base = limits();
+        let limits = holding(base, stated(base, &[64], false));
+        let admission = AdmissionLimits::new(limits, 16);
+        assert_eq!(admission.single_request_limit_error(&pending(decode(1, 1), InstanceId(1))), None);
+        let refused = admission
+            .single_request_limit_error(&buffered_decode(7))
+            .expect("a buffered step the load never stated is refused");
+        assert!(
+            refused.contains("instance 7")
+                && refused.contains("outside the set")
+                && refused.contains("nearest stated"),
+            "{refused}"
         );
     }
 }
