@@ -23,9 +23,51 @@ const RING_SLOT_BYTES: usize = 1 << 20;
 /// that last read it has landed, which with this many is long past.
 const RING_SLOTS: usize = 32;
 
+/// A slot: its pinned span, the event recorded after the copy that last
+/// read it, and the stream that event was recorded on (0: never recorded).
+/// The event belongs to that stream: once the stream is destroyed, a query
+/// of it reads freed state (on ROCm, a lock no thread holds, so the query
+/// waits forever), so a stream's slots are forgotten before it goes
+/// ([`forget_stream`]).
 struct StageRing {
-    slots: Vec<(Pinned, kernels_cuda::hip::rt::Event, bool)>,
+    slots: Vec<(Pinned, kernels_cuda::hip::rt::Event, usize)>,
     next: usize,
+}
+
+/// Every device's ring, by ordinal.
+static RINGS: std::sync::Mutex<Option<std::collections::HashMap<core::ffi::c_int, StageRing>>> =
+    std::sync::Mutex::new(None);
+
+/// Forgets what `stream` recorded in the rings, before it is destroyed:
+/// each slot whose event it recorded waits for that event (the stream still
+/// live) and takes a fresh, unrecorded one, so no later stage queries an
+/// event of a destroyed stream.
+pub(crate) fn forget_stream(stream: usize) {
+    use kernels_cuda::hip::rt;
+    let mut rings = RINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(rings) = rings.as_mut() else {
+        return;
+    };
+    for ring in rings.values_mut() {
+        for (_, event, recorded_on) in &mut ring.slots {
+            if *recorded_on != stream {
+                continue;
+            }
+            // SAFETY: the slot's own event, recorded on `stream`, which is
+            // live until its caller destroys it after this returns.
+            unsafe {
+                let _ = rt::hipEventSynchronize(*event);
+                let _ = rt::hipEventDestroy(*event);
+            }
+            let mut fresh: rt::Event = core::ptr::null_mut();
+            // SAFETY: writes the new event.
+            let made = unsafe { rt::hipEventCreateWithFlags(&raw mut fresh, rt::hipEventDisableTiming) };
+            // A slot whose event could not be made again is left with none:
+            // the next stage that reaches it takes a fresh slot ahead of it.
+            *event = if made == 0 { fresh } else { core::ptr::null_mut() };
+            *recorded_on = 0;
+        }
+    }
 }
 
 // SAFETY: the ring is only touched under its mutex; the events and pinned
@@ -46,7 +88,6 @@ pub(crate) fn staged_through_ring(
 ) -> Result<bool> {
     use kernels_cuda::hip::rt;
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
     if bytes.len() <= HIP_STAGED_BYTES || bytes.len() > RING_SLOT_BYTES {
         return Ok(false);
@@ -66,7 +107,6 @@ pub(crate) fn staged_through_ring(
     // SAFETY: writes one int.
     unsafe { check("hipGetDevice", rt::hipGetDevice(&raw mut device))? };
 
-    static RINGS: Mutex<Option<HashMap<core::ffi::c_int, StageRing>>> = Mutex::new(None);
     let mut rings = RINGS.lock().expect("rings lock poisoned");
     let rings = rings.get_or_insert_with(HashMap::new);
     let ring = match rings.entry(device) {
@@ -82,13 +122,14 @@ pub(crate) fn staged_through_ring(
     // A slot whose copy is still queued behind airborne work is not waited
     // out: a fresh one goes in ahead of it, so the ring holds as many slots
     // as copies are in flight and the oldest stays next.
-    let (_, event, used) = &ring.slots[at];
-    // SAFETY: queries the slot's own event.
-    if *used && unsafe { rt::hipEventQuery(*event) } != 0 {
+    let (_, event, recorded_on) = &ring.slots[at];
+    // SAFETY: queries the slot's own event, recorded on a live stream (a
+    // stream's slots are forgotten before it is destroyed).
+    if event.is_null() || (*recorded_on != 0 && unsafe { rt::hipEventQuery(*event) } != 0) {
         ring.slots.insert(at, ring_slot()?);
     }
     ring.next = (at + 1) % ring.slots.len();
-    let (pinned, event, used) = &mut ring.slots[at];
+    let (pinned, event, recorded_on) = &mut ring.slots[at];
     // SAFETY: the slot holds RING_SLOT_BYTES ≥ bytes.len(), and the copy that
     // last read it has landed; the new copy reads it until the event records.
     unsafe {
@@ -105,12 +146,12 @@ pub(crate) fn staged_through_ring(
         )?;
         check("hipEventRecord", rt::hipEventRecord(*event, stream.cast()))?;
     }
-    *used = true;
+    *recorded_on = stream as usize;
     Ok(true)
 }
 
 /// A pinned stage slot and the event its copy records.
-fn ring_slot() -> Result<(Pinned, kernels_cuda::hip::rt::Event, bool)> {
+fn ring_slot() -> Result<(Pinned, kernels_cuda::hip::rt::Event, usize)> {
     use kernels_cuda::hip::rt;
     let pinned = Pinned::mapped_uninit(RING_SLOT_BYTES)?;
     let mut event: rt::Event = core::ptr::null_mut();
@@ -121,5 +162,5 @@ fn ring_slot() -> Result<(Pinned, kernels_cuda::hip::rt::Event, bool)> {
             rt::hipEventCreateWithFlags(&raw mut event, rt::hipEventDisableTiming),
         )?;
     }
-    Ok((pinned, event, false))
+    Ok((pinned, event, 0))
 }
