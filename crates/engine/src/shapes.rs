@@ -285,6 +285,56 @@ impl StepShape {
             && step.floor() <= self.rung
     }
 
+    /// What of `step` this shape does not hold, each by name with the
+    /// step's count and the shape's span: empty where it holds it.
+    #[must_use]
+    pub fn misses(&self, step: &StepComposition) -> Vec<String> {
+        let mut missed = Vec::new();
+        if self.kind != step.kind() {
+            missed.push(format!("kind {} (the shape's {})", step.kind(), self.kind));
+        }
+        if self.treatment != step.treatment {
+            missed.push(format!(
+                "treatment {} (the shape's {})",
+                step.treatment, self.treatment
+            ));
+        }
+        for (what, count, span) in [
+            ("rows", step.rows, self.rows),
+            ("decode lanes", step.decode_lanes, self.decode_lanes),
+            ("prompt lanes", step.prompt_lanes, self.prompt_lanes),
+            ("prompt rows", step.prompt_rows, self.prompt_rows),
+            ("readout rows", step.readout_rows, self.readout_rows),
+        ] {
+            if !span.contains(count) {
+                missed.push(format!("{what} {count} (the shape's {span})"));
+            }
+        }
+        if step.prompt_lanes > 0
+            && !(self.lane_rows.contains(step.lane_rows.lo)
+                && self.lane_rows.contains(step.lane_rows.hi))
+        {
+            missed.push(format!(
+                "a lane's rows {} (the shape's {})",
+                step.lane_rows, self.lane_rows
+            ));
+        }
+        if !step.attachments.within(self.attachments) {
+            missed.push(format!(
+                "lanes carrying {} (the shape's {})",
+                step.attachments, self.attachments
+            ));
+        }
+        if step.floor() > self.rung {
+            missed.push(format!(
+                "carried rows {} past the rung's {}",
+                step.floor(),
+                self.rung
+            ));
+        }
+        missed
+    }
+
     /// How far `step` is from this shape, for naming the nearest: kind and
     /// treatment first, then the rows, lanes and readouts each is past by.
     fn distance(&self, step: &StepComposition) -> (u32, u64) {
@@ -704,11 +754,15 @@ pub struct StepGap {
 
 impl std::fmt::Display for StepGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the step builder formed a step outside the set it stated at load: {}; nearest stated:",
-            self.step
-        )?;
+        write!(f, "a step outside the set the load stated: {}", self.step)?;
+        if let Some(nearest) = self.nearest.first() {
+            write!(
+                f,
+                "; past the nearest in {}",
+                nearest.misses(&self.step).join(", ")
+            )?;
+        }
+        f.write_str("; nearest stated:")?;
         for shape in &self.nearest {
             write!(f, " [{shape}]")?;
         }

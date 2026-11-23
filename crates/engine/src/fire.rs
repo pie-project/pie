@@ -1054,9 +1054,11 @@ pub fn replay_agrees(
     Ok(())
 }
 
-/// Whether engines run [`replay_agrees`] at their door: debug builds, or
-/// `PIE_CHECK_REPLAY` set; it changes no behavior but to name a contract
-/// bug.
+/// Whether the contract's cross-checks run: debug builds, or
+/// `PIE_CHECK_REPLAY` set. It gates both of them: engines running
+/// [`replay_agrees`] at their door, and the step builder checking every step
+/// it forms against the load's stated set ([`crate::shapes::check_on`]). It
+/// changes no behavior but to name a contract bug.
 #[must_use]
 pub fn replay_check_on() -> bool {
     cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_REPLAY").is_some()
