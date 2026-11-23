@@ -5668,9 +5668,17 @@ impl Shell {
                 carried_max: Some(tokens),
                 total_max: Some(tokens.saturating_mul(2)),
             };
+            // Counted as the runtime counts them: by the load's stated
+            // `rs_compact` (`Shell::pool_chunk_facts`), so the rung the
+            // runtime chose and this check agree. What a fire that is not
+            // compact (snapshot lanes, no rs page table) really lays in the
+            // scratch is the seat's own bytes check below, against the
+            // rung's reserved bytes.
+            let load_compact = self.rs_layout.as_ref().is_some_and(|layout| layout.compact)
+                && self.rs_buffers.is_some();
             let held = engine::ReplayRows::of_lanes(
                 rs_plans.iter().zip(&rs_own).map(|(plan, &own)| (own, plan.replay)),
-                compact,
+                load_compact,
             );
             if let Err(past) = engine::fire::rung_holds(&rung, held) {
                 return Err(Fault::program(
