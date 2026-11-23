@@ -58,7 +58,9 @@ interface forward {
         ) -> result<_, error>;
 
         /// Slots at which a recurrent state is kept, so a later pass over the
-        /// same tokens resumes there. Nothing on a model without one.
+        /// same tokens resumes there: one in the scope its working set shares
+        /// in (`working-set.share`). Nothing on a model without one, or on a
+        /// set that shares nothing.
         checkpoints: func(slots: list<u32>) -> result<_, error>;
 
         /// Bind embedding token ids and CSR row indptr. Both are channels.

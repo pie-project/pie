@@ -5,6 +5,7 @@ mod output;
 pub(crate) mod residency;
 pub(crate) mod teardown;
 
+pub(crate) use ctx::Keying;
 pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
@@ -999,8 +1000,28 @@ impl Process {
         // A process arrives, as a policy sees it, before it waits: every gate
         // below orders by its key.
         let props = arrival.props.clone();
+        let keying = match arrival.keys_under {
+            Some(domain) => Keying::OnBehalf(domain),
+            None => Keying::Asker(crate::policy::share::Asker {
+                tenant: crate::policy::share::TenantId(arrival.tenant.clone()),
+                session: match &arrival.session {
+                    Some(session) => crate::policy::share::SessionId::Named(session.clone()),
+                    None => crate::policy::share::SessionId::Process(process_id),
+                },
+            }),
+        };
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
-        crate::store::waiting::arrived(process_id, &props);
+        crate::store::waiting::arrived(
+            process_id,
+            &props,
+            match &keying {
+                Keying::Asker(asker) => crate::policy::share::ShareAs::Scope(
+                    crate::policy::share::ShareScope::Tenant,
+                    asker.clone(),
+                ),
+                Keying::OnBehalf(domain) => crate::policy::share::ShareAs::OnBehalf(*domain),
+            },
+        );
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
         if let Some(planner) = crate::planner::planner_of(process_id) {
@@ -1026,6 +1047,7 @@ impl Process {
                 .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
+            store.data_mut().set_keying(keying);
             store.data_mut().set_props(props);
             store.data_mut().set_files(files);
             if let Some(lease) = lease {

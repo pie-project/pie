@@ -338,7 +338,8 @@ async fn run_one(
     let prefill_rng = Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]);
     let (temperature, top_p, top_k) = (input.temperature, input.top_p, input.top_k);
 
-    let ws = WorkingSet::new();
+    // A bench's prompts share their prefixes across its requests.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
     let n = prompt_vec.len() as u32;
     step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
     // Nothing to reserve; the empty step keeps `prologue_us`'s shape.

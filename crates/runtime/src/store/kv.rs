@@ -247,7 +247,16 @@ pub struct KvStore {
     shape: Option<::engine::chunk::ShapeId>,
     /// `None` while some are off the device.
     flat: HashMap<WorkingSetId, Option<Vec<PhysicalKvPageId>>>,
+    /// The model's domain ([`state::identity::ModelIdentity::domain`]):
+    /// what every set's own domain is derived under, and what the disk
+    /// journal and snapshots are checked against.
     domain: Hash256,
+    /// Each live set's domain, and the scope it asked if it did
+    /// ([`crate::policy::share`]).
+    scopes: HashMap<WorkingSetId, SetScope>,
+    /// Random each run: what a set that asked nothing keys under.
+    private_seed: Hash256,
+    private_nonce: u64,
     /// By entry id. Under test in id order (the order entries were kept),
     /// so a seeded simulation reclaims the same entries on each run.
     cache: CacheMap,
@@ -440,6 +449,15 @@ struct KeptEntry {
     decoded: bool,
 }
 
+/// A set's domain: where its keys chain from at row 0. A set that asked
+/// nothing has one of its own; one that shares, its scope's, resolved again
+/// at each keyed pass ([`KvStore::pass_domain`]).
+#[derive(Debug, Clone)]
+struct SetScope {
+    domain: Hash256,
+    share: Option<crate::policy::share::ShareAs>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CachedWorkingSet {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -511,6 +529,9 @@ impl KvStore {
             shape: None,
             flat: HashMap::new(),
             domain: hash::cache_domain(&seed),
+            scopes: HashMap::new(),
+            private_seed: seed,
+            private_nonce: 0,
             cache: CacheMap::new(),
             by_owner: HashMap::new(),
             node_epochs: HashMap::new(),
@@ -565,6 +586,104 @@ impl KvStore {
         self.domain = domain;
     }
 
+    /// Whether `ws` has keyed nothing yet: no row logged, no page sealed.
+    fn unkeyed(&self, ws: WorkingSetId) -> Result<bool, KvStoreError> {
+        Ok(self.table.logged(ws)?.is_empty() && self.table.sealed_prefix(ws)? == 0)
+    }
+
+    /// `ws` shares as `ask` says (`working-set.share`): asked before it
+    /// keys anything, since its keys chain from its domain. Asking what it
+    /// shares as already is no change.
+    pub fn share(
+        &mut self,
+        ws: WorkingSetId,
+        ask: crate::policy::share::ShareAs,
+    ) -> Result<(), String> {
+        let domain = crate::policy::share::domain_now(&self.domain, &ask);
+        let unkeyed = self.unkeyed(ws).map_err(|error| error.to_string())?;
+        let Some(entry) = self.scopes.get_mut(&ws) else {
+            return Err("share: the working set is gone".to_string());
+        };
+        if entry.share.as_ref() == Some(&ask) && entry.domain == domain {
+            return Ok(());
+        }
+        if !unkeyed {
+            return Err(
+                "share: the working set holds keyed rows already; ask before its first pass"
+                    .to_string(),
+            );
+        }
+        *entry = SetScope {
+            domain,
+            share: Some(ask),
+        };
+        Ok(())
+    }
+
+    /// A set shared within the test tenant ([`crate::policy::share::test_tenant`]).
+    #[cfg(test)]
+    pub fn create_shared_working_set(&mut self) -> WorkingSetId {
+        let ws = self.create_working_set();
+        self.share(ws, crate::policy::share::test_tenant())
+            .expect("a new set shares");
+        ws
+    }
+
+    /// Whether `ws` shares (asked, and its scope still stands).
+    pub fn shares(&self, ws: WorkingSetId) -> bool {
+        self.scopes.get(&ws).is_some_and(|scope| scope.share.is_some())
+    }
+
+    /// The domain a keyed pass on `ws` hashes its rows under, and whether
+    /// it shares: its scope resolved again (a group's grant may have been
+    /// revoked or reissued). A set that keyed nothing yet takes the scope's
+    /// domain now; one whose rows chain from a domain its scope no longer
+    /// resolves to shares nothing from here on, its rows still keyed where
+    /// they began.
+    pub fn pass_domain(&mut self, ws: WorkingSetId) -> Result<(Hash256, bool), KvStoreError> {
+        let Some(entry) = self.scopes.get(&ws) else {
+            return Err(page_table::KvTableError::UnknownWorkingSet.into());
+        };
+        let Some(ask) = &entry.share else {
+            return Ok((entry.domain, false));
+        };
+        let now = crate::policy::share::domain_now(&self.domain, ask);
+        if now == entry.domain {
+            return Ok((now, true));
+        }
+        let unkeyed = self.unkeyed(ws)?;
+        let entry = self.scopes.get_mut(&ws).expect("looked up above");
+        if unkeyed {
+            entry.domain = now;
+            Ok((now, true))
+        } else {
+            tracing::debug!(target: "pie::kv", "a set's share scope moved past its rows; it shares no more");
+            entry.share = None;
+            Ok((entry.domain, false))
+        }
+    }
+
+    /// `ws` asked nothing: a domain of its own, which no other set keys under.
+    fn private_scope(&mut self, ws: WorkingSetId) {
+        self.private_nonce += 1;
+        let domain = crate::policy::share::private_domain(
+            &self.domain,
+            &self.private_seed,
+            self.private_nonce,
+        );
+        self.scopes.insert(ws, SetScope { domain, share: None });
+    }
+
+    /// Where `ws`'s keys chain from at row 0.
+    /// Every set the store makes has one ([`Self::private_scope`]); a set
+    /// it does not know keys under no scope's domain either.
+    fn domain_of(&self, ws: WorkingSetId) -> Hash256 {
+        self.scopes.get(&ws).map_or_else(
+            || crate::policy::share::private_domain(&self.domain, &self.private_seed, 0),
+            |scope| scope.domain,
+        )
+    }
+
     /// `Some(None)` at slot 0; `None` when that slot is opaque and no hash
     /// names what follows.
     pub fn chain_root(
@@ -595,7 +714,7 @@ impl KvStore {
     ) -> Result<Option<Vec<Hash256>>, KvStoreError> {
         Ok(self
             .chain_root(ws, start, page_size)?
-            .map(|prev| hash::chain_slots(&self.domain, prev, start, tokens)))
+            .map(|prev| hash::chain_slots(&self.domain_of(ws), prev, start, tokens)))
     }
 
     /// A page whose every slot is hashed seals, its hash naming it and all its
@@ -735,6 +854,7 @@ impl KvStore {
         Ok(sealed)
     }
 
+    /// The model's domain, not any set's: see [`Self::pass_domain`].
     pub fn domain(&self) -> Hash256 {
         self.domain
     }
@@ -770,6 +890,7 @@ impl KvStore {
     pub fn create_working_set(&mut self) -> WorkingSetId {
         let ws = self.table.create_working_set();
         self.flat.insert(ws, Some(Vec::new()));
+        self.private_scope(ws);
         ws
     }
 
@@ -2081,6 +2202,8 @@ impl KvStore {
         let backings = slots.into_iter().map(KvPageBacking::Swapped).collect();
         let ws = self.table.imported(set, backings)?;
         self.refresh_flat(ws);
+        // Its rows came keyed: it shares nothing until a scope it asks.
+        self.private_scope(ws);
         Ok(ws)
     }
 
@@ -2157,6 +2280,10 @@ impl KvStore {
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvStoreError> {
         let child = self.table.fork(ws)?;
         self.refresh_flat(child);
+        // The child's rows chain from its parent's, and share as they do.
+        if let Some(scope) = self.scopes.get(&ws).cloned() {
+            self.scopes.insert(child, scope);
+        }
         Ok(child)
     }
 
@@ -2222,7 +2349,8 @@ impl KvStore {
         if let Ok(Some(terminal)) = self.table.terminal(ws) {
             self.stamp_path(terminal, epoch);
         }
-        if self.keeps {
+        // Only a set that shares leaves its prefix for others to find.
+        if self.keeps && self.shares(ws) {
             self.keep_sealed_prefix(ws);
         }
         // A hint is for what its owner leaves in the cache: one that left
@@ -2237,6 +2365,7 @@ impl KvStore {
         // What no fire in flight reads is free now, not at a next fire.
         self.retire_idle();
         self.flat.remove(&ws);
+        self.scopes.remove(&ws);
         self.note_cached();
     }
 
@@ -2394,7 +2523,7 @@ impl KvStore {
             return Ok(0);
         };
         let tokens = logged[start as usize..(full * page) as usize].to_vec();
-        let slots = hash::chain_slots(&self.domain, prev, start, &tokens);
+        let slots = hash::chain_slots(&self.domain_of(ws), prev, start, &tokens);
         self.seal_rows(ws, start, &slots, self.page_size)?;
         if !decoded {
             self.table.reach_prompt(ws, full)?;

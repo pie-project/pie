@@ -464,7 +464,9 @@ pub async fn generate(
     let vocab = model::output_vocab_size();
     let n = prompt.len() as u32;
 
-    let ws = WorkingSet::new();
+    // Each request is a process of its own: a system prompt is reused
+    // across requests only within the tenant.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
 
     let penalized = sampling.penalized();
     let present: Vec<f32> = if penalized {

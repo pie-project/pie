@@ -1674,7 +1674,11 @@ fn supply(
                 keys
             }
         };
-        let run = kv.cached_run(&keys);
+        // A pass that may map nothing in looks nothing up.
+        let run = match attach {
+            Attach::No => Vec::new(),
+            _ => kv.cached_run(&keys),
+        };
         let clean = held.is_multiple_of(page) && kv.mapped_len(ws)? == held / page;
         let mapped = match attach {
             Attach::Kv if clean && kv.keeps() => {
@@ -3976,15 +3980,22 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && folds_all;
         let mut full = req;
         let keyed = if keyable { keyed_rows(&full) } else { 0 };
+        // Keyed under the set's domain: its scope's, resolved again now,
+        // where it asked to share (`working-set.share`); else its own.
+        let mut shares = false;
+        let mut key_domain = None;
         let mut pass_slots = (keyed > 0)
             .then(|| {
                 let lane = &full.lanes[0];
                 let start = u64::from(lane.kv.held);
                 let root = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                    let (domain, shared) = kv.pass_domain(ws.id)?;
                     kv.chain_root(ws.id, start, page_size)
-                        .map(|root| root.map(|prev| (kv.domain(), prev)))
+                        .map(|root| root.map(|prev| (domain, shared, prev)))
                 });
-                let (domain, prev) = root.ok().flatten()?;
+                let (domain, shared, prev) = root.ok().flatten()?;
+                shares = shared;
+                key_domain = Some(domain);
                 Some(crate::store::kv::hash::chain_slots(
                     &domain,
                     prev,
@@ -3999,7 +4010,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             [rs] => Some(*rs),
             _ => None,
         };
-        let attach = if !cuttable || !keyable || !plain_rows(&full) {
+        // Only a set that shares maps, waits on, fetches or resumes from
+        // what others computed.
+        let attach = if !shares || !cuttable || !keyable || !plain_rows(&full) {
             Attach::No
         } else if rs_ws_ids.is_empty() {
             Attach::Kv
@@ -4017,6 +4030,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if matches!(attach, Attach::Kv)
             && !carries_media
             && let Some(slots) = &pass_slots
+            && let Some(domain) = key_domain
         {
             let lane = &full.lanes[0];
             // Pages another pass is computing now are waited for, not
@@ -4040,6 +4054,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 pid,
                 &stores,
                 engine,
+                domain,
                 ws.id,
                 u64::from(lane.kv.held),
                 &lane.tokens,
@@ -4088,7 +4103,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             cursor.reserved = cursor.reserved.max(end);
         }
         drop(promoted);
-        if pass_slots.is_some() {
+        if pass_slots.is_some() && shares {
             // It looked, so what it found is measured, nothing included.
             ctx.note_cached(u64::from(supplied));
             crate::policy::report(crate::policy::Event::Cached(pid, u64::from(supplied)));
@@ -4121,14 +4136,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
             failure: pipeline_failure.clone(),
         });
         let reach = held + full.lanes[0].tokens.len() as u64;
+        // Only on a set that shares: a later pass resumes from one only
+        // through its scope.
         let checkpoints: Vec<u64> = match state {
-            Some(_) => checkpoint_rows(
+            Some(_) if shares => checkpoint_rows(
                 &ctx.resources().get(&fwd)?.bindings.checkpoints,
                 held..reach,
                 page_size,
                 keys.len(),
             ),
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         // An engine that lands a lane's state at rows inside a fire is cut only
         // past as many as it lands at once. A window's piece keeps the
@@ -8323,7 +8340,7 @@ pub(crate) mod fold_tests {
         Vec<crate::store::kv::hash::Hash256>,
         Vec<crate::store::kv::hash::Hash256>,
     ) {
-        let ws = stores.kv.lock().create_working_set();
+        let ws = stores.kv.lock().create_shared_working_set();
         let slots = written(stores, ws, tokens);
         let mut kv = stores.kv.lock();
         kv.seal_rows(ws, 0, &slots, 16).unwrap();
@@ -8362,16 +8379,130 @@ pub(crate) mod fold_tests {
         kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap()
     }
 
-    /// A keyed pass over `tokens` on a fresh set of `stores`: the set, and
-    /// its rows' hashes.
+    /// A keyed pass over `tokens` on a fresh set of `stores`, shared within
+    /// the test tenant: the set, and its rows' hashes.
     fn keyed_pass(
         stores: &Stores,
         tokens: &[u32],
     ) -> (WorkingSetId, Vec<crate::store::kv::hash::Hash256>) {
+        keyed_pass_as(stores, tokens, Some(crate::policy::share::test_tenant()))
+    }
+
+    /// [`keyed_pass`] on a set that shares as `ask` says (`None`: private).
+    fn keyed_pass_as(
+        stores: &Stores,
+        tokens: &[u32],
+        ask: Option<crate::policy::share::ShareAs>,
+    ) -> (WorkingSetId, Vec<crate::store::kv::hash::Hash256>) {
         let mut kv = stores.kv.lock();
         let ws = kv.create_working_set();
+        if let Some(ask) = ask {
+            kv.share(ws, ask).unwrap();
+        }
         let slots = kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap();
         (ws, slots)
+    }
+
+    /// Two tenants' identical prompts never share a page: not by a lookup,
+    /// not by a coalesced claim, not by what a released set leaves kept.
+    /// One tenant's tenant-scoped sets share all three ways, and a private
+    /// set with the same prompt shares with no one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenants_never_share_pages_and_one_tenants_sets_do() {
+        use crate::policy::share::tenant_of;
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        let tokens: Vec<u32> = (0..65).map(|t| 2700 + t).collect();
+        let of = |tenant: &str| keyed_pass_as(&stores, &tokens, Some(tenant_of(tenant)));
+        let looked = |ws, slots: &[_]| {
+            supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows
+        };
+        let (a1, a1_slots) = of("a");
+        let claims = crate::pipeline::coalesce::before_pass(&stores, a1, 0, &a1_slots, || {})
+            .await
+            .expect("a's first claims what it computes");
+        // Coalesce: b's identical prompt waits on nothing of a's; a's own
+        // second waits on its first.
+        let (b1, b1_slots) = of("b");
+        assert_ne!(a1_slots, b1_slots, "another tenant keys another chain");
+        let b_claims =
+            crate::pipeline::coalesce::before_pass(&stores, b1, 0, &b1_slots, || {}).await;
+        assert!(b_claims.is_some(), "b claims its own pages");
+        let (a2, a2_slots) = of("a");
+        assert_eq!(a1_slots, a2_slots, "one tenant keys one chain");
+        let a_waits = {
+            let (stores, slots) = (stores.clone(), a2_slots.clone());
+            tokio::spawn(async move {
+                crate::pipeline::coalesce::before_pass(&stores, a2, 0, &slots, || {}).await
+            })
+        };
+        settle_tasks().await;
+        assert!(!a_waits.is_finished(), "a's second waits on a's first");
+        written(&stores, a1, &tokens);
+        stores.kv.lock().freeze(a1, 65).unwrap();
+        SealOnLanding {
+            claims,
+            stores: stores.clone(),
+            ws: a1,
+            start: 0,
+            slots: a1_slots,
+            page_size: 16,
+            failure: PipelineFailure::default(),
+        }
+        .landed(true);
+        assert!(a_waits.await.unwrap().is_none(), "sealed: nothing left to claim");
+        // Lookup, while a's first is live: a's second maps it in, b nothing.
+        assert_eq!(looked(a2, &a2_slots), 64, "a maps a's four sealed pages");
+        let (b2, b2_slots) = of("b");
+        assert_eq!(looked(b2, &b2_slots), 0, "b finds none of a's");
+        // Keep: a's sets gone, their prefix kept for a alone.
+        drop(b_claims);
+        {
+            let mut kv = stores.kv.lock();
+            let epoch = kv.current_epoch();
+            for ws in [a1, a2, b1, b2] {
+                kv.release_working_set(ws, epoch);
+            }
+            kv.retire_idle();
+            assert!(!kv.cached_runs().is_empty(), "a's prefix is kept");
+        }
+        let (b3, b3_slots) = of("b");
+        assert_eq!(looked(b3, &b3_slots), 0, "b finds nothing a kept");
+        let (a3, a3_slots) = of("a");
+        assert_eq!(looked(a3, &a3_slots), 64, "a finds what a kept");
+        // A private set with a prompt of its own: no one maps it while it
+        // lives, it looks nothing up, and it leaves nothing kept.
+        let mine: Vec<u32> = (0..65).map(|t| 2900 + t).collect();
+        let (p1, p1_slots) = keyed_pass_as(&stores, &mine, None);
+        assert_eq!(
+            supply(&stores, p1, &rows(0, &mine), &p1_slots, Attach::No, 65, 16).rows,
+            0,
+            "a private set looks nothing up"
+        );
+        written(&stores, p1, &mine);
+        {
+            let mut kv = stores.kv.lock();
+            kv.freeze(p1, 65).unwrap();
+            kv.seal_rows(p1, 0, &p1_slots, 16).unwrap();
+            assert!(kv.share(p1, tenant_of("a")).is_err(), "too late to ask");
+        }
+        let (a4, a4_slots) = keyed_pass_as(&stores, &mine, Some(tenant_of("a")));
+        assert_ne!(a4_slots, p1_slots);
+        assert_eq!(
+            supply(&stores, a4, &rows(0, &mine), &a4_slots, Attach::Kv, 65, 16).rows,
+            0,
+            "a live private set is no one's to map"
+        );
+        let kept = {
+            let mut kv = stores.kv.lock();
+            let before = kv.cached_runs().len();
+            let epoch = kv.current_epoch();
+            kv.release_working_set(p1, epoch);
+            kv.retire_idle();
+            kv.cached_runs().len() - before
+        };
+        assert_eq!(kept, 0, "a private set keeps nothing at release");
     }
 
     /// Passes over `prompt(2..5)` that arrive while a first pass over
