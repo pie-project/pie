@@ -2043,14 +2043,36 @@ pub fn near(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
 /// One seat-addressed lane prefilling `prompt` rows in fires of 256 (past
 /// the model's window) and decoding `steps` on: every logit row.
 fn windowed_rows(fixture: &Fixture, page: u32, context: u32, prompt: u32, steps: usize) -> Option<Vec<Vec<f32>>> {
-    let mut shell = load_paged(fixture, page, context, None)?;
+    windowed_rows_in(fixture, page, context, prompt, steps, 256, None)
+}
+
+/// [`windowed_rows`], the prompt in fires of `piece` rows.
+fn windowed_rows_in(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    prompt: u32,
+    steps: usize,
+    piece: usize,
+    budget: Option<u64>,
+) -> Option<Vec<Vec<f32>>> {
+    let mut shell = load_with(
+        fixture,
+        page,
+        context,
+        None,
+        engine::load::Residency {
+            device: engine::Allowance { budget },
+            ..engine::load::Residency::default()
+        },
+    )?;
     let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
     let mut have = 0u32;
     let mut out = Vec::new();
     let mut fed = prompt;
     for _ in 0..=steps {
         let mut last = Vec::new();
-        for piece in fed.chunks(256) {
+        for piece in fed.chunks(piece) {
             let seated = Seated {
                 held: Some(have),
                 ..Seated::of(Lane {
@@ -3227,4 +3249,18 @@ fn a_device_counted_fold_folds_what_its_count_says() {
         &rows,
         &want[want.len() - rows.len()..],
     );
+}
+
+
+
+/// Gemma's shared tail: its layers write no kv and read their owner
+/// layers' rings (a 26-layer cut of the 30-layer miniature: two tail
+/// layers over the trunk's), held to the window-list build's fixture.
+#[test]
+fn a_shared_tail_answers_what_its_window_lists_did() {
+    let fixture = fixture("gemma4-e4b-mini-l30", Some(26));
+    let Some(rows) = windowed_rows_in(&fixture, PAGE, 1024, 700, 8, 256, Some(20 << 30)) else {
+        return;
+    };
+    fixture_check("gemma4-e4b-mini-l30-26", &rows);
 }

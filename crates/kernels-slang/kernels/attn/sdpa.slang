@@ -271,7 +271,7 @@ uint page_row(int req, int kp) {
 }
 
 // Where a row's keys lie: its lane's buffer base and first row of the
-// fire, and its ring's keys and values as bf16 elements of the pool.
+// fire, and its ring's keys and values as u32 words of the pool.
 struct Keys {
     int folded;
     int base;
@@ -296,8 +296,8 @@ Keys keys_of(int req) {
     at.run_at = ring_lanes[lane + 5u];
     uint rec_k = uint(ring_lanes[lane + 6u + params.ring_piece]) * params.slot_stride;
     uint rec_v = uint(ring_lanes[lane + 6u + params.ring_piece_v]) * params.slot_stride;
-    at.ring_k = 2u * (rec_k + params.ring_k);
-    at.ring_v = 2u * (rec_v + params.ring_v);
+    at.ring_k = rec_k + params.ring_k;
+    at.ring_v = rec_v + params.ring_v;
 #else
     at.folded = 0;
     at.base = 0;
@@ -331,21 +331,43 @@ int key_page(Keys at, int kp, out uint row) {
 #endif
 }
 
-// The bf16 elements of the pool key `kp` of request `req` starts at, its
-// key then its value (the head's offset not added).
-void key_at(int req, Keys at, int kp, out uint k_el, out uint v_el) {
+// The u32 word of the pool key `kp` of request `req` starts at, its key
+// then its value (the head's offset not added). Words, not bf16 elements:
+// a pool past 8 GiB (the fire's own slots lie at its top) passes a u32 of
+// elements.
+void key_at(int req, Keys at, int kp, out uint k_w, out uint v_w) {
     uint row;
     int page = key_page(at, kp, row);
-    uint cell = row * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM);
+    uint cell = (row * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)) >> 1;
     if (page < 0) {
-        k_el = at.ring_k + cell;
-        v_el = at.ring_v + cell;
+        k_w = at.ring_k + cell;
+        v_w = at.ring_v + cell;
         return;
     }
     uint phys = kv_page_indices[kv_page_indptr[req] + uint(page)];
-    uint el = phys * (2u * params.page_stride) + cell;
-    k_el = 2u * params.k_origin + el;
-    v_el = 2u * params.v_origin + el;
+    uint w = phys * params.page_stride + cell;
+    k_w = params.k_origin + w;
+    v_w = params.v_origin + w;
+}
+
+// The segment pool word `w` lies in and its index there as the kernel's
+// storage counts it (`SDPA_KV_SCALE` a word): `pie_pool_find` over words.
+void ring_find(uint w, out uint seg, out uint local) {
+    uint s = params.seg_words;
+    seg = 0u;
+    if (w >= s) {
+        w -= s;
+        seg = 1u;
+        if (w >= s) {
+            w -= s;
+            seg = 2u;
+            if (w >= s) {
+                w -= s;
+                seg = 3u;
+            }
+        }
+    }
+    local = SDPA_KV_SCALE * w;
 }
 
 // Row `row`'s boundary, read once a row: `MASK_NONE` where it states no mask.
@@ -485,11 +507,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 // next table entry.
                 uint cell_words = (in_page * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)) >> 1;
 #if defined(PIE_ONE_SEGMENT)
-                k_page = SDPA_KV_SCALE * ((ring.ring_k >> 1) + cell_words);
-                v_page = SDPA_KV_SCALE * ((ring.ring_v >> 1) + cell_words);
+                k_page = SDPA_KV_SCALE * (ring.ring_k + cell_words);
+                v_page = SDPA_KV_SCALE * (ring.ring_v + cell_words);
 #else
-                pie_pool_at(SDPA_KV_SCALE * ((ring.ring_k >> 1) + cell_words), k_seg, k_page);
-                pie_pool_at(SDPA_KV_SCALE * ((ring.ring_v >> 1) + cell_words), v_seg, v_page);
+                pie_pool_at(SDPA_KV_SCALE * (ring.ring_k + cell_words), k_seg, k_page);
+                pie_pool_at(SDPA_KV_SCALE * (ring.ring_v + cell_words), v_seg, v_page);
 #endif
                 page_at = -1;
                 in_page = 0u;
@@ -686,10 +708,10 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
             }
             uint k_seg, k_at, v_seg, v_at;
 #if defined(PIE_RING)
-            uint k_el, v_el;
-            key_at(req, ring, kp, k_el, v_el);
-            pie_pool_find(k_el + uint(kv_head) * uint(PIE_HEAD_DIM), k_seg, k_at);
-            pie_pool_find(v_el + uint(kv_head) * uint(PIE_HEAD_DIM), v_seg, v_at);
+            uint k_w, v_w;
+            key_at(req, ring, kp, k_w, v_w);
+            ring_find(k_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), k_seg, k_at);
+            ring_find(v_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), v_seg, v_at);
 #else
             uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             pie_pool_find(SDPA_KV_SCALE * params.k_origin + base, k_seg, k_at);
@@ -908,10 +930,10 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         uint k_seg = 0u, k_at = 0u, v_seg = 0u, v_at = 0u;
         if (take) {
 #if defined(PIE_RING)
-            uint k_el, v_el;
-            key_at(req, ring, kp, k_el, v_el);
-            pie_pool_find((k_el + uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1, k_seg, k_at);
-            pie_pool_find((v_el + uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1, v_seg, v_at);
+            uint k_w, v_w;
+            key_at(req, ring, kp, k_w, v_w);
+            ring_find(k_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), k_seg, k_at);
+            ring_find(v_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), v_seg, v_at);
 #else
             base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             pie_pool_find(SDPA_KV_SCALE * params.k_origin + (base >> 1), k_seg, k_at);

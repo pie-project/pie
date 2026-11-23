@@ -353,6 +353,24 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize])
     }
 }
 
+/// `pool` moved past 8 GiB of the pool's words: its one buffer the fourth
+/// segment of segments of 4 GiB, every place it names (pages' origins, the
+/// rings') three segments up. A bf16 element index there passes a u32.
+fn high(pool: &KvPool) -> KvPool {
+    const SEG: u32 = 1 << 30;
+    let mut moved = *pool;
+    moved.pool = Segments {
+        bufs: [kernels_slang::ABSENT, kernels_slang::ABSENT, kernels_slang::ABSENT, pool.pool.bufs[0]],
+        words: SEG,
+    };
+    moved.origin = [pool.origin[0] + 3 * SEG, pool.origin[1] + 3 * SEG];
+    if let Some(ring) = &mut moved.ring {
+        ring.keys += 3 * SEG;
+        ring.values += 3 * SEG;
+    }
+    moved
+}
+
 /// Decode lanes: the ring and a buffer page straddling folded, a lane whose
 /// buffer holds only folded rows of a page, a lane with no ring yet, a
 /// masked one; prefill lanes: rows past the window from the fire's own,
@@ -452,7 +470,8 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                 };
                 let splits: &[bool] = if prefilling { &[false] } else { &[false, true] };
                 for &splitting in splits {
-                    for with_lse in [false, true] {
+                    for (with_lse, past) in [(false, false), (true, false), (false, true)] {
+                        let kv = if past { high(&staged.pool) } else { staged.pool };
                         let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
                         let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
                         let ot = t(o, rows, QH * hd, Dtype::Bf16);
@@ -463,7 +482,7 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                                     tactic,
                                     qt,
                                     &staged.tables,
-                                    &staged.pool,
+                                    &kv,
                                     Some(g.w as u32),
                                     hd as u32,
                                     (1.0 / (hd as f64).sqrt()) as f32,
@@ -476,7 +495,7 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                                     tactic,
                                     qt,
                                     &staged.tables,
-                                    &staged.pool,
+                                    &kv,
                                     Some(g.w as u32),
                                     hd as u32,
                                     (1.0 / (hd as f64).sqrt()) as f32,
@@ -487,7 +506,7 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                             }
                         });
                         let label = format!(
-                            "ring {what} d {hd} subgroup {subgroup} threads {threads} tile {tile}x{lanes_a_row} tiled {tiled} split {splitting} lse {with_lse}"
+                            "ring {what} d {hd} subgroup {subgroup} threads {threads} tile {tile}x{lanes_a_row} tiled {tiled} split {splitting} lse {with_lse} past 8 GiB {past}"
                         );
                         close(&gpu.down(o, n), &want_o, &label);
                         if with_lse {
@@ -571,7 +590,9 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
     padded.resize(1 + most as usize * 4, 0);
     let jt = gpu.up_i32(&padded);
     let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
-    gpu.run(|c| ring::fold(c, &staged.pool, job_table, most));
+    // Past 8 GiB of the pool's words, as the fire's own slots lie at a big
+    // pool's top.
+    gpu.run(|c| ring::fold(c, &high(&staged.pool), job_table, most));
     let after = gpu.down(staged.pool_buf, g.elems);
     let mut want: Vec<f64> = laid.pool.iter().map(|x| f64::from(*x)).collect();
     for (l, lane) in lanes.iter().enumerate() {
