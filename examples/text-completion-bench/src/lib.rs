@@ -71,6 +71,10 @@ struct Input {
     /// For a plane whose channel rings belong to the pass instance, not the channel.
     #[serde(default)]
     host_first_token: bool,
+    /// Ask the runtime to keep the prompt's state at its end (`checkpoints`),
+    /// so a later pass sharing the prompt resumes there.
+    #[serde(default)]
+    checkpoint_prompt_end: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -378,6 +382,10 @@ async fn run_one(
     fwd_p
         .state(&[&ws], StateGeometry::folding())
         .context("bind prefill state")?;
+    if input.checkpoint_prompt_end {
+        let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
+        fwd_p.checkpoints(&[end]).context("ask the prompt end's checkpoint")?;
+    }
     let prefill_knobs = SampleKnobs::new(temperature, top_p, top_k);
     fwd_p.epilogue(move || {
         let carried_on = tok_in.map(|tok_in| (tok_in.traced(), None));
