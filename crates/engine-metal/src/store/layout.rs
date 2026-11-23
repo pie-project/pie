@@ -568,6 +568,9 @@ impl Layout {
                     total_max: Some(tokens.saturating_mul(2)),
                 })
                 .collect(),
+            // The load's rs layout's compactness is `rs::compact(trace)`
+            // with its rs page table staged (Mac's branch states it); a
+            // fire's own is decided only by `engine::fire::scratch_compact`.
             rs_compact: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,

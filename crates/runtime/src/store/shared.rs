@@ -2259,11 +2259,13 @@ impl SharedPool {
             .collect()
     }
 
-    /// The load's rs scratch lays only the carried rows a rung counts.
+    /// The load's rs scratch layout is compact
+    /// (`::engine::fire::scratch_compact` decides each fire's).
     #[must_use]
     pub fn rs_compact(&self) -> bool {
         self.rs_compact
     }
+
 
     /// Every activation rung's tokens, ascending.
     #[must_use]
