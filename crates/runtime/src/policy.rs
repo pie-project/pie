@@ -9,6 +9,7 @@
 pub mod pressure;
 pub mod retention;
 pub mod schedule;
+pub mod share;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod port;

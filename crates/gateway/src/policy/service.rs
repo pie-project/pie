@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use client_api::{ClientMessage, Props};
-use controller_api::{GatewayDecisions, Outcome, PlacementView, ProcessEvent, ReplicateOrder};
+use controller_api::{
+    GatewayDecisions, Outcome, PlacementView, ProcessEvent, ReplicateOrder, ShareGrants,
+};
 use ids::{GatewayId, ReqId, WorkerId};
 use tokio::sync::{Notify, mpsc, watch};
 use worker_api::Request;
@@ -68,6 +70,9 @@ struct Shared {
     /// What a controller new to this gateway is told first: each live
     /// process's arrival, and each session's props.
     told: Mutex<Told>,
+    /// The cluster's share grants as last decided, and the version each
+    /// linked worker was last sent.
+    grants: Mutex<(ShareGrants, HashMap<WorkerId, u64>)>,
 }
 
 #[derive(Default)]
@@ -150,6 +155,7 @@ impl Cluster {
             acted: Mutex::default(),
             changed: Notify::new(),
             told: Mutex::default(),
+            grants: Mutex::default(),
         });
         let (events, mut rx) = mpsc::unbounded_channel::<ProcessEvent>();
         let workers = events.clone();
@@ -167,6 +173,7 @@ impl Cluster {
             // The decisions.
             let mut decisions = control.decisions_watch(gateway);
             let shared = decisions_shared;
+            let linked_fleet = fleet.clone();
             tokio::spawn(async move {
                 loop {
                     let view = decisions.borrow_and_update().clone();
@@ -183,6 +190,7 @@ impl Cluster {
                     let now: Vec<WorkerId> =
                         connected.borrow_and_update().iter().copied().collect();
                     told.told.lock().unwrap().workers = now.clone();
+                    push_grants(&told, &linked_fleet);
                     if workers.send(ProcessEvent::Workers(now)).is_err()
                         || connected.changed().await.is_err()
                     {
@@ -485,9 +493,41 @@ fn apply(shared: &Shared, view: GatewayDecisions, fleet: &crate::worker::WorkerR
     carry(&mut acted.asked, view.replicate, fleet);
     retell_helpers(shared, &mut acted, fleet);
     drop(acted);
+    shared.grants.lock().unwrap().0 = view.share;
+    push_grants(shared, fleet);
     move_misplaced(shared);
     shared.heard.send_replace(view.heard);
     shared.changed.notify_waiters();
+}
+
+/// Sends the cluster's share grants to each worker linked here that was not
+/// sent this version: on a change, and to a worker as it links. A worker
+/// whose send failed holds no grant (it fails closed) until the next version
+/// or its next link.
+fn push_grants(shared: &Shared, fleet: &crate::worker::WorkerRegistry) {
+    let linked = shared.told.lock().unwrap().workers.clone();
+    let mut grants = shared.grants.lock().unwrap();
+    let (table, sent) = &mut *grants;
+    sent.retain(|worker, _| linked.contains(worker));
+    if table.version == 0 {
+        return;
+    }
+    for worker in linked {
+        if sent.get(&worker) == Some(&table.version) {
+            continue;
+        }
+        let Some(client) = fleet.client(worker) else {
+            continue;
+        };
+        sent.insert(worker, table.version);
+        let table = table.clone();
+        tokio::spawn(async move {
+            let version = table.version;
+            if let Err(error) = client.share_groups(tarpc::context::current(), table).await {
+                tracing::warn!(%worker, version, %error, "share grants not delivered");
+            }
+        });
+    }
 }
 
 /// Moves each running process whose placement leaves out the worker it runs
@@ -865,6 +905,42 @@ mod tests {
             .unwrap()
             .unwrap();
         until_placed(&rig, &placed, None).await;
+    }
+
+    /// The share grants a cluster policy writes (`pie:plex-ext/share-groups`)
+    /// reach the gateway whole, each grant with its id; unloaded, the policy's
+    /// rows are withdrawn under a newer version, so every worker holds none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn share_grants_reach_the_gateway_and_go_with_their_policy() {
+        let rig = rig_of(0, &["test-share"]).await;
+        let decisions = rig.host.decisions(GatewayId(0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let granted = loop {
+            let share = decisions.borrow().share.clone();
+            if !share.groups.is_empty() && share.default.is_some() {
+                break share;
+            }
+            assert!(Instant::now() < deadline, "no grants: {share:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let (group, tenants, id) = &granted.groups[0];
+        assert_eq!((group.as_str(), tenants.clone()), ("team", vec!["acme".to_string(), "beta".to_string()]));
+        let (default, default_id) = granted.default.clone().unwrap();
+        assert_eq!(default, ["acme"]);
+        assert_ne!(*id, default_id, "each grant its own id");
+        assert!(granted.version >= (*id).max(default_id));
+
+        rig.host.reload(programs(&["noop"])).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let share = decisions.borrow().share.clone();
+            if share.groups.is_empty() && share.default.is_none() {
+                assert!(share.version > granted.version, "a newer version: workers take it");
+                break;
+            }
+            assert!(Instant::now() < deadline, "grants not withdrawn: {share:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

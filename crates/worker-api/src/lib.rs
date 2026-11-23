@@ -67,4 +67,8 @@ pub trait WorkerControl {
     /// `changes` is a JSON object whose `null`s remove names; none closes the
     /// session.
     async fn plex_session(session: String, changes: Option<String>);
+
+    /// The cluster's share grants as of `grants.version`, whole; an older
+    /// version than the worker holds is ignored.
+    async fn share_groups(grants: controller_api::ShareGrants);
 }

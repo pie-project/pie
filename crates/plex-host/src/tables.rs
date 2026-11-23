@@ -263,8 +263,10 @@ pub const PLACEMENT_WORKERS: &str = "plex:placement/workers";
 pub const PLACEMENT_HELPERS: &str = "plex:placement/helpers";
 pub const REPLICATION_WORKERS: &str = "plex:replication/workers";
 pub const TERMINATE: &str = "plex:core/terminate";
+/// pie's extension (`wit-ext/`, `EXTENSION.md`): cross-tenant share grants.
+pub const SHARE_GROUPS: &str = "pie:plex-ext/share-groups";
 
-pub const COLUMNS: [&str; 7] = [
+pub const COLUMNS: [&str; 8] = [
     SCHEDULE_PRIORITY,
     SCHEDULE_HOLD,
     RETENTION_PRIORITY,
@@ -272,6 +274,7 @@ pub const COLUMNS: [&str; 7] = [
     PLACEMENT_WORKERS,
     PLACEMENT_HELPERS,
     REPLICATION_WORKERS,
+    SHARE_GROUPS,
 ];
 
 /// Every column, and what policies have said beside them.
@@ -284,6 +287,8 @@ pub struct Tables {
     pub placement_workers: Column<String, Vec<String>>,
     pub placement_helpers: Column<String, Vec<String>>,
     pub replication_workers: Column<Prefix, Vec<String>>,
+    /// Group -> tenants, sorted (`pie:plex-ext/share-groups`).
+    pub share_groups: Column<String, Vec<String>>,
     /// Notes, by subject, then by (writer, name).
     pub notes: HashMap<Subject, HashMap<(String, String), Value>>,
     /// Processes to end, and why, until the port takes them.
@@ -303,6 +308,7 @@ pub struct Staged {
     pub placement_workers: Stage<String, Vec<String>>,
     pub placement_helpers: Stage<String, Vec<String>>,
     pub replication_workers: Stage<Prefix, Vec<String>>,
+    pub share_groups: Stage<String, Vec<String>>,
     /// A note set (some) or deleted (none), in order.
     pub notes: Vec<(Subject, String, Option<Value>)>,
     pub terminate: Vec<(String, String)>,
@@ -321,6 +327,7 @@ impl Tables {
         any |= self.placement_workers.commit(staged.placement_workers);
         any |= self.placement_helpers.commit(staged.placement_helpers);
         any |= self.replication_workers.commit(staged.replication_workers);
+        any |= self.share_groups.commit(staged.share_groups);
         for (subject, name, value) in staged.notes {
             let key = (writer.to_string(), name.clone());
             let changed = match &value {
@@ -361,6 +368,7 @@ impl Tables {
                 PLACEMENT_WORKERS => self.placement_workers.withdraw(),
                 PLACEMENT_HELPERS => self.placement_helpers.withdraw(),
                 REPLICATION_WORKERS => self.replication_workers.withdraw(),
+                SHARE_GROUPS => self.share_groups.withdraw(),
                 _ => false,
             };
         }

@@ -206,6 +206,11 @@ impl GatewayLinkManager {
                 "gateway link died; dropping it so it can be re-dialed"
             );
         }
+        if !dead.is_empty() && self.links.is_empty() {
+            // No gateway carries the cluster's grants now: what this worker
+            // holds may go stale, so it holds none until a link pushes again.
+            runtime::policy::share::withdraw();
+        }
         dead
     }
 
@@ -259,6 +264,10 @@ impl WorkerControl for WorkerControlServer {
                 Accepted::Reject
             }
         }
+    }
+
+    async fn share_groups(self, _: tarpc::context::Context, grants: controller_api::ShareGrants) {
+        runtime::policy::share::install(grants.version, grants.groups, grants.default);
     }
 
     async fn plex_session(

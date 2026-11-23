@@ -20,7 +20,7 @@ use std::time::Duration;
 use client_api::props::{PROMPT_BLOCK_BYTES, TOKENS_PER_BYTE};
 use controller_api::{
     DirectoryView, GatewayDecisions, Health, PlacementView, ProcessEvent, ReplicateOrder, Role,
-    RoutingTable,
+    RoutingTable, ShareGrants,
 };
 use ids::{GatewayId, WorkerId};
 use plex_host::host::{Config, Delta, Host as PlexHost};
@@ -34,6 +34,7 @@ const SUPPORTED: &[&str] = &[
     tables::PLACEMENT_WORKERS,
     tables::PLACEMENT_HELPERS,
     tables::REPLICATION_WORKERS,
+    tables::SHARE_GROUPS,
 ];
 
 /// How often the policies hear what the directory and the routing table
@@ -115,6 +116,13 @@ struct Tables {
     /// Notes on a process, passed on with it: the worker plane reads them
     /// as `cluster/note/<writer>/<name>`.
     notes: HashMap<String, BTreeMap<String, String>>,
+    /// `pie:plex-ext/share-groups` rows: a group's tenants and its grant's
+    /// id, and the default's.
+    share: BTreeMap<String, (Vec<String>, u64)>,
+    share_default: Option<(Vec<String>, u64)>,
+    /// Bumped by every change to the grants. A grant's id is the version
+    /// it was made at, so a revoke or a re-grant is a new id everywhere.
+    share_version: u64,
 }
 
 struct Shared {
@@ -324,6 +332,15 @@ fn decisions_of(shared: &Shared, gateway: GatewayId, courier: bool) -> GatewayDe
                 .collect();
         }
     }
+    let share = ShareGrants {
+        version: tables.share_version,
+        groups: tables
+            .share
+            .iter()
+            .map(|(group, (tenants, id))| (group.clone(), tenants.clone(), *id))
+            .collect(),
+        default: tables.share_default.clone(),
+    };
     drop(tables);
     let terminated = shared
         .terminated
@@ -351,6 +368,7 @@ fn decisions_of(shared: &Shared, gateway: GatewayId, courier: bool) -> GatewayDe
         placements: placements.into_iter().collect(),
         terminated,
         replicate: if courier { orders(shared) } else { Vec::new() },
+        share,
     }
 }
 
@@ -819,6 +837,23 @@ impl Port {
         }
         if let Some(default) = delta.replication_workers.default {
             tables.replicas_default = default.map(parse);
+        }
+        for (group, row) in delta.share_groups.rows {
+            tables.share_version += 1;
+            let id = tables.share_version;
+            match row {
+                Some(tenants) => {
+                    tables.share.insert(group, (tenants, id));
+                }
+                None => {
+                    tables.share.remove(&group);
+                }
+            }
+        }
+        if let Some(default) = delta.share_groups.default {
+            tables.share_version += 1;
+            let id = tables.share_version;
+            tables.share_default = default.map(|tenants| (tenants, id));
         }
         for (writer, subject, name, value) in delta.notes {
             tracing::debug!(%writer, subject = %format!("{}/{}", subject.kind(), subject.id()), %name, ?value, "cluster policy note");

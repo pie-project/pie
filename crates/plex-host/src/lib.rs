@@ -1,7 +1,5 @@
-//! The PLEX 1.1 host (`docs/plex-1.1.md`, `wit-1.1/`).
+//! The PLEX 1.1 host (the normative contract is `wit/`).
 pub mod host;
 pub mod runtime;
 pub mod tables;
 
-#[cfg(feature = "python")]
-mod py;

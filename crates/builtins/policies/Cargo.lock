@@ -203,6 +203,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-share"
+version = "0.1.0"
+dependencies = [
+ "plex",
+]
+
+[[package]]
 name = "test-trap"
 version = "0.1.0"
 dependencies = [

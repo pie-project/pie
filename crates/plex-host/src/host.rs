@@ -125,6 +125,8 @@ pub struct Delta {
     pub placement_workers: ColumnDelta<String, Vec<String>>,
     pub placement_helpers: ColumnDelta<String, Vec<String>>,
     pub replication_workers: ColumnDelta<Prefix, Vec<String>>,
+    /// pie's extension: group -> tenants, sorted.
+    pub share_groups: ColumnDelta<String, Vec<String>>,
     /// Processes to end, and why.
     pub terminate: Vec<(String, String)>,
     /// Notes written for the other scope: (writer, subject, name, value).
@@ -1162,6 +1164,7 @@ impl Host {
             prefix,
             |v| json!(v),
         );
+        column(&mut out, tables::SHARE_GROUPS, d.share_groups, id, |v| json!(v));
         if !d.terminate.is_empty() {
             out.insert("terminate".into(), json!(d.terminate));
         }
@@ -1207,6 +1210,7 @@ impl Host {
             placement_workers: take(&mut t.placement_workers),
             placement_helpers: take(&mut t.placement_helpers),
             replication_workers: take(&mut t.replication_workers),
+            share_groups: take(&mut t.share_groups),
             terminate: std::mem::take(&mut t.terminate),
             notes: std::mem::take(&mut t.notes_out),
         }

@@ -28,12 +28,13 @@ extern crate alloc;
 #[doc(hidden)]
 pub mod bindings {
     wit_bindgen::generate!({
-        path: "../plex-host/wit",
+        path: ["../plex-host/wit", "../plex-host/wit-ext"],
         inline: "
             package plex:sdk;
             world policy {
                 include plex:policy/worker@1.1.0;
                 include plex:policy/cluster@1.1.0;
+                include pie:plex-ext/cluster@0.1.0;
             }
         ",
         world: "plex:sdk/policy",
@@ -65,6 +66,13 @@ pub mod placement {
 }
 pub mod replication {
     pub use crate::bindings::plex::replication::workers;
+}
+
+/// pie's extension of PLEX 1.1 (`pie:plex-ext`, not part of the 1.1
+/// contract): a cluster policy's cross-tenant share grants. A policy that
+/// imports it loads only on pie.
+pub mod ext {
+    pub use crate::bindings::pie::plex_ext::share_groups;
 }
 
 /// A length of time, in nanoseconds, as marks are.

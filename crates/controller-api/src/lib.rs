@@ -304,6 +304,20 @@ pub struct ReplicateOrder {
     pub table: String,
 }
 
+/// The cluster's cross-tenant share grants (pie's PLEX extension,
+/// `pie:plex-ext/share-groups`), whole. Each grant carries its id: it changes
+/// with every change to that group's row (the default's with the default),
+/// so KV keyed under one grant never matches under the next.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareGrants {
+    /// Grows with every change; 0: no table yet.
+    pub version: u64,
+    /// (group, tenants, grant id), by group.
+    pub groups: Vec<(String, Vec<String>, u64)>,
+    /// The tenants of every group without a row, and the grant's id.
+    pub default: Option<(Vec<String>, u64)>,
+}
+
 /// The cluster policy's decisions about one gateway's processes,
 /// level-triggered, as of `epoch`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -322,6 +336,8 @@ pub struct GatewayDecisions {
     pub terminated: Vec<(u64, String)>,
     /// For the gateway that carries worker calls: the copies to ask for.
     pub replicate: Vec<ReplicateOrder>,
+    /// The share grants, for every worker the gateway links.
+    pub share: ShareGrants,
 }
 
 #[tarpc::service]

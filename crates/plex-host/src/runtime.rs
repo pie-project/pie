@@ -11,12 +11,13 @@ use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use crate::tables::{self, MAX_ROWS, Prefix, Refusal, Staged, Subject, Tables, TierSet};
 
 wasmtime::component::bindgen!({
-    path: "wit",
+    path: ["wit", "wit-ext"],
     inline: "
         package plex:host;
         world policy-host {
             include plex:policy/worker@1.1.0;
             include plex:policy/cluster@1.1.0;
+            include pie:plex-ext/cluster@0.1.0;
         }
     ",
     world: "plex:host/policy-host",
@@ -418,6 +419,69 @@ column!(plex::replication::workers::Host, replication_workers,
     valid: |s, v| known_workers(s, v));
 
 impl plex::core::types::Host for Ctx {}
+
+/// A share grant as the column keeps it: its tenants sorted, once each.
+/// `None` where a name is empty (`invalid-argument`).
+fn grant(group: &str, tenants: Vec<String>) -> Option<Vec<String>> {
+    if group.is_empty() || tenants.iter().any(String::is_empty) {
+        return None;
+    }
+    let mut tenants = tenants;
+    tenants.sort_unstable();
+    tenants.dedup();
+    Some(tenants)
+}
+
+/// pie's extension column. Written out rather than by `column!`: a group
+/// has no lifetime (a row is never stale), and an empty name is refused at
+/// the write rather than passed over.
+impl pie::plex_ext::share_groups::Host for Ctx {
+    fn get(&mut self, group: String) -> Option<Vec<String>> {
+        let call = self.call();
+        let tables = call.tables.lock().unwrap();
+        call.staged.share_groups.get(&tables.share_groups, &group)
+    }
+
+    fn set(&mut self, group: String, value: Vec<String>) -> Result<(), wit::ErrorCode> {
+        self.set_list(vec![(group, value)])
+    }
+
+    fn set_list(&mut self, entries: Vec<(String, Vec<String>)>) -> Result<(), wit::ErrorCode> {
+        let call = self.call();
+        let rows: Vec<(String, Vec<String>)> = entries
+            .into_iter()
+            .map(|(group, tenants)| Some((group.clone(), grant(&group, tenants)?)))
+            .collect::<Option<_>>()
+            .ok_or(wit::ErrorCode::InvalidArgument)?;
+        let committed = call.tables.lock().unwrap();
+        if call.staged.share_groups.len(&committed.share_groups) + rows.len() > MAX_ROWS {
+            return Err(wit::ErrorCode::LimitExceeded);
+        }
+        drop(committed);
+        for (group, tenants) in rows {
+            call.staged.share_groups.set(group, tenants);
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, group: String) {
+        self.call().staged.share_groups.delete(group);
+    }
+
+    fn set_default(&mut self, value: Vec<String>) -> Result<(), wit::ErrorCode> {
+        let tenants = grant("default", value).ok_or(wit::ErrorCode::InvalidArgument)?;
+        self.call().staged.share_groups.set_default(tenants);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.call().staged.share_groups.clear();
+    }
+
+    fn get_refused(&mut self) -> Vec<(String, wit::ErrorCode)> {
+        Vec::new()
+    }
+}
 impl plex::schedule::types::Host for Ctx {}
 impl plex::retention::types::Host for Ctx {}
 
@@ -567,7 +631,7 @@ impl Program {
         let mut imports = Vec::new();
         for (import, _) in component.component_type().imports(engine) {
             let bare = import.split('@').next().unwrap_or(import).to_string();
-            if !bare.starts_with("plex:") {
+            if !bare.starts_with("plex:") && !bare.starts_with("pie:plex-ext/") {
                 return Err(format!(
                     "imports {import}: a policy imports only plex interfaces"
                 ));

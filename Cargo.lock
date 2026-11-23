@@ -4455,7 +4455,6 @@ name = "plex-host"
 version = "1.1.0"
 dependencies = [
  "imbl",
- "pyo3",
  "serde",
  "serde_json",
  "wasmtime",
