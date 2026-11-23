@@ -909,6 +909,9 @@ pub struct Shell<B: Serve> {
     /// the user's stored one's key does not match and its own does
     /// (`profile::fire::Tuned::committed_settle`).
     committed_settle: Vec<profile::fire::DenseSettled>,
+    /// The key the settle looked its stored entries up by, once it ran:
+    /// `(of, code)` ([`Shell::settle_key`]).
+    settle_keyed: Option<(u32, u32)>,
     /// Whether the load times what no stored or committed profile states
     /// (`[engine] measure`): skipped, the settle fires nothing.
     measuring: engine::rates::Measuring,
@@ -2698,6 +2701,7 @@ impl<B: Serve> Shell<B> {
             dense_planes: dense_planes.clone(),
             dense_rates: device_profile.rates(),
             committed_settle: device_profile.tuned().committed_settle.clone(),
+            settle_keyed: None,
             measuring: B::measuring(boot.device),
             settled: Vec::new(),
             to_store: None,
@@ -2819,6 +2823,7 @@ impl<B: Serve> Shell<B> {
         // the device is the user's file's, `crate::stored`) are taken again
         // without firing; the rest are settled (again) this load.
         let (of, code) = self.settle_key(lanes)?;
+        self.settle_keyed = Some((of, code));
         // The user's stored settle first, then a committed profile's: the
         // first whose key matches is taken, each other said and why.
         let why_not = |stored: &profile::fire::DenseSettled| {
@@ -3222,9 +3227,15 @@ impl<B: Serve> Shell<B> {
         );
         let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
             self.asks.kernels.iter().copied().collect();
-        let code = crate::dense::settle_code(
-            crate::stored::code_of_all(B::TARGET, &kernels)?,
-            &self.dense,
+        let all = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        let code = crate::dense::settle_code(all, &self.dense);
+        tracing::debug!(
+            of = format_args!("{of:#010x}"),
+            code = format_args!("{code:#010x}"),
+            kernels_code = format_args!("{all:#010x}"),
+            kernels = ?kernels.iter().map(|k| k.key).collect::<Vec<_>>(),
+            picks = %self.dense.canonical(),
+            "dense settle: what its key reads"
         );
         Ok((of, code))
     }
@@ -3308,6 +3319,23 @@ impl<B: Serve> Shell<B> {
                     })
             })
             .collect()
+    }
+
+    /// The key the dense settle looked its stored entries up by, `(of,
+    /// code)`, once it ran.
+    #[must_use]
+    pub fn settle_keyed(&self) -> Option<(u32, u32)> {
+        self.settle_keyed
+    }
+
+    /// Every kernel a fire of this load can ask for, by key, sorted: what
+    /// the settle's code is keyed by.
+    #[must_use]
+    pub fn asked_kernels(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self.asks.kernels.iter().map(|k| k.key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 
     /// Every kernel whose pipeline is built, in the order built.

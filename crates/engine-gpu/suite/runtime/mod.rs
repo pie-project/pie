@@ -19,6 +19,7 @@ mod scores;
 mod shared;
 mod slots;
 mod settle_bound;
+mod settle_key;
 mod submit_bound;
 mod swapped_pick;
 mod unplaced;

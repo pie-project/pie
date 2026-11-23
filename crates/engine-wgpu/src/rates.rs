@@ -236,7 +236,10 @@ pub fn shapes_at_load(
         top_rows,
         measuring,
     );
-    Ok(crate::tuning::Tuning::new(chip?).with_workgroup_bytes(device.workgroup_bytes()))
+    // What the load held of the adapter stays (the decodes it splits): a
+    // load naming its kernels after its curves are timed names what a load
+    // that read them names.
+    Ok(tuning.with_profile(chip?))
 }
 
 /// How a rates frame is timed on wgpu: the device's span where it states
