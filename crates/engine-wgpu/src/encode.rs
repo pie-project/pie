@@ -308,6 +308,11 @@ impl Sink<'_> {
 
         let mut staged: Vec<(wgpu::Buffer, u64, wgpu::Buffer, u64, u64)> = Vec::new();
         let mut scratch_views = 0usize;
+        // A window of a value binds the value from its aligned first byte,
+        // the kernel's rebased twin stepping each binding over its element
+        // offset here ([`crate::device::pipelines::Rebased`]).
+        let mut twin: Option<Option<std::sync::Arc<crate::device::pipelines::Rebased>>> = None;
+        let mut rebase: Vec<u32> = Vec::new();
         let mut words: Vec<u8> = Vec::with_capacity(64);
         for arg in args {
             match *arg {
@@ -350,18 +355,76 @@ impl Sink<'_> {
                     );
                     storage_view_fits(views.len(), view, max_binding)
                         .map_err(|detail| Sink::backend(fire, detail))?;
-                    if binding.offset().is_multiple_of(storage_align) {
+                    // A view binds its slab from its first byte to the end
+                    // (as Vulkan's descriptors do), up to the largest binding,
+                    // holding at least the `need` bytes the kernel reads: the
+                    // group a dispatch binds names where a value starts, not
+                    // how many rows a fire's window cuts of it, so the load's
+                    // walk builds the one every fire over it binds.
+                    let slab_bytes = binding.buffer().slab().size;
+                    let whole = |from: u64, need: u64| {
+                        let to_end = (slab_bytes.saturating_sub(from) & !3).min(max_binding & !3);
+                        to_end.max(need)
+                    };
+                    // A window of a value (a class region's rows of it) binds
+                    // the value from its aligned first byte and steps the
+                    // kernel over the window's lead, so every region of the
+                    // value binds the one group whatever row it starts at.
+                    let at = binding.offset();
+                    let origin = binding.origin().min(at);
+                    let base = origin - origin % storage_align;
+                    if at == base {
                         views.push((
                             binding.buffer().slab().buffer.clone(),
-                            binding.offset(),
-                            view,
+                            at,
+                            whole(at, view),
                             mutable,
                         ));
                         continue;
                     }
 
+                    let lead = at - base;
+                    let step = pipeline.stride.get(views.len()).copied().unwrap_or(0);
+                    if step > 0
+                        && lead.is_multiple_of(u64::from(step))
+                        && lead + view <= max_binding
+                    {
+                        let held = match &twin {
+                            Some(held) => held.clone(),
+                            None => {
+                                let held = self
+                                    .pipelines
+                                    .rebased(self.device, &pipeline)
+                                    .map_err(|fault| Sink::refuse(fire, fault))?;
+                                twin = Some(held.clone());
+                                held
+                            }
+                        };
+                        if held.is_some() {
+                            let slot = views.len();
+                            if rebase.len() <= slot {
+                                rebase.resize(slot + 1, 0);
+                            }
+                            rebase[slot] = u32::try_from(lead / u64::from(step)).unwrap_or(u32::MAX);
+                            views.push((
+                                binding.buffer().slab().buffer.clone(),
+                                base,
+                                whole(base, lead + view),
+                                mutable,
+                            ));
+                            continue;
+                        }
+                    }
+                    if at.is_multiple_of(storage_align) {
+                        views.push((
+                            binding.buffer().slab().buffer.clone(),
+                            at,
+                            whole(at, view),
+                            mutable,
+                        ));
+                        continue;
+                    }
                     let source = binding.buffer().slab().buffer.clone();
-                    let at = binding.offset();
                     if !at.is_multiple_of(4) {
                         if mutable {
                             return Err(Sink::backend(
@@ -490,24 +553,37 @@ impl Sink<'_> {
             .map(|(buffer, offset, size, _)| (buffer.clone(), *offset, *size))
             .collect();
         let uniform_bytes = u64::from(pipeline.push_bytes.max(rounded).max(16));
+        // The twin where a view was rebased: its offsets block beside the
+        // kernel's scalars.
+        let rebased = if rebase.is_empty() {
+            None
+        } else {
+            twin.flatten()
+        };
         if self.frame.bind_only {
             // A load's bind walk: the group a dispatch over these views binds
             // is built and kept; nothing is encoded. A fire whose views go
             // through scratch binds a group of its own frame's either way.
             if scratch_views == 0 {
                 self.pipelines
-                    .bind_group(core, &pipeline, &keyed, uniform_bytes)
+                    .bind_group(core, &pipeline, &keyed, uniform_bytes, rebased.as_deref())
                     .map_err(|fault| Sink::refuse(fire, fault))?;
             }
             return Ok(());
         }
         let group = if scratch_views == 0 {
             self.pipelines
-                .bind_group(core, &pipeline, &keyed, uniform_bytes)
+                .bind_group(core, &pipeline, &keyed, uniform_bytes, rebased.as_deref())
         } else {
             // Its scratch views are this frame's: a group of its own.
             self.pipelines.note_scratch_group();
-            crate::device::pipelines::group_of(core, &pipeline, &keyed, uniform_bytes)
+            crate::device::pipelines::group_of(
+                core,
+                &pipeline,
+                &keyed,
+                uniform_bytes,
+                rebased.as_deref(),
+            )
         }
         .map_err(|fault| Sink::refuse(fire, fault))?;
         // The scalars in this frame's slot, the group reading them there.
@@ -529,7 +605,30 @@ impl Sink<'_> {
                 )
             })?);
         }
+        // The rebased views' element offsets, in their block's slot: bound
+        // past the kernel's uniform, so its dynamic offset follows.
+        if let Some(rebased) = &rebased {
+            let bytes = u64::from(rebased.bytes);
+            let (_, at) = self
+                .frame
+                .uniform_slot(bytes)
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+            rebase.resize(bytes as usize / 4, 0);
+            let block: Vec<u8> = rebase.iter().flat_map(|lead| lead.to_le_bytes()).collect();
+            self.frame
+                .write_uniform(at, &block)
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+            offsets.push(u32::try_from(at).map_err(|_| {
+                Sink::backend(
+                    fire,
+                    format!("a uniform slot at byte {at} is past a u32 offset"),
+                )
+            })?);
+        }
 
+        let compute = rebased
+            .as_ref()
+            .map_or(&pipeline.pipeline, |rebased| &rebased.pipeline);
         let key = label(name, fire, args);
         if let Some((set, at)) = timing().then(|| self.frame.timestamp_slot(&key)).flatten() {
             self.frame
@@ -542,14 +641,14 @@ impl Sink<'_> {
                             end_of_pass_write_index: Some(at + 1),
                         }),
                     });
-                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_pipeline(compute);
                     pass.set_bind_group(0, &group, &offsets);
                     pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
                 })
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         } else {
             self.frame
-                .dispatch_at(name, &pipeline.pipeline, &group, &offsets, groups)
+                .dispatch_at(name, compute, &group, &offsets, groups)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         }
         if !staged.is_empty() {

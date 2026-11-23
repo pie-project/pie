@@ -199,15 +199,13 @@ fn a_switched_class_is_served_from_what_the_load_prepared() {
 }
 
 /// A fire mixing the switched class's lanes with a plain lane's, in the
-/// class order and out of it: each lane reads its own arm's rows, and the
-/// fire binds nothing the load did not. Ignored: on wgpu a class's region
-/// whose rows start off the device's storage offset alignment (256 bytes
-/// here) is staged through the frame's scratch and binds a group of its own
-/// each fire (`Tally::BoundInFire`, engine-wgpu `encode.rs`), and the plain
-/// lane after a switched lane reads the switched lane's unscaled row (token
-/// 13's, not 8's). Vulkan passes both.
+/// class order and out of it: each lane reads its own arm's rows (a region's
+/// streamed table rows staged at its own rows of the fire, never over
+/// another region's), and the fire binds nothing the load did not (a region
+/// whose rows start off the device's storage offset alignment binds its
+/// values from their first byte, as the load's walk did, not a copy of its
+/// rows).
 #[test]
-#[ignore = "wgpu: a mixed fire's unaligned region binds in the fire, and an out-of-order plain lane reads the wrong row"]
 fn a_mixed_fire_of_a_switched_class_is_served_from_what_the_load_prepared() {
     let Some(Loaded {
         mut engine,

@@ -632,7 +632,7 @@ impl<'c, B: Backend> Run<'c, B> {
         let rows = keep.min(handle.rows.saturating_sub(skip));
         let cut = self
             .handles
-            .cut(
+            .window(
                 handle.buf,
                 u64::from(skip) * stride,
                 u64::from(rows) * stride,
@@ -1128,11 +1128,18 @@ impl<'c, B: Backend> Run<'c, B> {
         // staged their misses in the arm's stage before the fire, which the
         // gather reads from the window's first row.
         let ring = match &self.values[ids_value.0 as usize].def {
-            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => self
-                .fire
-                .row_ring
-                .map(|arm| (arm, self.window().span.row_offset)),
+            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => {
+                self.fire.row_ring
+            }
             _ => None,
+        };
+        // The fire's row the window's ids start at: a stage is laid by the
+        // fire's rows, each region's in its own.
+        let first = match (&self.window().gathered, &self.values[ids_value.0 as usize].ty) {
+            (None, Ty::Tensor { shape, .. }) if shape.first() == Some(&Dim::Tokens) => {
+                self.window().span.row_offset
+            }
+            _ => 0,
         };
         let known = match &self.values[ids_value.0 as usize].def {
             Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => {
@@ -1161,6 +1168,7 @@ impl<'c, B: Backend> Run<'c, B> {
             param,
             ids,
             ring,
+            first,
             known,
             &self.row_ids,
             pool,
