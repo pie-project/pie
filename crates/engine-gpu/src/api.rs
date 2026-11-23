@@ -1119,6 +1119,7 @@ where
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
+            windowed_state: false,
             // The prompt scans land the state as of rows inside a lane, a
             // record a snapshot in pieces (CONTRACT-BC 16).
             rs_snapshots: crate::rs::snapshots(shell.trace()),

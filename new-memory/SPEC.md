@@ -15,8 +15,9 @@ must need one poem line and no engine change.
 3. Chunk size C and slot sizes are chosen by the compiler as `f(model, DeviceProfile)`: large on server CUDA
    (~16MB), small on on-device Metal. C is a load-time constant for the engine.
 4. Slot shapes: **fixed** (GDN/mamba/conv state, VAE frame cache, engram/replay ids, snapshots), **list** (full-attention kv, compressed pools via `tokens // r`,
-   drafter kv: T tokens x all rows, layer-major inside the slot; sliding-window kv is a **window list**: the same
-   list shape kind, one shape per distinct window, whose slots are freed once wholly outside the window — no ring).
+   drafter kv: T tokens x all rows, layer-major inside the slot). A sliding-window layer is **state + buffer**,
+   exactly like a recurrent layer (CONTRACT-BC 19): its last W folded rows are a ring in the
+   lane's record, its unfolded rows sit in the window buffer, a list shape; no window lists.
    Fixed records larger than C split into equal pieces that never
    cross an op's atom (GDN/KDA/mamba: head axis; conv: channel; conv3d frame cache: frame-position axis 0;
    attention: token; n-gram ids: uncuttable). Do not cut pieces below 1MiB until prefill GDN is measured.

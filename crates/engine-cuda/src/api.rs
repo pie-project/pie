@@ -876,6 +876,7 @@ impl Engine for Cuda {
             kv_handle,
             media_encode: false,
             rs_verbs: true,
+            windowed_state: false,
             rs_snapshots: if state_rows && shell.lands_snapshots() {
                 crate::store::rs::SNAPSHOTS
             } else {

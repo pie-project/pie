@@ -342,6 +342,7 @@ fn name_of(trace: &Trace, row: RowId) -> &str {
         },
         RowId::Rs(_) => "rs",
         RowId::Pool(_) => "pool",
+        RowId::Ring => "ring",
     }
 }
 

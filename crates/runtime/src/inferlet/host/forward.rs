@@ -557,6 +557,10 @@ impl ProcessCtx {
             let _ = self.ctx().table.get(channel)?;
         }
         let reps: Vec<u32> = lanes.iter().map(Resource::rep).collect();
+        // The window-list path's refusal: removed by the windowed-state
+        // change (the integration commit deletes it). A load whose engine
+        // serves windowed layers as ring + buffer states no window tokens
+        // (`RsCaps::window_state`): its beams share one folded window.
         if crate::model::model().rs_caps().window_tokens > 0
             && let Some((first, again)) = first_repeat(&reps)
         {

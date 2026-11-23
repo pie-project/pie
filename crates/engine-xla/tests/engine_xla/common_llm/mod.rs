@@ -79,9 +79,31 @@ pub fn write_checkpoint(path: &std::path::Path, trace: &poem_ir::Trace, seed: u6
         .iter()
         .filter(|param| param.source == poem_ir::ParamSource::Checkpoint)
         .collect();
+    // A packed plane (gpt-oss's MXFP4 experts) is stored as the bf16 it is
+    // quantized from, at the shape it has before the load packs it, and its
+    // scales are the load's own (engine-cuda `golden_logits::seeded_planes`).
+    let packed = |dtype: poem::Dtype| {
+        !matches!(
+            dtype,
+            poem::Dtype::Bf16 | poem::Dtype::F32 | poem::Dtype::I64 | poem::Dtype::I32
+        )
+    };
+    let made: std::collections::BTreeSet<String> = planes
+        .iter()
+        .filter(|param| packed(param.dtype))
+        .flat_map(|param| {
+            [
+                poem::scales_name(&param.name),
+                poem::biases_name(&param.name),
+                poem::global_scales_name(&param.name),
+            ]
+        })
+        .collect();
+    planes.retain(|param| !made.contains(&param.name));
     planes.sort_by(|a, b| a.name.cmp(&b.name));
     for param in planes {
-        let count = param.shape.iter().product::<u64>() as usize;
+        let shape = poem::Weight::of_plane(param).shape;
+        let count = shape.iter().product::<u64>() as usize;
         let norm = param.name.ends_with("norm");
         let mut state = fnv(&param.name) ^ seed;
         let mut next = || {
@@ -111,13 +133,19 @@ pub fn write_checkpoint(path: &std::path::Path, trace: &poem_ir::Trace, seed: u6
                     .flat_map(|_| value(next()).to_le_bytes())
                     .collect(),
             ),
+            other if packed(other) => (
+                ztensor::Leaf::BF16,
+                (0..count)
+                    .flat_map(|_| ((value(next()).to_bits() >> 16) as u16).to_le_bytes())
+                    .collect(),
+            ),
             other => panic!(
                 "`{}` is {other:?}, not a dtype the fixture seeds",
                 param.name
             ),
         };
         writer
-            .add(param.name.as_str(), param.shape.clone(), leaf, &bytes)
+            .add(param.name.as_str(), shape, leaf, &bytes)
             .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
     }
     writer.finish().expect("the fixture finishes");
@@ -247,13 +275,19 @@ impl Model {
         held: bool,
         extra: u32,
     ) -> Model {
-        let package = poem_compiler::catalog::package_of(name).expect("the model is listed");
-        let deploy = poem::star::Deploy {
-            layers,
-            ..poem_compiler::catalog::one_rank(poem::Dtype::Bf16, poem::Dtype::Bf16)
+        // A deployment named: its model at its dtypes (gpt-oss's experts in
+        // mxfp4 beside bf16 weights); a model named: every plane in bf16.
+        let (package, model_id, base) = match poem_compiler::catalog::deployment(name) {
+            Some(d) => (&d.package, d.model.id.as_str(), d.deploy.clone()),
+            None => (
+                poem_compiler::catalog::package_of(name).expect("the model is listed"),
+                name,
+                poem_compiler::catalog::one_rank(poem::Dtype::Bf16, poem::Dtype::Bf16),
+            ),
         };
+        let deploy = poem::star::Deploy { layers, ..base };
         let trace = package
-            .trace(name, &deploy, name, Platform::Xla)
+            .trace(model_id, &deploy, name, Platform::Xla)
             .unwrap_or_else(|why| panic!("`{name}` traces: {why:#}"));
         sweep_fixtures();
         let dir = std::env::temp_dir().join(format!(
@@ -265,7 +299,35 @@ impl Model {
         ));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("weights.zt");
-        write(&path, &trace);
+        // A deployment serving a plane in another form than its floats
+        // (gpt-oss's MXFP4 experts) loads from a serving artifact alone: its
+        // artifact is imported from the seeded floats, by the plan's own
+        // names (engine-cuda `golden_logits::fixture_as`).
+        let encoded = trace.params.iter().any(|param| {
+            param.source == poem_ir::ParamSource::Checkpoint
+                && !matches!(
+                    param.dtype,
+                    poem::Dtype::Bf16 | poem::Dtype::F32 | poem::Dtype::I64 | poem::Dtype::I32
+                )
+        });
+        if encoded {
+            let floats = dir.join("floats.zt");
+            write(&floats, &trace);
+            let source = ztensor::Source::open(&floats).expect("the seeded floats open");
+            let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Xla)
+                .expect("the seeded floats are read by the plan's own names");
+            drop(source);
+            checkpoint::testkit::artifact::import(
+                &floats,
+                &contract,
+                &checkpoint::serving::Stamp::of("xla", name),
+                &[],
+                &path,
+            )
+            .unwrap_or_else(|why| panic!("{name} imports: {why}"));
+        } else {
+            write(&path, &trace);
+        }
         let vocab = trace
             .params
             .iter()
@@ -275,6 +337,9 @@ impl Model {
         let facts = trace.facts.clone();
         let boot = DeviceBoot {
             pool_extra_chunks: extra,
+            // `PIE_XLA_TEST_PROFILES=<dir>`: a user's profiles over the
+            // device's (a decision turned off to isolate it)
+            profiles: std::env::var_os("PIE_XLA_TEST_PROFILES").map(std::path::PathBuf::from),
             ..DeviceBoot::default()
         };
         let mut engine = Xla::new(boot, contract_for);
@@ -456,6 +521,10 @@ impl Refs {
 pub struct Seq {
     pub slot: u32,
     pub held: u32,
+    /// The rows folded into the rings (`lane_fold`).
+    pub folded: u32,
+    /// The window-buffer slot of each page that holds buffered rows.
+    pub buffered: std::collections::BTreeMap<u32, u32>,
     pub kv: Vec<u32>,
     pub window: Vec<u32>,
     pub record: Vec<(engine::chunk::ShapeId, Vec<[u32; 2]>)>,
@@ -472,6 +541,60 @@ impl Seq {
     pub fn lane(&mut self, model: &Model, refs: &mut Refs, tokens: Vec<u32>) -> Lane {
         let word = model.word(tokens.len() as u32);
         self.lane_of(model.context, word, refs, tokens)
+    }
+
+    /// [`Seq::lane`] of a windowed load folding `fold` rows (CONTRACT-BC
+    /// 21): the rows past `folded + fold` stay in window-buffer slots, the
+    /// lane's table of them from its base. The caller adds the rows to
+    /// `held` once the fire is done, as for [`Seq::lane`].
+    pub fn lane_fold(
+        &mut self,
+        model: &Model,
+        refs: &mut Refs,
+        tokens: Vec<u32>,
+        fold: u32,
+    ) -> Lane {
+        use engine::chunk::{SlotKind, SlotRole};
+        let rows = tokens.len() as u32;
+        let mut lane = self.lane(model, refs, tokens);
+        let buffer = refs
+            .shapes(|s| s.role == SlotRole::WindowBuffer)
+            .into_iter()
+            .next()
+            .expect("a windowed load's window buffer");
+        let SlotKind::List { tokens: page, .. } = buffer.kind else {
+            unreachable!()
+        };
+        let page = page.max(1);
+        let after = self.held + rows;
+        let folded = self.folded + fold;
+        assert!(folded <= after, "a fold past the lane's rows");
+        let carrying = self.held > self.folded;
+        let base = if carrying { self.folded } else { folded } / page * page;
+        let end = if carrying || after > folded {
+            after.div_ceil(page)
+        } else {
+            base / page
+        };
+        let table: Vec<u32> = (base / page..end)
+            .map(|p| {
+                *self
+                    .buffered
+                    .entry(p)
+                    .or_insert_with(|| refs.take(buffer.id))
+            })
+            .collect();
+        lane.tables.push((buffer.id, table));
+        lane.kv.folded = self.folded;
+        lane.window = Some(engine::fire::WindowFold {
+            base,
+            fold: engine::fire::FoldLen::Host(fold),
+            lineage: engine::fire::Lineage::Set,
+        });
+        // the slots wholly folded are free after the fire
+        self.buffered.retain(|&p, _| (p + 1) * page > folded);
+        self.folded = folded;
+        lane
     }
 
     /// The lane as the runtime fires it: legacy page ids in a degenerate
@@ -549,6 +672,24 @@ impl Seq {
                 })
                 .collect();
             lane.tables.push((list.id, table));
+        }
+        // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): every fire
+        // folds every row it computes, so the lane names no buffer slot and
+        // its folded index is every row it held before.
+        let page = refs
+            .shapes(|s| s.role == SlotRole::WindowBuffer)
+            .first()
+            .and_then(|s| match s.kind {
+                SlotKind::List { tokens, .. } => Some(tokens.max(1)),
+                _ => None,
+            });
+        if let Some(page) = page {
+            lane.kv.folded = self.held;
+            lane.window = Some(engine::fire::WindowFold {
+                base: after / page * page,
+                fold: engine::fire::FoldLen::Host(rows),
+                lineage: engine::fire::Lineage::Set,
+            });
         }
         if self.record.is_empty() {
             for fixed in refs.shapes(|s| {

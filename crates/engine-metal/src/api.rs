@@ -742,6 +742,7 @@ impl Engine for Metal {
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
+            windowed_state: false,
             rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: true,
             adapter_attachments: false,
