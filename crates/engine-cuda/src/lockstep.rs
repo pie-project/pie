@@ -911,6 +911,15 @@ impl Engine for Rank {
         self.with(|cuda| cuda.evacuate(evacuation))
     }
 
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.chunk_table(),
+            None => Err(Error::Program(
+                "a rank is busy: its chunk table is read between frames".to_string(),
+            )),
+        }
+    }
+
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         self.with(|cuda| cuda.copy_slots(copy))
     }

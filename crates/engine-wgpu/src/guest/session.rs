@@ -447,6 +447,22 @@ impl Pass {
     }
 }
 
+/// Where an evacuation leaves a session ([`Session::resolve`]), to put it
+/// there once the copies are committed ([`Session::install`]).
+pub struct Rebound {
+    status: Held,
+    stages: Vec<([Held; 4], Held)>,
+    instance: Pair,
+    pair: Pair,
+    /// Each stage's step records as they name the session there; none for
+    /// a parked session, whose unpark writes them.
+    records: Option<Vec<Vec<u8>>>,
+    /// The runs its own state takes there, by its claims' name.
+    pub own: (Holder, Vec<Run>),
+    /// Its pair group's there, where it is bound on one.
+    pub pair_runs: Option<(Holder, Vec<Run>)>,
+}
+
 pub struct Session {
     /// The status word the stages share, in the instance's `Instance` slots.
     status: Held,
@@ -635,13 +651,16 @@ impl Session {
     fn locate(&self) -> Result<()> {
         // Claimed before a record is written there.
         self.claim_runs()?;
-        self.write_records()
+        let records = self.records()?;
+        self.write_records(&records)
     }
 
-    /// Writes each stage's step records with where the instance lies now,
-    /// claimed already, each base checked ([`bases`]).
-    fn write_records(&self) -> Result<()> {
+    /// Each stage's step records as they name where the instance lies now,
+    /// each base checked ([`bases`]) and its bind group at hand; nothing
+    /// written.
+    fn records(&self) -> Result<Vec<Vec<u8>>> {
         let places = [&self.instance, &self.pair];
+        let mut records = Vec::with_capacity(self.stages.len());
         for stage in &self.stages {
             let bases = bases(
                 &self.status,
@@ -652,10 +671,20 @@ impl Session {
             )?;
             self.library
                 .group(self.status.buffer(), heap_span(places, stage.heap)?.0)?;
-            stage.args.write(
-                0,
-                &step_records(&stage.lowered, &stage.areas, stage.stride, bases),
-            )?;
+            records.push(step_records(
+                &stage.lowered,
+                &stage.areas,
+                stage.stride,
+                bases,
+            ));
+        }
+        Ok(records)
+    }
+
+    /// Writes each stage's step records ([`Self::records`]).
+    fn write_records(&self, records: &[Vec<u8>]) -> Result<()> {
+        for (stage, records) in self.stages.iter().zip(records) {
+            stage.args.write(0, records)?;
         }
         Ok(())
     }
@@ -750,43 +779,77 @@ impl Session {
         heap_span([&self.instance, &self.pair], stage.heap)
     }
 
-    /// After an evacuation, its passes landed, takes where its tables'
-    /// slots and, bound, its state and its pair's sit in now, and returns
-    /// the runs it holds there, to be claimed with every other holder's in
-    /// one step ([`Library::claim_moved`]) before [`Self::repoint`] writes
-    /// its step records there. A park that kept its tables in place
-    /// (`parked`) holds their run alone, as its park claimed: its state and
-    /// its share of its pair went back at its park.
-    pub fn relocate(
-        &mut self,
-        pools: &Pools<crate::device::Api>,
-        parked: bool,
-    ) -> Result<Vec<(Holder, Vec<Run>)>> {
-        for stage in &mut self.stages {
-            for table in &mut stage.tables {
+    /// Where the stages' tables and records, the status and, bound, the
+    /// guest's state lie under `pools`' chunk table, an evacuation's not yet
+    /// committed, each checked as [`Self::locate`] checks it, with the runs
+    /// the session and its pair would hold there; nothing changed. A park
+    /// that kept its tables in place (`parked`) holds their run alone, as
+    /// its park claimed: its state and its share of its pair went back at
+    /// its park, and its unpark writes its records. The caller claims every
+    /// holder's runs in one step ([`Library::claim_moved`]), then installs
+    /// each ([`Self::install`]).
+    pub fn resolve(&mut self, pools: &Pools<crate::device::Api>, parked: bool) -> Result<Rebound> {
+        let mut rebound = Rebound {
+            status: self.status.clone(),
+            stages: self
+                .stages
+                .iter()
+                .map(|stage| (stage.tables.clone(), stage.args.clone()))
+                .collect(),
+            instance: self.instance.clone(),
+            pair: self.pair.clone(),
+            records: None,
+            own: (Holder::Instance(self.claim), Vec::new()),
+            pair_runs: None,
+        };
+        for (tables, args) in &mut rebound.stages {
+            for table in tables {
                 table.rebind(pools)?;
             }
-            stage.args.rebind(pools)?;
+            args.rebind(pools)?;
         }
-        self.status.rebind(pools)?;
+        rebound.status.rebind(pools)?;
+        if !parked {
+            rebound.instance.rebind(pools)?;
+            rebound.pair.rebind(pools)?;
+        }
+        // Checked as the session would lie there, then put back.
+        self.swap(&mut rebound);
+        let records = (!parked).then(|| self.records()).transpose();
+        let own = self.own_runs();
+        let pair = self.pair_runs();
+        self.swap(&mut rebound);
+        rebound.records = records?;
         if parked {
-            let tables = self.own_runs().into_iter().take(1).collect();
-            return Ok(vec![(Holder::Instance(self.claim), tables)]);
+            rebound.own.1 = own.into_iter().take(1).collect();
+        } else {
+            rebound.own.1 = own;
+            // The pair's state moved for every instance on it: the group's.
+            rebound.pair_runs = self.pair_group.map(|(group, _)| (Holder::Pair(group), pair));
         }
-        self.instance.rebind(pools)?;
-        self.pair.rebind(pools)?;
-        let mut moved = vec![(Holder::Instance(self.claim), self.own_runs())];
-        // The pair's state moved for every instance on it: the group's.
-        if let Some((pair, _)) = self.pair_group {
-            moved.push((Holder::Pair(pair), self.pair_runs()));
-        }
-        Ok(moved)
+        Ok(rebound)
     }
 
-    /// Writes its step records where [`Self::relocate`] found its slots
-    /// and state, claimed there.
-    pub fn repoint(&self) -> Result<()> {
-        self.write_records()
+    /// Puts the session where [`Self::resolve`] resolved it, the
+    /// evacuation's copies committed and its runs claimed: the step records
+    /// name it there, where it is bound.
+    pub fn install(&mut self, mut rebound: Rebound) -> Result<()> {
+        self.swap(&mut rebound);
+        match &rebound.records {
+            Some(records) => self.write_records(records),
+            None => Ok(()),
+        }
+    }
+
+    /// The session's places and `rebound`'s, each the other's.
+    fn swap(&mut self, rebound: &mut Rebound) {
+        std::mem::swap(&mut self.status, &mut rebound.status);
+        for (stage, (tables, args)) in self.stages.iter_mut().zip(&mut rebound.stages) {
+            std::mem::swap(&mut stage.tables, tables);
+            std::mem::swap(&mut stage.args, args);
+        }
+        std::mem::swap(&mut self.instance, &mut rebound.instance);
+        std::mem::swap(&mut self.pair, &mut rebound.pair);
     }
 
     /// Moves the tables to `slots` (`Instance` slot refs, as many as they

@@ -1638,6 +1638,15 @@ impl Lane {
                         PoolOp::ReleaseSpan(segments) => engine.release_span(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
                         PoolOp::SettleCopies => engine.settle_copies(),
+                        PoolOp::CheckTable(runtime) => engine.chunk_table().and_then(|table| {
+                            match crate::store::shared::programs::table_apart(
+                                table.as_slice(),
+                                &runtime,
+                            ) {
+                                Some(apart) => Err(::engine::Error::Program(apart)),
+                                None => Ok(()),
+                            }
+                        }),
                         PoolOp::Rebind(rebind) => crate::store::roles::rebind(
                             roles_of(engine_idx).as_ref(),
                             &mut **engine,
@@ -1946,6 +1955,10 @@ mod landing_tests {
 
         fn kind(&self) -> &'static str {
             "fake-late-copies"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(

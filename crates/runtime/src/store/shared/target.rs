@@ -740,6 +740,9 @@ impl SharedGrow {
                 PoolOp::CommitSpan(n) => Some(*n),
                 _ => None,
             };
+            let moved = matches!(op, PoolOp::Evacuate(_)).then(|| {
+                if compacting.is_some() { "a compaction" } else { "a segment's evacuation" }
+            });
             match (self.lane)(self.engine, op).await {
                 Ok(()) => {
                     // A segment mapped: what was promised a waiter is
@@ -791,8 +794,18 @@ impl SharedGrow {
                             planner.pages_freed();
                         }
                     }
+                    // Refused means nothing moved: the map taken back is
+                    // the engine's table still.
+                    if let Some(what) = moved {
+                        super::programs::check_moved(&self.shared, &WalkMover(self), what).await;
+                    }
                     return;
                 }
+            }
+            // Taken: the engine's table is the runtime's map as the move
+            // left it.
+            if let Some(what) = moved {
+                super::programs::check_moved(&self.shared, &WalkMover(self), what).await;
             }
             if evacuating.is_some() {
                 // The engine took the copy and waits it out before it
@@ -924,6 +937,12 @@ impl super::programs::Mover for WalkMover<'_> {
 
     fn epoch_now(&self) -> u64 {
         self.0.epochs().0
+    }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        (self.0.lane)(self.0.engine, PoolOp::CheckTable(runtime))
+            .await
+            .map_err(|error| format!("{error:#}"))
     }
 }
 
@@ -1188,7 +1207,11 @@ mod tests {
         let moves = Arc::new(std::sync::Mutex::new(Vec::new()));
         let told = moves.clone();
         let mut grow = SharedGrow::new(model, ENGINE, shared.clone()).with_lane(move |op| {
-            told.lock().unwrap().push(format!("{op:?}"));
+            // The walk's own check of the engine's table after a move is no
+            // move the engine is told.
+            if !matches!(op, PoolOp::CheckTable(_)) {
+                told.lock().unwrap().push(format!("{op:?}"));
+            }
             Ok(())
         });
 

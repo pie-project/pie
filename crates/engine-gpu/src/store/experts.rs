@@ -640,7 +640,16 @@ impl<B: Backend> ExpertCaches<B> {
     /// chunk table: after a residency, and after an evacuation moves a
     /// chunk. The caller has drained every fire that reads the entries.
     pub fn restage(&mut self, pools: &Pools<B>) -> Result<()> {
-        for cache in &mut self.caches {
+        let entries = self.entries(pools)?;
+        self.write_entries(&entries)
+    }
+
+    /// Every cache's entries as `pools`' chunk table places them, each
+    /// cache's in one run of bytes, nothing written: what an evacuation
+    /// resolves against its moved table before it commits a copy.
+    pub fn entries(&self, pools: &Pools<B>) -> Result<Vec<Vec<u8>>> {
+        let mut entries = Vec::with_capacity(self.caches.len());
+        for cache in &self.caches {
             let mut units = Vec::with_capacity(cache.slots.len() * 4);
             for &slot in &cache.slots {
                 let unit = if slot == NOT_HELD {
@@ -656,7 +665,16 @@ impl<B: Backend> ExpertCaches<B> {
                 };
                 units.extend_from_slice(&unit.to_le_bytes());
             }
-            cache.units.write(0, &units)?;
+            entries.push(units);
+        }
+        Ok(entries)
+    }
+
+    /// Writes `entries` ([`Self::entries`]) into the caches' tables. The
+    /// caller has drained every fire that reads them.
+    pub fn write_entries(&mut self, entries: &[Vec<u8>]) -> Result<()> {
+        for (cache, units) in self.caches.iter_mut().zip(entries) {
+            cache.units.write(0, units)?;
         }
         Ok(())
     }

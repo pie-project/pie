@@ -1123,6 +1123,14 @@ impl Engine for Xla {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let shell = self
+            .shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?;
+        Ok(shell.pools().chunk_table().clone())
+    }
+
     fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],

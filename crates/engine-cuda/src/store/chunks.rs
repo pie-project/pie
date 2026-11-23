@@ -958,6 +958,12 @@ impl Chunks {
     pub fn physical(&self, logical: u32) -> Option<u32> {
         self.table.physical(logical)
     }
+
+    /// The chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn table(&self) -> &ChunkTable {
+        &self.table
+    }
 }
 
 impl Chunks {

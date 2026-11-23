@@ -213,10 +213,24 @@ impl<B: Backend> Cell<B> {
         }
     }
 
-    pub fn rebind(&mut self, pools: &Pools<B>) -> Result<()> {
-        match &mut self.place {
-            CellPlace::Pooled(held) => held.rebind(pools),
-            CellPlace::Own(_) => Ok(()),
+    /// Where the cell lies under `pools`' chunk table, an evacuation's not
+    /// yet committed; `None` for a cell of its own buffer, which no
+    /// evacuation moves. Nothing changed.
+    pub fn resolve(&self, pools: &Pools<B>) -> Result<Option<Held<B>>> {
+        match &self.place {
+            CellPlace::Pooled(held) => {
+                let mut held = held.clone();
+                held.rebind(pools)?;
+                Ok(Some(held))
+            }
+            CellPlace::Own(_) => Ok(None),
+        }
+    }
+
+    /// Puts a pooled cell where [`Self::resolve`] resolved it.
+    pub fn install(&mut self, held: Held<B>) {
+        if let CellPlace::Pooled(place) = &mut self.place {
+            *place = held;
         }
     }
 

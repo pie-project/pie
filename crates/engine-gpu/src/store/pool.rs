@@ -456,17 +456,14 @@ impl<B: Backend> Pool<B> {
         }
     }
 
-    /// Copies each moved chunk onto its new physical chunk in `frame`, then
-    /// takes the moves into the table: the caller commits `frame` before any
-    /// later fire is encoded, so the copies land first.
-    /// Returns each move as `(from, to)` physical chunks, for what lies
-    /// beside the pool indexed by physical chunk.
-    pub fn evacuate(
-        &mut self,
-        frame: &mut B::Frame,
-        evacuation: &Evacuation,
-    ) -> Result<Vec<(u32, u32)>> {
-        let mut moved = Vec::with_capacity(evacuation.moves.len());
+    /// Records each moved chunk's copy onto its new physical chunk in
+    /// `frame`, then takes the moves into the table and hands back the
+    /// table as it stood. Nothing is committed: the caller resolves what
+    /// the moves leave to repoint against the new table, then commits
+    /// `frame` before any later fire is encoded (the copies land first), or
+    /// puts the old table back ([`Pool::restore`]) and drops `frame`, its
+    /// copies unsubmitted. Refused with the table as it stood.
+    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<ChunkTable> {
         let mut table = self.table.clone();
         table.apply(evacuation).map_err(|why| Fault::Program {
             at: "store::pool::evacuate",
@@ -479,7 +476,6 @@ impl<B: Backend> Pool<B> {
             if from == physical {
                 continue;
             }
-            moved.push((from, physical));
             self.copy(
                 frame,
                 u64::from(from) * self.chunk_bytes,
@@ -487,8 +483,19 @@ impl<B: Backend> Pool<B> {
                 self.chunk_bytes,
             )?;
         }
+        Ok(std::mem::replace(&mut self.table, table))
+    }
+
+    /// Puts back the table an evacuation replaced ([`Pool::evacuate`]),
+    /// its copies dropped unsubmitted.
+    pub fn restore(&mut self, table: ChunkTable) {
         self.table = table;
-        Ok(moved)
+    }
+
+    /// The chunk table as it stands.
+    #[must_use]
+    pub fn table(&self) -> &ChunkTable {
+        &self.table
     }
 
     /// Writes `from` at virtual byte `at` through the queue, after every

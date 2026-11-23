@@ -1165,9 +1165,27 @@ where
         } = self;
         let shell = shell.as_mut().ok_or_else(unloaded::<B>)?;
         programs.quiesce().map_err(refusal)?;
-        shell.evacuate(evacuation).map_err(fault)?;
-        // Guest tables and cells bind their slots' chunks by place.
-        programs.rebind(shell.pools()).map_err(refusal)
+        // All or nothing (`Engine::evacuate`): the copies recorded and the
+        // table moved, nothing committed; guest tables and cells, which
+        // bind their slots' chunks by place, resolved against the moved
+        // table and their runs claimed; only then is a copy committed.
+        let Some(staged) = shell.stage_evacuation(evacuation).map_err(fault)? else {
+            return Ok(());
+        };
+        let rebound = match programs.resolve_rebind(shell.pools()) {
+            Ok(rebound) => rebound,
+            Err(refused) => {
+                shell.abort_evacuation(staged);
+                return Err(refusal(refused));
+            }
+        };
+        shell.commit_evacuation(staged).map_err(fault)?;
+        programs.install_rebind(rebound).map_err(refusal)
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let shell = self.shell.as_ref().ok_or_else(unloaded::<B>)?;
+        Ok(shell.pools().chunk_table().clone())
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {

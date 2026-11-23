@@ -689,6 +689,91 @@ pub trait Mover {
     /// The engine whose rung events ([`super::rung_changed`]) a wait on
     /// this raise waits on.
     fn engine(&self) -> usize;
+
+    /// The engine's chunk table (`Engine::chunk_table`) checked against
+    /// `runtime`, the runtime's logical to physical map, through the
+    /// engine's lane: `Err` names the first chunk they place apart
+    /// ([`table_apart`]).
+    fn check_table(
+        &self,
+        runtime: Vec<u32>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+/// Where the engine's chunk table (`engine`, physical by logical chunk)
+/// and the runtime's map (`runtime`) place a chunk apart: the first logical
+/// chunk they differ on, or `None` where they agree. An engine may keep
+/// chunks past those it states, which the runtime never names; one short
+/// of them is apart.
+#[must_use]
+pub fn table_apart(engine: &[u32], runtime: &[u32]) -> Option<String> {
+    if let Some(logical) = runtime
+        .iter()
+        .zip(engine)
+        .position(|(runtime, engine)| runtime != engine)
+    {
+        return Some(format!(
+            "logical chunk {logical} lies on physical {} in the engine's chunk table and on {} \
+             in the runtime's",
+            engine[logical], runtime[logical]
+        ));
+    }
+    (engine.len() < runtime.len()).then(|| {
+        format!(
+            "the engine's chunk table holds {} chunks and the runtime names {}",
+            engine.len(),
+            runtime.len()
+        )
+    })
+}
+
+/// After every evacuation the engine took or refused (a raise's copy, the
+/// segment walk's, a compaction): the engine's chunk table checked against
+/// the runtime's map as the move left it, never assumed. Apart, said at
+/// ERROR naming the first logical chunk they place apart and `what` moved,
+/// and a debug build stops on it: a fire through a table the runtime does
+/// not share reads and writes chunks it never placed (the M1's NaN: a free
+/// logical id swapped up onto a segment the walk then gave back, taken by
+/// the runtime at a physical the engine did not resolve it to). An engine
+/// that states no table is not checked.
+pub async fn check_moved(shared: &Shared, mover: &impl Mover, what: &str) {
+    let runtime = shared.lock().unwrap().pool().chunk_table().to_vec();
+    let Err(apart) = mover.check_table(runtime).await else {
+        return;
+    };
+    if !(apart.contains("lies on physical") || apart.contains("chunk table holds")) {
+        return;
+    }
+    tracing::error!(
+        engine = mover.engine(),
+        %apart,
+        what,
+        "store: the engine's chunk table and the runtime's are apart after a move"
+    );
+    assert!(
+        !cfg!(debug_assertions),
+        "engine {}: after {what}, the engine's chunk table is apart from the runtime's: {apart}",
+        mover.engine()
+    );
+}
+
+/// After a refused raise: the engine's chunk table checked against the
+/// runtime's map as the refusal left it, never assumed (debug builds).
+async fn check_refused(shared: &Shared, mover: &impl Mover) {
+    if cfg!(debug_assertions) {
+        let runtime = shared.lock().unwrap().pool().chunk_table().to_vec();
+        // Only the tables apart is a fault: an engine gone (teardown, "no
+        // scheduler") or stating no table answers nothing to check.
+        if let Err(apart) = mover.check_table(runtime).await
+            && (apart.contains("lies on physical") || apart.contains("chunk table holds"))
+        {
+            panic!(
+                "engine {}: a refused raise left the engine's chunk table apart from the \
+                 runtime's: {apart}",
+                mover.engine()
+            );
+        }
+    }
 }
 
 /// Raises `shared`'s activation to `goal`'s (a rung's tokens, given the
@@ -779,6 +864,9 @@ pub async fn carry_raise(
     {
         tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
+        // Refused means nothing moved (`Engine::evacuate`): the map taken
+        // back is the engine's table still.
+        check_refused(shared, mover).await;
         return Err(format!("the engine refused a raise's copy: {error}"));
     }
     if let Some((from, to)) = notice
@@ -786,17 +874,24 @@ pub async fn carry_raise(
     {
         tracing::warn!(%error, from, to, "a raise's carve was refused; fires stay at the rung in hand");
         let next = mover.epoch_now().saturating_add(1);
-        let mut pool = shared.lock().unwrap();
-        if evacuation.moves.is_empty() {
-            pool.raise_refused(evacuation);
-        } else {
-            // Its copy landed: the state stays where it moved, and the
-            // activation is the rung in hand's again.
-            pool.raise_carve_refused(next);
+        {
+            let mut pool = shared.lock().unwrap();
+            if evacuation.moves.is_empty() {
+                pool.raise_refused(evacuation);
+            } else {
+                // Its copy landed: the state stays where it moved, and the
+                // activation is the rung in hand's again.
+                pool.raise_carve_refused(next);
+            }
         }
+        // The copy stands: the map keeps the moves, as the engine's table.
+        check_refused(shared, mover).await;
         return Err(format!(
             "the engine refused the carve for rung {to}: {error}"
         ));
+    }
+    if !evacuation.moves.is_empty() {
+        check_moved(shared, mover, "a raise's copy").await;
     }
     let next = mover.epoch_now().saturating_add(1);
     shared.lock().unwrap().raise_copied(next);
@@ -985,6 +1080,15 @@ impl<F: Fn() -> u64 + Sync> Mover for LaneMover<F> {
 
     fn epoch_now(&self) -> u64 {
         (self.epoch_now)()
+    }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        crate::scheduler::pool(
+            self.engine,
+            crate::scheduler::worker::PoolOp::CheckTable(runtime),
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))
     }
 }
 
