@@ -713,7 +713,7 @@ impl RoleShapes {
             SlotRole::Instance => self.instance,
             SlotRole::Channel => self.channel,
             SlotRole::Adapter => self.adapter,
-            SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer => None,
+            SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer | SlotRole::Ring => None,
         }
     }
 
@@ -1068,7 +1068,12 @@ impl SharedPool {
                         SlotRole::Instance => &mut instances,
                         SlotRole::Channel => &mut channels,
                         SlotRole::Adapter => &mut adapters,
-                        SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer => &mut fixed,
+                        // The ring shape is a piece of the record, as a
+                        // state shape is (CONTRACT-BC 21).
+                        SlotRole::State
+                        | SlotRole::RsBuffer
+                        | SlotRole::WindowBuffer
+                        | SlotRole::Ring => &mut fixed,
                     };
                     found.push(FixedShape {
                         id: shape.id,
