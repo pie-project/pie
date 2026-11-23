@@ -171,7 +171,7 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
                 kv.set_domain(identity.domain());
             }
             // KV alone resumes a model only when it has no recurrent state.
-            kv.set_keeps(kv_sharing() && pools.state.device == 0 && pools.window_tokens == 0);
+            kv.set_keeps(pools.state.device == 0 && pools.window_tokens == 0);
             kv.set_page_size(kv_page_size);
             let kv = Arc::new(parking_lot::Mutex::new(kv));
             let slots = pools.state.device;
@@ -263,7 +263,7 @@ pub fn shared_stores(
     }
     {
         let mut kv = kv.lock();
-        kv.set_keeps(kv_sharing() && records == 0 && !rs.is_window());
+        kv.set_keeps(records == 0 && !rs.is_window());
         kv.set_page_size(kv_page_size);
     }
     Stores {
@@ -309,12 +309,6 @@ impl super::roles::DiskSlots for KvDiskSlots {
             with_kv_lock(&kv, "roles-disk", |kv| kv.disk_free_slots()) / self.1.max(1) as usize
         })
     }
-}
-
-/// `PIE_KV_SHARE`, on unless `0`.
-pub fn kv_sharing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_KV_SHARE").is_none_or(|value| value != "0"))
 }
 
 pub fn get(model_idx: usize, engine_idx: usize) -> Stores {

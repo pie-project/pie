@@ -106,8 +106,11 @@ pub struct Held {
 pub trait PrefillPeer: Send + Sync {
     /// Prefills on the peer, its pages to come back as `delivery` says; held
     /// in place, they are read by [`PrefillPeer::read`].
+    /// The tokens are keyed under `domain`, the asking set's
+    /// ([`crate::policy::share`]).
     fn prefill(
         &self,
+        domain: Hash256,
         tokens: Vec<u32>,
         from_page: u32,
         delivery: Delivery,
@@ -158,6 +161,8 @@ struct Pass {
     first: u64,
     limit: u64,
     have: u64,
+    /// The asking set's domain, which its keys chain from.
+    domain: Hash256,
     tokens: Vec<u32>,
     keys: Vec<Hash256>,
     token_hashes: Vec<Vec<Option<Hash256>>>,
@@ -169,20 +174,22 @@ impl Pass {
     }
 }
 
-/// Before a keyed, single-lane pass, for what its rows reach that this
-/// worker holds nowhere: first the pages another worker holds, fetched by
-/// key where the directory names one; then, when enough is left, a peer's
-/// prefill of the rest. Any failure leaves the pass to run here.
+/// Before a keyed, single-lane pass of a set that shares, keyed under
+/// `domain`, for what its rows reach that this worker holds nowhere: first
+/// the pages another worker holds, fetched by key where the directory
+/// names one; then, when enough is left, a peer's prefill of the rest. Any
+/// failure leaves the pass to run here.
 pub(crate) async fn before_pass(
     pid: crate::inferlet::process::ProcessId,
     stores: &Stores,
     engine: usize,
+    domain: Hash256,
     ws: crate::store::kv::page_table::WorkingSetId,
     held: u64,
     rows: &[u32],
     slots: &[Hash256],
 ) {
-    let Some(mut pass) = plan(stores, ws, held, rows, slots) else {
+    let Some(mut pass) = plan(stores, domain, ws, held, rows, slots) else {
         tracing::debug!(target: "pie::offload", %pid, held, rows = rows.len(), "a pass with nothing to send away");
         return;
     };
@@ -278,6 +285,7 @@ fn rule(_pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)>
 
 fn plan(
     stores: &Stores,
+    domain: Hash256,
     ws: crate::store::kv::page_table::WorkingSetId,
     held: u64,
     rows: &[u32],
@@ -315,6 +323,7 @@ fn plan(
             first,
             limit,
             have,
+            domain,
             tokens,
             keys: keys[first as usize..limit as usize].to_vec(),
             token_hashes: (first..limit)
@@ -398,6 +407,7 @@ async fn take(
     let t0 = std::time::Instant::now();
     let pages = peer
         .prefill(
+            pass.domain,
             pass.tokens.clone(),
             u32::try_from(pass.have)?,
             if peer.reads_in_place() {
@@ -645,12 +655,16 @@ async fn land(
     Ok(())
 }
 
-/// Each whole page of `tokens` from token 0: its slots' hashes and its key.
-fn keyed_pages(stores: &Stores, tokens: &[u32]) -> (Vec<Vec<Option<Hash256>>>, Vec<Hash256>) {
+/// Each whole page of `tokens` from token 0, keyed under `domain`: its
+/// slots' hashes and its key.
+fn keyed_pages(
+    stores: &Stores,
+    domain: &Hash256,
+    tokens: &[u32],
+) -> (Vec<Vec<Option<Hash256>>>, Vec<Hash256>) {
     let page = stores.kv_page_size.max(1) as usize;
     let whole = tokens.len() / page * page;
-    let domain = with_kv_lock(&stores.kv, "offload-keys", |kv| kv.domain());
-    let slots = hash::chain_slots(&domain, None, 0, &tokens[..whole]);
+    let slots = hash::chain_slots(domain, None, 0, &tokens[..whole]);
     let token_hashes: Vec<Vec<Option<Hash256>>> = slots
         .chunks_exact(page)
         .map(|page| page.iter().map(|h| Some(*h)).collect())
@@ -729,13 +743,14 @@ fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
     })
 }
 
-/// Prefills `tokens` here and hands the asker the pages from `from_page`
+/// Prefills `tokens`, keyed under the asker's `domain`, here and hands the asker the pages from `from_page`
 /// that the run fills completely, as `delivery` asks: kept for it to fetch,
 /// held on this device for it to read in place, or streamed a layer at a
 /// time as they are computed. Pages before `from_page` this worker holds
 /// nowhere are first fetched from `home`, which holds them, so only the
 /// rest is computed.
 pub async fn serve(
+    domain: Hash256,
     tokens: Vec<u32>,
     from_page: u32,
     home: Option<String>,
@@ -748,7 +763,7 @@ pub async fn serve(
     let engine = 0usize;
     let page = u64::from(stores.kv_page_size.max(1));
     let from = u64::from(from_page);
-    let (token_hashes, keys) = keyed_pages(&stores, &tokens);
+    let (token_hashes, keys) = keyed_pages(&stores, &domain, &tokens);
     let pages = keys.len() as u64;
     if from >= pages {
         return Ok(RemotePages {
@@ -813,7 +828,7 @@ pub async fn serve(
         match super::stream::expect(&keys, from as usize).await {
             Ok(run) => {
                 tokio::spawn(async move {
-                    let ran = run_prefill(&whole).await.map(drop);
+                    let ran = run_prefill(domain, &whole).await.map(drop);
                     super::stream::done(run, ran);
                 });
                 tracing::debug!(
@@ -835,7 +850,7 @@ pub async fn serve(
             }
         }
     }
-    let departure = run_prefill(&whole).await?;
+    let departure = run_prefill(domain, &whole).await?;
     let t_run = t0.elapsed();
     // The program has exited; its working set's pages are kept as it is
     // released, which may land just after. Pages joining the cache and the
@@ -1020,7 +1035,12 @@ pub const PROGRAM: &str = "prefill";
 
 /// Runs the built-in prefill program over `tokens`; answers a watch on its
 /// full departure, taken while it runs.
-async fn run_prefill(tokens: &[u32]) -> Result<crate::planner::DepartureWatch> {
+/// Runs the built-in `prefill` program over `tokens`, its set keyed under
+/// the asker's `domain` (whatever scope the program asks).
+async fn run_prefill(
+    domain: Hash256,
+    tokens: &[u32],
+) -> Result<crate::planner::DepartureWatch> {
     use crate::inferlet::program;
     let reference = program::ProgramRef::parse(PROGRAM)?;
     let name = program::resolve(None, &reference)
@@ -1038,7 +1058,10 @@ async fn run_prefill(tokens: &[u32]) -> Result<crate::planner::DepartureWatch> {
         false,
         Some(tx),
         None,
-        crate::policy::Arrival::default(),
+        crate::policy::Arrival {
+            keys_under: Some(domain),
+            ..Default::default()
+        },
         Vec::new(),
     )?;
     rx.await

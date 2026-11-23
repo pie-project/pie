@@ -360,7 +360,7 @@ fn sealed(store: &mut KvStore, ws: WorkingSetId, tokens: &[u32]) {
 
 fn kept_and_gone(store: &mut KvStore, seed: u32, pages: u64, owner: ProcessId) -> Vec<u32> {
     let tokens = prompt(seed, pages);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     sealed(store, ws, &tokens);
     store.keep_checkpoint(ws, pages, Some(owner));
     store.release_working_set(ws, store.current_epoch());
@@ -369,7 +369,7 @@ fn kept_and_gone(store: &mut KvStore, seed: u32, pages: u64, owner: ProcessId) -
 }
 
 fn reader(store: &mut KvStore, tokens: &[u32], pages: u64) -> WorkingSetId {
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let keys = keys_ahead(store, ws, 0, tokens);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(ws, &run, pages).unwrap(), pages);
@@ -377,7 +377,7 @@ fn reader(store: &mut KvStore, tokens: &[u32], pages: u64) -> WorkingSetId {
 }
 
 fn on_device(store: &mut KvStore, tokens: &[u32]) -> usize {
-    let probe = store.create_working_set();
+    let probe = store.create_shared_working_set();
     let keys = keys_ahead(store, probe, 0, tokens);
     store.release_working_set(probe, store.current_epoch());
     let run = store.cached_run(&keys);
@@ -426,7 +426,7 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
     let mut store = KvStore::new(8, h(9));
     let (running, idle) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
     let tokens = prompt(5, 4);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     sealed(&mut store, ws, &tokens);
     for k in 1..=4 {
         store.keep_checkpoint(ws, k, Some(running));
@@ -461,7 +461,7 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
     // A reader of a shorter prefix spares only what it reads: the longer
     // entries go, and the pages only they held with them.
     let tokens = prompt(7, 4);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     sealed(&mut store, ws, &tokens);
     for k in 1..=4 {
         store.keep_checkpoint(ws, k, Some(idle));
@@ -504,7 +504,7 @@ fn a_dropped_entry_leaves_its_readers_whole() {
 
 fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     let mut store = KvStore::new_with_swap(4, 1, 2, h(42));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let before = commit_fresh(&mut store, ws, 3, 1);
     let sets = HashSet::from([ws]);
     let Some(txn) = store.prepare_suspend(&sets, |_| 0).unwrap() else {
@@ -543,7 +543,7 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     // A keeps a 3-page prompt and decodes on; B and C map it in and decode
     // a page each.
     let tokens = prompt(9, 3);
-    let a = store.create_working_set();
+    let a = store.create_shared_working_set();
     sealed(&mut store, a, &tokens);
     store.keep_checkpoint(a, 3, Some(ProcessId::from_u128(1)));
     commit_fresh(&mut store, a, 1, 1);
@@ -631,7 +631,7 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
     let mut store = KvStore::new_with_swap(12, 0, 12, h(13));
     let owner = ProcessId::from_u128(7);
     let tokens = prompt(13, 1);
-    let first = store.create_working_set();
+    let first = store.create_shared_working_set();
     sealed(&mut store, first, &tokens);
     store.keep_checkpoint(first, 1, Some(owner));
     let mut forks = vec![first];
@@ -666,7 +666,7 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
     // running: the last one's suspend takes it down.
     let mut store = KvStore::new_with_swap(12, 0, 12, h(14));
     let tokens = prompt(14, 1);
-    let first = store.create_working_set();
+    let first = store.create_shared_working_set();
     sealed(&mut store, first, &tokens);
     store.keep_checkpoint(first, 1, Some(owner));
     let forks: Vec<_> = std::iter::once(first)
@@ -689,7 +689,7 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
 fn an_entry_left_on_the_host_goes_when_swap_needs_room() {
     let mut store = KvStore::new_with_swap(5, 3, 0, h(12));
     let tokens = prompt(10, 3);
-    let w = store.create_working_set();
+    let w = store.create_shared_working_set();
     sealed(&mut store, w, &tokens);
     store.keep_checkpoint(w, 3, Some(ProcessId::from_u128(1)));
     let suspend = |store: &mut KvStore, ws| match store.prepare_suspend(&HashSet::from([ws]), |_| 0) {
@@ -700,7 +700,7 @@ fn an_entry_left_on_the_host_goes_when_swap_needs_room() {
     store.release_working_set(w, store.current_epoch());
     assert_eq!(store.host_swap_available(), 0);
 
-    let v = store.create_working_set();
+    let v = store.create_shared_working_set();
     commit_fresh(&mut store, v, 2, 1);
     assert_eq!(suspend(&mut store, v), 2);
     assert_eq!(on_device(&mut store, &tokens), 0);
@@ -746,9 +746,9 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
 #[test]
 fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
     let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
-    let a = store.create_working_set();
+    let a = store.create_shared_working_set();
     commit_fresh(&mut store, a, 2, 1);
-    let b = store.create_working_set();
+    let b = store.create_shared_working_set();
     commit_fresh(&mut store, b, 2, 1);
     store.mark_suspended(&HashSet::from([a, b]));
     let page = u64::from(store.page_size.max(1));
@@ -767,9 +767,9 @@ fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
 #[test]
 fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
-    let a = store.create_working_set();
+    let a = store.create_shared_working_set();
     commit_fresh(&mut store, a, 2, 1);
-    let b = store.create_working_set();
+    let b = store.create_shared_working_set();
     commit_fresh(&mut store, b, 2, 1);
     // Suspended with nothing moved, as a kv-less eviction leaves them.
     store.mark_suspended(&HashSet::from([a, b]));
@@ -812,7 +812,7 @@ fn keys_ahead(store: &KvStore, ws: WorkingSetId, start: u64, tokens: &[u32]) -> 
 
 fn keys_from_row_zero_are_hashed_without_the_store() {
     let mut store = KvStore::new(16, h(15));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let tokens: Vec<u32> = (0..40).map(|t| 900 + t).collect();
     let slots = store.slot_hashes(ws, 0, &tokens, 16).unwrap().unwrap();
     let keys = store.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
@@ -839,7 +839,7 @@ fn a_page_seals_under_a_key_that_names_its_prefix() {
     let mut store = KvStore::new(16, h(15));
     let tokens: Vec<u32> = (0..40).map(|t| 500 + t).collect();
     let fresh = |store: &mut KvStore| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         commit_opaque(store, ws, 3);
         ws
     };
@@ -883,12 +883,12 @@ fn a_page_seals_under_a_key_that_names_its_prefix() {
 fn keys_computed_ahead_find_what_another_sealed() {
     let mut store = KvStore::new(16, h(17));
     let tokens: Vec<u32> = (0..48).map(|t| 900 + t).collect();
-    let sealer = store.create_working_set();
+    let sealer = store.create_shared_working_set();
     commit_opaque(&mut store, sealer, 3);
     seal(&mut store, sealer, 0, &tokens[..20]);
     seal(&mut store, sealer, 20, &tokens[20..]);
 
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(keys.len(), 3);
     assert_eq!(store.cached_run(&keys).len(), 3);
@@ -914,7 +914,7 @@ fn keys_computed_ahead_find_what_another_sealed() {
 
 fn sealed_and_gone(store: &mut KvStore, tokens: &[u32], owner: ProcessId) {
     store.set_keeps(true);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, owner).unwrap();
     commit_opaque(store, ws, (tokens.len() as u64).div_ceil(16));
     seal(store, ws, 0, tokens);
@@ -935,7 +935,7 @@ fn a_working_set_that_goes_leaves_its_sealed_prefix() {
     let sets = store.cached_working_sets();
     assert_eq!(sets.len(), 1);
     assert_eq!((sets[0].owner, sets[0].pages), (owner, 2));
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 2);
 
@@ -947,7 +947,7 @@ fn a_working_set_that_goes_leaves_its_sealed_prefix() {
     let mut store = KvStore::new(16, h(19));
     sealed_and_gone(&mut store, &tokens, owner);
     store.set_keeps(false);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     commit_opaque(&mut store, ws, 3);
     seal(&mut store, ws, 0, &tokens);
     store.release_working_set(ws, store.current_epoch());
@@ -965,7 +965,7 @@ fn a_working_set_maps_in_what_another_sealed() {
     let held = 16 - store.available_pages() as u64;
     assert_eq!(held, 4);
 
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.reserve(ws, 5).unwrap();
     let keys = keys_ahead(&store, ws, 0, &tokens);
     let run = store.cached_run(&keys);
@@ -1002,7 +1002,7 @@ fn a_pass_maps_in_more_after_what_it_mapped_in() {
     let mut store = KvStore::new(16, h(21));
     let tokens: Vec<u32> = (0..64).map(|t| 500 + t).collect();
     sealed_and_gone(&mut store, &tokens, ProcessId::from_u128(9));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let keys = keys_ahead(&store, ws, 0, &tokens);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(ws, &run, 1).unwrap(), 1);
@@ -1012,7 +1012,7 @@ fn a_pass_maps_in_more_after_what_it_mapped_in() {
     assert_eq!(store.mapped_len(ws).unwrap(), 4);
 
     // Its own first page, computed, is not the path's: nothing maps in.
-    let own = store.create_working_set();
+    let own = store.create_shared_working_set();
     commit_opaque(&mut store, own, 1);
     seal(&mut store, own, 0, &tokens[..16]);
     let keys = keys_ahead(&store, own, 16, &tokens[16..]);
@@ -1025,10 +1025,10 @@ fn a_page_no_one_else_reads_is_written_in_place() {
     let mut store = KvStore::new(16, h(23));
     store.set_keeps(true);
     let tokens: Vec<u32> = (0..40).map(|t| 700 + t).collect();
-    let live = store.create_working_set();
+    let live = store.create_shared_working_set();
     commit_opaque(&mut store, live, 4);
     seal(&mut store, live, 0, &tokens);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(reader, &run, 2).unwrap(), 2);
@@ -1049,14 +1049,14 @@ fn a_lookup_takes_the_copy_on_the_device() {
     let mut store = KvStore::new(16, h(24));
     let tokens: Vec<u32> = (0..48).map(|t| 800 + t).collect();
     let copy = |store: &mut KvStore| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         commit_opaque(store, ws, 3);
         seal(store, ws, 0, &tokens);
         ws
     };
     copy(&mut store);
     copy(&mut store);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     let run = store.cached_run(&keys);
     assert_eq!(run.len(), 3);
@@ -1069,7 +1069,7 @@ fn a_lookup_takes_the_copy_on_the_device() {
 fn decoded(store: &mut KvStore, tokens: &[u32], prefilled: usize, logged: usize) -> WorkingSetId {
     store.set_keeps(true);
     store.set_page_size(16);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, ProcessId::from_u128(11)).unwrap();
     commit_opaque(store, ws, (tokens.len() as u64).div_ceil(16));
     let seq = store.log_begin(ws, 0).unwrap();
@@ -1099,7 +1099,7 @@ fn what_a_decode_folds_seals() {
     assert_eq!(store.sealed_in(ws, 0..3).unwrap(), [0, 1]);
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(
         store.cached_run(&keys).len(),
@@ -1116,7 +1116,7 @@ fn a_fire_that_never_settled_leaves_the_log_cut() {
     assert_eq!(store.fold(ws, 40, true).unwrap(), 0);
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 1);
 }
@@ -1127,7 +1127,7 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
     let (short, long) = (ProcessId::from_u128(12), ProcessId::from_u128(13));
     sealed_and_gone(&mut store, &tokens[..32], short);
     // `long` maps in the two pages, seals a third, and goes.
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, long).unwrap();
     let keys = keys_ahead(&store, ws, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
@@ -1146,7 +1146,7 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
             .last_use
     };
     assert!(last_use(&store, long) >= last_use(&store, short));
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(reader, &run, 2).unwrap(), 2);
@@ -1164,7 +1164,7 @@ fn what_decode_wrote_is_reclaimed_before_the_prompt() {
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.cached_working_sets()[0].entries, 2);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 2);
     assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 1);
@@ -1196,7 +1196,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     );
 
     // A hit: the run in any tier comes up, held until it is mapped in.
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     let run = store.cached_run_any_tier(&keys);
     assert_eq!((run.len(), store.below_device(&run)), (3, 3));
@@ -1239,7 +1239,7 @@ fn an_exited_owner_holds_its_kv_until_its_working_set_is_released() {
     store.set_keeps(true);
     let (owner, other) = (ProcessId::from_u128(25), ProcessId::from_u128(26));
     let tokens: Vec<u32> = (0..32).map(|t| 500 + t).collect();
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, owner).unwrap();
     commit_opaque(&mut store, ws, 2);
     seal(&mut store, ws, 0, &tokens);
@@ -1259,7 +1259,7 @@ fn a_suspend_short_of_host_room_drops_host_cache_first() {
     let txn = store.prepare_demote(8, |_| 1).unwrap().unwrap();
     store.commit_suspend(txn).unwrap();
     assert_eq!(store.host_swap_available(), 0);
-    let running = store.create_working_set();
+    let running = store.create_shared_working_set();
     commit_fresh(&mut store, running, 2, 1);
     let Some(txn) = store.prepare_suspend(&HashSet::from([running]), |_| 0).unwrap() else {
         panic!("two pages to move");
@@ -1357,7 +1357,7 @@ fn on_the_host_the_lower_set_goes_first() {
         .expect("four pages to park");
     store.commit_suspend(txn).unwrap();
     let below = |store: &mut KvStore, tokens: &[u32]| {
-        let probe = store.create_working_set();
+        let probe = store.create_shared_working_set();
         let found = keys_ahead(store, probe, 0, tokens);
         store.release_working_set(probe, store.current_epoch());
         store.cached_run_any_tier(&found).len()
@@ -1386,7 +1386,7 @@ fn a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host() {
         assert_eq!(store.host_swap_available(), 0, "the host is full");
         sealed_and_gone(&mut store, &a_tokens, a);
         let below = |store: &mut KvStore, tokens: &[u32]| {
-            let probe = store.create_working_set();
+            let probe = store.create_shared_working_set();
             let found = keys_ahead(store, probe, 0, tokens);
             store.release_working_set(probe, store.current_epoch());
             store.cached_run_any_tier(&found).len()
@@ -1509,7 +1509,7 @@ fn idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted() {
     store.commit_suspend(txn).unwrap();
     store.retire_idle();
     assert_eq!(on_device(&mut store, &tokens), 0);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(
         store.cached_run_any_tier(&keys).len(),
@@ -1886,7 +1886,7 @@ fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
     sealed_and_gone(&mut store, &tokens, ProcessId::from_u128(1));
 
     let asker = ProcessId::from_u128(2);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, asker).unwrap();
     store.set_persist_hint(asker, Some(32));
     store.reserve(ws, 4).unwrap();
@@ -1902,7 +1902,7 @@ fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
 #[test]
 fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
     let mut s = KvStore::new_with_swap(8, 8, 0, h(40));
-    let a = s.create_working_set();
+    let a = s.create_shared_working_set();
     commit_fresh(&mut s, a, 3, 1);
     let b = s.fork(a).unwrap();
     s.set_parked(a, true);
@@ -2016,7 +2016,12 @@ fn a_waiting_prompt_finds_its_cached_prefix_and_loses_it_when_evicted() {
     let stores = registry::all_for_model(model);
     let tokens: Vec<u32> = (0..64).map(|t| 700 + t).collect();
     let waiter = ProcessId::from_u128(71);
-    waits(&stores, waiter, &tokens);
+    waits(
+        &stores,
+        waiter,
+        &crate::policy::share::test_tenant(),
+        &tokens,
+    );
     assert_eq!(found(&stores, waiter), (0, Some(0)), "nothing cached yet");
 
     let other: Vec<u32> = (0..64).map(|t| 900 + t).collect();
@@ -2071,12 +2076,12 @@ fn a_prefix_computed_twice_maps_whole_from_either_copy() {
             .collect()
     };
     let computed = |store: &mut KvStore, tail: u32| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         commit_opaque(store, ws, 3);
         seal(store, ws, 0, &prompt(tail));
     };
     let look = |store: &mut KvStore, tail: u32| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         let keys = keys_ahead(store, ws, 0, &prompt(tail));
         let run = store.cached_run(&keys);
         let mapped = store.attach_run(ws, &run, 2).unwrap();
@@ -2105,9 +2110,30 @@ fn a_prefix_computed_twice_maps_whole_from_either_copy() {
 #[test]
 fn a_release_with_nothing_in_flight_frees_its_pages_at_once() {
     let mut store = KvStore::new(8, h(11));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     commit_opaque(&mut store, ws, 3);
     let before = store.available_pages();
     store.release_working_set(ws, store.current_epoch());
     assert_eq!(store.available_pages(), before + 3, "free now, no retire asked");
+}
+
+/// The directory hears of a shared set's sealed pages, never a private
+/// set's: their keys are unmatchable, and their count would tell of it.
+#[test]
+fn only_a_shared_sets_sealed_keys_are_published() {
+    let mut store = KvStore::new(16, h(43));
+    let tokens: Vec<u32> = (0..32).map(|t| 4100 + t).collect();
+    let shared = store.create_shared_working_set();
+    commit_opaque(&mut store, shared, 2);
+    assert_eq!(seal(&mut store, shared, 0, &tokens), 2);
+    let private = store.create_working_set();
+    commit_opaque(&mut store, private, 2);
+    assert_eq!(seal(&mut store, private, 0, &tokens), 2, "it seals as any set does");
+    let published: HashSet<Hash256> = store.sealed_key_list(&store.node_ids()).into_iter().collect();
+    let keys = |store: &KvStore, ws| keys_ahead(store, ws, 0, &tokens);
+    let shared_keys = keys(&store, shared);
+    let private_keys = keys(&store, private);
+    assert!(shared_keys.iter().all(|key| published.contains(key)));
+    assert!(private_keys.iter().all(|key| !published.contains(key)));
+    assert_eq!(published.len(), 2, "the shared set's two pages, nothing more");
 }

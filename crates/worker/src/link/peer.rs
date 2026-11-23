@@ -212,6 +212,7 @@ impl Peer for PeerServer {
         let started = Instant::now();
         let bulk = listen().ok_or("this worker serves no bulk link")?;
         let pages = runtime::offload::prefill::serve(
+            request.domain,
             request.tokens,
             request.from_page,
             request.home,
@@ -349,6 +350,7 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
 
     fn prefill(
         &self,
+        domain: [u8; 32],
         tokens: Vec<u32>,
         from_page: u32,
         delivery: runtime::offload::prefill::Delivery,
@@ -364,6 +366,7 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
                 .prefill(
                     ctx,
                     Prefill {
+                        domain,
                         tokens,
                         from_page,
                         home,

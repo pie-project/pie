@@ -122,6 +122,9 @@ struct KvTrieNode {
     parent: Option<NodeId>,
     children: SmallVec<[NodeId; 2]>,
     pages: Pages,
+    /// Its sealed pages are a shared set's (or came from elsewhere by key):
+    /// what the directory hears of. A private set's keys are never told.
+    published: bool,
     exact_anchors: u32,
     path_anchors: u32,
 }
@@ -424,6 +427,7 @@ impl KvPageTable {
                         token_hashes,
                         page_hashes,
                     },
+                    published: false,
                     exact_anchors: 0,
                     path_anchors: 0,
                 });
@@ -628,11 +632,14 @@ impl KvPageTable {
         Ok(self.page_hash_at(ws, index)?.is_some())
     }
 
+    /// `published`: `ws` shares, so the pages it seals are told to the
+    /// directory.
     pub fn commit_hashes(
         &mut self,
         ws: WorkingSetId,
         first: u64,
         pages: Vec<(Vec<Option<Hash256>>, Option<Hash256>)>,
+        published: bool,
     ) -> Result<(), KvTableError> {
         let entry = self.entry(ws)?;
         let end = first + pages.len() as u64;
@@ -651,7 +658,9 @@ impl KvPageTable {
                 .copied()
                 .expect("published mapping covers [0, mapped_len)");
             let (owner, local) = self.resolve_owner(seg.node, (index as i64 - seg.start) as u64);
-            match &mut self.nodes.get_mut(owner).expect("live node").pages {
+            let node = self.nodes.get_mut(owner).expect("live node");
+            node.published |= published && page.is_some();
+            match &mut node.pages {
                 Pages::Owned {
                     token_hashes,
                     page_hashes,
@@ -963,6 +972,9 @@ impl KvPageTable {
     pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
         let mut keys = Vec::new();
         for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
+            if !node.published {
+                continue;
+            }
             if let Pages::Owned { page_hashes, .. } = &node.pages {
                 keys.extend(page_hashes.iter().flatten().copied());
             }
@@ -1027,6 +1039,7 @@ impl KvPageTable {
                 token_hashes,
                 page_hashes: page_hashes.into_iter().map(Some).collect(),
             },
+            published: true,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -1388,6 +1401,7 @@ impl KvPageTable {
             parent: Some(owner),
             children: SmallVec::new(),
             pages: Pages::ParentSelection { runs },
+            published: false,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -2108,6 +2122,7 @@ impl KvPageTable {
                 token_hashes,
                 page_hashes,
             },
+            published: false,
             exact_anchors: 0,
             path_anchors: 0,
         });

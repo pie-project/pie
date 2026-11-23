@@ -1452,10 +1452,14 @@ impl RsStore {
         if at == window.committed {
             return self.checkpoint(ws, key, owner);
         }
-        if at == 0 || at > window.committed || self.holds_host(entry) || self.unsettled(ws) {
+        if at == 0 || at > window.committed || self.holds_host(entry) {
             return Ok(false);
         }
         self.device_fold_gate(ws)?;
+        // Only the slots wholly behind `at` must have landed: a later fire of
+        // the same pass (a cut's next piece) may be on its way already, and it
+        // writes from `at` on, so it is no reason to refuse.
+        let busy = self.busy_slots();
         let mut snapshot = entry.clone();
         let mut state = WindowState {
             committed: at,
@@ -1467,6 +1471,14 @@ impl RsStore {
             let first = (at.saturating_sub(geom.window) / tokens) as usize;
             let end = at.div_ceil(tokens) as usize;
             if table.len() < end || table[first..end].iter().any(Option::is_none) {
+                return Ok(false);
+            }
+            let whole = (at / tokens) as usize;
+            if table[first..whole.max(first)]
+                .iter()
+                .flatten()
+                .any(|id| busy.contains(id))
+            {
                 return Ok(false);
             }
             table.truncate(end);

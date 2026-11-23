@@ -551,6 +551,202 @@ fn window_geometry() -> crate::store::rs::RsGeometry {
     }
 }
 
+/// A pass cut so its window checkpoint is a piece's own end (64, the end of
+/// 0..64), with the next piece (64..72) on its way before the first settles:
+/// each piece keeps what 64's windows reach, so the checkpoint is taken at the
+/// first piece's settle though the next one writes, and a later pass adopts
+/// it at 64 by its key. Without the keep across the cut the next piece's
+/// advance trims narrow 5 (rows 40..48), which 64 reaches; without taking it
+/// beside the piece in flight it is refused outright.
+#[test]
+fn a_window_checkpoint_on_a_cut_is_kept_and_found() {
+    use crate::pipeline::fire::rs::settle;
+    let (facts, shared, stores) = windowed_stores();
+    let mut rs = stores.rs.lock().unwrap();
+    let ws = rs.create_working_set(window_geometry());
+    let first = window_fire_keeping(&mut rs, ws, 0..64, None, Some(64));
+    let (narrow, wide) = window_tables(&first, &shared);
+    // The next piece is prepared (its writes in flight) before the first
+    // settles, as the pass's pieces go out.
+    let next = window_fire_keeping(&mut rs, ws, 64..72, None, Some(64));
+    settle(&mut rs, first.txn);
+    rs.retire_idle();
+    assert!(
+        rs.checkpoint_at(ws, [7; 32], None, 64).unwrap(),
+        "the checkpoint on the cut is taken beside the piece in flight"
+    );
+    settle(&mut rs, next.txn);
+    rs.release_working_set(ws);
+    rs.retire_idle();
+
+    // The next pass finds it by its key and stands at 64 on the slots it took.
+    let warm = rs.create_working_set(window_geometry());
+    assert!(rs.adopt_checkpoint(warm, &[7; 32]).unwrap());
+    assert_eq!(rs.window_positions(warm), Ok(Some((64, 64))));
+    let out = window_fire(&mut rs, warm, 64..65, None);
+    let lane = shared_lanes(&out, &shared, 1).remove(0);
+    lane.validate_chunks(&facts).unwrap();
+    let (n64, w64) = window_tables(&out, &shared);
+    assert_eq!(n64[5..8], narrow[5..8]);
+    assert_eq!(w64[..4], wide[..4]);
+    settle(&mut rs, out.txn);
+}
+
+/// The window lists' rows as a device holds them: each slot (by shape and
+/// engine id) a row tag per position, written as fires' lanes name them.
+#[derive(Default)]
+struct WindowDevice(std::collections::BTreeMap<(EngineShape, u32), Vec<Option<(u32, u32)>>>);
+
+impl WindowDevice {
+    /// Each window list's `(shape, tokens a slot)`.
+    const LISTS: [(EngineShape, u32); 2] = [(RING, 16), (NARROW, 8)];
+
+    /// A fire of `lane` landing rows `rows`, tagged `pass`: its slot copies
+    /// first, then each row at its slot's position.
+    fn fire(&mut self, lane: &Lane, rows: std::ops::Range<u32>, pass: u32) {
+        for (shape, pairs) in &lane.slot_copies {
+            for &[src, dst] in pairs {
+                let held = self.0.get(&(*shape, src)).cloned().unwrap_or_default();
+                self.0.insert((*shape, dst), held);
+            }
+        }
+        for (shape, tokens) in Self::LISTS {
+            let table = Self::table(lane, shape);
+            for row in rows.clone() {
+                let id = table[(row / tokens) as usize];
+                assert_ne!(id, 0, "row {row} of {shape:?} lands on a slot");
+                let cells = self.0.entry((shape, id)).or_default();
+                cells.resize(tokens as usize, None);
+                cells[(row % tokens) as usize] = Some((pass, row));
+            }
+        }
+    }
+
+    /// What `lane` reads of rows `rows` of list `shape`.
+    fn read(&self, lane: &Lane, shape: EngineShape, tokens: u32, rows: std::ops::Range<u32>) -> Vec<Option<(u32, u32)>> {
+        let table = Self::table(lane, shape);
+        rows.map(|row| {
+            self.0
+                .get(&(shape, table[(row / tokens) as usize]))
+                .and_then(|cells| cells.get((row % tokens) as usize).copied().flatten())
+        })
+        .collect()
+    }
+
+    fn table(lane: &Lane, shape: EngineShape) -> Vec<u32> {
+        lane.tables
+            .iter()
+            .find(|(id, _)| *id == shape)
+            .map(|(_, refs)| refs.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// A checkpoint mid-slot (60: 12 rows into wide slot 3, 4 into narrow 7),
+/// taken at its piece's settle beside the next piece (60..100) already on
+/// its way: that piece writes rows 60.. into the slots the checkpoint shares,
+/// and goes far enough that its windows move past every slot the checkpoint
+/// reads. Settled before the adopt, it leaves the checkpoint's rows as a cold
+/// fold to 60 has them: a slot's rows past 60 are another position of the
+/// slot (a list's slot `i` holds rows `[i T, (i + 1) T)`, never wrapping), and
+/// the slots the pass retires the checkpoint holds by refcount. The adopter's
+/// first write into a shared slot copies it first (`RsBufferTarget::Cow`).
+/// A cold fold after the pass, and sets live beside it, write none of the
+/// checkpoint's slots; two resumes from it each write their own copy.
+#[test]
+fn a_mid_slot_window_checkpoint_reads_what_a_cold_fold_does() {
+    use crate::pipeline::fire::rs::settle;
+    const AT: u32 = 60;
+    let (_facts, shared, stores) = windowed_stores();
+    let mut rs = stores.rs.lock().unwrap();
+    let mut device = WindowDevice::default();
+    let ws = rs.create_working_set(window_geometry());
+    let first = window_fire_keeping(&mut rs, ws, 0..AT, None, Some(AT));
+    let first_lane = shared_lanes(&first, &shared, 1).remove(0);
+    let next = window_fire_keeping(&mut rs, ws, AT..100, None, Some(AT));
+    let next_lane = shared_lanes(&next, &shared, 1).remove(0);
+    device.fire(&first_lane, 0..AT, 1);
+    settle(&mut rs, first.txn);
+    rs.retire_idle();
+    assert!(rs.checkpoint_at(ws, [9; 32], None, AT).unwrap());
+    // The next piece was laid before the checkpoint shared its slots: it
+    // writes them in place, rows 60.. of them.
+    device.fire(&next_lane, AT..100, 1);
+    settle(&mut rs, next.txn);
+    rs.release_working_set(ws);
+    rs.retire_idle();
+
+    // A cold fold to 60 on a set of its own.
+    let cold_ws = rs.create_working_set(window_geometry());
+    let cold = window_fire(&mut rs, cold_ws, 0..AT, None);
+    let cold_lane = shared_lanes(&cold, &shared, 1).remove(0);
+    // Its own tag: a slot it takes that the checkpoint still reads shows.
+    device.fire(&cold_lane, 0..AT, 3);
+    settle(&mut rs, cold.txn);
+
+    // Other sets live beside it take the slots the pass let go, each
+    // written with a tag of its own: a slot the checkpoint reads that went
+    // back to the pool shows.
+    let fillers: Vec<_> = (0..4)
+        .map(|_| {
+            let filler = rs.create_working_set(window_geometry());
+            let out = window_fire(&mut rs, filler, 0..AT, None);
+            device.fire(&shared_lanes(&out, &shared, 1).remove(0), 0..AT, 4);
+            settle(&mut rs, out.txn);
+            filler
+        })
+        .collect();
+
+    let warm = rs.create_working_set(window_geometry());
+    assert!(rs.adopt_checkpoint(warm, &[9; 32]).unwrap());
+    assert_eq!(rs.window_positions(warm), Ok(Some((AT, AT))));
+    let resume = window_fire(&mut rs, warm, AT..AT + 1, None);
+    let lane = shared_lanes(&resume, &shared, 1).remove(0);
+    for (shape, tokens) in WindowDevice::LISTS {
+        let whole = WindowDevice::table(&lane, shape)[(AT / tokens) as usize];
+        let shared_slot = WindowDevice::table(&first_lane, shape)[(AT / tokens) as usize];
+        assert!(
+            lane.slot_copies
+                .iter()
+                .any(|(id, pairs)| *id == shape && pairs.contains(&[shared_slot, whole])),
+            "{shape:?}: the resume copies the shared slot {shared_slot} before writing row {AT}"
+        );
+    }
+    device.fire(&lane, AT..AT + 1, 2);
+    for (shape, tokens) in WindowDevice::LISTS {
+        let window = if shape == RING { 64 } else { 24 };
+        let reach = AT.saturating_sub(window)..AT;
+        let warm_rows = device.read(&lane, shape, tokens, reach.clone());
+        let cold_rows = device.read(&cold_lane, shape, tokens, reach.clone());
+        let row_of = |cells: &[Option<(u32, u32)>]| cells.iter().map(|cell| cell.map(|(_, row)| row)).collect::<Vec<_>>();
+        assert_eq!(row_of(&warm_rows), row_of(&cold_rows), "{shape:?}: the rows a cold fold reads");
+        assert!(cold_rows.iter().all(|cell| cell.is_some_and(|(pass, _)| pass == 3)));
+        assert!(
+            warm_rows.iter().zip(reach).all(|(cell, row)| *cell == Some((1, row))),
+            "{shape:?}: the checkpoint's rows are the pass's own, {warm_rows:?}"
+        );
+        assert_eq!(device.read(&lane, shape, tokens, AT..AT + 1), [Some((2, AT))]);
+    }
+    settle(&mut rs, resume.txn);
+
+    // A second resume from the checkpoint copies the shared slot again: its
+    // row 60 is its own, the first resume's is the first's.
+    let again = rs.create_working_set(window_geometry());
+    assert!(rs.adopt_checkpoint(again, &[9; 32]).unwrap());
+    let out = window_fire(&mut rs, again, AT..AT + 1, None);
+    let second = shared_lanes(&out, &shared, 1).remove(0);
+    device.fire(&second, AT..AT + 1, 5);
+    for (shape, tokens) in WindowDevice::LISTS {
+        assert_eq!(device.read(&second, shape, tokens, AT..AT + 1), [Some((5, AT))]);
+        assert_eq!(device.read(&lane, shape, tokens, AT..AT + 1), [Some((2, AT))], "{shape:?}");
+        let window = if shape == RING { 64 } else { 24 };
+        let reach = AT.saturating_sub(window)..AT;
+        assert!(device.read(&second, shape, tokens, reach.clone()).iter().zip(reach).all(|(cell, row)| *cell == Some((1, row))));
+    }
+    settle(&mut rs, out.txn);
+    drop(fillers);
+}
+
 /// (c3) A window pass ending inside a page keeps its checkpoint at the page
 /// boundary before its end: the fire trims nothing that boundary's windows
 /// reach, so the checkpoint holds the slots `[at - window, at)` touches. Had

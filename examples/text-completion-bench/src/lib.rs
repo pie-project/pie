@@ -71,6 +71,10 @@ struct Input {
     /// For a plane whose channel rings belong to the pass instance, not the channel.
     #[serde(default)]
     host_first_token: bool,
+    /// Ask the runtime to keep the prompt's state at its end (`checkpoints`),
+    /// so a later pass sharing the prompt resumes there.
+    #[serde(default)]
+    checkpoint_prompt_end: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -334,7 +338,8 @@ async fn run_one(
     let prefill_rng = Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]);
     let (temperature, top_p, top_k) = (input.temperature, input.top_p, input.top_k);
 
-    let ws = WorkingSet::new();
+    // A bench's prompts share their prefixes across its requests.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
     let n = prompt_vec.len() as u32;
     step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
     // Nothing to reserve; the empty step keeps `prologue_us`'s shape.
@@ -378,6 +383,10 @@ async fn run_one(
     fwd_p
         .state(&[&ws], StateGeometry::folding())
         .context("bind prefill state")?;
+    if input.checkpoint_prompt_end {
+        let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
+        fwd_p.checkpoints(&[end]).context("ask the prompt end's checkpoint")?;
+    }
     let prefill_knobs = SampleKnobs::new(temperature, top_p, top_k);
     fwd_p.epilogue(move || {
         let carried_on = tok_in.map(|tok_in| (tok_in.traced(), None));

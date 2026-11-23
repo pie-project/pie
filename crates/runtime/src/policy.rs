@@ -10,6 +10,7 @@ pub mod pressure;
 pub mod retention;
 pub mod schedule;
 pub mod grants;
+pub mod share;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod port;
@@ -58,6 +59,10 @@ pub struct Arrival {
     pub tenant: String,
     pub session: Option<String>,
     pub props: Props,
+    /// Set by the runtime alone, for a pass a peer offloaded here: the
+    /// asking set's domain, which the pass keys under whatever scope it
+    /// asks ([`share`]). Never from a client.
+    pub keys_under: Option<crate::store::kv::hash::Hash256>,
 }
 
 /// A resting handle, for the worker policy to read.
