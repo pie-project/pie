@@ -273,7 +273,35 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
         let pair: Vec<u64> = self.pair_sets(program, extents)?.iter().map(|s| s.2).collect();
         let instance = self.instance_sets(program, extents)?;
-        Ok(guest::guest_state(&pair, &instance, self.resident_of(program), room_of(pools)?))
+        let state = guest::guest_state(&pair, &instance, self.resident_of(program), room_of(pools)?);
+        // A place lies in one run of a segment's chunks: a run past a segment
+        // can never be opened, compaction or not, so it is refused here by
+        // name rather than asked of the pool (where a restore waited on it
+        // for good: Mac Pro's w32 on the M5, a run of 57 past a segment's 35).
+        let segment = pools.chunk_facts().segment_chunks;
+        if state.run > segment {
+            let chunk = pools.chunk_bytes();
+            let mut why = format!(
+                "program {program_id}'s guest state at these extents takes a run of {} chunks of \
+                 {chunk} bytes (its scratch {} bytes, resident {}), past a segment's {segment}: \
+                 a run never spans segments",
+                state.run, state.scratch, state.resident
+            );
+            // A beam group's scratch grows with its beams (its rows): the
+            // widest group whose place fits a segment, at this scratch a beam.
+            if let Some(layout) = self.beam_of(program) {
+                let per_beam = state.scratch.div_ceil(u64::from(layout.lanes.max(1)));
+                let fits = (u64::from(segment) * chunk / per_beam.max(1))
+                    .min(u64::from(self.beam_max_lanes));
+                why.push_str(&format!(
+                    "; a group of {} beams, and this load holds about {fits} a group at \
+                     {per_beam} bytes of scratch a beam",
+                    layout.lanes
+                ));
+            }
+            return Err(Fault::program("program::plane", why));
+        }
+        Ok(state)
     }
 
     /// The bytes an instance of `program` keeps resident in its place
@@ -4733,6 +4761,74 @@ mod tests {
             .expect("the slots rebind");
         names_status(&mut plane);
         assert_eq!(peak(&mut plane, 789), vec![789, 789]);
+    }
+
+    /// A guest state whose place needs a run past a segment is refused by
+    /// name at guest_state, naming the run, the segment and (for a beam
+    /// group) the widest group this load holds, never asked of the pool,
+    /// where a restore waited on a run that can never open (Mac Pro's w32
+    /// on the M5). The same program over a pool whose segment holds its run
+    /// is stated as before.
+    #[test]
+    fn a_place_past_a_segment_is_refused_by_name() {
+        use eta_compiler::codegen::program::{Backend, emit_program};
+        use eta_compiler::contract::beam_stage;
+        use eta_compiler::plan::compile_bound;
+        let Ok(context) = Context::bind() else {
+            eprintln!("no device: skipping");
+            return;
+        };
+        let case = beam_stage().into_iter().next().expect("a beam case");
+        let parents = case
+            .bound
+            .container
+            .channels
+            .iter()
+            .position(|channel| {
+                channel.dtype == eta_ir::container::ChanDType::Concrete(eta_ir::Dtype::U32)
+                    && channel.shape.dims() == [case.rows]
+            })
+            .expect("a parents channel");
+        let stages = compile_bound(&case.bound);
+        let backend = Backend::parse("metal").expect("the metal codegen");
+        let mut launch = eta_compiler::codegen::launch::build(&case.bound, &stages);
+        launch.ports.push(eta_compiler::codegen::launch::LaunchPort {
+            port: eta_ir::registry::Port::Parents,
+            channel: u32::try_from(parents).expect("a channel index"),
+            ..Default::default()
+        });
+        let registration = ProgramRegistration {
+            program_hash: 0xbea5_0001,
+            emitted_kernels: emit_program(backend, &stages, &case.bound),
+            emitter_version: backend.emitter_version(),
+            launch,
+            ..Default::default()
+        };
+        let extents = Extents {
+            row_count: case.rows,
+            sampled_rows: case.rows,
+            query_len: case.rows,
+            ..Extents::default()
+        };
+        let mut plane = Plane::new();
+        plane.set_flight(1, 1, case.rows);
+        plane.set_beam_bounds(4, 2);
+        plane.set_beam_max_lanes(kernels_metal::runtime::beam::max_lanes(32 << 10, 0));
+        let program = plane.register(&context, &registration).expect("the program registers");
+
+        let roomy = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+        let state = plane.guest_state(&roomy, program, &extents).expect("its place fits a segment");
+        // A pool of small chunks a segment each: the same place's run is past it.
+        let small = 16u64 << 10;
+        let tight = crate::store::Pools::guests_over(&context, small, 4096, 1).expect("a tight pool");
+        let needs = (state.resident + state.scratch).div_ceil(small);
+        assert!(needs > 1, "the place takes more than one {small}-byte chunk: {state:?}");
+        let refused = plane
+            .guest_state(&tight, program, &extents)
+            .expect_err("a run past a segment is refused");
+        let why = refused.to_string();
+        assert!(why.contains("past a segment's 1"), "named by its segment: {why}");
+        assert!(why.contains("beams"), "named for the beam group: {why}");
     }
 
     /// A beam group's state is resident in its instance's place
