@@ -1026,9 +1026,21 @@ impl Pools {
             act_replay: self
                 .act_chunks
                 .iter()
-                .map(|&(tokens, _)| engine::RungReplay::floor(tokens))
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(crate::rs::carried_room(tokens)),
+                    // Each window's scratch is laid for the rung's carried
+                    // rows (`crate::rs::carried_room`): no bytes beyond.
+                    scratch: engine::ScratchBytes {
+                        slot_bytes: Vec::new(),
+                        lane_bytes: 0,
+                        room_bytes: 0,
+                        pad: 1,
+                    },
+                })
                 .collect(),
             rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

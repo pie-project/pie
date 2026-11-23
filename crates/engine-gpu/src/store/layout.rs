@@ -488,9 +488,21 @@ impl Layout {
             // (`crate::arena`'s rung check); no bound on the two together.
             act_replay: act_chunks
                 .iter()
-                .map(|&(tokens, _)| engine::RungReplay::floor(tokens))
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(tokens),
+                    // The replay lies in the rung's own rooms, laid for its
+                    // tokens of own and of carried rows: no bytes beyond.
+                    scratch: engine::ScratchBytes {
+                        slot_bytes: Vec::new(),
+                        lane_bytes: 0,
+                        room_bytes: 0,
+                        pad: 1,
+                    },
+                })
                 .collect(),
             rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

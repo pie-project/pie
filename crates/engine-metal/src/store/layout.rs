@@ -556,22 +556,11 @@ impl Layout {
             .collect(),
             shapes,
             act_chunks: self.act().to_vec(),
-            // Each rung's rs scratch is laid for its tokens of own rows and
-            // as many carried (`serve`'s `rs_room`: `scratch_rows(T + T)`):
-            // own T, carried T (a decode lane's none), 2T together.
-            act_replay: self
-                .act()
-                .iter()
-                .map(|&(tokens, _)| engine::RungReplay {
-                    own_max: Some(tokens),
-                    carried_max: Some(tokens),
-                    total_max: Some(tokens.saturating_mul(2)),
-                })
-                .collect(),
-            // The load's rs layout's compactness is `rs::compact(trace)`
-            // with its rs page table staged (Mac's branch states it); a
-            // fire's own is decided only by `engine::fire::scratch_compact`.
+            // Each rung's rs scratch, from its reserve: the shell states it
+            // (`Shell::pool_chunk_facts`).
+            act_replay: Vec::new(),
             rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,

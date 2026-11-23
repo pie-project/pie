@@ -896,8 +896,8 @@ struct FireRows {
 }
 
 impl FireRows {
-    /// The rows a rung of the contract's floor ([`::engine::RungReplay::floor`])
-    /// must hold for these: its own and its carried rows each.
+    /// The rows a rung must hold for these: its own and its carried rows
+    /// each.
     #[cfg(test)]
     fn ask(self) -> u32 {
         self.own.max(self.carried)
@@ -1022,6 +1022,7 @@ fn replay_rung(
     engine: usize,
     rows: FireRows,
     replayed: u32,
+    lanes: u32,
     compact: bool,
 ) -> Result<u32, String> {
     let holds = crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
@@ -1033,17 +1034,20 @@ fn replay_rung(
         .map_or_else(Vec::new, |shared| shared.lock().unwrap().rung_replays());
     rungs.retain(|&(tokens, _)| tokens <= holds);
     if rungs.is_empty() {
-        rungs.push((holds, ::engine::RungReplay::floor(holds)));
+        // No rung stated (pinned pools): one fire's tokens, its own and
+        // carried rows each, the engine's scratch its own to check.
+        rungs.push((holds, crate::store::shared::rows_only(holds)));
     }
-    let count = ::engine::ReplayRows::of_sums(rows.own, rows.carried, replayed, compact);
+    let count = ::engine::ReplayRows::of_sums(rows.own, rows.carried, replayed, lanes, compact);
     let floor = rows.own.max(rows.carried);
     let mut first = true;
     let mut past = None;
-    for &(tokens, bound) in &rungs {
+    for (tokens, bound) in &rungs {
+        let tokens = *tokens;
         if tokens < floor {
             continue;
         }
-        match ::engine::fire::rung_holds(&bound, count) {
+        match ::engine::fire::rung_holds(bound, count) {
             Ok(()) => return Ok(if first { floor } else { tokens }),
             Err(why) => past = Some((tokens, why)),
         }
@@ -1052,8 +1056,9 @@ fn replay_rung(
     let (tokens, why) = match past {
         Some(past) => past,
         None => {
-            let &(tokens, bound) = rungs.last().expect("one rung at least");
-            match ::engine::fire::rung_holds(&bound, count) {
+            let (tokens, bound) = rungs.last().expect("one rung at least");
+            let tokens = *tokens;
+            match ::engine::fire::rung_holds(bound, count) {
                 Ok(()) => return Ok(tokens),
                 Err(why) => (tokens, why),
             }
@@ -1089,11 +1094,17 @@ fn pieces_rung(
             engine,
             piece_rows(full, piece, frozen, behind),
             piece_replayed(full, piece, frozen, behind),
+            piece_lanes(piece),
             scratch.compact(stores, full, piece, frozen, behind),
         )?;
         widest = widest.max(rows);
     }
     Ok(widest)
+}
+
+/// The lanes with rows in `piece`.
+fn piece_lanes(piece: &[Option<(u32, u32)>]) -> u32 {
+    u32::try_from(piece.iter().filter(|cut| cut.is_some()).count()).unwrap_or(u32::MAX)
 }
 
 /// What a host pass's pieces' rs scratch is laid by
@@ -1133,12 +1144,17 @@ impl PassScratch<'_> {
                 continue;
             };
             let folded = if folded_behind { start } else { state };
-            let lineage = if self.shared.get(lane).copied().unwrap_or(false) {
+            let shared = self.shared.get(lane).copied().unwrap_or(false);
+            let lineage = if shared {
                 ::engine::fire::Lineage::Admitted
             } else {
                 ::engine::fire::Lineage::Set
             };
-            one_run &= ::engine::fire::lane_one_run(rows.mask.as_ref(), folded, start, lineage);
+            // A lane sharing its set whose mask the host does not state (the
+            // device resolves it) reads slots the host cannot name: not one
+            // run as far as it can say.
+            one_run &= !(shared && rows.mask.is_none())
+                && ::engine::fire::lane_one_run(rows.mask.as_ref(), folded, start, lineage);
         }
         let snapshots = match kept.as_slice() {
             [(start, end)] => {
@@ -1160,8 +1176,13 @@ fn fire_compact(
     any_lane_snapshots: bool,
 ) -> bool {
     stores.shared.as_ref().is_some_and(|shared| {
-        let layout = shared.lock().unwrap().rs_compact();
-        ::engine::fire::scratch_compact(layout, every_lane_one_run, any_lane_snapshots)
+        let pool = shared.lock().unwrap();
+        ::engine::fire::scratch_compact(
+            pool.rs_compact(),
+            pool.rs_scratch_per_fire(),
+            every_lane_one_run,
+            any_lane_snapshots,
+        )
     })
 }
 
@@ -4750,6 +4771,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             engine,
             FireRows { own: 0, carried },
             replayed,
+            piece_lanes(&whole),
             whole_compact,
         ) {
             return Ok(Err(refusal));
@@ -4966,6 +4988,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 engine,
                 counted,
                 piece_replayed(&full, piece, &frozen, folds_each && at > 0),
+                piece_lanes(piece),
                 scratch.compact(&stores, &full, piece, &frozen, folds_each && at > 0),
             ) {
                 Ok(width) => width,
@@ -6544,7 +6567,9 @@ async fn fire_device_geometry<C: FireContext>(
         .iter()
         .all(|(_, lanes)| lanes.len() == 1 || frozen[lanes[0]].is_none());
     let compact = fire_compact(&stores, every_lane_one_run, false);
-    let rows = match replay_rung(&stores, ws.engine, counted, replayed, compact) {
+    let fire_lanes = u32::try_from(groups.iter().map(|(_, lanes)| lanes.len()).sum::<usize>())
+        .unwrap_or(u32::MAX);
+    let rows = match replay_rung(&stores, ws.engine, counted, replayed, fire_lanes, compact) {
         Ok(rows) => rows,
         Err(refusal) => return Ok(Err(refusal)),
     };
@@ -11505,16 +11530,16 @@ mod unfolded_tests {
     fn a_fire_carrying_past_the_largest_rung_is_refused_by_name() {
         let (_, stores) = pool_with_rungs_of(vec![(256, 2), (2048, 8)]);
         let carrying = |carried| FireRows { own: 5, carried };
-        assert_eq!(replay_rung(&stores, 56, carrying(0), 0, false), Ok(5));
-        assert_eq!(replay_rung(&stores, 56, carrying(2048), 2048, false), Ok(2048));
-        let host = replay_rung(&stores, 56, carrying(2049), 2049, false).unwrap_err();
+        assert_eq!(replay_rung(&stores, 56, carrying(0), 0, 1, false), Ok(5));
+        assert_eq!(replay_rung(&stores, 56, carrying(2048), 2048, 1, false), Ok(2048));
+        let host = replay_rung(&stores, 56, carrying(2049), 2049, 1, false).unwrap_err();
         assert!(
             host.contains("of 2048 tokens")
                 && host.contains("2049 carried recurrent rows")
                 && host.contains("fold what its lanes have written before they write more"),
             "{host}"
         );
-        assert!(replay_rung(&stores, 56, FireRows { own: 4096, carried: 0 }, 0, false).is_ok());
+        assert!(replay_rung(&stores, 56, FireRows { own: 4096, carried: 0 }, 0, 1, false).is_ok());
     }
 
     /// A pass cut into pieces: one folding all it writes folds piece by
@@ -11577,54 +11602,58 @@ mod unfolded_tests {
         let metal = |tokens: u32| RungReplay {
             own_max: Some(tokens),
             carried_max: Some(tokens),
-            total_max: Some(2 * tokens),
+            scratch: rows_bytes(2 * tokens),
         };
         let rungs = vec![(256, 2), (1024, 8)];
         let (_, stores) = pool_stating(rungs.clone(), vec![metal(256), metal(1024)], false);
         // Eight decode lanes, each replaying its share of 1052 rows.
         let w8 = FireRows { own: 8, carried: 0 };
-        assert_eq!(replay_rung(&stores, 56, w8, 1052, false), Ok(1024), "served at the 1024 rung");
+        assert_eq!(replay_rung(&stores, 56, w8, 1052, 8, false), Ok(1024), "served at the 1024 rung");
         let w11 = FireRows { own: 929, carried: 0 };
-        let refused = replay_rung(&stores, 56, w11, 1144, false).unwrap_err();
+        let refused = replay_rung(&stores, 56, w11, 1144, 11, false).unwrap_err();
         assert!(
-            refused.contains("of 1024 tokens") && refused.contains("2073 replay scratch rows"),
+            refused.contains("of 1024 tokens") && refused.contains("2074 bytes of rs scratch"),
             "{refused}"
         );
         // On a compact rs scratch a decode lane's rows take none of it.
         let (_, compact) = pool_stating(rungs.clone(), vec![metal(256), metal(1024)], true);
-        assert_eq!(replay_rung(&compact, 56, w11, 1144, true), Ok(929));
+        assert_eq!(replay_rung(&compact, 56, w11, 1144, 11, true), Ok(929));
 
         // CUDA-shaped: carried held to the widest bucket's tokens, no total.
         let cuda = |tokens: u32| RungReplay {
             own_max: Some(tokens),
             carried_max: Some(1024),
-            total_max: None,
+            scratch: rows_bytes(0).unbound(),
         };
         let (_, cuda_stores) = pool_stating(rungs.clone(), vec![cuda(256), cuda(1024)], false);
-        assert_eq!(replay_rung(&cuda_stores, 56, w8, 1052, false), Ok(8));
-        assert_eq!(replay_rung(&cuda_stores, 56, w11, 1144, false), Ok(929), "no total bound: its own rows ask");
+        assert_eq!(replay_rung(&cuda_stores, 56, w8, 1052, 8, false), Ok(8));
+        assert_eq!(replay_rung(&cuda_stores, 56, w11, 1144, 11, false), Ok(929), "no total bound: its own rows ask");
 
         // Each bound alone.
         let only = |bound: RungReplay| pool_stating(vec![(64, 1)], vec![bound], false).1;
-        let none = RungReplay::default();
+        let none = RungReplay {
+            own_max: None,
+            carried_max: None,
+            scratch: rows_bytes(0).unbound(),
+        };
         let own = only(RungReplay {
             own_max: Some(64),
-            ..none
+            ..none.clone()
         });
-        assert!(replay_rung(&own, 56, FireRows { own: 65, carried: 0 }, 0, false).is_ok(), "own past: capacity's");
+        assert!(replay_rung(&own, 56, FireRows { own: 65, carried: 0 }, 0, 1, false).is_ok(), "own past: capacity's");
         let carried = only(RungReplay {
             carried_max: Some(64),
-            ..none
+            ..none.clone()
         });
-        let why = replay_rung(&carried, 56, FireRows { own: 2, carried: 65 }, 65, false).unwrap_err();
+        let why = replay_rung(&carried, 56, FireRows { own: 2, carried: 65 }, 65, 1, false).unwrap_err();
         assert!(why.contains("65 carried recurrent rows"), "{why}");
         let total = only(RungReplay {
-            total_max: Some(64),
-            ..none
+            scratch: rows_bytes(64),
+            ..none.clone()
         });
-        let why = replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 61, false).unwrap_err();
-        assert!(why.contains("65 replay scratch rows"), "{why}");
-        assert!(replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 60, false).is_ok());
+        let why = replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 61, 1, false).unwrap_err();
+        assert!(why.contains("66 bytes of rs scratch"), "{why}");
+        assert!(replay_rung(&total, 56, FireRows { own: 4, carried: 0 }, 60, 1, false).is_ok());
     }
 
     /// A host pass whose uncut own rows and carried rows together pass the
@@ -11637,7 +11666,7 @@ mod unfolded_tests {
         let metal = |tokens: u32| ::engine::RungReplay {
             own_max: Some(tokens),
             carried_max: Some(tokens),
-            total_max: Some(2 * tokens),
+            scratch: rows_bytes(2 * tokens),
         };
         let (_, stores) = pool_stating(vec![(256, 2), (1024, 8)], vec![metal(256), metal(1024)], false);
         // Folded through 100, 300 rows buffered since, 2000 more to write
@@ -11651,6 +11680,7 @@ mod unfolded_tests {
                 56,
                 piece_rows(&full, &whole, &frozen, false),
                 piece_replayed(&full, &whole, &frozen, false),
+                1,
                 false
             )
             .is_ok(),
@@ -11705,10 +11735,10 @@ mod unfolded_tests {
     #[test]
     fn a_fire_s_compactness_is_its_lanes_and_snapshots() {
         use ::engine::fire::{Lineage, lane_one_run, scratch_compact};
-        assert!(scratch_compact(true, true, false));
-        assert!(!scratch_compact(true, true, true), "a lane lands a snapshot");
-        assert!(!scratch_compact(false, true, false), "a layout not compact");
-        assert!(!scratch_compact(true, false, false), "a lane of more than one run");
+        assert!(scratch_compact(true, true, true, false));
+        assert!(!scratch_compact(true, true, true, true), "a lane lands a snapshot");
+        assert!(!scratch_compact(false, true, true, false), "a layout not compact");
+        assert!(!scratch_compact(true, true, false, false), "a lane of more than one run");
         // A lane alone on its set replays one run ending at its first row.
         assert!(lane_one_run(None, 100, 104, Lineage::Set));
         assert!(lane_one_run(None, 104, 104, Lineage::Set), "nothing buffered");
@@ -11746,22 +11776,106 @@ mod unfolded_tests {
             !sharing.compact(&stores, &beam, &piece, &frozen, false),
             "a beam lane whose ancestry is two runs"
         );
+        assert!(
+            !sharing.compact(&stores, &full, &piece, &frozen, false),
+            "a beam lane whose mask the device resolves"
+        );
+        // Mac's w4 lane: folded 34, its row at 38, sharing its set, its mask
+        // admitting the one buffered slot 34 (a parent's), not ending at 38.
+        let mut w4 = lane_at(38, 1);
+        w4.lanes[0].lane.mask = Some(::engine::Masking::Extent(::engine::Mask::new(vec![0, 1, 3, 1], 5)));
+        assert!(!sharing.compact(&stores, &w4, &[Some((0, 1))], &[Some(34)], false));
 
         // The 160-lane fire on a Metal-shaped load: not compact, it counts
         // 160 own and 4200 replayed rows in its scratch.
         let metal = |tokens: u32| ::engine::RungReplay {
             own_max: Some(tokens),
             carried_max: Some(tokens),
-            total_max: Some(2 * tokens),
+            scratch: rows_bytes(2 * tokens),
         };
         let (_, metal_stores) =
             pool_stating(vec![(1024, 4), (4096, 8)], vec![metal(1024), metal(4096)], true);
         let wide = FireRows { own: 160, carried: 0 };
-        assert_eq!(replay_rung(&metal_stores, 56, wide, 4200, false), Ok(4096), "a rung holding 4360");
-        assert_eq!(replay_rung(&metal_stores, 56, wide, 4200, true), Ok(160), "compact, it would not need it");
+        assert_eq!(replay_rung(&metal_stores, 56, wide, 4200, 160, false), Ok(4096), "a rung holding 4360");
+        assert_eq!(replay_rung(&metal_stores, 56, wide, 4200, 160, true), Ok(160), "compact, it would not need it");
         let (_, narrow) = pool_stating(vec![(1024, 4)], vec![metal(1024)], true);
-        let refused = replay_rung(&narrow, 56, wide, 4200, false).unwrap_err();
-        assert!(refused.contains("4360 replay scratch rows"), "{refused}");
+        let refused = replay_rung(&narrow, 56, wide, 4200, 160, false).unwrap_err();
+        assert!(refused.contains("4361 bytes of rs scratch"), "{refused}");
+    }
+
+    /// Metal's rs scratch is bytes, not a row budget: a rung reserves each
+    /// scratch slot's rows at 2T and the lanes' work term at min(T, max
+    /// lanes); a fire of fewer lanes has the work term's slack for more
+    /// rows. A non-compact replay of 126 own and 1150 replayed rows fits
+    /// the 1024 rung at 60 and at 176 lanes, past 2T rows at 60 lanes too;
+    /// one whose bytes pass the reserve is refused by name.
+    #[test]
+    fn a_rung_s_scratch_is_its_bytes_over_its_lanes() {
+        let pad = |bytes: u64| bytes.div_ceil(256) * 256;
+        let metal = |tokens: u32| ::engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: ::engine::ScratchBytes {
+                slot_bytes: vec![1000],
+                lane_bytes: 50_000,
+                room_bytes: pad(2 * u64::from(tokens) * 1000) + pad(u64::from(tokens) * 50_000),
+                pad: 256,
+            },
+        };
+        let (_, stores) = pool_stating(vec![(1024, 8)], vec![metal(1024)], true);
+        let fire = FireRows { own: 126, carried: 0 };
+        assert!(replay_rung(&stores, 56, fire, 1150, 60, false).is_ok());
+        assert!(replay_rung(&stores, 56, fire, 1150, 176, false).is_ok());
+        assert!(
+            replay_rung(&stores, 56, fire, 2300, 60, false).is_ok(),
+            "past 2T rows, in the work term's slack"
+        );
+        let refused = replay_rung(&stores, 56, fire, 52_000, 176, false).unwrap_err();
+        assert!(refused.contains("bytes of rs scratch"), "{refused}");
+    }
+
+    /// Mac's measurements (Metal, Qwen3.5-0.8B w8, the old path): its rs
+    /// scratch from `rs::Layout`, eight scratch slots of
+    /// [12288, 64, 4096, 12288, 128, 128, 8192, 8192] bytes a row, 1 MiB a
+    /// lane, each term rounded to 256; rung 256 reserves 291,667,968 bytes,
+    /// rung 512 583,335,936. Three non-compact replay fires fit the rung
+    /// they ran at, to the byte Metal counted; the fourth (256, 48 lanes,
+    /// 9040 scratch rows, 460,530,688 bytes) passes rung 256 and is placed
+    /// at 512, never refused.
+    #[test]
+    fn mac_s_qwen3_5_replay_fires_fit_their_rungs_by_their_bytes() {
+        let scratch = |room_bytes| ::engine::ScratchBytes {
+            slot_bytes: vec![12288, 64, 4096, 12288, 128, 128, 8192, 8192],
+            lane_bytes: 262_144 * 4,
+            room_bytes,
+            pad: 256,
+        };
+        let rung = |tokens: u32, room| ::engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: scratch(room),
+        };
+        let (r256, r512) = (rung(256, 291_667_968), rung(512, 583_335_936));
+        let fire = |lanes: u32, rows: u32| ::engine::ReplayRows {
+            own: lanes,
+            carried: 0,
+            scratch: rows,
+            lanes,
+        };
+        assert_eq!(r512.scratch.bytes(1969, 121), 216_223_488);
+        assert_eq!(r512.scratch.bytes(1640, 128), 208_634_368);
+        assert_eq!(r256.scratch.bytes(5560, 32), 285_844_992);
+        assert_eq!(r256.scratch.bytes(9040, 48), 460_530_688);
+        assert!(::engine::fire::rung_holds(&r512, fire(121, 1969)).is_ok());
+        assert!(::engine::fire::rung_holds(&r512, fire(128, 1640)).is_ok());
+        assert!(::engine::fire::rung_holds(&r256, fire(32, 5560)).is_ok());
+        let over = ::engine::fire::rung_holds(&r256, fire(48, 9040)).unwrap_err();
+        assert_eq!(over.bound, ::engine::ReplayBound::Scratch);
+        // The runtime places that fire at 512: 48 decode lanes replaying
+        // 8992 rows, not compact.
+        let (_, stores) = pool_stating(vec![(256, 4), (512, 8)], vec![r256, r512], true);
+        let rows = FireRows { own: 48, carried: 0 };
+        assert_eq!(replay_rung(&stores, 56, rows, 8992, 48, false), Ok(512));
     }
 
     fn lane_at(held: u32, rows: u32) -> crate::engine::FireRequest {
@@ -11787,11 +11901,44 @@ mod unfolded_tests {
 
     /// [`pool_with_rungs_of`], each rung's replay scratch stated
     /// (`act_replay`) and the load's rs scratch `rs_compact` or not.
+    /// A Metal-shaped test scratch: one byte a row, no lane term past its
+    /// one pad, holding `rows` scratch rows.
+    pub(super) fn rows_bytes(rows: u32) -> ::engine::ScratchBytes {
+        ::engine::ScratchBytes {
+            slot_bytes: vec![1],
+            lane_bytes: 0,
+            room_bytes: u64::from(rows) + 1,
+            pad: 1,
+        }
+    }
+
+    trait Unbound {
+        fn unbound(self) -> ::engine::ScratchBytes;
+    }
+
+    impl Unbound for ::engine::ScratchBytes {
+        /// No bytes binding.
+        fn unbound(self) -> ::engine::ScratchBytes {
+            ::engine::ScratchBytes {
+                slot_bytes: Vec::new(),
+                ..self
+            }
+        }
+    }
+
     pub(super) fn pool_stating(
         act_chunks: Vec<(u32, u32)>,
         act_replay: Vec<::engine::RungReplay>,
         rs_compact: bool,
     ) -> (usize, crate::store::registry::Stores) {
+        let act_replay = if act_replay.is_empty() {
+            act_chunks
+                .iter()
+                .map(|&(tokens, _)| crate::store::shared::rows_only(tokens))
+                .collect()
+        } else {
+            act_replay
+        };
         use ::engine::chunk::{
             ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
             SlotShape,
@@ -11834,6 +11981,7 @@ mod unfolded_tests {
             act_chunks,
             act_replay,
             rs_compact,
+            rs_scratch_per_fire: true,
             ..ChunkFacts::default()
         };
         let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();

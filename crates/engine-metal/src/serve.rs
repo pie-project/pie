@@ -1809,7 +1809,46 @@ impl Shell {
         // (`engine::fire::lane_carried`); its fires' scratch counts so too.
         facts.rs_compact = self.rs_layout.as_ref().is_some_and(|layout| layout.compact)
             && self.rs_buffers.is_some();
+        // Each rung's rs scratch, from its reserve (`rs_room` at load): a
+        // rung of T tokens lays `Seat::scratch_bytes(layout, own + T,
+        // min(T, max_lanes))`, each scratch slot's rows rounded to 256 bytes
+        // and the lanes' work term too; a fire takes the same of its own
+        // scratch rows and lanes, its own rows and carried rows each at
+        // most the rung's tokens. Its compactness is a fire's (its rs page
+        // table read per fire).
+        if self.rs_layout.is_some() {
+            facts.act_replay = facts
+                .act_chunks
+                .iter()
+                .filter_map(|&(tokens, _)| self.rung_replay(tokens))
+                .collect();
+            facts.rs_scratch_per_fire = true;
+        }
         facts
+    }
+
+    /// What the rung of `tokens` tokens holds of a fire's replay
+    /// ([`engine::RungReplay`]): own T, carried T, and its rs scratch's
+    /// bytes model (the room `rs_room` laid for it at load). `None` on a
+    /// load without an rs layout. The facts the runtime reads and this
+    /// engine's own check at submit state the same.
+    fn rung_replay(&self, tokens: u32) -> Option<engine::RungReplay> {
+        let layout = self.rs_layout.as_ref()?;
+        Some(engine::RungReplay {
+            own_max: Some(tokens),
+            carried_max: Some(tokens),
+            scratch: engine::ScratchBytes {
+                slot_bytes: layout.slots.clone(),
+                lane_bytes: layout.work_elems.saturating_mul(4),
+                room_bytes: self
+                    .arena
+                    .rs_rooms()
+                    .iter()
+                    .find(|&&(at, _)| at == tokens)
+                    .map_or(0, |&(_, bytes)| bytes),
+                pad: 256,
+            },
+        })
     }
 
     /// Backs every seat's run, its pages and its record: what a caller
@@ -5673,16 +5712,15 @@ impl Shell {
         // The fire's rows against what its rung's rs scratch holds, by the
         // one function the runtime's rung choice also calls
         // (`engine::fire::rung_holds` over the bounds this load states,
-        // `store::Layout`'s `act_replay`: own T, carried T, together 2T).
+        // `Shell::rung_replay`: own T, carried T, and the rung's rs scratch
+        // bytes).
         // A fire past them was cut or chosen wrong: refused by name before
         // anything is encoded.
         if rs_active {
             let tokens = self.arena.current_tokens();
-            let rung = engine::RungReplay {
-                own_max: Some(tokens),
-                carried_max: Some(tokens),
-                total_max: Some(tokens.saturating_mul(2)),
-            };
+            let rung = self.rung_replay(tokens).ok_or_else(|| {
+                Fault::program("serve::rs", "an rs fire on a load that lays no rs layout".to_string())
+            })?;
             // The fire's compactness by the one function the runtime also
             // evaluates on this fire (`engine::fire::scratch_compact`: the
             // load's stated layout fact, every lane one run, no snapshot),
@@ -5693,6 +5731,7 @@ impl Shell {
                 && self.rs_buffers.is_some();
             let fire_compact = engine::fire::scratch_compact(
                 load_compact,
+                true,
                 rs_one_run.iter().all(|&one| one),
                 !rs_snaps.is_empty(),
             );
