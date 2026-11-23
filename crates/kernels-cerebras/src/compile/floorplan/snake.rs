@@ -48,6 +48,13 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             );
             split(g.key_dim, gdn, "a key head")?;
             split(g.value_dim, onorm, "a value head")?;
+            // a GDN layer's state row k lives on weight row k ([`crate::compile::block::gdn`])
+            if s.layers.iter().any(|l| matches!(l, LayerKind::Gdn)) && py < g.key_dim {
+                return Err(format!(
+                    "snake: {py} rows hold a key head's {} state rows",
+                    g.key_dim
+                ));
+            }
             (gdn, onorm)
         }
         None => (scores, scores),

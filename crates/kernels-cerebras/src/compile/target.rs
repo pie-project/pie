@@ -557,6 +557,30 @@ mod tests {
         assert!(e.contains("the search found no partition"), "{e}");
     }
 
+    /// A GDN layer's state row k lives on weight row k: Qwen3.5-0.8B's search keeps a key head's
+    /// 128 rows, and 64 rows (the chip's wrong tokens, 1603 / 1606) find no partition.
+    #[test]
+    fn a_gdn_unit_holds_every_key_row() {
+        let p = searched("qwen35-d0.8b-bf16-kv-bf16").plan;
+        assert!(p.partition.rows >= p.shape.gdn.unwrap().key_dim);
+        let ask = Ask {
+            set: "PY=64".into(),
+            ..Ask::default()
+        };
+        let e = plan(&trace("qwen35-d0.8b-bf16-kv-bf16"), &ask).unwrap_err();
+        assert!(e.contains("the search found no partition"), "{e}");
+    }
+
+    /// A head whose vocabulary groups hold fewer ids than the vocabulary is refused.
+    #[test]
+    fn a_head_short_of_the_vocabulary_is_refused() {
+        let mut p = searched("qwen35-d0.8b-bf16-kv-bf16").plan;
+        p.validate().unwrap();
+        p.partition.head.rows = p.shape.vocab / p.partition.head.vocab_rows;
+        let e = p.validate().unwrap_err();
+        assert!(e.contains("holds less than the"), "{e}");
+    }
+
     /// A shape no shipping model has plans: Qwen3.5-0.8B with another MLP width plans and builds.
     #[test]
     fn a_shape_of_no_shipping_model_is_searched() {

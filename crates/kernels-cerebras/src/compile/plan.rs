@@ -359,8 +359,8 @@ pub struct Plan {
 
 impl Plan {
     /// Checks the plan is self-consistent before any physical work: divisibility, `layers_per_unit
-    /// * units == layers.len()`, `kv_rows <= rows`, positions within the RoPE reach. A layout's
-    /// own rules stay in its constructor ([`super::floorplan`]).
+    /// * units == layers.len()`, `kv_rows <= rows`, a head holding the vocabulary, positions
+    /// within the RoPE reach. A layout's own rules stay in its constructor ([`super::floorplan`]).
     pub fn validate(&self) -> Result<(), String> {
         let (sh, pa, co) = (&self.shape, &self.partition, &self.contract);
         let bad = |m: String| Err(format!("plan: {m}"));
@@ -424,6 +424,16 @@ impl Plan {
                     "{n} segments of {w} do not divide the {half} columns they live in"
                 ));
             }
+        }
+        // the head's vocabulary groups (its rows, or its columns where they are more) hold every id
+        let h = &pa.head;
+        if u64::from(h.rows.max(h.cols)) * u64::from(h.vocab_rows) < u64::from(sh.vocab) {
+            return bad(format!(
+                "a head of {} x {} vocabulary rows holds less than the {} ids",
+                h.rows.max(h.cols),
+                h.vocab_rows,
+                sh.vocab
+            ));
         }
         if let Some(groups) = &pa.head.groups {
             let mut seen = vec![false; pa.rows as usize];

@@ -74,7 +74,14 @@ impl Gdn {
 impl Block for Gdn {
     fn wire(&self, _plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
         for u in &floor.units {
-            for r in 0..u.rows().min(self.key_rows) {
+            if u.rows() < self.key_rows {
+                return Err(format!(
+                    "gdn: {} rows hold a key head's {} state rows",
+                    u.rows(),
+                    self.key_rows
+                ));
+            }
+            for r in 0..self.key_rows {
                 let pts: Vec<Coord> = (0..u.cols())
                     .map(|c| Coord::new(u.col_x(c), u.row_y(r)))
                     .collect();
