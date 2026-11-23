@@ -290,6 +290,11 @@ impl SharedGrow {
                     // again once room is freed, not on its next wake.
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
+                    // Runs in its way with no free run below: the segment
+                    // walk, next, compacts below the raise's activation.
+                    if self.shared.lock().unwrap().compaction_for_raise(goal) {
+                        tracing::debug!(engine = self.engine, goal, "a raise waits on a compaction below its activation");
+                    }
                     self.fund_owed();
                     return;
                 }
@@ -363,7 +368,13 @@ impl SharedGrow {
                     if let Some((from, to)) = notice {
                         // No lane: no engine holds a carve to come down from.
                         let landed = match crate::scheduler::scheduler_handle(self.engine) {
-                            Ok(lane) => lane.pool(PoolOp::Rung { from, to }).await,
+                            Ok(lane) => {
+                                let _awaits = super::walk_awaits(
+                                    self.engine,
+                                    format!("the reply to a lower's notice {from} -> {to}"),
+                                );
+                                lane.pool(PoolOp::Rung { from, to }).await
+                            }
                             Err(_) => Ok(()),
                         };
                         let mut pool = self.shared.lock().unwrap();
@@ -504,9 +515,23 @@ impl SharedGrow {
                     self.room_freed();
                     return;
                 }
-                // Short again (the pool moved since), or nothing left to
-                // raise: asked again as it stands.
-                Ok(Some(Ok(None))) => {}
+                // Short again (the pool moved since), or not plannable as
+                // the pool stands (a copy still reading the span, chunks
+                // held for a served restore there): asked again once room
+                // moves. Asked again at once, the raise was planned and
+                // refused in a loop that never yielded, every other task
+                // starved (the simulation's field mix, seed 274: a raise
+                // owner's frame, 1.8 M asks in 20 s).
+                Ok(Some(Ok(None))) => {
+                    let given = self.shared.lock().unwrap().pool().room_watch();
+                    let rung = super::rung_watch(engine);
+                    tokio::select! {
+                        // In order, never at random: a seeded run takes the same branch.
+                        biased;
+                        () = given.given() => {}
+                        () = rung => {}
+                    }
+                }
                 Ok(Some(Err(refused))) => {
                     tracing::warn!(engine, rung, %refused, "the engine refused a raise to held frames");
                     return;
@@ -704,10 +729,23 @@ impl SharedGrow {
                     if self.shared.lock().unwrap().mapped_segments() > goal {
                         self.no_room.store(true, Ordering::Release);
                     }
+                    // A compaction asked and answered no room: the planner
+                    // passes its head again on that answer, never waits on
+                    // the ask.
+                    if self.shared.lock().unwrap().take_compaction_answered()
+                        && let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                    {
+                        planner.pages_freed();
+                    }
                     return;
                 }
                 Some(SegmentMove::NoRoom) => {
                     self.no_room.store(true, Ordering::Release);
+                    if self.shared.lock().unwrap().take_compaction_answered()
+                        && let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                    {
+                        planner.pages_freed();
+                    }
                     return;
                 }
                 Some(SegmentMove::Commit { prefix }) => PoolOp::CommitSegments(prefix),
@@ -762,7 +800,11 @@ impl SharedGrow {
                 PoolOp::CommitSpan(n) => Some(*n),
                 _ => None,
             };
-            match (self.lane)(self.engine, op).await {
+            let landed = {
+                let _awaits = super::walk_awaits(self.engine, format!("the reply to {}", op.name()));
+                (self.lane)(self.engine, op).await
+            };
+            match landed {
                 Ok(()) => {
                     // A segment mapped: what was promised a waiter is
                     // kept, and `pages_freed` wakes the planner.
@@ -933,12 +975,14 @@ impl super::programs::Mover for WalkMover<'_> {
     }
 
     async fn evacuate(&self, evacuation: ::engine::chunk::Evacuation) -> Result<(), String> {
+        let _awaits = super::walk_awaits(self.0.engine, "the reply to a raise's evacuate".into());
         (self.0.lane)(self.0.engine, PoolOp::Evacuate(evacuation))
             .await
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+        let _awaits = super::walk_awaits(self.0.engine, format!("the reply to set rung {from} -> {to}"));
         (self.0.lane)(self.0.engine, PoolOp::Rung { from, to })
             .await
             .map_err(|error| format!("{error:#}"))

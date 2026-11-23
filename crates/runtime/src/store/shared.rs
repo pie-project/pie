@@ -106,6 +106,37 @@ struct RungGate {
     /// The pool's walker is asked to look now ([`ask_walk`]): a bind or a
     /// raise waits on a cut or a lower that is the walk's to take.
     walk: tokio::sync::Notify,
+    /// What the pool's walker awaits now and since when (a lane op's reply:
+    /// a segment move, an evacuation, a rung's notice), `None` between: a
+    /// stall's dump says it ([`walk_waiting`]).
+    walk_waiting: Mutex<Option<(String, std::time::Instant)>>,
+}
+
+/// What `engine`'s walker awaits now and for how long, for a stall's dump:
+/// `None` where it awaits nothing (it waits for its next wake, or runs).
+#[must_use]
+pub fn walk_waiting(engine: usize) -> Option<(String, std::time::Duration)> {
+    rung_gate(engine)
+        .walk_waiting
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(what, since)| (what.clone(), since.elapsed()))
+}
+
+/// Marks `engine`'s walker awaiting `what` until the guard drops.
+pub(crate) fn walk_awaits(engine: usize, what: String) -> WalkAwait {
+    *rung_gate(engine).walk_waiting.lock().unwrap() = Some((what, std::time::Instant::now()));
+    WalkAwait(engine)
+}
+
+/// See [`walk_awaits`].
+pub(crate) struct WalkAwait(usize);
+
+impl Drop for WalkAwait {
+    fn drop(&mut self) {
+        *rung_gate(self.0).walk_waiting.lock().unwrap() = None;
+    }
 }
 
 /// Every engine's rung gate by its id: one for each engine named here,
@@ -133,6 +164,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 owed_by: Mutex::new(None),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
+                walk_waiting: Mutex::new(None),
             }))
         })
 }
@@ -894,6 +926,12 @@ pub struct SharedPool {
     /// free chunks are enough but no run of them stands
     /// ([`Self::compaction_comes`]): the walk moves chunks until they do.
     compact_for: Option<(u32, u32)>,
+    /// A compaction asked found no window ([`Self::compact_step`]): the
+    /// walk tells the planner, whose head then goes on.
+    compaction_answered: bool,
+    /// The rung a raise waits on a compaction below its activation for
+    /// ([`Self::compaction_for_raise`]).
+    compact_raise: Option<u32>,
     /// Logical chunks the engine refused a fire for, their state where it
     /// will not read or write it (`engine::Error::Placement`): the walk
     /// moves them down ([`Self::refused_step`]); the scheduler holds the
@@ -1162,6 +1200,8 @@ impl SharedPool {
             span_commit_blocked: false,
             guest_head: None,
             compact_for: None,
+            compaction_answered: false,
+            compact_raise: None,
             refused: BTreeSet::new(),
             refused_moving: BTreeSet::new(),
             refused_stuck: BTreeSet::new(),
@@ -2424,12 +2464,45 @@ impl SharedPool {
     /// stand, if one is due: each step clears one run, the next planned
     /// once its moves' fence lifts. Over once the runs stand.
     fn compact_step(&mut self, epoch: u64) -> Option<SegmentMove> {
-        let (run, pieces) = self.compact_for?;
-        if self.pool.free_chunk_runs(run) >= pieces {
-            self.compact_for = None;
-            return None;
-        }
-        let moves = self.pool.plan_compaction_for(run, pieces)?;
+        let moves = match self.compact_for {
+            Some((run, pieces)) if self.pool.free_chunk_runs(run) < pieces => {
+                if self.pool.compacting() {
+                    // One on its way: the next is planned once its fence
+                    // lifts.
+                    return None;
+                }
+                let Some(moves) = self.pool.plan_compaction_for(run, pieces) else {
+                    // Asked and no window clears now: the ask is answered,
+                    // never left pending (the M1's run 10: a restore's plan
+                    // ended "compaction asked" every pass for ten minutes,
+                    // the walk sending none). The head's next pass reads the
+                    // pool as it stands and goes to its eviction.
+                    tracing::debug!(
+                        run,
+                        pieces,
+                        free_runs = self.pool.free_chunk_runs(run),
+                        "store: a compaction asked finds no window to clear; answered no room"
+                    );
+                    self.compact_for = None;
+                    self.compaction_answered = true;
+                    return None;
+                };
+                moves
+            }
+            Some(_) => {
+                self.compact_for = None;
+                return None;
+            }
+            None => {
+                let rung = self.compact_raise?;
+                let Some((run, pieces)) = self.pool.raise_runs_short(rung) else {
+                    self.compact_raise = None;
+                    return None;
+                };
+                let below = self.pool.total_chunks() - self.pool.act_chunks(rung);
+                self.pool.plan_compaction_below(run, pieces, below)?
+            }
+        };
         self.pool
             .apply_compaction(&moves, epoch)
             .expect("a compaction planned under the lock applies");
@@ -2438,6 +2511,28 @@ impl SharedPool {
             applied: moves,
             epoch,
         })
+    }
+
+    /// A raise to `rung` the pool cannot plan as it stands, its way holding
+    /// runs of chunks that find no free run below its activation: the walk
+    /// compacts below that limit until they do
+    /// ([`SlotPool::raise_runs_short`]), and the raise goes once its moves
+    /// plan. Whether such a compaction is plannable now.
+    pub fn compaction_for_raise(&mut self, rung: u32) -> bool {
+        let Some((run, pieces)) = self.pool.raise_runs_short(rung) else {
+            return false;
+        };
+        let below = self.pool.total_chunks() - self.pool.act_chunks(rung);
+        if !self.pool.compacting() && self.pool.plan_compaction_below(run, pieces, below).is_none() {
+            return false;
+        }
+        self.compact_raise = Some(rung);
+        true
+    }
+
+    /// Whether a compaction asked was answered no room since last read.
+    pub fn take_compaction_answered(&mut self) -> bool {
+        std::mem::take(&mut self.compaction_answered)
     }
 
     /// Whether moving chunks stands `pieces` free runs of `run` for a bind

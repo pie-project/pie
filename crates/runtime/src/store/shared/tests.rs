@@ -1616,3 +1616,52 @@ fn the_state_room_leaves_out_the_weights_pinned_slots() {
     assert_eq!(pool.state_chunks_most(), most - 4);
     assert_eq!(pool.state_chunks_now(), now - 4);
 }
+
+/// A compaction the planner asked for that no window clears by the walk's
+/// turn is answered, never left pending (the M1's run 10: a restore's plan
+/// ended "compaction asked" every pass for ten minutes, the walk sending
+/// none, nothing in flight): the ask is dropped, and the walk tells the
+/// planner, whose next pass reads the pool as it stands.
+#[test]
+fn a_compaction_asked_that_no_window_clears_is_answered() {
+    let mut p = pool();
+    p.walked_to(Arc::new(std::sync::atomic::AtomicU32::new(8)));
+    let list = p.pool_shape(LIST).expect("the kv list's pool shape");
+    let holder = crate::store::slots::Holder::WorkingSet(1);
+    let spc = p.pool().shape(list).expect("its shape").slots_per_chunk;
+    let free = p.pool().free_chunks();
+    let held = p
+        .pool_mut()
+        .acquire(holder, list, u64::from(free * spc))
+        .expect("every committed chunk");
+    // One free run of three (1..=3), and free chunks 5, 12 and 14 scattered:
+    // a window over 11..=13 clears a second run by moving 11 and 13 to 5
+    // and 14.
+    let physical = |p: &SharedPool, slot: &crate::store::slots::Slot| p.pool().physical(slot.chunk);
+    let back: Vec<_> = held
+        .iter()
+        .copied()
+        .filter(|slot| physical(&p, slot).is_some_and(|at| [1, 2, 3, 5, 12, 14].contains(&at)))
+        .collect();
+    p.pool_mut().release(holder, &back, 0);
+    p.pool_mut().retire_through(u64::MAX);
+    assert_eq!(p.pool().free_chunk_runs(3), 1);
+    assert!(p.compaction_comes(3, 2), "a window clears a second run now");
+    // Before the walk's turn, every free chunk is taken: no window clears.
+    let left = p.pool().free_chunks();
+    let taken = p
+        .pool_mut()
+        .acquire(holder, list, u64::from(left * spc))
+        .expect("the free chunks");
+    assert!(p.pool().plan_compaction_for(3, 2).is_none(), "no window clears now");
+    // At the segments it has: no grow comes first.
+    let at = p.mapped_segments();
+    let step = p.next_move(at, 1);
+    assert!(
+        !matches!(step, Some(SegmentMove::Compact { .. })),
+        "nothing to send: {step:?}"
+    );
+    assert!(p.take_compaction_answered(), "the ask is answered");
+    assert!(!p.compaction_comes(3, 2), "asked again on the pool as it stands, none comes");
+    drop(taken);
+}

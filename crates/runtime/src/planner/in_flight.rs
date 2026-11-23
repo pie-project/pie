@@ -51,7 +51,6 @@ impl ResidencyPlanner {
             // It runs: an eviction candidate again, and no head of its
             // holds a restore back any more.
             let first = std::mem::replace(&mut proc.unfired, false);
-            proc.restored_past = None;
             // Firing: a bind it was restored for went through.
             let bound = inner.bind_restoring == Some(pid);
             if bound {

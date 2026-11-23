@@ -1412,36 +1412,39 @@ impl SchedulerHandle {
                 .and_then(|stores| stores.roles)
                 .map(|roles| roles.lock().unwrap().room_watch())
         };
-        // Whether `pieces` runs of `run` chunks stand free for its state,
-        // and the capacity gate lets them in.
-        let fits = |run: u32, pieces: u32| {
+        // Whether `pieces` runs of `run` chunks and `singles` chunks beside
+        // them stand free for its state, and the capacity gate lets them in.
+        let fits = |run: u32, pieces: u32, singles: u32| {
             crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
-                .is_some_and(|roles| roles.lock().unwrap().free_runs(run) >= pieces)
+                .is_some_and(|roles| roles.lock().unwrap().room_free(run, pieces, singles))
                 && crate::planner::planner_for(0, engine).is_none_or(|planner| {
-                    !planner.capacity_would_hold(pid, run.max(1).saturating_mul(pieces))
+                    !planner.capacity_would_hold(
+                        pid,
+                        run.max(1).saturating_mul(pieces).saturating_add(singles),
+                    )
                 })
         };
         // Holding guest state of its own, it is suspended instead: waiting,
         // it would hold room its own bind lacks.
-        let suspend = |run: u32, pieces: u32| {
+        let suspend = |run: u32, pieces: u32, singles: u32| {
             let holds = crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
                 .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
             holds
                 && crate::planner::planner_of(pid)
-                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces))
+                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces, singles))
         };
         // Waiting, it is a waiter in the planner's queue: idle cache goes
         // first, then a resident is parked for it, as for a restore short
         // of room for its roles.
-        let planned = |run: u32, pieces: u32| async move {
+        let planned = |run: u32, pieces: u32, singles: u32| async move {
             let planner = crate::planner::planner_of(pid)
                 .ok_or_else(|| "its process has no planner".to_string())?;
             crate::inferlet::process::said(
                 "bind: room for its guest state",
                 pid,
-                planner.wait_bind_room(pid, run, pieces),
+                planner.wait_bind_room(pid, run, pieces, singles),
             )
             .await
             .map_err(|why| why.to_string())
@@ -3157,7 +3160,7 @@ impl BatchScheduler {
                 "scheduler: a refused chunk's move lacks free chunks below: the planner makes them"
             );
             crate::rt::spawn(async move {
-                if let Err(error) = planner.wait_bind_room(owner, 1, stuck).await {
+                if let Err(error) = planner.wait_bind_room(owner, 1, stuck, 0).await {
                     tracing::warn!(%owner, %error, "scheduler: the room for a refused chunk's move was refused");
                 }
                 crate::store::shared::ask_walk(engine_id);

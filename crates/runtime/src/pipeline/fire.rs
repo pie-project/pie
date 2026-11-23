@@ -8125,7 +8125,7 @@ mod rung_wait_tests {
         planner.note_admitted(pid);
         let bind = {
             let planner = planner.clone();
-            crate::rt::spawn(async move { planner.wait_bind_room(pid, 2, 1).await })
+            crate::rt::spawn(async move { planner.wait_bind_room(pid, 2, 1, 0).await })
         };
         while !planner.demand_waits() {
             tokio::task::yield_now().await;
