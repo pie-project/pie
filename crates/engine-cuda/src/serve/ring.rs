@@ -33,6 +33,10 @@ pub struct RingLane<'a> {
     /// Whether the lane writes its ring alone this fire (no other lane of
     /// the fire names its record).
     pub alone: bool,
+    /// The rows after which the fire lands a snapshot of the lane's rings
+    /// (`Lane::rs_snapshots`, a fire's rows from its first), each onto the
+    /// ring pages of the snapshot's record.
+    pub snapshots: &'a [(u32, &'a [(i32, u64)])],
 }
 
 /// Where a page's rows lie for the fold to read them.
@@ -60,6 +64,9 @@ pub struct Composed {
     pub direct: u32,
     /// Ring pages it reads that its fold then writes.
     pub read_then_folded: u32,
+    /// The snapshots' row copies, before the fold: (snapshot ring page
+    /// address, source address, first row in the page, rows).
+    pub snaps: Vec<(u64, u64, u32, u32)>,
 }
 
 /// The widest window's rows below `row` the fire's first row reads from:
@@ -114,7 +121,10 @@ pub fn compose(
     }
     // The fire's own pages past the buffer go to the ring where the pages
     // read and written span no more than it.
-    let direct = lane.alone && pages.saturating_sub(first) <= ring_pages;
+    // A fire that lands a snapshot keeps its ring as it found it until its
+    // fold, so the snapshot reads every row where it lies.
+    let direct =
+        lane.alone && lane.snapshots.is_empty() && pages.saturating_sub(first) <= ring_pages;
     let mut out = Composed {
         table: Vec::with_capacity(pages as usize),
         ..Composed::default()
@@ -148,6 +158,33 @@ pub fn compose(
             sources.push(Source::At(at));
         }
     }
+    // Each snapshot: the last ring's worth of the rows before its row, each
+    // page's from where it lies now (the ring as the fire found it, a
+    // buffer slot, an own-row page) to the snapshot's ring page.
+    for &(at, rings) in lane.snapshots {
+        if rings.len() != ring_pages as usize {
+            return Err(Fault::program(
+                "serve::ring",
+                format!(
+                    "a snapshot record of {} ring pages beside a lane's of {ring_pages}",
+                    rings.len()
+                ),
+            ));
+        }
+        let to = (lane.have + at).min(end);
+        let mut row = to.saturating_sub(ring_pages * page);
+        while row < to {
+            let n = row / page;
+            let stop = ((n + 1) * page).min(to);
+            let from = match sources[n as usize] {
+                Source::At(from) => from,
+                Source::Ring => lane.ring[(n % ring_pages) as usize].1,
+            };
+            let dst = rings[(n % ring_pages) as usize].1;
+            out.snaps.push((dst, from, row % page, stop - row));
+            row = stop;
+        }
+    }
     // The fold: rows `[folded, folded + fold)`, only the last ring's worth
     // of them (the rest the ring drops at once), each page's to its ring
     // page.
@@ -175,6 +212,9 @@ pub fn compose(
 pub struct Work {
     pub page_bytes: u64,
     pub fills: Vec<(u64, u64)>,
+    /// The snapshots' row runs, landed after the forward and before the
+    /// fold (which may write the ring pages they read).
+    pub snaps: Vec<(u64, u64, u64)>,
     pub folds: Vec<(u64, u64, u64)>,
 }
 
@@ -184,6 +224,12 @@ impl Work {
     /// row) — a row's key plane and its value plane.
     pub fn add(&mut self, composed: &Composed, planes: &[(u64, u64)]) {
         self.fills.extend_from_slice(&composed.fills);
+        for &(dst, from, first, rows) in &composed.snaps {
+            for &(offset, row_bytes) in planes {
+                let at = offset + u64::from(first) * row_bytes;
+                self.snaps.push((dst + at, from + at, u64::from(rows) * row_bytes));
+            }
+        }
         for &(ring, source, first, rows) in &composed.folds {
             let Source::At(from) = source else { continue };
             for &(offset, row_bytes) in planes {
@@ -222,6 +268,10 @@ pub fn shared_pool(lanes: &[(u64, u32, bool)]) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
+    fn ring_at(pages: u32, at: u64) -> Vec<(i32, u64)> {
+        (0..pages).map(|p| (900 + p as i32, at + u64::from(p))).collect()
+    }
+
     fn ring(pages: u32) -> Vec<(i32, u64)> {
         (0..pages).map(|p| (100 + p as i32, 1000 + u64::from(p))).collect()
     }
@@ -251,6 +301,7 @@ mod tests {
             folded: 40,
             fold: 1,
             alone: true,
+            snapshots: &[],
         };
         let mut own = || panic!("no own page");
         let c = compose(&lane, 16, 20, 0, &mut own).unwrap();
@@ -271,6 +322,7 @@ mod tests {
             folded: 8,
             fold: 100,
             alone: true,
+            snapshots: &[],
         };
         let mut next = 0u32;
         let mut own = || {
@@ -288,6 +340,38 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_lands_the_rows_before_its_row_from_where_they_lie() {
+        let ring = ring(3);
+        let snap = ring_at(3, 9000);
+        let lane = RingLane {
+            ring: &ring,
+            buffer: &[],
+            base: 32,
+            have: 40,
+            rows: 20,
+            folded: 40,
+            fold: 20,
+            alone: true,
+            snapshots: &[(5, &snap)],
+        };
+        let mut next = 0u32;
+        let mut own = || {
+            next += 1;
+            Ok((500 + next as i32, 5000 + u64::from(next)))
+        };
+        let c = compose(&lane, 16, 20, 0, &mut own).unwrap();
+        // A snapshot keeps the fire off its ring: its own rows on own pages.
+        assert_eq!(c.direct, 0);
+        // Rows [0, 45): page 0 and 1 from the ring as found, page 2's rows
+        // [32, 40) from the ring and [40, 45) from its own page (the page is
+        // the own page, filled from the ring): one run a page.
+        let rows: u32 = c.snaps.iter().map(|s| s.3).sum();
+        assert_eq!(rows, 45);
+        assert_eq!(c.snaps[0], (9000, 1000, 0, 16));
+        assert_eq!(c.snaps[2], (9002, 5001, 0, 13));
+    }
+
+    #[test]
     fn a_lagged_lane_reads_its_buffer_and_folds_from_it() {
         let ring = ring(3);
         let buffer = [(7, 70u64), (8, 80)];
@@ -300,6 +384,7 @@ mod tests {
             folded: 36,
             fold: 4,
             alone: false,
+            snapshots: &[],
         };
         let mut own = || panic!("no own page");
         let c = compose(&lane, 16, 20, 0, &mut own).unwrap();

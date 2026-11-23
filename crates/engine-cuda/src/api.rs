@@ -855,7 +855,12 @@ impl Engine for Cuda {
             media_encode: false,
             rs_verbs: true,
             windowed_state,
-            rs_snapshots: if state_rows && shell.lands_snapshots() {
+            // A load of rings alone lands its snapshots itself
+            // (`serve::ring`); one of recurrent state too, as its state
+            // lands them.
+            rs_snapshots: if (state_rows && shell.lands_snapshots())
+                || (windowed_state && !state_rows)
+            {
                 crate::store::rs::SNAPSHOTS
             } else {
                 0
@@ -1780,9 +1785,21 @@ impl Cuda {
             for snap in lane
                 .rs_snapshots
                 .iter()
-                .filter(|snap| !snap.pieces.is_empty())
+                .filter(|snap| !snap.pieces.is_empty() || !snap.fixed.is_empty())
             {
-                let named = shell.name_record(&snap.pieces).map_err(fault)?;
+                // A record of rings and state names its pieces a shape at a
+                // time: the rings' first.
+                let pieces: Vec<u32> = if snap.fixed.is_empty() {
+                    snap.pieces.clone()
+                } else {
+                    snap.fixed
+                        .iter()
+                        .filter(|(shape, _)| *shape == RING)
+                        .chain(snap.fixed.iter().filter(|(shape, _)| *shape == FIXED))
+                        .flat_map(|(_, pieces)| pieces.iter().copied())
+                        .collect()
+                };
+                let named = shell.name_record(&pieces).map_err(fault)?;
                 if named != snap.slot {
                     return Err(Error::Invalid(format!(
                         "lane in slot {} snapshots into the record at slot ref {}, whose \

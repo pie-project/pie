@@ -215,6 +215,9 @@ impl Shell {
         super::btrace::mark("route");
         let readback = fire.readback(p, &staged)?;
         super::btrace::mark("readback");
+        // A windowed fire's snapshots land before its fold, which may write
+        // the ring pages they read.
+        self.copy_ring_runs(&p.ring_work.snaps)?;
         self.fold_rings(&p.ring_work)?;
         if tapping.is_some() {
             // The read-outs hold the tapped pages and the host slots they

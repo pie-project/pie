@@ -1716,6 +1716,17 @@ impl Shell {
                         ));
                     }
                 };
+                // The snapshots the lane's fire lands: each onto its
+                // record's ring pages.
+                let snap_rings = seated
+                    .rs_snapshots
+                    .iter()
+                    .map(|snap| Ok((snap.row, self.pools.ring_pages(snap.slot)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let snapshots: Vec<(u32, &[(i32, u64)])> = snap_rings
+                    .iter()
+                    .map(|(row, rings)| (*row, rings.as_slice()))
+                    .collect();
                 let pools = &self.pools;
                 let mut own = || {
                     let at = own_next;
@@ -1732,6 +1743,7 @@ impl Shell {
                         folded,
                         fold,
                         alone,
+                        snapshots: &snapshots,
                     },
                     page,
                     window,
