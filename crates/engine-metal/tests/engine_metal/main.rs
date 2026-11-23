@@ -87,6 +87,7 @@ mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
 mod the_weight_cache_serves_the_dense_logits;
+mod two_models_exported_boot_a_clean_home_measuring_nothing;
 
 /// The `device_kv_budget` a test states for its shell: none, so the chunk
 /// pool spans the room. A sparse pool maps only the segments a fire touches

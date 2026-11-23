@@ -779,6 +779,9 @@ pub(crate) fn at_load(
                 eprintln!("{name}: kernel.dense curves not stored: {why}");
             }
         }
+        let mut tuned = chip.tuned().clone();
+        tuned.timed.push(format!("dense curves ({})", fresh.len()));
+        chip = chip.with_tuned(tuned);
         curves.retain(|c| !fresh.iter().any(|f| f.id() == c.id()));
         curves.extend(fresh);
     } else {

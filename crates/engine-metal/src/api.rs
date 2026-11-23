@@ -457,6 +457,15 @@ impl Engine for Metal {
         self.boot.measure == engine::rates::Measuring::Skip
     }
 
+    /// What the load timed (`Shell::measured_at_load`): the device's rates
+    /// and the model's kernel.dense curves, each where it measured them.
+    /// `None` before a load, which has timed nothing yet to say.
+    fn measured_at_load(&self) -> Option<Vec<String>> {
+        self.shell
+            .as_ref()
+            .map(|shell| shell.measured_at_load().to_vec())
+    }
+
     fn kind(&self) -> &'static str {
         "metal"
     }
