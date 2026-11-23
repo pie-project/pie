@@ -1343,7 +1343,11 @@ impl Shell {
                     }
                     _ => None,
                 };
-                let buffers = buffering && rungs.contains(&bucket) && class.is_some();
+                // A wide composition (a class past the plain tiers, keyed
+                // by its bucket alone: a block drafter's verify) buffers and
+                // replays its rows too.
+                let keyed = class.is_some() || matches!(target, BodySynth::Wide { .. });
+                let buffers = buffering && rungs.contains(&bucket) && keyed;
                 let treatments: &[record::RsBody] = if buffers {
                     &[
                         record::RsBody::Folds,
