@@ -158,6 +158,7 @@ fn one(lanes: Vec<usize>, writes: std::ops::Range<u32>, fold: GroupFold) -> RsPl
         writes: Some(writes),
         fold,
         snapshots: Vec::new(),
+        beams: false,
     }])
 }
 
@@ -525,6 +526,7 @@ fn a_fire_too_wide_for_the_free_buffer_slots_is_cut_not_refused() {
         writes: None,
         fold: GroupFold::Host(wide),
         snapshots: Vec::new(),
+        beams: false,
     }]);
     assert_eq!(demand(&rs, &[ws], &folds_all).map(|units| units.pages), Ok(0));
 
@@ -718,6 +720,12 @@ fn hybrid_facts() -> ChunkFacts {
         ..WindowedLayer::default()
     }];
     facts.record_bytes = facts.ring_bytes() + 4096;
+    // Each rung's rs scratch: its rows only, nothing past them laid.
+    facts.act_replay = facts
+        .act_chunks
+        .iter()
+        .map(|&(tokens, _)| super::rows_only(tokens))
+        .collect();
     facts.validate().unwrap();
     facts
 }
@@ -1014,6 +1022,11 @@ fn a_beam_group_s_long_prompt_on_a_windowed_load_is_cut_not_refused() {
             MIB / 8,
         )
     });
+    listed.act_replay = listed
+        .act_chunks
+        .iter()
+        .map(|&(tokens, _)| super::rows_only(tokens))
+        .collect();
     listed.validate().unwrap();
     let (_, listed) = stores_of(&listed);
     assert!(crate::pipeline::fire::window_only(&listed, true));

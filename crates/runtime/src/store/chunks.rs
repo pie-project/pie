@@ -313,6 +313,12 @@ impl<I: PoolId> ShapePool<I> {
     /// `ids` go back once the fire at `epoch` retires.
     pub fn recycle_after_epoch(&mut self, ids: Vec<I>, epoch: u64) {
         if !ids.is_empty() {
+            tracing::debug!(
+                target: "runtime::store::kv",
+                epoch,
+                ids = ?ids.iter().map(|id| id.index()).collect::<Vec<_>>(),
+                "pool ids let go behind an epoch"
+            );
             self.pending.push((epoch, ids));
         }
     }
@@ -338,6 +344,12 @@ impl<I: PoolId> ShapePool<I> {
         if ids.is_empty() {
             return;
         }
+        tracing::debug!(
+            target: "runtime::store::kv",
+            base = self.base,
+            ids = ?ids.iter().map(|id| id.index()).collect::<Vec<_>>(),
+            "pool ids given back"
+        );
         match &mut self.slots {
             Backing::Own(pool) => {
                 let slots: Vec<Slot> = ids

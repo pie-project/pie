@@ -3076,6 +3076,7 @@ name = "kernels-cuda"
 version = "0.6.0"
 dependencies = [
  "cudarc",
+ "engine",
  "kernels-ir",
  "pie-dtype",
  "pie-profile",
@@ -3105,6 +3106,7 @@ dependencies = [
 name = "kernels-rocm"
 version = "0.6.0"
 dependencies = [
+ "engine",
  "kernels-ir",
  "libloading 0.9.0",
  "miniz_oxide 0.9.1",

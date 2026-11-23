@@ -202,3 +202,27 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     lane's tables / Lane.fixed. Byte reads of host refs (read_host_kv / read_host_state) are not stated. copy_kv /
     copy_state to/from host remain only for engines stating degenerate facts. TP: smallest host/disk chunk counts
     across ranks; each rank moves its band.
+23. **A rung's replay scratch is stated; one function checks a fire against it (replaces `fire::rung_rows`).**
+    Each activation rung states what its replay scratch holds, from the engine's own reserve formula:
+    `ChunkFacts.act_replay: Vec<RungReplay { own_max: Option<u32>, carried_max: Option<u32>, scratch:
+    ScratchBytes { slot_bytes: Vec<u64>, lane_bytes, room_bytes, pad } }>`, one a rung of `act_chunks`, in its
+    order; required (no default) of a load with an rs list (`ChunkFacts::validate` refuses one stating none by
+    name). A fire of `rows` scratch rows over `lanes` lanes takes `Σ_slots roundup_pad(rows × slot_bytes) +
+    roundup_pad(lanes × lane_bytes)` bytes (`ScratchBytes::bytes`), and fits where that is at most `room_bytes`;
+    an engine laying no rs scratch past its rung's rows states no slot. A fire's rows are `ReplayRows { own,
+    carried, scratch, lanes }`: `own` every row its lanes compute (never its lane count), `carried` each lane's
+    by `fire::lane_carried` (a decode lane's none), `scratch` `fire::rs_scratch_rows` (own, and each lane's
+    carried rows: on a compact fire `lane_carried`'s, else every one, a decode lane's included). Compactness is
+    the fire's, decided only by `fire::scratch_compact(ChunkFacts.rs_compact, ChunkFacts.rs_scratch_per_fire,
+    every_lane_one_run, any_lane_snapshots)`: the load's layout compact, and where compactness is a fire's
+    (Metal's), every lane's buffered rows one stretch (`fire::lane_one_run(mask, folded, first, lineage)`, from
+    its `RsVerb::Buffer`) and no lane landing an rs snapshot (an auto-checkpoint's included); no engine derives
+    it otherwise. `fire::rung_holds(&RungReplay, ReplayRows)` returns the bound that binds (`ReplayPast { bound:
+    Own | Carried | Scratch, rows, max }`). The runtime runs a fire at the smallest rung that holds it, each
+    piece of a cut pass as cut (the uncut pass's own rows are no piece's), and refuses by name a piece no rung
+    holds, before any step; each engine's submit check calls the same functions against the rung it stages in.
+    Stated: Metal own T, carried T, its rs layout's slots and work term (`Seat::scratch_bytes`), pad 256,
+    compactness a fire's; CUDA own T, carried its widest bucket's tokens, the extended run's row bytes over
+    `rows_ext(max_tokens)` rows, compact (a decoding lane's rows never take it); engine-gpu and XLA own T, carried
+    T, no slot (their replay lies in the rung's own rooms). `FireLimits.replayed_rows` stays the step's bound on
+    every lane's replayed rows.

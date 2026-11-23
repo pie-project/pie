@@ -28,5 +28,8 @@ zstd = { version = "0.14", optional = true }
 
 tracing = "0.1"
 
+[dev-dependencies]
+engine = { path = "../engine" }
+
 [lints]
 workspace = true

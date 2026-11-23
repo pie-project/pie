@@ -120,6 +120,7 @@ fn serve(
     let tokens = prompt();
     let mut rows = Vec::new();
     let first = Seated {
+        replay_stated: None,
         pages,
         held: Some(0),
         refs: true,
@@ -179,6 +180,7 @@ fn serve(
             )
             .expect("the device-geometry instance binds");
         let lane = Seated {
+            replay_stated: None,
             pages: &[],
             translation: pages,
             ..first
@@ -206,6 +208,7 @@ fn serve(
     for step in 0..STEPS {
         let got = shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 pages,
                 held: Some(PROMPT + step),
                 refs: true,

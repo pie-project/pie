@@ -246,6 +246,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
             })
             .collect();
         let seated = Seated {
+            replay_stated: None,
             held: Some(0),
             refs: true,
             pages: &own_pages,
@@ -273,6 +274,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
             }
         }
         let seated = Seated {
+            replay_stated: None,
             held: Some(held),
             refs: true,
             pages: &pages,

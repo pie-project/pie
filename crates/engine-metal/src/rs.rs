@@ -14,6 +14,17 @@ use crate::store::kv::Paging;
 pub enum Role {
     ConvX,
     Ba,
+    /// A gated-delta row's keys (the conv output's key heads, bf16): what
+    /// a decode step reads a buffered row's attention weight by.
+    Keys,
+    /// A gated-delta row's corrected value `u` (f32): the value its delta
+    /// rule writes, which a decode step reads as a linear attention.
+    U,
+    /// A gated-delta row's per-head scalars (f32, `v_heads` log-gates then
+    /// `v_heads` key-norm inverses, `poem_compiler::rs::gdn_scalars_bytes`):
+    /// written by the step that lands the row, read by a later decode step
+    /// in place of the row's `[b | a]` softplus and its key norm.
+    Scalars,
     Ids,
     KdaF,
     KdaB,
@@ -54,6 +65,72 @@ pub struct Layout {
     pub out_of: HashMap<u32, usize>,
     pub token_bytes: u64,
     pub work_elems: u64,
+    /// Whether every op that reads a state slot runs the paged forms (the
+    /// verify conv and the gated-delta verify and carried scans): then a
+    /// decode lane reads its carried rows from its buffer pages wherever it
+    /// lies, and takes no extended rows ([`compact`], [`scratch_rows`]).
+    pub compact: bool,
+}
+
+/// The extended rows a fire's rs scratch holds: its own rows and the rows
+/// its lanes carry in, as each counts toward the rung
+/// ([`engine::fire::lane_carried`] where the fire is compact: a decode
+/// lane's none; else every carried row). What the load reserves for each
+/// rung, at the rung's bound, and what each fire is checked against.
+#[must_use]
+pub fn scratch_rows(own: u32, carried: u32) -> u32 {
+    own.saturating_add(carried)
+}
+
+/// Whether every op of `trace` that reads a state slot is a conv or a
+/// gated-delta scan the paged forms run: a conv of a multiple of four
+/// channels within the verify conv's taps and history, no bias; a scan of
+/// the verify scan's heads.
+#[must_use]
+pub fn compact(trace: &Trace) -> bool {
+    use poem_ir::Operands;
+    let state = |id: &ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|value| &value.def),
+            Some(Def::Cache(row))
+                if matches!(trace.caches.get(*row as usize), Some(poem_ir::CacheRow::State { .. }))
+        )
+    };
+    let mut reads = Vec::new();
+    let mut any = false;
+    let paged = trace.nodes.iter().all(|node| {
+        reads.clear();
+        node.op.inputs(&mut reads);
+        if !reads.iter().any(state) {
+            return true;
+        }
+        any = true;
+        match &node.op {
+            Operation::Ssm(
+                Ssm::CausalConv1d {
+                    x,
+                    bias: None,
+                    conv_width,
+                    dilation,
+                    ..
+                }
+                | Ssm::CausalConv1dChunked {
+                    x,
+                    bias: None,
+                    conv_width,
+                    dilation,
+                    ..
+                },
+            ) => row_of(trace, *x).is_ok_and(|(width, _, _)| {
+                kernels_metal::ssm::causal_conv1d_verify_fits(width, *conv_width, *dilation)
+            }),
+            Operation::Ssm(
+                Ssm::GatedDelta { k_dim, v_dim, .. } | Ssm::GatedDeltaChunked { k_dim, v_dim, .. },
+            ) => kernels_metal::ssm::gated_delta_verify_fits(*k_dim, *v_dim),
+            _ => false,
+        }
+    });
+    paged && any
 }
 
 /// The snapshot rows one lane lands in a fire (`Lane::rs_snapshots`):
@@ -151,9 +228,13 @@ impl Layout {
         let mut plane = |layout: &mut Layout,
                          cache: u32,
                          role: Role,
-                         value: ValueId|
+                         value: ValueId,
+                         sized: Option<(u32, Dtype, u64)>|
          -> Result<()> {
-            let (width, dtype, row_bytes) = row_of(trace, value)?;
+            let (width, dtype, row_bytes) = match sized {
+                Some(sized) => sized,
+                None => row_of(trace, value)?,
+            };
             let at = match plane_keys.get(&(cache, role)) {
                 Some(&at) => {
                     let have = layout.planes[at];
@@ -217,7 +298,7 @@ impl Layout {
                     | Ssm::CausalConv1dChunked { x, state, y, .. },
                 ) if deferred.contains(&y.0) => {
                     let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::ConvX, *x)?;
+                    plane(&mut layout, cache, Role::ConvX, *x, None)?;
                     region(&mut layout, cache, "conv", *y)?;
                 }
                 Operation::Ssm(
@@ -271,8 +352,8 @@ impl Layout {
                     },
                 ) => {
                     let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::KdaF, *f)?;
-                    plane(&mut layout, cache, Role::KdaB, *b)?;
+                    plane(&mut layout, cache, Role::KdaF, *f, None)?;
+                    plane(&mut layout, cache, Role::KdaB, *b, None)?;
                     region(&mut layout, cache, "scan", *y)?;
                     layout.work_elems = layout
                         .work_elems
@@ -293,7 +374,7 @@ impl Layout {
                     },
                 ) => {
                     let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::Ids, *ids)?;
+                    plane(&mut layout, cache, Role::Ids, *ids, None)?;
                     region(&mut layout, cache, "ngram", *ngram_ids)?;
                 }
                 _ => {}
@@ -309,14 +390,107 @@ impl Layout {
                     gates.0
                 ),
             })?;
-            plane(&mut layout, cache, Role::Ba, *ba)?;
+            plane(&mut layout, cache, Role::Ba, *ba, None)?;
             region(&mut layout, cache, "gates", *gates)?;
+        }
+        // The corrected row (`ChunkProfile::rs_corrected`, Metal's profile):
+        // a buffered gated-delta row keeps its keys (the conv output's key
+        // heads, bf16) and its corrected values `u` (f32), as the chunk plan
+        // lays them (`poem_compiler::chunk::census::rs_rows`): a decode step
+        // reads the buffered rows as a linear attention and re-steps none.
+        if poem_compiler::chunk::ChunkProfile::ON_DEVICE_METAL.rs_corrected {
+            let gated: std::collections::HashSet<u32> = trace
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Operation::Ssm(Ssm::GdnGates { gates, .. }) => Some(gates.0),
+                    _ => None,
+                })
+                .collect();
+            for node in &trace.nodes {
+                let Operation::Ssm(Ssm::GatedDeltaChunked {
+                    qkv,
+                    gates,
+                    state,
+                    y,
+                    k_heads,
+                    k_dim,
+                    v_heads,
+                    v_dim,
+                    ..
+                }) = &node.op
+                else {
+                    continue;
+                };
+                if !deferred.contains(&qkv.0) || !gated.contains(&gates.0) {
+                    continue;
+                }
+                let cache = cache_of(trace, *state)?;
+                let keys = k_heads * k_dim;
+                let values = v_heads * v_dim;
+                plane(
+                    &mut layout,
+                    cache,
+                    Role::Keys,
+                    *qkv,
+                    Some((keys, Dtype::Bf16, u64::from(keys) * 2)),
+                )?;
+                plane(
+                    &mut layout,
+                    cache,
+                    Role::U,
+                    *y,
+                    Some((values, Dtype::F32, u64::from(values) * 4)),
+                )?;
+                plane(
+                    &mut layout,
+                    cache,
+                    Role::Scalars,
+                    *gates,
+                    Some((
+                        2 * v_heads,
+                        Dtype::F32,
+                        poem_compiler::rs::gdn_scalars_bytes(*v_heads),
+                    )),
+                )?;
+            }
+            // The decode form (`GatedDelta`) of a layer reads the planes its
+            // prompt form lays, by its own values: the same state's.
+            let of = |layout: &Layout, cache: u32, role: Role| {
+                layout
+                    .planes
+                    .iter()
+                    .position(|plane| plane.cache == cache && plane.role == role)
+            };
+            for node in &trace.nodes {
+                let Operation::Ssm(Ssm::GatedDelta {
+                    qkv,
+                    gates,
+                    state,
+                    y,
+                    ..
+                }) = &node.op
+                else {
+                    continue;
+                };
+                let cache = cache_of(trace, *state)?;
+                if let (Some(keys), Some(u), Some(scalars)) = (
+                    of(&layout, cache, Role::Keys),
+                    of(&layout, cache, Role::U),
+                    of(&layout, cache, Role::Scalars),
+                ) {
+                    layout.in_of.insert(qkv.0, keys);
+                    layout.in_of.insert(y.0, u);
+                    layout.in_of.insert(gates.0, scalars);
+                }
+            }
         }
         if layout.planes.is_empty() {
             return Ok(None);
         }
         layout.token_bytes = layout.planes.iter().map(|plane| plane.row_bytes).sum();
         layout.share(trace);
+        layout.compact = compact(trace);
         Ok(Some(layout))
     }
 
@@ -431,7 +605,8 @@ mod page_tests {
             scatter: Some(run(5, 1)),
             ..LanePlan::default()
         };
-        assert!(page_table(&[one], 16).is_some(), "one run reads in place");
+        let ints = super::page_ints(256, 16);
+        assert!(page_table(&[one], 16, ints).unwrap().is_some(), "one run reads in place");
         let two = LanePlan {
             replay: 2,
             gather: Some(run(3, 1)),
@@ -439,7 +614,7 @@ mod page_tests {
             scatter: Some(run(6, 1)),
             ..LanePlan::default()
         };
-        assert!(page_table(&[two], 16).is_none(), "two runs gather by copies");
+        assert!(page_table(&[two], 16, ints).unwrap().is_none(), "two runs gather by copies");
     }
 }
 
@@ -537,6 +712,19 @@ impl Buffers {
         self.page_tokens
     }
 
+    /// The GPU address an rs page id's slot is reached from (`pie_page_at`
+    /// over the pool's first buffer), as a beam's rs copies address it.
+    #[must_use]
+    pub fn slab_address(&self) -> Option<u64> {
+        self.parts.first()?.address_at(0)
+    }
+
+    /// Each plane's rows' byte offset in an rs page.
+    #[must_use]
+    pub fn plane_offsets(&self) -> &[u64] {
+        &self.plane_at
+    }
+
     #[must_use]
     pub fn page_bytes(&self) -> u64 {
         self.page_bytes
@@ -551,36 +739,52 @@ impl Buffers {
 }
 
 /// The ints of one lane's row in the page table a verify arm reads its
-/// buffer through: the in-page token of the lane's first extended row, or
+/// buffer through (the in-page token of the lane's first extended row, or
 /// -1 for a lane that buffers nothing, then the slab slots of the pages its
-/// extended rows touch.
-pub const PAGE_INTS: u32 = kernels_metal::ssm::RS_PAGE_INTS;
-
-/// The page table of `lanes`, one [`PAGE_INTS`] row a lane, where every
-/// lane's replayed and own rows fit the row's pages; else `None`, and the
-/// fire's recurrent ops gather and scatter by copies.
+/// extended rows touch) over an rs buffer of `page_tokens` rows a page, for
+/// a load of `context` tokens: the pages of the most rows a lane touches in
+/// one fire (its buffered rows and its own, all within its context: a
+/// decode lane's carried rows count toward no rung, as
+/// `engine::fire::lane_carried` states, and a beam in a parents pass
+/// carries every row since its fold) from any in-page offset, and the
+/// header. 0 where the load buffers no rs row.
 #[must_use]
-pub fn page_table(lanes: &[LanePlan], page_tokens: u32) -> Option<Vec<i32>> {
+pub fn page_ints(context: u32, page_tokens: u32) -> u32 {
+    if page_tokens == 0 {
+        return 0;
+    }
+    1 + (page_tokens - 1).saturating_add(context).div_ceil(page_tokens)
+}
+
+/// The page table of `lanes`, one `ints` row a lane ([`page_ints`]); `None`
+/// where a lane's rows lie in no one stretch of pages, and the fire's
+/// recurrent ops gather and scatter by copies. A lane touching more pages
+/// than the row holds is a count past the rung the width was derived from:
+/// refused by name.
+pub fn page_table(lanes: &[LanePlan], page_tokens: u32, ints: u32) -> Result<Option<Vec<i32>>> {
     let page_tokens = page_tokens.max(1);
-    let mut table = Vec::with_capacity(lanes.len() * PAGE_INTS as usize);
+    if ints < 2 {
+        return Ok(None);
+    }
+    let mut table = Vec::with_capacity(lanes.len() * ints as usize);
     for plan in lanes {
         // A lane replaying more than one run (its ancestry among siblings'
         // slots) reads no one stretch of pages: the fire gathers by copies.
         if plan.gathers.len() > 1 {
-            return None;
+            return Ok(None);
         }
-        let mut row = [0i32; PAGE_INTS as usize];
+        let mut row = vec![0i32; ints as usize];
         row[0] = -1;
         let (first, pages) = match (&plan.gather, &plan.scatter) {
             (Some(gather), Some(scatter)) => {
                 if scatter.from != gather.from + gather.count || scatter.pages != gather.pages {
-                    return None;
+                    return Ok(None);
                 }
                 (gather.from, &gather.pages)
             }
             (Some(run), None) | (None, Some(run)) => (run.from, &run.pages),
             (None, None) => {
-                table.extend(row);
+                table.extend(row.iter().copied());
                 continue;
             }
         };
@@ -589,21 +793,40 @@ pub fn page_table(lanes: &[LanePlan], page_tokens: u32) -> Option<Vec<i32>> {
         let page0 = (first / page_tokens) as usize;
         let in_page = first % page_tokens;
         let touched = (in_page + span).div_ceil(page_tokens) as usize;
-        if touched >= PAGE_INTS as usize {
-            return None;
+        if touched >= ints as usize {
+            return Err(Fault::program(
+                "rs::page_table",
+                format!(
+                    "a lane's {span} recurrent rows from in-page row {in_page} touch {touched} \
+                     pages of {page_tokens} rows, past the {} a page table row of this rung \
+                     holds (rs::page_ints); the fire is refused and writes nothing",
+                    ints - 1
+                ),
+            ));
         }
-        row[0] = i32::try_from(in_page).ok()?;
-        for (at, &slot) in pages.get(page0..page0 + touched)?.iter().enumerate() {
-            row[1 + at] = i32::try_from(slot).ok()?;
+        let (Ok(at), Some(slots)) = (i32::try_from(in_page), pages.get(page0..page0 + touched))
+        else {
+            return Ok(None);
+        };
+        row[0] = at;
+        for (at, &slot) in slots.iter().enumerate() {
+            let Ok(slot) = i32::try_from(slot) else {
+                return Ok(None);
+            };
+            row[1 + at] = slot;
         }
-        table.extend(row);
+        table.extend(row.iter().copied());
     }
-    Some(table)
+    Ok(Some(table))
 }
 
 #[derive(Debug)]
 pub struct Seat {
     pub lanes: Vec<LanePlan>,
+    /// Each lane's carried rows among the extended rows: its replay, or
+    /// none for a decode lane of a compact fire ([`scratch_rows`]).
+    pub ext_replay: Vec<u32>,
+    pub ext_replay_table: Tensor,
     pub replay: Tensor,
     pub commit: Tensor,
     pub slots: Tensor,
@@ -626,6 +849,12 @@ pub struct Seat {
     /// verify arm then reads the replayed rows from the buffer and lands the
     /// window's own there itself.
     pub pages: Option<Tensor>,
+    /// The ints of a lane's row of `pages` ([`page_ints`]).
+    pub page_ints: u32,
+    /// The fire's beam groups' folds before each recurrent layer's step
+    /// (BEAM-PAGE-LISTS §11.3), read through `pages`; `None` where no group
+    /// folds this fire.
+    pub folds: Option<kernels_metal::ssm::GroupFolds>,
     pub ext: RefCell<HashMap<u32, Tensor>>,
     /// The gate preps whose gates the verify scan derives as it stages its
     /// rows, by the gates value: the `[b | a]` projection, `dt_bias` and
@@ -664,11 +893,14 @@ impl Seat {
         buffers: &Buffers,
         (scratch, (base, have)): (&Buffer, (u64, u64)),
         lanes: Vec<LanePlan>,
+        (ext_replay, ext_replay_table): (Vec<u32>, Tensor),
         replay: Tensor,
         commit: Tensor,
         slots: Tensor,
         rows_ext: u32,
         pages: Option<Tensor>,
+        page_ints: u32,
+        folds: Option<(Tensor, u32)>,
     ) -> Result<Seat> {
         let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
         let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
@@ -718,6 +950,8 @@ impl Seat {
         );
         Ok(Seat {
             lanes,
+            ext_replay,
+            ext_replay_table,
             replay,
             commit,
             slots,
@@ -734,6 +968,8 @@ impl Seat {
             work,
             rows_ext,
             pages,
+            page_ints,
+            folds: folds.map(|(table, count)| kernels_metal::ssm::GroupFolds { table, count }),
             ext: RefCell::new(HashMap::new()),
             prepped: RefCell::new(HashMap::new()),
         })
@@ -754,6 +990,7 @@ impl Seat {
             page_tokens: self.page_tokens,
             page_bytes: u32::try_from(self.page_bytes).ok()?,
             row_bytes: u32::try_from(self.layout.planes[plane].row_bytes).ok()?,
+            page_ints: self.page_ints,
         })
     }
 

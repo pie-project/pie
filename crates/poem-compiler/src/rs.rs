@@ -13,6 +13,21 @@ use std::collections::HashMap;
 
 use poem_ir::{Def, Operation, Ssm, Trace, ValueId};
 
+/// The bytes a token of a gated-delta row's scalars plane takes
+/// (`ChunkProfile::rs_corrected`): two f32 runs of `v_heads`, each value
+/// head's log-gate `g = -exp(A_log) * softplus(a + dt_bias)`, then its key
+/// norm's inverse (its key head's, repeated over the value heads that share
+/// it), as the writing engine's scan norms a key: an engine reads only the
+/// rows it wrote. The step that lands the row writes them
+/// (it holds both); a reader of a buffered row takes them instead of
+/// recomputing them from the row's `[b | a]` and keys. A backend whose
+/// kernels recompute them leaves the plane unwritten and unread: a fork
+/// copies it with the rest, and nothing reads what it holds.
+#[must_use]
+pub const fn gdn_scalars_bytes(v_heads: u32) -> u64 {
+    2 * v_heads as u64 * 4
+}
+
 /// What a buffered conv's output feeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Feeds {

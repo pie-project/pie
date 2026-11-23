@@ -46,6 +46,7 @@ fn the_ledger_accounts_for_the_device() {
         let seated: Vec<Seated<'_>> = lanes
             .iter()
             .map(|&lane| Seated {
+                replay_stated: None,
                 pages: &[],
                 held: Some(held[lane]),
                 ..Seated::of(Lane {

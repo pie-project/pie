@@ -165,7 +165,7 @@ type Decodes = Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>;
 fn ready(fixture: &Fixture) -> Shell {
     let mut shell = load_with(fixture, CONTEXT);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
     shell
 }
 
@@ -176,6 +176,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
     shell.open(0).expect("the slot opens");
     shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 0,
@@ -248,6 +249,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
         let logits = shell
             .fire_attached(
                 &[Seated {
+                    replay_stated: None,
                     held: Some(PROMPT + step),
                     ..Seated::of(Lane {
                         slot: 0,
@@ -286,6 +288,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
     // an instance attached at more lanes than its one lane's rows.
     let refused = shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(PROMPT + DECODES),
             ..Seated::of(Lane {
                 slot: 0,
@@ -301,6 +304,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
     let refused = shell
         .fire_attached(
             &[Seated {
+                replay_stated: None,
                 held: Some(PROMPT + DECODES),
                 ..Seated::of(Lane {
                     slot: 0,

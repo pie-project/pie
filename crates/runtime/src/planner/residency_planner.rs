@@ -86,6 +86,9 @@ pub struct ResidencyPlanner {
     /// again once either has moved past it: on the same room it would find
     /// the same readers with fires in flight, or the same chunks taken.
     pub(super) list_compaction_failed: AtomicU64,
+    /// What had landed (fires, evictions, restores) when the pages gathered
+    /// for the heads were last packed again ([`Self::compact_lists`]).
+    pub(super) repacked_at: AtomicU64,
     /// The segment walk made no grow it promised: the next pass goes on
     /// past its grow steps ([`Self::no_grow`]).
     pub(super) no_grow: AtomicBool,
@@ -114,6 +117,21 @@ pub struct ResidencyPlanner {
     /// The engine's weight cache, shed before the device's shortfall is
     /// said; `None` where no cache stands in front of the pool.
     weight_shed: Option<WeightShed>,
+}
+
+// How far short the safe order stood at its last read (for tests,
+// `ResidencyPlanner::order_least`).
+#[cfg(test)]
+thread_local! {
+    static ORDER_LEAST: std::cell::Cell<Option<i128>> = const { std::cell::Cell::new(None) };
+}
+
+/// The first's room in the order: what it has free less its need.
+#[cfg(test)]
+fn free_first(order: &[(u64, u64, super::inner::CapacityRead)]) -> i128 {
+    order
+        .first()
+        .map_or(i128::MAX, |&(need, _, read)| read.free() as i128 - need as i128)
 }
 
 /// How long a process waits at admission before it says why, and again
@@ -166,6 +184,7 @@ impl ResidencyPlanner {
             parking_down: AtomicBool::new(false),
             park_down_failed: AtomicU64::new(u64::MAX),
             list_compaction_failed: AtomicU64::new(u64::MAX),
+            repacked_at: AtomicU64::new(u64::MAX),
             no_grow: AtomicBool::new(false),
             swap_bound: AtomicBool::new(false),
             port,
@@ -449,6 +468,23 @@ impl ResidencyPlanner {
         // Fewest needed first, the oldest first among equals (candidates
         // come by admission, and the sort is stable).
         order.sort_by_key(|&(need, ..)| need);
+        // The finisher stays first while it still fits, or while no one
+        // else does: it runs to its end. Read afresh each pass, the first
+        // flipped between two processes as a restore moved one's need:
+        // restored as the finisher, the other's next ask evicted it, which
+        // made it the finisher again, 914 times over one head in the field
+        // mix's wide shape (seed 7: many beam searches at once). A move
+        // under way opens chunks below for a step (the slack): read then,
+        // no one fitted, and the finisher passed to whoever needed least
+        // for that step, its own restore's victim among the rest.
+        let kept = self.with_inner(|inner| inner.capacity.map(|gate| gate.finisher));
+        let fits = |&(need, _, read): &(u64, u64, super::inner::CapacityRead)| need <= read.free();
+        if let Some(at) = order.iter().position(|&(_, _, read)| Some(read.finisher) == kept)
+            && (fits(&order[at]) || !order.iter().any(fits))
+        {
+            let first = order.remove(at);
+            order.insert(0, first);
+        }
         let (_, _, first) = *order.first()?;
         let mut free = first.free() as i128;
         let mut least = i128::MAX;
@@ -461,7 +497,18 @@ impl ResidencyPlanner {
         // The first's place is the finisher's: it never waits. One not in
         // the order goes after the last.
         places.remove(0);
+        #[cfg(test)]
+        ORDER_LEAST.with(|cell| cell.set(Some(least.min(free_first(&order)))));
         Some((first, places, u64::try_from(least.max(0)).unwrap_or(u64::MAX)))
+    }
+
+    /// How far short the safe order stood when last read: negative where
+    /// some process in it (the first included) cannot finish in turn
+    /// (for tests).
+    #[cfg(test)]
+    pub(super) fn order_least(&self) -> Option<i128> {
+        let _ = self.capacity_reads();
+        ORDER_LEAST.with(std::cell::Cell::get)
     }
 
     /// Whether an allocation of `pages` for `pid` waits on the capacity
@@ -633,6 +680,17 @@ impl ResidencyPlanner {
                 total,
                 runs: room.longest(),
             });
+        }
+        // A run longer than any segment lays for state is never laid,
+        // whatever moves: refused by name, never waited on (the M5 at beam
+        // w32: a restore of runs of 57 chunks, the planner finding no step
+        // 0.5 M times).
+        let longest = self.port.longest_run_most();
+        if longest != u32::MAX
+            && let Some(room) = self.head_room_within(key, false)
+            && let Some(&(run, _)) = room.entries().iter().find(|&&(run, _)| run > longest)
+        {
+            return Some(super::PlannerError::RunPastPool { run, longest });
         }
         let (need, runs) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&key)?;
@@ -865,10 +923,16 @@ impl ResidencyPlanner {
             let quiet = self.with_inner(|inner| inner.nothing_in_flight());
             let held_by = self.held_by_state();
             let store = self.store_holders();
+            // What the pool's walker awaits and for how long: a walk stuck
+            // on a lane op's reply steps nothing, the head's asked
+            // compaction or grow never sent (the M1's run 10).
+            let walk = crate::store::shared::walk_waiting(self.port.locus().1)
+                .map_or_else(|| "nothing".to_string(), |(what, since)| format!("{what} since {since:?} ago"));
             tracing::warn!(
                 %pid,
                 kind,
                 quiet,
+                %walk,
                 %plan,
                 %blocked,
                 capped = %self.capped_line(),
@@ -1172,9 +1236,12 @@ impl ResidencyPlanner {
         let (need, suspended, kv_missing) = self.with_inner(|inner| {
             let waiter = inner.queue.get(&inner.locate(key)?)?;
             match &waiter.kind {
-                WaitKind::BindRoom { run, pieces, .. } => {
-                    Some(((*run, *pieces), None, (0, RsUnits::default())))
-                }
+                WaitKind::BindRoom {
+                    run,
+                    pieces,
+                    singles,
+                    ..
+                } => Some(((*run, *pieces), None, (*singles, (0, RsUnits::default())))),
                 WaitKind::Restore { .. } => {
                     let proc = inner.procs.get(&waiter.pid)?;
                     let need = proc.restore_need()?;
@@ -1188,6 +1255,8 @@ impl ResidencyPlanner {
                         .bind_room
                         .filter(|bind| !suspended && bind.run != need.0)
                         .map(|bind| (bind.run, bind.pieces));
+                    // The single chunks its bind asks beside its runs.
+                    let singles = proc.bind_room.map_or(0, |bind| bind.singles);
                     // Its kv pages not yet gathered take chunks of the same
                     // free pool as its runs, and so does its state (records,
                     // rs list slots) its serve takes before its unpark.
@@ -1195,12 +1264,13 @@ impl ResidencyPlanner {
                     Some((
                         need,
                         Some((waiter.pid, suspended, bind, refused)),
-                        (kv_missing, waiter.rs_need()),
+                        (singles, (kv_missing, waiter.rs_need())),
                     ))
                 }
                 WaitKind::Allocation { .. } => None,
             }
         })?;
+        let (singles, kv_missing) = kv_missing;
         let refused = suspended.and_then(|(_, _, _, refused)| refused);
         let mut room = match suspended {
             // A bind's runs beside what its own unpark takes back first.
@@ -1217,6 +1287,7 @@ impl ResidencyPlanner {
             }
             None => RunNeed::one(need.0, need.1),
         };
+        room.add(1, singles);
         if let Some((run, pieces)) = refused {
             room.at_least(run, pieces);
         }
@@ -1460,6 +1531,16 @@ impl ResidencyPlanner {
     /// once either moves.
     /// The room a list compaction is planned on: the pool's room count, the
     /// swap tiers' free slots and the fires landed.
+    /// What has landed: fires, evictions and restores, hashed.
+    pub(super) fn landed(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.stats.fires_landed.load(Ordering::Acquire).hash(&mut hasher);
+        self.stats.evictions.load(Ordering::Acquire).hash(&mut hasher);
+        self.stats.restores.load(Ordering::Acquire).hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub(super) fn compaction_room(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
@@ -1992,6 +2073,12 @@ impl ResidencyPlanner {
             let changed = inner.procs.get_mut(&pid).is_some_and(|proc| {
                 let was = proc.bind_waiting;
                 proc.bind_waiting = waiting;
+                // Resident and binding again: the room an eviction taken
+                // back left pending is its bind's own again, taken or
+                // asked anew.
+                if !waiting && proc.state == Residency::Resident {
+                    proc.bind_room = None;
+                }
                 was != waiting
             });
             // The suspended bind it was restored for waits for room again:
@@ -2015,6 +2102,10 @@ impl ResidencyPlanner {
     /// parked process queues its restore, ahead of its next fire.
     pub fn set_idle(self: &Arc<Self>, pid: ProcessId, idle: bool) {
         self.with_inner(|inner| {
+            // A new request: it arrives.
+            if !idle {
+                inner.arrived(pid);
+            }
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
             };
@@ -2132,17 +2223,25 @@ impl ResidencyPlanner {
     /// adjacent chunks: its restore waits for them beside its kv pages
     /// ([`super::proc::Proc::bind_room`]), never served into the same
     /// shortfall.
-    pub fn suspend_for_room(self: &Arc<Self>, pid: ProcessId, run: u32, pieces: u32) -> bool {
+    pub fn suspend_for_room(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        run: u32,
+        pieces: u32,
+        singles: u32,
+    ) -> bool {
+        let chunks = run.max(1).saturating_mul(pieces).saturating_add(singles);
         let need = PendingBind {
+            singles,
             run: run.max(1),
             pieces,
-            pages: self.port.chunks_as_pages(run.max(1).saturating_mul(pieces)),
+            pages: self.port.chunks_as_pages(chunks),
         };
 
         // A bind the capacity gate holds waits for the gate in the planner:
         // suspended, it parked its process for room that was there, and
         // came back to the same hold.
-        if self.capacity_would_hold(pid, run.max(1).saturating_mul(pieces)) {
+        if self.capacity_would_hold(pid, chunks) {
             return false;
         }
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
@@ -2318,6 +2417,7 @@ impl ResidencyPlanner {
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
+            inner.arrived(pid);
             if inner.bind_restoring == Some(pid) {
                 inner.bind_restoring = None;
             }
@@ -2428,12 +2528,14 @@ impl ResidencyPlanner {
     /// on. A pass for it finds no step.
     pub(super) fn head_refused_on_room_unmoved(&self) -> bool {
         let free = self.port.free_chunks();
+        let gives = self.port.room_gives();
         self.with_inner(|inner| {
             inner.unmet_head().is_some_and(|(_, waiter)| {
                 matches!(waiter.kind, WaitKind::Restore { .. })
                     && inner.procs.get(&waiter.pid).is_some_and(|proc| {
                         proc.roles_short.is_some()
                             && proc.roles_short_free.is_some_and(|left| free <= left)
+                            && proc.roles_short_gives == Some(gives)
                     })
             })
         })

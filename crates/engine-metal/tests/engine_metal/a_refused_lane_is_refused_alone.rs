@@ -232,6 +232,7 @@ fn a_refused_lane_is_refused_alone() {
         .iter()
         .enumerate()
         .map(|(slot, tokens)| Seated {
+            replay_stated: None,
             kv_less: true,
             ..Seated::of(engine_metal::Lane {
                 slot: slot as u32,

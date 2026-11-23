@@ -75,6 +75,24 @@ pub struct ChunkFacts {
     /// Empty where activation lives in a buffer of its own.
     #[serde(default)]
     pub act_chunks: Vec<(u32, u32)>,
+    /// What each rung's replay scratch holds ([`crate::RungReplay`]), one
+    /// a rung of [`ChunkFacts::act_chunks`] in its order, from the engine's
+    /// own reserve formula: stated by every engine whose rungs replay
+    /// buffered recurrent rows (a load with an rs list), no default
+    /// ([`ChunkFacts::validate`] refuses such a load stating none).
+    #[serde(default)]
+    pub act_replay: Vec<crate::RungReplay>,
+    /// The load's rs scratch layout is compact (every recurrent op on its
+    /// paged forms, its rs page table staged): a fire on it lays only the
+    /// carried rows a rung counts ([`crate::fire::lane_carried`]: a decode
+    /// lane's none) where the fire is compact too
+    /// ([`crate::fire::scratch_compact`], which alone decides it).
+    #[serde(default)]
+    pub rs_compact: bool,
+    /// The load's scratch compactness is a fire's
+    /// ([`crate::fire::scratch_compact`]'s `per_fire`): Metal's.
+    #[serde(default)]
+    pub rs_scratch_per_fire: bool,
     /// The rungs of [`ChunkFacts::act_chunks`] the engine states eager, by
     /// their tokens, ascending; every other rung stated is armed, its
     /// bodies captured before the load returned. Fixed at load: nothing
@@ -555,6 +573,13 @@ impl ChunkFacts {
         })
     }
 
+    /// What rung `at` of [`ChunkFacts::act_chunks`] holds of a fire's
+    /// replay, as the engine states it.
+    #[must_use]
+    pub fn rung_replay(&self, at: usize) -> Option<&crate::RungReplay> {
+        self.act_replay.get(at)
+    }
+
     #[must_use]
     pub fn act_chunks_max(&self) -> u32 {
         self.act_chunks.last().map_or(0, |&(_, chunks)| chunks)
@@ -679,6 +704,9 @@ impl ChunkFacts {
             }],
             shapes,
             act_chunks: Vec::new(),
+            act_replay: Vec::new(),
+            rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,
@@ -705,6 +733,21 @@ impl ChunkFacts {
     /// pool.
     pub fn validate(&self) -> Result<()> {
         let invalid = |what: String| Err(Error::Invalid(format!("chunk facts: {what}")));
+        let replays = self.shapes.iter().any(|shape| shape.role == SlotRole::RsBuffer);
+        if replays && !self.act_chunks.is_empty() && self.act_replay.is_empty() {
+            return invalid(
+                "this engine states no rs scratch model for its rungs (act_replay), and its \
+                 load replays buffered recurrent rows"
+                    .into(),
+            );
+        }
+        if !self.act_replay.is_empty() && self.act_replay.len() != self.act_chunks.len() {
+            return invalid(format!(
+                "{} rungs' replay bounds stated for {} rungs",
+                self.act_replay.len(),
+                self.act_chunks.len()
+            ));
+        }
         let total = u64::from(self.total_chunks);
         if !matches!(
             self.reserved.first(),

@@ -27,6 +27,18 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
     )
 }
 
+/// The word copies' pipelines: [`copy_words`]'s and [`copy_words_batch`]'s.
+/// Which one a recurrent op launches is its lanes' count of row runs (one
+/// copy, or two to four side by side), which no walked fire states in full;
+/// they are fixed pipelines ([`super::fixed_pipelines`]).
+#[must_use]
+pub fn pipelines() -> [Fire; 2] {
+    [
+        Fire::at("runtime/blit.metal", "rs_copy_words"),
+        Fire::at("runtime/blit.metal", "rs_copy_words4"),
+    ]
+}
+
 /// Up to four word copies in one launch, `(src, dst, bytes)` each; the
 /// copies must not overlap one another, since they run side by side.
 pub fn copy_words_batch(ctx: &Ctx<'_>, copies: &[(Tensor, Tensor, u64)]) -> Result<(), Error> {

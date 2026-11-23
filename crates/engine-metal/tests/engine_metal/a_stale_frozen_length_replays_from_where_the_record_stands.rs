@@ -35,6 +35,7 @@ fn fire(
 ) -> Vec<Vec<f32>> {
     shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(held),
             rs,
             rs_reset: reset,

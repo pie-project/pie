@@ -169,8 +169,12 @@ impl ResidencyPlanner {
             let proc = inner.procs.get_mut(&pid)?;
             if proc.state == Residency::Evicting {
                 proc.state = Residency::Resident;
-                // Never parked: its bind goes again as it stands.
-                proc.bind_room = None;
+                // Never parked: its bind goes again as it stands. The room
+                // a bind withdrawn by this eviction waited for is kept
+                // until that bind asks again ([`Self::wait_room`]): moved
+                // again before it did, its restore came back without the
+                // room, short, and its process went down a second time for
+                // one bind (the simulation's seed 276).
             }
             Some(proc.signal.clone())
         });
@@ -227,6 +231,7 @@ impl ResidencyPlanner {
         let signal = self.with_inner(|inner| {
             #[cfg(test)]
             inner.moves.push((pid, None));
+            inner.arrived(pid);
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
@@ -398,6 +403,7 @@ impl ResidencyPlanner {
         let understated = refused_saw && stood < max_runs;
         let pieces = if understated { pieces.max(stood.saturating_add(1)) } else { pieces };
         let updated = super::proc::PendingBind {
+            singles: 0,
             run,
             pieces,
             pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
@@ -467,16 +473,17 @@ impl ResidencyPlanner {
                 .procs
                 .get(&pid)
                 .and_then(|proc| proc.bind_room)
-                .map(|need| (need.run, need.pieces));
+                .map(|need| need.entries())
+                .unwrap_or_default();
             inner.queue.iter().find_map(|(key, waiter)| {
                 (waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
-                    .then(|| (*key, waiter.rs_need(), bind, inner.restore_kv_missing(*key)))
+                    .then(|| (*key, waiter.rs_need(), bind.clone(), inner.restore_kv_missing(*key)))
             })
         });
         if let Some((key, state, bind, kv)) = queued {
             let stood = self
                 .head_room(key)
-                .is_some_and(|need| self.port.restore_stands(pid, &need, state, kv, bind));
+                .is_some_and(|need| self.port.restore_stands(pid, &need, state, kv, &bind));
             self.with_inner(|inner| {
                 if let Some(proc) = inner.procs.get_mut(&pid) {
                     proc.roles_short_stood = Some(stood);

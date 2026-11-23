@@ -69,7 +69,15 @@ pub enum CoresFrom {
     Registry,
     /// The checked-in model table, by this model identifier.
     Model(&'static str),
+    /// Measured as the device opened: the full workgroups it keeps resident
+    /// at once ([`Context::resident_groups`]), [`RESIDENT_PER_CORE`] a core.
+    Probe,
 }
+
+/// The full workgroups (1024 threads, 32 KiB of threadgroup memory each) an
+/// Apple GPU core keeps resident at once: 48 on a 24-core M1 Max (Apple7),
+/// whatever the groups' count or length (`the_resident_probe_counts_the_cores`).
+pub const RESIDENT_PER_CORE: u32 = 2;
 
 impl CoresFrom {
     /// Its value of the `cores_from` fact.
@@ -78,6 +86,7 @@ impl CoresFrom {
         match self {
             CoresFrom::Registry => "registry",
             CoresFrom::Model(_) => "model",
+            CoresFrom::Probe => "probe",
         }
     }
 }
@@ -87,6 +96,7 @@ impl std::fmt::Display for CoresFrom {
         match self {
             CoresFrom::Registry => write!(f, "from the IORegistry"),
             CoresFrom::Model(id) => write!(f, "from the model table, as {id}"),
+            CoresFrom::Probe => write!(f, "measured from the workgroups it keeps resident"),
         }
     }
 }
@@ -180,7 +190,7 @@ impl Context {
                 call: "newEvent",
                 why: "the device would not open an event".to_string(),
             })?;
-            Ok(Context {
+            let mut context = Context {
                 device,
                 queue,
                 name,
@@ -192,7 +202,16 @@ impl Context {
                 barrier: (barrier, std::cell::Cell::new(0)),
                 indirect: RefCell::new(Vec::new()),
                 empty: std::cell::OnceCell::new(),
-            })
+            };
+            // A device that states no cores is measured: the compiler prices
+            // its parallelism, and the tuner fills it, at what it runs.
+            if context.cores.is_none() {
+                context.cores = context
+                    .resident_groups()
+                    .filter(|&groups| groups >= RESIDENT_PER_CORE)
+                    .map(|groups| (groups / RESIDENT_PER_CORE, CoresFrom::Probe));
+            }
+            Ok(context)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -314,6 +333,42 @@ impl Context {
     }
 
     #[must_use]
+    /// The full workgroups the GPU keeps resident at once, measured: a probe
+    /// launch of many groups that each take a group's most threads and
+    /// threadgroup memory, counting the most in at once. `None` where the
+    /// probe did not run.
+    pub fn resident_groups(&self) -> Option<u32> {
+        #[cfg(target_vendor = "apple")]
+        {
+            const GROUPS: u32 = 1024;
+            const ITERS: u32 = 20_000;
+            let handles = super::Handles::new();
+            let pipelines = super::Pipelines::new();
+            let mut counters = super::Buffer::zeroed(self, 16).ok()?;
+            counters.write(0, &[0u8; 16]).ok()?;
+            let sink = super::Buffer::zeroed(self, 16).ok()?;
+            let counted = kernels_metal::Tensor::new(
+                handles.bind(&counters, 0, 16).ok()?,
+                1,
+                4,
+                poem_ir::Dtype::U32,
+            );
+            let sunk =
+                kernels_metal::Tensor::new(handles.bind(&sink, 0, 16).ok()?, 1, 4, poem_ir::Dtype::F32);
+            let frame = self.frame().ok()?;
+            let encoder = crate::encode::Sink::new(self, &frame, &pipelines, &handles);
+            kernels_metal::runtime::resident::resident_groups(&encoder, counted, sunk, GROUPS, ITERS)
+                .ok()?;
+            frame.commit().ok()?;
+            let bytes = handles.read(counted.buf, 8).ok()?;
+            Some(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            None
+        }
+    }
+
     pub fn cores(&self) -> Option<u32> {
         self.cores.map(|(n, _)| n)
     }

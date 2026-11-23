@@ -963,6 +963,22 @@ by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-4
 inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
 inactive + active (all file cache, which reclaim reaches under pressure).
 
+## F57. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
+
+A beam group's pool (`new-memory/designs/BEAM-PAGE-LISTS.md` §3) grows a
+column at a time to `B (c + 2) + B F + 1` pages: each live column's pages,
+plus `B` pages one fire may hand out and `B F` pages freed in the `F`
+frames in flight, terms every group carries whatever its length. At short
+lengths they are most of the reserve: 64 tokens, B = 4, F = 2 reserves up
+to 33 pages against the earlier shared pool's 18, and the 9 GiB-capped
+200-beam + 300-decode gate on MI300X ran 25-28 s against the tip's 21-22 s
+(uncapped 16 s both: speed parity, a capacity cost). Measure whether the
+`B` handed and `B F` pending terms can come from one pool-wide reserve
+sized by the fires in flight across groups (a fire hands out at most `B`
+pages per group it runs, and frees wait `F` fires whichever group freed
+them) without weakening the per-step guarantee that a fire never opens a
+column it cannot back: the capped gate's walls against the tip, the pages
+the planner counts per group, and the refusals under over-demand.
 ## F47. General per-lane split of a pass whose whole demand exceeds the device
 
 A pass whose whole demand (every lane's kv and state) is past the device while each lane fits
@@ -1133,6 +1149,74 @@ settle exists for. Fix: stage a feed for those channels in the settle's fires (z
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
 
+## F61. Metal streamed guest passes run far below bandwidth (needs Metal System Trace counters)
+Qwen3.5-0.8B beam-4 on the M1 Max, the beam epilogue's log-softmax region (4 rows x vocab ≈ 1M
+elements), after sc/mac-beam-hybrid 83cbd18f9 / ce84536d1 / 0f6db38c4 (register handover, dropped
+stores, broadcast index once a pass, a pipeline per streamed step, broadcast sinking, length
+classes; guest time 0.81 -> 0.54 ms a fire). The region now runs only the passes it needs (max
+reduce, exponentials, sum reduce, one output pass) and still takes 0.32 ms: each full pass ~70 µs
+and each reduction ~60 µs, against ~10-15 µs of memory traffic each.
+Measured (streamed-repeat / streamed-nop / streamed-groups diagnostics):
+- a dispatch's fixed cost is ~4 µs (streamed-nop), so launches are not it;
+- the group cap is at its optimum: r2 0.68 / 0.45 / 0.33 / 0.32 / 0.42 / 0.87 ms at 8 / 16 / 32 /
+  64 / 256 / 1024 groups of 512 threads, slower both ways;
+- pass count, materialized broadcasts and the per-element broadcast index are gone and moved it
+  little (0.55 -> 0.54 ms for the last two passes removed).
+Not yet separated: memory latency against ALU (the precise exp / log the bit-exact results need,
+the bf16 roundings), and the reductions' three dependent levels. That needs the GPU's counters
+(Metal System Trace / Instruments: occupancy, ALU and memory utilization per dispatch), which a
+headless session cannot capture. The M5 meets the beam rule already (beam-4 / 4-lane 1.023x), so
+this is the M1's and a general guest-codegen item, not a gate.
+
+## F62. Chunked lane scratch through the eta scratch ABI (post-PR)
+
+A guest instance's value scratch lies whole in one run of adjacent chunks inside one segment: the eta
+scratch ABI (`eta-compiler` codegen/lane_scratch.rs) has a grouped kernel address every value of a lane
+from its one base (`scratch = lane_scratch[l]`, value `v` at `scratch + offsets[v]`), so a lane's stage
+scratch is one contiguous run, and a place whose run is past a segment is refused by name (engine-metal
+`Plane::guest_state`). A beam group's scratch grows with its beams (Qwen3-0.6B at 4K context on the M5:
+113 MB at w17, 215 MB at w32, ~6.7 MB a beam of peak-live log-softmax-wide values; liveness packing is
+already on), so its width is bounded by the segment: Metal's 64 MiB (35 chunks of 1.9 MB on the M5) holds
+about w17-w19 at 4K context, CUDA's 1 GiB w96.
+
+Raising Metal's segment to CUDA's 1 GiB (ChunkProfile::ON_DEVICE_METAL.segment_bytes, which
+engine-metal's pool reads) was tried and kept out of the PR: Metal's segment is the elastic pool's grow
+and release step (the governor would yield in 1 GiB steps on unified memory), and the activation span is
+placed against segment boundaries (pool::top_first), so a small pool's span landed on unmapped top heaps
+("mapped bytes of an elastic buffer's top"); two integration tests also assume several segments. Doing it
+means placing the span at heap granularity whatever the segment, with the governor's step decoupled.
+
+`eta_exec::lay_out_chunked` already packs a stage's values into pieces of at most a segment (lifetimes
+shared, each item whole in one piece); no kernel reads that layout. Removing the bound for every engine:
+- the lane table carries a base a (lane, piece), or a per-lane piece table;
+- each value's place is (piece, offset), not one offset;
+- every emitter's value addressing follows: Metal's grouped, streamed and fused forms, CUDA / HIP's SIMT
+  (one ABI), the emitter versions bumped;
+- each engine lays `lay_out_chunked`'s pieces in the place the runtime took (`GuestState::run` the
+  piece run, pieces of a segment at most), and `FireFacts` follow.
+Estimate for Metal and the shared eta change: ~2 days, plus CUDA / HIP's emitter side.
+
+
+## F60. Hybrid beam replay grows with lineage divergence
+
+On a hybrid model each beam lane replays its buffered rows past its group's
+common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,
+`[c, s_t]`). Where two lineages stay apart, the rows grow with the steps
+since they parted: Vulkan Qwen3.5 beam-4 on one prompt carried 4 × 257 rows
+at step 257 and up to 4 × 1018 rows later in the search. engine-gpu serves
+it (a beam lane's carried rows are a span whose pages resolve through its
+list, its set's rs entries in its group's state; the per-fire tables stay
+O(lanes + widest bucket)), but the cost per step grows with the divergence
+(O(steps) replay, O(steps²) over a search). CUDA, Metal and XLA move to the
+same shape. A deep group's resident state (its lists and set entries) lies
+first in its instance's one scratch place (`GuestState::resident`); past a
+chunk that place is whole runs of adjacent chunks, so binding or restoring it
+relies on the planner naming a compaction for a run the free chunks' total
+covers, else it waits on scattered room that never forms a run. A bound by
+design is a spec question for AMD / Leader: per-beam state checkpoints (each
+beam's recurrent state kept at page boundaries, so a beam replays at most a
+page past its last checkpoint) would bound the replay by a page at the cost
+of a state per beam per page.
 
 ## F56. Every engine's load-time measurements through the one keyed resolve path (found 2026-11-22)
 sc/gpu-committed-profiles put engine-gpu (Vulkan, wgpu) behind one path: each stored entry is taken from the user's
@@ -1189,8 +1273,40 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   (`engine_gpu::dense::by_shape`; by the roofline where one is stated); with curves but no roofline, the curves
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
+## F58. The capacity gate does not charge the room a park to disk opens (planner sim, found 2026-11-23)
+The field mix as it now runs (beam pools bound beside the prefill's instance, frames owing rung raises, two-ended
+pools with the span backed on demand) fails 4 of the 751 seeds without the wide shape: 401 and 645 (liveness: every
+tier full, the finisher a page short), 589 (a victim evicted twice for one head) and 603 (a raise owed to its
+owner's frame never planned: `rung_short` reads the raise as fitting while `plan_rung` finds no free run below for
+a run in the span, so the planner funds nothing and the walk has nothing to move). Seed 401's cause: a park to
+disk lays its guest parts in whole disk chunks per slot class, which raises the census's slack; the gate's margin
+(`CapacityRead::margin`, the largest other resident's move) counts the move's own pages only, so a move under a
+finisher whose spare was 0 left every tier full (free 72 -> 39 in one step, slack +32). Charging a chunk per slot
+class of the mover's held parts in the margin passes 589 and 645 but breaks main seed 134 (a thrash) and leaves 401
+failing: the margin must be the exact granularity a park opens (the classes whose chunks on the tier below have no
+room for its parts), not a bound.
 
-## F60. XLA states a replay bound its prepare does not hold to (found 2026-11-24)
+## F59. The safe order turns short with no ask past it: a gate accounting gap, not admission (planner sim, found 2026-11-23)
+
+The field mix's seed 401 (45 processes arriving at once on a 15-chunk device) and the 401 family (589, 645;
+the Metal w17 mix's thrash and liveness seeds, 31 of its first 200: 18, 43, 47, 54, 67, 70, 74, 76, 77, 84,
+88, ...) end with every process short in the banker's order. `PIE_SIM_SHORT=1` says each step the order turns
+short (`ResidencyPlanner::order_least`, the raw least room in the order, negative when some process cannot
+finish in turn) with the gate's read. On 401 it turns short at step 7 already (least -6, free 99, `moving` 9,
+unit 29), again at 10 (-6) and 17 (-21, `moving` 21): before any process grew far, while moves were under way.
+
+Admission at the last place does not explain it: a newcomer appended last needs its end with every other
+process's holdings given back, which fits whenever its end fits the pool, so a banker's check there refuses
+nothing. The order goes short because a step's reads move under the gate: the second slots of moves under way
+(`moving`) and the margin (`unit`, the largest other resident's move) grow with grants the gate let through as
+safe at their own read. A grant's cost (`CapacityGate::cost`) charges the margin for the asker's own move only;
+the read after the grant also counts the moving copies the grant's own eviction or restore opened. The fix is
+in the gate's accounting (charge what a grant will put in flight, or read the order after the moves it starts),
+then admission priced by the same order. Repro: `PIE_SIM_SHORT=1 PIE_SIM_FIELD=1 PIE_SIM_SEED=401` on
+`replay_one_simulated_seed`, and `PIE_SIM_METAL=1` sweeps.
+
+
+## F66. XLA states a replay bound its prepare does not hold to (found 2026-11-24)
 
 sc/rt-rung-carried (6fd1ea355) has each engine state per rung what its replay scratch holds
 (`engine::RungReplay { own_max, carried_max, total_max }` in `ChunkFacts::act_replay`) and the

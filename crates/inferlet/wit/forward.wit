@@ -35,11 +35,29 @@ interface forward {
     /// - `fold`: per lane, how many more slots freeze after this fire;
     ///   `u32::MAX` folds everything. Default: none. May be computed on the
     ///   device; lanes sharing a working set fold by the first one's count.
+    /// - `parents`: `[lanes]` u32, a beam search's: lane `b` continues lane
+    ///   `parents[b]` of the fire before. Every lane names the same working
+    ///   set, whose reserve past its frozen full pages is a pool each lane
+    ///   holds its own pages of; the engine keeps the lanes' page lists and
+    ///   reorders them by the parents before each fire reads or appends
+    ///   (`new-memory/designs/BEAM-PAGE-LISTS.md`). Computed on the device by
+    ///   the epilogue before; the first fire ignores it. A parent past the
+    ///   lanes faults its lane. Default: none.
+    ///   A search owns its set's state: the rows every live beam shares
+    ///   (below the group's common ancestor) fold into the set as the search
+    ///   runs (`BEAM-PAGE-LISTS.md` §11.3), so a search left without adopting
+    ///   a beam leaves the set folded past its prompt. A guest that wants the
+    ///   prompt state back forks the set before the search.
     record state-geometry {
         positions: option<borrow<channel>>,
         slots:     option<borrow<channel>>,
         kv-len:    option<borrow<channel>>,
         fold:      option<borrow<channel>>,
+        parents:   option<borrow<channel>>,
+        // With `parents`: the slot past the search's last row (its folded
+        // slots and its fires), which its page lists are laid for
+        // (`BEAM-PAGE-LISTS.md` §3); required there, absent otherwise.
+        parents-end: option<u32>,
     }
 
     /// A forward-pass builder. Construction is empty; descriptor resources are
@@ -83,6 +101,14 @@ interface forward {
         /// one group attend each other's rows; a lane naming none attends its
         /// own. Set before `program`.
         group: func(lane: u32, id: u32) -> result<_, error>;
+
+        // A beam search's finish (`BEAM-PAGE-LISTS.md` §6.6): once the
+        // pass's last fire has landed, its working set holds beam `beam`'s
+        // hypothesis at its slots `[folded, end)` in its own order, as its
+        // page list names them (its recurrent rows too, on a hybrid); the
+        // other beams' pages are let go. Later passes bind the set as any
+        // (no `parents`). The pass must bind `parents`.
+        adopt-beam: func(beam: u32, end: u32) -> result<_, error>;
 
         /// `[rows, n]` bools. Where lanes read kv: per row, which slots of its
         /// working set's buffer and of the pass's own rows it attends. Column

@@ -839,6 +839,12 @@ impl Engine for Cuda {
                 prefill_lanes: shell.prefill_lanes(),
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
                     .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                // A lane's replayed rows are spans of its buffer and a beam's
+                // resolve through its group's list (`kernels_cuda::ssm::Carry`):
+                // no table holds a row, so a fire replays what its lanes'
+                // contexts hold.
+                replayed_rows: shell.fire_lanes().saturating_mul(paging.context()),
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -847,7 +853,8 @@ impl Engine for Cuda {
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::Fold),
+                .with(Port::Fold)
+                .with(Port::Parents),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle,
             media_encode: false,
@@ -866,6 +873,8 @@ impl Engine for Cuda {
             // CUDA states no bound on one submission (no watchdog on a
             // compute device).
             guest_cost: engine::GuestCost::default(),
+            // A beam group's page list (`beam_list`), read at a search's finish.
+            host_ops: engine::HostOps { beam_list: true },
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: u32::from(
                 engine::runahead::Runahead::of(frames_in_flight).frames_in_flight,
@@ -1485,6 +1494,10 @@ impl Engine for Cuda {
         self.instance(instance)?.take(channel).map_err(fault)
     }
 
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
+    }
+
     fn host_kv_layout(&self) -> Option<state::PageLayout> {
         self.shell.as_ref()?.host_kv_layout(1)
     }
@@ -1830,7 +1843,7 @@ impl Cuda {
                     translation: if placed[at] {
                         table(lane, LIST).unwrap_or(&[])
                     } else {
-                        &[]
+                        &lane.reserve
                     },
                     write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),

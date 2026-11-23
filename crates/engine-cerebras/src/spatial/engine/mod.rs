@@ -249,6 +249,8 @@ impl Engine for Spatial {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: budgets.max_tokens,
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: false,
             has_attn_page_mask: false,
@@ -270,6 +272,8 @@ impl Engine for Spatial {
             classes: facts.classes(),
             // Cerebras states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            // No `beam_list`: a beam group's bind is refused by name.
+            host_ops: engine::HostOps::NONE,
             mixed_lanes: engine::MixedLanes::Any,
             // one frame at a time: no run-ahead
             frames_in_flight: 1,

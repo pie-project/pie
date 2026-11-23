@@ -589,6 +589,8 @@ impl Engine for Xla {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -611,6 +613,8 @@ impl Engine for Xla {
             classes: shell.classes(),
             // XLA states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            // No `beam_list`: a beam group's bind is refused by name.
+            host_ops: engine::HostOps::NONE,
             mixed_lanes: shell.mixed_lanes(),
             // the staging ring's slots less the one being written
             frames_in_flight: engine::stated_frames(
@@ -1883,7 +1887,7 @@ impl Xla {
         }
         // What each reported lane wrote, told when the step lands: one past
         // the last slot its rows landed at (the runtime bounds what a
-        // device-placed lane carries by it, `engine::fire::rung_rows`), and
+        // device-placed lane carries by it, `engine::fire::rung_holds`), and
         // where its fold length was the device's, the slots this fire's fold
         // froze, clamped to its rows' end as the plan clamps it
         // (`engine::rs::LanePlan::of`).

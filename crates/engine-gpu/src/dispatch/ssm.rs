@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Tactics as _};
+use crate::backend::{Backend, Buffer as _, Tactics as _};
 use crate::run::Run;
 use kernels_slang::ssm::{StatePool, conv1d, gdn_prep, gdn_recurrent, kda};
 use poem_exec::{DispatchSsm, KernelError};
@@ -85,6 +85,145 @@ impl<B: Backend> Run<'_, B> {
         self.tensor(id)
     }
 
+    /// The seat of a buffering fire whose window carries its lanes' buffered
+    /// rows in its decode steps' own kernels.
+    fn rs_carrying(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
+        self.rs_seat()
+            .filter(|seat| seat.carries(self.window().span.lane_offset))
+    }
+
+    /// The seat of a buffering fire whose window replays its lanes'
+    /// buffered rows through the extended run.
+    fn rs_extending(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
+        self.rs_seat()
+            .filter(|seat| !seat.carries(self.window().span.lane_offset))
+    }
+
+    /// The state cache row value `id` reads.
+    fn state_cache(&self, op: &'static str, id: ValueId) -> Result<u32, kernels_slang::Error> {
+        match self.values().get(id.0 as usize).map(|decl| &decl.def) {
+            Some(poem_ir::Def::Cache(row)) => Ok(*row),
+            _ => Err(kernels_slang::Error::Backend {
+                op,
+                detail: format!("value {} is read as a recurrent state and is no cache row", id.0),
+            }),
+        }
+    }
+
+    /// The staged rs table and plane `role` of the recurrence keeping
+    /// `state`, as this window's decode step reads them.
+    fn carried(
+        &self,
+        op: &'static str,
+        seat: &crate::rs::Seat,
+        state: ValueId,
+        role: crate::rs::Role,
+    ) -> Result<(kernels_slang::ssm::Carry, kernels_slang::ssm::CarryPlane), kernels_slang::Error>
+    {
+        let fault = |fault: crate::error::Fault| kernels_slang::Error::Backend {
+            op,
+            detail: fault.to_string(),
+        };
+        let pool = self.state_pool(state);
+        // One pool, whatever handles each was bound under.
+        let same = |a: u32, b: u32| {
+            a == b
+                || match (self.handles().get(a), self.handles().get(b)) {
+                    (Some(a), Some(b)) => {
+                        a.buffer().slab_id() == b.buffer().slab_id() && a.offset() == b.offset()
+                    }
+                    _ => false,
+                }
+        };
+        if pool.pool.words != seat.pool.words
+            || !pool.pool.bufs.iter().zip(&seat.pool.bufs).all(|(&a, &b)| same(a, b))
+        {
+            return Err(kernels_slang::Error::Backend {
+                op,
+                detail: "the state and the rs list lie in different pools, and a carried step \
+                         addresses both by the state's"
+                    .to_string(),
+            });
+        }
+        let carry = seat.carry(self.window().span.lane_offset).map_err(fault)?;
+        let plane = seat
+            .carry_plane(self.state_cache(op, state)?, role)
+            .map_err(fault)?;
+        Ok((carry, plane))
+    }
+
+    /// A beam group's folds (`BEAM-PAGE-LISTS.md` §11.3) of the recurrence
+    /// a carried step of `op` reads, ahead of it: `fold(count, carry)` over
+    /// the fire's folds where it stages any. A naming walk names the fold
+    /// twin as a way the host may go before the step.
+    fn group_folds(
+        &self,
+        op: &'static str,
+        seat: &crate::rs::Seat,
+        fold: impl FnOnce(u32, &kernels_slang::ssm::Carry) -> Result<(), kernels_slang::Error>,
+    ) -> Result<(), kernels_slang::Error> {
+        let fault = |fault: crate::error::Fault| kernels_slang::Error::Backend {
+            op,
+            detail: fault.to_string(),
+        };
+        if let Some(naming) = self.ctx.naming() {
+            // Either way: no fold, or one before the step.
+            let carry = seat.carry(self.window().span.lane_offset).map_err(fault)?;
+            naming.fork();
+            naming.or();
+            let named = fold(1, &carry);
+            naming.join();
+            return named;
+        }
+        let Some(folds) = seat.folds else {
+            return Ok(());
+        };
+        // A window runs the folds of the groups whose first lane it holds,
+        // ahead of its step: each group's once a fire.
+        let span = self.window().span;
+        let window = span.lane_offset..span.lane_offset + span.lanes;
+        let from = seat.fold_lanes.partition_point(|&lane| lane < window.start);
+        let to = seat.fold_lanes.partition_point(|&lane| lane < window.end);
+        if to <= from {
+            return Ok(());
+        }
+        let _ = folds.count;
+        let carry = seat
+            .fold_carry(&folds, u32::try_from(from).unwrap_or(u32::MAX))
+            .map_err(fault)?;
+        fold(u32::try_from(to - from).unwrap_or(u32::MAX), &carry)
+    }
+
+    /// The gate prep `gates` comes from: its `[b | a]`, `dt_bias` and
+    /// `A_log`.
+    fn gdn_gated(
+        &self,
+        op: &'static str,
+        gates: ValueId,
+    ) -> Result<gdn_recurrent::Gated, kernels_slang::Error> {
+        let node = match self.values().get(gates.0 as usize).map(|decl| &decl.def) {
+            Some(poem_ir::Def::Op(node)) => self.nodes().get(*node as usize),
+            _ => None,
+        };
+        match node.map(|node| &node.op) {
+            Some(poem_ir::Operation::Ssm(Ssm::GdnGates {
+                ba, dt_bias, a_log, ..
+            })) => Ok(gdn_recurrent::Gated {
+                ba: self.attended(*ba),
+                dt_bias: self.slang_of(*dt_bias),
+                a_log: self.slang_of(*a_log),
+            }),
+            _ => Err(kernels_slang::Error::Backend {
+                op,
+                detail: format!(
+                    "the gates value {} no gate prep forms, which a carried step forms its \
+                     buffered rows' gates as",
+                    gates.0
+                ),
+            }),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn kda_gates(
         &self,
@@ -127,6 +266,67 @@ impl<B: Backend> Run<'_, B> {
                 dilation,
                 y,
                 ..
+            } if self
+                .rs_carrying()
+                .is_some_and(|seat| seat.layout.out_of.contains_key(&y.0)) =>
+            {
+                // A decode conv the rs buffer covers, in a window that
+                // carries: the own row's window from the committed history
+                // and the lane's last buffered rows where they lie.
+                const OP: &str = "ssm.causal_conv1d_carried";
+                let seat = self.rs_carrying().expect("guarded");
+                let (carry, plane) = self.carried(OP, &seat, *state, crate::rs::Role::ConvX)?;
+                // A beam group's fold (§11.3), ahead of the step that reads
+                // the history: the window's first launch names it whether a
+                // fire folds or not (a naming walk), a fire runs it where it
+                // stages one.
+                self.group_folds(OP, &seat, |folds, fold_carry| {
+                    conv1d::conv1d_carried_fold(
+                        ctx,
+                        self.attended(*x),
+                        self.slang_of(*weight),
+                        &self.state_pool(*state),
+                        fold_carry,
+                        plane,
+                        *conv_width,
+                        *dilation,
+                        self.attended(*y),
+                        folds,
+                    )
+                })?;
+                conv1d::conv1d_carried(
+                    ctx,
+                    self.attended(*x),
+                    self.slang_of(*weight),
+                    &self.state_pool(*state),
+                    &carry,
+                    plane,
+                    *conv_width,
+                    *dilation,
+                    self.attended(*y),
+                    self.row_span(),
+                )
+            }
+            Ssm::CausalConv1dChunked { .. }
+            | Ssm::GatedDeltaChunked { .. }
+            | Ssm::KdaChunked { .. }
+                if self.rs_carrying().is_some() =>
+            {
+                Err(kernels_slang::Error::Backend {
+                    op: op.name(),
+                    detail: "a window whose decode steps carry its lanes' buffered rows runs a \
+                             chunked recurrence, which reads them extended"
+                        .to_string(),
+                })
+            }
+            Ssm::CausalConv1d {
+                x,
+                weight,
+                state,
+                conv_width,
+                dilation,
+                y,
+                ..
             }
             | Ssm::CausalConv1dChunked {
                 x,
@@ -137,7 +337,7 @@ impl<B: Backend> Run<'_, B> {
                 y,
                 ..
             } if self
-                .rs_seat()
+                .rs_extending()
                 .is_some_and(|seat| seat.layout.out_of.contains_key(&y.0)) =>
             {
                 // A conv the rs buffer covers (`poem_compiler::rs::
@@ -146,7 +346,7 @@ impl<B: Backend> Run<'_, B> {
                 // buffered ones, the kernel walks them over the state's
                 // `(w - 1) * dilation + 1` rows and commits as of the fold.
                 const OP: &str = "ssm.causal_conv1d_committed";
-                let seat = self.rs_seat().expect("guarded");
+                let seat = self.rs_extending().expect("guarded");
                 let ext_x = self.rs_extend(OP, &seat, *x)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
                 conv1d::conv1d_committed(
@@ -167,9 +367,9 @@ impl<B: Backend> Run<'_, B> {
                 dt_bias,
                 a_log,
                 gates,
-            } if self.rs_seat().is_some() => {
+            } if self.rs_extending().is_some() => {
                 const OP: &str = "ssm.gdn_gates";
-                let seat = self.rs_seat().expect("guarded");
+                let seat = self.rs_extending().expect("guarded");
                 let ext_ba = self.rs_extend(OP, &seat, *ba)?;
                 let ext_gates = self.rs_out(OP, &seat, *gates)?;
                 gdn_prep::gdn_prep(
@@ -192,6 +392,58 @@ impl<B: Backend> Run<'_, B> {
                 v_dim,
                 y,
                 ..
+            } if self.rs_carrying().is_some() => {
+                // A decode step in a window that carries: the lane's
+                // buffered rows read where they lie, as a linear attention
+                // from its committed state.
+                const OP: &str = "ssm.gated_delta_carried";
+                let seat = self.rs_carrying().expect("guarded");
+                let (carry, ba) = self.carried(OP, &seat, *state, crate::rs::Role::Ba)?;
+                let (_, keys) = self.carried(OP, &seat, *state, crate::rs::Role::Keys)?;
+                let (_, u) = self.carried(OP, &seat, *state, crate::rs::Role::U)?;
+                self.group_folds(OP, &seat, |folds, fold_carry| {
+                    gdn_recurrent::gated_delta_carried_fold(
+                        ctx,
+                        self.tuning().recurrent(),
+                        self.attended(*qkv),
+                        self.gdn_gated(OP, *gates)?,
+                        &self.state_pool(*state),
+                        fold_carry,
+                        [ba, keys, u],
+                        *k_heads,
+                        *v_heads,
+                        *k_dim,
+                        *v_dim,
+                        self.attended(*y),
+                        folds,
+                    )
+                })?;
+                gdn_recurrent::gated_delta_carried(
+                    ctx,
+                    self.tuning().recurrent(),
+                    self.attended(*qkv),
+                    self.gdn_gated(OP, *gates)?,
+                    &self.state_pool(*state),
+                    &carry,
+                    [ba, keys, u],
+                    *k_heads,
+                    *v_heads,
+                    *k_dim,
+                    *v_dim,
+                    self.attended(*y),
+                    self.row_span(),
+                )
+            }
+            Ssm::GatedDelta {
+                qkv,
+                gates,
+                state,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                y,
+                ..
             }
             | Ssm::GatedDeltaChunked {
                 qkv,
@@ -203,9 +455,11 @@ impl<B: Backend> Run<'_, B> {
                 v_dim,
                 y,
                 ..
-            } if self.rs_seat().is_some() => {
+            } if self.rs_extending().is_some() => {
                 const OP: &str = "ssm.gated_delta_committed";
-                let seat = self.rs_seat().expect("guarded");
+                let seat = self.rs_extending().expect("guarded");
+                let (carry, keys) = self.carried(OP, &seat, *state, crate::rs::Role::Keys)?;
+                let (_, u) = self.carried(OP, &seat, *state, crate::rs::Role::U)?;
                 let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
                 let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
                 let ext_y = self.rs_out(OP, &seat, *y)?;
@@ -225,6 +479,8 @@ impl<B: Backend> Run<'_, B> {
                         *v_dim,
                         ext_y,
                         row0,
+                        &carry,
+                        [keys, u],
                     )?;
                 }
                 self.rs_land(OP, &seat, ext_y, *y)
@@ -254,9 +510,9 @@ impl<B: Backend> Run<'_, B> {
                 norm_eps,
                 gate_floor,
                 y,
-            } if self.rs_seat().is_some() => {
+            } if self.rs_extending().is_some() => {
                 const OP: &str = "ssm.kda_committed";
-                let seat = self.rs_seat().expect("guarded");
+                let seat = self.rs_extending().expect("guarded");
                 let ext_mixed = self.rs_ext_of(OP, &seat, *mixed)?;
                 let ext_f = self.rs_extend(OP, &seat, *f)?;
                 let ext_b = self.rs_extend(OP, &seat, *b)?;

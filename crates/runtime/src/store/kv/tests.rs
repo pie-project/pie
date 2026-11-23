@@ -83,6 +83,8 @@ fn tests_every_case() {
     a_page_no_one_else_reads_is_written_in_place();
     a_lookup_takes_the_copy_on_the_device();
     what_a_decode_folds_seals();
+    a_truncated_set_ends_where_it_was_cut();
+    a_set_never_ends_inside_a_sealed_page();
     a_fire_that_never_settled_leaves_the_log_cut();
     a_hit_refreshes_only_the_entries_it_used_whole();
     what_decode_wrote_is_reclaimed_before_the_prompt();
@@ -96,6 +98,95 @@ fn tests_every_case() {
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
+    a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
+    a_beams_finish_copies_the_chosen_pages_another_reads();
+    a_cut_waits_out_a_move();
+}
+
+/// A beam search's finish while its set is suspending waits for the move
+/// to end, and never names a page the move gives back (the M1's beam line:
+/// a relist under a suspend left the chosen pages named by the new tail and
+/// the suspend's pinned old one, and the suspend's commit gave them back
+/// while the set still read them).
+fn a_beams_finish_waits_out_a_suspend_and_names_each_page_once() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(61));
+    let total = store.free_committed();
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    let sets = HashSet::from([ws]);
+    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    assert!(matches!(
+        store.relist_beam_needs(ws, 1, &[2, 0]).unwrap(),
+        super::RelistNeeds::MoveEnd(_)
+    ));
+    assert!(!store.relist_beam_with(ws, 1, &[2, 0], &[]).unwrap(), "nothing while it moves");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 4);
+    store.retire_idle();
+    let mut granted = store.reserve_device_pages(4).unwrap();
+    let txn = store.prepare_restore(&sets, &mut granted).unwrap();
+    assert_eq!(store.commit_restore(txn).unwrap(), 4);
+    let before: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(ws, i).unwrap()).collect();
+    assert!(matches!(
+        store.relist_beam_needs(ws, 1, &[2, 0]).unwrap(),
+        super::RelistNeeds::Copies(ref shared) if shared.is_empty()
+    ));
+    assert!(store.relist_beam_with(ws, 1, &[2, 0], &[]).unwrap());
+    assert_eq!(store.mapped_len(ws).unwrap(), 3);
+    let after: Vec<PhysicalKvPageId> = (0..3).map(|i| store.lookup(ws, i).unwrap()).collect();
+    assert_eq!(after, [before[0], before[3], before[1]]);
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+    assert_eq!(store.free_committed(), total, "every page back once");
+}
+
+/// A beam search's finish whose chosen pages another set still reads (a
+/// fork's path through the old tail) names copies of them: the other set
+/// reads the pages it read, and every page goes back once.
+fn a_beams_finish_copies_the_chosen_pages_another_reads() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(62));
+    let total = store.free_committed();
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    let other = store.fork(ws).unwrap();
+    let read: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(other, i).unwrap()).collect();
+    let super::RelistNeeds::Copies(shared) = store.relist_beam_needs(ws, 1, &[2, 0]).unwrap() else {
+        panic!("out of any move");
+    };
+    assert_eq!(shared, [read[3], read[1]], "both chosen pages are the fork's too");
+    // The engine copies them onto pages the planner granted.
+    let copies = store.reserve_device_pages(shared.len()).unwrap();
+    let pairs: Vec<_> = shared.iter().copied().zip(copies.iter().copied()).collect();
+    let counted = super::RELIST_COPIES.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(store.relist_beam_with(ws, 1, &[2, 0], &pairs).unwrap());
+    assert!(super::RELIST_COPIES.load(std::sync::atomic::Ordering::Relaxed) >= counted + 2);
+    let after: Vec<PhysicalKvPageId> = (0..3).map(|i| store.lookup(ws, i).unwrap()).collect();
+    assert_eq!(after, [read[0], copies[0], copies[1]], "the copies, named once");
+    let still: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(other, i).unwrap()).collect();
+    assert_eq!(still, read, "the fork reads what it read");
+    store.release_working_set(ws, store.current_epoch());
+    store.release_working_set(other, store.current_epoch());
+    store.drop_entries_off_device();
+    store.retire_idle();
+    let cached = total - store.free_committed();
+    assert!(
+        cached <= 4,
+        "what stays is cache alone, the copies and the originals each back once: {cached}"
+    );
+}
+
+/// A cut of a set in a move is refused until the move ends: cut under it,
+/// what the cut freed went back again as the move committed.
+fn a_cut_waits_out_a_move() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(63));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    let sets = HashSet::from([ws]);
+    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    assert!(matches!(store.truncate(ws, 0), Err(super::KvStoreError::MoveInFlight)));
+    assert_eq!(store.mapped_len(ws).unwrap(), 4, "nothing cut while it moves");
+    store.abort_suspend(txn);
+    store.truncate(ws, 0).unwrap();
+    assert_eq!(store.mapped_len(ws).unwrap(), 0);
 }
 
 /// Pages that came from another worker, whose keys this worker computes from
@@ -1080,17 +1171,16 @@ fn decoded(store: &mut KvStore, tokens: &[u32], prefilled: usize, logged: usize)
     ws
 }
 
+/// What a decode folds seals once the set goes, not as it folds: the rows a
+/// program ran ahead past its stop are taken back unsealed.
 fn what_a_decode_folds_seals() {
     let mut store = KvStore::new(16, h(25));
     let tokens: Vec<u32> = (0..48).map(|t| 900 + t).collect();
     let ws = decoded(&mut store, &tokens, 20, 40);
     assert_eq!(store.sealed_in(ws, 0..3).unwrap(), [0]);
-    assert_eq!(
-        store.fold(ws, 40, true).unwrap(),
-        1,
-        "the partial page stays open"
-    );
-    assert_eq!(store.sealed_in(ws, 0..3).unwrap(), [0, 1]);
+    assert_eq!(store.fold(ws, 40, true).unwrap(), 0, "frozen, not sealed");
+    assert_eq!(store.folded(ws).unwrap(), 40);
+    assert_eq!(store.sealed_in(ws, 0..3).unwrap(), [0]);
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     let reader = store.create_working_set();
@@ -1100,6 +1190,79 @@ fn what_a_decode_folds_seals() {
         2,
         "the decoded page too, not the partial one"
     );
+}
+
+/// A set cut at row 37 after a decode ran on to 52: the pages wholly past
+/// it go back to the pool, its folded length and log end there, a fork
+/// takes nothing past it, and what it writes next is sealed under the
+/// tokens it holds, never the ones taken back.
+fn a_truncated_set_ends_where_it_was_cut() {
+    let mut store = KvStore::new(16, h(29));
+    let accepted: Vec<u32> = (0..48).map(|t| 1300 + t).collect();
+    let mut ran: Vec<u32> = accepted[..37].to_vec();
+    ran.extend((37..52).map(|t| 7000 + t));
+    let ws = decoded(&mut store, &ran, 20, 52);
+    store.fold(ws, 52, true).unwrap();
+    assert_eq!(store.mapped_len(ws).unwrap(), 4);
+    let free = store.free_committed();
+    store.truncate(ws, 37).unwrap();
+    store.retire_idle();
+    assert_eq!(store.mapped_len(ws).unwrap(), 3, "page 3 (48..52) leaves");
+    assert_eq!(
+        store.free_committed(),
+        free + 1,
+        "and goes back to the pool"
+    );
+    assert_eq!(store.folded(ws).unwrap(), 37);
+    assert_eq!(store.logged(ws).unwrap(), &ran[..37]);
+    let child = store.fork(ws).unwrap();
+    assert_eq!(
+        store.folded(child).unwrap(),
+        37,
+        "a fork takes no row past it"
+    );
+    assert_eq!(store.mapped_len(child).unwrap(), 3);
+    store.release_working_set(child, store.current_epoch());
+    // It goes on from 37 with the tokens the program took.
+    let seq = store.log_begin(ws, 37).unwrap();
+    store
+        .log_end(ws, seq, Some((37, &accepted[37..48])))
+        .unwrap();
+    assert_eq!(
+        store.fold(ws, 48, false).unwrap(),
+        1,
+        "page 2 seals: the fork sealed page 1, whole below the cut, as it went"
+    );
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+    let reader = store.create_working_set();
+    let keys = keys_ahead(&store, reader, 0, &accepted);
+    assert_eq!(
+        store.cached_run(&keys).len(),
+        3,
+        "sealed under what it holds"
+    );
+    let keys = keys_ahead(&store, reader, 0, &ran[..48]);
+    assert_eq!(
+        store.cached_run(&keys).len(),
+        2,
+        "nothing under the rows taken back"
+    );
+}
+
+/// A cut inside a page a fold sealed is refused by name: the page is frozen
+/// whole under the key of the rows past the cut.
+fn a_set_never_ends_inside_a_sealed_page() {
+    let mut store = KvStore::new(16, h(30));
+    let tokens: Vec<u32> = (0..48).map(|t| 1400 + t).collect();
+    let ws = decoded(&mut store, &tokens, 32, 32);
+    assert_eq!(store.sealed_in(ws, 0..2).unwrap(), [0, 1]);
+    let refused = store.truncate(ws, 20).unwrap_err().to_string();
+    assert!(refused.contains("sealed page"), "{refused}");
+    assert_eq!(store.folded(ws).unwrap(), 32, "nothing moved");
+    store.truncate(ws, 16).unwrap();
+    assert_eq!(store.folded(ws).unwrap(), 16, "a page boundary is a cut");
+    assert_eq!(store.mapped_len(ws).unwrap(), 1);
 }
 
 fn a_fire_that_never_settled_leaves_the_log_cut() {
@@ -1766,11 +1929,23 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
     assert_eq!(on_device(&mut store, &unkept_tokens), 3);
     // The policy keeps one: a demand reclaims only the other.
     let keep = move |owner: Option<ProcessId>| {
-        if owner == Some(kept) { FLOOR + 1 } else { FLOOR }
+        if owner == Some(kept) {
+            FLOOR + 1
+        } else {
+            FLOOR
+        }
     };
     assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 3);
-    assert_eq!(on_device(&mut store, &unkept_tokens), 0, "unkept: reclaimed");
-    assert_eq!(on_device(&mut store, &kept_tokens), 3, "the keep is honoured");
+    assert_eq!(
+        on_device(&mut store, &unkept_tokens),
+        0,
+        "unkept: reclaimed"
+    );
+    assert_eq!(
+        on_device(&mut store, &kept_tokens),
+        3,
+        "the keep is honoured"
+    );
     assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 0);
     assert_eq!(on_device(&mut store, &kept_tokens), 3, "still kept");
     // The keep is over: the policy lowers the key, and the next demand

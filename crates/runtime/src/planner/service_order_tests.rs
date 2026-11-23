@@ -131,6 +131,7 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         "control"
     );
     inner.procs.get_mut(&pids[0]).unwrap().roles_short = Some(super::proc::PendingBind {
+        singles: 0,
         run: 3,
         pieces: 1,
         pages: 3,
@@ -396,6 +397,7 @@ fn a_roles_short_head_with_a_bind_waiting_behind_it_is_funded_while_a_decoder_fi
     let (head, decoder, binder) = (pids[0], pids[1], pids[2]);
     park_restore(&mut inner, head, 4);
     inner.procs.get_mut(&head).unwrap().roles_short = Some(super::proc::PendingBind {
+        singles: 0,
         run: 3,
         pieces: 1,
         pages: 3,

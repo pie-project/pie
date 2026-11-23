@@ -148,6 +148,11 @@ pub struct Handles {
 
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
+    /// The fire's staged rs table (`kernels_slang::ssm::Carry`), bound at
+    /// its room whatever the fire stages: one view for every fire.
+    pub rs_carry: Option<Tensor>,
+    /// The fire's beam groups' folds' rs table and slot table (§11.3).
+    pub rs_folds: Option<(Tensor, Tensor)>,
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
@@ -215,6 +220,9 @@ pub struct Fire<'a> {
 
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
+    pub rs_carry: Option<&'a [i32]>,
+    /// The beam groups' folds' rs table and slot table, where it folds any.
+    pub rs_folds: Option<(&'a [i32], &'a [i32])>,
 
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
@@ -271,6 +279,11 @@ pub struct Laid {
 
     rs_replay: u64,
     rs_commit: u64,
+    /// The rs table's place and ints, where the load buffers rs rows.
+    rs_carry: Option<(u64, u64)>,
+    /// The beam groups' folds' rs table and slot table: each place and its
+    /// ints.
+    rs_folds: Option<((u64, u64), (u64, u64))>,
 
     group_of_lane: u64,
     packings: Vec<PackingAt>,
@@ -279,8 +292,47 @@ pub struct Laid {
     /// The capture table's ints, laid where the trace captures scores:
     /// `TABLE_INTS` for each of a fire's lanes at most.
     capture: Option<(u64, u64)>,
+    /// A fire's beam groups' records and what they read
+    /// ([`crate::beam`]).
+    beams: Option<BeamRoom>,
     /// The store's bytes.
     total: u64,
+}
+
+/// What a load lays a fire's beam groups for (`crate::beam`): the kv
+/// planes a page holds and the rs planes an rs page holds, and the frames
+/// in flight a freed page waits out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeamFacts {
+    pub planes: u32,
+    pub rs_planes: u32,
+    pub frames: u32,
+}
+
+/// Where a fire's beam groups' parts lie in the store, each its first u32
+/// word (from the store's first byte) and the words laid for it: a fire's
+/// most, its lanes all beams of groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BeamRoom {
+    /// Each lane's parent (copied from its group's cell ahead of the step),
+    /// and each lane's fault word.
+    pub parents: (u32, u32),
+    pub faults: (u32, u32),
+    /// Each group's common slot (§11.3), right past the fault words: a
+    /// fire's readout carries both as one run.
+    pub commons: (u32, u32),
+    /// The records: groups' steps, lanes' list runs (a table each), their
+    /// rs list runs, their kv copies and rs copies.
+    pub steps: (u32, u32),
+    pub lists: (u32, u32),
+    pub rs_lists: (u32, u32),
+    pub copies: (u32, u32),
+    pub rs_copies: (u32, u32),
+    /// The kv planes, then the rs planes: two words a plane.
+    pub planes: (u32, u32),
+    /// Each group's pool pages' ids, and its set's rs entries' units.
+    pub trans: (u32, u32),
+    pub rs_bases: (u32, u32),
 }
 
 #[derive(Debug)]
@@ -322,7 +374,9 @@ impl Laid {
         voxel: Option<VoxelSeat>,
         pieces: u32,
         capture: bool,
+        rs_page_tokens: Option<u32>,
         binding: u64,
+        beams: Option<BeamFacts>,
     ) -> Laid {
         let pieces = pieces.max(1);
         let rows = u64::from(budget.max_tokens);
@@ -394,6 +448,22 @@ impl Laid {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        // A fire's lanes carry no more buffered rows than its widest
+        // bucket's tokens (`engine::fire::rung_holds`, refused past at the
+        // stage): the table holds a header a lane, those rows' tokens, and
+        // the pages they and the lanes' own rows lie in.
+        let rs_carry = rs_page_tokens.map(|tokens| {
+            let ints = rs_carry_ints(lanes, rows, tokens);
+            (take(ints * 4), ints)
+        });
+        // A beam group's fold a lane of a table of its own, its rows no more
+        // than a fire carries; its record a lane's.
+        let rs_folds = rs_page_tokens.map(|tokens| {
+            let ints = rs_carry_ints(lanes, rows, tokens);
+            let table = (take(ints * 4), ints);
+            let slots = lanes * u64::from(pieces);
+            (table, (take(slots * 4), slots))
+        });
         let group_of_lane = if selections == 0 { 0 } else { take(lanes * 4) };
         let packings: Vec<PackingAt> = (0..selections)
             .map(|_| PackingAt {
@@ -430,6 +500,55 @@ impl Laid {
             let ints = lanes * u64::from(kernels_slang::attn::score::TABLE_INTS);
             (take(ints * 4), ints)
         });
+        // A fire's beam groups: each a group of at least one of its lanes,
+        // every lane a beam. A group's pool pages staged are at most
+        // `B (c + 2) + B F + 1` (BEAM-PAGE-LISTS §3), `c` its column, at
+        // most a lane's pages; its set's rs entries cover its pages' slots.
+        let beams = beams.map(|facts| {
+            use kernels_slang::runtime::beam as kb;
+            let tables = page_tables.len() as u64;
+            let frames = u64::from(facts.frames.max(1));
+            let columns = u64::from(paging.pages_per_slot.max(table_pages)) + 2;
+            // The set's rs entries a fire appends to its group's state
+            // (§11.1, the state holds the rest): those of the pool pages its
+            // step may hand out past what the state holds, a group's at most
+            // a page a beam and the frames' and a fire's rows' worth.
+            let rs_appends = rs_page_tokens.map_or(0, |tokens| {
+                let per_page = u64::from(paging.page_size).div_ceil(u64::from(tokens.max(1)));
+                lanes * (frames + 2) * (per_page + 1) + rows.div_ceil(u64::from(tokens.max(1)))
+            });
+            let mut word = |words: u64| {
+                let at = take(words.max(1) * 4);
+                (
+                    u32::try_from(at / 4).unwrap_or(u32::MAX),
+                    u32::try_from(words).unwrap_or(u32::MAX),
+                )
+            };
+            let parents = word(lanes);
+            let both = word(2 * lanes);
+            let lanes32 = u32::try_from(lanes).unwrap_or(u32::MAX);
+            BeamRoom {
+                parents,
+                faults: (both.0, lanes32),
+                commons: (both.0 + lanes32, lanes32),
+                steps: word(lanes * u64::from(kb::STEP_WORDS)),
+                lists: word(lanes * tables * u64::from(kb::LIST_WORDS)),
+                rs_lists: word(if rs_page_tokens.is_some() {
+                    lanes * u64::from(kb::RS_LIST_WORDS)
+                } else {
+                    0
+                }),
+                copies: word(lanes * u64::from(kb::COPY_WORDS)),
+                rs_copies: word(if rs_page_tokens.is_some() {
+                    lanes * u64::from(kb::RS_COPY_WORDS)
+                } else {
+                    0
+                }),
+                planes: word(2 * u64::from(facts.planes + facts.rs_planes)),
+                trans: word(lanes * (columns + frames) + lanes),
+                rs_bases: word(rs_appends),
+            }
+        });
         let total = at;
 
         Laid {
@@ -456,12 +575,54 @@ impl Laid {
             mrope,
             rs_replay,
             rs_commit,
+            rs_carry,
+            rs_folds,
             group_of_lane,
             packings,
             seats,
             voxels,
             capture,
+            beams,
         }
+    }
+
+    /// Where a fire's beam groups' parts lie, where the load lays them.
+    #[must_use]
+    pub fn beams(&self) -> Option<BeamRoom> {
+        self.beams
+    }
+
+    /// Where page table `table`'s staged indices, write pages and write
+    /// offsets lie: their first u32 words in the store.
+    #[must_use]
+    pub fn table_words(&self, table: usize) -> Option<(u32, u32, u32)> {
+        let at = self.page_tables.get(table)?;
+        let word = |bytes: u64| u32::try_from(bytes / 4).unwrap_or(u32::MAX);
+        Some((word(at.indices), word(at.write_page), word(at.write_offset)))
+    }
+
+    /// Where the beam groups' folds' rs table lies: its first u32 word in
+    /// the store.
+    #[must_use]
+    pub fn rs_folds_word(&self) -> Option<u32> {
+        self.rs_folds
+            .map(|((at, _), _)| u32::try_from(at / 4).unwrap_or(u32::MAX))
+    }
+
+    /// The ints the rs table and the folds' table each hold a fire.
+    #[must_use]
+    pub fn rs_table_ints(&self) -> (u64, u64) {
+        (
+            self.rs_carry.map_or(0, |(_, ints)| ints),
+            self.rs_folds.map_or(0, |((_, ints), _)| ints),
+        )
+    }
+
+    /// Where the rs table lies: its first u32 word in the store.
+    #[must_use]
+    pub fn rs_carry_word(&self) -> Option<u32> {
+        self.rs_carry
+            .map(|(at, _)| u32::try_from(at / 4).unwrap_or(u32::MAX))
     }
 
     /// The store's bytes.
@@ -575,6 +736,18 @@ impl<B: Backend> Inputs<B> {
         &self.store
     }
 
+    /// Where its inputs lie.
+    #[must_use]
+    pub fn laid(&self) -> &Laid {
+        &self.laid
+    }
+
+    /// Writes `words` from u32 word `at` of the store.
+    pub fn write_words(&mut self, at: u32, words: &[u32]) -> Result<()> {
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        self.store.write(u64::from(at) * 4, &bytes)
+    }
+
     #[must_use]
     pub fn seat(&self, id: u32) -> Option<(&B::Buffer, u64)> {
         self.laid.seats
@@ -679,6 +852,70 @@ impl<B: Backend> Inputs<B> {
                 true
             }
             _ => false,
+        };
+        let rs_carry = match (fire.rs_carry, self.laid.rs_carry) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(Fault::Unbound {
+                    what: "the rs table of a fire on a load that buffers no rs rows".to_string(),
+                });
+            }
+            (Some(table), Some((at, ints))) => {
+                if table.len() as u64 > ints {
+                    return Err(Fault::Ceiling {
+                        what: "ints of the staged rs table: lanes' headers, carried tokens \
+                               and buffer pages",
+                        need: table.len() as u64,
+                        have: ints,
+                    });
+                }
+                self.store.write(at, bytes_of(table))?;
+                Some(i32s(
+                    handles,
+                    &self.store,
+                    at,
+                    u32::try_from(ints).unwrap_or(u32::MAX),
+                    self.laid.room(at)?,
+                )?)
+            }
+        };
+
+        let rs_folds = match (fire.rs_folds, self.laid.rs_folds) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(Fault::Unbound {
+                    what: "the beam folds' table of a fire on a load that buffers no rs rows"
+                        .to_string(),
+                });
+            }
+            (Some((table, slots)), Some(((table_at, table_ints), (slots_at, slots_ints)))) => {
+                if table.len() as u64 > table_ints || slots.len() as u64 > slots_ints {
+                    return Err(Fault::Ceiling {
+                        what: "ints of the beam groups' folds' tables: their headers, rows, \
+                               pages and records",
+                        need: (table.len().max(slots.len())) as u64,
+                        have: table_ints.min(slots_ints),
+                    });
+                }
+                self.store.write(table_at, bytes_of(table))?;
+                self.store.write(slots_at, bytes_of(slots))?;
+                Some((
+                    i32s(
+                        handles,
+                        &self.store,
+                        table_at,
+                        u32::try_from(table_ints).unwrap_or(u32::MAX),
+                        self.laid.room(table_at)?,
+                    )?,
+                    i32s(
+                        handles,
+                        &self.store,
+                        slots_at,
+                        u32::try_from(slots_ints).unwrap_or(u32::MAX),
+                        self.laid.room(slots_at)?,
+                    )?,
+                ))
+            }
         };
 
         let adapter_routes = match fire.adapter_routes {
@@ -1188,6 +1425,8 @@ impl<B: Backend> Inputs<B> {
             } else {
                 None
             },
+            rs_carry,
+            rs_folds,
             group_of_lane,
             packings,
             inputs,
@@ -1223,6 +1462,20 @@ impl<B: Backend> Inputs<B> {
             slot_of_row: views.slot_of_row,
         }
     }
+}
+
+/// The ints a beam fold's header takes in its table: a lane's of the rs
+/// table (`kernels_slang::ssm::CARRY_HEADER`).
+pub const FOLD_HEADER: u32 = kernels_slang::ssm::CARRY_HEADER;
+
+/// The ints a fire's staged rs table holds for fires of `lanes` lanes and
+/// `rows` tokens over rs pages of `page_tokens`: a header a lane, as many
+/// carried tokens as the fire's rows, and the pages those and the lanes' own
+/// rows lie in (two partial pages a lane at most).
+#[must_use]
+pub fn rs_carry_ints(lanes: u64, rows: u64, page_tokens: u32) -> u64 {
+    let pages = (2 * rows).div_ceil(u64::from(page_tokens.max(1))) + 2 * lanes;
+    lanes * u64::from(kernels_slang::ssm::CARRY_HEADER) + rows + pages
 }
 
 fn i32s<B: Backend>(
@@ -1315,7 +1568,13 @@ mod tests {
             None,
             2,
             true,
+            Some(16),
             1 << 30,
+            Some(BeamFacts {
+                planes: 4,
+                rs_planes: 2,
+                frames: 2,
+            }),
         );
         let rooms: Vec<(u64, u64)> = laid.rooms.iter().map(|(&at, &room)| (at, room)).collect();
         assert!(rooms.len() > 20, "the store lays {} inputs", rooms.len());

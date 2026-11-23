@@ -184,6 +184,7 @@ fn buffer_over(tokens: u32, folded: u32, fold: u32) -> RsVerb {
 
 fn seated<'a>(slot: u32, tokens: &'a [u32], rs: &'a RsVerb, reset: RsReset) -> Seated<'a> {
     Seated {
+        replay_stated: None,
         rs,
         rs_reset: reset,
         ..Seated::of(Lane {
@@ -202,6 +203,7 @@ fn seated_at<'a>(
     held: u32,
 ) -> Seated<'a> {
     Seated {
+        replay_stated: None,
         held: Some(held),
         ..seated(slot, tokens, rs, reset)
     }

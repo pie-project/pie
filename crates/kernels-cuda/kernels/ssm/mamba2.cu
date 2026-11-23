@@ -1,5 +1,6 @@
 #include "ssm/tile_sm80.cuh"
 #include "prim/state_rows.cuh"
+#include "ssm/carry.cuh"
 
 namespace pie::ssm {
 
@@ -82,6 +83,212 @@ __global__ void __launch_bounds__(256) mamba2_step(
         for (int q = 1; q < ROWS; ++q) mine = l == q ? acc[q] : mine;
         const long long o = row * inner + h * M2_P + l * 8 + warp;
         y[o] = __float2bfloat16((mine + D[h] * xl) * silu_f(__bfloat162float(z[o])));
+    }
+}
+
+// `mamba2_step` over a lane's buffered rows then its own, read as a linear
+// attention from the committed state `S`. With `a_i = exp(-exp(A_log) dt_i)`,
+//   h_t = A_{0,t} S + sum_s A_{s,t} (dt_s x_s) B_s^T,  A_{s,t} = prod_{s<i<=t} a_i,
+//   y_t = A_{0,t} C_t S + sum_s A_{s,t} dt_s (B_s . C_t) x_s + D x_t,
+// so the own row reads the state once and each buffered row as one dot
+// (`B_s . C_t`, a warp a row) and its `x_s`. The decays are formed in f32
+// from per-row log-decays, a suffix sum, never as a ratio. A buffered row
+// keeps its step size (plane 0) and its convolved `x | B` (plane 1, the
+// conv lands it); a fold applies `S <- a S + (dt x) B^T` a committed row,
+// the only state write. The own row's step size lands in its buffer. Lanes
+// index the fire's tables (`win[3]` on).
+__global__ void __launch_bounds__(256) mamba2_step_carried(
+    const bf16* __restrict__ xbc,
+    const bf16* __restrict__ dt,
+    const bf16* __restrict__ z,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ D,
+    StateRows rows,
+    bf16* __restrict__ y,
+    int H, int G,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    Carry carry,
+    const u32* __restrict__ win)
+{
+    constexpr int ROWS = M2_P / 8;
+    constexpr int WARPS = 8;
+    // A chunk of buffered rows a pass: each row's weight to the own row
+    // (before its decay), its log-decay and its `x`.
+    constexpr int CH = 32;
+    __shared__ float s_w[CH];
+    __shared__ float s_la[CH];
+    __shared__ __align__(16) float s_x[CH][M2_P];
+    const int r = blockIdx.x;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int h = blockIdx.y;
+    const CarryLane cl = carry.lane(rl);
+    if (threadIdx.x == 0) {
+        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) dst[h] = dt[row * H + h];
+    }
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int inner = H * M2_P;
+    const int width = inner + 2 * G * M2_N;
+    const int g = h / (H / G);
+    const int warp = threadIdx.x >> 5;
+    const int l = threadIdx.x & 31;
+    float4* st = reinterpret_cast<float4*>(
+        rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N)) + threadIdx.x;
+    float4 s[ROWS];
+    #pragma unroll
+    for (int q = 0; q < ROWS; ++q) s[q] = __ldcs(st + q * 256);
+    const bf16* at = xbc + row * width;
+    const uint2 braw = *reinterpret_cast<const uint2*>(at + inner + g * M2_N + 4 * l);
+    const uint2 craw = *reinterpret_cast<const uint2*>(at + inner + (G + g) * M2_N + 4 * l);
+    const float xl = l < ROWS ? __bfloat162float(at[h * M2_P + l * 8 + warp]) : 0.f;
+    const float ea = __expf(A_log[h]);
+    const float bias = dt_bias[h];
+    const float step = m2_dt(__bfloat162float(dt[row * H + h]), bias);
+    const float la_n = -ea * step;
+    const float2 b01 = gdn_unpack(braw.x), b23 = gdn_unpack(braw.y);
+    const float2 c01 = gdn_unpack(craw.x), c23 = gdn_unpack(craw.y);
+    // The committed state's part, `C S` a state row, and the own row's
+    // `B . C`.
+    float acc[ROWS];
+    #pragma unroll
+    for (int q = 0; q < ROWS; ++q) {
+        acc[q] = s[q].x * c01.x + s[q].y * c01.y + s[q].z * c23.x + s[q].w * c23.y;
+    }
+    const float bc_n = ::pie::warp_sum(b01.x * c01.x + b01.y * c01.y + b23.x * c23.x + b23.y * c23.y);
+    const int n = carry.carried(cl);
+    const int commit = carry.commit(rl, n + 1);
+    const bool fold = folds(write_state, write_state_mask, rl) && commit > 0;
+    // The buffered rows, a chunk at a time from the last: lane `l < 8` of
+    // warp `w` sums row `p = 8 l + w` of the output. `after` is the
+    // log-decay of the rows after the chunk, the own row's with them.
+    float ya = 0.f;
+    float after = la_n;
+    const int p = l * 8 + warp;
+    for (int c = (n + CH - 1) / CH - 1; c >= 0; --c) {
+        const int base = CH * c;
+        const int rows_c = min(CH, n - base);
+        for (int e = warp; e < rows_c; e += WARPS) {
+            u64 slot;
+            u32 tok;
+            carry.carried_at(cl, base + e, slot, tok);
+            const bf16* xb = carry.plane_at<const bf16>(slot, tok, 1);
+            const uint2 bj = *reinterpret_cast<const uint2*>(xb + inner + g * M2_N + 4 * l);
+            const float2 j01 = gdn_unpack(bj.x), j23 = gdn_unpack(bj.y);
+            const float dot = ::pie::warp_sum(j01.x * c01.x + j01.y * c01.y + j23.x * c23.x + j23.y * c23.y);
+            const float2 xv = gdn_unpack(*reinterpret_cast<const unsigned*>(xb + h * M2_P + 2 * l));
+            s_x[e][2 * l] = xv.x;
+            s_x[e][2 * l + 1] = xv.y;
+            if (l == 0) {
+                const float sj = m2_dt(__bfloat162float(carry.plane_at<const bf16>(slot, tok, 0)[h]), bias);
+                s_w[e] = sj * dot;
+                s_la[e] = -ea * sj;
+            }
+        }
+        __syncthreads();
+        const float la = l < rows_c ? s_la[l] : 0.f;
+        float later = la;
+        #pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const float down = __shfl_down_sync(0xffffffffu, later, off);
+            if (l + off < 32) later += down;
+        }
+        const float total = __shfl_sync(0xffffffffu, later, 0);
+        const float w = l < rows_c ? __expf(after + later - la) * s_w[l] : 0.f;
+        after += total;
+        for (int e = 0; e < rows_c; ++e) {
+            const float we = __shfl_sync(0xffffffffu, w, e);
+            if (l < ROWS) ya += we * s_x[e][p];
+        }
+        __syncthreads();
+    }
+    const float g0 = __expf(after);
+    #pragma unroll
+    for (int q = 0; q < ROWS; ++q) acc[q] = ::pie::warp_sum(acc[q]);
+    if (l < ROWS) {
+        float mine = acc[0];
+        #pragma unroll
+        for (int q = 1; q < ROWS; ++q) mine = l == q ? acc[q] : mine;
+        const long long o = row * inner + h * M2_P + p;
+        const float yo = g0 * mine + ya + step * bc_n * xl + D[h] * xl;
+        y[o] = __float2bfloat16(yo * silu_f(__bfloat162float(z[o])));
+    }
+    if (!fold) return;
+    // The rows the lane commits fold into the state: its buffered ones, then
+    // its own where it commits that too.
+    const int folded = min(commit, n);
+    for (int j = 0; j < folded; ++j) {
+        u64 slot;
+        u32 tok;
+        carry.carried_at(cl, j, slot, tok);
+        const bf16* xb = carry.plane_at<const bf16>(slot, tok, 1);
+        const uint2 bj = *reinterpret_cast<const uint2*>(xb + inner + g * M2_N + 4 * l);
+        const float xj = l < ROWS ? __bfloat162float(xb[h * M2_P + l * 8 + warp]) : 0.f;
+        const float sj = m2_dt(__bfloat162float(carry.plane_at<const bf16>(slot, tok, 0)[h]), bias);
+        const float decay = __expf(-ea * sj);
+        const float2 j01 = gdn_unpack(bj.x), j23 = gdn_unpack(bj.y);
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) {
+            const float dx = sj * __shfl_sync(0xffffffffu, xj, q);
+            s[q].x = s[q].x * decay + dx * j01.x;
+            s[q].y = s[q].y * decay + dx * j01.y;
+            s[q].z = s[q].z * decay + dx * j23.x;
+            s[q].w = s[q].w * decay + dx * j23.y;
+        }
+    }
+    if (commit == n + 1) {
+        const float decay = __expf(la_n);
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) {
+            const float dx = step * __shfl_sync(0xffffffffu, xl, q);
+            s[q].x = s[q].x * decay + dx * b01.x;
+            s[q].y = s[q].y * decay + dx * b01.y;
+            s[q].z = s[q].z * decay + dx * b23.x;
+            s[q].w = s[q].w * decay + dx * b23.y;
+        }
+    }
+    #pragma unroll
+    for (int q = 0; q < ROWS; ++q) __stcs(st + q * 256, s[q]);
+}
+
+// The rows a chunked Mamba-2 fire's lanes land past their commit, made
+// ready for a later decode's linear attention: each row's convolved
+// `x | B` (the first `xb` channels of its `xbc` row) into plane 1 of the
+// lane's buffer (its step size, plane 0, the fire lands). A block a lane;
+// the rows read where the fire lays them: the lane's extended rows (`ext`:
+// row `RsLane::ext + j`) or its own (`qo_indptr`, the window's row offset
+// `win[1]`).
+__global__ void mamba2_tail_rows(
+    const bf16* __restrict__ xbc,
+    const u32* __restrict__ qo_indptr,
+    bool ext,
+    int width, int xb,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    int lanes_stated,
+    Carry carry,
+    const u32* __restrict__ win)
+{
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int r = blockIdx.x;
+    if (r >= lanes) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const CarryLane cl = carry.lane(rl);
+    if (cl.at == CARRY_NONE) return;
+    const int n = carry.carried(cl);
+    const int own = static_cast<int>(qo_indptr[r + 1] - qo_indptr[r]);
+    const int run = n + own;
+    const int start = folds(write_state, write_state_mask, rl) ? carry.commit(rl, run) : 0;
+    for (int e = max(start - n, 0); e < own; ++e) {
+        const long long at = ext ? static_cast<long long>(cl.ext) + n + e
+                                 : static_cast<long long>(row0) + qo_indptr[r] + e;
+        const uint4* src = reinterpret_cast<const uint4*>(xbc + at * width);
+        uint4* dst = reinterpret_cast<uint4*>(carry.own_row<bf16>(cl, e, 1));
+        for (int i = threadIdx.x; i < xb / 8; i += blockDim.x) dst[i] = src[i];
     }
 }
 
@@ -371,6 +578,66 @@ __global__ void __launch_bounds__(128) mamba2_scan(
                 }
             }
         }
+    }
+}
+
+// A beam group's fold of its Mamba-2 state (BEAM-PAGE-LISTS §11.3): its fold
+// rows (step sizes and `x | B`: planes 0 and 1, through the representative
+// lane's pages) folded in order, `S <- a S + (dt x) B^T`, `a = exp(-exp(A_log)
+// dt)`, as a decode step folds a committed row, and the state stored once. A
+// block a head, folding the groups in turn (the folding ones lead the table;
+// the first of no rows ends it), `mamba2_step_carried`'s layout.
+__global__ void __launch_bounds__(256) mamba2_fold(
+    StateRows rows,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    int H, int G,
+    Carry carry,
+    const GroupFold* __restrict__ folds,
+    int groups)
+{
+    constexpr int ROWS = M2_P / 8;
+    const int h = blockIdx.x;
+    const int inner = H * M2_P;
+    const int gi = h / (H / G);
+    const int warp = threadIdx.x >> 5;
+    const int l = threadIdx.x & 31;
+    const float ea = __expf(A_log[h]);
+    const float bias = dt_bias[h];
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        float4* st = reinterpret_cast<float4*>(
+            rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N)) + threadIdx.x;
+        float4 s[ROWS];
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) s[q] = __ldcs(st + q * 256);
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 tok;
+            carry.fold_at(cl, f.fold_off, j, slot, tok);
+            const bf16* xb = carry.plane_at<const bf16>(slot, tok, 1);
+            const uint2 bj = *reinterpret_cast<const uint2*>(xb + inner + gi * M2_N + 4 * l);
+            const float xj = l < ROWS ? __bfloat162float(xb[h * M2_P + l * 8 + warp]) : 0.f;
+            const float sj = m2_dt(__bfloat162float(carry.plane_at<const bf16>(slot, tok, 0)[h]), bias);
+            const float decay = __expf(-ea * sj);
+            const float2 j01 = gdn_unpack(bj.x), j23 = gdn_unpack(bj.y);
+            #pragma unroll
+            for (int q = 0; q < ROWS; ++q) {
+                const float dx = sj * __shfl_sync(0xffffffffu, xj, q);
+                s[q].x = s[q].x * decay + dx * j01.x;
+                s[q].y = s[q].y * decay + dx * j01.y;
+                s[q].z = s[q].z * decay + dx * j23.x;
+                s[q].w = s[q].w * decay + dx * j23.y;
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < ROWS; ++q) __stcs(st + q * 256, s[q]);
     }
 }
 

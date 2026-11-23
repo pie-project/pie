@@ -39,6 +39,8 @@ pub(super) enum WaitKind {
     BindRoom {
         run: u32,
         pieces: u32,
+        /// Single chunks beside its runs: its tables, rings and adapter.
+        singles: u32,
         pages: u32,
         notify: Arc<Notify>,
         served: bool,
