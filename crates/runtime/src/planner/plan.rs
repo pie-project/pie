@@ -781,6 +781,12 @@ impl ResidencyPlanner {
 
     fn plan_heads(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
+            // A hold may have named the finisher the last pass read: the
+            // gate is read again, without the held, before any is paused.
+            // Read stale, the held finisher was never paused (conform's
+            // running hold on the L40S: 502 tokens while held).
+            let order = self.capacity_order();
+            self.with_inner(|inner| inner.set_capacity(order));
             self.pause_held();
         }
         self.reseat_released();
