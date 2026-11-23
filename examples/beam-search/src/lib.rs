@@ -236,6 +236,9 @@ async fn main(input: Input) -> Result<String> {
     // The finish's check (`verify`): how far the adopted set's next-token
     // score lay from an unbranched decode's, and its room.
     let mut finished: Option<(f32, f32, f32)> = None;
+    // Under `--corrupt finish`: where the adopted beam's hypothesis parts
+    // from the checked one's, of its length.
+    let mut parted: Option<(usize, usize)> = None;
     // The parents the last fire's epilogue picked: the device's lists are
     // the last fire's beams', so the final beam `l` lies on beam
     // `last_parents[l]`'s pages (its last token on none).
@@ -473,15 +476,24 @@ async fn main(input: Input) -> Result<String> {
                         .filter(|&lane| lane != best)
                         .min_by_key(|&lane| shared(lane))
                         .unwrap_or(best);
-                    // A beam that parts from the checked one only at its last
-                    // token (which no fire fed, so no row holds) holds the
-                    // same rows: no control.
-                    if shared(lane) + 1 >= hypotheses[best].len() {
-                        return Err("the finish's control: every beam holds the checked \
-                                    hypothesis's rows (they part at the last token at most), \
-                                    so adopting another proves nothing"
-                            .into());
+                    // A beam that parts from the checked one only near its end
+                    // holds nearly the same context, which no check can tell
+                    // from rounding: the control is formed only where the
+                    // adopted beam parts at least `CONTROL_PARTS_BEFORE`
+                    // tokens before the end. A formed one is caught where its
+                    // context still moves the set's next-token head past
+                    // rounding; one whose context no longer moves it cannot be
+                    // told from correct output by any check on outputs.
+                    let (at, of) = (shared(lane), hypotheses[best].len());
+                    if at + CONTROL_PARTS_BEFORE > of {
+                        return Err(format!(
+                            "no control formed: every other beam shares {at} of the checked \
+                             hypothesis's {of} tokens, parting later than \
+                             {CONTROL_PARTS_BEFORE} before its end"
+                        )
+                        .into());
                     }
+                    parted = Some((at, of));
                     lane
                 } else {
                     best
@@ -650,7 +662,10 @@ async fn main(input: Input) -> Result<String> {
         "{text}\n[beam] width={b} steps={max_steps} best_score={:.4}{verified}{}{}",
         final_scores[best_lane],
         finished.map_or(String::new(), |(apart, room, got)| format!(
-            " finished_apart={apart:.6} finished_room={room:.3} finished_got={got:.6}"
+            " finished_apart={apart:.6} finished_room={room:.3} finished_got={got:.6}{}",
+            parted.map_or(String::new(), |(at, of)| format!(
+                " finished_parts_at={at}/{of}"
+            ))
         )),
         stopped.map_or(String::new(), |why| format!(" stopped {why}"))
     ))
@@ -706,8 +721,8 @@ async fn finish_check(
         FinishRead::Committed(committed) => committed,
         _ => slot,
     }]);
-    let out = Channel::new([1], dtype::f32);
-    let next = Channel::new([1], dtype::i32);
+    let out = Channel::new([FINISH_TOKENS], dtype::f32);
+    let next = Channel::new([FINISH_TOKENS], dtype::i32);
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &indptr)?;
     fwd.state(
@@ -720,42 +735,95 @@ async fn finish_check(
     )
     .context("bind the finished set")?;
     fwd.epilogue(move || {
-        // The second-ranked token: its log-probability moves with the context
-        // even where the first is near certain (log-probability near 0 under
-        // any context, which no check could tell apart).
+        // The head of the next-token distribution: a set that holds another
+        // context moves it, though one token's log-probability may move less
+        // than its room.
         let logits = cast(reshape(intrinsics::output(0, "logits"), [v]), dtype::bf16);
-        let (s, i) = top_k(log_softmax(&logits), 2);
-        out.put(cast(gather(&s, iota(1) + 1u32), dtype::f32));
-        next.put(cast(gather(&i, iota(1) + 1u32), dtype::i32));
+        let (s, i) = top_k(log_softmax(&logits), FINISH_TOKENS);
+        out.put(cast(&s, dtype::f32));
+        next.put(cast(&i, dtype::i32));
     });
     fwd.submit(&pipeline).context("finished-set submit")?;
     let got = out.take_host::<Vec<f32>>().await.context("finished-set drain")?;
     let token = next.take_host::<Vec<i32>>().await.context("finished-set drain")?;
     pipeline.close();
-    let (got, token) = match (got.first(), token.first()) {
-        (Some(&got), Some(&token)) => (got, token as u32),
-        _ => return Err("the finished set's fire returned nothing".into()),
-    };
-    let mut forced = hypothesis.to_vec();
-    forced.push(token);
-    let rescored = rescore(prompt, &forced, width, None).await?;
-    let want = rescored.last().ok_or("the unbranched decode returned nothing")?;
-    // The set's fire rounds its logits and log-probability as the beam's
-    // fires do, and takes no candidate: a step's room with nothing carried.
-    let room = want.room(got);
-    let apart = (got - want.step).abs();
+    if got.len() != FINISH_TOKENS as usize || token.len() != got.len() {
+        return Err("the finished set's fire returned nothing".into());
+    }
+    let tokens: Vec<u32> = token.iter().map(|&t| t as u32).collect();
+    let wants = rescore_last(prompt, hypothesis, width, &tokens).await?;
+    // The set's fire rounds its logits and log-probabilities as the beam's
+    // fires do, and takes no candidate: each token's room is a step's, with
+    // nothing carried. The farthest from its room is the one reported.
+    let mut farthest: Option<(usize, f32, f32)> = None;
+    for (at, (&got, want)) in got.iter().zip(&wants).enumerate() {
+        let got = finite(&format!("the finished set's {}-ranked token", at + 1), got)?;
+        let room = want.room(got);
+        let apart = (got - want.step).abs();
+        if farthest.is_none_or(|(_, far, far_room)| apart / room > far / far_room) {
+            farthest = Some((at, apart, room));
+        }
+    }
+    let (at, apart, room) = farthest.ok_or("the finished set's fire returned nothing")?;
+    let (got, want) = (got[at], &wants[at]);
     if apart > room {
         return Err(format!(
-            "after its finish the set scored the next token {got:.4} and an unbranched decode \
-             {:.4}: {apart:.4} apart, room {room:.4} ({STEP_ULPS} bf16 gaps at its logits' scale): \
-             {:.2} times its room; its pages are not its \
-             beam's",
+            "after its finish the set scored its {}-ranked next token ({}) {got:.4} and an \
+             unbranched decode {:.4}: {apart:.4} apart, room {room:.4} ({STEP_ULPS} bf16 gaps at \
+             its logits' scale): {:.2} times its room; its pages are not its beam's",
+            at + 1,
+            tokens[at],
             want.step,
             apart / room
         )
         .into());
     }
     Ok((apart, room, got))
+}
+
+/// The next tokens a finish's check reads ([`finish_check`]): the head of
+/// the finished set's distribution, compared token by token.
+const FINISH_TOKENS: u32 = 16;
+
+/// How far before its end the beam `--corrupt finish` adopts parts from the
+/// checked one, at least: a beam parting later holds nearly the checked
+/// context, and the control is not formed.
+const CONTROL_PARTS_BEFORE: usize = 16;
+
+/// As [`rescore`], at the position after `hypothesis` alone, for each of the
+/// tokens `last` there: each one's log-probability and logit from a 1-row
+/// fire folding every step, the position's largest logit, and (reported,
+/// never a room) how far `width` unfolded copies move each.
+async fn rescore_last(
+    prompt: &[u32],
+    hypothesis: &[u32],
+    width: u32,
+    last: &[u32],
+) -> Result<Vec<Rescored>> {
+    // The forced sequence's last token stands for `last`, the position's
+    // targets.
+    let mut forced = hypothesis.to_vec();
+    forced.push(*last.first().ok_or("no token to score")?);
+    let (one_steps, one) = teacher_forced(prompt, &forced, 1, Fold::All, last).await?;
+    let (_, wide) = teacher_forced(prompt, &forced, width, Fold::None, last).await?;
+    let largest = one_steps.last().ok_or("the rescore returned nothing")?.2;
+    if one.len() != last.len() || wide.len() != last.len() {
+        return Err("the rescore returned fewer targets than it was given".into());
+    }
+    one.iter()
+        .zip(&wide)
+        .enumerate()
+        .map(|(at, (&(step, picked), &(paired, _)))| {
+            Ok(Rescored {
+                step: finite(&format!("the rescore of target {at}"), step)?,
+                picked: finite(&format!("the rescore of target {at}"), picked)?,
+                largest,
+                spread: (step - paired).abs(),
+                by: "width-copies",
+                unshaped: (step - paired).abs(),
+            })
+        })
+        .collect()
 }
 
 /// A value the verifier compares, refused by name where it is not finite: a
@@ -875,9 +943,9 @@ async fn rescore(
     width: u32,
     shaped: Option<&[(f32, f32, f32)]>,
 ) -> Result<Vec<Rescored>> {
-    let one = teacher_forced(prompt, hypothesis, 1, Fold::All).await?;
+    let (one, _) = teacher_forced(prompt, hypothesis, 1, Fold::All, &[]).await?;
     let mut others = vec![
-        teacher_forced(prompt, hypothesis, width, Fold::None).await?,
+        teacher_forced(prompt, hypothesis, width, Fold::None, &[]).await?.0,
         replay(prompt, hypothesis).await?,
     ];
     if let Some(shaped) = shaped {
@@ -1168,13 +1236,16 @@ async fn replay_beam(
 /// logit and its largest logit, teacher-forced one token a fire as `copies`
 /// rows (the hypothesis repeated, each copy on a working set of its own,
 /// the prompt's fire the first copy's alone), read off the first. The prompt is folded; each step after it folds by
-/// `fold`.
+/// `fold`. Where `last` names tokens, the last step targets them all (its
+/// step reads the first), and each one's log-probability and logit there
+/// come back beside.
 async fn teacher_forced(
     prompt: &[u32],
     hypothesis: &[u32],
     copies: u32,
     fold: Fold<'static>,
-) -> Result<Vec<(f32, f32, f32)>> {
+    last: &[u32],
+) -> Result<(Vec<(f32, f32, f32)>, Vec<(f32, f32)>)> {
     let v = model::output_vocab_size();
     // The prompt is prefilled once, on the first set; the other copies are
     // forks of it after that fire, sharing the prompt's pages, so the
@@ -1182,7 +1253,15 @@ async fn teacher_forced(
     let mut sets: Vec<WorkingSet> = vec![WorkingSet::new()];
     let pipeline = Pipeline::new();
     let mut steps = Vec::with_capacity(hypothesis.len());
+    let mut finals = Vec::new();
     for (at, &target) in hypothesis.iter().enumerate() {
+        let finals_here = at + 1 == hypothesis.len() && !last.is_empty();
+        let targets: Vec<u32> = if finals_here {
+            last.to_vec()
+        } else {
+            vec![target]
+        };
+        let wanted_count = u32::try_from(targets.len()).map_err(|_| "targets past u32")?;
         if at == 1 {
             for _ in 1..copies {
                 let copy = sets[0].fork(&pipeline).context("fork the prompt's set")?;
@@ -1200,9 +1279,9 @@ async fn teacher_forced(
         let all: Vec<i32> = (0..copies).flat_map(|_| fed.iter().copied()).collect();
         let toks = Channel::from(&all[..]);
         let indptr = Channel::from_iter((0..=copies).map(|c| c * rows));
-        let wanted = Channel::from([target]);
-        let out = Channel::new([1], dtype::f32);
-        let picked = Channel::new([1], dtype::f32);
+        let wanted = Channel::from(&targets[..]);
+        let out = Channel::new([wanted_count], dtype::f32);
+        let picked = Channel::new([wanted_count], dtype::f32);
         let largest = Channel::new([1], dtype::f32);
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
@@ -1249,7 +1328,13 @@ async fn teacher_forced(
                 .ok_or("the rescoring fire returned nothing")
         };
         steps.push((step, first(&picked)?, first(&largest)?));
+        if finals_here {
+            if got.len() != targets.len() || picked.len() != targets.len() {
+                return Err("the rescoring fire returned fewer targets than it was given".into());
+            }
+            finals = got.iter().copied().zip(picked.iter().copied()).collect();
+        }
     }
     pipeline.close();
-    Ok(steps)
+    Ok((steps, finals))
 }
