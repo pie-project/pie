@@ -61,6 +61,7 @@ fn step(
         shell.open(slot as u32).expect("the slot opens");
         shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane {
                     slot: slot as u32,
@@ -89,6 +90,7 @@ fn step(
     let plain = word(&fixture.trace, 1);
     let lanes: Vec<Seated<'_>> = (0..2u32)
         .map(|slot| Seated {
+            replay_stated: None,
             held: Some(PROMPT),
             ..Seated::of(Lane {
                 slot,

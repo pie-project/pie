@@ -17,6 +17,7 @@ use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, load_w
 fn last_row(shell: &mut Shell, fixture: &Fixture, slot: u32, tokens: &[u32]) -> Vec<f32> {
     let positions = vec![0u32; tokens.len()];
     let seated = Seated {
+        replay_stated: None,
         held: Some(0),
         positions: &positions,
         ..Seated::of(Lane {

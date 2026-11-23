@@ -176,6 +176,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
     shell.open(0).expect("the slot opens");
     shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(0),
             ..Seated::of(Lane {
                 slot: 0,
@@ -248,6 +249,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
         let logits = shell
             .fire_attached(
                 &[Seated {
+                    replay_stated: None,
                     held: Some(PROMPT + step),
                     ..Seated::of(Lane {
                         slot: 0,
@@ -286,6 +288,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
     // an instance attached at more lanes than its one lane's rows.
     let refused = shell
         .fire_seated(&[Seated {
+            replay_stated: None,
             held: Some(PROMPT + DECODES),
             ..Seated::of(Lane {
                 slot: 0,
@@ -301,6 +304,7 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
     let refused = shell
         .fire_attached(
             &[Seated {
+                replay_stated: None,
                 held: Some(PROMPT + DECODES),
                 ..Seated::of(Lane {
                     slot: 0,

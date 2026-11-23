@@ -152,6 +152,7 @@ fn a_stated_group_mask_reads_only_the_rows_it_admits() {
     for (fire, masked) in [false, true, false].into_iter().enumerate() {
         let lanes: Vec<Seated<'_>> = (0..ROWS.len())
             .map(|at| Seated {
+                replay_stated: None,
                 kv_less: true,
                 readout: Some(read.as_slice()),
                 mask: masked.then(|| &masks[at]),

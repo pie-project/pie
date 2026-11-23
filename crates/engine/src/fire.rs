@@ -346,6 +346,12 @@ pub struct Lane {
     /// in slots of their own as it runs.
     #[serde(default)]
     pub rs_snapshots: Vec<RsSnapshot>,
+    /// The lane's replay as the runtime stated it when it chose the fire's
+    /// rung ([`LaneReplay`]): what an engine's submit check compares its own
+    /// count with ([`replay_agrees`]). `None` on a lane carrying no
+    /// recurrent verb.
+    #[serde(default)]
+    pub replay_stated: Option<LaneReplay>,
     pub readout: Readout,
     /// Unique to its pass in a fire, so two passes' lanes never attend each other.
     #[serde(default)]
@@ -962,6 +968,98 @@ pub fn lane_one_run(masking: Option<&Masking>, folded: u32, first: u32, lineage:
         },
         Err(_) => false,
     }
+}
+
+/// A lane's replay as the runtime states it ([`Lane::replay_stated`]): the
+/// buffered rows it replays ahead of its own (its lineage's,
+/// [`buffered_reads`], a decode lane's included) and whether they are one
+/// stretch ([`lane_one_run`]), from the verb it sends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneReplay {
+    pub replayed: u32,
+    pub one_run: bool,
+}
+
+impl LaneReplay {
+    /// A lane of `verb` whose first row is `first`, its mask `masking`.
+    #[must_use]
+    pub fn of(verb: &RsVerb, masking: Option<&Masking>, first: u32) -> Option<LaneReplay> {
+        let RsVerb::Buffer {
+            folded, lineage, ..
+        } = verb
+        else {
+            return None;
+        };
+        let reads = buffered_reads(masking, *folded, first, *lineage).ok();
+        Some(LaneReplay {
+            replayed: reads
+                .as_ref()
+                .map_or(first.saturating_sub(*folded), |runs| {
+                    runs.iter().map(|run| run.len() as u32).sum()
+                }),
+            one_run: lane_one_run(masking, *folded, first, *lineage),
+        })
+    }
+}
+
+/// The debug cross-check at an engine's door: the fire's rows and
+/// compactness as its lanes state the runtime counted them
+/// ([`Lane::replay_stated`]) against the engine's own (`own`,
+/// `own_compact`), at the rung it stages the fire in. A disagreement in
+/// compactness, or in whether `rung` holds the fire, is a contract bug,
+/// named with both inputs. `layout_compact`, `per_fire` and `snapshots` are
+/// [`scratch_compact`]'s; `lanes` each lane's own rows and its stated replay.
+/// A fire none of whose lanes states one is not compared. Engines call it
+/// in debug builds ([`replay_check_on`]).
+pub fn replay_agrees(
+    lanes: impl IntoIterator<Item = (u32, Option<LaneReplay>)>,
+    rung: &RungReplay,
+    own: ReplayRows,
+    own_compact: bool,
+    layout_compact: bool,
+    per_fire: bool,
+    snapshots: bool,
+) -> std::result::Result<(), String> {
+    let lanes: Vec<(u32, Option<LaneReplay>)> = lanes.into_iter().collect();
+    if lanes.iter().all(|(_, stated)| stated.is_none()) {
+        return Ok(());
+    }
+    let stated: Vec<(u32, LaneReplay)> = lanes
+        .iter()
+        .map(|&(rows, stated)| (rows, stated.unwrap_or_default()))
+        .collect();
+    let compact = scratch_compact(
+        layout_compact,
+        per_fire,
+        stated.iter().all(|(_, lane)| lane.one_run),
+        snapshots,
+    );
+    let rows = ReplayRows::of_lanes(
+        stated.iter().map(|&(own, lane)| (own, lane.replayed)),
+        compact,
+    );
+    let held = rung_holds(rung, rows).is_ok();
+    let own_held = rung_holds(rung, own).is_ok();
+    // The runtime may count more than the engine lays (a mask the device
+    // resolves, a bound in place of a count): only its counting less, a
+    // fire it priced compact the engine lays wide, or one it found held
+    // the engine refuses, is the bug.
+    if (compact && !own_compact) || (held && !own_held) {
+        return Err(format!(
+            "the runtime's count of this fire's replay and the engine's disagree (a contract \
+             bug): stated {rows:?} compact {compact} (held {held}), the engine's {own:?} compact \
+             {own_compact} (held {own_held}), at {rung:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether engines run [`replay_agrees`] at their door: debug builds, or
+/// `PIE_CHECK_REPLAY` set; it changes no behavior but to name a contract
+/// bug.
+#[must_use]
+pub fn replay_check_on() -> bool {
+    cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_REPLAY").is_some()
 }
 
 /// Whether a fire's rs scratch is compact, laying only the carried rows a

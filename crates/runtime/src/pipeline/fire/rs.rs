@@ -260,6 +260,26 @@ impl PreparedRs {
         for (row, lane) in request.lanes.iter_mut().enumerate() {
             if let Some(verb) = self.verbs.get(row) {
                 lane.rs = verb.clone();
+                // Its replay as the runtime counts it, from the verb it
+                // sends (what the engine's submit cross-check compares): a
+                // lane sharing its set whose mask the device resolves is no
+                // one run as far as the host can say.
+                lane.lane.replay_stated =
+                    engine::fire::LaneReplay::of(verb, lane.lane.mask.as_ref(), lane.lane.kv.held)
+                        .map(|mut stated| {
+                            if lane.lane.mask.is_none()
+                                && matches!(
+                                    verb,
+                                    engine::fire::RsVerb::Buffer {
+                                        lineage: engine::fire::Lineage::Admitted,
+                                        ..
+                                    }
+                                )
+                            {
+                                stated.one_run = false;
+                            }
+                            stated
+                        });
             }
             if let Some(&flags) = self.slot_flags.get(row) {
                 lane.rs_reset = if flags & crate::engine::RS_FLAG_RESET != 0 {
@@ -756,6 +776,88 @@ mod tests {
             .into_iter()
             .map(|lane| (lane.lane.rs, lane.lane.rs_reset))
             .collect()
+    }
+
+    /// Mac's w10 lane, as the runtime states it from the verb it sends: a
+    /// decode lane of a group sharing its set, folded through 34, its row
+    /// at 38, its mask admitting the one buffered slot 34 (a parent's): one
+    /// row replayed, not one stretch ending at its row (Metal lays such a
+    /// fire wide). Alone on its set it replays all four, one stretch.
+    #[test]
+    fn a_lane_states_its_replay_from_its_verb() {
+        let verb = |lineage| RsVerb::Buffer {
+            pages: vec![1],
+            base: 32,
+            folded: 34,
+            fold: FoldLen::Host(0),
+            lineage,
+        };
+        let mask = engine::Masking::Extent(engine::Mask::new(vec![0, 1, 3, 1], 5));
+        let beam = engine::fire::LaneReplay::of(&verb(engine::fire::Lineage::Admitted), Some(&mask), 38);
+        assert_eq!(
+            beam,
+            Some(engine::fire::LaneReplay {
+                replayed: 1,
+                one_run: false
+            })
+        );
+        let alone = engine::fire::LaneReplay::of(&verb(engine::fire::Lineage::Set), None, 38);
+        assert_eq!(
+            alone,
+            Some(engine::fire::LaneReplay {
+                replayed: 4,
+                one_run: true
+            })
+        );
+        assert_eq!(engine::fire::LaneReplay::of(&RsVerb::Fold, None, 38), None);
+        // The runtime lowers it onto the lane it sends, and a lane sharing
+        // its set whose mask the device resolves states no one run.
+        let mut store = RsStore::new(8, 8);
+        let ws = warm(&mut store, 4);
+        let out = prepare_many(
+            &mut store,
+            &[ws, ws],
+            &group(vec![0, 1], 4..6, GroupFold::None),
+            None,
+        )
+        .unwrap();
+        let mut req = request(2);
+        req.lanes[0].lane.kv.held = 4;
+        req.lanes[1].lane.kv.held = 5;
+        out.apply_to(&mut req);
+        assert!(req.lanes.iter().all(|lane| lane.replay_stated.is_some_and(|s| !s.one_run)));
+        settle(&mut store, out.txn);
+    }
+
+    /// The engine's door: the runtime's stated count against the engine's,
+    /// a disagreement where the runtime counted less (priced compact what
+    /// the engine lays wide, or found held what it refuses) named with both;
+    /// the runtime counting more is no bug.
+    #[test]
+    fn the_engine_s_door_names_a_count_the_runtime_got_wrong() {
+        let rung = engine::RungReplay {
+            own_max: Some(256),
+            carried_max: Some(256),
+            scratch: engine::ScratchBytes {
+                slot_bytes: vec![1],
+                lane_bytes: 0,
+                room_bytes: 300,
+                pad: 1,
+            },
+        };
+        let stated = |one_run| {
+            (0..10).map(move |_| (1, Some(engine::fire::LaneReplay { replayed: 37, one_run })))
+        };
+        let wide = engine::ReplayRows::of_lanes((0..10).map(|_| (1, 37)), false);
+        // The runtime priced it compact, the engine lays it wide: a bug.
+        let why = engine::fire::replay_agrees(stated(true), &rung, wide, false, true, true, false)
+            .unwrap_err();
+        assert!(why.contains("disagree"), "{why}");
+        // Both wide: they agree (and both refuse it).
+        assert!(engine::fire::replay_agrees(stated(false), &rung, wide, false, true, true, false).is_ok());
+        // The runtime wider than the engine: no bug.
+        let narrow = engine::ReplayRows::of_lanes((0..10).map(|_| (1, 37)), true);
+        assert!(engine::fire::replay_agrees(stated(false), &rung, narrow, true, true, true, false).is_ok());
     }
 
     #[test]

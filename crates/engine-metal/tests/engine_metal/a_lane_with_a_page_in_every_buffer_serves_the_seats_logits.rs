@@ -52,6 +52,7 @@ fn serve(shell: &mut Shell, fixture: &Fixture, rows: u32, pages: Option<&[u32]>)
     let fire = |shell: &mut Shell, tokens: &[u32], held: u32| -> Vec<Vec<f32>> {
         shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(held),
                 refs: pages.is_some(),
                 pages: pages.unwrap_or(&[]),

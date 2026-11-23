@@ -533,6 +533,7 @@ fn serve(
         let seated: Vec<Seated<'_>> = lanes
             .iter()
             .map(|&(lane, tokens, have, (pages, windows))| Seated {
+                replay_stated: None,
                 pages,
                 windows,
                 held: Some(have),
@@ -1134,6 +1135,7 @@ fn trimmed_windows(model: &str, fixture: &Fixture, context: u32, prompt: u32, li
                     _ => Vec::new(),
                 };
                 let seated = Seated {
+                    replay_stated: None,
                     held: Some(held),
                     refs: trimmed,
                     pages: &list_pages,

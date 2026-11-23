@@ -50,6 +50,7 @@ fn walk(shell: &mut Shell, fixture: &Fixture, rs_pages: u32, refs: Option<&Refs>
         (&next[..], buffer(rs_pages, 1, 0), RsReset::Held, bound + 1),
     ] {
         let lane = Seated {
+            replay_stated: None,
             held: Some(held),
             rs: &verb,
             rs_reset: reset,

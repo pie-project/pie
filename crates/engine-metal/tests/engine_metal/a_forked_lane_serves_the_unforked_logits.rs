@@ -71,6 +71,7 @@ fn fire(
     slots: &Slots,
 ) -> Vec<f32> {
     let seated = Seated {
+        replay_stated: None,
         held: Some(held),
         refs: true,
         pages: &slots.pages,

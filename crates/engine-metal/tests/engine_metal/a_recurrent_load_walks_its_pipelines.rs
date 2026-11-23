@@ -66,6 +66,7 @@ fn a_recurrent_load_walks_its_pipelines() {
         shell.open(1).expect("slot 1 opens");
         shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane {
                     slot: 1,
@@ -160,6 +161,7 @@ fn every_form_a_recurrent_load_serves_is_built_by_its_walk() {
     };
     let (hold, replay) = (buffer(0), buffer(1));
     let lane = |slot: u32, tokens: &'static [u32], word: u64, rs: &'static RsVerb, held: u32| Seated {
+        replay_stated: None,
         held: Some(held),
         rs,
         ..Seated::of(Lane { slot, word, tokens })

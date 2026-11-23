@@ -1073,6 +1073,18 @@ fn replay_rung(
     ))
 }
 
+/// What the rung a fire of `width` rows asks holds of its replay: the
+/// stated bounds of the narrowest rung at least that wide.
+fn rung_model(stores: &crate::store::registry::Stores, width: u32) -> Option<::engine::RungReplay> {
+    let shared = stores.shared.as_ref()?;
+    let rungs = shared.lock().unwrap().rung_replays();
+    rungs
+        .iter()
+        .find(|(tokens, _)| *tokens >= width)
+        .or_else(|| rungs.last())
+        .map(|(_, rung)| rung.clone())
+}
+
 /// The widest rung a host pass's pieces ask, each piece as it is cut
 /// ([`replay_rung`]: its own rows and the rows it carries in, against every
 /// rung's stated bounds); refused by name where some piece no rung holds.
@@ -4994,6 +5006,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Ok(width) => width,
                 Err(refusal) => return Ok(Err(refusal)),
             };
+            let piece_compact =
+                scratch.compact(&stores, &full, piece, &frozen, folds_each && at > 0);
             if let Some(ask) = rung_ask.as_ref()
                 && let Err(refusal) = ask.wait(width).await
             {
@@ -5016,6 +5030,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // What the scheduler steps and holds the fire by.
             req.carried = counted.carried;
             req.replayed = piece_replayed(&full, piece, &frozen, folds_each && at > 0);
+            req.scratch_compact = piece_compact;
+            req.replay_rung = rung_model(&stores, width);
             // A piece's request keeps only the lanes with rows in it,
             // renumbered; `groups` holds the pass's lane indices. What reads
             // the piece's request (its written spans, its page tables) needs
@@ -6738,6 +6754,8 @@ async fn fire_device_geometry<C: FireContext>(
             .collect(),
         carried: counted.carried,
         replayed,
+        scratch_compact: compact,
+        replay_rung: rung_model(&stores, rows),
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);

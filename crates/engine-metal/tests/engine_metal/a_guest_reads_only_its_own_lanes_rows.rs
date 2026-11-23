@@ -142,6 +142,7 @@ fn step(fixture: &Fixture, rows: u32) -> (Result<(), String>, engine::InstanceId
         shell.open(slot).expect("the slot opens");
         let logits = shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane {
                     slot,
@@ -160,6 +161,7 @@ fn step(fixture: &Fixture, rows: u32) -> (Result<(), String>, engine::InstanceId
     let plain = word(&fixture.trace, 1);
     let lanes: Vec<Seated<'_>> = (0..2u32)
         .map(|slot| Seated {
+            replay_stated: None,
             held: Some(PROMPT),
             ..Seated::of(Lane {
                 slot,
