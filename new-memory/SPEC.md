@@ -16,7 +16,7 @@ must need one poem line and no engine change.
    (~16MB), small on on-device Metal. C is a load-time constant for the engine.
 4. Slot shapes: **fixed** (GDN/mamba/conv state, VAE frame cache, engram/replay ids, snapshots), **list** (full-attention kv, compressed pools via `tokens // r`,
    drafter kv: T tokens x all rows, layer-major inside the slot). A sliding-window layer is **state + buffer**,
-   exactly like a recurrent layer (CONTRACT-BC 19): its last W folded rows (and S sink rows) are a ring in the
+   exactly like a recurrent layer (CONTRACT-BC 19): its last W folded rows are a ring in the
    lane's record, its unfolded rows sit in the window buffer, a list shape; no window lists.
    Fixed records larger than C split into equal pieces that never
    cross an op's atom (GDN/KDA/mamba: head axis; conv: channel; conv3d frame cache: frame-position axis 0;

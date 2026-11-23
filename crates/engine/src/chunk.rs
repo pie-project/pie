@@ -170,15 +170,16 @@ pub struct ChunkFacts {
 }
 
 /// One windowed layer's ring in a lane's recurrent-state record
-/// (CONTRACT-BC 19, 21): the layer's K and V of its `sinks` first rows
-/// (folded once, never dropped) and of the last `window` folded rows past
-/// them, row `r` at ring place `r mod window`. Record bytes: they copy,
+/// (CONTRACT-BC 19, 21): the layer's K and V of its last `window` folded
+/// rows, row `r` at ring place `r mod window`. Record bytes: they copy,
 /// park and restore with the record and are costed in the record's tier.
 /// The contract states only their bytes; how the rows lie inside them (a
 /// plane of their own or inside the state bytes, padded or not) is the
 /// engine's, and `window` need not be a page multiple. Attention over rows
 /// chosen by score (index-selected or compressed attention) is no window:
-/// it stays kv.
+/// it stays kv. Attention sinks that are learned logits (DeepSeek's,
+/// gpt-oss's: a weight in the softmax, no stored row) are untouched by the
+/// ring; a model with stored sink rows gets its field when one arrives.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowedLayer {
     /// The model's layer.
@@ -186,13 +187,9 @@ pub struct WindowedLayer {
     /// W: the rows the layer attends back over, its own row included; the
     /// rows the ring holds.
     pub window: u32,
-    /// S: the sink rows `[0, S)` the layer always reads beside its window
-    /// (a windowed sink attention's window part); 0 for a plain window.
-    #[serde(default)]
-    pub sinks: u32,
-    /// The ring's and sinks' bytes in the record: at least `window + sinks`
-    /// times the layer's K and V bytes of one row; an engine that pads them
-    /// (to a page multiple, say) states the padded bytes.
+    /// The ring's bytes in the record: at least `window` times the layer's
+    /// K and V bytes of one row; an engine that pads them (to a page
+    /// multiple, say) states the padded bytes.
     pub bytes: u64,
 }
 
@@ -1233,7 +1230,7 @@ mod tests {
     }
 
     /// `facts()` with a window buffer of 16 rows and two windowed layers
-    /// whose rings (one with 4 sinks) fill the record.
+    /// whose rings fill the record.
     fn windowed() -> ChunkFacts {
         let mut facts = facts();
         facts.shapes.push(SlotShape {
@@ -1254,14 +1251,12 @@ mod tests {
             WindowedLayer {
                 layer: 0,
                 window: 100,
-                sinks: 0,
                 bytes: 100 * 64,
             },
             WindowedLayer {
                 layer: 3,
-                window: 100,
-                sinks: 4,
-                bytes: 104 * 64,
+                window: 128,
+                bytes: 128 * 64,
             },
         ];
         facts.record_bytes = facts.ring_bytes();

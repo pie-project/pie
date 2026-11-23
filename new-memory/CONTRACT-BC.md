@@ -78,19 +78,20 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
 19. **A windowed layer is state + buffer, exactly like a recurrent layer (user ruling: "a window model has exactly
     the same mental model as a recurrent model. Use the buffer. The window holds only folded rows."; supersedes the
     trimmed window lists of the earlier 19 and the ring shapes, ring addressing and gcd form of 3, 4, 11, 12).**
-    Windowed layers are the sliding-window attention layers (Gemma, gpt-oss, and the window part of a windowed sink
-    attention). Attention over rows chosen by score (index-selected or compressed attention) is no window: it stays kv.
+    Windowed layers are the sliding-window attention layers (Gemma, gpt-oss, DeepSeek's window attention). Attention
+    over rows chosen by score (index-selected or compressed attention) is no window: it stays kv. Attention sinks
+    that are learned logits (DeepSeek's, gpt-oss's: a weight in the softmax, no stored row) are untouched by this
+    change; no field states sink rows, and a model with stored sink rows gets one when it arrives.
     - **State.** Per windowed layer the lane's record holds a ring of W rows (that layer's K and V) holding only
-      folded rows, row r at ring place `r mod W`, and, for a layer with S sink rows, those S rows beside it (folded
-      once, never dropped). The ring and sinks are record bytes: they copy, park and restore with the record as
-      opaque bytes and are costed in the record's tier. Their layout is the engine's (a plane of its own or inside
-      the state bytes); the contract states only the bytes per windowed layer, at least (W + S) times that layer's
-      K + V row bytes, padded as the engine pads them. W need not be a page multiple.
+      folded rows, row r at ring place `r mod W`. The rings are record bytes: they copy, park and restore with the
+      record as opaque bytes and are costed in the record's tier. Their layout is the engine's (a plane of its own
+      or inside the state bytes); the contract states only the bytes per windowed layer, at least W times that
+      layer's K + V row bytes, padded as the engine pads them. W need not be a page multiple.
     - **Buffer.** The windowed layers' K/V rows still unfolded after a fire live in window-buffer slots, a slot list
       like kv: taken on demand as rows accrue (no carried-rows bound; a fire too wide for the pool is cut like
       chunked prefill, never refused), named in the lane's tables in token order, every entry a real slot. Rows a
       fire itself folds take no buffer slot: their K/V live in the fire's own activation scratch while the fire
-      reads them, and only the ring (the last W, plus sinks) receives them at the fold. A fold frees every buffer
+      reads them, and only the ring (the last W) receives them at the fold. A fold frees every buffer
       slot whose rows are all folded. On a hybrid the rs rows keep their own buffer (18, 20); window K/V use this
       list.
     - **Fold.** The lane's folded index (`KvDelta.folded`, the one `RsVerb::Buffer.folded` states) is the only
@@ -100,8 +101,8 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       window read one field; until then the two are stated equal and validated so. Lanes sharing a folded window
       (a beam group: the shared common-ancestor lagged fold) fold once; 12 and 15 order a group's fold after every
       lane read.
-    - **Read.** Row p of a windowed layer reads keys `[0, S)` and `[max(S, p - W + 1), p]` (`[max(0, p - W + 1), p]`
-      for a plain window): those below folded from the ring and sinks, those in `[folded, p]` from the lane's
+    - **Read.** Row p of a windowed layer reads keys `[max(0, p - W + 1), p]`: those below folded from the ring,
+      those in `[folded, p]` from the lane's
       buffer rows in lineage order (the `buffered_reads` lineage the rs replay uses; a lane never reads a sibling's
       divergent rows) and its own rows. One mask; one softmax over the union.
     - **Sharing.** A record shared with a prefix-cache entry (or any other owner at a different fold point) is
@@ -127,19 +128,20 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     before any lane of the fire reads or writes (after earlier fires); no two copies share a dst; `pages` already
     names dst; `validate_chunks` checks them like table refs. A buffered write no longer forces record CoW. A model
     that buffers rs rows must state an rs-list shape.
-21. **Windowed-state fields (fills in 19).** `ChunkFacts.windowed: Vec<WindowedLayer { layer, window, sinks,
-    bytes }>` (serde default; layers ascending and distinct, `window > 0`, `bytes > 0`), the rings and sinks a
-    record holds; `ChunkFacts.record_bytes` counts them (validate refuses rings past it). The window buffer is
+21. **Windowed-state fields (fills in 19).** `ChunkFacts.windowed: Vec<WindowedLayer { layer, window, bytes }>`
+    (serde default; layers ascending and distinct, `window > 0`, `bytes > 0`), the rings a record holds;
+    `ChunkFacts.record_bytes` counts them (validate refuses rings past it). The window buffer is
     `SlotKind::List { tokens: T, rate: 1, window: None }` with `role: SlotRole::WindowBuffer`: a slot holds T
     unfolded rows of every windowed layer's K and V, layer-major as the engine lays it. `ChunkFacts::validate`
     refuses a window buffer of another kind, two window buffers, a window buffer with no windowed layer and windowed
     layers with none, and any window list beside windowed layers. A lane states `Lane.window: Option<WindowFold {
     base, fold, lineage }>` (serde default None), on every seated lane of such a load and on no other:
-    `base` is the row entry 0 of the lane's window-buffer table holds: the lane's folded index after the fire
-    (`kv.folded` plus a host-counted fold; `kv.folded` for a device-counted one), rounded down to T, and where the
-    lane carries rows earlier fires buffered (its first row past `kv.folded`) those keep their slots while the fire
-    reads and folds them, so `base` is `kv.folded` rounded down to T (validated: a multiple of T, at most the folded
-    index after the fire). A kv-less lane carries no attention rows and states no `window`. `fold` how
+    `base` is the row entry 0 of the lane's window-buffer table holds. A lane carrying rows earlier fires buffered
+    (its first row past `kv.folded`): `kv.folded`, the folded index before the fire, rounded down to T; those rows
+    stay named for this fire's reads and the fold frees their slots after. A lane carrying none: the folded index
+    after the fire (`kv.folded` plus a host-counted fold; `kv.folded` for a device-counted one), rounded down to T;
+    rows the fire computes and folds itself take no slot. Validated: a multiple of T, at most the folded index
+    after the fire, and at most `kv.folded` where the lane carries earlier-buffered rows (`kv.held > kv.folded`). A kv-less lane carries no attention rows and states no `window`. `fold` how
     far the fire advances folded (`FoldLen`, read as `RsVerb::Buffer`'s: a device-counted fold's count reaches the
     runtime when the fire settles, and the engine keeps the row its rings stand at with the record), `lineage`
     which buffered rows the windowed layers read. On a hybrid `RsVerb::Buffer` states the same folded, fold and
@@ -152,7 +154,7 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     engine without it is refused by name.
     **Recipe.** An engine stating `windowed_state` takes `poem_compiler::chunk::plan_windowed(trace, budgets,
     profile, &dyn RingLayout)` (`plan` keeps window lists for the others until the integration commit). The recipe
-    states the windowed layers (`WindowedRow { layer, rows, window, sinks, per_token }`, per_token the layer's K + V
+    states the windowed layers (`WindowedRow { layer, rows, window, per_token, shard }`, per_token the layer's K + V
     bytes of one row) and asks the engine's required hook `RingLayout::ring_region(layers, &WindowBufferSlot {
     tokens, bytes, rows })` for one ring region a record: `RingRegion { bytes, atom, placement, layer_bytes }`, cut
     only between atoms, `layer_bytes` the per-layer shares summing to `bytes` (what the engine states as
@@ -160,11 +162,15 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     of the record's first slot, the record's rows aligned to a) or `ChunkStart` (its own fixed shape of one slot a
     chunk, every piece starting at a chunk boundary; the record names the ring pieces first, its state pieces
     after). The layout inside the region is the engine's: an engine indexing per-layer rings takes
-    `plain_rings(layers, align)` (W + S rows a layer, one after another, the offsets stated); Metal answers pages
+    `plain_rings(layers, align)` (W rows a layer, one after another, the offsets stated); Metal answers pages
     laid like window-buffer slots on the slot grid, `(ceil(W/P) + 1)` pages of the buffer slot's bytes,
     `ChunkStart`. The window buffer is `ChunkRecipe.windowed.buffer` (a `SlotLayout::List { tokens: T, window: None
     }` of the kv page's T rows of every windowed layer, layer-major, each layer's runs in its rows); `recipe.list()`
-    never returns it, `recipe.fixed()` never returns the ring shape. A kv-only window model gets a record.
+    never returns it, `recipe.fixed()` never returns the ring shape. A kv-only window model gets a record. The
+    window buffer and a `ChunkStart` ring shape are weighed in the chunk-size pick like the other shapes (the
+    buffer at a fire's unfolded tail, as the rs list; the ring's whole-chunk pieces as a fixed record). Under
+    tensor parallelism each layer's ring share shrinks by the parts the ranks cut that layer's own rows into
+    (`WindowedRecipe::rank_layer_bytes(recipe, tp)`; `ChunkRecipe::per_rank` sizes the ring from it).
     **A ring at chunk starts in the facts and the record.** The ring is its own `SlotShape`: `SlotKind::Fixed {
     pieces }`, `slots_per_chunk = 1` (so every piece starts a chunk), `role: SlotRole::Ring`, stated before the
     record's state shapes (`ChunkFacts::validate` refuses another kind, more than one slot a chunk, a second ring
