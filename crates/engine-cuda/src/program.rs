@@ -302,6 +302,9 @@ pub struct Plane {
     score_bytes: u64,
     /// The pages and frames a beam group's state is laid for.
     beam_bounds: (u32, u32),
+    /// The widest beam group the device's step holds
+    /// (`kernels_cuda::runtime::channel::beam_max_lanes`).
+    beam_max_lanes: u32,
     /// Where each live instance's own state lies, by device address: a
     /// bind or a rebind over another's is refused by name before it writes
     /// ([`engine::guest_claims`]).
@@ -485,6 +488,7 @@ impl Plane {
             arenas: launch::Arenas::default(),
             score_bytes: 0,
             beam_bounds: (0, 1),
+            beam_max_lanes: u32::MAX,
             claims: Claims::default(),
         }
     }
@@ -503,8 +507,9 @@ impl Plane {
 
     /// The kv page a beam group's lists count in, and the frames its
     /// pending pages wait (the frames in flight): its depth is each bind's.
-    pub fn set_beam_bounds(&mut self, page: u32, frames: u32) {
+    pub fn set_beam_bounds(&mut self, page: u32, frames: u32, max_lanes: u32) {
         self.beam_bounds = (page.max(1), frames.max(1));
+        self.beam_max_lanes = max_lanes;
     }
 
     /// Where instance `id`'s beam group keeps its page lists now, and how it
@@ -581,6 +586,14 @@ impl Plane {
         // (BEAM-PAGE-LISTS §3, §4). A search past it faults SHORT by name.
         let beam = match program.beam_lanes() {
             Some(lanes) => {
+                if lanes > self.beam_max_lanes {
+                    return Err(Fault::Ceiling {
+                        what: "beams of one group, whose step lays its tables in one block's \
+                               shared memory",
+                        need: u64::from(lanes),
+                        have: u64::from(self.beam_max_lanes),
+                    });
+                }
                 let (page, frames) = self.beam_bounds;
                 if extents.key_len <= 1 {
                     return Err(Fault::program(
@@ -969,27 +982,31 @@ impl Plane {
             };
             let held = program.held(self.score_bytes, self.beam_bounds);
             let place = bound.slots.place(&held, span)?;
-            let room = program.bound_room(bound.session.extents())?;
-            let scratch = piece_at(&bound.slots.scratch, room.place_bytes(), span)?;
-            moved.push((
-                Holder::Instance(id.0),
-                own_runs(&held, &place, &bound.slots.scratch, scratch, room.place_bytes()),
-            ));
-        }
-        for program in self.programs.values() {
-            // A pair whose every member closed while a fire of it flew holds
-            // nothing any more.
-            for batch in program.batches.iter().filter(|batch| {
-                batch.bound > 0 && !self.claims.members(batch.claim).is_empty()
-            }) {
-                let base = piece_at(&batch.pair, batch.room.bytes(), span)?;
-                moved.push((Holder::Pair(batch.claim), vec![device_run(base, batch.room.bytes())]));
+            // A kept park's scratch went back with its park: nothing of it
+            // is repointed until its rebind names fresh room.
+            // Its place is its resident state (a beam group's), then its
+            // scratch: both repointed where the evacuation moved them.
+            let scratch = if bound.parked {
+                None
+            } else {
+                let room = program.bound_room(bound.session.extents())?;
+                let piece = piece_at(&bound.slots.scratch, room.place_bytes(), span)?;
+                Some((piece, room.place_bytes(), room.lay(piece)))
+            };
+            if !self.closing.contains(id) {
+                let runs = match scratch {
+                    Some((scratch, bytes, _)) => {
+                        own_runs(&held, &place, &bound.slots.scratch, scratch, bytes)
+                    }
+                    None => own_runs(&held, &place, &engine::ScratchPlace::None, 0, 0),
+                };
+                moved.push((Holder::Instance(id.0), runs));
             }
             let cells = bound.session.ring_cells(&place)?;
             instances.push(Rebased {
                 id: *id,
                 scores: held.score_at.map(|at| place.instance + at),
-                scratch: scratch.map(|(scratch, _)| scratch.next_multiple_of(launch::SPAN_ALIGN)),
+                laid: scratch.map(|(_, _, laid)| laid),
                 place,
                 cells,
             });
@@ -1000,26 +1017,17 @@ impl Plane {
             .filter(|bound| !bound.parked)
             .map(|bound| (bound.program_id, bound.session.extents()))
             .collect();
-        for bound in self.instances.values_mut().filter(|bound| !bound.parked) {
-            let Some(program) = self.programs.get(&bound.program_id) else {
-                continue;
-            };
-            let held = program.held(self.score_bytes, self.beam_bounds);
-            let place = bound.slots.place(&held, span)?;
-            bound.scores = held.score_at.map(|at| place.instance + at);
-            bound.session.rebase(&place)?;
-            let room = program.bound_room(bound.session.extents())?;
-            (bound.resident, bound.scratch) =
-                room.lay(piece_at(&bound.slots.scratch, room.place_bytes(), span)?);
-        }
-        for (program_id, program) in &mut self.programs {
-            for batch in program.batches.iter_mut().filter(|batch| {
-                batch.bound > 0 && live.contains(&(*program_id, batch.extents))
-            }) {
-                let base = piece_at(&batch.pair, batch.room.bytes(), span)?;
-                if base != batch.base {
-                    batch.base = base;
-                    batch.stale = true;
+        // Every bound pair's base where the evacuation left its runs, its
+        // members parked or not: a member that binds or comes back at the
+        // same taking finds its tables laid where its runs lie now, never at
+        // bytes the move handed on. A pair none live holds may lie in slots
+        // given back; where they no longer resolve, it is laid again at the
+        // next bind that names them.
+        let mut batches = Vec::new();
+        for (program_id, program) in &self.programs {
+            for (at, batch) in program.batches.iter().enumerate() {
+                if batch.bound == 0 {
+                    continue;
                 }
                 // A pair whose every member closed while a fire of it flew
                 // holds nothing any more.
@@ -1068,7 +1076,8 @@ impl Plane {
             };
             bound.scores = planned.scores;
             bound.session.rebase_to(&planned.place, planned.cells);
-            if let Some(scratch) = planned.scratch {
+            if let Some((resident, scratch)) = planned.laid {
+                bound.resident = resident;
                 bound.scratch = scratch;
             }
         }
@@ -1170,6 +1179,20 @@ if engine::guest_claims::saying() {
         // taking, and never moved by this member alone while another is
         // bound on it. One closed while a fire of it flies holds nothing.
         let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.place_bytes());
+        if engine::guest_claims::saying() {
+            engine::guest_claims::say(
+                "cuda: rebind claims",
+                format_args!(
+                    "instance={} was_parked={} was_kept={} closing={} instance_refs={:?} pair_generation={}",
+                    id.0,
+                    bound.parked,
+                    bound.kept,
+                    self.closing.contains(&id),
+                    slots.instance,
+                    slots.pair_generation,
+                ),
+            );
+        }
         let fresh_pair = if self.closing.contains(&id) {
             false
         } else if slots.pair == engine::ScratchPlace::None {
@@ -1879,8 +1902,9 @@ struct Rebased {
     place: launch::Place,
     cells: Vec<u64>,
     scores: Option<u64>,
-    /// `None` for a kept park: its scratch went back with its park.
-    scratch: Option<u64>,
+    /// Where its resident state and its scratch lie ([`PairRoom::lay`]):
+    /// `None` for a kept park, its place gone back with its park.
+    laid: Option<(u64, u64)>,
 }
 
 /// The address of a guest item of the stated bytes, where it lies now
