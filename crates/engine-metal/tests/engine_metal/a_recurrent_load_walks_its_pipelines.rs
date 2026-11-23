@@ -123,7 +123,21 @@ fn every_form_a_recurrent_load_serves_is_built_by_its_walk() {
     let fixture = fixture_of("qwen35-tiny", None);
     let mut shell = load(&fixture);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
+    // Every fixed pipeline (a fire names it by its lanes' shape, no rung
+    // keys it) is built at load: `rs_copy_words4`, four row copies side by
+    // side, was refused at a beam's first replay on Qwen3.5 before.
+    let built = shell.pipeline_keys();
+    for fire in kernels_metal::runtime::fixed_pipelines(true) {
+        assert!(
+            built
+                .iter()
+                .any(|(file, entry, _, _)| file == fire.file && entry == fire.entrypoint),
+            "`{}` of {} is not built at load",
+            fire.entrypoint,
+            fire.file
+        );
+    }
     let end = shell
         .pool_layout()
         .shapes()

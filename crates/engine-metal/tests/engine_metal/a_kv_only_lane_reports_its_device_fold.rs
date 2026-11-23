@@ -240,6 +240,7 @@ fn a_kv_only_lane_reports_its_device_fold() {
         engine::StepOutcome {
             wrote: writes,
             faulted,
+            ..
         } if faulted.is_empty() && !writes.is_empty() => {
             assert_eq!(writes.len(), 1, "one reporting lane");
             assert_eq!(writes[0].tag, 7);
@@ -251,6 +252,7 @@ fn a_kv_only_lane_reports_its_device_fold() {
         engine::StepOutcome {
             wrote: writes,
             faulted,
+            ..
         } if faulted.is_empty() && !writes.is_empty() => {
             assert_eq!(writes.len(), 1, "one reporting lane");
             assert_eq!(writes[0].fold, None, "no `fold` port, no fold told");

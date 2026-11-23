@@ -171,7 +171,89 @@ impl Run<'_> {
                         Some(_) => self.tensor(ba),
                         None => self.rs_extend(OP, &seat, ba)?,
                     };
-                    return ssm::gated_delta_verify(
+                    // The corrected planes (keys, u) each own row lands:
+                    // through the page table, or into the planes' scratch at
+                    // its own row and scattered into the buffer after.
+                    let in_of = |id: poem_ir::ValueId| seat.layout.in_of.get(&id.0).copied();
+                    let planes = in_of(*qkv).zip(in_of(*y)).zip(in_of(*gates));
+                    let corrected = match (planes, paged) {
+                        (None, _) => None,
+                        (Some(_), Some(_)) => seat
+                            .paged(self.handles(), *qkv)
+                            .zip(seat.paged(self.handles(), *y))
+                            .zip(seat.paged(self.handles(), *gates))
+                            .map(|((keys, u), scalars)| ssm::Corrected {
+                                keys: keys.slab,
+                                key_row_bytes: keys.row_bytes,
+                                u: u.slab,
+                                u_row_bytes: u.row_bytes,
+                                scalars: scalars.slab,
+                                scalars_row_bytes: scalars.row_bytes,
+                            }),
+                        (Some(((kp, up), sp)), None) => Some(ssm::Corrected {
+                            keys: seat.ext_in[kp],
+                            key_row_bytes: plane_row_bytes(&seat, kp, OP)?,
+                            u: seat.ext_in[up],
+                            u_row_bytes: plane_row_bytes(&seat, up, OP)?,
+                            scalars: seat.ext_in[sp],
+                            scalars_row_bytes: plane_row_bytes(&seat, sp, OP)?,
+                        }),
+                    };
+                    // The beam groups' folds first (BEAM-PAGE-LISTS §11.3):
+                    // each group's state takes the rows its beams share
+                    // before any of its lanes reads it.
+                    if let Some(folds) = seat.folds {
+                        let (Some(ba_paged), Some(corrected)) = (paged, corrected) else {
+                            return Err(kernels_metal::Error::Backend {
+                                op: OP,
+                                detail: "a beam group folds its shared rows before the step, and \
+                                      the scan reads its rows through no page table and \
+                                      corrected planes: a group fold reads them there"
+                                    .to_string(),
+                            });
+                        };
+                        ssm::gated_delta_group_fold(
+                            self.ctx(),
+                            folds,
+                            self.window_lanes(),
+                            self.rs_committed(&seat, *state).slots,
+                            (a_log, dt_bias),
+                            ba_paged,
+                            corrected,
+                            &self.recurrent(*state),
+                            (*k_heads, *v_heads, *k_dim, *v_dim),
+                        )?;
+                    }
+                    // A decode window (a row of its own every lane, few
+                    // carried) reads its carried rows as a linear attention.
+                    if let (Some(ba_paged), Some(corrected)) = (paged, corrected)
+                        && self.rs_snapshots(*state).is_none()
+                        && self.carried_window(&seat)
+                    {
+                        return ssm::gated_delta_carried(
+                            self.ctx(),
+                            ext_qkv,
+                            self.qo_indptr(),
+                            &self.rs_committed(&seat, *state),
+                            &ssm::VerifyGates {
+                                ba,
+                                dt_bias,
+                                a_log,
+                                gates: self.tensor(*gates),
+                            },
+                            ba_paged,
+                            corrected,
+                            &self.recurrent(*state),
+                            *k_heads,
+                            *v_heads,
+                            *k_dim,
+                            *v_dim,
+                            self.tensor(*y),
+                            self.dots_table(&seat, *k_heads)?,
+                        );
+                    }
+                    let scattered = planes.filter(|_| paged.is_none());
+                    let landed = ssm::gated_delta_verify(
                         self.ctx(),
                         ext_qkv,
                         self.qo_indptr(),
@@ -183,6 +265,7 @@ impl Run<'_> {
                             gates: self.tensor(*gates),
                         },
                         paged,
+                        corrected,
                         &self.recurrent(*state),
                         *k_heads,
                         *v_heads,
@@ -191,6 +274,41 @@ impl Run<'_> {
                         self.tensor(*y),
                         self.rs_snapshots(*state),
                     );
+                    if let (Ok(()), Some(((kp, up), sp))) = (&landed, scattered) {
+                        self.rs_scatter(OP, &seat, kp, seat.ext_in[kp])?;
+                        self.rs_scatter(OP, &seat, up, seat.ext_in[up])?;
+                        self.rs_scatter(OP, &seat, sp, seat.ext_in[sp])?;
+                    }
+                    landed?;
+                    // A compact fire's decode lanes beside wider ones read
+                    // their carried rows from their buffers as a decode
+                    // window's do (the verify scan passed them over).
+                    if let (Some(ba_paged), Some(corrected)) = (paged, corrected)
+                        && self.window_has_compact_decode(&seat)
+                    {
+                        ssm::gated_delta_carried(
+                            self.ctx(),
+                            ext_qkv,
+                            self.qo_indptr(),
+                            &self.rs_committed(&seat, *state),
+                            &ssm::VerifyGates {
+                                ba,
+                                dt_bias,
+                                a_log,
+                                gates: self.tensor(*gates),
+                            },
+                            ba_paged,
+                            corrected,
+                            &self.recurrent(*state),
+                            *k_heads,
+                            *v_heads,
+                            *k_dim,
+                            *v_dim,
+                            self.tensor(*y),
+                            self.dots_table(&seat, *k_heads)?,
+                        )?;
+                    }
+                    return Ok(());
                 }
                 // Heads the verify scan does not stage take the gate prep
                 // the verify scan would have folded in.
@@ -462,5 +580,82 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
         }
+    }
+}
+
+/// A buffered plane's bytes a token, as the kernels take it.
+fn plane_row_bytes(
+    seat: &crate::rs::Seat,
+    plane: usize,
+    op: &'static str,
+) -> Result<u32, kernels_metal::Error> {
+    u32::try_from(seat.layout.planes[plane].row_bytes).map_err(|_| kernels_metal::Error::Backend {
+        op,
+        detail: "a buffered plane's row is past a u32 of bytes".to_string(),
+    })
+}
+
+impl crate::run::Run<'_> {
+    /// Whether this window's lanes each run one row of their own over their
+    /// carried rows (any number of them): a decode step the carried scan
+    /// serves.
+    /// The per-head table a carried window's scan reads (`ssm::DotsTable`),
+    /// in the seat's work area (the verify path's, unused by the carried
+    /// scan): refused by name where the window's lanes carry more rows than
+    /// it holds for each lane and key head.
+    pub(crate) fn dots_table(&self, seat: &crate::rs::Seat, k_heads: u32) -> Result<ssm::DotsTable, kernels_metal::Error> {
+        let lane0 = self.window().span.lane_offset as usize;
+        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        let max_rep = seat
+            .lanes
+            .iter()
+            .skip(lane0)
+            .take(lanes)
+            .map(|plan| plan.replay)
+            .max()
+            .unwrap_or(0);
+        // The table holds as many rows as the seat's work area gives a lane
+        // and key head; a lane carrying more (a beam whose lineages stay
+        // apart, a long run-ahead) is served all the same: the scan makes
+        // each chunk's reductions itself (`ssm::DotsTable::fits`).
+        let rows = u32::try_from(seat.layout.work_elems * 4 / 16 / u64::from(k_heads.max(1)))
+            .unwrap_or(u32::MAX);
+        Ok(ssm::DotsTable {
+            table: seat.work,
+            rows,
+            max_rep,
+        })
+    }
+
+    /// Whether a lane of this window takes fewer extended rows than it
+    /// carries: a compact fire's decode lane, which the carried scan reads.
+    pub(crate) fn window_has_compact_decode(&self, seat: &crate::rs::Seat) -> bool {
+        let (lane0, lanes) = self.window_lanes();
+        (lane0..lane0.saturating_add(lanes)).any(|lane| {
+            let lane = lane as usize;
+            match (seat.ext_replay.get(lane), seat.lanes.get(lane)) {
+                (Some(&ext), Some(plan)) => ext < plan.replay,
+                _ => false,
+            }
+        })
+    }
+
+    /// This window's first lane and its lane count: the lanes its
+    /// recurrent ops run.
+    pub(crate) fn window_lanes(&self) -> (u32, u32) {
+        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        (
+            self.window().span.lane_offset,
+            u32::try_from(lanes).unwrap_or(u32::MAX),
+        )
+    }
+
+    pub(crate) fn carried_window(&self, seat: &crate::rs::Seat) -> bool {
+        let indptr = self.qo_indptr_host();
+        let lane0 = self.window().span.lane_offset as usize;
+        indptr
+            .windows(2)
+            .enumerate()
+            .all(|(r, pair)| pair[1] - pair[0] == 1 && seat.lanes.get(lane0 + r).is_some())
     }
 }
