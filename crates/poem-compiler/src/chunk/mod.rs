@@ -908,7 +908,13 @@ fn plan_with(
     let device = profile.chunk;
     let align = device.align();
     let (lo, hi) = device.range();
-    let census = census::census(trace, device.state_f32, device.rs_mamba2, device.rs_corrected)?;
+    let census = census::census(
+        trace,
+        device.state_f32,
+        device.rs_mamba2,
+        device.rs_corrected,
+        device.rs_scalars,
+    )?;
     let weight_groups = weights::census(trace, budgets.tokens.max_tokens, device.tma_rows);
     // Where experts are not cut, no chunk is smaller than one.
     let expert = weight_groups

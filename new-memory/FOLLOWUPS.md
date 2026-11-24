@@ -1603,3 +1603,9 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 **Idea.** Exact lane counts for small prompt counts (fewer padding lanes in the scan) traded against program count, or a chunked scan whose cost follows the live lanes (padding lanes skipped as data).
 
 **Why later.** A perf opportunity against the program count; the boot-time work keeps today's rungs.
+
+## F??. Gated-delta per-head scalars in the rs row
+
+**What.** The corrected planes of a gated-delta row may keep its per-head scalars (`poem_compiler::rs::gdn_scalars_bytes`: each value head's log-gate, then its key norm's inverse, f32), as `ChunkProfile::rs_scalars` states. Metal's decode reads them. CUDA's kernels recompute them from the row's `[b | a]` and keys, so CUDA's profile lays none (the cleanup dropped `Corrected::scalars`). engine-gpu's profile still lays the plane and, by its own `rs::Plane::Scalars` doc, neither writes nor reads it.
+
+**Why later.** engine-gpu is GPU's to flip (`rs_scalars: false` in `chunks::profile`). On CUDA, lay them again (`rs_scalars: true` and a plane in `store::rs`) only if a decode kernel comes to read them in place of recomputing.
