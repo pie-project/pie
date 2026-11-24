@@ -282,6 +282,10 @@ describe('final rows', () => {
     lagged.attachProgram();
     expect(stub(lagged).finalStated).toBe(0);
     expect(() => lagged.retractable()).toThrow(/already attached/);
+
+    const beam = pass();
+    stub(beam).finalRefusal = 'a beam';
+    expect(() => beam.attachProgram()).toThrow(/final-rows: a beam .*ForwardPass\.retractable\(\)/);
   });
 
   it('retracts past a run-ahead break only for a retractable pass', () => {

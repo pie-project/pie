@@ -436,6 +436,11 @@ class TestFinalRows:
         with pytest.raises(InferletError, match="already attached"):
             lagged.retractable()
 
+        beam = self._pass()
+        beam.wit.final_refusal = "a beam"
+        with pytest.raises(InferletError, match=r"final-rows: a beam .*ForwardPass\.retractable\(\)"):
+            beam.attach_program()
+
     def test_run_ahead_retracts_only_a_retractable_pass(self):
         import asyncio
 
