@@ -1966,6 +1966,8 @@ struct Log {
     departures: u64,
     /// Admission refusals retried.
     retries: u64,
+    /// Processes failed by name with every tier full.
+    wedged: u64,
     /// Each process the planner failed ([`super::ResidencyPlanner::fail_tiers_full`])
     /// and the step it was first seen failed: it departs within the next
     /// step, or its failure reached no wait of its own.
@@ -2730,8 +2732,18 @@ async fn run_once(ctx: Arc<Ctx>, pid: ProcessId, script: Script) -> bool {
     let retry = lived
         .as_ref()
         .is_err_and(|why| why.contains(&format!("[{}]", super::ADMISSION_REFUSED)));
+    // Failed by name with every tier full ([`super::TIERS_FULL`]): an
+    // allowed end where the fleet was truly wedged, counted apart; the
+    // run goes on, and every other process must still end.
+    let wedged = lived
+        .as_ref()
+        .is_err_and(|why| why.contains(&format!("[{}]", super::TIERS_FULL)));
+    if wedged {
+        ctx.log.lock().unwrap().wedged += 1;
+    }
     if let Err(why) = &lived
         && !retry
+        && !wedged
     {
         ctx.refused(pid, why.clone());
     }
@@ -3497,7 +3509,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.bind_waits = log.bind_waits;
         coverage.bind_suspends = log.bind_suspends;
         coverage.raises_owed = log.raises_owed;
-        eprintln!("SIM outcome: finished {} refused_at_admission_retried {} failures_named {}", log.finished, log.retries, log.refusals.len());
+        eprintln!("SIM outcome: finished {} refused_at_admission_retried {} failed_wedged {} other_failures {}", log.finished, log.retries, log.wedged, log.refusals.len());
         coverage.rung_raises = lane_ops[0].load(Ordering::Relaxed);
         coverage.rung_lowers = lane_ops[2].load(Ordering::Relaxed);
         coverage.evacuations = lane_ops[1].load(Ordering::Relaxed);

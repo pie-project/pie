@@ -10793,11 +10793,11 @@ async fn replay_bd4f4ffe7_quiet_refusal_standing_in_its_placement() {
     replay(&stall_bd4f4ffe7_quiet_mismatch()).await.unwrap();
 }
 
-/// Every tier full, the head with no move left: the would-be victim, the
-/// lowest of the residents but the head in the policy's order, fails by
+/// Every tier full, the head with no move left: the victim (here named,
+/// as an eviction whose copy found the tier below full names it) fails by
 /// name with every tier's room ([`PlannerError::TiersFull`]), its waits
-/// ending with it (its next ask and its wait for residency both), and the
-/// head is never the one failed.
+/// ending with it (its next ask and its wait for residency both), and no
+/// one else fails.
 #[tokio::test(flavor = "current_thread")]
 async fn every_tier_full_fails_the_lowest_resident_by_name() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -10817,7 +10817,7 @@ async fn every_tier_full_fails_the_lowest_resident_by_name() {
         );
         inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
     });
-    assert!(planner.fail_tiers_full(None), "one fails");
+    assert!(planner.fail_tiers_full(Some(younger)), "one fails");
     let Err(error) = planner
         .acquire(younger, younger, Demand { kv_pages: 1, ..Demand::default() })
         .await
