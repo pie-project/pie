@@ -149,6 +149,43 @@ pub(super) struct CapacityGate {
     /// largest raises the margin by its pages, any other's by no more
     /// than it takes the second past the largest.
     pub(super) unit: (u64, Option<ProcessId>, u64),
+    /// The whole chunks the finisher's chunk-granular need leaves to
+    /// others' asks ([`ChunkSpare`]); `None` where it needs none.
+    pub(super) chunks: Option<ChunkSpare>,
+}
+
+/// The finisher's need in whole device chunks (a bind's room, or the bind
+/// its restore carries) weighed in chunks, not pages: free pages scattered
+/// over partly used chunks on every tier make no run, and counted as pages
+/// they let others' asks take the chunks and the room below the finisher's
+/// bind needed (the wide shape's seed 729: 128 pages free over the tiers,
+/// one whole chunk free on the device, fifteen slots below, the finisher's
+/// bind of four chunks never served).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ChunkSpare {
+    /// The whole chunks past the finisher's need that can stand: wholly
+    /// free device chunks, and chunks the moves of others' state empty
+    /// within the room below for those moves
+    /// ([`super::ResidencyPlanner::chunk_spare`]).
+    pub(super) spare: u32,
+    /// Kv pages a chunk holds.
+    pub(super) per_chunk: u32,
+    /// Free kv slots in the chunks the kv list has open: an allocation
+    /// takes these before it opens a chunk.
+    pub(super) list_free: u64,
+    /// Kv pages asks took since the read.
+    pub(super) kv_used: u64,
+    /// Whole chunks binds took since the read.
+    pub(super) whole_used: u32,
+}
+
+impl ChunkSpare {
+    /// The whole chunks taken once `kv` more kv pages and `whole` more
+    /// whole chunks are taken.
+    fn taken(&self, kv: u64, whole: u32) -> u64 {
+        let pages = (self.kv_used + kv).saturating_sub(self.list_free);
+        pages.div_ceil(u64::from(self.per_chunk.max(1))) + u64::from(self.whole_used + whole)
+    }
 }
 
 /// What the capacity gate is read from, in kv pages
@@ -251,6 +288,7 @@ impl CapacityRead {
             free,
             unit: self.unit,
             used: 0,
+            chunks: None,
         }
     }
 
@@ -270,9 +308,40 @@ impl CapacityRead {
 }
 
 impl CapacityGate {
-    /// Whether an allocation of `pages` for `pid` waits on the gate.
-    pub(super) fn holds(&self, pid: ProcessId, pages: u32, place: Option<u64>) -> bool {
-        pid != self.finisher && pages > 0 && self.cost(pid, pages) > self.allowance(place)
+    /// Whether an ask of `pages` for `pid` waits on the gate: kv pages, or
+    /// (`whole`) whole chunks of fresh state, a bind's.
+    pub(super) fn holds(&self, pid: ProcessId, pages: u32, place: Option<u64>, whole: bool) -> bool {
+        pid != self.finisher
+            && pages > 0
+            && (self.cost(pid, pages) > self.allowance(place) || self.holds_chunks(pages, whole))
+    }
+
+    /// Whether the ask leaves the finisher's whole chunks short
+    /// ([`ChunkSpare`]).
+    fn holds_chunks(&self, pages: u32, whole: bool) -> bool {
+        self.chunks.is_some_and(|chunks| {
+            let (kv, runs) = if whole {
+                (0, pages.div_ceil(chunks.per_chunk.max(1)))
+            } else {
+                (u64::from(pages), 0)
+            };
+            chunks.taken(kv, runs) > u64::from(chunks.spare)
+        })
+    }
+
+    /// Takes an ask of `pages` (`whole`: whole chunks) out of the spare.
+    pub(super) fn take(&mut self, pid: ProcessId, pages: u32, whole: bool) {
+        if pid == self.finisher {
+            return;
+        }
+        self.used = self.used.saturating_add(self.cost(pid, pages));
+        if let Some(chunks) = &mut self.chunks {
+            if whole {
+                chunks.whole_used += pages.div_ceil(chunks.per_chunk.max(1));
+            } else {
+                chunks.kv_used += u64::from(pages);
+            }
+        }
     }
 
     /// What an ask may take at `place` in the order (its allowance as read,
@@ -295,18 +364,24 @@ impl CapacityGate {
         pages + raised
     }
 
-    /// Whether `waiter` waits on the gate: an allocation's pages, or a
-    /// bind's room (its guest state's fresh chunks), new state either way;
-    /// a restore brings back what is held already, and a rung raise moves
-    /// the requester's own.
-    pub(super) fn holds_waiter(&self, waiter: &Waiter, place: Option<u64>) -> bool {
+    /// Whether `waiter` waits on the gate: an allocation's pages, a bind's
+    /// room (its guest state's fresh chunks), or the room of the bind a
+    /// restore carries (`bind`, the bind that suspended its process: laid
+    /// with the restore, [`super::proc::Proc::bind_room`]), new state each;
+    /// a restore otherwise brings back what is held already, and a rung
+    /// raise moves the requester's own. Ungated, a restore laid its bind's
+    /// fresh chunk past the finisher's headroom (the simulation's Metal
+    /// seed 44: a chunk taken with nothing spare, the finisher 14 pages
+    /// short of its end).
+    pub(super) fn holds_waiter(&self, waiter: &Waiter, place: Option<u64>, bind: u32) -> bool {
         match waiter.kind {
             WaitKind::Allocation { rise: false, .. } => {
-                self.holds(waiter.pid, waiter.kv_need(), place)
+                self.holds(waiter.pid, waiter.kv_need(), place, false)
             }
             WaitKind::BindRoom { rise: None, .. } => {
-                self.holds(waiter.pid, waiter.room_pages(), place)
+                self.holds(waiter.pid, waiter.room_pages(), place, true)
             }
+            WaitKind::Restore { .. } => self.holds(waiter.pid, bind, place, true),
             _ => false,
         }
     }
@@ -739,9 +814,7 @@ impl Inner {
             }
             // An allocation past what every tier keeps for the finisher
             // waits on the gate: no head ([`CapacityGate`]).
-            if self.capacity.is_some_and(|gate| {
-                gate.holds_waiter(waiter, self.capacity_allow.get(&waiter.pid).copied())
-            }) {
+            if self.gate_holds_waiter(waiter) {
                 continue;
             }
             match &waiter.kind {
@@ -833,6 +906,11 @@ impl Inner {
                     };
                     key = up;
                 }
+                // Not gated here: this is the one that goes when every
+                // waiter is held and nothing is in flight. Held at the gate
+                // too, nothing went, and the finisher's bind waited on moves
+                // no pass made (the wide shape's seeds 7, 104 and 184 among
+                // eleven: liveness at the bind).
                 key
             }
         };
@@ -923,12 +1001,37 @@ impl Inner {
     /// the moves around it kept something in flight for good (the field
     /// mix, seed 178: the finisher's bind of two adjacent chunks unserved
     /// 2,400 steps, one move away).
+    /// The pages of the bind `waiter`'s restore lays (the bind that
+    /// suspended its process): new state the gate weighs. 0 for any other
+    /// wait.
+    pub(super) fn restore_bind_pages(&self, waiter: &Waiter) -> u32 {
+        match waiter.kind {
+            WaitKind::Restore { .. } => self
+                .procs
+                .get(&waiter.pid)
+                .and_then(|proc| proc.bind_room)
+                .map_or(0, |bind| bind.pages),
+            _ => 0,
+        }
+    }
+
+    /// Whether the capacity gate holds `waiter` ([`CapacityGate::holds_waiter`]).
+    pub(super) fn gate_holds_waiter(&self, waiter: &Waiter) -> bool {
+        self.capacity.is_some_and(|gate| {
+            gate.holds_waiter(
+                waiter,
+                self.capacity_allow.get(&waiter.pid).copied(),
+                self.restore_bind_pages(waiter),
+            )
+        })
+    }
+
     pub(super) fn gate_holds(&self, pid: ProcessId) -> bool {
         self.capacity.is_some_and(|gate| {
             let place = self.capacity_allow.get(&pid).copied();
             self.queue
                 .values()
-                .any(|waiter| waiter.pid == pid && waiter.is_unmet() && gate.holds_waiter(waiter, place))
+                .any(|waiter| waiter.pid == pid && waiter.is_unmet() && gate.holds_waiter(waiter, place, self.restore_bind_pages(waiter)))
         })
     }
 
@@ -1060,7 +1163,7 @@ impl Inner {
             capacity_allow,
             ..
         } = self;
-        let mut used = capacity.map(|gate| gate.used);
+        let mut used = *capacity;
         for (&key, waiter) in queue.range_mut(head..) {
             if !waiter.is_unmet() {
                 continue;
@@ -1068,16 +1171,13 @@ impl Inner {
             // Past the finisher's headroom: it waits on the gate.
             let pid = waiter.pid;
             let pages = waiter.kv_need();
-            if let (Some(gate), Some(used)) = (capacity.as_ref(), used.as_mut())
+            if let Some(used) = used.as_mut()
                 && matches!(waiter.kind, WaitKind::Allocation { rise: false, .. })
             {
-                let gate = CapacityGate { used: *used, ..*gate };
-                if gate.holds(pid, pages, capacity_allow.get(&pid).copied()) {
+                if used.holds(pid, pages, capacity_allow.get(&pid).copied(), false) {
                     continue;
                 }
-                if pid != gate.finisher {
-                    *used = used.saturating_add(gate.cost(pid, pages));
-                }
+                used.take(pid, pages, false);
             }
             let waited = waiter.since.elapsed();
             let (lacked, wanted) = (waiter.lacked, waiter.wanted);
