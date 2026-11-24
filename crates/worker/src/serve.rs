@@ -235,8 +235,8 @@ async fn boot_decode(
     Ok((model, booted, kv_agent))
 }
 
-/// Serves other workers' passes, and dials the peers this worker's passes
-/// may be prefilled on, retrying until one takes them.
+/// Serves other workers' passes. The workers this one's passes go to are
+/// the cluster's to name (`placement/helpers`).
 async fn start_peers(user_cfg: &config::Config) -> Result<Option<kv::KvAgent>> {
     let engine = engine_of(user_cfg);
     // Its kv agent first: the hello says whether peers can read it in place.
@@ -264,24 +264,6 @@ async fn start_peers(user_cfg: &config::Config) -> Result<Option<kv::KvAgent>> {
         peer::set_link(listen.clone());
     }
     peer::clients();
-    if !user_cfg.offload.pools.is_empty() {
-        tokio::spawn(peer::push_to_pools(user_cfg.offload.pools.clone()));
-    }
-    let peers = user_cfg.offload.peers.clone();
-    let listen = peer::listen();
-    if !peers.is_empty() {
-        tokio::spawn(async move {
-            loop {
-                for addr in &peers {
-                    match peer::dial(addr, &hello, listen.clone()).await {
-                        Ok(()) => return,
-                        Err(error) => tracing::debug!(peer = %addr, %error, "peer not taken"),
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        });
-    }
     Ok(kv_agent)
 }
 

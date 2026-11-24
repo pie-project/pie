@@ -69,9 +69,9 @@ fn runtime_config(
     model: runtime::bootstrap::ModelConfig,
 ) -> Result<runtime::bootstrap::Config> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = match user.runtime.worker_policy.as_deref() {
-        Some(spec) => Some((spec.to_string(), builtins::policy_component(spec)?)),
-        None => None,
+    let policy = {
+        let spec = &user.runtime.worker_policy;
+        Some((spec.clone(), builtins::policy_component(spec)?))
     };
     // The browser runs no policy.
     #[cfg(target_arch = "wasm32")]

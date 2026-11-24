@@ -827,15 +827,15 @@ mod tests {
     /// A gateway, its policies `names` running in a controller beside it,
     /// once the gateway has heard they run.
     async fn rig_of(kv: u8, names: &[&str]) -> Rig {
+        rig_with(kv, names, DirectoryView::default()).await
+    }
+
+    /// As [`rig_of`], the directory reading `directory`.
+    async fn rig_with(kv: u8, names: &[&str], directory: DirectoryView) -> Rig {
         let (table, table_rx) = watch::channel(table(kv));
         let (connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
-        let host = Host::start(
-            programs(names),
-            table_rx,
-            watch::channel(DirectoryView::default()).1,
-        )
-        .unwrap();
+        let host = Host::start(programs(names), table_rx, watch::channel(directory).1).unwrap();
         let (me, me_rx) = watch::channel(Some(GatewayId(0)));
         let (router, cancelled, moves) = Cluster::start(
             HostControl(host.clone()),
@@ -879,6 +879,33 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// `default-cluster` names every worker that serves others' passes
+    /// (`pie/prefill-listen`) a helper of every process, and places none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_default_cluster_policy_names_the_listening_workers_helpers() {
+        let directory = DirectoryView {
+            links: vec![(WorkerId(1), "10.0.0.1:7100".into())],
+            ..DirectoryView::default()
+        };
+        let rig = rig_with(0, &["default-cluster"], directory).await;
+        let req = launch(1, serde_json::json!({}));
+        rig.router.admit(&req, &rig.routing).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while rig.router.placement(&req).2 != [WorkerId(1)] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helpers {:?}",
+                rig.router.placement(&req).2
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            placed_on(&rig, &req),
+            None,
+            "the router's own order places it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1335,7 +1362,10 @@ mod tests {
     async fn with_no_policy_running_the_gateway_goes_by_its_defaults() {
         let (_table, table_rx) = watch::channel(table(0));
         let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));
-        let controller = controller::embed(controller::Config::default());
+        let controller = controller::embed(controller::Config {
+            cluster_policies: Vec::new(),
+            ..controller::Config::default()
+        });
         let (_me, me_rx) = watch::channel(Some(GatewayId(0)));
         #[derive(Clone)]
         struct Idle(controller::Handle);

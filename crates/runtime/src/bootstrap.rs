@@ -105,6 +105,8 @@ pub struct Config {
     pub model: ModelConfig,
     pub skip_tracing: bool,
     pub max_concurrent_processes: Option<usize>,
+    /// The worker policy (name, component). Every native worker runs one
+    /// (`noop` writes no rows); the browser runs none.
     pub policy: Option<(String, Cow<'static, [u8]>)>,
 }
 
@@ -925,12 +927,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some((name, component)) = &config.policy {
+    {
+        let (name, component) = config
+            .policy
+            .as_ref()
+            .context("a worker names its policy (`noop` writes no rows)")?;
         crate::policy::start(name, component).with_context(|| format!("worker policy {name}"))?;
-    } else {
-        // No policy: the thread still keeps its record, and the default
-        // responder answers tier pressure.
-        crate::policy::start_default().context("the default worker policy thread")?;
     }
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()
