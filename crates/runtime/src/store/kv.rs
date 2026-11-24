@@ -1085,24 +1085,18 @@ impl KvStore {
         freed
     }
 
-    /// Frees `short` device pages of idle cache, and no more than the last
-    /// group it reaches holds: only what no live working set reads, lowest
-    /// key first, then least recently used. The runtime runs it once a
+    /// Frees `short` device pages of idle cache and no more (policy-out
+    /// A18: exactly what is short): only what no live working set reads,
+    /// lowest key first, then least recently used, a set at a time (the
+    /// entries that hold one set's pages go together, oldest set first),
+    /// stopping once what is short is freed. The runtime runs it once a
     /// demote had nothing to move (`prepare_demote` goes first where the
     /// planner demotes): what may sit on a lower tier with room moved there,
     /// so what is left has none, and cached KV yields to running work,
     /// whatever its key. Pages the disk tier keeps a copy of settle there
     /// instead, at no cost, and their entries stay.
     pub fn reclaim_cache(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, short, keys, false)
-    }
-
-    /// [`Self::reclaim_cache`] for what is `short` and no more, entry by
-    /// entry: a group the walk reaches gives its entries one at a time
-    /// (oldest first) until `short` is freed, never the whole group. What a
-    /// point measured behind serving takes of idle cache: one point's worth.
-    pub fn reclaim_cache_bounded(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, short, keys, true)
+        self.reclaim_cache_where(epoch, short, keys)
     }
 
     fn reclaim_cache_where(
@@ -1110,7 +1104,6 @@ impl KvStore {
         epoch: u64,
         short: usize,
         keys: impl Keys,
-        bounded: bool,
     ) -> usize {
         // Pages an earlier reclaim freed are on their way back: what they
         // cover is not short.
@@ -1155,15 +1148,24 @@ impl KvStore {
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
                         .collect();
                     tracing::debug!(target: "pie::kv", key, entries = ids.len(), "reclaim drops");
-                    if bounded {
-                        for id in ids {
-                            freed += self.drop_entries(vec![id], By::Host, epoch);
-                            if freed >= short {
-                                break;
-                            }
+                    // A set at a time, oldest first: every entry that holds
+                    // the set's pages (a kept checkpoint and the sealed
+                    // prefix it stands on name the same pages) goes with
+                    // it, since dropping one alone frees nothing.
+                    for id in ids {
+                        let Some(terminal) = self.cache.get(&id).map(|e| e.path.terminal) else {
+                            continue;
+                        };
+                        let set: Vec<u64> = self
+                            .cache
+                            .iter()
+                            .filter(|(_, e)| e.path.terminal == terminal)
+                            .map(|(&id, _)| id)
+                            .collect();
+                        freed += self.drop_entries(set, By::Host, epoch);
+                        if freed >= short {
+                            break;
                         }
-                    } else {
-                        freed += self.drop_entries(ids, By::Host, epoch);
                     }
                     reached.push(at);
                 }
@@ -1393,7 +1395,10 @@ impl KvStore {
             return Vec::new();
         }
         type Group = (Vec<u64>, Instant);
-        let mut groups: HashMap<(Option<ProcessId>, i64), Group> = HashMap::new();
+        // An owner's entries group by their row's key; an entry no process
+        // owns (a sealed prefix an exited set left) is a group of its own,
+        // never pooled with every other exited set's.
+        let mut groups: HashMap<(Result<ProcessId, u64>, i64), Group> = HashMap::new();
         for (&id, entry) in &self.cache {
             let root = entry.path.terminal;
             if !unused.contains(&root) || self.table.in_move_at(root) || !held(&self.table, root) {
@@ -1401,7 +1406,7 @@ impl KvStore {
             }
             let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
             let group = groups
-                .entry((entry.owner, key))
+                .entry((entry.owner.ok_or(id), key))
                 .or_insert_with(|| (Vec::new(), entry.last_use));
             group.0.push(id);
             group.1 = group.1.max(entry.last_use);
