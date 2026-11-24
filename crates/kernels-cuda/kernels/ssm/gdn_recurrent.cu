@@ -490,8 +490,10 @@ __device__ __forceinline__ void gdn_fold_row(float (&s)[8][8], float g, const fl
 // `u` and output, folds the own row where the lane commits it too, and
 // stores the tile once if it folded any. The own row's `[b | a]` and `u`
 // land in its buffer (its keys land with the conv's output). The state is
-// rounded to bf16 only as it is stored.
-template <int W>
+// rounded to bf16 only as it is stored. `SPLIT`: the form a splitting
+// fire launches (`Carry::split`, below); any other fire's form carries none
+// of the split's code, which its registers would pay for.
+template <int W, bool SPLIT>
 __global__ void __launch_bounds__(W * 32) gdn_step_carried(
     const bf16* __restrict__ qkv_post,
     const float* __restrict__ gates,
@@ -548,6 +550,12 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         u32 tok;
         // The block stage its last chunk lies in.
         int buf;
+        // Where the own row lands in the lane's buffer (its page slot and
+        // row there), resolved with the rest a tile ahead; `own` false where
+        // it lands none.
+        bool own;
+        u64 own_slot;
+        u32 own_tok;
     };
     auto plan = [&](int tile) {
         Tile tl;
@@ -557,6 +565,9 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         tl.slot = 0;
         tl.tok = 0;
         tl.buf = 0;
+        tl.own = false;
+        tl.own_slot = 0;
+        tl.own_tok = 0;
         if (tile >= tiles) return tl;
         const int vt = tile % vts;
         const int rest = tile / vts;
@@ -574,6 +585,8 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
         const CarryLane cl = carry.lane(tl.rl);
         tl.n = carry.carried(cl);
         tl.commit = carry.commit(tl.rl, tl.n + 1);
+        tl.own = carry.lanes != nullptr && cl.at != CARRY_NONE;
+        if (tl.own) carry.locate(cl, cl.at, tl.own_slot, tl.own_tok);
         const int j = CH * ((tl.n + CH - 1) / CH - 1) + lane;
         if (tl.n > 0 && lane < CH && j < tl.n) carry.carried_at(cl, j, tl.slot, tl.tok);
         return tl;
@@ -674,7 +687,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
     // another. A unit of one chunk, or a grid with no spare block (every
     // fire but a splitting one, `Carry::split` null), runs whole.
     const int units = tiles / W;
-    const bool can_split = carry.split != nullptr && units > 0 && static_cast<int>(gridDim.x) > units;
+    const bool can_split = SPLIT && carry.split != nullptr && units > 0 && static_cast<int>(gridDim.x) > units;
     const int parts_max = can_split ? static_cast<int>(gridDim.x) / units : 1;
     u32* split_count = can_split ? reinterpret_cast<u32*>(carry.split) : nullptr;
     float* split_part = can_split ? reinterpret_cast<float*>(carry.split + 4ull * gridDim.x) : nullptr;
@@ -795,6 +808,9 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                 }
                 __syncthreads();
             }
+            // The log-gates of the range's first chunk (lane e its row e):
+            // where the range starts at row 0, the fold rows lie in it.
+            float glog0 = 0.f;
             for (int c = idle ? -1 : hi0 - 1; c >= lo0; --c) {
                 const int base = CH * c;
                 // The chunk before this one streams into the other stage.
@@ -875,6 +891,7 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                     dq = dd.x;
                     dk = dd.y;
                 }
+                glog0 = glog;
                 float later = glog;
                 #pragma unroll
                 for (int off = 1; off < 32; off <<= 1) {
@@ -990,9 +1007,26 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                 a[u] += g0 * xk[u];
                 o[u] += g0 * xq[u];
             }
-            // The carried rows the lane commits fold into the state.
+            // The carried rows the lane commits fold into the state: those of
+            // the first chunk from the stage that still holds it (where this
+            // block's range starts at row 0), their gates as the attention
+            // formed them; any past it through the lane's pages.
             const int folded = fold ? min(commit, n) : 0;
-            for (int base = 0; base < folded; base += 32) {
+            const int staged = !idle && lo0 == 0 ? min(folded, CH) : 0;
+            {
+                const unsigned char* bs = bring + cbuf * BSTAGE;
+                const bf16* kst = reinterpret_cast<const bf16*>(bs);
+                const float* ust = reinterpret_cast<const float*>(bs + CH * KROW);
+                for (int e = 0; e < staged; ++e) {
+                    const float g = __expf(__shfl_sync(0xffffffffu, glog0, e));
+                    float kj[MR];
+                    gdn_keys(kst + e * (KROW / 2), i0, K_d, 1.f, kj);
+                    float uu[VEC];
+                    gdn_u8(ust + e * (UROW / 4) + cur.j0, uu);
+                    gdn_fold_row(s, g, kj, uu);
+                }
+            }
+            for (int base = staged; base < folded; base += 32) {
                 u64 slot;
                 u32 tok;
                 resolve(cl, folded, base + lane, slot, tok);
@@ -1022,7 +1056,8 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
                 o[u] += kq * un[u];
             }
             if (lane < 2) {
-                if (float* dst = carry.own_row<float>(cl, 0, 2)) {
+                if (cur.own) {
+                    float* dst = carry.plane_at<float>(cur.own_slot, cur.own_tok, 2);
                     float4* d4 = reinterpret_cast<float4*>(dst + (long long)cur.h * V_d + cur.j0);
                     d4[0] = make_float4(un[0], un[1], un[2], un[3]);
                     d4[1] = make_float4(un[4], un[5], un[6], un[7]);
@@ -1048,7 +1083,8 @@ __global__ void __launch_bounds__(W * 32) gdn_step_carried(
             }
             // The head's first tile lands the own row's `[b | a]` pair.
             if ((cur.j0 & ~15) == 0 && lane < 2) {
-                if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+                if (cur.own) {
+                    bf16* dst = carry.plane_at<bf16>(cur.own_slot, cur.own_tok, 0);
                     const int at = lane * V_h + cur.h;
                     dst[at] = ba[(long long)cur.r_row * 2 * V_h + at];
                 }

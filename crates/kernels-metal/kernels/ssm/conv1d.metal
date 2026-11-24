@@ -684,6 +684,10 @@ template [[host_name("causal_conv1d_group_fold_bfloat16")]]
 // the extended plane and the window's own rows, and its input in the
 // buffer. Where the lane commits, the thread moves its channel's window on
 // to the commit, every tap read before any is written.
+// The buffered rows a carried conv lane's threadgroup places: a chunk's
+// carried rows and its own.
+constant constexpr int kVerifyConvRows = 17;
+
 template <typename T>
 [[kernel]] void causal_conv1d_carried(
     const device T* x              [[buffer(0)]],
@@ -708,7 +712,9 @@ template <typename T>
     const device ulong* map        [[buffer(19)]],
     const device int* ext_replay   [[buffer(20)]],
     uint2 pos [[thread_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]]) {
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint2 tg_at [[thread_position_in_threadgroup]],
+    uint2 tg_width [[threads_per_threadgroup]]) {
   const int c = int(pos.x);
   const int r = int(pos.y);
   // The lanes before this one's extended rows, read side by side across the
@@ -723,6 +729,19 @@ template <typename T>
     before += ext_replay[lane0 + j];
   }
   int begin = indptr[r] + metal::simd_sum(before);
+  // Each buffered row's place once a threadgroup (a threadgroup row is one
+  // lane), not a page walk a tap a thread: its rows from 0 to its own.
+  threadgroup ulong row_at[kVerifyConvRows];
+  {
+    const int reps = min(replay[lane0 + r], kVerifyConvRows - 1);
+    const device int* lane_pages = page_table + size_t(lane0 + r) * uint(page_ints);
+    if (lane_pages[0] >= 0) {
+      for (int e = int(tg_at.x); e <= reps; e += int(tg_width.x)) {
+        row_at[e] = ulong(rs_buffered_row(slab, lane_pages, e, page_tokens, page_bytes, row_bytes) - slab);
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   if (c >= channels) {
     return;
   }
@@ -745,9 +764,12 @@ template <typename T>
   // Its own input lands for the fires after this one, unless this fire
   // folds it into the window.
   const bool buffers = pages[0] >= 0 && keep < span;
+  // A row past the table's (a carry longer than a chunk) walks its page.
   auto buffered = [&](int e) -> device T* {
-    return reinterpret_cast<device T*>(
-        rs_buffered_row(slab, pages, e, page_tokens, page_bytes, row_bytes) + col * sizeof(T));
+    const ulong at = e < kVerifyConvRows
+                         ? row_at[e]
+                         : ulong(rs_buffered_row(slab, pages, e, page_tokens, page_bytes, row_bytes) - slab);
+    return reinterpret_cast<device T*>(slab + at + col * sizeof(T));
   };
   auto tap = [&](int src) -> float {
     if (src < 0) {
@@ -787,4 +809,4 @@ template [[host_name("causal_conv1d_carried_bfloat16")]]
     device bfloat*, device bfloat*, const constant int&, const constant int&,
     const constant int&, device uchar*, const device int*, const constant uint&,
     const constant uint&, const constant uint&, const constant int&, const device ulong*,
-    const device int*, uint2, uint);
+    const device int*, uint2, uint, uint2, uint2);

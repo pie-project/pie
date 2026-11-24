@@ -103,6 +103,11 @@ pub enum Source {
     /// side leaves (`Engine::host_room`): the pool yields to other
     /// processes, never to its own load.
     MacosBesideOwn,
+    /// Windows: `GlobalMemoryStatusEx`'s physical memory, the share of it
+    /// available now (`ullAvailPhys` over `ullTotalPhys`), the level Task
+    /// Manager's memory graph shows; read when asked, as macOS's level is.
+    /// The reading is `1 - available / total` ([`windows_available`]).
+    WindowsAvailable,
     /// A test hook: the file `PIE_PRESSURE_FILE` names holds the reading,
     /// a number in `0..=1`, so a test can induce pressure mid-run.
     File(PathBuf),
@@ -112,13 +117,13 @@ impl Source {
     const PSI: &str = "/proc/pressure/memory";
 
     /// This system's source, read once to show it reads: the test hook
-    /// where `PIE_PRESSURE_FILE` is set, else the OS's own (macOS's
-    /// available memory; a Linux or Android kernel's PSI).
+    /// where `PIE_PRESSURE_FILE` is set, else the OS's own (macOS's or
+    /// Windows' available memory; a Linux or Android kernel's PSI).
     ///
     /// # Errors
     ///
     /// The source does not read (`"<source> reads <error>"`), or this
-    /// platform has none (Windows, iOS, a browser tab).
+    /// platform has none (iOS, a browser tab).
     pub fn of_this_system() -> Result<Source, String> {
         let source = if let Some(path) = std::env::var_os("PIE_PRESSURE_FILE") {
             Source::File(path.into())
@@ -126,6 +131,8 @@ impl Source {
             Source::MacosAvailable
         } else if cfg!(any(target_os = "linux", target_os = "android")) {
             Source::Psi
+        } else if cfg!(windows) {
+            Source::WindowsAvailable
         } else {
             return Err(format!(
                 "nothing reads it on this platform ({})",
@@ -180,6 +187,9 @@ impl Source {
                 "macOS kern.memorystatus_level beside this process: 1 - (available + its \
                  footprint) / 100"
             }
+            Source::WindowsAvailable => {
+                "Windows GlobalMemoryStatusEx, 1 - available physical / total physical"
+            }
             Source::File(_) => "PIE_PRESSURE_FILE",
         }
     }
@@ -192,12 +202,17 @@ impl Source {
     /// notification for its continuous `kern.memorystatus_level` (the
     /// dispatch memory-pressure source fires only on the three-step level's
     /// changes, which a tick sees anyway), and a sysctl read is cheap, so it
-    /// is read on each tick of the governor's loop; the test file likewise.
+    /// is read on each tick of the governor's loop; Windows' available
+    /// physical memory is current at each `GlobalMemoryStatusEx` call, and
+    /// read likewise; the test file likewise.
     #[must_use]
     pub const fn period(&self) -> Option<Duration> {
         match self {
             Source::Psi => Some(Duration::from_secs(2)),
-            Source::MacosAvailable | Source::MacosBesideOwn | Source::File(_) => None,
+            Source::MacosAvailable
+            | Source::MacosBesideOwn
+            | Source::WindowsAvailable
+            | Source::File(_) => None,
         }
     }
 
@@ -212,8 +227,8 @@ impl Source {
     }
 
     /// The pressure now, beside the source's own value it came from (PSI's
-    /// `some avg10` percentage, macOS's percent available, the test file's
-    /// number), for a log that shows both.
+    /// `some avg10` percentage, macOS's or Windows' percent available, the
+    /// test file's number), for a log that shows both.
     ///
     /// # Errors
     ///
@@ -252,6 +267,16 @@ impl Source {
                     pressure,
                 })
             }
+            Source::WindowsAvailable => {
+                let (available, total) = windows::physical_memory()?;
+                let pressure = windows_available(available, total).ok_or_else(|| {
+                    format!("GlobalMemoryStatusEx states {available} of {total} bytes available")
+                })?;
+                Ok(Sample {
+                    raw: (1.0 - pressure) * 100.0,
+                    pressure,
+                })
+            }
             Source::File(path) => {
                 let text = std::fs::read_to_string(path)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -274,8 +299,8 @@ impl Source {
 /// `0..=1` it reads as.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
-    /// What the source states: PSI's `some avg10` percent, macOS's percent
-    /// available, the test file's number.
+    /// What the source states: PSI's `some avg10` percent, macOS's or
+    /// Windows' percent available, the test file's number.
     pub raw: f64,
     pub pressure: f64,
 }
@@ -311,6 +336,59 @@ pub fn macos_available_beside(level: u32, own: u64, total: u64) -> Option<f64> {
     }
     let available = f64::from(level) + own as f64 / total as f64 * 100.0;
     Some(1.0 - available.min(100.0) / 100.0)
+}
+
+/// Windows' available physical memory as a reading: `1 - available /
+/// total`; `None` with no total or more available than the total.
+#[must_use]
+pub fn windows_available(available: u64, total: u64) -> Option<f64> {
+    (total > 0 && available <= total).then(|| 1.0 - available as f64 / total as f64)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows {
+    /// `MEMORYSTATUSEX`.
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        _memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        _total_page_file: u64,
+        _avail_page_file: u64,
+        _total_virtual: u64,
+        _avail_virtual: u64,
+        _avail_extended_virtual: u64,
+    }
+
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    /// The machine's available and total physical memory, in bytes.
+    pub(super) fn physical_memory() -> Result<(u64, u64), String> {
+        // SAFETY: a zeroed `MEMORYSTATUSEX` is valid; its length is set
+        // before the call, as the call requires.
+        let mut status: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        // SAFETY: `status` is a `MEMORYSTATUSEX` with its length set, owned
+        // here for the call.
+        if unsafe { GlobalMemoryStatusEx(&raw mut status) } == 0 {
+            return Err(format!(
+                "GlobalMemoryStatusEx: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok((status.avail_phys, status.total_phys))
+    }
+}
+
+#[cfg(not(windows))]
+mod windows {
+    pub(super) fn physical_memory() -> Result<(u64, u64), String> {
+        Err("GlobalMemoryStatusEx is Windows'".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +549,28 @@ mod tests {
         assert_eq!(macos_available(25), Some(0.75));
         assert_eq!(macos_available(0), Some(1.0));
         assert_eq!(macos_available(101), None);
+    }
+
+    #[test]
+    fn windows_available_memory_reads_as_its_complement() {
+        assert_eq!(windows_available(64, 64), Some(0.0));
+        assert_eq!(windows_available(16, 64), Some(0.75));
+        assert_eq!(windows_available(0, 64), Some(1.0));
+        assert_eq!(windows_available(65, 64), None);
+        assert_eq!(windows_available(0, 0), None);
+    }
+
+    /// Windows is a system with a source: its available physical memory
+    /// reads, a nonzero share of a nonzero total.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_its_available_memory() {
+        let sample = Source::WindowsAvailable.sample().expect("a reading");
+        assert!(sample.raw > 0.0 && sample.raw <= 100.0, "{sample:?}");
+        assert!((0.0..1.0).contains(&sample.pressure), "{sample:?}");
+        if std::env::var_os("PIE_PRESSURE_FILE").is_none() {
+            assert_eq!(Source::of_this_system(), Ok(Source::WindowsAvailable));
+        }
     }
 
     #[test]

@@ -1959,6 +1959,7 @@ impl Cuda {
                         .or(nulls[at].then_some(0)),
                     rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
+                    replay_stated: lane.replay_stated,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,

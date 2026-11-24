@@ -2398,6 +2398,8 @@ impl Shell {
             &measured,
         )
         .map_err(Fault::Card)?;
+        // The table this load's products are chosen from from now on.
+        self.products = crate::rates::joined_product_times(&self.products, &measured);
         let chosen = self.device.ctx().routes().cloned();
         let said: Vec<String> = wanted
             .iter()
@@ -2502,6 +2504,15 @@ impl Shell {
             started.elapsed().as_secs_f64(),
         );
         Ok(())
+    }
+
+    /// The decode products' times this load chooses their kernels from: the
+    /// profile's under a matching key, joined by what it measured. For a
+    /// test that serves a later load with the same choices.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn product_times(&self) -> &[profile::fire::ProductTime] {
+        &self.products
     }
 
     /// Two load facts of this shell

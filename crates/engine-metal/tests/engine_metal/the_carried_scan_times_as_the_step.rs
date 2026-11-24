@@ -107,7 +107,7 @@ fn the_carried_scan_times_as_the_step() {
         };
         time(&format!("carried scan, {rep} carried"), &|sink| {
             ssm::gated_delta_carried(
-                sink, qkv, indptr, &committed, &verify, ba_paged, corrected, &pool, K_HEADS, V_HEADS, D, D, y, dots,
+                sink, &tuning, qkv, indptr, &committed, &verify, ba_paged, corrected, &pool, K_HEADS, V_HEADS, D, D, y, dots,
             )
             .expect("carried");
         });

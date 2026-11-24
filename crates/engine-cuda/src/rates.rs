@@ -187,6 +187,24 @@ fn ensure_by(
 /// body serves it so, and the interquartile spread of the rounds.
 pub type ProductTimes = Vec<(kernels_cuda::linear::routes::Shape, u32, f64, f64)>;
 
+/// `held` (the profile's product times under a matching key) with
+/// `measured` in place of each entry of the same key: the table a load's
+/// decode products are chosen from once it has measured.
+#[must_use]
+pub fn joined_product_times(
+    held: &[profile::fire::ProductTime],
+    measured: &ProductTimes,
+) -> Vec<profile::fire::ProductTime> {
+    let fresh = kernels_cuda::linear::routes::product_times(measured);
+    let mut joined: Vec<profile::fire::ProductTime> = held
+        .iter()
+        .filter(|old| fresh.iter().all(|new| new.key() != old.key()))
+        .cloned()
+        .collect();
+    joined.extend(fresh);
+    joined
+}
+
 /// `measured` saved in device `device`'s user profile under `profiles`
 /// (`[rates] product_ns`, joining `held`, what the load's profile states
 /// under a matching key: each newly measured entry in place of one of the
@@ -203,13 +221,7 @@ pub fn save_product_times(
     let Some(profiles) = profiles else {
         return Ok(None);
     };
-    let fresh = kernels_cuda::linear::routes::product_times(measured);
-    let mut joined: Vec<profile::fire::ProductTime> = held
-        .iter()
-        .filter(|old| fresh.iter().all(|new| new.key() != old.key()))
-        .cloned()
-        .collect();
-    joined.extend(fresh);
+    let joined = joined_product_times(held, measured);
     let rates = keys.stamp(Rates {
         product_ns: Some(joined),
         ..Rates::default()
