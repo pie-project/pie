@@ -217,7 +217,7 @@ pub trait Serve: Backend {
     fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration>;
 
     /// Whether a load of `boot` lays its fires to the rows its budgets state
-    /// ([`CheckRungs::To`] at `max_tokens`) in place of the ruling's fire
+    /// ([`CheckRungs::To`] at `max_tokens`) in place of the fire-top rule's
     /// top: a test's load whose harness states what the test fires, which
     /// a runtime fitting its steps to the load's caps never needs
     /// (`test-limits`). No config or profile reaches it.
@@ -1286,6 +1286,10 @@ pub struct Shell<B: Serve> {
     /// and the host time those passes took, all told.
     laid_at_first_fire: u64,
     pub lay_ns: u64,
+    /// The arm walk's compositions a lay-only pass laid, not walked, and
+    /// the host time its passes took.
+    pub laid_walk: u64,
+    pub lay_walk_ns: u64,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
@@ -1925,7 +1929,7 @@ impl<B: Serve> Shell<B> {
             (None, false) => None,
         };
         let device_profile = tuning.profile().clone();
-        // The live range the ruling weighs a span against: the pool the room
+        // The live range the fire-top rule weighs a span against: the pool the room
         // leaves past one working set at the declared context, bound in the
         // segments the kernels bind.
         let live = {
@@ -3176,6 +3180,8 @@ impl<B: Serve> Shell<B> {
             filled_in_fire: 0,
             laid_at_first_fire: 0,
             lay_ns: 0,
+            laid_walk: 0,
+            lay_walk_ns: 0,
             eager: 0,
             eager_next: false,
             armed: false,
@@ -4602,10 +4608,17 @@ impl<B: Serve> Shell<B> {
                 guest,
             );
             // Its inputs, stated at load: what the field rules on.
-            eprintln!(
-                "engine-gpu: the unstated disk tier: {bytes} bytes = {seats} seats x {context}                  tokens: {pages} kv pages in {} chunks and {state} chunks of state ({} B a seat),                  and {guest} B of guest state the device holds live, chunks of {chunk} B",
-                pages.div_ceil(per_list),
-                self.state_slot_bytes(),
+            tracing::info!(
+                bytes,
+                seats,
+                context,
+                kv_pages = pages,
+                page_chunks = pages.div_ceil(per_list),
+                state_chunks = state,
+                seat_state_bytes = self.state_slot_bytes(),
+                guest_bytes = guest,
+                chunk_bytes = chunk,
+                "engine-gpu: the unstated disk tier"
             );
             bytes
         });
@@ -5618,16 +5631,16 @@ impl<B: Serve> Shell<B> {
             },
             None,
         )?;
-        crate::kernel_profile::phase(0, t);
+        crate::kernel_profile::phase_if(0, t);
         let t = std::time::Instant::now();
         let enqueued = FrameShell::enqueue(self, prepared)?;
-        crate::kernel_profile::phase(1, t);
+        crate::kernel_profile::phase_if(1, t);
         let t = std::time::Instant::now();
         let landed = FrameShell::settle(self, enqueued)?;
-        crate::kernel_profile::phase(2, t);
+        crate::kernel_profile::phase_if(2, t);
         let t = std::time::Instant::now();
         let rows = self.rows_of(&landed);
-        crate::kernel_profile::phase(3, t);
+        crate::kernel_profile::phase_if(3, t);
         rows
     }
 
@@ -8618,7 +8631,12 @@ impl<B: Serve> Shell<B> {
         self.handles.rewind_to(mark);
         let layout = laid?;
         let filled = B::lay_fill(self, frame, prepared, &layout, walked.launches)?;
-        if filled {
+        if self.arming {
+            self.lay_walk_ns = self.lay_walk_ns.saturating_add(at.elapsed().as_nanos() as u64);
+        }
+        if filled && self.arming {
+            self.laid_walk += 1;
+        } else if filled {
             let ns = at.elapsed().as_nanos() as u64;
             self.lay_ns = self.lay_ns.saturating_add(ns);
             self.laid_at_first_fire += 1;
@@ -8647,7 +8665,7 @@ impl<B: Serve> Shell<B> {
         };
         let t = std::time::Instant::now();
         let walked = self.walk_fill(prepared);
-        crate::kernel_profile::phase(4, t);
+        crate::kernel_profile::phase_if(4, t);
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
@@ -8667,7 +8685,7 @@ impl<B: Serve> Shell<B> {
         let layout = laid?;
         let t = std::time::Instant::now();
         let filled = B::fill(self, frame, prepared, &layout, walked.launches);
-        crate::kernel_profile::phase(5, t);
+        crate::kernel_profile::phase_if(5, t);
         filled
     }
 
@@ -9357,10 +9375,17 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             // its shape) and records nothing: a body is recorded once, each
             // composition of it a table of data.
             B::ready_fill(self, &prepared);
-            self.arm_filled = B::derive_fill(self, &prepared) || self.fill_once(&mut prepared)?;
+            // A composition whose kernels name a family already recorded is
+            // laid, not walked: a lay-only pass, its picks the family's.
+            self.arm_filled = B::derive_fill(self, &prepared) || self.lay_once(&mut prepared)? || {
+                // A pass that laid none took what the plan laid for the next
+                // frame: laid again for the fill walk's.
+                B::ready_fill(self, &prepared);
+                self.fill_once(&mut prepared)?
+            };
             let t = std::time::Instant::now();
             let plan = B::plan(self, &mut prepared)?;
-            crate::kernel_profile::phase(6, t);
+            crate::kernel_profile::phase_if(6, t);
             plan
         } else {
             B::plan(self, &mut prepared)?
@@ -9471,7 +9496,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 picks: Vec::new(),
             })
         } else {
-            self.walk_once(&prepared, keep.is_some(), split)
+            let t = std::time::Instant::now();
+            let walked = self.walk_once(&prepared, keep.is_some(), split);
+            crate::kernel_profile::phase_if(8, t);
+            walked
         };
         self.split_layers = 1;
         let walked = walked?;
@@ -10511,12 +10539,12 @@ impl<B: Serve> Shell<B> {
         let table = &self.compiled.classes;
         let mut decoding = vec![false; table.classes.len()];
         let mut prefilling = vec![false; table.classes.len()];
-        // Interim: the walk arms classes without a score capture, an adapter
-        // or a guest input. A class whose lanes carry one binds commands of
-        // its own per attachment, which multiplies
-        // the bodies past what a device holds; it is stated eager at load
-        // until its commands read the attachment as data.
-        // (A mask is armed: every class of a load that masks carries one.)
+        // The walk arms classes without a score capture, an adapter or a
+        // guest input. A class whose lanes carry one binds commands of its
+        // own per attachment, which multiplies the bodies past what a device
+        // holds; it is stated eager at load, by name, until its commands read
+        // the attachment as data. (A mask is armed: every class of a load
+        // that masks carries one.)
         let attached: Vec<bool> = (0..table.classes.len())
             .map(|class| {
                 let lane = self.naming_lane(class, 1).ok();

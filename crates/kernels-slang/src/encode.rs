@@ -44,6 +44,9 @@ pub enum ArgValue {
     I32(i32),
     U32(u32),
     F32(f32),
+    /// That many zero u32 scalars: a fired table's rows past those a fire
+    /// fills (`gather.rs_copy_runs`'s runs), laid without one argument each.
+    Zeros(u32),
 }
 
 impl ArgValue {
@@ -55,6 +58,7 @@ impl ArgValue {
             Self::I32(_) => "an i32",
             Self::U32(_) => "a u32",
             Self::F32(_) => "an f32",
+            Self::Zeros(_) => "zero scalars",
         }
     }
 }

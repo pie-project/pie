@@ -8,7 +8,7 @@
 use dtype::Dtype;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, nonzero, refuse, stated,
+    Arg, ArgValue, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, nonzero, refuse, stated,
 };
 use crate::error::Error;
 use crate::tensor::Tensor;
@@ -181,16 +181,18 @@ pub fn copy_runs(
         let mut args = vec![arena_a.arg_mut(), arena_b.arg_mut()];
         args.extend(pool.args(true));
         args.extend([count.arg(), 0u32.arg(), 0u32.arg(), 0u32.arg()]);
-        for at in 0..table {
-            let [spaces, from, to, words] = chunk.get(at).map_or([0; 4], |run| {
-                [
-                    run.from.0.code() << 16 | run.to.0.code(),
-                    run.from.1,
-                    run.to.1,
-                    run.words,
-                ]
-            });
-            args.extend([spaces.arg(), from.arg(), to.arg(), words.arg()]);
+        for run in chunk {
+            args.extend([
+                (run.from.0.code() << 16 | run.to.0.code()).arg(),
+                run.from.1.arg(),
+                run.to.1.arg(),
+                run.words.arg(),
+            ]);
+        }
+        // The table's rows past the fire's runs, zero, as one argument.
+        let unused = u32::try_from((table - chunk.len()) * 4).unwrap_or(u32::MAX);
+        if unused > 0 {
+            args.push(ArgValue::Zeros(unused));
         }
         ctx.fire(
             Fire::at(ROWS, entry)

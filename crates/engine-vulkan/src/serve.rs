@@ -574,9 +574,11 @@ impl Serve for Api {
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
         crate::encode::profile_ready();
-        if shell.shelf.derived_fills > 0 || verifying_arms() {
+        if shell.shelf.derived_fills > 0 || shell.laid_walk > 0 || verifying_arms() {
             tracing::info!(
                 derived = shell.shelf.derived_fills,
+                laid = shell.laid_walk,
+                lay_ms = shell.lay_walk_ns / 1_000_000,
                 checked = shell.shelf.derived_checked,
                 image_bytes = ?shell.shelf.image_bytes,
                 mismatches = shell.shelf.derived_mismatches,
@@ -857,13 +859,22 @@ impl Serve for Api {
             return Ok(false);
         }
         let shape = record_key(shell, prepared);
-        let laid = crate::record::Fill::new(
-            family,
+        let (groups, image, room_pasts) = (
             std::sync::Arc::new(fill.groups),
             std::sync::Arc::new(fill.image),
+            std::sync::Arc::new(fill.room_pasts),
+        );
+        // The arm walk's first-arm fill, laid: an arm past it derives its own.
+        if !verifying_derived() {
+            note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+        }
+        let laid = crate::record::Fill::new(
+            family,
+            groups,
+            image,
             layout.to_vec(),
             launches,
-            std::sync::Arc::new(fill.room_pasts),
+            room_pasts,
         );
         // Verifying, the fire walks for its fill all the same, held to this.
         if verifying_derived() {
@@ -890,9 +901,7 @@ impl Serve for Api {
         layout: &[ReadSpan],
         launches: u32,
     ) -> Result<bool> {
-        let t = std::time::Instant::now();
         let fill = frame.into_fill();
-        engine_gpu::kernel_profile::phase(2, t);
         let shape = record_key(shell, prepared);
         let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
         if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
@@ -1375,7 +1384,7 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
     let t = std::time::Instant::now();
     let key = keyed_inner(shell, p, reads);
-    engine_gpu::kernel_profile::phase(7, t);
+    engine_gpu::kernel_profile::phase_if(7, t);
     key
 }
 

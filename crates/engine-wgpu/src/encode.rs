@@ -165,6 +165,7 @@ fn label(name: &'static str, fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<
             ArgValue::I32(v) => v.to_string(),
             ArgValue::U32(v) => v.to_string(),
             ArgValue::F32(v) => format!("{v}"),
+            ArgValue::Zeros(words) => format!("0x{words}"),
             ArgValue::Buffer(_) | ArgValue::BufferMut(_) => continue,
         };
         let _ = write!(key, "{}{scalar}", if first { " s=" } else { "," });
@@ -432,6 +433,7 @@ impl Sink<'_> {
                 ArgValue::I32(v) => words.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::U32(v) => words.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::F32(v) => words.extend_from_slice(&v.to_le_bytes()),
+                ArgValue::Zeros(count) => words.resize(words.len() + count as usize * 4, 0),
             }
         }
 
