@@ -52,7 +52,7 @@ impl std::fmt::Display for Language {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn artifact_extension(language: Option<Language>) -> &'static str {
     language.map_or("wasm", Language::extension)
 }

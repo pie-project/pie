@@ -1,9 +1,8 @@
 //! The stores' slot ids, taken from [`SlotPool`]s.
 //!
-//! The engine states its pools as chunks ([`ChunkFacts`]); until a backend
-//! switches to one shared pool, each of today's pools is a *pinned* shape:
-//! a run of chunks of its own, one slot a chunk, whose slots keep the ids
-//! the engine numbers them by today ([`ChunkFacts::degenerate`]). Each such
+//! An engine states one shared pool as chunks ([`ChunkFacts`]). Stores
+//! registered without one (`registry::register_model_with_swap`) keep
+//! *pinned* pools: a run of chunks of their own, one slot a chunk. Each such
 //! run is one [`ShapePool`]: a `SlotPool` of one shape whose chunk `c` is
 //! the store's id `base + c`. A `SlotPool` opens its lowest free chunk first,
 //! as the stores' own pools did, so the ids handed to the engine are the
@@ -16,9 +15,7 @@ use std::sync::Arc;
 use crate::policy::pressure::{Bytes, Meter, Tier};
 use crate::store::registry;
 
-use ::engine::chunk::{
-    ChunkFacts, DEGENERATE_BUFFER, DEGENERATE_KV, DEGENERATE_STATE, Pinned, SlotKind,
-};
+use ::engine::chunk::{ChunkFacts, SlotKind};
 
 use super::kv::page_table::WorkingSetId;
 use super::pool::PoolId;
@@ -712,7 +709,7 @@ impl Seats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShapeRun {
     pub slot_bytes: u64,
-    /// Device ids, from [`Pinned::ids_from`].
+    /// Device ids, from `ids_from`.
     pub device: u32,
     pub ids_from: u32,
     /// The slot ref of the device run's first slot: id `i` is ref
@@ -722,23 +719,10 @@ pub struct ShapeRun {
     pub disk: u32,
 }
 
-impl ShapeRun {
-    fn of(pinned: Pinned, slot_bytes: u64, slots_per_chunk: u32) -> Self {
-        Self {
-            slot_bytes,
-            device: pinned.device.chunks * slots_per_chunk,
-            ids_from: pinned.ids_from,
-            ref_from: pinned.device.first * slots_per_chunk,
-            host: pinned.host.chunks * slots_per_chunk,
-            disk: pinned.disk.chunks * slots_per_chunk,
-        }
-    }
-}
-
-/// What a store needs of an engine's [`ChunkFacts`]: each of today's pools,
-/// as the pinned shape the degenerate mode states it as; or, where the
-/// engine states a shared pool, its geometry, the stores drawing their ids
-/// from a [`SharedPool`] built of the same facts.
+/// What a store needs of an engine's [`ChunkFacts`]: the shared pool's
+/// geometry, the stores drawing their ids from a [`SharedPool`] built of the
+/// same facts. Stores registered without a shared pool
+/// (`registry::register_model_with_swap`) state their pinned pools' counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorePools {
     /// The shapes share one pool: the counts below are not stated.
@@ -752,50 +736,21 @@ pub struct StorePools {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ChunkFactsError {
-    #[error(
-        "shape {0} takes chunks from the shared pool beside pinned shapes; an engine states every shape pinned or none"
-    )]
-    Mixed(u32),
-    #[error("shape {0} is not one of the degenerate mode's")]
-    Unknown(u32),
-    #[error("shape {0} cuts a slot into pieces, which the stores do not take yet")]
-    Pieces(u32),
+    #[error("shape {0} is pinned; the stores take an engine's shared pool alone")]
+    Pinned(u32),
 }
 
 impl StorePools {
-    /// The stores' pools as `facts` states them: every shape pinned (the
-    /// degenerate mode), or none (a shared pool).
+    /// The stores' pools as `facts` states them: one shared pool, or none
+    /// where the engine states no shape.
     pub fn of(facts: &ChunkFacts) -> Result<Self, ChunkFactsError> {
-        if SharedPool::states_shared(facts) {
-            return Ok(Self::shared(facts));
+        if let Some(shape) = facts.shapes.iter().find(|shape| shape.pinned.is_some()) {
+            return Err(ChunkFactsError::Pinned(shape.id.0));
         }
-        let mut pools = Self::default();
-        for shape in &facts.shapes {
-            let pinned = shape.pinned.ok_or(ChunkFactsError::Mixed(shape.id.0))?;
-            let run = ShapeRun::of(pinned, shape.slot_bytes, shape.slots_per_chunk);
-            match (shape.id, shape.kind) {
-                (
-                    DEGENERATE_KV,
-                    SlotKind::List {
-                        tokens,
-                        window: None,
-                        ..
-                    },
-                ) => {
-                    pools.page_size = tokens;
-                    pools.kv = run;
-                }
-                (DEGENERATE_STATE | DEGENERATE_BUFFER, SlotKind::Fixed { pieces })
-                    if pieces != 1 =>
-                {
-                    return Err(ChunkFactsError::Pieces(shape.id.0));
-                }
-                (DEGENERATE_STATE, SlotKind::Fixed { .. }) => pools.state = run,
-                (DEGENERATE_BUFFER, SlotKind::Fixed { .. }) => pools.buffer = run,
-                _ => return Err(ChunkFactsError::Unknown(shape.id.0)),
-            }
+        if facts.shapes.is_empty() {
+            return Ok(Self::default());
         }
-        Ok(pools)
+        Ok(Self::shared(facts))
     }
 
     /// A shared pool's geometry: the kv list's tokens a slot, the widest

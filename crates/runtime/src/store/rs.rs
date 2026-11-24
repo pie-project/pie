@@ -152,8 +152,7 @@ pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
 
 /// A count in each recurrent pool: state slots and buffer pages, or, of a
 /// windowed store, its window lists' slots: `pages` their sum and
-/// `windows[l]` list `l`'s (each its own shape's slots). In the degenerate
-/// mode a slot is a chunk, so this is the chunks the shapes ask for.
+/// `windows[l]` list `l`'s (each its own shape's slots).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RsUnits {
     pub slots: u32,
@@ -393,7 +392,7 @@ impl RsDisk {
 
 /// What a set holds, in its own numbering: see [`RsEntry`].
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct RsExport {
     pub folded: Option<RsSlotId>,
     pub buffer: Vec<Option<RsSlotId>>,
@@ -935,6 +934,7 @@ impl RsStore {
 
     /// Whether `id` is a disk row: its state lies in the disk tier.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn on_disk(&self, id: RsSlotId) -> bool {
         self.is_disk(id)
     }
@@ -1332,7 +1332,7 @@ impl RsStore {
     /// What a snapshot keeps of `ws`, on the rows it stands on now: not
     /// while its frozen length is behind its record
     /// ([`Self::device_fold_gate`]), which an export leaves the engine with.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn export(&self, ws: RsWorkingSetId) -> Result<RsExport, RsError> {
         self.device_fold_gate(ws)?;
         let entry = self.entry(ws)?;
@@ -1349,7 +1349,7 @@ impl RsStore {
     }
 
     /// Whether `id` is a host row already.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn on_host(&self, id: RsSlotId) -> bool {
         self.is_host(id) && !self.is_disk(id)
     }
@@ -1361,14 +1361,14 @@ impl RsStore {
     /// (a slot of each fixed shape a piece) and rs list or window slots,
     /// whose bytes the engine reads and writes by those refs
     /// ([`Self::tier_refs`], `Engine::read_tier_slots`).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
         self.take_host_of(slots, pages, 0)
     }
 
     /// [`Self::take_host`], and `wpages` of a hybrid's window-buffer rows
     /// after the pages.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn take_host_of(
         &mut self,
         slots: usize,
@@ -1390,7 +1390,7 @@ impl RsStore {
         Some(rows)
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn give_host(&mut self, rows: Vec<RsSlotId>) {
         self.release_host(rows);
     }
@@ -1399,7 +1399,7 @@ impl RsStore {
     /// row in order, the refs of each shape it spans (a record's pieces, a
     /// list slot), runs of one shape merged. The order the bytes of
     /// `Engine::read_tier_slots` lie in.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn tier_refs(&self, rows: &[RsSlotId]) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
         let mut out: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = Vec::new();
         for &row in rows {
@@ -1415,7 +1415,7 @@ impl RsStore {
 
     /// A shared pool's copy of device rows to host rows, `(device, host)`
     /// pairs, shape by shape: what `copy_slots` moves.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn tier_copies(
         &self,
         moves: &[(RsSlotId, RsSlotId)],
@@ -1440,7 +1440,7 @@ impl RsStore {
     }
 
     /// A set of its own on host rows, as `export` said one stood.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn import(&mut self, geom: RsGeometry, set: RsExport) -> RsWorkingSetId {
         self.working_sets.insert(RsEntry {
             geom,

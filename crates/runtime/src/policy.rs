@@ -4,7 +4,10 @@
 //! A process's PLEX id is the id its client knows: one restarted after a KV
 //! reclaim keeps it. The browser build runs no policy: the runtime still
 //! reports here, and nothing listens.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#![cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser: its reports are formed and dropped")
+)]
 
 pub mod pressure;
 pub mod retention;

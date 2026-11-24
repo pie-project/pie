@@ -240,8 +240,8 @@ mod lane {
 
     /// A lane of a fire the runtime builds: the engine's lane, and the ids
     /// the runtime's stores place its state by, which the fire names to the
-    /// engine in the lane's slot tables (`pipeline::fire::rs::apply_shared`,
-    /// `apply_pinned`) and never otherwise.
+    /// engine in the lane's slot tables (`pipeline::fire::rs::apply_shared`)
+    /// and never otherwise.
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct FireLane {
         pub lane: Lane,

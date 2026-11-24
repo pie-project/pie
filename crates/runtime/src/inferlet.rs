@@ -5,7 +5,7 @@ pub use host::pie::inferlet::frames::{AudioFormat, ImageFormat};
 pub(crate) mod linker;
 pub mod process;
 pub mod program;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser grants no fs or network access"))]
 pub(crate) mod sandbox;
 
 pub use process::ProcessId;
