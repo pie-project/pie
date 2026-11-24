@@ -142,7 +142,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
         .iter()
         .position(|input| input.name == "t")
         .expect("the plan reads `t`") as u32;
-    let mut engine = backend::Engine::new(boot, contract_for);
+    let mut engine = backend::Engine::new(crate::gpu::fires_stated(boot), contract_for);
     let loaded = engine
         .load(LoadRequest {
             trace,

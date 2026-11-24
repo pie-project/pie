@@ -195,6 +195,15 @@ pub trait Serve: Backend {
     /// where neither states one.
     fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration>;
 
+    /// Whether a load of `boot` lays its fires to the rows its budgets state
+    /// ([`CheckRungs::To`] at `max_tokens`) in place of the ruling's fire
+    /// top: a test's load whose harness states what the test fires, which
+    /// a runtime fitting its steps to the load's caps never needs
+    /// (`test-limits`). No config or profile reaches it.
+    fn fires_stated(_boot: &Self::DeviceBoot) -> bool {
+        false
+    }
+
     /// The highest tier the device runs.
     fn tier(device: &Self::Context) -> kernels_slang::Tier;
 
@@ -480,7 +489,8 @@ pub enum CheckRungs {
     /// served-shape load whose rungs and estimate the check weighs.
     PastTop,
     /// To the lattice's rung at these rows: a load sized for one kind of
-    /// the check's fires.
+    /// the check's fires, or for the fires a test's harness states
+    /// ([`Serve::fires_stated`]).
     To(u32),
 }
 
