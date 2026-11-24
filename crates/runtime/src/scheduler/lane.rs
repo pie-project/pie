@@ -855,6 +855,23 @@ pub(crate) fn give_behind(stores: &crate::store::registry::Stores, taken: Behind
 /// runs).
 static BEHIND_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a lane said its behind work waits for a live process.
+static BEHIND_SAID_LIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Every lane turned once ([`LaneRequest::Behind`]) once the runtime is
+/// ready: where the last live process's pipeline parked or closed, so a lane
+/// asleep since takes up its engine's behind work without waiting for a
+/// request. Nothing before ready.
+pub(crate) fn turn_behind() {
+    if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if let Ok(mut lanes) = LANES.try_lock() {
+        lanes.retain(|lane| lane.send(LaneRequest::Behind).is_ok());
+    }
+}
+
 /// Whether a lane said its behind work waits for ready.
 static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1146,15 +1163,27 @@ impl Lane {
         }
         let began = Instant::now();
         let stores = crate::store::registry::try_get(0, engine_idx);
-        // No process live on the engine: no working set or snapshot holds a
-        // slot (idle cache alone does) and no waiter is short of one.
-        let alone = stores
-            .as_ref()
-            .and_then(|stores| stores.shared.as_ref())
-            .is_some_and(|shared| {
-                let pool = shared.lock().unwrap();
-                pool.pool().demand().live == 0 && !pool.pool().waiting()
-            });
+        // Behind work of any kind runs only while no process has work
+        // outstanding (no pipeline open; idle cache, resting handles and
+        // snapshots are no process) and no waiter is short of a slot: never
+        // between the steps of live traffic. The last pipeline to park or
+        // close turns the lanes ([`turn_behind`]).
+        let alone = crate::pipeline::none_active()
+            && !stores
+                .as_ref()
+                .and_then(|stores| stores.shared.as_ref())
+                .is_some_and(|shared| shared.lock().unwrap().pool().waiting());
+        if !alone {
+            if !BEHIND_SAID_LIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    engine_idx,
+                    "behind serving: waiting: a process has work outstanding (behind work runs \
+                     only once none has)"
+                );
+            }
+            return None;
+        }
+        BEHIND_SAID_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         // A point longer than one decode step waits for no live process:
         // nothing is taken for it before then.
         let taken = engine
@@ -2517,5 +2546,85 @@ mod landing_tests {
         let completion =
             copy_settled_on_landing(&mut inline, &broker, park()).expect("the copy is taken");
         assert!(completion.is_settled());
+    }
+}
+
+#[cfg(test)]
+mod behind_tests {
+    use super::*;
+    use ::engine::chunk::SlotCopy;
+    use ::engine::fire::{FrameSubmission, FrameTicket};
+    use ::engine::load::{LoadRequest, Loaded};
+    use ::engine::Engine;
+
+    /// An engine with work left behind serving, counting the slices it ran.
+    struct Pending(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Engine for Pending {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn measured_at_load(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+        fn kind(&self) -> &'static str {
+            "fake-behind"
+        }
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
+        }
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+        fn finish_program(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+        fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
+            Err(::engine::Error::Load("no model".into()))
+        }
+        fn submit(&mut self, _frame: &FrameSubmission) -> ::engine::Result<FrameTicket> {
+            unreachable!("nothing fires here")
+        }
+        fn copy_slots(&mut self, _copy: &SlotCopy) -> ::engine::Result<()> {
+            Ok(())
+        }
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+        fn copy_slots_landing(&mut self, _copy: &SlotCopy, _token: u64) -> ::engine::Result<bool> {
+            Ok(true)
+        }
+        fn measures_behind(&self) -> bool {
+            true
+        }
+        fn measure_behind(&mut self, _behind: &::engine::BehindServing<'_>) -> ::engine::Result<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(true)
+        }
+    }
+
+    /// While a process has work outstanding (a pipeline open), the lane runs
+    /// none of an engine's behind work, whatever the engine states: never
+    /// between the steps of live traffic.
+    #[test]
+    fn behind_work_waits_while_a_pipeline_is_open() {
+        open_behind();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine: Option<EngineBox> = Some(Box::new(Pending(Arc::clone(&ran))));
+        let live = crate::pipeline::Pipeline::new();
+        assert!(!crate::pipeline::none_active(), "an open pipeline is live");
+        let sliced = Lane::measure_behind(usize::MAX, &mut engine, &|| false);
+        assert!(sliced.is_none(), "no slice while a process has work outstanding");
+        assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(live);
     }
 }
