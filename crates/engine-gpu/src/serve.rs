@@ -4274,14 +4274,49 @@ impl<B: Serve> Shell<B> {
 
     /// The disk tier: a slot file of `budget` bytes in disk chunks, any
     /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
-    /// [`Pools::disk_division`] lay them; stated at load. No budget (or 0)
-    /// is no disk tier. One that cannot be seated is refused by name. The
-    /// disk chunks it holds.
-    pub fn seat_disk_kv(&mut self, budget: Option<u64>, dir: Option<&Path>) -> Result<u32> {
-        let (Some(budget), Some(dir)) = (budget.filter(|&bytes| bytes > 0), dir) else {
+    /// [`Pools::disk_division`] lay them; stated at load. Unstated
+    /// `budget`: the disk chunks `seats` sequences' kv pages at `context`
+    /// and their state take, within the free disk
+    /// ([`engine::disk::derived_budget`]). One that cannot be seated is
+    /// refused by name, stated or not. The disk chunks it holds.
+    pub fn seat_disk_kv(
+        &mut self,
+        budget: Option<u64>,
+        dir: Option<&Path>,
+        seats: u32,
+        context: u32,
+    ) -> Result<u32> {
+        // A stated 0 is no disk tier; unstated is derived below.
+        let (Some(dir), false) = (dir, budget == Some(0)) else {
             return Ok(0);
         };
+        let paging = self.pools.paging();
+        let layout = *self.pools.layout();
         let chunk = self.pools.disk_chunk_bytes();
+        let budget = budget.unwrap_or_else(|| {
+            let pages =
+                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+            let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
+            let state = (u64::from(seats) * self.state_slot_bytes()).div_ceil(chunk.max(1));
+            // The guest state the device can hold live (the room a guest
+            // program binds within): evicted, it has a home.
+            let guest = self.pool_chunk_facts().guest_room_bytes();
+            let bytes = engine::disk::unstated_budget(
+                dir,
+                0,
+                0,
+                pages.div_ceil(per_list) + state,
+                chunk,
+                guest,
+            );
+            // Its inputs, stated at load: what the field rules on.
+            eprintln!(
+                "engine-gpu: the unstated disk tier: {bytes} bytes = {seats} seats x {context}                  tokens: {pages} kv pages in {} chunks and {state} chunks of state ({} B a seat),                  and {guest} B of guest state the device holds live, chunks of {chunk} B",
+                pages.div_ceil(per_list),
+                self.state_slot_bytes(),
+            );
+            bytes
+        });
         self.pools.seat_disk(&self.device, dir, budget)?;
         let chunks = self.pools.disk_chunks();
         if chunks > 0 {
