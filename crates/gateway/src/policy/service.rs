@@ -908,6 +908,39 @@ mod tests {
         );
     }
 
+    /// Arrival to admitted, 50 launches one after another, under `names`.
+    async fn admit_waits(names: &[&str]) -> Vec<Duration> {
+        let rig = rig_of(0, names).await;
+        let mut waits = Vec::new();
+        for req in 1..=50 {
+            let launch = launch(req, serde_json::json!({}));
+            let at = Instant::now();
+            rig_admit(&rig.router, &launch, &rig.routing).await;
+            waits.push(at.elapsed());
+            rig.router.exited(&launch, Outcome::Completed);
+        }
+        waits.sort();
+        waits
+    }
+
+    /// `default-cluster` writes only defaults and imports nothing that
+    /// decides a pending process: a launch under it goes by the rows in
+    /// force, not after a policy round trip, which one that places
+    /// (`test-route`) still waits for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launch_under_the_default_cluster_policy_does_not_wait_for_it() {
+        let rig = rig_of(0, &["default-cluster"]).await;
+        assert_eq!(rig.host.decisions(GatewayId(0)).borrow().gate_ms, 0);
+        drop(rig);
+        let free = admit_waits(&["default-cluster"]).await;
+        let gated = admit_waits(&["test-route"]).await;
+        let (free, gated) = (free[free.len() / 2], gated[gated.len() / 2]);
+        assert!(
+            free * 10 < gated,
+            "median arrival to admitted: {free:?} under default-cluster, {gated:?} gated"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_reload_swaps_the_policies_and_withdraws_the_old_ones_rows() {
         let rig = rig(0).await;
@@ -951,7 +984,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         let (group, tenants, id) = &granted.groups[0];
-        assert_eq!((group.as_str(), tenants.clone()), ("team", vec!["acme".to_string(), "beta".to_string()]));
+        assert_eq!(
+            (group.as_str(), tenants.clone()),
+            ("team", vec!["acme".to_string(), "beta".to_string()])
+        );
         let (default, default_id) = granted.default.clone().unwrap();
         assert_eq!(default, ["acme"]);
         assert_ne!(*id, default_id, "each grant its own id");
@@ -962,7 +998,10 @@ mod tests {
         loop {
             let share = decisions.borrow().share.clone();
             if share.groups.is_empty() && share.default.is_none() {
-                assert!(share.version > granted.version, "a newer version: workers take it");
+                assert!(
+                    share.version > granted.version,
+                    "a newer version: workers take it"
+                );
                 break;
             }
             assert!(Instant::now() < deadline, "grants not withdrawn: {share:?}");
