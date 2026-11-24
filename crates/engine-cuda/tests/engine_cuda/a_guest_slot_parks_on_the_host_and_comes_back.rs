@@ -1,7 +1,7 @@
 #![cfg(feature = "device")]
 
 //! A guest's `Instance` and `Channel` slots move between the device and the
-//! host tier as every state shape's do (CONTRACT-BC 22): what suspends a
+//! host tier as every state shape's do: what suspends a
 //! process that has bound a guest program.
 
 use std::path::Path;

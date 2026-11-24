@@ -298,8 +298,8 @@ impl Shell {
     /// rows' treatment and the stated step it records; `None` where there
     /// is nothing to arm.
     ///
-    /// The compositions are the load's stated step set's (`Shell::steps`,
-    /// CONTRACT-BC 24), walked in its order: each shape at each bucket its
+    /// The compositions are the load's stated step set's (`Shell::steps`:
+    /// every step the runtime may stamp), walked in its order: each shape at each bucket its
     /// rows pad to, by the engine's classes crossed with it ([`ARMS`]),
     /// recorded for its treatment ([`Shell::rs_bodies`]). A bucket an
     /// earlier shape of the same treatment walked is not walked again.
@@ -497,7 +497,7 @@ impl Shell {
         bodies
     }
 
-    /// The step compositions this load's builder forms (CONTRACT-BC 24),
+    /// The step compositions this load's builder forms,
     /// over `rules` and the load's facts as they stand before arming: what
     /// the arm walk takes its targets from. The rungs are the arena's
     /// (every one a fire can carve, up to one fire's tokens).

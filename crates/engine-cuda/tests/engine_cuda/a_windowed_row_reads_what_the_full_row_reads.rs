@@ -114,7 +114,7 @@ fn a_windowed_row_reads_what_the_full_row_reads() {
     agree(&got, &want, DEPLOYMENT);
 }
 
-// CONTRACT-BC 19: a fire's fold lands after every read its lanes' attention
+// A fire's fold lands after every read its lanes' attention
 // makes, on every stream it forks: a fire whose lanes read ring pages that
 // its own fold then overwrites (its own rows past its ring on own-row pages,
 // folded onto ring pages it read) and fires that write their rows on their
@@ -188,7 +188,7 @@ fn served_masked(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec
     out
 }
 
-// CONTRACT-BC 19: a lane reading a mask of its own through the masked arms
+// A lane reading a mask of its own through the masked arms
 // reads its windowed rows from ring + buffer as from the full rows.
 #[test]
 fn a_masked_lane_reads_its_ring_as_its_full_rows() {

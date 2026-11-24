@@ -334,8 +334,8 @@ impl Seats {
 #[derive(Debug)]
 pub struct Pools {
     /// The pages of a fire's own rows its lane folds past its ring, at the
-    /// activation's top (CONTRACT-BC 19: rows a fire folds itself take no
-    /// window-buffer slot).
+    /// activation's top (rows a fire folds itself take no window-buffer
+    /// slot).
     own: Option<OwnRows>,
     pool: PhysicalPool,
     /// The state pool: the kv rows' pages and the working sets' recurrent
@@ -434,7 +434,7 @@ pub struct Pools {
     /// Where the next host<->disk move is told how it ended
     /// ([`Pools::defer_disk_tell`]); taken by the move.
     disk_told: DiskTell,
-    /// The shared pool's host tier (CONTRACT-BC 22): chunks of the state
+    /// The shared pool's host tier: chunks of the state
     /// pool's size, a slot of any shape at the place its host ref names, in
     /// pageable memory behind a page-locked staging ring ([`host`]).
     tier: Option<host::HostTier>,
@@ -775,7 +775,7 @@ impl Pools {
             .collect()
     }
 
-    /// The windowed layers a record holds the rings of (CONTRACT-BC 21),
+    /// The windowed layers a record holds the rings of,
     /// where the load serves them as ring + buffer: each windowed cache row
     /// (its `layer`) with its window and its share of the ring's bytes, the
     /// last row's share padded to the pieces the record takes.
@@ -1285,7 +1285,7 @@ impl Pools {
     }
 
     /// The shapes a record spans, in its pieces' order: its rings', then
-    /// its state's (CONTRACT-BC 21), each with its pieces and slot bytes.
+    /// its state's, each with its pieces and slot bytes.
     fn record_shapes(&self) -> Vec<(Kind, u32, u64)> {
         let layout = self.chunks.layout();
         layout
@@ -2367,7 +2367,7 @@ fn lay(
     };
     // Each plane at the bytes its slot holds: laid scales as their atoms.
     let view = crate::weights::laid_view(trace);
-    // Windowed rows as ring + buffer (CONTRACT-BC 19, 21): each windowed
+    // Windowed rows as ring + buffer: each windowed
     // layer's last folded rows a ring in the lane's record, its unfolded
     // rows in the window buffer.
     let recipe = poem_compiler::chunk::plan_windowed(&view, budgets, &profile, &CudaRings)

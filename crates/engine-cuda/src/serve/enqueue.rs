@@ -235,7 +235,7 @@ impl Shell {
 }
 
 impl Shell {
-    /// A windowed fire's fold (CONTRACT-BC 19): the rows it folds, from
+    /// A windowed fire's fold: the rows it folds, from
     /// their buffer or own-row pages onto their ring pages, after its
     /// forward on its stream.
     fn fold_rings(&mut self, work: &super::ring::Work) -> Result<()> {
@@ -1013,7 +1013,7 @@ impl FireCtx<'_> {
             });
         }
         // The fire's beam group folds, every layer's, on its stream ahead of
-        // its body (§11.3): no step of the fire reads a state before its
+        // its body: no step of the fire reads a state before its
         // fold.
         if p.rs.predicated {
             let lanes = self.gate_lanes(p);
@@ -1093,8 +1093,8 @@ impl FireCtx<'_> {
                     if after.captures > before.captures {
                         self.live.tally(engine::live::Tally::Compiled, 1);
                     } else if after.stated_eager > before.stated_eager {
-                        // A composition the load stated eager (CONTRACT-BC
-                        // 24): uncaptured, as stated.
+                        // A composition the load stated eager: uncaptured,
+                        // as stated.
                         self.live.tally(engine::live::Tally::Eager, 1);
                     } else if after.hits == before.hits {
                         self.live.tally(engine::live::Tally::Unrecorded, 1);

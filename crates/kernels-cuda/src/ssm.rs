@@ -24,7 +24,7 @@ pub use conv1d::{
 };
 pub use dyn_conv::dyn_conv;
 
-/// The kernel of a beam group's fold (`BEAM-PAGE-LISTS.md` §11.3) by the step it folds
+/// The kernel of a beam group's fold by the step it folds
 /// for: launched eagerly ahead of a fire's body, so no arming fire reaches
 /// it, and a load makes its kernel beforehand ([`FoldKernel::load`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +267,7 @@ fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
     Ok(())
 }
 
-/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, as `kernels-rocm`'s
+/// A beam group's fold (as `kernels-rocm`'s
 /// `ssm::GroupFold`): its representative lane (any of its lanes; they share
 /// the set's state), where its fold rows start in the replay table, and how
 /// many. The fold kernels read a device table of them: the groups that fold

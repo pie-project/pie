@@ -1072,8 +1072,8 @@ fn golden_logits_by_refs() {
     probe(served_by_refs);
 }
 
-/// Tier refs handed out as the runtime's host and disk tiers would
-/// (CONTRACT-BC 22): a fresh chunk of the tier's `chunks` for a shape whose
+/// Tier refs handed out as the runtime's host and disk tiers would: a
+/// fresh chunk of the tier's `chunks` for a shape whose
 /// open one is full, chunk ids their own places.
 struct TierRefs {
     next: u32,
@@ -1329,7 +1329,7 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     steps
 }
 
-/// CONTRACT-BC 22: a lane offloaded mid-decode (every slot it holds to the
+/// A lane offloaded mid-decode (every slot it holds to the
 /// host tier and back, then to the disk tier and back) serves the
 /// never-offloaded lane's logits bit for bit, in one process.
 #[test]
@@ -1619,7 +1619,7 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
 }
 
 /// Every shape a parked set carries comes back bit for bit through the
-/// tiers below the device (CONTRACT-BC 22): the kv list, the window lists
+/// tiers below the device: the kv list, the window lists
 /// (Gemma's miniature), the hybrid's rs-list rows and records (Qwen3.5's),
 /// and the guests' instance and channel slots, device -> disk -> device
 /// and host -> disk -> host (and on up to the device), into other slots,
@@ -4266,7 +4266,7 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
     }
 }
 
-/// CONTRACT-BC 19: a load serving its windowed rows as ring + buffer arms
+/// A load serving its windowed rows as ring + buffer arms
 /// every composition it fires (the arming pass's synthetic lanes fold on
 /// records of their own): `PIE_GOLDEN_MODELS`
 /// (default the mini Gemma and MiMo, windowed beside full attention, MiMo's

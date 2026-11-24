@@ -579,7 +579,7 @@ impl Run<'_> {
         )
     }
 
-    /// The fire's beam group folds (`BEAM-PAGE-LISTS.md` §11.3), every
+    /// The fire's beam group folds, every
     /// recurrent layer's, launched on the fire's stream ahead of its body: a
     /// fold reads only the rows earlier fires kept in their buffer, never
     /// this fire's, so each layer's state is folded before any of the
@@ -726,7 +726,7 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The beam groups' conv window folds before the layer's step (§11.3).
+    /// The beam groups' conv window folds before the layer's step.
     pub(crate) fn conv1d_group_fold(
         &self,
         x: ValueId,
@@ -751,7 +751,7 @@ impl Run<'_> {
         )
     }
 
-    /// The beam groups' gated-delta folds before the layer's step (§11.3).
+    /// The beam groups' gated-delta folds before the layer's step.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gated_delta_group_fold(
         &self,

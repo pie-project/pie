@@ -1249,7 +1249,7 @@ impl Shell {
             // holds (`Pools::page_planes`).
             pools.page_planes().len(),
             // A hybrid beam's fork copies a page's first rows of each
-            // buffered plane (`BEAM-PAGE-LISTS.md` §11).
+            // buffered plane.
             buffers
                 .as_ref()
                 .map(crate::store::rs::Buffers::page_planes)
@@ -1547,8 +1547,8 @@ impl Shell {
         // the cache rows take what the walk leaves.
         // The staged inputs' slab is a run of that span as well, past the
         // workspaces: one address every body names, under no rung's carve.
-        // The step compositions the runtime's builder forms over this load
-        // (CONTRACT-BC 24): what the size-only walk and arming take their
+        // The step compositions the runtime's builder forms over this load:
+        // what the size-only walk and arming take their
         // targets from.
         // Expert parallelism seats its buffers in the arena laid at the
         // span's start: no smaller rung, for the set, the walk and serving.

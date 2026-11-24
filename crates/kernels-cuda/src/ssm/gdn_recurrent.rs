@@ -419,7 +419,7 @@ mod tests {
     }
 }
 
-/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, `carry`'s
+/// Folds each beam group's fold rows (`carry`'s
 /// planes `[b | a]`, keys, `u`) into its gated-delta state, as a decode step
 /// folds a token and stores it, the state stored once.
 /// The groups that fold lead `folds` (`groups` entries at most, the first of

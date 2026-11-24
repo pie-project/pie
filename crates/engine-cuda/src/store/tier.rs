@@ -55,7 +55,7 @@ pub(super) fn slot_file(error: std::io::Error) -> Fault {
     }
 }
 
-/// A tier a slot copy reads or writes (CONTRACT-BC 22).
+/// A tier a slot copy reads or writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Device,
@@ -76,7 +76,7 @@ pub(super) struct Swap {
     pub(super) wide: bool,
 }
 
-/// The disk tier below host memory (CONTRACT-BC 22): a slot file of disk
+/// The disk tier below host memory: a slot file of disk
 /// chunks, each a pool chunk on the direct I/O boundary
 /// ([`Pools::disk_chunk_bytes`]) laid out as the device's, any state
 /// shape's slots in any chunk; and the pinned stage a slot's cover (the
@@ -547,7 +547,7 @@ impl Pools {
     }
 
     /// Copies whole slots of `shape`, `(src, dst)`, from tier `from` to tier
-    /// `to` (CONTRACT-BC 22), on `stream` behind every fire enqueued on it
+    /// `to`, on `stream` behind every fire enqueued on it
     /// and ahead of every one after: a device ref is the runtime's (through
     /// the chunk table), a host ref a place in the host tier, a disk ref a
     /// place in the disk tier, of any state shape. A slot is laid the same

@@ -183,8 +183,8 @@ pub struct Shell {
     /// over them (`Shell::size_arming`), by its bucket and composition: the
     /// order arming takes within one row count (`lattice_targets`).
     walked_launches: std::collections::HashMap<(u32, String), u64>,
-    /// The step compositions the runtime's builder forms over this load
-    /// (CONTRACT-BC 24), computed from the load request's rules before
+    /// The step compositions the runtime's builder forms over this load,
+    /// computed from the load request's rules before
     /// arming: what the arm walk takes its targets from, in its order.
     steps: engine::StepShapes,
     /// What the last whole arming recorded, by treatment and bucket:
@@ -595,7 +595,7 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host tier (CONTRACT-BC 22), committed as it is
+    /// Seats this rank's host tier, committed as it is
     /// first used, behind the staging `ring` the load pinned before it
     /// measured the device ([`crate::store::staging_ring_for`]; `None` seats
     /// no tier), from `stated` bytes shared by `ranks`, within the host memory
@@ -655,7 +655,7 @@ impl Shell {
     }
     /// Seats this rank's share of `budget` disk bytes under `dir`: disk
     /// chunks of a pool chunk each, any state shape's slots in any chunk,
-    /// laid out as the device's (CONTRACT-BC 22), the division stated at
+    /// laid out as the device's, the division stated at
     /// load. `persistent` keeps its slot file for the next run. Answers
     /// the disk chunks it holds.
     pub fn seat_disk_kv(
@@ -991,7 +991,7 @@ impl Shell {
     }
 
     /// Beam `beam`'s page list of instance `id`'s beam group as its last
-    /// fire left it (`BEAM-PAGE-LISTS.md` §6.6): its state's lists are kept
+    /// fire left it: its state's lists are kept
     /// twice by the fire count's parity (`channel.hip`), the last fire's at
     /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. Every
     /// fire in flight lands first.
@@ -1041,7 +1041,7 @@ impl Shell {
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
         // A hybrid's beam group pages its beams' recurrent rows by the same
-        // lists as their kv slots, slot by slot (`BEAM-PAGE-LISTS.md` §11):
+        // lists as their kv slots, slot by slot:
         // the rs page's rows must divide the kv page's. A load whose recipe
         // does not says so at the bind, before any beam fires.
         if device.contains(eta_ir::registry::Port::Parents)
@@ -1055,7 +1055,7 @@ impl Shell {
                         "a beam group (parents) on this hybrid pages its beams' recurrent rows \
                          by their kv page lists, and the load's recipe pages them {tokens} rows a \
                          page against kv pages of {page}: the rs page's rows must divide the kv \
-                         page's (BEAM-PAGE-LISTS.md §11)"
+                         page's"
                     ),
                 ));
             }
@@ -1472,7 +1472,7 @@ pub struct StepView<'a> {
     pub attachments: &'a [Attached],
     pub media: &'a [Media<'a>],
     pub voxels: &'a [Clips<'a>],
-    /// The stated shape the runtime stamped the step with (CONTRACT-BC 24):
+    /// The stated shape the runtime stamped the step with:
     /// what treatment its body keys and the bucket a buffering step with a
     /// prompt's rows composes at are read from. `None` on a fire built by
     /// hand (arming's, a test's): read from its lanes.
@@ -1489,7 +1489,7 @@ struct RsFire<'a> {
     truncates: bool,
     /// How its lanes treat their recurrent rows.
     body: record::RsBody,
-    /// Whether its beam groups fold their sets (§11.3): it stages a fold.
+    /// Whether its beam groups fold their sets: it stages a fold.
     group_folds: bool,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,

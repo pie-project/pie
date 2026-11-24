@@ -357,7 +357,7 @@ pub fn flight_lanes(members: u32) -> u32 {
 pub struct PairRoom {
     /// What a flight of the pair lays.
     pub flight: FireBytes,
-    /// A beam group's state (BEAM-PAGE-LISTS §4), laid for the bind's
+    /// A beam group's resident state (zeroed with the item at bind), laid for the bind's
     /// depth in the instance's resident run (`engine::GuestState::resident`,
     /// live from the bind to the close): its offset from the run's first
     /// aligned byte.
@@ -583,7 +583,7 @@ impl Plane {
         // A beam group's state for the search's depth (the bind's `key_len`,
         // its end slot): each beam's pages to it, the pages a fire hands out,
         // those pending over the frames in flight and the prompt's own page
-        // (BEAM-PAGE-LISTS §3, §4). A search past it faults SHORT by name.
+        // (the pool sized exactly). A search past it faults SHORT by name.
         let beam = match program.beam_lanes() {
             Some(lanes) => {
                 if lanes > self.beam_max_lanes {

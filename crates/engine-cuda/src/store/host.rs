@@ -1,4 +1,4 @@
-//! The shared pool's host tier (CONTRACT-BC 22): pageable host memory, and
+//! The shared pool's host tier: pageable host memory, and
 //! a page-locked staging ring every move to or from the device goes
 //! through, a piece at a time.
 //!

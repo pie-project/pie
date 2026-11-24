@@ -459,7 +459,7 @@ impl Shell {
             .copy_whole_slots(self.device.stream(), shape, pairs)
     }
 
-    /// Copies whole slots of `shape` between tiers (CONTRACT-BC 22), on
+    /// Copies whole slots of `shape` between tiers, on
     /// the stream behind the fires enqueued and ahead of the next.
     pub fn copy_tier_slots(
         &mut self,
