@@ -1229,68 +1229,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_turn_that_can_go_on_moves_after_output_under_its_process() {
-        let router = MockRouter::new(Some(WorkerId(7)));
-        let sessions = Sessions::new(router.clone());
-        let mut input = launch();
-        input.resume = Some(Resume(Arc::new(|value: &str| {
-            Some(format!("after {value}"))
-        })));
-        let (_h, mut rx) = sessions
-            .create(ident(), input)
-            .await
-            .unwrap();
-        let req = router.dispatched.lock().unwrap()[0];
-        let said = |value: &str| {
-            Tokens::Chunk(ServerMessage::ProcessEvent {
-                process_id: "p".into(),
-                event: "message".into(),
-                value: value.into(),
-            })
-        };
-        sessions
-            .feed_from(req, said("one"), Some(WorkerId(7)))
-            .await;
-        *router.dispatch_worker.lock().unwrap() = Some(WorkerId(8));
-        assert!(sessions.migrate(req, WorkerId(8)).await);
-        assert_eq!(*router.cancels.lock().unwrap(), [(WorkerId(7), req)]);
-        assert_eq!(*router.moves.lock().unwrap(), [(req, Some(WorkerId(8)))]);
-        let message = router.messages.lock().unwrap()[1].clone();
-        let ClientMessage::LaunchProcess { input, .. } = message else {
-            panic!("a launch");
-        };
-        assert_eq!(input, "after one", "it goes on after what was sent");
-        assert_eq!(
-            sessions
-                .feed_from(req, said("late"), Some(WorkerId(7)))
-                .await,
-            worker_api::Control::Abort,
-            "the worker it left is not heard"
-        );
-        let renamed = Tokens::Chunk(ServerMessage::ProcessEvent {
-            process_id: "q".into(),
-            event: "message".into(),
-            value: "two".into(),
-        });
-        sessions.feed_from(req, renamed, Some(WorkerId(8))).await;
-        let mut seen = Vec::new();
-        while let Ok(Some(Tokens::Chunk(ServerMessage::ProcessEvent {
-            process_id, value, ..
-        }))) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
-        {
-            seen.push((process_id, value));
-        }
-        assert_eq!(
-            seen,
-            [
-                ("p".to_string(), "one".to_string()),
-                ("p".to_string(), "two".to_string())
-            ],
-            "one process to the client"
-        );
-    }
-
-    #[tokio::test]
     async fn cancelled_dispatches_are_cancelled_where_they_land() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());

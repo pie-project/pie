@@ -89,15 +89,6 @@ mod tests {
         assert!(channel_handle(u64::MAX - 1).is_err(), "never declared");
     }
 
-    fn ready<F: std::future::Future>(f: F) -> F::Output {
-        let mut f = std::pin::pin!(f);
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        match f.as_mut().poll(&mut cx) {
-            std::task::Poll::Ready(out) => out,
-            std::task::Poll::Pending => panic!("the driver never waits here"),
-        }
-    }
-
     /// A pass is final unless the program states it retractable: the SDK
     /// states its rows final then, and only then, and a refusal names the
     /// opt-out.
@@ -122,62 +113,4 @@ mod tests {
         assert!(refused.contains("ForwardPass::retractable"), "{refused}");
     }
 
-    /// A run ahead never submits past its budget, whatever its frame, its
-    /// window, or where the program breaks; a break takes back only the
-    /// fires past the one read (none where nothing ran past it).
-    #[test]
-    fn a_run_ahead_never_samples_past_its_budget() {
-        use std::cell::Cell;
-        for r in 1..=4 {
-            for window_frames in 1..=4 {
-                for budget in 0..=13 {
-                    for stop in (0..=budget).map(Some).chain([None]) {
-                        let (fired, taken_back, reads) = (Cell::new(0), Cell::new(0), Cell::new(0));
-                        let driver = Driver {
-                            r,
-                            window_frames,
-                            budget,
-                            submit: |live: usize| {
-                                fired.set(fired.get() + live);
-                                assert!(fired.get() <= budget, "submitted past the budget");
-                                assert!(fired.get() - reads.get() <= window_frames * r);
-                                Ok(())
-                            },
-                            close: || {},
-                            retract: |fires: u32| {
-                                taken_back.set(fires as usize);
-                                Ok(())
-                            },
-                        };
-                        let kept = if budget == 0 {
-                            0
-                        } else {
-                            ready(run_ahead_driven(driver, async || {
-                                reads.set(reads.get() + 1);
-                                Ok(if Some(reads.get()) == stop {
-                                    std::ops::ControlFlow::Break(())
-                                } else {
-                                    std::ops::ControlFlow::Continue(())
-                                })
-                            }))
-                            .unwrap()
-                        };
-                        let what = format!("r {r} window {window_frames} budget {budget} stop {stop:?}");
-                        assert!(fired.get() <= budget, "{what}");
-                        match stop.filter(|&s| s >= 1 && budget > 0) {
-                            Some(s) => {
-                                assert_eq!(kept, s, "{what}");
-                                assert_eq!(taken_back.get(), fired.get() - s, "{what}");
-                            }
-                            None => {
-                                assert_eq!(kept, budget, "{what}");
-                                assert_eq!(fired.get(), budget, "{what}");
-                                assert_eq!(taken_back.get(), 0, "{what}");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }

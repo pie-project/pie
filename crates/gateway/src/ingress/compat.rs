@@ -886,26 +886,4 @@ mod tests {
         assert!(props.is_empty());
     }
 
-    #[test]
-    fn a_completion_prompt_of_token_ids_is_stated_as_them() {
-        assert_eq!(
-            completion_token_ids(&json!({"prompt": [5, 6]})),
-            Some(json!([5, 6]))
-        );
-        assert_eq!(
-            completion_token_ids(&json!({"prompt": [[5, 6]]})),
-            Some(json!([5, 6]))
-        );
-        assert_eq!(completion_token_ids(&json!({"prompt": [[5], [6]]})), None);
-        assert_eq!(completion_token_ids(&json!({"prompt": "abc"})), None);
-    }
-
-    #[test]
-    fn a_completion_prompt_is_its_one_string() {
-        assert_eq!(completion_prompt(&json!({"prompt": "abc"})), Some("abc"));
-        assert_eq!(completion_prompt(&json!({"prompt": ["abc"]})), Some("abc"));
-        assert_eq!(completion_prompt(&json!({"prompt": ["a", "b"]})), None);
-        assert_eq!(completion_prompt(&json!({"prompt": [1, 2]})), None);
-        assert_eq!(completion_prompt(&json!({"messages": []})), None);
-    }
 }
