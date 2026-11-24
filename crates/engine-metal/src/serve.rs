@@ -7418,7 +7418,7 @@ fn beam_faulted(
         .filter(|(word, _)| *word != 0)
         .map(|(word, &(lane, instance))| {
             let at = u32::try_from(lane).unwrap_or(u32::MAX);
-            (at..at + 1, instance, crate::beam::fault_reason(word, lane))
+            (at..at + 1, instance, engine::beam::fault_reason(word, lane, "engine-metal"))
         })
         .collect()
 }
