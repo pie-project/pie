@@ -10951,6 +10951,11 @@ impl<B: Serve> Shell<B> {
             .or_else(|| B::max_maps(self));
         let maps_before = map_count().unwrap_or(0);
         let mut dearest_maps = 0u64;
+        // The process's maps as last read: the file lists every map, so a
+        // read costs as many as the process holds (a kgsl map each driver
+        // allocation, on Android). A recording makes them; a shape that
+        // records none reads the count it left, re-read each 64 shapes.
+        let mut maps_seen = map_count();
         let before = rss();
         let mut dearest = 0u64;
         let mut dearest_device = 0u64;
@@ -10966,7 +10971,24 @@ impl<B: Serve> Shell<B> {
         }
         // `flags`: 1 a capturing lane of the pageless form (its key rows
         // alone), 2 every lane reading out its class's outputs.
+        let mut stride = (std::time::Instant::now(), [0u64; 10]);
         for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
+            // Under the kernel profile, each 64 shapes' time and its phases:
+            // whether the walk slows as it goes.
+            if crate::kernel_profile::phases_timed() && at % 64 == 0 && at > 0 {
+                let now: [u64; 10] = std::array::from_fn(|phase| {
+                    crate::kernel_profile::WALK_PHASES[phase].load(std::sync::atomic::Ordering::Relaxed)
+                });
+                let ms: Vec<u64> = now.iter().zip(&stride.1).map(|(n, b)| (n - b) / 1_000_000).collect();
+                tracing::info!(
+                    at,
+                    of = shapes.len(),
+                    ms = stride.0.elapsed().as_millis() as u64,
+                    phases_ms = ?ms,
+                    "arm walk stride"
+                );
+                stride = (std::time::Instant::now(), now);
+            }
             // A known lattice states eager what its allowance did; every shape
             // short of it is walked, the ones whose family an earlier shape
             // recorded filling it (their fills kept before ready).
@@ -10977,6 +10999,7 @@ impl<B: Serve> Shell<B> {
             }) {
                 break;
             }
+            let probed = std::time::Instant::now();
             let used = rss().saturating_sub(before);
             // The next shape's bodies cost what the dearest so far did, on
             // each arm: on the host (its resident bytes) and on the device
@@ -10991,12 +11014,16 @@ impl<B: Serve> Shell<B> {
             let cmds_short = most_cmds.is_some_and(|most| {
                 live_cmds.saturating_add(dearest_cmds.saturating_mul(depth as u64)) >= most
             });
-            let maps_now = map_count();
+            if at % 64 == 0 {
+                maps_seen = map_count();
+            }
+            let maps_now = maps_seen;
             let maps_short = max_maps.zip(maps_now).is_some_and(|(most, now)| {
                 now.saturating_add(dearest_maps.saturating_mul(depth as u64))
                     .saturating_add(maps_before)
                     >= most
             });
+            crate::kernel_profile::phase_if(9, probed);
             if device_short || host_short || cmds_short || maps_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
@@ -11053,10 +11080,13 @@ impl<B: Serve> Shell<B> {
             }
             let families = self.recorded;
             for arm in 0..depth {
+                let probed = std::time::Instant::now();
                 let ahead = rss();
                 let cmds_ahead = B::command_buffers(self).0;
-                let maps_ahead = map_count();
+                let maps_ahead = maps_seen;
                 let left_ahead = self.device.left();
+                let bodies_ahead = self.recorded;
+                crate::kernel_profile::phase_if(9, probed);
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
@@ -11142,14 +11172,23 @@ impl<B: Serve> Shell<B> {
                 // A body's cost: what it took of the host's memory or of the
                 // device's (a driver that keeps its command buffers and
                 // descriptors in device-visible memory), whichever is more.
+                // An arm that recorded no body (its fill derived, laid or
+                // walked into a family recorded before) cost none.
+                if self.recorded == bodies_ahead {
+                    recorded += 1;
+                    continue;
+                }
+                let probed = std::time::Instant::now();
                 let on_device = left_ahead.saturating_sub(self.device.left());
                 let cost = rss().saturating_sub(ahead).max(on_device);
                 dearest = dearest.max(cost);
                 dearest_device = dearest_device.max(on_device);
                 dearest_cmds = dearest_cmds.max(B::command_buffers(self).0.saturating_sub(cmds_ahead));
-                if let (Some(ahead), Some(after)) = (maps_ahead, map_count()) {
+                maps_seen = map_count();
+                if let (Some(ahead), Some(after)) = (maps_ahead, maps_seen) {
                     dearest_maps = dearest_maps.max(after.saturating_sub(ahead));
                 }
+                crate::kernel_profile::phase_if(9, probed);
                 recorded += 1;
             }
             if self.recorded > families {
