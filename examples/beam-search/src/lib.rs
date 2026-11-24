@@ -47,8 +47,12 @@ struct Input {
     /// Beam width. `1` degenerates to greedy decoding (the beam identity).
     #[serde(default = "default_beams")]
     beams: u32,
+    /// `rollback_mode: "ckpt_sync"` when `rollback_mode` is left out.
     #[serde(default)]
     ckpt_sync: bool,
+    /// `flush_free` (no checkpoint), `ckpt_sync` (each step checkpoints the
+    /// pool and, when a beam changed parent, replays on a fork of it) or
+    /// `stop_wait` (the replay every step). Any other name is refused.
     #[serde(default)]
     rollback_mode: Option<String>,
     /// Rescore each final hypothesis as a lone sequence, one token a fire on
@@ -106,6 +110,27 @@ fn advance<T: Copy>(rows: &[Vec<T>], picked: &[T], parents: &[u32]) -> Result<Ve
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rollback {
+    FlushFree,
+    CkptSync,
+    StopWait,
+}
+
+/// The rollback the request names; a name this program does not run is
+/// refused, never taken for the default.
+fn rollback(input: &Input) -> Result<Rollback> {
+    match input.rollback_mode.as_deref() {
+        None if input.ckpt_sync => Ok(Rollback::CkptSync),
+        None | Some("flush_free") => Ok(Rollback::FlushFree),
+        Some("ckpt_sync") => Ok(Rollback::CkptSync),
+        Some("stop_wait") => Ok(Rollback::StopWait),
+        Some(other) => Err(format!(
+            "unknown rollback_mode `{other}`: this program runs flush_free, ckpt_sync or stop_wait"
+        )),
+    }
+}
+
 fn advance_hypotheses(
     hypotheses: &[Vec<u32>],
     picked: &[i32],
@@ -119,6 +144,7 @@ fn advance_hypotheses(
 async fn main(input: Input) -> Result<String> {
     let max_steps = input.max_tokens;
     let b = input.beams;
+    let mode = rollback(&input)?;
     if b == 0 {
         return Err("beams must be at least 1".into());
     }
@@ -315,22 +341,12 @@ async fn main(input: Input) -> Result<String> {
         });
 
         let mut step = 0usize;
-        let mode = input
-            .rollback_mode
-            .as_deref()
-            .unwrap_or(if input.ckpt_sync {
-                "ckpt_sync"
-            } else {
-                "flush_free"
-            });
-        let ckpt_sync = mode == "ckpt_sync";
-        let stop_wait = mode == "stop_wait";
-        if ckpt_sync || stop_wait {
+        let stop_wait = mode == Rollback::StopWait;
+        if mode != Rollback::FlushFree {
             for _ in 0..decodes {
-                // The step's checkpoint, forked before its fire.
                 let ckpt_ws = ws
                     .fork(&pipeline)
-                    .with_context(|| format!("@{step}: checkpoint the pool"))?;
+                    .with_context(|| format!("checkpoint @{step}"))?;
                 fwd.submit(&pipeline).with_context(|| format!("@{step}"))?;
                 let picked = out
                     .take_host::<Vec<i32>>()
@@ -1340,4 +1356,26 @@ async fn teacher_forced(
     }
     pipeline.close();
     Ok((steps, finals))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(json: &str) -> Input {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A rollback the program does not run is refused by name, not flushed.
+    #[test]
+    fn an_unknown_rollback_mode_is_refused() {
+        let err = rollback(&request(r#"{"rollback_mode": "ckpt"}"#)).unwrap_err();
+        assert!(err.contains("unknown rollback_mode `ckpt`"), "{err}");
+        assert_eq!(rollback(&request("{}")), Ok(Rollback::FlushFree));
+        assert_eq!(rollback(&request(r#"{"ckpt_sync": true}"#)), Ok(Rollback::CkptSync));
+        assert_eq!(
+            rollback(&request(r#"{"rollback_mode": "stop_wait"}"#)),
+            Ok(Rollback::StopWait)
+        );
+    }
 }
