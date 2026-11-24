@@ -1379,8 +1379,6 @@ impl Shell {
                 boot.residency.cached_experts()
             },
             !boot.knobs.dense_weights(),
-            boot.knobs.diagnostics.one_window,
-            boot.knobs.diagnostics.windowed_state,
             boot.budget.max_tokens,
         )?;
         if boot.knobs.diagnostics.arm_trace {

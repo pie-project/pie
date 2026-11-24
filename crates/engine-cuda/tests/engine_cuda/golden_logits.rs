@@ -655,9 +655,6 @@ pub(super) fn knobs() -> engine_cuda::Knobs {
     if std::env::var_os("PIE_GOLDEN_EAGER").is_some() {
         knobs.pin = Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off)));
     }
-    // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
-    knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
-    knobs.diagnostics.windowed_state = std::env::var_os("PIE_GOLDEN_WINDOWED_STATE").is_some();
     knobs.diagnostics.arm_trace = std::env::var_os("PIE_GOLDEN_ARM_TRACE").is_some();
     // `PIE_GOLDEN_TIER_INLINE`: tier copies ride the compute stream.
     knobs.diagnostics.tier_inline = std::env::var_os("PIE_GOLDEN_TIER_INLINE").is_some();
@@ -966,10 +963,9 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             u32::try_from(tokens.len()).expect("a count"),
             false,
         ));
-        let more: Vec<&[u32]> = windows.iter().skip(1).map(Vec::as_slice).collect();
         let window = windows.first().map_or(&[][..], Vec::as_slice);
         fn seat<'a>(
-            (pages, window, more, record): (&'a [u32], &'a [u32], &'a [&'a [u32]], Option<u32>),
+            (pages, window, record): (&'a [u32], &'a [u32], Option<u32>),
             word: u64,
             tokens: &'a [u32],
             held: u32,
@@ -978,7 +974,6 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 pages,
                 held: Some(held),
                 window,
-                more_windows: more,
                 rs_slot: record,
                 ..Seated::of(Lane {
                     slot: 0,
@@ -987,7 +982,7 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 })
             }
         }
-        let tables = (&pages[..], window, &more[..], record);
+        let tables = (&pages[..], window, record);
         let seated = |word, tokens, held| seat(tables, word, tokens, held);
         // A long prompt of a load that replays (`engine_cuda::replay`) fires
         // as the runtime's step and `Shell::fire` split it: its leading rows
@@ -4354,8 +4349,8 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
 }
 
 /// CONTRACT-BC 19: a load serving its windowed rows as ring + buffer arms
-/// every composition it fires, as its window lists do (the arming pass's
-/// synthetic lanes fold on records of their own): `PIE_GOLDEN_MODELS`
+/// every composition it fires (the arming pass's synthetic lanes fold on
+/// records of their own): `PIE_GOLDEN_MODELS`
 /// (default the mini Gemma and MiMo, windowed beside full attention, MiMo's
 /// routed), many seats.
 #[test]
@@ -4372,9 +4367,7 @@ fn golden_windowed_arms() {
     );
     for model in models {
         let fixture = fixture(&model, &cache);
-        let mut knobs = knobs();
-        knobs.diagnostics.windowed_state = true;
-        let shell = load_lanes(&fixture, &cache, knobs, 16, None);
+        let shell = load_lanes(&fixture, &cache, knobs(), 16, None);
         assert!(
             !shell.windowed_layers().is_empty(),
             "{model}: the load keeps rings"

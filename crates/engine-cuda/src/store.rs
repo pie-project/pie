@@ -1070,8 +1070,6 @@ impl Pools {
         chunk_bytes: Option<u64>,
         experts: &[usize],
         rows: bool,
-        one_window: bool,
-        windowed_state: bool,
         own_rows_tokens: u32,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, ceiling)?;
@@ -1082,8 +1080,6 @@ impl Pools {
             chunk_bytes,
             experts,
             rows,
-            one_window,
-            windowed_state,
         )?;
         // The pages a fire's own rows take where its lane folds them past
         // what its ring holds (`OwnRows`): at the activation's top, above
@@ -2329,16 +2325,6 @@ impl Pools {
         let layout = self.chunks.layout();
         at.checked_sub(usize::from(layout.list.is_some()))
             .filter(|&window| window < layout.windows.len())
-    }
-
-    /// The tokens window list `window` retains.
-    #[must_use]
-    pub fn window_tokens(&self, window: usize) -> Option<u32> {
-        self.chunks
-            .layout()
-            .windows
-            .get(window)
-            .and_then(|shape| shape.window)
     }
 
     /// Each window a kv row is declared with and the page table of a
@@ -5601,8 +5587,6 @@ fn lay(
     chunk_bytes: Option<u64>,
     experts: &[usize],
     rows: bool,
-    one_window: bool,
-    windowed: bool,
 ) -> Result<layout::Layout> {
     let context = if paging.window.is_some() {
         paging.context()
@@ -5619,16 +5603,15 @@ fn lay(
     server.tma_rows = tma;
     let paged = server.paged(paging.page_size, context);
     let profile = poem_compiler::DeviceProfile {
-        chunk: if one_window { paged.merged() } else { paged },
+        chunk: paged,
         ..poem_compiler::DeviceProfile::default()
     };
     // Each plane at the bytes its slot holds: laid scales as their atoms.
     let view = crate::weights::laid_view(trace);
-    let recipe = if windowed {
-        poem_compiler::chunk::plan_windowed(&view, budgets, &profile, &CudaRings)
-    } else {
-        poem_compiler::chunk::plan(&view, budgets, &profile)
-    }
+    // Windowed rows as ring + buffer (CONTRACT-BC 19, 21): each windowed
+    // layer's last folded rows a ring in the lane's record, its unfolded
+    // rows in the window buffer.
+    let recipe = poem_compiler::chunk::plan_windowed(&view, budgets, &profile, &CudaRings)
     .map_err(|why| Fault::Unbound {
         what: format!("a chunk recipe for this load's cache rows: {why}"),
     })?;

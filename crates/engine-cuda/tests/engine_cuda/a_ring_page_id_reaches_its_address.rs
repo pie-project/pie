@@ -52,8 +52,6 @@ fn a_ring_page_id_reaches_its_address() {
         None,
         &[],
         true,
-        false,
-        true,
         256,
     )
     .expect("the pool reserves");
