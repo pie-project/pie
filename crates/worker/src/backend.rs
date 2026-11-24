@@ -41,64 +41,6 @@ pub enum EngineOptions {
 
 pub use engine::Capabilities as EngineCapabilities;
 
-/// The fire ceilings of a shell with no planner to derive its rungs from
-/// the device: the most lanes and tokens one fire carries.
-#[cfg(any(
-    feature = "vulkan",
-    feature = "wgpu",
-    feature = "xla",
-    feature = "cerebras",
-    all(feature = "metal", target_vendor = "apple")
-))]
-#[derive(Clone, Copy)]
-struct Fire {
-    lanes: u32,
-    tokens: u32,
-}
-
-#[cfg(any(
-    feature = "vulkan",
-    feature = "wgpu",
-    feature = "xla",
-    feature = "cerebras",
-    all(feature = "metal", target_vendor = "apple")
-))]
-impl Fire {
-    /// Its lanes and tokens.
-    const fn of(self) -> (u32, u32) {
-        (self.lanes, self.tokens)
-    }
-}
-
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
-const METAL_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
-};
-/// The Metal shell has no planner to derive a page from.
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
-const METAL_PAGE_SIZE: u32 = 32;
-#[cfg(feature = "vulkan")]
-const VULKAN_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
-};
-#[cfg(feature = "wgpu")]
-const WGPU_FIRE: Fire = Fire {
-    lanes: 512,
-    tokens: 10240,
-};
-#[cfg(feature = "xla")]
-const XLA_FIRE: Fire = Fire {
-    lanes: 64,
-    tokens: 2608,
-};
-#[cfg(feature = "cerebras")]
-const CEREBRAS_FIRE: Fire = Fire {
-    lanes: 4,
-    tokens: 64,
-};
-
 /// The index in a device name (`vulkan:1`, `tpu:0`), for a shell that drives
 /// one device; its family must be one of `families`.
 #[cfg(any(feature = "vulkan", feature = "wgpu", feature = "xla"))]
@@ -118,6 +60,48 @@ fn device_index(devices: &[String], families: &[&str]) -> Result<u32> {
     index
         .parse()
         .map_err(|_| anyhow!("[engine] device {device:?}: {index:?} is not a device number"))
+}
+
+/// The budgets a shell with no planner loads at: the fire ceiling its
+/// engine states ([`engine::Engine::fire_ceiling`]), the operator's adapter
+/// seats, and the stated context (a stated 0 is unstated; at least one
+/// page), which binds where the engine's program is built for it.
+#[cfg(any(
+    feature = "vulkan",
+    feature = "wgpu",
+    feature = "xla",
+    feature = "cerebras",
+    all(feature = "metal", target_vendor = "apple")
+))]
+fn ceiling_budgets(
+    engine: &dyn engine::Engine,
+    adapters: &crate::config::AdapterConfig,
+    max_context: Option<u32>,
+) -> Result<engine::Budgets> {
+    let ceiling = engine.fire_ceiling().ok_or_else(|| {
+        anyhow!(
+            "[engine] the {} engine states no fire ceiling, and the worker has no planner to \
+             derive one",
+            engine.kind()
+        )
+    })?;
+    let defaults = engine::Budgets::default();
+    let page_size = ceiling.page_size.unwrap_or(defaults.page_size);
+    let stated = max_context.filter(|&len| len > 0);
+    Ok(engine::Budgets {
+        max_lanes: ceiling.lanes,
+        max_tokens: ceiling.tokens,
+        buckets: Vec::new(),
+        max_adapters: adapters.seats(),
+        page_size,
+        max_context: stated.unwrap_or(defaults.max_context).max(page_size),
+        context_declared: ceiling.context_binds && stated.is_some(),
+        slots: 0,
+        max_patches: None,
+        max_images: None,
+        max_voxels: None,
+        max_clips: None,
+    })
 }
 
 #[cfg(any(feature = "engine-cuda", test))]
@@ -621,27 +605,8 @@ pub(crate) fn create_engine_backend(
                 || runtime::engine::backend::open::metal(boot_doc.as_bytes()),
                 Ok,
             )?;
-            let page_size = METAL_PAGE_SIZE;
-            let max_context = max_context.unwrap_or_else(|| engine::Budgets::default().max_context);
-            let (max_lanes, max_tokens) = METAL_FIRE.of();
-            (
-                backend,
-                engine::Budgets {
-                    max_lanes,
-                    max_tokens,
-                    buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
-                    page_size,
-                    max_context,
-                    context_declared: false,
-                    slots: 0,
-                    max_patches: None,
-                    max_images: None,
-                    max_voxels: None,
-                    max_clips: None,
-                },
-                poem_ir::Platform::Metal,
-            )
+            let budgets = ceiling_budgets(backend.as_ref(), adapters, max_context)?;
+            (backend, budgets, poem_ir::Platform::Metal)
         }
         #[cfg(feature = "vulkan")]
         EngineOptions::Vulkan(opts) => {
@@ -664,26 +629,8 @@ pub(crate) fn create_engine_backend(
                 || runtime::engine::backend::open::vulkan(boot_doc.as_bytes()),
                 Ok,
             )?;
-            let defaults = engine::Budgets::default();
-            let (max_lanes, max_tokens) = VULKAN_FIRE.of();
-            (
-                backend,
-                engine::Budgets {
-                    max_lanes,
-                    max_tokens,
-                    buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
-                    page_size: defaults.page_size,
-                    max_context: max_context.unwrap_or(defaults.max_context),
-                    context_declared: false,
-                    slots: 0,
-                    max_patches: None,
-                    max_images: None,
-                    max_voxels: None,
-                    max_clips: None,
-                },
-                poem_ir::Platform::Vulkan,
-            )
+            let budgets = ceiling_budgets(backend.as_ref(), adapters, max_context)?;
+            (backend, budgets, poem_ir::Platform::Vulkan)
         }
         #[cfg(feature = "wgpu")]
         EngineOptions::Wgpu(opts) => {
@@ -706,26 +653,8 @@ pub(crate) fn create_engine_backend(
                 || runtime::engine::backend::open::wgpu(boot_doc.as_bytes()),
                 Ok,
             )?;
-            let defaults = engine::Budgets::default();
-            let (max_lanes, max_tokens) = WGPU_FIRE.of();
-            (
-                backend,
-                engine::Budgets {
-                    max_lanes,
-                    max_tokens,
-                    buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
-                    page_size: defaults.page_size,
-                    max_context: max_context.unwrap_or(defaults.max_context),
-                    context_declared: false,
-                    slots: 0,
-                    max_patches: None,
-                    max_images: None,
-                    max_voxels: None,
-                    max_clips: None,
-                },
-                poem_ir::Platform::Wgpu,
-            )
+            let budgets = ceiling_budgets(backend.as_ref(), adapters, max_context)?;
+            (backend, budgets, poem_ir::Platform::Wgpu)
         }
         #[cfg(feature = "xla")]
         EngineOptions::Xla(opts) => {
@@ -750,29 +679,8 @@ pub(crate) fn create_engine_backend(
                 || runtime::engine::backend::open::xla(boot_doc.as_bytes()),
                 Ok,
             )?;
-            let defaults = engine::Budgets::default();
-            let (max_lanes, max_tokens) = XLA_FIRE.of();
-            (
-                backend,
-                engine::Budgets {
-                    max_lanes,
-                    max_tokens,
-                    buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
-                    page_size: defaults.page_size,
-                    max_context: max_context
-                        .filter(|&len| len > 0)
-                        .unwrap_or(defaults.max_context)
-                        .max(defaults.page_size),
-                    context_declared: false,
-                    slots: 0,
-                    max_patches: None,
-                    max_images: None,
-                    max_voxels: None,
-                    max_clips: None,
-                },
-                poem_ir::Platform::Xla,
-            )
+            let budgets = ceiling_budgets(backend.as_ref(), adapters, max_context)?;
+            (backend, budgets, poem_ir::Platform::Xla)
         }
         #[cfg(feature = "cerebras")]
         EngineOptions::Cerebras(opts) => {
@@ -813,30 +721,8 @@ pub(crate) fn create_engine_backend(
             doc.insert("cerebras".into(), toml::Value::Table(cerebras));
             let boot_doc = toml::to_string(&doc)?;
             let backend = runtime::engine::backend::open::cerebras(boot_doc.as_bytes())?;
-            let defaults = engine::Budgets::default();
-            let (max_lanes, max_tokens) = CEREBRAS_FIRE.of();
-            (
-                backend,
-                engine::Budgets {
-                    max_lanes,
-                    max_tokens,
-                    buckets: Vec::new(),
-                    max_adapters: adapters.seats(),
-                    page_size: defaults.page_size,
-                    max_context: max_context
-                        .filter(|&len| len > 0)
-                        .unwrap_or(defaults.max_context)
-                        .max(defaults.page_size),
-                    // a stated length is the positions the wafer program is built for
-                    context_declared: max_context.is_some_and(|len| len > 0),
-                    slots: 0,
-                    max_patches: None,
-                    max_images: None,
-                    max_voxels: None,
-                    max_clips: None,
-                },
-                poem_ir::Platform::Cerebras,
-            )
+            let budgets = ceiling_budgets(backend.as_ref(), adapters, max_context)?;
+            (backend, budgets, poem_ir::Platform::Cerebras)
         }
     };
     #[cfg_attr(

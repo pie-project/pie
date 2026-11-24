@@ -29,6 +29,23 @@ pub const CUDA_FIRE_LANES: u32 = 512;
 /// planner's page.
 pub const CUDA_PAGE_SIZE: u32 = 16;
 
+/// The fire a shell with no planner to derive its rungs from the device
+/// serves at most, stated before its load ([`crate::Engine::fire_ceiling`]):
+/// the worker asks the load for these budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FireCeiling {
+    /// The most lanes one fire carries.
+    pub lanes: u32,
+    /// The most tokens one fire carries.
+    pub tokens: u32,
+    /// The tokens a kv page holds where the shell fixes it; `None`: the
+    /// load's default page.
+    pub page_size: Option<u32>,
+    /// A stated context is the positions the engine's program is built
+    /// for, not a budget the engine may shorten to what the device holds.
+    pub context_binds: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     pub max_lanes: u32,
