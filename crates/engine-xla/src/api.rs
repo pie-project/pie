@@ -654,7 +654,7 @@ impl Engine for Xla {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
-                prefill_lanes: 0,
+                prefill_lanes: shell.prefill_lanes(),
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
                     &budgets,
                 )))

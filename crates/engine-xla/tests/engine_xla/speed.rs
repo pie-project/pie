@@ -103,6 +103,71 @@ fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     f64::from(len) / median(&mut times)
 }
 
+/// One prefill fire of `rows` rows as `lanes` prompts (the rows split
+/// evenly, the first taking the rest), seconds to its readout: the median
+/// of `runs`. A fire's lane count is part of its program (a recurrent
+/// layer's chunked scan lays out a chunk for every lane): at one row
+/// bucket, the times across lane counts say what padding a fire's prompts
+/// to a coarser lane rung costs.
+fn prefill_lanes(model: &mut Model, rows: u32, lanes: u32, runs: u32) -> f64 {
+    let vocab = model.vocab;
+    let each = rows / lanes;
+    // each fire's slots from the pool's start again (timing only)
+    let fire = |model: &mut Model, seed: u64| {
+        let refs = &mut Refs::of(model);
+        let fired: Vec<_> = (0..lanes)
+            .map(|l| {
+                let n = if l == 0 {
+                    rows - each * (lanes - 1)
+                } else {
+                    each
+                };
+                let mut seq = Seq::new(l);
+                seq.lane(model, refs, tokens(seed + u64::from(l), n as usize, vocab))
+            })
+            .collect();
+        model.fire(fired);
+    };
+    for w in 0..2 {
+        fire(model, w);
+    }
+    let mut times = Vec::with_capacity(runs as usize);
+    for r in 0..runs {
+        let t = Instant::now();
+        fire(model, 100 + u64::from(r));
+        times.push(t.elapsed().as_secs_f64());
+    }
+    median(&mut times)
+}
+
+/// One prefill fire of prompts of `rows` rows each, seconds to its
+/// readout: the median of `runs` (how a fire's padding layout costs).
+fn prefill_split(model: &mut Model, rows: &[u32], runs: u32) -> f64 {
+    let vocab = model.vocab;
+    let fire = |model: &mut Model, seed: u64| {
+        let refs = &mut Refs::of(model);
+        let fired: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(l, &n)| {
+                let mut seq = Seq::new(l as u32);
+                seq.lane(model, refs, tokens(seed + l as u64, n as usize, vocab))
+            })
+            .collect();
+        model.fire(fired);
+    };
+    for w in 0..2 {
+        fire(model, w);
+    }
+    let mut times = Vec::with_capacity(runs as usize);
+    for r in 0..runs {
+        let t = Instant::now();
+        fire(model, 100 + u64::from(r));
+        times.push(t.elapsed().as_secs_f64());
+    }
+    median(&mut times)
+}
+
 /// The model as the gate loads it: streaming its weights, or held with
 /// `PIE_XLA_WEIGHTS_HELD=1` (what the worker loads unless streaming is on);
 /// cut to `PIE_XLA_SPEED_LAYERS` layers where set (a whole model's widths
@@ -134,6 +199,38 @@ fn speed() {
         let tps = match kind {
             "decode" => decode(&name, n, 64, 20),
             "prefill" => prefill(&name, n, 7),
+            "split" => {
+                // `PIE_XLA_SPEED_SPLITS`: fires of prompts' rows, `;` apart
+                set("SLOTS", 64);
+                set("LANES", 64);
+                set("TOKENS", n);
+                let mut model = load(&name, (n + 64).next_power_of_two());
+                let splits = std::env::var("PIE_XLA_SPEED_SPLITS").unwrap_or_default();
+                for split in splits.split(';').filter(|s| !s.is_empty()) {
+                    let rows: Vec<u32> =
+                        split.split('/').map(|r| r.parse().expect("rows")).collect();
+                    let s = prefill_split(&mut model, &rows, 9);
+                    eprintln!("SPEED {name} split {split}: {:.3} ms", s * 1e3);
+                }
+                continue;
+            }
+            "lanes" => {
+                // `n` rows as 1 to 64 prompts, one model for them all
+                set("SLOTS", 64);
+                set("LANES", 64);
+                set("TOKENS", n);
+                let mut model = load(&name, (n + 64).next_power_of_two());
+                for lanes in [1u32, 2, 4, 8, 16, 32, 64] {
+                    if n / lanes >= 2 {
+                        let s = prefill_lanes(&mut model, n, lanes, 7);
+                        eprintln!(
+                            "SPEED {name} lanes {n} rows over {lanes}: {:.3} ms",
+                            s * 1e3
+                        );
+                    }
+                }
+                continue;
+            }
             other => panic!("unknown run {other}"),
         };
         eprintln!("SPEED {name} {kind} {n}: {tps:.1} tok/s");
