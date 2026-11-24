@@ -476,16 +476,6 @@ impl ExpertTable {
     }
 }
 
-/// The contiguous bank's table: `planes` given as `(base, stride)` in bytes,
-/// expert `e`'s entry `p` at `base_p + e * stride_p` (a plane the bank lacks
-/// as `(0, 0)`). Uploaded, it lands what no table does.
-#[must_use]
-pub fn contiguous_entries(experts: u32, planes: &[(u64, u64)]) -> Vec<u64> {
-    (0..u64::from(experts))
-        .flat_map(|e| planes.iter().map(move |&(base, stride)| base + e * stride))
-        .collect()
-}
-
 /// Where a token-id-gathered table's row blocks lie, as the CUDA kernels
 /// take it: a u64 address a block of `block_rows` rows (null: the
 /// contiguous table), and a u32 read counter a block (`hits`, or 0).
@@ -1392,10 +1382,10 @@ mod ordered {
 }
 
 /// Grouped GEMMs the hipBLASLt leg has launched, for tests.
-#[cfg(feature = "rocm")]
+#[cfg(all(feature = "rocm", feature = "test-support"))]
 static LT_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "rocm")]
+#[cfg(all(feature = "rocm", feature = "test-support"))]
 pub fn lt_grouped_fires() -> u64 {
     LT_FIRES.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -1538,6 +1528,7 @@ fn lt_launch(
     // naming staged planes and the bank, all live through the fire.
     unsafe { lib.launch(at, experts + 1, args, grid, stream) }.map_err(|why| refuse(op, why))?;
     // A size-only walk launches nothing.
+    #[cfg(feature = "test-support")]
     if !crate::sizing::active() {
         LT_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }

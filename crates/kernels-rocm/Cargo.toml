@@ -16,6 +16,10 @@ path = "src/lib.rs"
 default = []
 
 rocm = ["dep:libloading", "dep:miniz_oxide", "dep:zstd"]
+# The references and counters only the crate's own tests read: the serial
+# scans the chunked passes answer to, the tiled product at a stated tuple,
+# the hipBLASLt leg's launch count.
+test-support = []
 
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
@@ -30,6 +34,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 engine = { path = "../engine" }
+kernels-rocm = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

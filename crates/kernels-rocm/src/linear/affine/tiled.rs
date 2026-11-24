@@ -143,6 +143,8 @@ pub fn lm_head(
     tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
+/// [`matmul`] at a stated tile tuple, whatever the tuning picks.
+#[cfg(feature = "test-support")]
 pub fn matmul_with(
     ctx: &Ctx,
     act: Tensor,

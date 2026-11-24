@@ -1432,6 +1432,7 @@ impl Delta {
     }
 }
 
+#[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked_serial(
     ctx: &Ctx,
@@ -2134,6 +2135,7 @@ pub fn kda_fold(
 
 /// `kda_chunked` through the token-by-token scan whatever the head: the
 /// reference the chunk-parallel passes answer to.
+#[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn kda_chunked_serial(
     ctx: &Ctx,
