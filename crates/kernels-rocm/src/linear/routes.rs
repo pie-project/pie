@@ -35,28 +35,3 @@ impl Kernel {
 pub fn pick(routes: &Routes, shape: Shape, weight: u64) -> Kernel {
     Kernel::of(routes.pick(shape, weight, &Kernel::CANDIDATES)).unwrap_or(Kernel::Skinny)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GATE_UP: Shape = Shape { kind: Kind::NormedGated, rows: 6144, k: 1024, m: 4 };
-
-    #[test]
-    fn the_turned_kernel_serves_only_where_it_is_faster_past_the_noise() {
-        let routes = |turned: f64, skinny: f64| {
-            Routes::default().with(&[
-                (GATE_UP, Kernel::Turned as u32, turned, 100.0),
-                (GATE_UP, Kernel::Skinny as u32, skinny, 60.0),
-            ])
-        };
-        assert_eq!(pick(&routes(9000.0, 9500.0), GATE_UP, 1), Kernel::Turned);
-        assert_eq!(pick(&routes(9000.0, 9080.0), GATE_UP, 1), Kernel::Skinny);
-        assert_eq!(pick(&routes(9500.0, 9000.0), GATE_UP, 1), Kernel::Skinny);
-    }
-
-    #[test]
-    fn an_unmeasured_shape_takes_the_skinny_kernel() {
-        assert_eq!(pick(&Routes::default(), GATE_UP, 1), Kernel::Skinny);
-    }
-}

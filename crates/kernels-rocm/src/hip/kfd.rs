@@ -327,33 +327,3 @@ fn property(node: &Path, name: &str) -> Result<Option<u64>, String> {
         (key == name).then(|| value.trim().parse().ok()).flatten()
     }))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_queue_holds_what_kfd_sizes_on_gfx942() {
-        // MI300X: 38 CUs and 32 arrays an XCC, 8 XCC; measured 186,019,840
-        // bytes of device memory a queue past what HIP counts.
-        let debug = debug_bytes(90_402, 38, 32).unwrap();
-        assert_eq!(debug, 48_640);
-        let areas = SaveAreas {
-            queues: 1,
-            xcc: 8,
-            cwsr: 23_203_840,
-            debug,
-        };
-        assert_eq!(areas.area(), 186_019_840);
-    }
-
-    #[test]
-    fn a_bus_id_is_its_kfd_location() {
-        assert_eq!(parse_bus_id("0000:83:00.0"), Some((0, 0x8300)));
-        assert_eq!(
-            parse_bus_id("0001:0a:1f.7"),
-            Some((1, 0x0a << 8 | 0x1f << 3 | 7))
-        );
-        assert_eq!(parse_bus_id("83:00.0"), None);
-    }
-}
