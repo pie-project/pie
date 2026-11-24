@@ -953,7 +953,11 @@ impl Shell {
         let group_masked = group_masked_classes(&boot.trace, &compiled);
         let wide = wide_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
-        let landing = landing_requests(&boot.trace.facts, &compiled.classes);
+        let adapter_fact = adapter_fact(&compiled.classes, &corrected);
+        let adapter_fold = adapter_fact.filter(|_| weights.adapter_seats() > 0);
+        let landing = landing_requests(&boot.trace.facts, &compiled.classes, |word| {
+            crate::exports::class_word(&compiled.classes, &corrected, adapter_fold, word)
+        });
         let decoding = decoding_of(&landing);
         // A schedule only decoding classes read sees a row a lane: its
         // partials are sized for the lanes, not the widest fire's rows.
@@ -1337,7 +1341,6 @@ impl Shell {
             tracing::info!("{fact}");
         }
         let adapter_seats = weights.adapter_seats();
-        let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(poem_ir::RowAxis::Patches).is_some();
         // A tensor-parallel rank holds its band of every page's heads, not
         // the page: it reads nothing out.
@@ -1383,6 +1386,7 @@ impl Shell {
             wide,
             feeds,
             adapter_fact,
+            adapter_fold,
             corrected,
             decoding,
             tiers,
