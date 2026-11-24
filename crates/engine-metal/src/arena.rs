@@ -12,7 +12,7 @@ use crate::run::SlotTable;
 /// was carved with.
 pub const ALIGN: u64 = 64 << 10;
 
-/// A fire's activation: the top of the pool's range (REDESIGN 3c), the
+/// A fire's activation: the top of the pool's range, the
 /// activation span the runtime keeps state out of at each rung.
 ///
 /// The kernel scratch plane takes the span's top `scratch` bytes for every

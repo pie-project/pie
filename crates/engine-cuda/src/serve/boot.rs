@@ -248,6 +248,6 @@ pub struct Boot<'a> {
     pub comm: *const crate::comm::Comm,
     /// The runtime's step builder's rules (`LoadRequest::steps`): the set of
     /// step compositions the arm walk takes its targets from is formed by
-    /// them over the load's facts (CONTRACT-BC 24, `Shell::walk_steps`).
+    /// them over the load's facts (`Shell::walk_steps`).
     pub steps: engine::StepRules,
 }

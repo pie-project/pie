@@ -69,9 +69,10 @@ pub fn gated_delta(
 }
 
 /// The shared memory a block of the carried step stages a chunk of buffered
-/// rows in, double-buffered with its state: 16 rows of a head's keys (at
-/// most 128 bf16), corrected values (at most 128 f32) and `a` gate word.
-const CARRIED_ROWS_SMEM: u32 = 2 * 16 * (128 * 2 + 128 * 4 + 4);
+/// rows in, double-buffered with its state: [`crate::ssm::CARRY_CHUNK`]
+/// rows of a head's keys (at most 128 bf16), corrected values (at most 128
+/// f32) and `a` gate word.
+const CARRIED_ROWS_SMEM: u32 = 2 * crate::ssm::CARRY_CHUNK * (128 * 2 + 128 * 4 + 4);
 
 /// The value columns one warp of the fused step owns.
 const FUSED_BV: u32 = 16;
@@ -418,7 +419,7 @@ mod tests {
     }
 }
 
-/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, `carry`'s
+/// Folds each beam group's fold rows (`carry`'s
 /// planes `[b | a]`, keys, `u`) into its gated-delta state, as a decode step
 /// folds a token and stores it, the state stored once.
 /// The groups that fold lead `folds` (`groups` entries at most, the first of

@@ -455,11 +455,23 @@ impl Inner {
                     })
         };
         let passed = |head: ProcessId| self.passed.iter().any(|&(_, pid)| pid == head);
+        // Its head a binder still in its request: between two binds it
+        // stands out of the queue a moment, and a victim restored then is
+        // moved for the next bind (the Metal mix's seed 25: a beam's verify
+        // each step, its victim evicted twice). Held until the head's
+        // request ends: an event, no deadline.
+        let binder_in_request = |head: ProcessId| {
+            self.procs
+                .get(&head)
+                .is_some_and(|proc| proc.binds_served > 0 && Self::in_request(proc))
+        };
         let held_for_head = |pid: ProcessId| {
             self.procs
                 .get(&pid)
                 .and_then(|proc| proc.evicted_for)
-                .is_some_and(|head| head != pid && unserved(head) && !passed(head))
+                .is_some_and(|head| {
+                    head != pid && (unserved(head) || binder_in_request(head)) && !passed(head)
+                })
         };
         let head_at_bind = |pid: ProcessId| {
             self.procs
@@ -591,6 +603,21 @@ impl Inner {
                         break;
                     };
                     key = up;
+                }
+                // Evicted for a binder still in its request: held until its
+                // request ends (an event that plans again). Sent as the last
+                // resort while the head stood out of the queue between two
+                // binds, it was moved for the next one at once (the Metal
+                // mix's seed 25: a beam's verify each step). A head waiting
+                // on room itself is never held behind: the restore goes.
+                if let Some(proc) = self.queue.get(&key).and_then(|waiter| self.procs.get(&waiter.pid))
+                    && let Some(head) = proc.evicted_for
+                    && let Some(at) = self.procs.get(&head)
+                    && at.binds_served > 0
+                    && Self::in_request(at)
+                    && !self.queue.values().any(|waiter| waiter.pid == head && waiter.is_unmet())
+                {
+                    return None;
                 }
                 key
             }

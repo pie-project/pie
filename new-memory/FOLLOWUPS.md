@@ -1610,9 +1610,9 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 
 **Why later.** engine-gpu is GPU's to flip (`rs_scalars: false` in `chunks::profile`). On CUDA, lay them again (`rs_scalars: true` and a plane in `store::rs`) only if a decode kernel comes to read them in place of recomputing.
 
-## F93. Shared host crate, phase 2: the kernels-rocm / kernels-cuda host files that differ by 10–30%
+## F93. Shared host crate: the kernels-rocm / kernels-cuda host files that repeat each other
 
-**What.** After phase 1 moves the byte-identical and comment-only host files into the shared crate, 15 same-path files (~4.7k lines a side) remain near-copies: attn/plan.rs, elemwise/rope.rs, linear/affine/tiled.rs, jit/ctx.rs, synth.rs, elemwise/pointwise.rs, jit/kernel.rs, conv/conv3d.rs and others, plus the attention schedulers (kernels-rocm attn/sched_{decode,prefill,mla}.rs against kernels-cuda attn/plan/{decode,prefill,mla}.rs: 70 / 277 / 80 diff lines).
+**What.** Phase 1, dropped from the cleanup PR (coordinator, 2026-11-24): the byte-identical and comment-only host files (tensor.rs, attn/sched.rs = kernels-cuda attn/plan/sched.rs, sizing.rs, voxels.rs; ~0.76k lines a side) are no pure move: each imports its own crate's `jit` / `error` (`Error`, `ArgValue`, `refuse`, the slab hooks), which differ per backend, so a shared crate first owns one `Error` / `ArgValue` / `refuse`. Phase 2: 15 same-path files (~4.7k lines a side) remain near-copies: attn/plan.rs, elemwise/rope.rs, linear/affine/tiled.rs, jit/ctx.rs, synth.rs, elemwise/pointwise.rs, jit/kernel.rs, conv/conv3d.rs and others, plus the attention schedulers (kernels-rocm attn/sched_{decode,prefill,mla}.rs against kernels-cuda attn/plan/{decode,prefill,mla}.rs: 70 / 277 / 80 diff lines).
 
 **Idea.** Move each into the shared crate with its backend differences as parameters (wave 64 vs warp 32, unit names `.hip` / `.cuh`, `-ffp-contract=off` vs `fmad=false`, the device facts each reads), one file a commit, each verified by both backends' kernel tests.
 
@@ -1641,3 +1641,11 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 ## F98. SDK parity: beam search and the speculative / latent helpers outside Rust
 
 **What.** The JS and Python bridges never bind `parents` / `parentsEnd`, so JS and Python inferlets cannot run beam search (Rust has `BeamGroup`). Python also lacks the speculative verify and latent flow-match helpers, and JS has diffusion only.
+
+## F100. Derive the ROCm caps stated as chosen bounds
+
+**What.** kernels-rocm and engine-cuda's HIP code state these as chosen bounds, not measured ones (their origin was lost to the squashed import): `linear::moe` LT_STAGE_CAP (3 GiB) and GROUP_WORKSPACE_CAP (512 MiB), `linear::affine::tiled` THIN_ROWS, `elemwise::norm` ROWS_PER_SPLIT, `linear::dense_batch` MAX_SPLITS / MIN_STAGES, `weights::hip` STAGED (256 MiB).
+
+**Idea.** A sweep per cap on MI300X over the shapes the served models fire (rocprofv3 on the kernel tests, the staging caps against the load's device-memory budget), each value then derived from what it bounds (the budget, the device's CUs, the pipeline's depth) or kept with its measurement stated.
+
+**Why later.** A value change re-measures what it fires; the cleanup PR changes no value.

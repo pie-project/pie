@@ -55,30 +55,11 @@ fn served(
     let deployment = poem_compiler::catalog::deployment(name).expect("the catalog ships the mini");
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
-        voxels: None,
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract: &contract,
-        checkpoint: path,
-        budget: Budget::new(1, CHUNK),
-        patches: None,
-        page_size: 16,
-        context: 1024,
-        slots: 1,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
             pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(trace, &contract, path, Budget::new(1, CHUNK), 1024, 1)
     })
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
@@ -133,7 +114,7 @@ fn a_windowed_row_reads_what_the_full_row_reads() {
     agree(&got, &want, DEPLOYMENT);
 }
 
-// CONTRACT-BC 19: a fire's fold lands after every read its lanes' attention
+// A fire's fold lands after every read its lanes' attention
 // makes, on every stream it forks: a fire whose lanes read ring pages that
 // its own fold then overwrites (its own rows past its ring on own-row pages,
 // folded onto ring pages it read) and fires that write their rows on their
@@ -175,30 +156,11 @@ fn served_masked(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec
     let deployment = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the mini");
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
-        voxels: None,
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract: &contract,
-        checkpoint: path,
-        budget: Budget::new(1, CHUNK),
-        patches: None,
-        page_size: 16,
-        context: 1024,
-        slots: 1,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
             pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(trace, &contract, path, Budget::new(1, CHUNK), 1024, 1)
     })
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
@@ -226,7 +188,7 @@ fn served_masked(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec
     out
 }
 
-// CONTRACT-BC 19: a lane reading a mask of its own through the masked arms
+// A lane reading a mask of its own through the masked arms
 // reads its windowed rows from ring + buffer as from the full rows.
 #[test]
 fn a_masked_lane_reads_its_ring_as_its_full_rows() {

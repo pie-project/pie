@@ -254,7 +254,7 @@ pub struct RsHandles {
     /// ([`kernels_cuda::runtime::channel::RsRows`]).
     pub lane_rows: u64,
     pub replay_spans: u64,
-    /// The beam groups' folds (§11.3), [`RsHandles::fold_entries`] of them,
+    /// The beam groups' folds, [`RsHandles::fold_entries`] of them,
     /// those past the fire's folding none.
     pub folds: u64,
     pub fold_entries: u32,
@@ -275,7 +275,7 @@ const fn rs_lane_table_bytes(lanes: u64) -> u64 {
 pub struct RsFire<'a> {
     pub lanes: &'a [kernels_cuda::runtime::channel::RsLane],
     pub replay_spans: &'a [u32],
-    /// The fire's beam group folds (§11.3).
+    /// The fire's beam group folds.
     pub folds: &'a [kernels_cuda::ssm::GroupFold],
 }
 
@@ -791,7 +791,7 @@ fn stage_pages(
     let lists_at = put(bytes_of(lists.as_ptr().cast(), lists.len() * size_of::<BeamListRun>()));
     // The lanes' rs rows, at their fixed place (a recorded body reads them
     // there): where the carried kernels resolve each lane's rows, a beam's
-    // (§11.1) through its group's list, which the step points it at.
+    // through its group's list, which the step points it at.
     if !work.rs.is_empty() {
         if !rs_tables {
             return Err(crate::error::Fault::program(
@@ -858,7 +858,7 @@ fn stage_pages(
         })
         .collect();
     let copies_at = put(bytes_of(copies.as_ptr().cast(), copies.len() * size_of::<PageCopyRun>()));
-    // A hybrid's beams' rs copies (§6.4, §11): row by row of each rs plane.
+    // A hybrid's beams' rs copies: row by row of each rs plane.
     let rs_copies: Vec<RsCopyRun> = work
         .rs_copies
         .iter()
@@ -984,7 +984,7 @@ struct PagesAt {
     lists_cap: u64,
     groups_cap: u64,
     copies_cap: u64,
-    /// A hybrid's beams' rs copies (`BEAM-PAGE-LISTS.md` §11), and the
+    /// A hybrid's beams' rs copies, and the
     /// lanes' rs rows (`rs`).
     rs_cap: u64,
     end: u64,
@@ -1077,7 +1077,7 @@ impl Inputs {
             use kernels_cuda::runtime::channel::{
                 BeamListRun, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun, RsRows,
             };
-            // A hybrid's beams also resolve and copy their rs rows (§11): the
+            // A hybrid's beams also resolve and copy their rs rows: the
             // set's rs entries' addresses (a sequence's at most, its pages of
             // `rs_page_tokens` rows), an rs table and an rs copy a lane, the
             // rs planes beside the kv ones.

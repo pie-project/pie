@@ -320,7 +320,7 @@ impl Run<'_> {
         // page table reads and lands the buffer's too.
         let paged = seat.paged(self.handles(), conv.x);
         let fits = ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
-        // The beam groups' conv folds first (BEAM-PAGE-LISTS §11.3): each
+        // The beam groups' conv folds first: each
         // group's window moves on by the rows its beams share before any of
         // its lanes reads it.
         if let Some(folds) = seat.folds {

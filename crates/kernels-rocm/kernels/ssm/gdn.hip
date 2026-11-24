@@ -588,7 +588,7 @@ __global__ __launch_bounds__(256) void ssm_gdn_tail_corrected(
     }
 }
 
-// A beam group's fold of its gated-delta state (BEAM-PAGE-LISTS §11.3): its
+// A beam group's fold of its gated-delta state (its rows below the common ancestor): its
 // fold rows (keys, corrected values and gates from the kept planes `[b | a]`,
 // keys, u, through the representative lane's pages) folded in order, rounded
 // as a token's step stores them, and the state stored once. Grid (V_d / BV,

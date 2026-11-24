@@ -30,10 +30,9 @@ use engine_cuda::{Knobs, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{Fused, Linear, Operation, ParamSource, Trace};
+use crate::common::fnv;
 
 const CEILING: u32 = 256;
-const PAGE: u32 = 16;
-
 /// Routed rows of bf16 planes: Qwen3-MoE's softmax router, GLM-4.5-Air's
 /// biased sigmoid, DeepSeek-V4's biased sqrt-softplus (its hashed layers
 /// routed apart) and Qwen3.5's softmax under a gated shared expert, each MLP
@@ -83,15 +82,6 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// A plane's bf16 values, by its name.
@@ -233,27 +223,15 @@ fn logits(
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
     let staged = Shell::stage(engine_cuda::Boot {
-        trace: trace.clone(),
-        contract: &contract,
-        checkpoint: container,
-        budget: Budget::new(1, CEILING),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CEILING,
-        slots: 1,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs,
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            trace.clone(),
+            &contract,
+            container,
+            Budget::new(1, CEILING),
+            CEILING,
+            1,
+        )
     })
     .expect("the row loads");
     let mut shell = staged.finish().expect("the row arms");

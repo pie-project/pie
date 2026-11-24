@@ -24,7 +24,7 @@ pub const LIST: ShapeId = ShapeId(0);
 /// The first (narrowest) window list's; the lists after it are
 /// [`window_id`]'s.
 pub const WINDOW: ShapeId = ShapeId(1);
-/// The window lists a load may state (CONTRACT-BC 21).
+/// The window lists a load may state.
 pub const MOST_WINDOWS: usize = 4;
 /// The ids of the window lists past the first start here, clear of the
 /// weight shapes' ([`WEIGHTS`] on).
@@ -49,8 +49,8 @@ pub fn window_of(id: ShapeId) -> Option<usize> {
 pub const FIXED: ShapeId = ShapeId(2);
 /// The rs list's.
 pub const RS: ShapeId = ShapeId(3);
-/// The ring shape's: the windowed layers' rings, a record's first pieces
-/// (CONTRACT-BC 21), clear of the weight shapes' and the window lists'.
+/// The ring shape's: the windowed layers' rings, a record's first pieces,
+/// clear of the weight shapes' and the window lists'.
 pub const RING: ShapeId = ShapeId(MORE_WINDOWS - 1);
 
 /// The guest shapes' ids start here, clear of the weight shapes' and the
@@ -61,7 +61,7 @@ const GUEST: u32 = 1 << 17;
 pub const INSTANCE: ShapeId = ShapeId(GUEST);
 /// A ring only the device reads and writes (`SlotRole::Channel`).
 pub const CHANNEL: ShapeId = ShapeId(GUEST + 1);
-/// An `Instance` slot's bytes (`new-memory/STATE-ROLES.md` 3).
+/// An `Instance` slot's bytes.
 pub const INSTANCE_SLOT: u64 = 4 << 10;
 /// A `Channel` slot's bytes.
 pub const CHANNEL_SLOT: u64 = 1 << 10;
@@ -273,7 +273,7 @@ impl SlotShape {
     }
 
     /// Where slot ref `slot` lies in a tier whose chunk ids are their
-    /// places (the host tier, CONTRACT-BC 22): its chunk, and its bytes
+    /// places (the host tier): its chunk, and its bytes
     /// from the chunk's start.
     #[must_use]
     pub fn tier_place(&self, slot: u32) -> (u32, u64) {
@@ -935,7 +935,7 @@ pub struct FixedShape {
 }
 
 /// The ring shape: a record's windowed rings, `pieces` slots of it, one a
-/// chunk, named first among the record's pieces (CONTRACT-BC 21).
+/// chunk, named first among the record's pieces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingShape {
     pub slot: SlotShape,

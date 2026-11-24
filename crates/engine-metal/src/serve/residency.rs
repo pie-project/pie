@@ -326,7 +326,7 @@ impl Shell {
         self.pools.write_slot_bytes(id, slot, bytes)
     }
 
-    /// The bytes one disk chunk takes (CONTRACT-BC 22).
+    /// The bytes one disk chunk takes.
     #[must_use]
     pub fn disk_chunk_bytes(&self) -> u64 {
         self.pools.disk_chunk_bytes()

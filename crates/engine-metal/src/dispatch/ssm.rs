@@ -199,7 +199,7 @@ impl Run<'_> {
                             scalars_row_bytes: plane_row_bytes(&seat, sp, OP)?,
                         }),
                     };
-                    // The beam groups' folds first (BEAM-PAGE-LISTS §11.3):
+                    // The beam groups' folds first:
                     // each group's state takes the rows its beams share
                     // before any of its lanes reads it.
                     if let Some(folds) = seat.folds {

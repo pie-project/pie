@@ -838,8 +838,8 @@ PIE_GDN_VERIFY(32, 8, 2)
 PIE_GDN_VERIFY(32, 4, 4)
 PIE_GDN_VERIFY(32, 8, 4)
 
-// A decode step over a lane's buffered rows read as a linear attention
-// (new-memory/designs/lagged-fold.md): one row of the window's own a lane,
+// A decode step over a lane's buffered rows read as a linear attention:
+// one row of the window's own a lane,
 // its `rep` carried rows never re-stepped. With the committed state S0, the
 // carried rows' normed keys k_s and corrected values u_s (their buffer's
 // corrected planes) and their log-gates, the own row's
@@ -1311,7 +1311,7 @@ template <typename T, int SG, int VROWS>
 PIE_GDN_CARRIED(8, 2)
 PIE_GDN_CARRIED(8, 16)
 
-// A beam group's gated-delta fold (BEAM-PAGE-LISTS §11.3): before the
+// A beam group's gated-delta fold: before the
 // layer's step, each group's state takes the `n` rows every live beam
 // shares, from its first lane's buffered keys, `u` and `[b | a]`: the
 // carried scan's commit, S <- g S + k u^T a row in turn, with each key
@@ -1441,7 +1441,7 @@ template [[host_name("gated_delta_group_fold_bfloat16")]]
 // `gated_delta_carried` for a carry of one chunk (up to `kVerifyChunk`
 // rows, a decode at its run-ahead lag): the fused step's tiling, a
 // simdgroup holding 16 value rows of the head's state in registers, loaded
-// and stored once (new-memory/designs/carried-kernel.md). Each carried
+// and stored once. Each carried
 // row's scalars (its key's norm, the normed key's dots with the own row's
 // q and k, its log-gate, where its `u` lies) are made once a threadgroup,
 // row s on simdgroup s mod SG, and shared through threadgroup memory behind

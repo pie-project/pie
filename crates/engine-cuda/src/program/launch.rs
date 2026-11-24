@@ -291,8 +291,7 @@ impl ChannelShape {
     }
 }
 
-/// What an instance of a program keeps in the pool
-/// (`new-memory/STATE-ROLES.md`): its own item, the rings' registry and
+/// What an instance of a program keeps in the pool: its own item, the rings' registry and
 /// then the native cells of each ring the host reads or writes, and the
 /// rings only the device touches, an item each.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,9 +307,8 @@ pub struct Held {
     /// Where a reader of captured scores keeps a capturing lane's rows in
     /// the instance's item (`crate::scores`); `None` for any other program.
     pub score_at: Option<u64>,
-    /// Where a beam group keeps its page lists in the instance's item
-    /// (`new-memory/designs/BEAM-PAGE-LISTS.md` §4): zeroed with the item at
-    /// bind, so the group's first fire primes it. `None` for any other.
+    /// Where a beam group keeps its page lists in the instance's item:
+    /// zeroed with the item at bind, so the group's first fire primes it. `None` for any other.
     pub beam: Option<BeamLayout>,
 }
 

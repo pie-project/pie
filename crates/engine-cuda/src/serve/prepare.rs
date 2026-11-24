@@ -734,7 +734,7 @@ impl Shell {
             })
             .collect();
         // A buffering step with a prompt's rows composes at its stated rung,
-        // where the walk recorded it: the stamped shape's (CONTRACT-BC 24),
+        // where the walk recorded it: the stamped shape's,
         // else the rung its lanes' rows make (`Shell::buffered_rung`).
         let at = self.forced_bucket.take().or_else(|| match shape {
             Some(shape) => self.stamped_bucket(shape),
@@ -1096,7 +1096,7 @@ impl Shell {
         let mut rs_pages: Vec<u32> = Vec::new();
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
-        // Each beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): the slot its
+        // Each beam group's fold: the slot its
         // set's state is folded to before any of its lanes reads it, as its
         // first lane states it; and the folds the fire runs, a representative
         // fire lane and its rows (buffer tokens) each.
@@ -1329,7 +1329,7 @@ impl Shell {
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
             // The lane's rings: folded where its runtime states, or where a
             // fold counted on the device not yet settled left them, and
-            // advanced by the fold its fire states (CONTRACT-BC 21).
+            // advanced by the fold its fire states.
             seat_sources.push(source);
             window_folds.push(match &seated.window_fold {
                 Some(stated) if ringed_load => {
@@ -1405,7 +1405,7 @@ impl Shell {
                         .min(first + row.rows);
                     // A beam group's lanes share their set's state: what its
                     // first lane folds is folded once for all of them, from
-                    // its buffered rows, before any reads (§11.3). Each lane
+                    // its buffered rows, before any reads. Each lane
                     // then replays only the rows past it and folds none
                     // itself.
                     let (reads, to, beam) = match group_of[source] {
@@ -1433,7 +1433,7 @@ impl Shell {
                     };
                     let replay = crate::run::replayed(&reads);
                     // A beam group's fold moves its set's state and buffer, never its
-                    // kv working set's folded point, which anchors its pool (§11.3).
+                    // kv working set's folded point, which anchors its pool.
                     rs_folded[source] = Some(if beam { 0 } else { to - folded });
                     rs_ends[source] = Some(first + row.rows);
                     if *fold == FoldLen::Device {
@@ -1475,7 +1475,7 @@ impl Shell {
             // the fire, while the lane beside it folds into the record the
             // fire writes: the two never meet in one row.
             // A beam group's lanes read the record the fire writes, which
-            // its fold (§11.3), if any, has written before them.
+            // its fold, if any, has written before them.
             if matches!(verb, RsMove::Scatter { fold: 0, .. })
                 && group_of[source].is_none()
                 && let Some(read) = seated.rs_read
@@ -1688,8 +1688,7 @@ impl Shell {
             let null = null[0];
             let mut own_next = 0u32;
             // A record a group of lanes shares folds once: the group's
-            // common rows, which its lanes read from slots they share
-            // (CONTRACT-BC 19). Each record's fold, as its first lane states.
+            // common rows, which its lanes read from slots they share. Each record's fold, as its first lane states.
             let mut record_folds: std::collections::HashMap<u32, (u32, u32)> =
                 std::collections::HashMap::new();
             let pooled: Vec<(u64, u32, bool)> = (0..seats.len())
@@ -1976,7 +1975,7 @@ impl Shell {
                 let replay_off = rs_spans.len() as u32;
                 // No table holds an entry a row. A beam's rows resolve on the
                 // device through its entry of the fire's lane rows
-                // (`channel::RsRows`), through its group's list (§11.1); any
+                // (`channel::RsRows`), through its group's list; any
                 // other lane's through the pages of its buffer the fire reads
                 // or writes, from the one holding its first replayed or own
                 // row (its tokens then count from that page), laid beside
@@ -2017,7 +2016,7 @@ impl Shell {
                     ext: begin,
                 });
             }
-            // Each beam group's fold rows (§11.3), past every lane's replayed
+            // Each beam group's fold rows, past every lane's replayed
             // ones, read through its representative lane's pages.
             for (lane, rows) in &group_folds {
                 rs_folds.push(kernels_cuda::ssm::GroupFold {
@@ -2150,7 +2149,7 @@ impl Shell {
                 (0..device_geometries.len()).any(|table| self.pools.geometry_window(table).is_some());
             let planes = self.pools.page_planes();
             let pools = &self.pools;
-            // A hybrid's beams (§11): their rs page tables as this fire
+            // A hybrid's beams: their rs page tables as this fire
             // stages them, and the planes a fork copies.
             let rs_fire = match self.buffers.as_ref() {
                 Some(buffers) if !rs_lanes.is_empty() => Some(super::pages::RsFire {

@@ -191,7 +191,7 @@ impl Buffers {
             .map(|&(offset, _)| offset)
             .collect();
         // A beam's fork copies a page's rows plane by plane
-        // (`Buffers::page_planes`, BEAM-PAGE-LISTS.md §11.2): the planes must
+        // (`Buffers::page_planes`): the planes must
         // tile each buffered layer's row, or a fork leaves a plane's rows
         // stale.
         for (layer, &width) in widths.iter().enumerate() {
@@ -864,7 +864,7 @@ impl Buffers {
 
     /// Every buffered plane as a page copy spans it: its rows' place in a
     /// page's slot and the bytes a token's row takes (a beam's fork copies a
-    /// page's first rows of each, `BEAM-PAGE-LISTS.md` §11).
+    /// page's first rows of each).
     pub fn page_planes(&self) -> Result<Vec<kernels_cuda::runtime::channel::PagePlane>> {
         self.planes
             .all()

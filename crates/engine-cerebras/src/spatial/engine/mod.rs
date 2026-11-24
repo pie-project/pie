@@ -8,12 +8,13 @@
 mod fire;
 mod kv;
 mod launch;
+mod pool;
 mod posted;
+mod window;
 
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use engine::chunk::{ChunkFacts, DegeneratePools};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
@@ -22,6 +23,7 @@ use engine::transfer::MemoryDomain;
 use eta_ir::registry::{GeometryClass, PortMask};
 
 use kv::Kv;
+use window::Windows;
 
 use super::config::{Config, Target};
 use super::facts::Facts;
@@ -41,6 +43,8 @@ pub struct Spatial {
     readout: Option<(String, u32)>,
     model: Option<wafer::Wafer>,
     kv: Kv,
+    /// Windowed layers' rings and window buffer.
+    windows: Windows,
     /// Fires run (the model-time log's count).
     fires: u64,
     /// Rows of history replayed into the model's cache.
@@ -74,6 +78,7 @@ impl Spatial {
             readout: None,
             model: None,
             kv: Kv::default(),
+            windows: Windows::default(),
             fires: 0,
             replayed: 0,
             ahead_hits: 0,
@@ -119,8 +124,8 @@ impl Engine for Spatial {
         "cerebras-spatial"
     }
 
-    /// Its pool is degenerate and no evacuation moves a chunk of it: it
-    /// states no table.
+    /// Its pool is host bookkeeping and no evacuation moves a chunk of it:
+    /// it states no table.
     fn chunk_table(&self) -> engine::Result<engine::chunk::ChunkTable> {
         Err(self.unsupported("chunk_table"))
     }
@@ -227,24 +232,34 @@ impl Engine for Spatial {
         let trace_name = facts.trace().name.clone();
         let paging = facts.paging();
         self.kv.page_size = paging.page_size;
-        let state_rows = facts.has_state();
-        // Pinned pools as chunks, one slot a chunk, device tier only: a kv
-        // page is its tokens on the host (a 32-bit token a position), never
-        // a device span the runtime could place, evict or stream.
-        let chunks = ChunkFacts::degenerate(&DegeneratePools {
-            // The pages hold tokens here (the program's cache is replayed from them).
-            kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-            kv_page_size: paging.page_size,
-            kv_page_bytes: u64::from(paging.page_size) * 4,
-            state_slots: if state_rows { paging.slots } else { 0 },
-            state_slot_bytes: facts.state_slot_bytes(),
-            // recurrent state replays from tokens: no buffered verbs
-            ..DegeneratePools::default()
-        });
-        self.kv.ref_from = chunks
-            .shape(engine::chunk::DEGENERATE_KV)
-            .and_then(|shape| Some((shape.pinned?, shape.slots_per_chunk)))
-            .map_or(0, |(pinned, per)| pinned.device.first * per - pinned.ids_from);
+        // One shared pool on the host: a kv page is its tokens (a 32-bit
+        // token a position), never a device span the runtime could place,
+        // evict or stream.
+        let windowed = facts.windowed_layers().map_err(Error::Load)?;
+        let lanes = budgets.max_lanes.max(1);
+        let pool = pool::Pool {
+            page_size: paging.page_size,
+            kv_pages: paging.pages(),
+            // each seat's record and a snapshot's, and a copy-on-write one
+            // a lane a fire runs
+            records: paging.slots.saturating_mul(2).saturating_add(lanes),
+            state_bytes: if facts.has_state() {
+                facts.state_slot_bytes()
+            } else {
+                0
+            },
+            buffer_pages: u64::from(paging.slots)
+                * u64::from(budgets.max_tokens.div_ceil(paging.page_size.max(1)) + 2),
+            windowed,
+        };
+        let chunks = pool.facts();
+        chunks
+            .validate()
+            .map_err(|e| Error::Load(format!("the spatial engine's pool: {e}")))?;
+        self.windows = Windows::new(
+            pool.windowed.iter().map(|&(_, window)| window).collect(),
+            paging.page_size,
+        );
         let pools = PoolFacts::default();
         let caps = Capabilities {
             device: DeviceFacts {
@@ -265,7 +280,7 @@ impl Engine for Spatial {
             limits: FireLimits {
                 // The model holds one sequence's cache; a fire's lanes run one
                 // after another, each cache brought back from its tokens.
-                max_lanes: budgets.max_lanes.max(1),
+                max_lanes: lanes,
                 max_tokens: budgets.max_tokens,
                 max_page_refs: paging.pages_per_slot,
                 max_context: paging.context().min(model_context),
@@ -286,7 +301,7 @@ impl Engine for Spatial {
             kv_handle: None,
             media_encode: false,
             rs_verbs: false,
-            windowed_state: false,
+            windowed_state: !self.windows.is_empty(),
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,
@@ -305,7 +320,7 @@ impl Engine for Spatial {
 
         // The step compositions the runtime's builder forms over this load's
         // facts (CONTRACT-BC 24). Interim: computed once the caps are; Cerebras records
-        // no bodies (degenerate facts, out of scope for this set).
+        // no bodies (out of scope for this set).
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
@@ -350,9 +365,6 @@ impl Engine for Spatial {
         Ok(())
     }
 
-    /// The load states its pools pinned (`ChunkFacts::degenerate`), so the
-    /// runtime moves its kv through `copy_kv`; there is no shared pool and
-    /// no host or disk tier to move slots between.
     /// Refused as [`Engine::copy_slots`] is: the wafer program moves no
     /// slot between tiers.
     fn copy_slots_landing(
@@ -367,7 +379,7 @@ impl Engine for Spatial {
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let _ = copy;
         Err(Error::Unsupported {
-            verb: "`copy_slots` on the wafer program (its pools are pinned, device tier only: \
+            verb: "`copy_slots` on the wafer program (its pool has no host or disk tier: \
                    kv moves through `copy_kv`)",
             engine: "cerebras-spatial",
         })

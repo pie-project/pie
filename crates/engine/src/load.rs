@@ -20,6 +20,15 @@ pub use top::{
     Counts, Kept, Refused, choose, choose_shaped, choose_tiled, estimate, line_of, measured_line, rectangle,
 };
 
+/// The lanes one fire may carry on the CUDA shell `pie serve` loads (its
+/// tokens are the largest rung its card holds, derived at load): the
+/// worker's budget and the estimate check's served-shape load both read it.
+pub const CUDA_FIRE_LANES: u32 = 512;
+
+/// The tokens a kv page holds on the CUDA shell `pie serve` loads: the
+/// planner's page.
+pub const CUDA_PAGE_SIZE: u32 = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     pub max_lanes: u32,

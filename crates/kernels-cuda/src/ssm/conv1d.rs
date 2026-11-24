@@ -477,7 +477,7 @@ fn conv1d_carried(
     )
 }
 
-/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, plane 0 of
+/// Folds each beam group's fold rows (plane 0 of
 /// `carry`: the rows' conv inputs, through the group's representative lane's
 /// pages) into its conv window: the window stored as it stands after them.
 /// The groups that fold lead `folds` (`groups` entries at most, the first of

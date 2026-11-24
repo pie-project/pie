@@ -21,9 +21,10 @@ impl Shell {
                 .map(|&(_, adapters, _)| adapters)
                 .min()
                 .unwrap_or(0),
-            // The sliding rows are paged in full here: the model's window
-            // is a fact of the model, its pool is not.
-            window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
+            // No window list: Metal serves windowed layers as ring + buffer
+            // only (`Capabilities::windowed_state`, each layer's window in
+            // `ChunkFacts::windowed`), so it states no window-list window.
+            window_tokens: 0,
         }
     }
 
@@ -105,7 +106,7 @@ pub fn recipe_near(
     })
 }
 
-/// Metal's ring hook (CONTRACT-BC 19): a windowed lane's folded rows lie in
+/// Metal's ring hook: a windowed lane's folded rows lie in
 /// its record as pages laid exactly as a window-buffer slot (`P` rows of
 /// every windowed layer's K and V, layer-major), so the attention kernels
 /// read ring pages and buffer pages through one composed page table, at the

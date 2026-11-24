@@ -1,4 +1,4 @@
-// Beam page lists (new-memory/designs/BEAM-PAGE-LISTS.md): a beam group's
+// Beam page lists: a beam group's
 // head step, on the device in the fire's own command buffer ahead of its
 // first append or read. The Metal port of engine-cuda's `beam_step` and
 // `copy_pages` (kernels-cuda/kernels/runtime/channel.cu): the same state
@@ -30,7 +30,7 @@ struct BeamListRun {
     uint pad;
 };
 
-// A hybrid lane's rs page table to resolve (§11.1): its row's slot entries
+// A hybrid lane's rs page table to resolve (rs resolve): its row's slot entries
 // from the one holding buffer entry `first` (`pages`: the row past its
 // in-page header), entry `e` the rows of slot `base + e * tokens` on, each
 // resolved to the set's entry holding the same rows of its beam's list's
@@ -48,8 +48,8 @@ struct BeamRsRun {
 };
 
 // A group's step: its state, the parents its last epilogue wrote, its pool's
-// device page ids, its lanes' list runs and fault words, the numbers of §3,
-// and on a hybrid its lanes' rs page tables (§11).
+// device page ids, its lanes' list runs and fault words, the pool sizing's numbers,
+// and on a hybrid its lanes' rs page tables (hybrid beams).
 struct BeamStepRun {
     ulong state;
     ulong parents;
@@ -94,8 +94,8 @@ static inline void fault_max(ulong faults, uint lane, uint code) {
     atomic_fetch_max_explicit(word, code, memory_order_relaxed);
 }
 
-// One threadgroup a group. §5 on the group's first fire, §6.1-6.3 after,
-// then §6.5 over its lanes' staged tables; leaves this fire's copies (§6.4)
+// One threadgroup a group. Priming on the group's first fire, parents, fresh and returned pages after,
+// then each lane's staged tables; leaves this fire's copies (page copies)
 // in its state for `beam_copy_pages`.
 kernel void beam_step(
     const device BeamStepRun* runs [[buffer(0)]],
@@ -150,7 +150,7 @@ kernel void beam_step(
     threadgroup uint handed;
 
     if (primed == 0u) {
-        // §5: beam b on pool page b; page 0 is the prompt's where it ends
+        // Priming: beam b on pool page b; page 0 is the prompt's where it ends
         // mid-page, which beam 0 keeps and every other beam copies.
         for (uint at = tid; at < B * cap; at += threads_in)
             map_new[at] = (at % cap) == 0u ? at / cap : 0u;
@@ -167,7 +167,7 @@ kernel void beam_step(
             if (B > Q) fault_max(r.faults, b, PIE_PAGES_EXHAUSTED);
         }
     } else {
-        // §6.1: a parent past the beams continues itself.
+        // Parents: a parent past the beams continues itself.
         for (uint b = tid; b < B; b += threads_in) {
             const uint p = parents[b];
             if (p >= B) {
@@ -177,13 +177,13 @@ kernel void beam_step(
                 parent_of[b] = p;
             }
         }
-        // The pool grows a column at a time (§3): pages that joined it since
+        // The pool grows a column at a time (the pool sizing): pages that joined it since
         // the last fire are free.
         const uint grown = header[2] < Q ? header[2] : Q;
         for (uint q = grown + tid; q < Q; q += threads_in)
             free_pages[q] = (q == 0u && tail > 0u) ? 0u : 1u;
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-        // §6.2: who needs a fresh page, and its rank among those that do.
+        // Fresh pages: who needs a fresh page, and its rank among those that do.
         if (tid == 0u) {
             uint k = 0u;
             for (uint b = 0u; b < B; ++b) {
@@ -237,7 +237,7 @@ kernel void beam_step(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Only the columns up to this fire's are live (later ones are
-        // unspecified, §4).
+        // unspecified in the resident state).
         const uint live = c + 1u < cap ? c + 1u : cap;
         for (uint at = tid; at < B * live; at += threads_in) {
             const uint b = at / live, j = at % live;
@@ -251,7 +251,7 @@ kernel void beam_step(
             copies[b * 3u + 1u] = copy ? fresh[b] : 0u;
             copies[b * 3u + 2u] = copy ? o : 0u;
         }
-        // §6.3: the pages freed `frames` fires ago join the free ones; this
+        // Returned pages: the pages freed `frames` fires ago join the free ones; this
         // fire's take their slot of the ring.
         for (uint q = tid; q < cap; q += threads_in) {
             bool taken = false;
@@ -275,7 +275,7 @@ kernel void beam_step(
         }
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    // The group's common slot (BEAM-PAGE-LISTS §11.3, §11.4): the depth of
+    // The group's common slot: the depth of
     // its live lanes' most recent common ancestor, whatever the guest forks
     // them for. `lca[i][j]` holds, for lanes i != j, the slot below which
     // their rows agree: lanes forked from one parent agree below this fire's
@@ -306,7 +306,7 @@ kernel void beam_step(
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     for (uint x = tid; x < B * B; x += threads_in) lca[x] = lca_new[x];
-    // §6.5: each lane's staged entries past `f0` and its rows' write pages.
+    // Staged tables: each lane's staged entries past `f0` and its rows' write pages.
     for (uint i = 0u; i < r.list_count; ++i) {
         const BeamListRun l = lists[i];
         const device uint* list = map_new + l.lane * cap;
@@ -341,7 +341,7 @@ kernel void beam_step(
             write_page[row] = trans[q];
         }
     }
-    // §11.1 on a hybrid: each lane's rs page table over the same list, slot
+    // On a hybrid, rs resolve: each lane's rs page table over the same list, slot
     // by slot: entry e (slot `base + e T`) holds the rows of the set's slot
     // (f0 + list[j]) S + (slot mod S), j its column; its write entry among
     // them. A frozen entry (below `f0 S`) keeps the set's staged slot.
@@ -426,7 +426,7 @@ kernel void beam_copy_pages(
     }
 }
 
-// A beam's rs copy (§11.2): the first `tokens` slots of pool page `src` to
+// A beam's rs copy (rs copy): the first `tokens` slots of pool page `src` to
 // pool page `dst` (the `[src, dst, tokens]` its group's step left at
 // `copy`), row by row of each plane, through the set's rs entries (`bases`:
 // slab slots, as `BeamRsRun`'s, each a page of `page_bytes` in `slab`): a

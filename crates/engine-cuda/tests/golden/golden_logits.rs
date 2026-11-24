@@ -25,10 +25,10 @@
 //! device (host work, kept out of the GPU's lock), then `golden_logits`:
 //!
 //! ```text
-//! cargo test -p engine-cuda --features cuda --test engine_cuda \
+//! cargo test -p engine-cuda --features cuda --test golden \
 //!     golden_fixtures -- --ignored --nocapture
 //! flock /tmp/pie-gpu.lock cargo test -p engine-cuda --features cuda \
-//!     --test engine_cuda golden_logits -- --ignored --nocapture --test-threads=1
+//!     --test golden golden_logits -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! It prints one `golden <model> <step> <hash> <argmax>` line a step and one
@@ -541,27 +541,19 @@ fn load_declared(
     declared: u32,
 ) -> Result<Shell, String> {
     Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: declared,
-        slots: 1,
         kv_budget: None,
         allowance,
         context_declared: true,
-        ordinal: 0,
         knobs: knobs(),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            declared,
+            1,
+        )
     })
     .map_err(|why| why.to_string())
 }
@@ -1080,8 +1072,8 @@ fn golden_logits_by_refs() {
     probe(served_by_refs);
 }
 
-/// Tier refs handed out as the runtime's host and disk tiers would
-/// (CONTRACT-BC 22): a fresh chunk of the tier's `chunks` for a shape whose
+/// Tier refs handed out as the runtime's host and disk tiers would: a
+/// fresh chunk of the tier's `chunks` for a shape whose
 /// open one is full, chunk ids their own places.
 struct TierRefs {
     next: u32,
@@ -1337,7 +1329,7 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
     steps
 }
 
-/// CONTRACT-BC 22: a lane offloaded mid-decode (every slot it holds to the
+/// A lane offloaded mid-decode (every slot it holds to the
 /// host tier and back, then to the disk tier and back) serves the
 /// never-offloaded lane's logits bit for bit, in one process.
 #[test]
@@ -1627,7 +1619,7 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
 }
 
 /// Every shape a parked set carries comes back bit for bit through the
-/// tiers below the device (CONTRACT-BC 22): the kv list, the window lists
+/// tiers below the device: the kv list, the window lists
 /// (Gemma's miniature), the hybrid's rs-list rows and records (Qwen3.5's),
 /// and the guests' instance and channel slots, device -> disk -> device
 /// and host -> disk -> host (and on up to the device), into other slots,
@@ -1874,27 +1866,17 @@ fn buffered_model() -> String {
 fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     // As a worker boots it: every chunk the fit left the pool backed at
@@ -2045,27 +2027,17 @@ const CARRIED: u32 = 40;
 fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f32>>, u64, u64) {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2192,27 +2164,17 @@ fn served_lagged_over(
 ) -> (Vec<Vec<f32>>, u64) {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, tokens),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, tokens),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2424,27 +2386,17 @@ fn served_pace(fixture: &Fixture, cache: &Path, schedule: &str) -> f64 {
         None => (schedule.parse::<u32>().expect("a lag"), 0),
     };
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2531,27 +2483,17 @@ fn golden_lagged_pace() {
 fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(2, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(engine_cuda::Knobs::default()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(2, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     let page = rs_page(&mut shell);
@@ -3577,27 +3519,17 @@ fn load_lanes(
     kv_budget: Option<u64>,
 ) -> Shell {
     Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(lanes, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: lanes,
         kv_budget: kv_budget.map(engine_cuda::store::KvSize::Bytes),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs,
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(lanes, TOKENS),
+            CONTEXT,
+            lanes,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
 }
@@ -3844,27 +3776,17 @@ fn served_partial_fold(
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -4344,7 +4266,7 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
     }
 }
 
-/// CONTRACT-BC 19: a load serving its windowed rows as ring + buffer arms
+/// A load serving its windowed rows as ring + buffer arms
 /// every composition it fires (the arming pass's synthetic lanes fold on
 /// records of their own): `PIE_GOLDEN_MODELS`
 /// (default the mini Gemma and MiMo, windowed beside full attention, MiMo's

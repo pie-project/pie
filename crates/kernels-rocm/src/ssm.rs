@@ -1,9 +1,12 @@
 mod dyn_conv;
 pub use dyn_conv::dyn_conv;
 
-/// The kernel of a beam group's fold (`BEAM-PAGE-LISTS.md` §11.3) by the step it folds
-/// for: launched eagerly ahead of a fire's body, so no arming fire reaches
-/// it, and a load makes its kernel beforehand ([`FoldKernel::load`]).
+/// The kernel of a beam group's fold by the step it folds for. A group's rows
+/// below its beams' most recent common ancestor are the same in every live
+/// beam, so they fold into the set's state once and each beam carries only
+/// the rows after it. The kernel is launched eagerly ahead of a fire's body,
+/// so no arming fire reaches it, and a load makes it beforehand
+/// ([`FoldKernel::load`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldKernel {
     Conv1d,
@@ -99,10 +102,10 @@ impl Carry {
     }
 }
 
-/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, `ssm/carry.hip`'s
-/// `GroupFold`): its representative lane (any of its lanes; they share the
-/// set's state), where its fold rows start in the replay table, and how
-/// many. The fold kernels read a device table of them: the groups that fold
+/// A beam group's fold of its rows below its common ancestor ([`FoldKernel`],
+/// `ssm/carry.hip`'s `GroupFold`): its representative lane (any of its
+/// lanes; they share the set's state), where its fold rows start in the
+/// replay table, and how many. The fold kernels read a device table of them: the groups that fold
 /// lead it, and the first entry of no rows ends it (a block folds each group
 /// in turn, so an empty table costs a read, not a block a group).
 #[repr(C)]
@@ -118,9 +121,9 @@ const _: () = assert!(size_of::<GroupFold>() == 12);
 /// A thread a channel for the group folds of the conv window.
 const FOLD_CONV_BLOCK: u32 = 256;
 
-/// Folds each group's rows into its conv window (§11.3): the window stored as
-/// it stands after them, from the committed cells and the rows' inputs
-/// (`carry`'s plane 0) (`ssm_conv1d_fold`).
+/// Folds each group's common rows into its conv window ([`FoldKernel`]):
+/// the window stored as it stands after them, from the committed cells and
+/// the rows' inputs (`carry`'s plane 0) (`ssm_conv1d_fold`).
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_fold(
     ctx: &Ctx,
@@ -154,9 +157,9 @@ pub fn conv1d_fold(
     )
 }
 
-/// Folds each group's rows into its gated-delta state (§11.3), from the kept
-/// planes (`carry`: `[b | a]`, keys, corrected values), rounded as a token's
-/// step stores them (`ssm_gdn_fold`).
+/// Folds each group's common rows into its gated-delta state ([`FoldKernel`]),
+/// from the kept planes (`carry`: `[b | a]`, keys, corrected values),
+/// rounded as a token's step stores them (`ssm_gdn_fold`).
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_fold(
     ctx: &Ctx,
@@ -2105,8 +2108,9 @@ pub fn kda_tail(
     )
 }
 
-/// Folds each group's rows into its KDA state (§11.3), from the kept planes
-/// (`carry`: forget rows, beta, keys, corrected values) (`ssm_kda_fold`).
+/// Folds each group's common rows into its KDA state ([`FoldKernel`]), from
+/// the kept planes (`carry`: forget rows, beta, keys, corrected values)
+/// (`ssm_kda_fold`).
 #[allow(clippy::too_many_arguments)]
 pub fn kda_fold(
     ctx: &Ctx,
@@ -2545,7 +2549,8 @@ pub fn mamba2_tail(
     )
 }
 
-/// Folds each group's rows into its Mamba-2 state (§11.3), from the kept
+/// Folds each group's common rows into its Mamba-2 state ([`FoldKernel`]),
+/// from the kept
 /// planes (`carry`: step sizes, convolved `x | B`) (`ssm_mamba2_fold`).
 pub fn mamba2_fold(
     ctx: &Ctx,
