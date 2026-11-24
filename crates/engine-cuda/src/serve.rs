@@ -251,9 +251,12 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
-    /// What this load timed, each by name (the device's rates where no
-    /// layer stated them, the decode products' times): its last line's.
-    pub(crate) measured: std::cell::RefCell<Vec<String>>,
+    /// What this load timed, each by name (`engine::Engine::measured_at_load`):
+    /// the device's rates where no layer stated them, the decode products'
+    /// times (`[rates] product_ns`) where the profile held none, and the
+    /// bodies where no record held what they take. Empty: it measured
+    /// nothing.
+    measured: Vec<String>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,
@@ -317,8 +320,8 @@ pub(crate) struct KvReport {
 impl Shell {
     /// What this load timed, each by name: empty where it measured nothing.
     #[must_use]
-    pub fn measured_at_load(&self) -> Vec<String> {
-        self.measured.borrow().clone()
+    pub fn measured_at_load(&self) -> &[String] {
+        &self.measured
     }
 }
 

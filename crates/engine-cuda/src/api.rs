@@ -613,7 +613,7 @@ impl Engine for Cuda {
     fn measured_at_load(&self) -> Vec<String> {
         self.shell
             .as_ref()
-            .map(crate::serve::Shell::measured_at_load)
+            .map(|shell| shell.measured_at_load().to_vec())
             .unwrap_or_default()
     }
 
