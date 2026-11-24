@@ -441,7 +441,13 @@ fn model(source: &str, dir: &Path, context: u32) -> Checked {
             checked.fits = Some(fits);
         }
         Ok(None) => {}
-        Err(why) => checked.reason = Some(format!("{why:#}")),
+        // A deployment the planner cannot size, a boot cannot hold either.
+        Err(why) => {
+            return unsupported(
+                checked,
+                &format!("this Mac cannot plan `{deployment}`: {why:#}"),
+            );
+        }
     }
     checked.deployment = Some(deployment);
     checked
