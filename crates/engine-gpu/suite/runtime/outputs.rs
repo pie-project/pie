@@ -277,7 +277,7 @@ pub(super) fn measure_behind(engine: &mut impl ::engine::Engine) -> usize {
     let behind = ::engine::BehindServing {
         others: &|| 0,
         arrived: &|| false,
-        quiet: true,
+        seats: None,
     };
     while engine
         .measure_behind(&behind)

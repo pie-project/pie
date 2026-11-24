@@ -91,7 +91,7 @@ fn a_settle_point_overlapped_by_a_fire_is_not_stored() {
     let behind = ::engine::BehindServing {
         others: &busy,
         arrived: &|| false,
-        quiet: true,
+        seats: None,
     };
     let mut slices = 0;
     while slices < 64 && loaded.engine.measure_behind(&behind).expect("measuring behind") {

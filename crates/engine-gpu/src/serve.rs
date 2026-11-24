@@ -703,7 +703,7 @@ struct Behind {
     /// The ranges weighed and stored since.
     stored: usize,
     /// The points discarded and fired again, by cause ([`Discard`]).
-    discarded: [u64; 3],
+    discarded: [u64; 4],
     /// The slices run, and the longest one: what an arrival can wait
     /// behind.
     slices: u64,
@@ -719,6 +719,8 @@ enum Discard {
     Overlap = 1,
     /// The device's clock moved under it.
     Clock = 2,
+    /// A request arrived: the slice gave the device back before it.
+    Yielded = 3,
 }
 
 /// One range's weighing behind serving: its options, fired one a slice in
@@ -3211,7 +3213,7 @@ impl<B: Serve> Shell<B> {
             left,
             trial: None,
             stored: 0,
-            discarded: [0; 3],
+            discarded: [0; 4],
             slices: 0,
             longest: std::time::Duration::ZERO,
         });
@@ -3345,20 +3347,29 @@ impl<B: Serve> Shell<B> {
         self.behind.is_some()
     }
 
-    /// One slice of the dense settle left behind serving: one fire of one
-    /// option of the range being weighed (or the device's clock read where
-    /// a range opens or closes). The caller runs it only where no serving
-    /// fire waits and the runtime holds no slot of the pool, so the fire
-    /// may write the seat-addressed chunks; nothing it does changes what
-    /// this load serves, records or builds (every kernel weighed was built
-    /// at load; a slice that built one stops the settle, said). Whether it
-    /// fired: `false` where nothing is left, or the seats' segments are
-    /// not backed now (backing them would drop the recorded bodies).
-    pub fn measure_behind(&mut self, others: &dyn Fn() -> u64) -> Result<bool> {
+    /// One slice of the dense settle left behind serving: one point of
+    /// one option of the range being weighed, or a range opened. The caller
+    /// runs it only where no serving fire waits. Its fire names the slots
+    /// the runtime took for it (`seats`, one a lane, [`Shell::behind_need`])
+    /// by ref, as a serving lane does; with no runtime (`None`), the
+    /// engine's own seats. Nothing it does changes what this load serves,
+    /// records or builds (every kernel weighed was built at load; a slice
+    /// that built one stops the settle, said). Whether it fired: `false`
+    /// where nothing is left, or (on the engine's seats) their segments
+    /// are not backed now (backing them would drop the recorded bodies).
+    pub fn measure_behind(
+        &mut self,
+        others: &dyn Fn() -> u64,
+        arrived: &dyn Fn() -> bool,
+        seats: Option<&[engine::BehindSeat]>,
+    ) -> Result<bool> {
         let Some(mut behind) = self.behind.take() else {
             return Ok(false);
         };
-        if self.pools.has_state()
+        // On the engine's own seats (no runtime), only where their segments
+        // are backed: backing them would drop the recorded bodies.
+        if seats.is_none()
+            && self.pools.has_state()
             && self.pools.seat_segments() > self.pools.chunk_facts().segments.committed
         {
             self.behind = Some(behind);
@@ -3379,7 +3390,7 @@ impl<B: Serve> Shell<B> {
                     .map(|_| B::lay_stamps(&self.device, 1))
                     .collect::<Result<Vec<_>>>()?;
             }
-            self.behind_slice(&mut behind, others)
+            self.behind_slice(&mut behind, others, arrived, seats)
         })();
         if laid {
             self.stamps.clear();
@@ -3420,17 +3431,19 @@ impl<B: Serve> Shell<B> {
         if more {
             self.behind = Some(behind);
         } else {
-            let [busy, overlap, clock] = behind.discarded;
+            let [busy, overlap, clock, yielded] = behind.discarded;
             tracing::info!(
                 pending = behind.pending,
                 stored = behind.stored,
                 busy,
                 overlap,
                 clock,
+                yielded,
                 slices = behind.slices,
                 longest_ms = behind.longest.as_secs_f64() * 1e3,
                 "dense settle behind serving done: {} of {} ranges stored for the next load \
-                 (points discarded: {busy} busy, {overlap} overlapped, {clock} clock); the longest \
+                 (points fired again: {busy} busy, {overlap} overlapped, {clock} clock, {yielded} \
+                 yielded); the longest \
                  slice, what an arrival waited behind at most, {:.1} ms",
                 behind.stored,
                 behind.pending,
@@ -3450,7 +3463,25 @@ impl<B: Serve> Shell<B> {
             .map(|b| (b.pending, b.stored, b.discarded.iter().sum()))
     }
 
-    fn behind_slice(&mut self, behind: &mut Behind, others: &dyn Fn() -> u64) -> Result<bool> {
+    /// What the next slice behind serving fires on the pool: the trial's
+    /// next point's lanes and rows (`engine::Engine::behind_need`); `None`
+    /// where the next slice opens a range, or nothing is left.
+    #[must_use]
+    pub fn behind_need(&self) -> Option<engine::BehindNeed> {
+        let trial = self.behind.as_ref()?.trial.as_ref()?;
+        Some(engine::BehindNeed {
+            lanes: trial.fire_lanes,
+            tokens: trial.per_lane,
+        })
+    }
+
+    fn behind_slice(
+        &mut self,
+        behind: &mut Behind,
+        others: &dyn Fn() -> u64,
+        arrived: &dyn Fn() -> bool,
+        seats: Option<&[engine::BehindSeat]>,
+    ) -> Result<bool> {
         let Some(mut trial) = behind.trial.take() else {
             let Some((bottom, top)) = behind.left.pop_front() else {
                 return Ok(false);
@@ -3467,7 +3498,7 @@ impl<B: Serve> Shell<B> {
             }
             return Ok(behind.trial.is_some() || !behind.left.is_empty());
         };
-        if let Some((cause, why)) = self.trial_fire(&mut trial, others)? {
+        if let Some((cause, why)) = self.trial_fire(&mut trial, others, arrived, seats)? {
             behind.discarded[cause as usize] += 1;
             tracing::debug!(
                 bottom = trial.bottom,
@@ -3487,16 +3518,17 @@ impl<B: Serve> Shell<B> {
         behind.rows.push(row);
         behind.stored += 1;
         self.to_store = Some(self.behind_entry(behind));
-        let [busy, overlap, clock] = behind.discarded;
+        let [busy, overlap, clock, yielded] = behind.discarded;
         tracing::info!(
             pending = behind.pending,
             stored = behind.stored,
             busy,
             overlap,
             clock,
-            "dense settle behind serving: {} of {} ranges weighed and stored (points discarded \
-             and fired again: {busy} the device busy as they started, {overlap} overlapped by \
-             another lane, {clock} under a clock that moved)",
+            yielded,
+            "dense settle behind serving: {} of {} ranges weighed and stored (points fired \
+             again: {busy} the device busy as they started, {overlap} overlapped by another \
+             lane, {clock} under a clock that moved, {yielded} yielded to an arrival)",
             behind.stored,
             behind.pending,
         );
@@ -3666,6 +3698,8 @@ impl<B: Serve> Shell<B> {
         &mut self,
         trial: &mut Trial,
         others: &dyn Fn() -> u64,
+        arrived: &dyn Fn() -> bool,
+        seats: Option<&[engine::BehindSeat]>,
     ) -> Result<Option<(Discard, String)>> {
         use crate::backend::Tactics as _;
         let timed = trial.round > 0;
@@ -3705,35 +3739,95 @@ impl<B: Serve> Shell<B> {
         self.split_next(None);
         self.dense = trial.options[trial.next].clone();
         let fire_lanes = trial.fire_lanes;
-        for slot in 0..fire_lanes {
-            self.open(slot)?;
+        // Behind a runtime, each lane names the slots it took for the
+        // point by ref, as a serving lane does (a fresh record, its kv
+        // pages); with no runtime, the engine's own seats, opened fresh.
+        if let Some(seats) = seats
+            && seats.len() < fire_lanes as usize
+        {
+            return Err(Fault::Device {
+                call: "settle behind serving",
+                why: format!(
+                    "the runtime took {} lanes' slots for a point of {fire_lanes} lanes",
+                    seats.len()
+                ),
+            });
         }
-        let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
-            .map(|slot| Seated {
-                hosts: false,
-                inputs: &zeros,
-                ..Seated::of(Lane {
-                    slot,
-                    word,
-                    tokens: &tokens,
+        let records: Vec<Option<&[u32]>> = (0..fire_lanes as usize)
+            .map(|at| {
+                seats.and_then(|seats| {
+                    seats[at]
+                        .record
+                        .iter()
+                        .find(|(shape, _)| *shape == crate::store::layout::FIXED)
+                        .map(|(_, refs)| refs.as_slice())
                 })
+            })
+            .collect();
+        let fresh_seats = |shell: &mut Self| -> Result<()> {
+            if seats.is_none() {
+                for slot in 0..fire_lanes {
+                    shell.open(slot)?;
+                }
+            }
+            Ok(())
+        };
+        fresh_seats(self)?;
+        let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
+            .map(|slot| {
+                let lane = Seated {
+                    hosts: false,
+                    inputs: &zeros,
+                    ..Seated::of(Lane {
+                        slot,
+                        word,
+                        tokens: &tokens,
+                    })
+                };
+                match seats {
+                    Some(seats) => Seated {
+                        refs: true,
+                        pages: &seats[slot as usize].pages,
+                        held: Some(0),
+                        record: records[slot as usize],
+                        rs_reset: engine::fire::RsReset::Fresh,
+                        ..lane
+                    },
+                    None => lane,
+                }
             })
             .collect();
         // A slice follows an idle gap, its clock fallen: the point's own
         // fire first, untimed (the clock raised by the load it times, not
         // by the small reference alone), then the reference read until the
         // clock settles ([`crate::rates::warmed`]).
+        // Each fire of the slice reads whether a request arrived first: one
+        // that did stops it, the point fired again on a later idle turn, so
+        // an arrival waits at most the fire in flight.
+        let yielded = || {
+            Ok(Some((
+                Discard::Yielded,
+                "a request arrived; the slice gave the device back".to_string(),
+            )))
+        };
         let clock_before = if timed {
+            if arrived() {
+                return yielded();
+            }
             self.drain()?;
             self.fire_seated(&seated)?;
             self.drain()?;
-            for slot in 0..fire_lanes {
-                self.open(slot)?;
+            fresh_seats(self)?;
+            match crate::rates::clock_warmed_until::<B>(&self.device, reference, arrived)? {
+                Some(read) => Some(read),
+                None => return yielded(),
             }
-            Some(crate::rates::clock_warmed::<B>(&self.device, reference)?)
         } else {
             None
         };
+        if arrived() {
+            return yielded();
+        }
         let submitted = others();
         self.drain()?;
         self.spans = Some(Vec::new());
@@ -3759,9 +3853,7 @@ impl<B: Serve> Shell<B> {
             })
             .flatten();
         // The seats as the runtime finds them: opened fresh.
-        for slot in 0..fire_lanes {
-            self.open(slot)?;
-        }
+        fresh_seats(self)?;
         if others() != submitted {
             return Ok(Some((
                 Discard::Overlap,

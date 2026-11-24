@@ -2311,7 +2311,15 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     // rates are this load's alone where the after read is slower than the
     // warmed before read.
     let reference = tactics.gemm(tier, crate::submit::PROBE.0);
-    let clock_before = clock_warmed::<B>(device, reference)?;
+    let clock_before = match yield_to {
+        Some(stop) => clock_warmed_until::<B>(device, reference, stop)?.ok_or_else(|| {
+            Fault::Device {
+                call: "measuring behind serving",
+                why: YIELDED.to_string(),
+            }
+        })?,
+        None => clock_warmed::<B>(device, reference)?,
+    };
     let mut rig = Rig::<B>::new(device, max_submit);
     rig.yield_to = yield_to;
     // Under a stated bound, the probe first: every estimate grows from it.
@@ -3905,24 +3913,50 @@ pub fn clock_warmed<B: Serve>(
     warmed(|| read_clock(device, &probe))
 }
 
+/// [`clock_warmed`] behind serving: `stop` read before each read, `None`
+/// where it stopped it (a request arrived), so an arrival waits at most one
+/// read of the reference.
+pub fn clock_warmed_until<B: Serve>(
+    device: &B::Context,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>> {
+    let probe = crate::submit::Probe::<B>::new(device, tactic)?;
+    warmed_until(|| read_clock(device, &probe), stop)
+}
+
 /// Reads of `read` taken until two in a row agree within their own spread
 /// (either way: a ramp still rising and a boost still falling both move by
 /// more): the settled clock, the median of the settled pair, at the wider
 /// spread. No process-wide fastest is kept: the reference is the clock
 /// measured right around the phase. A clock settles (a ramp has a top, a
 /// boost a sustained floor), so the reads end.
-pub fn warmed(mut read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
+pub fn warmed(read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
+    warmed_until(read, &|| false).map(|read| read.expect("never stopped"))
+}
+
+/// [`warmed`], `stop` read before each read: `None` where it stopped.
+pub fn warmed_until(
+    mut read: impl FnMut() -> Result<ClockRead>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>> {
+    if stop() {
+        return Ok(None);
+    }
     let mut last = read()?;
     loop {
+        if stop() {
+            return Ok(None);
+        }
         let next = read()?;
         let noise = last.spread.max(next.spread);
         let low = last.fastest_ns.min(next.fastest_ns);
         let high = last.fastest_ns.max(next.fastest_ns);
         if high <= low * (1.0 + noise) {
-            return Ok(ClockRead {
+            return Ok(Some(ClockRead {
                 fastest_ns: (low + high) / 2.0,
                 spread: noise,
-            });
+            }));
         }
         last = next;
     }

@@ -128,6 +128,9 @@ enum LaneRequest {
         step: u32,
         outcome: ::engine::StepOutcome,
     },
+    /// Turns an idle lane so it takes up what its engine measures behind
+    /// serving ([`open_behind`]): nothing else.
+    Behind,
 }
 
 pub(super) enum LaneCommit {
@@ -681,7 +684,7 @@ fn fail_request(request: LaneRequest, why: &str) {
             }
             let _ = reply.send(commit);
         }
-        LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } => {}
+        LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } | LaneRequest::Behind => {}
     }
 }
 
@@ -700,15 +703,162 @@ pub(crate) static BEHIND_WAITS: std::sync::atomic::AtomicU64 =
 /// engine times behind serving that sees it move ran beside other work.
 static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The slots taken for one point behind serving ([`take_behind`]), held
+/// by the store until [`give_behind`].
+#[derive(Default)]
+pub(crate) struct BehindTaken {
+    /// The kv list's shape and each lane's refs of it.
+    list: Option<(crate::store::slots::ShapeId, Vec<Vec<u32>>)>,
+    /// The fresh records, one a lane.
+    records: Vec<u32>,
+    /// What the engine names them by.
+    pub(crate) seats: Vec<::engine::BehindSeat>,
+}
+
+/// The slots one point behind serving asks for (`need`: its lanes and each
+/// lane's rows), taken for the store as a working set's are: each lane's
+/// kv pages and, where the load holds recurrent state, a fresh record. The
+/// lowest claim on the pool there is: none is taken while a waiter is
+/// short of a slot (any arrival or parked process comes first), and where
+/// the free slots fall short, idle cache yields what is short of it, the
+/// way it yields to running work (`KvStore::reclaim_droppable`, its
+/// retention keys' order; the rs checkpoints after), never a live, parked
+/// or suspended set. Taken in full, or none (empty seats: the slice that
+/// fires waits for a later idle turn). Nothing is waited on: the planner
+/// never sees it.
+pub(crate) fn take_behind(
+    stores: &crate::store::registry::Stores,
+    need: ::engine::BehindNeed,
+) -> BehindTaken {
+    let Some(shared) = stores.shared.clone() else {
+        return BehindTaken::default();
+    };
+    let lanes = need.lanes as usize;
+    // The pages each lane's rows take, and whether the load holds records.
+    let (pages, records) = {
+        let pool = shared.lock().unwrap();
+        if pool.pool().waiting() {
+            return BehindTaken::default();
+        }
+        let pages = pool
+            .list()
+            .map_or(0, |list| need.tokens.div_ceil(list.tokens.max(1)));
+        (pages, pool.holds_records())
+    };
+    let attempt = || -> Option<BehindTaken> {
+        let mut pool = shared.lock().unwrap();
+        let mut taken = BehindTaken::default();
+        if let Some((shape, n)) = pool.kv_takes(pages) {
+            let mut all = Vec::with_capacity(lanes);
+            for _ in 0..lanes {
+                match pool.take_refs(shape, n) {
+                    Some(refs) => all.push(refs),
+                    None => {
+                        for refs in &all {
+                            pool.give_refs(shape, refs);
+                        }
+                        return None;
+                    }
+                }
+            }
+            taken.list = Some((shape, all));
+        }
+        if records {
+            match pool.take_records(lanes) {
+                Some(ids) => taken.records = ids,
+                None => {
+                    if let Some((shape, all)) = &taken.list {
+                        for refs in all {
+                            pool.give_refs(*shape, refs);
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        taken.seats = (0..lanes)
+            .map(|at| ::engine::BehindSeat {
+                pages: taken
+                    .list
+                    .as_ref()
+                    .map(|(_, all)| all[at].clone())
+                    .unwrap_or_default(),
+                record: taken
+                    .records
+                    .get(at)
+                    .map(|&id| pool.record_refs(id))
+                    .unwrap_or_default(),
+            })
+            .collect();
+        Some(taken)
+    };
+    if let Some(taken) = attempt() {
+        return taken;
+    }
+    // Short: idle cache yields one point's worth, as it does to running
+    // work; then once more.
+    let short = (pages as usize).saturating_mul(lanes);
+    let freed = crate::store::registry::with_kv_lock(&stores.kv, "behind-reclaim-idle", |kv| {
+        let epoch = kv.current_epoch();
+        kv.reclaim_droppable(epoch, short, crate::policy::retention::Installed)
+    });
+    let rs_freed = if records {
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .reclaim_droppable(crate::policy::retention::Installed)
+    } else {
+        0
+    };
+    tracing::debug!(
+        lanes,
+        pages,
+        freed,
+        rs_freed,
+        "measuring behind serving: idle cache yielded for one point's slots"
+    );
+    attempt().unwrap_or_default()
+}
+
+/// The slots [`take_behind`] took go back to the pool.
+pub(crate) fn give_behind(stores: &crate::store::registry::Stores, taken: BehindTaken) {
+    let Some(shared) = stores.shared.as_ref() else {
+        return;
+    };
+    let mut pool = shared.lock().unwrap();
+    if let Some((shape, all)) = &taken.list {
+        for refs in all {
+            pool.give_refs(*shape, refs);
+        }
+    }
+    if !taken.records.is_empty() {
+        pool.give_records(&taken.records);
+    }
+}
+
 /// Whether the runtime is ready: measuring behind serving runs only after
 /// (nothing of it lengthens a boot, or lies beside the host cover's warm
 /// runs).
 static BEHIND_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Every lane's control queue, to turn it once the runtime is ready
+/// ([`open_behind`]).
+static LANES: std::sync::Mutex<Vec<crate::rt::channel::Sender<LaneRequest>>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// The runtime is ready: the engines' lanes may run what their engines
-/// measure behind serving, where they idle.
+/// measure behind serving, where they idle. Each is turned once, so a lane
+/// asleep since before ready takes it up without waiting for a request;
+/// from there an idle lane keeps turning while its engine has a slice to
+/// run, and sleeps once it has none.
 pub(crate) fn open_behind() {
     BEHIND_OPEN.store(true, std::sync::atomic::Ordering::Release);
+    // A lane that has shut down drops out.
+    LANES
+        .lock()
+        .unwrap()
+        .retain(|lane| lane.send(LaneRequest::Behind).is_ok());
 }
 
 /// The times an engine lane found nothing queued and stayed awake: a fire
@@ -785,6 +935,7 @@ impl Lane {
         let landed_tx = control_tx.clone();
         let parks = Arc::new(SchedulerParks::default());
         let lane_parks = Arc::clone(&parks);
+        LANES.lock().unwrap().push(control_tx.clone());
         let thread = crate::rt::thread::Builder::new()
             .name(format!("pie-engine-{engine_idx}"))
             .spawn(move || {
@@ -951,10 +1102,9 @@ impl Lane {
     }
 
     /// One slice of what the engine measures behind serving, where it has
-    /// any, told whether the runtime holds no slot of the engine's pool (no
-    /// working set, cache entry, snapshot, store table or weight lies in
-    /// any chunk, and no waiter is short of one): the slice's length where
-    /// it fired.
+    /// any: the slice's length where it fired. Where its next slice fires
+    /// on the pool ([`::engine::Engine::behind_need`]), the slots one point
+    /// takes are taken for it first ([`take_behind`]) and given back after.
     /// A fault in it ends that measuring, said; serving goes on.
     fn measure_behind(
         engine_idx: usize,
@@ -968,23 +1118,22 @@ impl Lane {
         if !engine.measures_behind() {
             return None;
         }
-        // Whether the runtime holds no slot of the pool: what a slice that
-        // writes the pool's chunks (a settle fire's seats) waits for; a
-        // slice that writes none runs on any idle turn.
-        let quiet = crate::store::registry::try_get(0, engine_idx)
-            .and_then(|stores| stores.shared)
-            .is_some_and(|shared| {
-                let pool = shared.lock().unwrap();
-                pool.pool().holds_nothing() && !pool.pool().waiting()
-            });
         let began = Instant::now();
+        let stores = crate::store::registry::try_get(0, engine_idx);
+        let taken = engine
+            .behind_need()
+            .map(|need| stores.as_ref().map(|stores| take_behind(stores, need)).unwrap_or_default());
         let others = || SUBMITS.load(std::sync::atomic::Ordering::Acquire);
         let behind = ::engine::BehindServing {
             others: &others,
             arrived,
-            quiet,
+            seats: Some(taken.as_ref().map_or(&[][..], |taken| taken.seats.as_slice())),
         };
-        match engine.measure_behind(&behind) {
+        let fired = engine.measure_behind(&behind);
+        if let (Some(taken), Some(stores)) = (taken, stores.as_ref()) {
+            give_behind(stores, taken);
+        }
+        match fired {
             Ok(true) => Some(began.elapsed()),
             Ok(false) => None,
             Err(error) => {
@@ -1107,7 +1256,9 @@ impl Lane {
                 LaneRequest::Control { .. } => Some(LaneWork::Control),
                 LaneRequest::Launch { prefill: true, .. } => Some(LaneWork::Prefill),
                 LaneRequest::Launch { .. } => Some(LaneWork::Launch),
-                LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } => None,
+                LaneRequest::Shutdown { .. } | LaneRequest::Landed { .. } | LaneRequest::Behind => {
+                    None
+                }
             };
             let _lane_charge = LaneCharge {
                 stats: &stats,
@@ -1222,6 +1373,9 @@ impl Lane {
                     let _ = response.send((engine.take(), std::mem::take(&mut channels)));
                     return;
                 }
+                // Nothing to do but turn: the lane, idle again, runs what
+                // its engine measures behind serving.
+                LaneRequest::Behind => false,
                 LaneRequest::Landed {
                     frame,
                     step,

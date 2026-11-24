@@ -307,7 +307,12 @@ impl<B: Host> Gpu<B> {
         let reference = shell.tuning().gemm(shell.tier(), crate::submit::PROBE.0);
         let submitted = (behind.others)();
         let began = std::time::Instant::now();
-        let before = crate::rates::clock_warmed::<B>(shell.device(), reference).map_err(fault)?;
+        let Some(before) =
+            crate::rates::clock_warmed_until::<B>(shell.device(), reference, behind.arrived)
+                .map_err(fault)?
+        else {
+            return Ok(true);
+        };
         let timed: crate::error::Result<profile::fire::Rates> =
             match key.strip_prefix(crate::rates::CURVE_BEHIND) {
                 Some(curve) => {
@@ -1734,6 +1739,10 @@ where
             .is_some_and(|shell| shell.measures_behind() || shell.rates_behind().is_some())
     }
 
+    fn behind_need(&self) -> Option<engine::BehindNeed> {
+        self.shell.as_ref().and_then(Shell::behind_need)
+    }
+
     fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
         // A frame whose numbers are not yet taken holds its readout seats.
         if self.pending.is_some() {
@@ -1743,21 +1752,28 @@ where
             return Ok(false);
         };
         // The settle's ranges first (decode's rows before the large ones),
-        // where the pool is quiet (a settle fire writes its seats); else,
+        // where the runtime took the slots its next fire asks for; else,
         // and after, each rate and curve served by a stale figure (its step
-        // writes no pool chunk: it runs on any idle turn).
-        if !shell.measures_behind() || !behind.quiet {
-            if shell.measures_behind() && shell.rates_behind().is_none() && !self.said_waiting {
+        // writes no pool slot: it runs on any idle turn).
+        let seats_short = match (shell.behind_need(), behind.seats) {
+            (Some(need), Some(seats)) => seats.len() < need.lanes as usize,
+            _ => false,
+        };
+        if !shell.measures_behind() || seats_short {
+            if seats_short && shell.rates_behind().is_none() && !self.said_waiting {
                 self.said_waiting = true;
                 tracing::info!(
-                    "dense settle behind serving: waiting for an idle turn on which the runtime \
-                     holds no slot of the pool (a settle fire writes its seats); this load \
-                     serves its fallback picks meanwhile"
+                    "dense settle behind serving: the pool holds no room for one point's slots \
+                     beyond live work; weighed on a later idle turn, this load serving its \
+                     fallback picks meanwhile"
                 );
             }
             return self.rate_behind(behind);
         }
-        let fired = shell.measure_behind(behind.others).map_err(fault)?;
+        self.said_waiting = false;
+        let fired = shell
+            .measure_behind(behind.others, behind.arrived, behind.seats)
+            .map_err(fault)?;
         // What the settle decided so far, kept in the user's profile for
         // the next load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {
