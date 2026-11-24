@@ -488,35 +488,6 @@ pub fn causal_conv1d_carried(
     )
 }
 
-/// [`short_conv`] over each lane's carried rows then its own, as
-/// [`causal_conv1d_carried`].
-#[allow(clippy::too_many_arguments)]
-pub fn short_conv_carried(
-    ctx: &Ctx,
-    x: Tensor,
-    weight: Tensor,
-    state: &RecurrentPool,
-    conv_width: u32,
-    y: &mut Tensor,
-    carry: &Carry,
-) -> Result<(), Error> {
-    const OP: &str = "ssm.short_conv";
-    conv1d_carried(
-        ctx,
-        OP,
-        x,
-        weight,
-        None,
-        state,
-        conv_width,
-        1,
-        y,
-        ConvOut::Residual,
-        carry,
-        None,
-    )
-}
-
 /// The taps the carried conv sums a row (`ssm_conv1d_carried`'s `KMAX`).
 const CONV_CARRIED_TAPS: u32 = 8;
 
@@ -1461,6 +1432,7 @@ impl Delta {
     }
 }
 
+#[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked_serial(
     ctx: &Ctx,
@@ -2163,6 +2135,7 @@ pub fn kda_fold(
 
 /// `kda_chunked` through the token-by-token scan whatever the head: the
 /// reference the chunk-parallel passes answer to.
+#[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn kda_chunked_serial(
     ctx: &Ctx,

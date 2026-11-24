@@ -476,16 +476,6 @@ impl ExpertTable {
     }
 }
 
-/// The contiguous bank's table: `planes` given as `(base, stride)` in bytes,
-/// expert `e`'s entry `p` at `base_p + e * stride_p` (a plane the bank lacks
-/// as `(0, 0)`). Uploaded, it lands what no table does.
-#[must_use]
-pub fn contiguous_entries(experts: u32, planes: &[(u64, u64)]) -> Vec<u64> {
-    (0..u64::from(experts))
-        .flat_map(|e| planes.iter().map(move |&(base, stride)| base + e * stride))
-        .collect()
-}
-
 /// Where a token-id-gathered table's row blocks lie, as the CUDA kernels
 /// take it: a u64 address a block of `block_rows` rows (null: the
 /// contiguous table), and a u32 read counter a block (`hits`, or 0).
@@ -1392,15 +1382,18 @@ mod ordered {
 }
 
 /// Grouped GEMMs the hipBLASLt leg has launched, for tests.
-#[cfg(feature = "rocm")]
+#[cfg(all(feature = "rocm", feature = "test-support"))]
 static LT_FIRES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "rocm")]
+#[cfg(all(feature = "rocm", feature = "test-support"))]
 pub fn lt_grouped_fires() -> u64 {
     LT_FIRES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// The most the hipBLASLt leg stages: its routes' rows in and out.
+/// The most the hipBLASLt leg stages: its routes' rows in and out. The load
+/// lays that staging for good (`jit::device` places every slab at load), so
+/// this bounds the device memory the leg holds: a chosen bound, not a
+/// measured one; a wider shape takes the grouped kernels.
 #[cfg(feature = "rocm")]
 const LT_STAGE_CAP: u64 = 3 << 30;
 
@@ -1483,7 +1476,7 @@ fn stage_lt(
     ctx.fire(
         op,
         Fire::at(kernel(FILE, &format!("::pie::linear::moe_lt_scatter<{t}>")))
-            .apply(Launch::grid([copy_blocks(rows, k), 1, 1], [256, 1, 1])),
+            .apply(Launch::grid([copy_blocks(rows, k, ctx.multiprocessors(op)?), 1, 1], [256, 1, 1])),
         &[
             x.arg(),
             ArgValue::Ptr(ordered.order),
@@ -1508,11 +1501,12 @@ fn stage_lt(
     })
 }
 
-/// Blocks a 16-byte grid-stride copy of `rows` rows of `width` takes.
+/// Blocks a 16-byte grid-stride copy of `rows` rows of `width` takes, at
+/// most eight on each of the device's `cus` compute units.
 #[cfg(feature = "rocm")]
-fn copy_blocks(rows: u32, width: u32) -> u32 {
+fn copy_blocks(rows: u32, width: u32, cus: u32) -> u32 {
     let pieces = u64::from(rows) * u64::from(width / 8);
-    pieces.div_ceil(256).clamp(1, 304 * 8) as u32
+    pieces.div_ceil(256).clamp(1, u64::from(cus) * 8) as u32
 }
 
 /// One grouped GEMM over the arguments at `args`: `experts` groups and the
@@ -1534,6 +1528,7 @@ fn lt_launch(
     // naming staged planes and the bank, all live through the fire.
     unsafe { lib.launch(at, experts + 1, args, grid, stream) }.map_err(|why| refuse(op, why))?;
     // A size-only walk launches nothing.
+    #[cfg(feature = "test-support")]
     if !crate::sizing::active() {
         LT_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
@@ -1709,6 +1704,9 @@ const fn block_rows(per_expert: u32) -> u32 {
     }
 }
 
+/// The most the rocBLAS leg stages (its blocks' rows in and out), held for
+/// good as [`LT_STAGE_CAP`]'s: a chosen bound, not a measured one; a wider
+/// shape takes the grouped kernels.
 #[cfg(feature = "rocm")]
 const GROUP_WORKSPACE_CAP: u64 = 512 << 20;
 
