@@ -1983,7 +1983,7 @@ impl Lane {
                     // learned is released: the registration fails whole.
                     if let Some(roles) = roles_of(engine_idx)
                         && let Err(error) =
-                            crate::store::roles::learn_program(&roles, &mut **engine, program_id)
+                            crate::store::roles::learn_program(&roles, &**engine, program_id)
                     {
                         let released = serve(engine, Engine::programs, "close_program")
                             .and_then(|programs| programs.close_program(program_id));
@@ -2057,7 +2057,7 @@ impl Lane {
                     }
                 };
                 let roles = roles_of(engine_idx);
-                let held = crate::store::roles::held_by(&mut **engine, &plans);
+                let held = crate::store::roles::held_by(&**engine, &plans);
                 // Everything it takes of the pool first, its rings, its
                 // guest state, its tables: a bind short of room is answered
                 // so before it registers anything, and waits for room
@@ -2590,6 +2590,10 @@ mod landing_tests {
             Some(self)
         }
 
+        fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+            Some(self)
+        }
+
         fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
             Some(self)
         }
@@ -2827,6 +2831,10 @@ mod behind_tests {
         }
 
         fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+            Some(self)
+        }
+
+        fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
             Some(self)
         }
 

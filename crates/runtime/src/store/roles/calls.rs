@@ -8,14 +8,14 @@ use crate::engine::verbs::serve;
 /// not yet: once a program, at its registration.
 pub fn learn_program(
     roles: &RolesHandle,
-    engine: &mut dyn Engine,
+    engine: &dyn Engine,
     program: ProgramId,
 ) -> ::engine::Result<()> {
     if roles.lock().unwrap().knows(program) {
         return Ok(());
     }
     // An engine that serves no programs states no facts of one.
-    let facts = match engine.programs() {
+    let facts = match engine.programs_ref() {
         Some(programs) => programs.facts(program)?,
         None => ::engine::ProgramFacts::default(),
     };
@@ -76,8 +76,8 @@ pub fn take_rings(
 ///
 /// [`Channels::holds`]: ::engine::Channels::holds
 #[must_use]
-pub fn held_by(engine: &mut dyn Engine, plans: &[ChannelRegistration]) -> Vec<ChannelId> {
-    let Some(channels) = engine.channels() else {
+pub fn held_by(engine: &dyn Engine, plans: &[ChannelRegistration]) -> Vec<ChannelId> {
+    let Some(channels) = engine.channels_ref() else {
         return Vec::new();
     };
     plans

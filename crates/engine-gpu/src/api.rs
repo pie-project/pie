@@ -1435,7 +1435,15 @@ where
         Some(self)
     }
 
+    fn programs_ref(&self) -> Option<&dyn engine::Programs> {
+        Some(self)
+    }
+
     fn channels(&mut self) -> Option<&mut dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn engine::Channels> {
         Some(self)
     }
 

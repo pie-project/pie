@@ -40,6 +40,10 @@ impl ::engine::Engine for PanickingEngine {
         Some(self)
     }
 
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
     fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
         Some(self)
     }
@@ -836,6 +840,10 @@ impl ::engine::Engine for ExhaustedEngine {
         Some(self)
     }
 
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
     fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
         Some(self)
     }
@@ -1067,6 +1075,10 @@ impl ::engine::Engine for InlineEngine {
     }
 
     fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
         Some(self)
     }
 
@@ -1373,6 +1385,10 @@ impl ::engine::Engine for LaneFaultEngine {
     }
 
     fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
         Some(self)
     }
 
@@ -1762,6 +1778,10 @@ impl ::engine::Engine for LaneRefusalEngine {
     }
 
     fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
         Some(self)
     }
 
@@ -2251,6 +2271,10 @@ impl ::engine::Engine for HoldingEngine {
     }
 
     fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
         Some(self)
     }
 

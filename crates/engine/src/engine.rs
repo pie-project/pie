@@ -379,6 +379,18 @@ pub trait Engine: Send {
         None
     }
 
+    /// [`Self::programs`] for a read: the facts a family states of its
+    /// programs (`&self` methods) are asked without the engine's `&mut`.
+    /// An engine that answers one answers the other.
+    fn programs_ref(&self) -> Option<&dyn Programs> {
+        None
+    }
+
+    /// [`Self::channels`] for a read ([`Self::programs_ref`]).
+    fn channels_ref(&self) -> Option<&dyn Channels> {
+        None
+    }
+
     fn pool(&mut self) -> Option<&mut dyn Pool> {
         None
     }

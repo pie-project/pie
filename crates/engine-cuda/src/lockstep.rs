@@ -769,7 +769,15 @@ impl Engine for Rank {
         Some(self)
     }
 
+    fn programs_ref(&self) -> Option<&dyn Programs> {
+        Some(self)
+    }
+
     fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn Channels> {
         Some(self)
     }
 

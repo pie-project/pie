@@ -978,6 +978,10 @@ impl ::engine::Engine for SimEngine {
         Some(self)
     }
 
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
     fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
         Some(self)
     }
