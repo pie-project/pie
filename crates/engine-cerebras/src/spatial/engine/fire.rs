@@ -11,6 +11,7 @@ use eta_exec::Value;
 use eta_ir::registry::{GeometryClass, Stage};
 
 use super::Spatial;
+use super::kv::Kv;
 use super::launch::{self, MODEL_NS};
 use crate::api::{port_error, refusal};
 use crate::spatial::wafer;
@@ -398,7 +399,7 @@ impl Spatial {
             }
         }
         let lanes = &step.lanes;
-        let pages: Vec<Vec<u32>> = lanes.iter().map(|lane| self.kv.lane_pages(lane)).collect();
+        let pages: Vec<Vec<u32>> = lanes.iter().map(Kv::lane_pages).collect();
         if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
             for lane in lanes {
                 tracing::debug!(target: "spatial_trace",
@@ -435,6 +436,8 @@ impl Spatial {
             dense_masks,
             positions,
         } = resolved;
+        // Every lane's window-buffer copies land before any lane reads or writes.
+        self.windows.copy_slots(lanes)?;
         // The forward, lane by lane, keeping the logits of the rows something reads.
         let attached: BTreeMap<usize, InstanceId> = step
             .attachments
@@ -480,6 +483,7 @@ impl Spatial {
                 } else {
                     // The model runs causal attention over the lane's own history only.
                     self.check_masks(lane, at, start, tokens[at].len(), dense_masks.get(&at))
+                        .and_then(|()| self.windows.fold(lane, start, &tokens[at]))
                 };
                 if let Err(refused) = runs {
                     fault_lane(&mut outcome, step, at, &refused.to_string());
@@ -619,7 +623,7 @@ impl Spatial {
                     .map_err(port_error)?
                     .map(|after| after.saturating_sub(rows as u32))
             } else {
-                (!self.kv.lane_pages(lane).is_empty()).then_some(lane.kv.held)
+                (!Kv::lane_pages(lane).is_empty()).then_some(lane.kv.held)
             };
             resolved.tokens[source] = ports.tokens_for(rows).map_err(port_error)?.to_vec();
             if let Some((cells, stride)) = ports.mask(rows).map_err(port_error)? {
