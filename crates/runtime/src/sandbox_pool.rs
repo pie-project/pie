@@ -24,10 +24,7 @@ use anyhow::{Result, bail};
 use std::sync::OnceLock;
 
 /// The memory maps this process held before its engines loaded.
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "android")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 static MAPS_BEFORE_ENGINES: OnceLock<u64> = OnceLock::new();
 
 /// Records the memory maps this process holds now, before its engines
