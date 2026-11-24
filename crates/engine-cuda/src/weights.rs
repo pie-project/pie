@@ -1565,20 +1565,16 @@ impl Weights {
                 })
             })
             .collect();
-        let overwrite = Overwrite::plan(path, contract, target, &held)?;
-        let arena = usize::try_from(overwrite.arena_bytes()).unwrap_or(0);
-        // The overwrite's transform arena, in memory: the load itself
-        // streams and keeps no arena to reuse.
-        let mut scratch = vec![0u8; arena];
-        let mut backing: &mut [u8] = scratch.as_mut_slice();
+        // Walked as the load walks its checkpoint: each plane written over
+        // its held one as it lands, no host image of the whole.
+        let overwrite = Overwrite::streaming(path, contract, target, &held)?;
         let (store, places) = (&mut self.store, &self.places);
         *torn = true;
-        let written = overwrite.run(Some(&mut backing), |at, plane| {
+        let written = overwrite.run(None, |at, plane| {
             store
                 .write(places[at].offset, plane)
                 .map_err(|fault| LoadError::Internal(fault.to_string()))
         })?;
-        drop(scratch);
         #[cfg(feature = "cuda")]
         share_input_scales(trace, &self.table.0, stream)?;
         #[cfg(not(feature = "cuda"))]

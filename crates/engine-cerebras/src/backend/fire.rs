@@ -555,14 +555,28 @@ impl CerebrasEngine {
             read_rows.push(rows);
         }
         if !paged.is_empty() {
+            // A lane's kv refs are the pool's: the wafer's pages they name. Its
+            // seat is its recurrences' state slot, where the program has any.
+            let wafer = self.wafer_pages.ok_or_else(|| {
+                Error::Load("a unit program loaded without its wafer pages".into())
+            })?;
+            let stateful = self
+                .facts
+                .as_ref()
+                .is_some_and(crate::facts::Facts::has_state);
             let mut all: Vec<crate::units::Row> = Vec::new();
             for &(at, start, greedy) in &paged {
+                let lane_pages = pages[at]
+                    .iter()
+                    .map(|&slot| wafer.page(slot))
+                    .collect::<Result<Vec<u32>, String>>()
+                    .map_err(Error::Invalid)?;
                 for (i, &token) in tokens[at].iter().enumerate() {
                     all.push(crate::units::Row {
                         token,
                         pos: start + i as u32,
-                        pages: pages[at].clone(),
-                        state: lanes[at].slot,
+                        pages: lane_pages.clone(),
+                        state: if stateful { lanes[at].slot } else { 0 },
                         logits: !greedy && read_rows[at].contains(&(i as u32)),
                     });
                 }
