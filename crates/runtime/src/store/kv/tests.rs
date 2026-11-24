@@ -2895,3 +2895,27 @@ fn a_unified_load_with_defaults_suspends_kv_to_disk() {
     let txn = store.prepare_restore(&sets, &mut granted).unwrap();
     assert_eq!(store.commit_restore(txn).unwrap(), 3, "read back whole");
 }
+
+/// Reclaim frees what is short and no more (policy-out A18): asked for two
+/// pages of four exited sets' idle cache (two pages each), it frees one
+/// set's two pages, oldest first, and every other set stays cached under
+/// its owner. A set's kept checkpoint and the sealed prefix it stands on go
+/// together (dropping one alone frees nothing), and sealed prefixes of
+/// different sets are never pooled into one group.
+#[test]
+fn reclaim_frees_what_is_short_and_keeps_the_rest_of_the_cache() {
+    let mut store = KvStore::new(8, h(41));
+    let owners: Vec<ProcessId> = (1..=4u128).map(ProcessId::from_u128).collect();
+    for (seed, &owner) in owners.iter().enumerate() {
+        kept_and_gone(&mut store, 60 + seed as u32, 2, owner);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(store.available_pages(), 0, "idle cache fills the store");
+    let freed = store.reclaim_cache(store.current_epoch(), 2, crate::policy::retention::Installed);
+    assert_eq!(freed, 2, "exactly what is short");
+    assert_eq!(store.available_pages(), 2);
+    assert!(!store.owns_cache(owners[0]), "the oldest set went");
+    for &owner in &owners[1..] {
+        assert!(store.owns_cache(owner), "{owner:?} stays cached");
+    }
+}
