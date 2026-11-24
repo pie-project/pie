@@ -7248,9 +7248,11 @@ impl<B: Serve> Shell<B> {
             // The lane's windowed rows (CONTRACT-BC 19, 21): its fold, and
             // its window-buffer slots from the table's base. A seat-addressed
             // lane folds every row it brings, its buffer its seat's run.
-            if self.pools.rings().is_some() && seated.kv_less {
-                // A kv-less lane carries no attention rows: its rows land in
-                // its fire slots, read by nothing past the fire.
+            if self.pools.rings().is_some() && (seated.kv_less || seated.sunk) {
+                // A kv-less lane carries no attention rows, and a sunk one
+                // (refused, firing to keep the composition) keeps none: its
+                // rows land in its fire slots, read by nothing past the fire,
+                // and it folds nothing into its record's ring or its buffer.
                 ring_lanes.push(crate::ring::Seat {
                     folded: have,
                     fold: 0,

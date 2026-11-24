@@ -2133,7 +2133,7 @@ pub fn folds_all(windowed: bool, have: u32, rows: u32) -> Option<engine::fire::W
 
 /// Logit rows alike within a bf16-derived bound: every logit within 2^-6
 /// of its row's largest magnitude (a few bf16 ulps of the rows that feed
-/// it), and the same argmax.
+/// it), and the same argmax, or one that ties it within that bound.
 pub fn near(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
     let mut worst = 0f32;
@@ -2151,37 +2151,37 @@ pub fn near(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
             argmax(got),
             argmax(want)
         );
-        assert_eq!(argmax(got), argmax(want), "{what}: row {at}'s argmax");
+        let (g, w) = (argmax(got) as usize, argmax(want) as usize);
+        assert!(
+            g == w || got[g] - got[w] <= scale / 64.0,
+            "{what}: row {at}'s argmax {g} ({}) against {w} ({})",
+            got[g],
+            got[w]
+        );
     }
     eprintln!("{what}: worst {worst:.2e} of a row's largest logit");
 }
 
-/// One seat-addressed lane prefilling `prompt` rows in fires of 256 (past
-/// the model's window) and decoding `steps` on, each step fed `feed`'s
-/// token for its row (the fixture's argmax, [`fixture_feed`]) or else its
-/// own argmax: every logit row.
+/// The prompt a windowed check feeds: `rows` rows past the window.
+fn windowed_prompt(rows: u32) -> Vec<u32> {
+    (0..rows).map(|at| (at * 37 + 11) % 256).collect()
+}
+
+/// One seat-addressed lane prefilling `prompt` in fires of `piece` rows
+/// (past the model's window) and decoding `steps` on, each step fed
+/// `feed`'s token or else its own argmax: the logit row of each step, and
+/// the tokens it fed.
+#[allow(clippy::too_many_arguments)]
 fn windowed_rows(
     fixture: &Fixture,
     page: u32,
     context: u32,
-    prompt: u32,
-    steps: usize,
-    feed: Option<&[u32]>,
-) -> Option<Vec<Vec<f32>>> {
-    windowed_rows_in(fixture, page, context, prompt, steps, 256, None, feed)
-}
-
-/// [`windowed_rows`], the prompt in fires of `piece` rows.
-fn windowed_rows_in(
-    fixture: &Fixture,
-    page: u32,
-    context: u32,
-    prompt: u32,
-    steps: usize,
-    piece: usize,
     budget: Option<u64>,
+    prompt: &[u32],
+    piece: usize,
+    steps: usize,
     feed: Option<&[u32]>,
-) -> Option<Vec<Vec<f32>>> {
+) -> Option<(Vec<Vec<f32>>, Vec<u32>)> {
     let mut shell = load_with(
         fixture,
         page,
@@ -2192,10 +2192,9 @@ fn windowed_rows_in(
             ..engine::load::Residency::default()
         },
     )?;
-    let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
     let mut have = 0u32;
-    let mut out = Vec::new();
-    let mut fed = prompt;
+    let (mut out, mut tokens) = (Vec::new(), Vec::new());
+    let mut fed = prompt.to_vec();
     for _ in 0..=steps {
         let mut last = Vec::new();
         for piece in fed.chunks(piece) {
@@ -2210,182 +2209,126 @@ fn windowed_rows_in(
             last = shell.fire_seated(&[seated]).expect("the fire lands");
             have += piece.len() as u32;
         }
-        let row = out.len() + last.len() - 1;
-        fed = vec![feed.and_then(|feed| feed.get(row).copied()).unwrap_or_else(|| argmax(&last[0]))];
+        let next = feed
+            .and_then(|feed| feed.get(tokens.len()).copied())
+            .unwrap_or_else(|| argmax(&last[0]));
+        tokens.push(next);
+        fed = vec![next];
         out.extend(last);
     }
-    Some(out)
+    tokens.pop();
+    Some((out, tokens))
 }
 
-/// The committed fixture of the window lists' logits
-/// (`suite/fixtures/window/<backend>-<name>.txt`, written by a build
-/// serving window lists with `$PIE_WINDOW_FIXTURE_WRITE`): each row's
-/// argmax and its top 8 logits, and every 256th logit of the first, middle
-/// and last rows. This build's rows are held to it under a bf16-derived
-/// bound: each logit within 2^-6 of its row's largest top logit, the same
-/// argmax.
-/// The argmax of each row of fixture `name`, which a checked run feeds on
-/// (a near tie the bf16 bound admits would otherwise send it down another
-/// continuation); none where the run writes the fixture.
-fn fixture_feed(name: &str) -> Option<Vec<u32>> {
-    if std::env::var_os("PIE_WINDOW_FIXTURE_WRITE").is_some() {
-        return None;
-    }
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../engine-gpu/suite/fixtures/window")
-        .join(format!("{}-{name}.txt", backend::NAME));
-    let text = std::fs::read_to_string(&path).ok()?;
-    Some(
-        text.lines()
-            .filter_map(|line| line.strip_prefix("top "))
-            .filter_map(|rest| rest.split_whitespace().next()?.parse().ok())
-            .collect(),
+/// The dense answer to [`windowed_rows`]: the prompt and the first `k`
+/// tokens in one fire, for each step `k`, its last row. One fire reads
+/// every key from its own rows through the window's mask, so no ring,
+/// buffer or fold stands between a row and the keys it reads.
+fn dense_rows(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    budget: Option<u64>,
+    prompt: &[u32],
+    tokens: &[u32],
+) -> Vec<Vec<f32>> {
+    let mut shell = load_with(
+        fixture,
+        page,
+        context,
+        None,
+        engine::load::Residency {
+            device: engine::Allowance { budget },
+            ..engine::load::Residency::default()
+        },
     )
+    .expect("loaded before");
+    (0..=tokens.len())
+        .map(|k| {
+            let rows: Vec<u32> = prompt.iter().chain(&tokens[..k]).copied().collect();
+            let seated = Seated {
+                held: Some(0),
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: word(&fixture.trace, rows.len() as u32),
+                    tokens: &rows,
+                })
+            };
+            let got = shell.fire_seated(&[seated]).expect("the fire lands");
+            got.into_iter().last().expect("a readout row")
+        })
+        .collect()
 }
 
-fn fixture_check(name: &str, rows: &[Vec<f32>]) {
-    const TOP: usize = 8;
-    const STRIDE: usize = 256;
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../engine-gpu/suite/fixtures/window")
-        .join(format!("{}-{name}.txt", backend::NAME));
-    let sampled = |rows: usize| [0, rows / 2, rows.saturating_sub(1)];
-    if std::env::var_os("PIE_WINDOW_FIXTURE_WRITE").is_some() {
-        let mut text = format!("rows {} width {}\n", rows.len(), rows[0].len());
-        for row in rows {
-            let mut order: Vec<usize> = (0..row.len()).collect();
-            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
-            text.push_str(&format!("top {}", argmax(row)));
-            for &at in &order[..TOP] {
-                text.push_str(&format!(" {at}:{:e}", row[at]));
-            }
-            text.push('\n');
-        }
-        for at in sampled(rows.len()) {
-            text.push_str(&format!("sample {at}"));
-            for col in (0..rows[at].len()).step_by(STRIDE) {
-                text.push_str(&format!(" {:e}", rows[at][col]));
-            }
-            text.push('\n');
-        }
-        std::fs::create_dir_all(path.parent().expect("a dir")).expect("the fixture dir");
-        std::fs::write(&path, text).expect("the fixture writes");
-        return;
-    }
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    let mut lines = text.lines();
-    let head: Vec<usize> = lines
-        .next()
-        .expect("a head")
-        .split_whitespace()
-        .filter_map(|w| w.parse().ok())
-        .collect();
-    assert_eq!(head, [rows.len(), rows[0].len()], "{name}: rows and width");
-    let mut worst = 0f32;
-    let mut scales = Vec::new();
-    for (at, line) in lines.by_ref().take(rows.len()).enumerate() {
-        let mut words = line.split_whitespace().skip(1);
-        let want_argmax: usize = words.next().and_then(|w| w.parse().ok()).expect("an argmax");
-        let tops: Vec<(usize, f32)> = words
-            .map(|w| {
-                let (col, value) = w.split_once(':').expect("col:value");
-                (col.parse().expect("a column"), value.parse().expect("a logit"))
-            })
-            .collect();
-        let scale = tops.iter().fold(0f32, |m, &(_, v)| m.max(v.abs())).max(1e-3);
-        scales.push(scale);
-        // Another argmax only where it ties the fixture's within the bound.
-        let got = argmax(&rows[at]) as usize;
-        assert!(
-            got == want_argmax || rows[at][got] - rows[at][want_argmax] <= scale / 64.0,
-            "{name}: row {at}'s argmax {got} ({}) against {want_argmax} ({})",
-            rows[at][got],
-            rows[at][want_argmax]
-        );
-        for &(col, value) in &tops {
-            let err = (rows[at][col] - value).abs();
-            worst = worst.max(err / scale);
-            assert!(err <= scale / 64.0, "{name}: row {at} column {col}: {} against {value}", rows[at][col]);
-        }
-    }
-    for line in lines {
-        let mut words = line.split_whitespace().skip(1);
-        let at: usize = words.next().and_then(|w| w.parse().ok()).expect("a row");
-        for (k, w) in words.enumerate() {
-            let value: f32 = w.parse().expect("a logit");
-            let col = k * STRIDE;
-            let err = (rows[at][col] - value).abs();
-            worst = worst.max(err / scales[at]);
-            assert!(err <= scales[at] / 64.0, "{name}: row {at} column {col}: {} against {value}", rows[at][col]);
-        }
-    }
-    eprintln!("{name}: against the window lists' fixture, worst {worst:.2e} of a row's top logit");
-}
-
-/// The window lists' logits, written by a build serving them
-/// (`$PIE_WINDOW_GOLDEN`, `<name>.bin`, with `$PIE_WINDOW_GOLDEN_WRITE`), and
-/// held against what this build serves where the file is there.
-fn golden(name: &str, rows: &[Vec<f32>]) {
-    let Some(dir) = std::env::var_os("PIE_WINDOW_GOLDEN") else {
-        eprintln!("{name}: no $PIE_WINDOW_GOLDEN, nothing to hold the rows against");
-        return;
-    };
-    let path = PathBuf::from(dir).join(format!("{}-{name}.bin", backend::NAME));
-    let width = rows.first().map_or(0, Vec::len);
-    if std::env::var_os("PIE_WINDOW_GOLDEN_WRITE").is_some() {
-        let bytes: Vec<u8> = rows
-            .iter()
-            .flat_map(|row| row.iter().flat_map(|v| v.to_le_bytes()))
-            .collect();
-        std::fs::write(&path, bytes).expect("the golden writes");
-        return;
-    }
-    let bytes = std::fs::read(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
-    let want: Vec<Vec<f32>> = bytes
-        .as_chunks::<4>()
-        .0
-        .chunks(width.max(1))
-        .map(|row| row.iter().map(|c| f32::from_le_bytes(*c)).collect())
-        .collect();
-    near(&format!("{name}: ring + buffer against the window lists"), rows, &want);
-}
-
-/// A windowed layer as ring + buffer (CONTRACT-BC 19, 21) answers what the
-/// window lists answered: a prefill of 700 rows past the 512-row window in
-/// fires of 256 (each fire's own rows read from its fire slots and folded
-/// into the ring), and 16 decodes reading the ring.
-fn windowed_logits(model: &str, page: u32) {
-    let fixture = fixture(model, None);
+/// A windowed model's prompt of 184 rows in fires of 64, past its window
+/// of at most 64 rows twice over, and `steps` decodes through the ring,
+/// held to the dense answer row for row (its fires of at most 200 rows
+/// fit every backend's). A model of a layer or two only: deeper, a
+/// miniature's logits move with how a prompt is cut into fires far past
+/// the bound (bf16 rounding through its random weights, F77), so the
+/// dense fire is no answer to hold it to ([`same_cut_check`]).
+fn windowed_check(what: &str, fixture: &Fixture, page: u32, budget: Option<u64>, steps: usize) {
+    const PROMPT: u32 = 184;
     let window = poem_exec::store::kv::declared_window(&fixture.trace).unwrap_or(0);
-    assert!(window > 0 && window < 700, "{model}: a window of {window} under the prompt");
-    let name = format!("{model}-p{page}");
-    let feed = fixture_feed(&name);
-    let Some(rows) = windowed_rows(&fixture, page, 1024, 700, 16, feed.as_deref()) else {
+    assert!(window > 0 && 2 * window < PROMPT, "{what}: a window of {window} twice under the prompt");
+    let prompt = windowed_prompt(PROMPT);
+    let Some((rows, tokens)) = windowed_rows(fixture, page, 1024, budget, &prompt, 64, steps, None) else {
         return;
     };
-    fixture_check(&name, &rows);
-    golden(&format!("{model}-p{page}"), &rows);
+    let want = dense_rows(fixture, page, 1024, budget, &prompt, &tokens);
+    near(&format!("{what}: ring + buffer against one dense fire"), &rows, &want);
 }
 
+/// A windowed layer as ring + buffer (CONTRACT-BC 19, 21) answers what
+/// one dense fire does: a prefill past its window (narrowed to 64 rows)
+/// in fires of 64 (each fire's own rows read from its fire slots and
+/// folded into the ring), and 16 decodes reading the ring.
 #[test]
-fn a_windowed_layer_answers_what_its_window_list_did() {
-    windowed_logits("gemma4-e4b-mini-l1", PAGE);
+fn a_windowed_layer_answers_what_one_dense_fire_does() {
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    let fixture = narrowed(MODEL, None, "64 if win != None else win", "-w64");
+    windowed_check(&format!("{MODEL}-p{PAGE}"), &fixture, PAGE, None, 16);
+}
+
+/// A deep windowed model through its rings, held to the same model with
+/// its windows taken out, fed the same rows in the same fires (a prompt of
+/// 184 rows in fires of 64 and `steps` decodes, all inside its window): a
+/// row inside its window reads what plain attention reads, through the
+/// ring its earlier fires folded, the buffer and its own fire slots.
+fn same_cut_check(model: &str, layers: Option<u32>, page: u32, budget: Option<u64>, steps: usize) {
+    let windowed = fixture_in(
+        poem_compiler::catalog::package_of(model).expect("the model is listed"),
+        model,
+        layers,
+        "",
+    );
+    let window = poem_exec::store::kv::declared_window(&windowed.trace).unwrap_or(0);
+    let prompt = windowed_prompt(184);
+    assert!(window as usize > prompt.len() + steps, "{model}: a window past the rows");
+    let plain = narrowed(model, layers, "None", "-plain");
+    assert_eq!(poem_exec::store::kv::declared_window(&plain.trace), None, "{model}: no window left");
+    let Some((rows, tokens)) = windowed_rows(&windowed, page, 1024, budget, &prompt, 64, steps, None) else {
+        return;
+    };
+    let (want, _) = windowed_rows(&plain, page, 1024, budget, &prompt, 64, steps, Some(&tokens))
+        .expect("loaded before");
+    near(&format!("{model}: ring + buffer against plain attention, fire for fire"), &rows, &want);
 }
 
 /// Windowed layers beside the kv list's, the buffer's slot the kv page.
 #[test]
-fn windowed_layers_beside_full_ones_answer_what_their_window_lists_did() {
-    windowed_logits("gemma4-e4b-mini-l6", 32);
+fn windowed_layers_beside_full_ones_answer_what_plain_attention_does() {
+    same_cut_check("gemma4-e4b-mini-l6", None, 32, None, 16);
 }
 
-/// Two windows beside full rows: Gemma's miniature with every other
-/// sliding layer reading back 256 rows instead of 512, each ring its own
-/// rows, the fold dropping what a narrower ring holds no place for.
-#[test]
-fn two_windows_answer_what_their_window_lists_did() {
-    const MODEL: &str = "gemma4-e4b-mini-l6";
-    let package = poem_compiler::catalog::package_of(MODEL).expect("the model is listed");
+/// `model` (cut to `layers`) with its sliding layers' windows as `rule`
+/// states them (a Starlark expression of `win` and the layer `l`), in its
+/// attention and its readout tail's alike: windows a dense fire spans past
+/// on every backend, or none (`"None"`). Two windows of one fold are held
+/// at the kernel (`attn::ring`'s narrower ring), a deep miniature having no
+/// answer across fire cuts to hold them to (F77).
+fn narrowed(model: &str, layers: Option<u32>, rule: &str, variant: &str) -> Fixture {
+    let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
     let (_, text) = package
         .files()
         .find(|(_, text)| text.contains("def forward(m, inputs):"))
@@ -2395,22 +2338,17 @@ fn two_windows_answer_what_their_window_lists_did() {
         + text[start..]
             .find("\ndef ")
             .expect("a function after the forward");
-    let stated = "        d, kv_heads, win = geometry(m, at.reading)\n";
-    let forward = text[start..end].replace(
-        stated,
-        &format!("{stated}        win = 256 if win != None and l % 2 == 1 else win\n"),
-    );
-    assert_ne!(forward, text[start..end], "the forward reads its geometry");
-    let narrowed = poem_compiler::catalog::replacing(MODEL, "forward", &forward)
+    let mut forward = text[start..end].to_string();
+    for stated in [
+        "        d, kv_heads, win = geometry(m, at.reading)\n",
+        "        d, _, win = geometry(m, at.reading)\n",
+    ] {
+        assert!(forward.contains(stated), "{model}'s forward reads its geometry: {stated:?}");
+        forward = forward.replace(stated, &format!("{stated}        win = {rule}\n"));
+    }
+    let narrowed = poem_compiler::catalog::replacing(model, "forward", &forward)
         .unwrap_or_else(|why| panic!("the narrowed forward loads: {why}"));
-    let fixture = fixture_in(&narrowed, MODEL, None, "-two-windows");
-    let name = format!("{MODEL}-two-windows");
-    let feed = fixture_feed(&name);
-    let Some(rows) = windowed_rows(&fixture, 32, 1024, 700, 16, feed.as_deref()) else {
-        return;
-    };
-    fixture_check(&name, &rows);
-    golden(&format!("{MODEL}-two-windows"), &rows);
+    fixture_in(&narrowed, model, layers, variant)
 }
 
 /// Slot refs of one shape `id` the runtime would hand out: slot `k` of
@@ -2726,6 +2664,89 @@ fn a_stop_truncate_leaves_the_ring_untouched() {
         &format!("{MODEL}: decoding on past a stop-truncate"),
         &rows,
         &want[want.len() - rows.len()..],
+    );
+}
+
+/// A lane of `rows` rows from `have`, folded to `folded`, folding `fold`:
+/// its buffer table from its base, slot `p % 64` of its own a page `p`,
+/// where it carries rows or leaves some unfolded.
+fn lagged_lane<'a>(
+    refs: &RingRefs,
+    slot: u32,
+    record: &'a [u32],
+    have: u32,
+    rows: u32,
+    folded: u32,
+    fold: u32,
+) -> RingLane<'a> {
+    let end = have + rows;
+    let (base, table) = if folded == have && folded + fold == end {
+        (end / PAGE * PAGE, Vec::new())
+    } else {
+        let base = folded / PAGE * PAGE;
+        (base, (base / PAGE..end.div_ceil(PAGE)).map(|p| refs.slot(slot, p % 64)).collect())
+    };
+    RingLane {
+        slot,
+        record,
+        have,
+        folded,
+        base,
+        fold,
+        table,
+        device: false,
+    }
+}
+
+/// Two lanes decoding one prompt through the ring's wrap, past the
+/// window many times over: one folding every row it brings, one folding
+/// every eighth step only, its newest rows read from its buffer slots
+/// between. A fire writes a buffer slot's unfolded rows and nothing else
+/// of it, so the lagged lane answers what the folding one does, step for
+/// step, within two bf16 units of a row's largest logit.
+#[test]
+fn a_lagged_fold_reads_its_newest_rows_through_the_wrap() {
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    const LAG: u32 = 8;
+    let fixture = fixture(MODEL, None);
+    let window = poem_exec::store::kv::declared_window(&fixture.trace).unwrap_or(0);
+    assert!(window > 0, "{MODEL}: a windowed layer");
+    // Through the ring's wrap twice, and a little past.
+    let steps = 2 * window + 64;
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let refs = RingRefs::of(&mut shell);
+    let (rec_a, rec_b) = (refs.record(0), refs.record(1));
+    let prompt: Vec<u32> = (0..40u32).map(|at| (at * 29 + 3) % 256).collect();
+    let n = prompt.len() as u32;
+    let got = fire_rings(
+        &mut shell,
+        &fixture.trace,
+        &[
+            (&lagged_lane(&refs, 0, &rec_a, 0, n, 0, n), &prompt[..]),
+            (&lagged_lane(&refs, 1, &rec_b, 0, n, 0, n), &prompt[..]),
+        ],
+    );
+    let mut next = argmax(&got[0]);
+    let mut folded_b = n;
+    let (mut a_rows, mut b_rows) = (Vec::new(), Vec::new());
+    for step in 0..steps {
+        let have = n + step;
+        // The lagged lane folds all it carries every LAG-th step.
+        let fold_b = if step % LAG == LAG - 1 { have + 1 - folded_b } else { 0 };
+        let a = lagged_lane(&refs, 0, &rec_a, have, 1, have, 1);
+        let b = lagged_lane(&refs, 1, &rec_b, have, 1, folded_b, fold_b);
+        let got = fire_rings(&mut shell, &fixture.trace, &[(&a, &[next][..]), (&b, &[next][..])]);
+        folded_b += fold_b;
+        next = argmax(&got[0]);
+        a_rows.push(got[0].clone());
+        b_rows.push(got[1].clone());
+    }
+    near(
+        &format!("{MODEL}: a lane folding every {LAG}th step against one folding every row"),
+        &b_rows,
+        &a_rows,
     );
 }
 
@@ -3411,15 +3432,9 @@ fn a_device_counted_fold_folds_what_its_count_says() {
 
 
 /// Gemma's shared tail: its layers write no kv and read their owner
-/// layers' rings (a 26-layer cut of the 30-layer miniature: two tail
-/// layers over the trunk's), held to the window-list build's fixture.
+/// layers' rings (the 30-layer miniature: six tail layers over 24 owners),
+/// held to the same model with plain attention, fire for fire.
 #[test]
-fn a_shared_tail_answers_what_its_window_lists_did() {
-    let fixture = fixture("gemma4-e4b-mini-l30", Some(26));
-    let feed = fixture_feed("gemma4-e4b-mini-l30-26");
-    let Some(rows) = windowed_rows_in(&fixture, PAGE, 1024, 700, 8, 256, Some(20 << 30), feed.as_deref())
-    else {
-        return;
-    };
-    fixture_check("gemma4-e4b-mini-l30-26", &rows);
+fn a_shared_tail_answers_what_plain_attention_does() {
+    same_cut_check("gemma4-e4b-mini-l30", None, PAGE, Some(20 << 30), 8);
 }

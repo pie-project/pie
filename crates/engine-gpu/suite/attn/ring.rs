@@ -651,6 +651,72 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
 /// page table (no ring: the old window list), from the ring, and through
 /// the ring kernel's table alone. Prints each arm's best of a few rounds
 /// and the ring's ratio to the table's; the gate is the serving decode.
+/// Two windows on one fold's jobs (CONTRACT-BC 19): the jobs laid for a
+/// ring of `R` rows fold into a layer whose ring holds 24, so a lane's
+/// rows below its last 24 drop and the rest land at their index modulo 24,
+/// the narrower layer's place; the rows the fire leaves unfolded land in
+/// their buffer slots as for any layer, and nothing else moves.
+#[test]
+fn a_narrower_ring_keeps_only_its_own_last_rows_of_one_fold() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    const NARROW: usize = 24;
+    let hd = 64;
+    let lanes = prefills();
+    let to = [70, 64 + 40, 21, 70, 100];
+    let g = Geometry::of(hd, 64, lanes.len());
+    let laid = lay(&g, &lanes, 9);
+    let staged = stage(&mut gpu, &g, &lanes, &laid, &to);
+    let (jobs, moved) = fold_jobs(&lanes, &to, &laid);
+    let most = (jobs.len() as u32 - 1) / ring::JOB_INTS + 3;
+    let pool = staged.pool;
+    let at = pool.ring.expect("the pool holds a ring");
+    let mut padded = vec![
+        pool.origin[0] as i32,
+        pool.origin[1] as i32,
+        pool.page_stride[0] as i32,
+        (pool.seq_stride / 2) as i32,
+        at.piece as i32,
+        at.values_piece as i32,
+        at.keys as i32,
+        at.values as i32,
+        NARROW as i32,
+    ];
+    padded.extend(&jobs);
+    padded.resize(ring::LAYER_INTS as usize + 1 + most as usize * 4, 0);
+    let jt = gpu.up_i32(&padded);
+    let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
+    let narrow_pool = KvPool {
+        ring: Some(kernels_slang::Ring {
+            rows: NARROW as u32,
+            ..at
+        }),
+        ..pool
+    };
+    gpu.run(|c| ring::fold(c, &[&narrow_pool], job_table, most));
+    let after = gpu.down(staged.pool_buf, g.elems);
+    let mut want: Vec<f64> = laid.pool.iter().map(|x| f64::from(*x)).collect();
+    for (l, lane) in lanes.iter().enumerate() {
+        for r in lane.folded.max(to[l].saturating_sub(NARROW))..to[l] {
+            for d in 0..g.row {
+                want[g.ring_at(l, r % NARROW, false) + d] = laid.keys[l][r][d];
+                want[g.ring_at(l, r % NARROW, true) + d] = laid.values[l][r][d];
+            }
+        }
+    }
+    for &(l, r, unit, row) in &moved {
+        for d in 0..g.row {
+            want[g.slot_at(unit, row, false) + d] = laid.keys[l][r][d];
+            want[g.slot_at(unit, row, true) + d] = laid.values[l][r][d];
+        }
+    }
+    let got: Vec<f64> = after.iter().map(|x| f64::from(*x)).collect();
+    let wrong = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+    assert_eq!(wrong, 0, "{wrong} pool elements differ from the narrower ring's fold");
+}
+
 /// What the ring forms cost against the paged window's: a decode at a
 /// short context (the served bench's, one lane and eight) and a long one,
 /// and a prefill fire past the ring (its second fire's rows reading the

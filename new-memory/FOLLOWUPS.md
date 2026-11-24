@@ -1522,10 +1522,16 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 
 **Why later.** Taken out for this round (coordinator, 2026-11-24): it allocated after ready, and the export round covers the stale keys.
 
-## F?? Metal: a yielded rates or curve key behind serving resumes where it stopped
+## F81. Metal: a yielded rates or curve key behind serving resumes where it stopped
 
 **What.** On Metal, a `[rates]` key or a `curve <n>x<k>` shape timed behind serving that yields to an arrival starts again whole at the next idle turn (`engine-metal` `rates::YIELDED`, `tune::dense::YIELDED`). engine-gpu keeps its finished points and resumes. The widest keys (`gemm_tflops_by_rows`, `attn_tflops_by_keys`; single fires of 100–345 ms on the M1 Max) take minutes, so under arrivals that keep coming in idle gaps they can restart many times before one finishes. They are stale only between a kernel change and the next export round.
 
 **Idea.** Keep a key's settled points across yields (per point, as engine-gpu does) and time only the rest at the next turn, with the clock and overlap checks applying to each point's frames.
 
 **Why later.** Behind work runs only when no process is live, so yields are rare. Each yield already waits for at most one fire (a frame of long fires is cut between them).
+
+## F82. engine-gpu: land a lane's ring snapshots inside the fire (CUDA parity)
+
+**What.** engine-cuda states `rs_snapshots` for a load of rings alone and lands each asked checkpoint's ring snapshot inside the fire (`serve::ring`, before the fold), so the runtime cuts no pass at a checkpoint. engine-gpu states none and takes the runtime's cut at each one (the pipelined-cut take keeps it). The machinery is on `sc/window-ring-snapshots` (3df710d6c and two follow-ups): `ring::stage` stages each snapshot's jobs (the last ring's rows before its row, from the lane's ring, buffer or fire slots, onto the snapshot record's rings, its record an entry past the lanes'), and the fold kernel runs a snapshot phase before the fold over one table, its workgroups striding over the jobs. Stated, served gemma-4-E2B on Vulkan reused nothing (warm 550 ms against 554 cold at 2050 rows): the snapshot is not kept end to end, where it drops not found.
+
+**Why later.** Gemma's reuse works through the cut today; this saves the cut's extra fire on a pass ending past its checkpoint. Find where the served snapshot drops (the lane's `rs_snapshots` reaching `ring::stage`, the snapshot record's units, the runtime's keep of a snapshot taken inside a fire), state it, and land it with a served warm-TTFT check on Vulkan and wgpu.
