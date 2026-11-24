@@ -1313,12 +1313,9 @@ fn mask_rows(share: u32, span: u64, context: u64, rung: impl Fn(u32) -> u64) -> 
     r
 }
 
-/// `PIE_FIRE_ROWS` overrides it, so a test compares outputs cut at the same
-/// rows.
+/// The prompt rows one fire on `engine` carries: the prefill budget shared
+/// among the live lanes.
 fn prefill_share(page: u32, engine: usize) -> u32 {
-    if let Some(rows) = fire_rows() {
-        return rows;
-    }
     crate::engine::get_spec(engine).map_or(u32::MAX, |spec| {
         crate::inferlet::host::model::prefill_share(
             // Within the pool's activation rung (SPEC decision 6).
@@ -1337,9 +1334,6 @@ fn prefill_share(page: u32, engine: usize) -> u32 {
 /// largest activation rung holds: what a pass asks the rung for
 /// ([`crate::store::shared::want_rows`]).
 fn prefill_want(rows: usize, engine: usize) -> u32 {
-    if let Some(fire) = fire_rows() {
-        return fire.min(u32::try_from(rows).unwrap_or(u32::MAX));
-    }
     let live = crate::inferlet::process::live_count();
     let wide = rows.saturating_add(live.saturating_sub(1));
     let wide = u32::try_from(wide).unwrap_or(u32::MAX);
@@ -1621,16 +1615,6 @@ impl Drop for RaiseFunding {
             .store(true, std::sync::atomic::Ordering::Release);
         self.stop.notify_one();
     }
-}
-
-fn fire_rows() -> Option<u32> {
-    static ROWS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| {
-        std::env::var("PIE_FIRE_ROWS")
-            .ok()
-            .and_then(|rows| rows.parse().ok())
-            .filter(|&rows| rows > 0)
-    })
 }
 
 /// Each piece but the last ends on a page boundary; the last holds every row
