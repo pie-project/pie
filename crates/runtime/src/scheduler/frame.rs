@@ -1091,6 +1091,11 @@ impl FramePolicy {
             self.in_flight_lanes
         );
         loop {
+            // Lanes that have not fired this boundary go ahead of those that
+            // have: a first-come, first-served turn per boundary, so no lane
+            // fires twice while another waits for its first. It ranks no
+            // tenant: the policy's schedule key, where one is installed,
+            // orders each group below, and lane order breaks its ties.
             let mut fresh: Vec<ProcessId> = Vec::new();
             let mut continuing: Vec<ProcessId> = Vec::new();
             for (lane_id, lane) in self.lanes.iter() {
