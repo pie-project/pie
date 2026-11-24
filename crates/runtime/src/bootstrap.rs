@@ -63,22 +63,20 @@ impl RuntimeShutdown {
             let map = planner.map_census();
             let edge = planner.edge_census();
             let stuck = planner.stuck_census();
-            println!(
-                "[planner-census] at shutdown: passes={} pass_ms={} pass_mean_us={} \
-                 map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
-                 stuck_settles={} forced_passes={} oldest_wait_ms={} refusal_repeats={}",
-                pass.0,
-                pass.1 / 1000,
-                pass.2,
-                map.0,
-                map.1 / 1000,
-                map.2,
-                edge.0,
-                edge.1,
-                stuck.0,
-                stuck.1,
-                stuck.2,
-                planner.refusal_repeats(),
+            tracing::info!(
+                passes = pass.0,
+                pass_ms = pass.1 / 1000,
+                pass_mean_us = pass.2,
+                map_passes = map.0,
+                map_pass_ms = map.1 / 1000,
+                quiet_waits = map.2,
+                skipped_wakes = edge.0,
+                map_cache_hits = edge.1,
+                stuck_settles = stuck.0,
+                forced_passes = stuck.1,
+                oldest_wait_ms = stuck.2,
+                refusal_repeats = planner.refusal_repeats(),
+                "planner census at shutdown"
             );
         }
         let scheduler_result = self.scheduler.shutdown().await;
@@ -166,8 +164,8 @@ pub struct EngineConfig {
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
-    /// The model's window (`PoolFacts::window_tokens`). The window-list
-    /// path: removed by the windowed-state change.
+    /// The model's window (`PoolFacts::window_tokens`): the window-list
+    /// path's.
     pub window_tokens: u32,
     /// The engine serves windowed layers as ring + buffer
     /// (`Capabilities::windowed_state`, CONTRACT-BC 19, 21).
@@ -254,9 +252,6 @@ fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
     Ok(budget)
 }
 
-/// The admission cap: `cap`, held to the `seats` a seated-first kv pool
-/// seats where the model holds no recurrent state (whose processes its
-/// planner admits against the state pool instead).
 /// The frames the model's engines keep in flight
 /// ([`::engine::Capabilities::frames_in_flight`]): one number, so engines
 /// stating different ones are refused by name.
@@ -638,8 +633,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
             // A window the engine holds no pages for is still a window (the
-            // window-list path: removed by the windowed-state change; a
-            // ring + buffer load holds no window list).
+            // window-list path; a ring + buffer load holds no window list).
             if pools.window_tokens == 0 && !rs_caps.window_state {
                 pools.window_tokens = d.window_tokens;
             }

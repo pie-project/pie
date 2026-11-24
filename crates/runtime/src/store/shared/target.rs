@@ -431,8 +431,8 @@ impl SharedGrow {
     /// ([`super::owed_cut_rows`]) where the rung the engine holds covers
     /// them now (a raise taken, by the walk or by a pass's or a bind's
     /// funding): they seal at once. A cap under them with their rung held
-    /// waited on a wake nothing sent, nothing in flight (the soak's stall:
-    /// raised to 512, the cap left at 128). None while a raise's copy or a
+    /// would wait on a wake nothing sends, nothing in flight (raised to 512,
+    /// the cap left at 128). None while a raise's copy or a
     /// lower's notice is under way.
     fn lift_to_owed(&self) {
         let owed = super::owed_cut_rows(self.engine);
@@ -684,10 +684,10 @@ impl SharedGrow {
         self.goal_in(&pool)
     }
 
-    /// [`Self::goal`] of `pool`, held: the test pin as it stands, else the
-    /// governor's target as [`SharedPool::walk_goal`] meets it.
+    /// [`Self::goal`] of `pool`, held: the governor's target as
+    /// [`SharedPool::walk_goal`] meets it.
     fn goal_in(&self, pool: &SharedPool) -> u32 {
-        pinned_segments().unwrap_or_else(|| pool.walk_goal(self.target.load(Ordering::Acquire)))
+        pool.walk_goal(self.target.load(Ordering::Acquire))
     }
 
     /// Walks each time something it waits on happens: a retarget or a
@@ -783,8 +783,8 @@ impl SharedGrow {
             // Every chunk an evacuation or compaction moves is held as it is
             // sent: planned and applied under the pool's lock just now, one
             // let go since moves as a free chunk the engine still copies.
-            // Said by name (the M1, race5 run 8: logicals 98 and 99 moved as
-            // sources 500 ms after the kv store gave their pages back).
+            // Said by name (logicals moved as sources after the kv store gave
+            // their pages back).
             if let PoolOp::Evacuate(evacuation) = &op {
                 let pool = self.shared.lock().unwrap();
                 let free: Vec<(u32, u32)> = evacuation
@@ -909,17 +909,6 @@ impl SharedGrow {
             }
         }
     }
-}
-
-/// A test hook: while the file `PIE_SHARED_SEGMENTS_FILE` names holds a
-/// number, that many mapped segments stand in for the governor's target, so
-/// a test can force a grow or a shrink (and its evacuation) mid-run.
-pub(crate) fn pinned_segments() -> Option<u32> {
-    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    let path = PATH
-        .get_or_init(|| std::env::var_os("PIE_SHARED_SEGMENTS_FILE").map(Into::into))
-        .as_ref()?;
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 impl PoolTarget for SharedGrow {

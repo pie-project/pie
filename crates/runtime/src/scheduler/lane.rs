@@ -200,10 +200,9 @@ fn take_landing(
 /// way names them, and a pair, channel or adapter it shares is held by it
 /// no more), and the pool told. A close the engine refused (an instance a
 /// failed fire left unusable) is closed all the same: in the engine's eyes
-/// no fire of it can run again. Kept, a failed process's items stayed on
-/// the device and in its pair for good (Mac Pro's M5: pairs of dead
-/// processes on the device and the host, a 6-chunk bind short with 1850
-/// chunks free).
+/// no fire of it can run again. Kept, a failed process's items would stay
+/// on the device and in its pair for good (pairs of dead processes on the
+/// device and the host, a bind short with most chunks free).
 pub(crate) fn close_books(
     id: ::engine::InstanceId,
     closed: anyhow::Result<u64>,
@@ -263,15 +262,12 @@ fn past_rung(held: u32, frame: &crate::engine::FrameFire) -> Option<String> {
 }
 
 fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Always in a debug build, and with PIE_CHECK_SLOT_REFS in any: a stale
-    // request (built before its stores let its slots go, fired after) is
-    // named at its source, whatever the path. Ownership exact: a slot the
-    // pool holds for another owner (its chunk reused by another shape, or
-    // the page another set's) is as stale as a free one.
-    if !*ON.get_or_init(|| {
-        cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
-    }) {
+    // In a debug build: a stale request (built before its stores let its
+    // slots go, fired after) is named at its source, whatever the path.
+    // Ownership exact: a slot the pool holds for another owner (its chunk
+    // reused by another shape, or the page another set's) is as stale as a
+    // free one.
+    if !cfg!(debug_assertions) {
         return None;
     }
     let stores = crate::store::registry::try_get(0, engine_idx)?;
@@ -358,7 +354,7 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
             // A lane whose set's table does not resolve now (its pages below,
             // or the set gone) names pages its set no longer holds there: it
             // does not fire (skipped, the check was passed by a fire whose
-            // set had been suspended since its stamp: the M1's run 12).
+            // set had been suspended since its stamp).
             if let Some(ws) = set
                 && sets.get(&ws).is_some_and(Option::is_none)
             {

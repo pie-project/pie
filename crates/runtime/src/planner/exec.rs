@@ -25,7 +25,7 @@ fn spawn_watched(
     let handle = crate::rt::spawn(task);
     crate::rt::spawn(async move {
         if let Err(join_error) = handle.await {
-            println!("[planner-exec] pid={pid} {label} task DIED: {join_error}");
+            tracing::error!(%pid, label, "planner task died: {join_error}");
             on_fail(&planner, pid);
         }
     });
@@ -674,8 +674,8 @@ impl MoveGuard {
     async fn copy(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
         // Every device chunk the copies read or write is fenced until they
         // land: no evacuation moves it, no segment holding it is released,
-        // no compaction or raise takes it (the L40S at 3 GiB on a0bfb512f:
-        // CUDA 700 on an eviction's queued kv-to-disk copy).
+        // no compaction or raise takes it (a copy queued against a chunk
+        // taken away faults on the device).
         let fenced: Vec<u32> = self
             .txn
             .as_ref()
@@ -822,13 +822,12 @@ impl From<CopyFailure> for String {
 impl MoveGuard {
     /// Takes the move back now, once every copy of it handed to the engine
     /// has landed: what follows reads the items where the move found them.
-    /// Dropped instead, the take-back ran later on a task of its own, and
-    /// the process said resident meanwhile was picked again, its second
-    /// eviction finding its items still moving and parking none of them;
-    /// the first move's take-back then left its instance bound on the
-    /// device beside a process said evicted, and its pair was taken anew
-    /// at its restore under it (the simulation's seed 1348: a bind over a
-    /// live pair's run).
+    /// Dropped instead, the take-back would run later on a task of its
+    /// own, and the process said resident meanwhile could be picked again,
+    /// its second eviction finding its items still moving and parking none
+    /// of them; the first move's take-back would then leave its instance
+    /// bound on the device beside a process said evicted, and its pair
+    /// taken anew at its restore under it (a bind over a live pair's run).
     async fn take_back(mut self) {
         let Some(txn) = self.txn.take() else {
             return;
@@ -911,8 +910,8 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     // guest state on the device, the room a bind short of runs was chosen to
     // free (a chunk's occupant): it parks all the same, its guest scratch
     // given back and its tables and resident bytes copied down. Found
-    // nothing, the M1 stress froze with eleven binds short of runs and every
-    // chosen occupant "found no working set".
+    // nothing, binds short of runs would wait for good on occupants that
+    // park nothing.
     let holds_guest = crate::store::registry::get(model, engine)
         .roles
         .as_ref()
@@ -929,8 +928,7 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let mut fence = FenceGuard::raise(handles, pid, (model, engine));
     crate::scheduler::worker::notify_process_suspend(pid);
     // Each wait of the prelude said as it begins: an eviction that never
-    // reports done names the wait it sits in (Mac Pro's beam mix: evicting
-    // stuck at 2 after a bind-suspend, nothing said).
+    // reports done names the wait it sits in.
     tracing::debug!(%pid, "planner: an eviction drains its detachable fires");
     drain_detachable(pid).await;
     let drained = began.elapsed();
@@ -1066,9 +1064,8 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let prepared_at = began.elapsed();
     let mut guard = MoveGuard::new(model, engine, Move::Suspend { kv, rs, roles });
     // The chunks its copy reads: no raise takes them back for its
-    // activation until the copy has landed or will not (Mac Pro at 5 GiB
-    // on 5aa45805b: an eviction's copy of a lent chunk refused inside the
-    // carve).
+    // activation until the copy has landed or will not (else a copy of a
+    // lent chunk is refused inside the carve).
     let reading = MovingOut::of(&planner, pid);
     let copied_out = guard.copy(&planner, pid).await;
     drop(reading);
@@ -1101,9 +1098,8 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let copied = began.elapsed();
     // Its instances said parked on its lane before the commit hands their
     // slots to anyone else: an engine still holding them at those slots
-    // refuses the next owner's bind there (Vulkan on a0bfb512f, long
-    // prompts: "Instance slots ... already hold instance N's run"), or
-    // lays a parked pair over it after an evacuation (Metal). One it
+    // refuses the next owner's bind there, or lays a parked pair over it
+    // after an evacuation. One it
     // refuses fails the process by name, its move taken back.
     // Refused partway, the move is taken back and those told are rebound
     // where they lie, live again, before the process fires.
@@ -1385,9 +1381,7 @@ async fn restore(
             // it: the placement every other waiter reads changed, and a
             // restore head the pass that sent this one found short (waiting
             // on this one in flight) may stand now. Planned on that, not on
-            // this restore's landing (the simulation's lost wakes: "restore
-            // short of runs: something in flight, not funded", its
-            // placement standing once the restore sent before it unparked).
+            // this restore's landing, or that head's wake is lost.
             if planner.returns.waiters.load(std::sync::atomic::Ordering::Acquire) != 0 {
                 planner.poke();
             }
@@ -1421,8 +1415,8 @@ async fn restore(
             // it goes again once that lands, its instances rebound to it.
             // It goes again once that move ends (committed or aborted, the
             // roles say so), never at once: queued again straight away it
-            // was served, short and queued again, round after round, as
-            // long as the move took (Mac Pro's M5: 27702 rounds).
+            // would be served, short and queued again, round after round, as
+            // long as the move takes.
             // Said once a wait, with what the move carries; woken by the
             // move's end alone (a commit or an abort tells the roles' watch,
             // and the pair no longer moves), never re-planned meanwhile.
@@ -1460,8 +1454,8 @@ async fn restore(
     // Every instance its rebinds name must be placed once this unpark
     // commits: one left unbound (moving, parked apart, its pair away) is
     // waited for here, nothing committed, its process waiting and not in
-    // flight; then it goes again, queued. Committed with one, it waited
-    // Restoring on a rebind nothing made (Mac Pro at 2 GiB on 1e87ab171).
+    // flight; then it goes again, queued. Committed with one, it would
+    // wait Restoring on a rebind nothing makes.
     if let Some(store) = stores.roles.as_ref() {
         let watch = store.lock().unwrap().room_watch();
         let unbound = store.lock().unwrap().unbound_after(pid, roles.as_ref());
@@ -1471,10 +1465,9 @@ async fn restore(
             planner.rebind_waiting(pid, Some(format!("{unbound:?} (uncommitted)")));
             // Its pair on its way with another holder's move: woken by that
             // move's end alone, as a restore refused for it is. Woken by
-            // room given back, two restores waiting on one pair woke each
-            // other with their own aborts, round after round, as long as
-            // the move took (the simulation with a bind's take and its engine
-            // bind apart, seed 33: 43,051 rounds in one step).
+            // room given back, two restores waiting on one pair would wake
+            // each other with their own aborts, round after round, as long
+            // as the move takes.
             let moving = store.lock().unwrap().moving_pair_of(&unbound);
             match moving {
                 Some(pair) => {
@@ -1501,11 +1494,10 @@ async fn restore(
     // room for its roles.
     // Refused so, it says why, and its need is the bind's runs beside what
     // its own unpark lays at that length: read as the larger of the two
-    // (bind (7, 2), unpark (7, 2): (7, 2)), the planner's placement stood
-    // it while this check, after the unpark took its own, did not, and the
-    // head was refused with no reason and no plan, round after round (Mac
-    // Pro at 5 GiB on 4cef0c7d3: 40,098 no-step lines in 6 minutes, free
-    // runs (7, 3) to (7, 4), need [(7, 2), (2, 2)]).
+    // (bind (7, 2), unpark (7, 2): (7, 2)), the planner's placement would
+    // stand it while this check, after the unpark took its own, would not,
+    // and the head would be refused with no reason and no plan, round
+    // after round.
     // Read by the one placement, the takes' own, with what its serve held
     // for it open to it: never a count of its own.
     if let Some(need) = planner.pending_bind(pid)
@@ -1543,8 +1535,7 @@ async fn restore(
         planner.note_roles_short_why(pid, why);
         // The bind's own runs: its unpark's were placed first by the one
         // placement, so they are never added again (added each refusal,
-        // the need grew 1, 3, 5, 7 until it fit nowhere: the simulation's
-        // seed 13, 455 of 5,000 seeds).
+        // the need would grow until it fits nowhere).
         let _ = own;
         planner.requeue_restore_roles(pid, (need.run, need.pieces), Some(free));
         return;
