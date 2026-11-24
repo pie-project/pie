@@ -2614,6 +2614,89 @@ fn a_stop_truncate_leaves_the_ring_untouched() {
     );
 }
 
+/// A lane of `rows` rows from `have`, folded to `folded`, folding `fold`:
+/// its buffer table from its base, slot `p % 64` of its own a page `p`,
+/// where it carries rows or leaves some unfolded.
+fn lagged_lane<'a>(
+    refs: &RingRefs,
+    slot: u32,
+    record: &'a [u32],
+    have: u32,
+    rows: u32,
+    folded: u32,
+    fold: u32,
+) -> RingLane<'a> {
+    let end = have + rows;
+    let (base, table) = if folded == have && folded + fold == end {
+        (end / PAGE * PAGE, Vec::new())
+    } else {
+        let base = folded / PAGE * PAGE;
+        (base, (base / PAGE..end.div_ceil(PAGE)).map(|p| refs.slot(slot, p % 64)).collect())
+    };
+    RingLane {
+        slot,
+        record,
+        have,
+        folded,
+        base,
+        fold,
+        table,
+        device: false,
+    }
+}
+
+/// Two lanes decoding one prompt through the ring's wrap, past the
+/// window many times over: one folding every row it brings, one folding
+/// every eighth step only, its newest rows read from its buffer slots
+/// between. A fire writes a buffer slot's unfolded rows and nothing else
+/// of it, so the lagged lane answers what the folding one does, step for
+/// step, within two bf16 units of a row's largest logit.
+#[test]
+fn a_lagged_fold_reads_its_newest_rows_through_the_wrap() {
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    const LAG: u32 = 8;
+    let fixture = fixture(MODEL, None);
+    let window = poem_exec::store::kv::declared_window(&fixture.trace).unwrap_or(0);
+    assert!(window > 0, "{MODEL}: a windowed layer");
+    // Through the ring's wrap twice, and a little past.
+    let steps = 2 * window + 64;
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let refs = RingRefs::of(&mut shell);
+    let (rec_a, rec_b) = (refs.record(0), refs.record(1));
+    let prompt: Vec<u32> = (0..40u32).map(|at| (at * 29 + 3) % 256).collect();
+    let n = prompt.len() as u32;
+    let got = fire_rings(
+        &mut shell,
+        &fixture.trace,
+        &[
+            (&lagged_lane(&refs, 0, &rec_a, 0, n, 0, n), &prompt[..]),
+            (&lagged_lane(&refs, 1, &rec_b, 0, n, 0, n), &prompt[..]),
+        ],
+    );
+    let mut next = argmax(&got[0]);
+    let mut folded_b = n;
+    let (mut a_rows, mut b_rows) = (Vec::new(), Vec::new());
+    for step in 0..steps {
+        let have = n + step;
+        // The lagged lane folds all it carries every LAG-th step.
+        let fold_b = if step % LAG == LAG - 1 { have + 1 - folded_b } else { 0 };
+        let a = lagged_lane(&refs, 0, &rec_a, have, 1, have, 1);
+        let b = lagged_lane(&refs, 1, &rec_b, have, 1, folded_b, fold_b);
+        let got = fire_rings(&mut shell, &fixture.trace, &[(&a, &[next][..]), (&b, &[next][..])]);
+        folded_b += fold_b;
+        next = argmax(&got[0]);
+        a_rows.push(got[0].clone());
+        b_rows.push(got[1].clone());
+    }
+    near(
+        &format!("{MODEL}: a lane folding every {LAG}th step against one folding every row"),
+        &b_rows,
+        &a_rows,
+    );
+}
+
 /// Every shape a parked set carries comes back bit for bit through the
 /// tiers below the device: kv list pages, the hybrid's records and its
 /// rs-list rows, device -> host -> device, device -> disk -> device and
