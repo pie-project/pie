@@ -83,14 +83,23 @@ impl Roles {
     /// or a pair's taken for it (another's are their item's).
     pub(super) fn taken_bytes(&self, taken: &Taken) -> u64 {
         let device = self.device.lock().unwrap();
-        let fresh = |part: &Part, fresh: bool| if fresh { self.part_bytes(&device, part) } else { 0 };
+        let fresh = |part: &Part, fresh: bool| {
+            if fresh {
+                self.part_bytes(&device, part)
+            } else {
+                0
+            }
+        };
         taken
             .parts
             .iter()
             .map(|part| self.part_bytes(&device, part))
             .sum::<u64>()
-            + taken.adapter.as_ref().map_or(0, |(_, part, own)| fresh(part, *own))
-            // A pair taken fresh is an item from its take: counted there.
+            + taken
+                .adapter
+                .as_ref()
+                .map_or(0, |(_, part, own)| fresh(part, *own))
+        // A pair taken fresh is an item from its take: counted there.
     }
 
     /// `taken` is on its way: its bytes are counted until it is bound or
@@ -135,7 +144,12 @@ impl Roles {
     /// from the slots each holds now: each item's tier off the device is
     /// `below`'s, in item order, the one it goes to (`out`), else the one
     /// it lies on now.
-    pub(super) fn moving(&self, out: bool, items: Vec<(Owner, Vec<Part>)>, below: Vec<Tier>) -> RoleMove {
+    pub(super) fn moving(
+        &self,
+        out: bool,
+        items: Vec<(Owner, Vec<Part>)>,
+        below: Vec<Tier>,
+    ) -> RoleMove {
         let mut copies: Vec<RoleCopy> = Vec::new();
         for ((owner, to), tier) in items.iter().zip(&below) {
             let disk = *tier == Tier::Disk;

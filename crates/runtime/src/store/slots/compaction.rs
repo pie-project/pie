@@ -46,7 +46,10 @@ impl SlotPool {
             return None;
         }
         let targets: BTreeSet<u32> = self.open.iter_in(0, limit).collect();
-        if self.moves_keeping_runs(&sources, targets.clone(), false).is_some() {
+        if self
+            .moves_keeping_runs(&sources, targets.clone(), false)
+            .is_some()
+        {
             return None;
         }
         // The runs in the way, by length: the longest that finds no room is
@@ -59,14 +62,21 @@ impl SlotPool {
             }
         }
         let (&run, &pieces) = lengths.iter().next_back()?;
-        let standing = self.runs_below(run, u32::MAX, limit, |chunk| targets.contains(&chunk)).len();
+        let standing = self
+            .runs_below(run, u32::MAX, limit, |chunk| targets.contains(&chunk))
+            .len();
         (standing < pieces as usize).then_some((run, pieces))
     }
 
     /// [`Self::plan_compaction_for`] below physical chunk `below`: a raise's
     /// activation limit, where the runs in its way go
     /// ([`Self::raise_runs_short`]).
-    pub fn plan_compaction_below(&self, run: u32, pieces: u32, below: u32) -> Option<Vec<ChunkMove>> {
+    pub fn plan_compaction_below(
+        &self,
+        run: u32,
+        pieces: u32,
+        below: u32,
+    ) -> Option<Vec<ChunkMove>> {
         let run = run.max(1);
         if run > self.segments.segment_chunks() || self.compacting() {
             return None;
@@ -76,7 +86,10 @@ impl SlotPool {
         if standing.len() >= pieces.max(1) as usize {
             return None;
         }
-        let kept: HashSet<u32> = standing.iter().flat_map(|&first| first..first + run).collect();
+        let kept: HashSet<u32> = standing
+            .iter()
+            .flat_map(|&first| first..first + run)
+            .collect();
         let free_here = |chunk: u32| self.open.get(chunk) && !kept.contains(&chunk);
         // Each run's chunks by physical chunk, its first and its length: a
         // run moves whole, to a free run of its length outside the window
@@ -232,7 +245,8 @@ impl SlotPool {
             })
             .collect();
         let targets: BTreeSet<u32> = self.open.iter_in(0, limit).collect();
-        self.moves_keeping_runs(&sources, targets, true).unwrap_or_default()
+        self.moves_keeping_runs(&sources, targets, true)
+            .unwrap_or_default()
     }
 
     /// Whether `moves` would split a run of chunks ([`Self::runs`]), and
@@ -250,7 +264,9 @@ impl SlotPool {
             let Some(&start) = self.logical_to_physical.get(head as usize) else {
                 continue;
             };
-            let moved: Vec<Option<u32>> = (start..start + run).map(|at| to_of.get(&at).copied()).collect();
+            let moved: Vec<Option<u32>> = (start..start + run)
+                .map(|at| to_of.get(&at).copied())
+                .collect();
             if moved.iter().all(Option::is_none) {
                 continue;
             }

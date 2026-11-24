@@ -60,7 +60,12 @@ impl Roles {
 
     /// `n` free slots of `role` in its disk chunks, `per_chunk` a chunk,
     /// opening whole chunks for what they lack; all or none.
-    pub(super) fn take_disk_slots(disk: &Disk, role: SlotRole, per_chunk: u32, n: usize) -> Option<Vec<u32>> {
+    pub(super) fn take_disk_slots(
+        disk: &Disk,
+        role: SlotRole,
+        per_chunk: u32,
+        n: usize,
+    ) -> Option<Vec<u32>> {
         let mut shapes = disk.chunks.lock().unwrap();
         let chunks = shapes.entry(role).or_default();
         let free: usize = chunks.values().map(BTreeSet::len).sum();

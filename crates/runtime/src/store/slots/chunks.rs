@@ -96,7 +96,14 @@ impl SlotPool {
     }
 
     /// Takes slots `first .. first + n` of `chunk`, every one free.
-    pub(super) fn fill_run(&mut self, chunk: u32, live: bool, first: u32, n: u32, taken: &mut Vec<Slot>) {
+    pub(super) fn fill_run(
+        &mut self,
+        chunk: u32,
+        live: bool,
+        first: u32,
+        n: u32,
+        taken: &mut Vec<Slot>,
+    ) {
         self.changes += 1;
         let meta = self.chunks[chunk as usize];
         let physical = self.logical_to_physical[chunk as usize];

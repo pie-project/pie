@@ -66,7 +66,12 @@ impl Roles {
                 // A guest part given back (its process parked where it lies,
                 // [`Item::shed`]) lies nowhere: never named to the engine;
                 // its own restore takes it back first, and rebinds it then.
-                if item.shed || item.parts.iter().any(|part| part.dead() && part.refs.is_empty()) {
+                if item.shed
+                    || item
+                        .parts
+                        .iter()
+                        .any(|part| part.dead() && part.refs.is_empty())
+                {
                     return None;
                 }
                 // Its pair not on the device yet: rebound once it lands,
@@ -150,7 +155,10 @@ impl Roles {
     pub fn unbound_after(&self, holder: Holder, txn: Option<&RoleMove>) -> Vec<InstanceId> {
         let moved = |owner: Owner| {
             txn.is_some_and(|txn| {
-                txn.items.iter().chain(&txn.shed).any(|(moved, _)| *moved == owner)
+                txn.items
+                    .iter()
+                    .chain(&txn.shed)
+                    .any(|(moved, _)| *moved == owner)
             })
         };
         self.items
@@ -253,7 +261,10 @@ impl Roles {
             Rebind::Instance { instance, .. } => {
                 item.tier == Tier::Device
                     && !item.shed
-                    && item.parts.first().map_or(instance.is_empty(), |part| part.refs == *instance)
+                    && item
+                        .parts
+                        .first()
+                        .map_or(instance.is_empty(), |part| part.refs == *instance)
             }
             Rebind::Channel { slots, .. } => item.tier == Tier::Device && item.refs() == *slots,
         }

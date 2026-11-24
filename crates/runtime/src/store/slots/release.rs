@@ -18,7 +18,10 @@ impl SlotPool {
             let was = state.refs[at];
             let mut now = was;
             if live {
-                assert!(now.live > 0, "{slot:?} has no live reference of {holder:?} to drop");
+                assert!(
+                    now.live > 0,
+                    "{slot:?} has no live reference of {holder:?} to drop"
+                );
                 now.live -= 1;
             } else {
                 assert!(now.cache > 0, "{slot:?} has no cache reference to drop");
@@ -141,7 +144,10 @@ impl SlotPool {
             .partial
             .iter()
             .map(|(&class, chunks)| {
-                let free = chunks.iter().map(|&(std::cmp::Reverse(used), _, _)| u64::from(state.spc() - used)).sum();
+                let free = chunks
+                    .iter()
+                    .map(|&(std::cmp::Reverse(used), _, _)| u64::from(state.spc() - used))
+                    .sum();
                 (class, chunks.len(), free)
             })
             .collect()

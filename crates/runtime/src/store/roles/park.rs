@@ -282,7 +282,10 @@ impl Roles {
         unparked
     }
 
-    pub(super) fn prepare_unpark_claimed(&mut self, holder: Holder) -> Result<Option<RoleMove>, RolesError> {
+    pub(super) fn prepare_unpark_claimed(
+        &mut self,
+        holder: Holder,
+    ) -> Result<Option<RoleMove>, RolesError> {
         let (groups, order) = self.unpark_order(holder);
         // An instance whose pair is on its way back with another process's
         // unpark is rebound once that lands: until then its restore is
@@ -297,8 +300,10 @@ impl Roles {
             return Err(RolesError::PairParked(pair));
         }
         let device = Arc::clone(&self.device);
-        let mut back: Vec<Vec<Option<Part>>> =
-            groups.iter().map(|(_, _, parts)| vec![None; parts.len()]).collect();
+        let mut back: Vec<Vec<Option<Part>>> = groups
+            .iter()
+            .map(|(_, _, parts)| vec![None; parts.len()])
+            .collect();
         for (at, index) in order {
             let part = &groups[at].2[index];
             match self.take_parts(&device, std::slice::from_ref(part), true) {
@@ -330,7 +335,10 @@ impl Roles {
                 items.push((owner, parts));
             }
         }
-        let below: Vec<Tier> = items.iter().map(|(owner, _)| self.items[owner].tier).collect();
+        let below: Vec<Tier> = items
+            .iter()
+            .map(|(owner, _)| self.items[owner].tier)
+            .collect();
         for (owner, _) in items.iter().chain(&shed) {
             self.items.get_mut(owner).expect("present").tier = Tier::Moving;
         }
@@ -449,7 +457,9 @@ impl Roles {
                 matches!(owner, Owner::Pair(_) | Owner::Adapter(_))
                     && item.tier == Tier::Device
                     && !item.shed
-                    && holders.iter().any(|&holder| self.moves_with(**owner, item, holder))
+                    && holders
+                        .iter()
+                        .any(|&holder| self.moves_with(**owner, item, holder))
             })
             .map(|(owner, _)| *owner)
             .collect();
@@ -500,7 +510,11 @@ impl Roles {
     /// The whole chunks `part` takes on the device: a guest part its runs
     /// of chunks (a run of slots, one), any other part its slots in whole
     /// chunks of its shape.
-    pub(super) fn part_chunks(&self, device: &super::super::shared::SharedPool, part: &Part) -> u64 {
+    pub(super) fn part_chunks(
+        &self,
+        device: &super::super::shared::SharedPool,
+        part: &Part,
+    ) -> u64 {
         if part.shaped() {
             let (run, pieces) = part.chunk_runs();
             u64::from(run) * u64::from(pieces)
@@ -529,7 +543,11 @@ impl Roles {
             .of(part.role)
             .and_then(|shape| pool.shape(shape.pool))
             .map_or(0, |shape| shape.slot_bytes);
-        let slots = if part.run > 0 { part.run as usize } else { part.refs.len() };
+        let slots = if part.run > 0 {
+            part.run as usize
+        } else {
+            part.refs.len()
+        };
         slots as u64 * slot_bytes
     }
 }

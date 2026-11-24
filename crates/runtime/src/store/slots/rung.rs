@@ -165,7 +165,8 @@ impl SlotPool {
         // with nothing funded and nothing to move).
         match self.raise_runs_short(rung) {
             Some((run, pieces))
-                if !self.compacting() && self.plan_compaction_below(run, pieces, limit).is_none() =>
+                if !self.compacting()
+                    && self.plan_compaction_below(run, pieces, limit).is_none() =>
             {
                 let open = self.open.iter_in(0, limit).count() as u32;
                 short.max((run * pieces + sources).saturating_sub(open).max(1))
@@ -189,7 +190,11 @@ impl SlotPool {
         }
         let mut targets = BTreeSet::new();
         let froms: BTreeSet<u32> = evacuation.moves.iter().map(|step| step.from).collect();
-        if !self.held_in(limit, self.state_limit()).iter().all(|chunk| froms.contains(chunk)) {
+        if !self
+            .held_in(limit, self.state_limit())
+            .iter()
+            .all(|chunk| froms.contains(chunk))
+        {
             return Err(SlotError::StaleRung);
         }
         for step in &evacuation.moves {
@@ -218,10 +223,12 @@ impl SlotPool {
             self.fenced.set(step.to);
         }
         if !evacuation.moves.is_empty() {
-            self.fences
-                .entry(epoch)
-                .or_default()
-                .extend(evacuation.moves.iter().flat_map(|step| [step.from, step.to]));
+            self.fences.entry(epoch).or_default().extend(
+                evacuation
+                    .moves
+                    .iter()
+                    .flat_map(|step| [step.from, step.to]),
+            );
         }
         self.set_act(act);
         Ok(())

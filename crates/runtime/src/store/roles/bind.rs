@@ -247,7 +247,8 @@ impl Roles {
         holder: Option<Holder>,
         beside: u32,
     ) -> Result<GuestTaken, RolesError> {
-        let heads = holder.is_none_or(|holder| self.guest_waiter.is_none_or(|counted| counted == holder));
+        let heads =
+            holder.is_none_or(|holder| self.guest_waiter.is_none_or(|counted| counted == holder));
         let taken = self.take_guest_now(channels, (pair, state), heads, beside);
         if let Some(holder) = holder.filter(|_| heads) {
             match &taken {
@@ -542,7 +543,12 @@ impl Roles {
     /// `guest`: the runs its guest state's fresh parts took; `opened`: the
     /// parts of its own (tables, rings, adapter) taken before the one
     /// short, each of which may have opened a chunk.
-    pub(super) fn bind_short(&self, error: RolesError, guest: Option<(u32, u32)>, opened: u32) -> RolesError {
+    pub(super) fn bind_short(
+        &self,
+        error: RolesError,
+        guest: Option<(u32, u32)>,
+        opened: u32,
+    ) -> RolesError {
         match error {
             RolesError::Short { .. } | RolesError::NoRun { .. }
                 if self.device.lock().unwrap().state_chunks_now() > 0 =>

@@ -40,7 +40,12 @@ impl SlotPool {
         // a segment released (unmapped) under a copy queued on another
         // stream is read unmapped (a device fault on an eviction's
         // kv-to-disk copy).
-        if self.moving_out.range(range.start..range.end).next().is_some() {
+        if self
+            .moving_out
+            .range(range.start..range.end)
+            .next()
+            .is_some()
+        {
             return None;
         }
         // Nor one holding chunks a served restore's reservation keeps for
@@ -167,10 +172,7 @@ impl SlotPool {
     /// go since, and the segment is committed again, its free chunks open.
     pub fn undo_evacuation(&mut self, evacuation: &Evacuation) {
         let segment = evacuation.segment;
-        if !matches!(
-            self.segments.state(segment),
-            SegmentState::Draining { .. }
-        ) {
+        if !matches!(self.segments.state(segment), SegmentState::Draining { .. }) {
             return;
         }
         self.segments.set_state(segment, SegmentState::Committed);
@@ -237,12 +239,18 @@ impl SlotPool {
         // chunks (fenced until the fire carrying it retires): a compaction
         // moving chunks out leaves the segment empty and committed, and
         // given back then, the copy read memory the engine unmapped.
-        let fenced = range.clone().filter(|&chunk| self.fenced.get(chunk)).count();
+        let fenced = range
+            .clone()
+            .filter(|&chunk| self.fenced.get(chunk))
+            .count();
         let copying = u32::try_from(self.moving_out.range(range.start..range.end).count() + fenced)
             .unwrap_or(u32::MAX)
             .saturating_add(u32::from(self.reserved_in(range.start, range.end)));
         if copying > 0 {
-            return Err(SegmentError::Held { segment, held: copying });
+            return Err(SegmentError::Held {
+                segment,
+                held: copying,
+            });
         }
         match self.segments.state(segment) {
             SegmentState::Draining { until } if until > self.retired => {

@@ -18,7 +18,10 @@ impl SlotPool {
             .uncommitted()
             .filter(|&segment| segment < self.top_segment)
             .collect();
-        let backed = uncommitted.iter().filter(|&&segment| self.backs(segment)).count();
+        let backed = uncommitted
+            .iter()
+            .filter(|&&segment| self.backs(segment))
+            .count();
         let lent = self.span_lent();
         format!(
             "budget: total={} reserved={} held={} act={} committed={} headroom={} \
@@ -57,10 +60,16 @@ impl SlotPool {
     #[must_use]
     pub fn census(&self, run: u32) -> String {
         let limit = self.state_limit().min(self.ceiling);
-        let free = (0..self.total).filter(|&chunk| self.free.get(chunk)).count();
-        let past_limit = (limit..self.total).filter(|&chunk| self.free.get(chunk)).count();
+        let free = (0..self.total)
+            .filter(|&chunk| self.free.get(chunk))
+            .count();
+        let past_limit = (limit..self.total)
+            .filter(|&chunk| self.free.get(chunk))
+            .count();
         let open = self.open.iter_in(0, self.total).count();
-        let fenced = (0..self.total).filter(|&chunk| self.fenced.get(chunk)).count();
+        let fenced = (0..self.total)
+            .filter(|&chunk| self.fenced.get(chunk))
+            .count();
         let empty_opened = self
             .chunks
             .iter()
@@ -154,8 +163,14 @@ impl SlotPool {
             assert_eq!(free + meta.used, state.spc());
             let partial = meta.used < state.spc();
             assert_eq!(
-                state.partial.get(&meta.class).is_some_and(|chunks| chunks
-                    .contains(&(Reverse(meta.used), physical, logical))),
+                state
+                    .partial
+                    .get(&meta.class)
+                    .is_some_and(|chunks| chunks.contains(&(
+                        Reverse(meta.used),
+                        physical,
+                        logical
+                    ))),
                 partial
             );
             assert!(

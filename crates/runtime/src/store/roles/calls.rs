@@ -150,7 +150,8 @@ pub fn take_bind(
     };
     let mut roles = roles.lock().unwrap();
     let free_before = roles.device.lock().unwrap().pool().free_chunks();
-    let beside = roles.instance_parts_fresh(binding.program, &binding.channels, &registered, adapter);
+    let beside =
+        roles.instance_parts_fresh(binding.program, &binding.channels, &registered, adapter);
     let guest = roles.take_guest(&binding.channels, (pair, state), holder, beside)?;
     let fresh = guest.fresh_runs();
     // The gate's room ask counts the pair it joined, where the pool could
@@ -159,9 +160,7 @@ pub fn take_bind(
     // fitting (the simulation's seed 213).
     let asked = guest
         .asked_runs()
-        .filter(|&(run, pieces)| {
-            roles.device.lock().unwrap().pool().runs_most(run) >= pieces
-        })
+        .filter(|&(run, pieces)| roles.device.lock().unwrap().pool().runs_most(run) >= pieces)
         .or(fresh);
     let mut taken = roles
         .take_instance(
@@ -452,7 +451,10 @@ where
             continue;
         }
         if let Some(RolesError::GuestGrow {
-            prefix, run, room: short, ..
+            prefix,
+            run,
+            room: short,
+            ..
         }) = error.downcast_ref::<RolesError>()
         {
             let (prefix, run) = (*prefix, *run);

@@ -18,12 +18,7 @@ impl Rng {
     }
 }
 
-fn facts(
-    total: u32,
-    segment: u32,
-    committed: u32,
-    shapes: &[(ShapeKind, u32)],
-) -> SlotPoolFacts {
+fn facts(total: u32, segment: u32, committed: u32, shapes: &[(ShapeKind, u32)]) -> SlotPoolFacts {
     facts_with(
         total,
         segment,
@@ -113,11 +108,7 @@ fn property_run(seed: u64, shapes: &[(ShapeKind, u32)]) {
                         let unique: HashSet<_> = slots.iter().collect();
                         assert_eq!(unique.len(), slots.len(), "a slot handed out twice");
                         for &slot in &slots {
-                            assert_eq!(
-                                model.refs(slot),
-                                (0, 0),
-                                "{slot:?} handed out while held"
-                            );
+                            assert_eq!(model.refs(slot), (0, 0), "{slot:?} handed out while held");
                             if let Some(&after) = model.pending.get(&slot) {
                                 assert!(
                                     after <= model.retired,
@@ -138,9 +129,7 @@ fn property_run(seed: u64, shapes: &[(ShapeKind, u32)]) {
                 let from = holders(&mut rng);
                 let to = holders(&mut rng);
                 let mut slots: Vec<Slot> = model.held.get(&from).cloned().unwrap_or_default();
-                slots.retain(|slot| {
-                    !model.held.get(&to).is_some_and(|held| held.contains(slot))
-                });
+                slots.retain(|slot| !model.held.get(&to).is_some_and(|held| held.contains(slot)));
                 slots.sort();
                 slots.dedup();
                 slots.truncate(rng.below(6) as usize);
@@ -295,17 +284,26 @@ fn a_slot_given_back_is_queued_for_poison_by_its_physical_bytes() {
     let mut copy = pool.clone();
     copy.release(holder, &slots, 0);
     copy.retire_through(u64::MAX);
-    assert!(queue.lock().unwrap().is_empty(), "a clone's give-back is its own");
+    assert!(
+        queue.lock().unwrap().is_empty(),
+        "a clone's give-back is its own"
+    );
     pool.touch(&slots, 5);
     pool.release(holder, &slots, 0);
-    assert!(queue.lock().unwrap().is_empty(), "held for the fire that touched them");
+    assert!(
+        queue.lock().unwrap().is_empty(),
+        "held for the fire that touched them"
+    );
     pool.retire_through(5);
     let mut due = std::mem::take(&mut *queue.lock().unwrap());
     due.sort_unstable();
     let mut want: Vec<(u64, u64)> = slots
         .iter()
         .map(|slot| {
-            (u64::from(physical) * (1 << 20) + u64::from(slot.index) * slot_bytes, slot_bytes)
+            (
+                u64::from(physical) * (1 << 20) + u64::from(slot.index) * slot_bytes,
+                slot_bytes,
+            )
         })
         .collect();
     want.sort_unstable();
@@ -325,24 +323,37 @@ fn a_raise_moves_a_run_whole_or_waits() {
     let low = pool.acquire_chunk_runs(holder, 0, 1, 9).unwrap();
     let at = |pool: &SlotPool, slot: &Slot| pool.chunk_table()[slot.chunk as usize];
     let free_of = |pool: &mut SlotPool, chunks: &[u32]| {
-        let slots: Vec<Slot> =
-            low.iter().copied().filter(|slot| chunks.contains(&at(pool, slot))).collect();
+        let slots: Vec<Slot> = low
+            .iter()
+            .copied()
+            .filter(|slot| chunks.contains(&at(pool, slot)))
+            .collect();
         pool.release(holder, &slots, 0);
         pool.retire_through(u64::MAX);
     };
     free_of(&mut pool, &[3, 5]);
     let run = pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap();
     let firsts: BTreeSet<u32> = run.iter().map(|slot| at(&pool, slot)).collect();
-    assert_eq!(firsts, BTreeSet::from([10, 11]), "the run lies in the span the raise takes");
+    assert_eq!(
+        firsts,
+        BTreeSet::from([10, 11]),
+        "the run lies in the span the raise takes"
+    );
     assert!(
         matches!(pool.plan_rung(256), Err(SlotError::NoRoom { .. })),
         "free chunks 3 and 5 hold no run of two: never split, it waits"
     );
     free_of(&mut pool, &[6]);
     let evacuation = pool.plan_rung(256).expect("a free run of two below");
-    let moved: BTreeSet<(u32, u32)> =
-        evacuation.moves.iter().map(|step| (step.from, step.to)).collect();
-    assert!(moved.contains(&(10, 5)) && moved.contains(&(11, 6)), "whole: {moved:?}");
+    let moved: BTreeSet<(u32, u32)> = evacuation
+        .moves
+        .iter()
+        .map(|step| (step.from, step.to))
+        .collect();
+    assert!(
+        moved.contains(&(10, 5)) && moved.contains(&(11, 6)),
+        "whole: {moved:?}"
+    );
     pool.apply_rung(&evacuation, 7).unwrap();
     pool.check();
 }
@@ -361,7 +372,11 @@ fn a_raise_moves_a_run_straddling_its_span_whole() {
     let at = |pool: &SlotPool, slot: &Slot| pool.chunk_table()[slot.chunk as usize];
     let run = pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap();
     let firsts: BTreeSet<u32> = run.iter().map(|slot| at(&pool, slot)).collect();
-    assert_eq!(firsts, BTreeSet::from([9, 10]), "the run straddles the span's limit");
+    assert_eq!(
+        firsts,
+        BTreeSet::from([9, 10]),
+        "the run straddles the span's limit"
+    );
     let freed: Vec<Slot> = low
         .iter()
         .copied()
@@ -370,9 +385,16 @@ fn a_raise_moves_a_run_straddling_its_span_whole() {
     pool.release(holder, &freed, 0);
     pool.retire_through(u64::MAX);
     let evacuation = pool.plan_rung(256).expect("a free run of two below");
-    let moved: BTreeSet<(u32, u32)> =
-        evacuation.moves.iter().map(|step| (step.from, step.to)).collect();
-    assert_eq!(moved, BTreeSet::from([(9, 5), (10, 6)]), "whole, both members");
+    let moved: BTreeSet<(u32, u32)> = evacuation
+        .moves
+        .iter()
+        .map(|step| (step.from, step.to))
+        .collect();
+    assert_eq!(
+        moved,
+        BTreeSet::from([(9, 5), (10, 6)]),
+        "whole, both members"
+    );
     pool.apply_rung(&evacuation, 7).unwrap();
     pool.check();
 }
@@ -388,10 +410,18 @@ fn the_span_starts_where_the_engine_pins_it() {
     let mut facts = facts_with(16, 4, 2, &[(ShapeKind::Fixed, 4)], &[(16, 2)]);
     facts.span_on_demand = true;
     let rungs = SlotPool::new(facts.clone());
-    assert_eq!(rungs.top_segment(), 3, "the rung's two chunks: the last segment");
+    assert_eq!(
+        rungs.top_segment(),
+        3,
+        "the rung's two chunks: the last segment"
+    );
     facts.act_span = Some(6);
     let pinned = SlotPool::new(facts);
-    assert_eq!(pinned.top_segment(), 2, "six chunks from the end: segment 2 on");
+    assert_eq!(
+        pinned.top_segment(),
+        2,
+        "six chunks from the end: segment 2 on"
+    );
     pinned.check();
 }
 
@@ -408,7 +438,9 @@ fn small_slot_runs_placed_alone_share_chunks_of_their_class() {
     let alone = pool.opens_alone(&own);
     assert_eq!(alone, 72u32.div_ceil(spc), "packed {spc} a chunk");
     let all = pool.free_chunks();
-    let _held = pool.acquire_chunk_runs(Holder::WorkingSet(9), 0, 1, all).unwrap();
+    let _held = pool
+        .acquire_chunk_runs(Holder::WorkingSet(9), 0, 1, all)
+        .unwrap();
     assert_eq!(pool.opens_beside(&own), None, "no room now");
     assert_eq!(pool.opens_alone(&own), alone, "placed alone, the same");
 }
@@ -424,7 +456,11 @@ fn moves_that_split_a_run_are_refused_whoever_planned_them() {
     let filler = pool.acquire_chunk_runs(holder, 0, 1, 4).unwrap();
     let run = pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap();
     let at = |pool: &SlotPool, chunk: u32| pool.chunk_table()[chunk as usize];
-    let low = filler.iter().map(|slot| at(&pool, slot.chunk)).min().unwrap();
+    let low = filler
+        .iter()
+        .map(|slot| at(&pool, slot.chunk))
+        .min()
+        .unwrap();
     pool.release(holder, &filler, 0);
     pool.retire_through(u64::MAX);
     let mut chunks: Vec<u32> = run.iter().map(|slot| slot.chunk).collect();
@@ -433,16 +469,42 @@ fn moves_that_split_a_run_are_refused_whoever_planned_them() {
     let (head, second) = (chunks[0], chunks[1]);
     let (from, next) = (at(&pool, head), at(&pool, second));
     assert_eq!(next, from + 1);
-    let alone = [ChunkMove { logical: second, from: next, to: low }];
-    assert!(matches!(pool.apply_compaction(&alone, 3), Err(SlotError::SplitsRun { .. })));
+    let alone = [ChunkMove {
+        logical: second,
+        from: next,
+        to: low,
+    }];
+    assert!(matches!(
+        pool.apply_compaction(&alone, 3),
+        Err(SlotError::SplitsRun { .. })
+    ));
     let apart = [
-        ChunkMove { logical: head, from, to: low },
-        ChunkMove { logical: second, from: next, to: low + 2 },
+        ChunkMove {
+            logical: head,
+            from,
+            to: low,
+        },
+        ChunkMove {
+            logical: second,
+            from: next,
+            to: low + 2,
+        },
     ];
-    assert!(matches!(pool.apply_compaction(&apart, 3), Err(SlotError::SplitsRun { .. })));
+    assert!(matches!(
+        pool.apply_compaction(&apart, 3),
+        Err(SlotError::SplitsRun { .. })
+    ));
     let whole = [
-        ChunkMove { logical: head, from, to: low },
-        ChunkMove { logical: second, from: next, to: low + 1 },
+        ChunkMove {
+            logical: head,
+            from,
+            to: low,
+        },
+        ChunkMove {
+            logical: second,
+            from: next,
+            to: low + 1,
+        },
     ];
     pool.apply_compaction(&whole, 3).unwrap();
     pool.retire_through(u64::MAX);
@@ -460,8 +522,11 @@ fn a_move_s_destination_is_handed_to_no_one_until_its_copy_lands() {
     let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
     let holder = Holder::WorkingSet(1);
     let taken = pool.acquire_chunk_runs(holder, 0, 1, 6).unwrap();
-    let low: Vec<Slot> =
-        taken.iter().copied().filter(|slot| pool.chunk_table()[slot.chunk as usize] < 3).collect();
+    let low: Vec<Slot> = taken
+        .iter()
+        .copied()
+        .filter(|slot| pool.chunk_table()[slot.chunk as usize] < 3)
+        .collect();
     pool.release(holder, &low, 0);
     pool.retire_through(u64::MAX);
     let high = taken
@@ -473,18 +538,36 @@ fn a_move_s_destination_is_handed_to_no_one_until_its_copy_lands() {
     pool.apply_compaction(&moves, 5).unwrap();
     let to = moves[0].to;
     // Its owner lets it go before the copy lands.
-    let rest: Vec<Slot> = taken.iter().copied().filter(|slot| slot.chunk == high).collect();
+    let rest: Vec<Slot> = taken
+        .iter()
+        .copied()
+        .filter(|slot| slot.chunk == high)
+        .collect();
     pool.release(holder, &rest, 0);
-    assert!(!pool.open_chunks().contains(&to), "the copy's destination stays closed");
+    assert!(
+        !pool.open_chunks().contains(&to),
+        "the copy's destination stays closed"
+    );
     let from = moves[0].from;
-    assert!(!pool.open_chunks().contains(&from), "the copy's source stays closed");
-    assert!(pool.plan_moves_of(&[high]).is_empty(), "a chunk mid-copy is moved by no one");
+    assert!(
+        !pool.open_chunks().contains(&from),
+        "the copy's source stays closed"
+    );
+    assert!(
+        pool.plan_moves_of(&[high]).is_empty(),
+        "a chunk mid-copy is moved by no one"
+    );
     assert_eq!(pool.plan_compaction(2), None, "nor compacted over");
-    let other = pool.acquire_chunk_runs(Holder::WorkingSet(2), 0, 1, 1).unwrap();
+    let other = pool
+        .acquire_chunk_runs(Holder::WorkingSet(2), 0, 1, 1)
+        .unwrap();
     let got = pool.chunk_table()[other[0].chunk as usize];
     assert!(got != to && got != from, "neither end is handed out: {got}");
     pool.retire_through(5);
-    assert!(pool.open_chunks().contains(&to), "the copy landed: open again");
+    assert!(
+        pool.open_chunks().contains(&to),
+        "the copy landed: open again"
+    );
     pool.check();
 }
 
@@ -515,12 +598,20 @@ fn a_move_taken_back_after_its_chunk_was_let_go_leaves_the_pool_whole() {
     assert_eq!(moves.len(), 1, "one move down");
     pool.apply_compaction(&moves, 5).unwrap();
     // Its process ends before the copy is taken or refused.
-    let rest: Vec<Slot> = taken.iter().copied().filter(|slot| slot.chunk == high).collect();
+    let rest: Vec<Slot> = taken
+        .iter()
+        .copied()
+        .filter(|slot| slot.chunk == high)
+        .collect();
     pool.release(holder, &rest, 0);
     pool.retire_through(u64::MAX);
     pool.undo_compaction(&moves);
     pool.check();
-    assert_eq!(pool.chunk_table()[high as usize], moves[0].from, "where the engine's table has it");
+    assert_eq!(
+        pool.chunk_table()[high as usize],
+        moves[0].from,
+        "where the engine's table has it"
+    );
 }
 
 /// An eviction's copy of state must not be refused "inside the
@@ -536,7 +627,11 @@ fn no_state_opens_where_the_engine_s_carve_still_lies() {
     pool.set_rung(256).expect("the wide rung");
     let wide = pool.state_limit();
     pool.set_rung(16).expect("lowered, the engine not told");
-    assert_eq!(pool.state_limit(), wide, "its carve still lies there: nothing lent");
+    assert_eq!(
+        pool.state_limit(),
+        wide,
+        "its carve still lies there: nothing lent"
+    );
     pool.engine_narrowed();
     assert_eq!(pool.state_limit(), 16 - 2, "narrowed: the span is lent");
 }
@@ -559,9 +654,17 @@ fn a_serve_s_state_is_placed_where_its_take_puts_it_before_the_runs() {
         .filter(|slot| (4..8).contains(&pool.physical(slot.chunk).unwrap()))
         .collect();
     pool.release(holder, &freed, 0);
-    assert_eq!(pool.free_chunk_runs(4), 1, "chunks 4..8 free: a run of four");
+    assert_eq!(
+        pool.free_chunk_runs(4),
+        1,
+        "chunks 4..8 free: a run of four"
+    );
     let take = [(0, 1)];
-    assert_eq!(pool.opens_for(&take), Some(vec![4]), "the state opens the lowest free chunk");
+    assert_eq!(
+        pool.opens_for(&take),
+        Some(vec![4]),
+        "the state opens the lowest free chunk"
+    );
     let own = [OwnPiece::Take { shape: 0, slots: 1 }];
     assert!(
         !pool.chunk_runs_beside(&own, 4, 1),
@@ -594,9 +697,16 @@ fn a_placement_is_the_takes_own_and_counts_partly_filled_slots_once() {
     let nine = at(&pool, 9..=9);
     pool.release(holder, &nine, 0);
     let _partial = pool.acquire(holder, 0, 3).unwrap();
-    let runs: Vec<Slot> = at(&pool, 1..=3).into_iter().chain(at(&pool, 5..=7)).collect();
+    let runs: Vec<Slot> = at(&pool, 1..=3)
+        .into_iter()
+        .chain(at(&pool, 5..=7))
+        .collect();
     pool.release(holder, &runs, 0);
-    assert_eq!(pool.partial_free(0), 1, "one slot free in the partly filled chunk");
+    assert_eq!(
+        pool.partial_free(0),
+        1,
+        "one slot free in the partly filled chunk"
+    );
     assert_eq!(pool.free_chunk_runs(3), 2, "two free runs of three");
     let own = [
         OwnPiece::Take { shape: 0, slots: 1 },
@@ -605,8 +715,15 @@ fn a_placement_is_the_takes_own_and_counts_partly_filled_slots_once() {
     let placement = pool.place(&own);
     assert!(placement.stands());
     assert_eq!(placement.opened.len(), 1, "the second take opens a chunk");
-    assert_eq!(placement.free_runs(3), 1, "one run of three stands after them");
-    assert!(!pool.chunk_runs_beside(&own, 3, 2), "the bind's two runs do not");
+    assert_eq!(
+        placement.free_runs(3),
+        1,
+        "one run of three stands after them"
+    );
+    assert!(
+        !pool.chunk_runs_beside(&own, 3, 2),
+        "the bind's two runs do not"
+    );
     // The real takes find the same.
     pool.acquire(holder, 0, 1).unwrap();
     pool.acquire(holder, 0, 1).unwrap();
@@ -636,7 +753,9 @@ fn a_parked_run_that_shares_a_partly_filled_chunk_leaves_the_free_runs_standing(
             pool.open_chunks(),
             pool.free_chunks(),
             pool.room_gives(),
-            (1..=4).map(|run| pool.free_chunk_runs(run)).collect::<Vec<_>>(),
+            (1..=4)
+                .map(|run| pool.free_chunk_runs(run))
+                .collect::<Vec<_>>(),
         )
     };
     let before = snapshot(&pool);
@@ -650,7 +769,11 @@ fn a_parked_run_that_shares_a_partly_filled_chunk_leaves_the_free_runs_standing(
     let whole = [OwnPiece::Chunks { run: 1, pieces: 1 }];
     assert!(!pool.chunk_runs_beside(&whole, 1, free));
     assert!(pool.chunk_runs_beside(&whole, 1, free - 1));
-    assert_eq!(snapshot(&pool), before, "read only: the pool is the same after");
+    assert_eq!(
+        snapshot(&pool),
+        before,
+        "read only: the pool is the same after"
+    );
     // And the real take puts it where the view did.
     let back = pool.acquire_run(holder, 0, 2).unwrap();
     assert_eq!(back[0].chunk, kept[0].chunk);
@@ -672,19 +795,29 @@ fn a_segment_under_a_copy_is_neither_evacuated_nor_released() {
     let fixed = [(ShapeKind::Fixed, 4)];
     let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
     let holder = Holder::WorkingSet(1);
-    let held = pool.acquire_chunk_runs(holder, 0, 1, pool.free_chunk_runs(1)).unwrap();
+    let held = pool
+        .acquire_chunk_runs(holder, 0, 1, pool.free_chunk_runs(1))
+        .unwrap();
     // Segment 1 (chunks 4..8) keeps one held chunk, 5; the rest of the
     // pool below it free enough to take it.
-    let (five, freed): (Vec<Slot>, Vec<Slot>) =
-        held.iter().copied().partition(|slot| pool.physical(slot.chunk).unwrap() == 5);
+    let (five, freed): (Vec<Slot>, Vec<Slot>) = held
+        .iter()
+        .copied()
+        .partition(|slot| pool.physical(slot.chunk).unwrap() == 5);
     pool.release(holder, &freed, 0);
-    assert!(pool.plan_evacuation(1).is_some(), "unfenced, it is evacuated");
+    assert!(
+        pool.plan_evacuation(1).is_some(),
+        "unfenced, it is evacuated"
+    );
     pool.moving_out(&[5]);
     assert!(pool.plan_evacuation(1).is_none(), "under a copy, it is not");
     // Its chunk given back (the copy's commit) while the copy's fence
     // still stands: the empty segment is not released.
     pool.release(holder, &five, 0);
-    assert!(pool.release_segment(1).is_err(), "not released under a copy");
+    assert!(
+        pool.release_segment(1).is_err(),
+        "not released under a copy"
+    );
     pool.moved_out(&[5]);
     assert!(pool.release_segment(1).is_ok(), "released once it landed");
 }
@@ -694,11 +827,15 @@ fn a_placement_of_runs_leaves_what_the_real_takes_leave() {
     let fixed = [(ShapeKind::Fixed, 4)];
     let mut pool = SlotPool::new(facts_with(32, 4, 8, &fixed, &[(16, 4)]));
     let holder = Holder::WorkingSet(1);
-    let held = pool.acquire_chunk_runs(holder, 0, 1, pool.free_chunk_runs(1)).unwrap();
+    let held = pool
+        .acquire_chunk_runs(holder, 0, 1, pool.free_chunk_runs(1))
+        .unwrap();
     let freed: Vec<Slot> = held
         .iter()
         .copied()
-        .filter(|slot| matches!(pool.physical(slot.chunk).unwrap(), 1 | 2 | 5 | 6 | 8..=11 | 13..=15))
+        .filter(
+            |slot| matches!(pool.physical(slot.chunk).unwrap(), 1 | 2 | 5 | 6 | 8..=11 | 13..=15),
+        )
         .collect();
     pool.release(holder, &freed, 0);
     let own = [OwnPiece::Chunks { run: 2, pieces: 2 }];
@@ -706,8 +843,15 @@ fn a_placement_of_runs_leaves_what_the_real_takes_leave() {
     assert!(placement.stands());
     let placed_runs = placement.free_runs(3);
     pool.acquire_chunk_runs(holder, 0, 2, 2).unwrap();
-    assert_eq!(pool.free_chunk_runs(3), placed_runs, "what the real takes leave");
-    assert_eq!(placed_runs, 2, "the lowest two-stretches taken, both runs of three left");
+    assert_eq!(
+        pool.free_chunk_runs(3),
+        placed_runs,
+        "what the real takes leave"
+    );
+    assert_eq!(
+        placed_runs, 2,
+        "the lowest two-stretches taken, both runs of three left"
+    );
     pool.check();
 }
 
@@ -731,19 +875,27 @@ fn a_compaction_moves_no_chunk_a_copy_reads_and_no_reserved_chunk() {
     };
     // Unfenced, the cheapest window is 4..7, its chunk 5 moved.
     let moves = build().plan_compaction(3).expect("a run of three is made");
-    assert_eq!(moves.iter().map(|step| step.from).collect::<Vec<_>>(), vec![5]);
+    assert_eq!(
+        moves.iter().map(|step| step.from).collect::<Vec<_>>(),
+        vec![5]
+    );
     // An eviction's copy reads chunk 5: it is moved by no compaction.
     let mut pool = build();
     pool.moving_out(&[5]);
     let moves = pool.plan_compaction(3).unwrap_or_default();
-    assert!(moves.iter().all(|step| step.from != 5 && step.to != 5), "{moves:?}");
+    assert!(
+        moves.iter().all(|step| step.from != 5 && step.to != 5),
+        "{moves:?}"
+    );
     // Chunks 2 and 4 held for a served restore: never a destination,
     // never inside a window cleared for another.
     let mut pool = build();
     let ticket = pool.reserve_chunks([2, 4]);
     let moves = pool.plan_compaction(3).unwrap_or_default();
     assert!(
-        moves.iter().all(|step| ![2, 4].contains(&step.to) && ![2, 4].contains(&step.from)),
+        moves
+            .iter()
+            .all(|step| ![2, 4].contains(&step.to) && ![2, 4].contains(&step.from)),
         "{moves:?}"
     );
     assert_eq!(pool.reserved(ticket), vec![2, 4], "still held");
@@ -843,10 +995,14 @@ fn a_second_run_is_compacted_beside_the_one_standing() {
     }
     assert_eq!(pool.free_chunk_runs(2), 1, "one run of two stands (1..3)");
     assert_eq!(pool.plan_compaction(2), None, "a run stands: none for one");
-    let moves = pool.plan_compaction_for(2, 2).expect("a second run is cleared");
+    let moves = pool
+        .plan_compaction_for(2, 2)
+        .expect("a second run is cleared");
     assert_eq!(moves.len(), 1);
     assert!(
-        moves.iter().all(|step| ![1, 2].contains(&step.from) && ![1, 2].contains(&step.to)),
+        moves
+            .iter()
+            .all(|step| ![1, 2].contains(&step.from) && ![1, 2].contains(&step.to)),
         "the standing run untouched: {moves:?}"
     );
     pool.apply_compaction(&moves, 3).unwrap();
@@ -894,15 +1050,25 @@ fn scattered_free_chunks_are_compacted_into_a_run_and_residents_keep_their_bytes
         "the bind is short"
     );
 
-    let moves = pool.plan_compaction(3).expect("five free chunks stand a run of 3");
+    let moves = pool
+        .plan_compaction(3)
+        .expect("five free chunks stand a run of 3");
     assert_eq!(moves.len(), 1, "the cheapest window: one chunk moved");
-    assert_eq!((moves[0].from, moves[0].to), (5, 2), "4..7 cleared, its 5 to the lowest free");
+    assert_eq!(
+        (moves[0].from, moves[0].to),
+        (5, 2),
+        "4..7 cleared, its 5 to the lowest free"
+    );
     pool.apply_compaction(&moves, 7).unwrap();
     // The engine's copy (`Engine::evacuate`): bytes follow the logical chunk.
     for step in &moves {
         bytes[step.to as usize] = bytes[step.from as usize];
     }
-    assert_eq!(pool.free_chunk_runs(3), 0, "closed until the copy's fire retires");
+    assert_eq!(
+        pool.free_chunk_runs(3),
+        0,
+        "closed until the copy's fire retires"
+    );
     assert!(pool.compacting());
     assert_eq!(pool.plan_compaction(3), None, "one at a time");
     pool.retire_through(7);
@@ -911,7 +1077,10 @@ fn scattered_free_chunks_are_compacted_into_a_run_and_residents_keep_their_bytes
     let bound = pool
         .acquire_chunk_runs(Holder::WorkingSet(2), 0, 3, 1)
         .expect("the bind takes it");
-    let mut chunks: Vec<u32> = bound.iter().map(|slot| pool.physical(slot.chunk).unwrap()).collect();
+    let mut chunks: Vec<u32> = bound
+        .iter()
+        .map(|slot| pool.physical(slot.chunk).unwrap())
+        .collect();
     chunks.dedup();
     assert_eq!(chunks, [4, 5, 6]);
     for (slot, mark) in &marks {
@@ -935,7 +1104,11 @@ fn scattered_free_chunks_are_compacted_into_a_run_and_residents_keep_their_bytes
             pool.release(resident, &slots, 0);
         }
     }
-    assert_eq!(pool.plan_compaction(3), None, "too few free chunks: it waits");
+    assert_eq!(
+        pool.plan_compaction(3),
+        None,
+        "too few free chunks: it waits"
+    );
 }
 
 /// Every return of slots tells the room signal once: a release whose
@@ -972,7 +1145,13 @@ fn slots_coming_free_tell_the_room_signal() {
 /// fixed shape, eleven of them free for state (the null chunk and the
 /// top segment's activation aside).
 fn run_pool() -> SlotPool {
-    SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1024)], &[(16, 4)]))
+    SlotPool::new(facts_with(
+        16,
+        4,
+        4,
+        &[(ShapeKind::Fixed, 1024)],
+        &[(16, 4)],
+    ))
 }
 
 /// A compaction moves a held chunk out of segment 1, swapping a free
@@ -1045,9 +1224,16 @@ fn a_placement_of_two_runs_lays_each_disjointly() {
     pool.release(holder, &back, 0);
     pool.retire_through(u64::MAX);
     assert_eq!(pool.free_chunk_runs(30), 1);
-    assert!(pool.free_chunks() >= 50, "free chunks enough: {}", pool.free_chunks());
+    assert!(
+        pool.free_chunks() >= 50,
+        "free chunks enough: {}",
+        pool.free_chunks()
+    );
     let two = [OwnPiece::Chunks { run: 30, pieces: 2 }];
-    assert!(!pool.place(&two).stands(), "one free run lays one piece, not two");
+    assert!(
+        !pool.place(&two).stands(),
+        "one free run lays one piece, not two"
+    );
     let one = [OwnPiece::Chunks { run: 30, pieces: 1 }];
     assert!(pool.place(&one).stands());
     // Nor two pieces asked apart, one after the other.
@@ -1129,7 +1315,9 @@ fn the_pools_moves_leave_the_table_the_engines_apply_does() {
         // Free chunks swapped among themselves (a move let go mid-way),
         // in chains: each the engine's swap too.
         let free: Vec<u32> = (0..pool.total_chunks())
-            .filter(|&logical| pool.chunks[logical as usize].shape == NO_SHAPE && logical >= pool.reserved)
+            .filter(|&logical| {
+                pool.chunks[logical as usize].shape == NO_SHAPE && logical >= pool.reserved
+            })
             .collect();
         for _ in 0..8 {
             if free.len() < 2 {
@@ -1140,11 +1328,16 @@ fn the_pools_moves_leave_the_table_the_engines_apply_does() {
             let from = pool.logical_to_physical[logical as usize];
             pool.move_chunk(ChunkMove { logical, from, to });
             engine
-                .apply(&::engine::chunk::Evacuation { moves: vec![(logical, to)] })
+                .apply(&::engine::chunk::Evacuation {
+                    moves: vec![(logical, to)],
+                })
                 .unwrap();
         }
         for logical in 0..pool.total_chunks() {
-            assert_eq!(engine.physical(logical), Some(pool.logical_to_physical[logical as usize]));
+            assert_eq!(
+                engine.physical(logical),
+                Some(pool.logical_to_physical[logical as usize])
+            );
         }
     }
     assert!(applied > 100, "moves applied: {applied}");
@@ -1160,11 +1353,20 @@ fn a_freed_run_is_reused_exactly_by_the_next_run_of_its_length() {
     let a = pool.acquire_run(holder, 0, 483).unwrap();
     let singles = pool.acquire(holder, 0, 10).unwrap();
     let b = pool.acquire_run(holder, 0, 483).unwrap();
-    assert_eq!(a[0].chunk, b[0].chunk, "two runs of one length share a chunk");
-    assert!(singles.iter().all(|slot| slot.chunk != a[0].chunk), "no single among runs");
+    assert_eq!(
+        a[0].chunk, b[0].chunk,
+        "two runs of one length share a chunk"
+    );
+    assert!(
+        singles.iter().all(|slot| slot.chunk != a[0].chunk),
+        "no single among runs"
+    );
     pool.release(holder, &a, 0);
     let again = pool.acquire_run(holder, 0, 483).unwrap();
-    assert_eq!(again, a, "the next run of its length takes the hole exactly");
+    assert_eq!(
+        again, a,
+        "the next run of its length takes the hole exactly"
+    );
     pool.check();
 }
 
@@ -1181,7 +1383,11 @@ fn a_chunk_whose_runs_all_leave_is_whole_again() {
     pool.release(holder, &b, 0);
     assert_eq!(pool.free_chunks(), free, "the chunk is whole again");
     let other = pool.acquire_run(holder, 0, 700).unwrap();
-    assert_eq!(pool.free_chunks(), free - 1, "a run of another length opens it");
+    assert_eq!(
+        pool.free_chunks(),
+        free - 1,
+        "a run of another length opens it"
+    );
     assert_eq!(other.len(), 700);
     pool.check();
 }
@@ -1205,7 +1411,9 @@ fn single_slots_never_fill_a_run_chunk_s_tail() {
     // Holes scattered among the single slots: no run of 483 there.
     let scattered: Vec<Slot> = singles.iter().step_by(2).copied().collect();
     pool.release(holder, &scattered, 0);
-    let second = pool.acquire_run(holder, 0, 483).expect("the run's own chunk holds it");
+    let second = pool
+        .acquire_run(holder, 0, 483)
+        .expect("the run's own chunk holds it");
     assert_eq!(second[0].chunk, first[0].chunk);
     pool.check();
 }

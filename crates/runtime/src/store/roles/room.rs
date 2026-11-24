@@ -31,7 +31,11 @@ impl Roles {
         }
         let shape = self.shape(role)?;
         let mut pool = on.lock().unwrap();
-        let claim = if Arc::ptr_eq(on, &self.device) { self.claim } else { None };
+        let claim = if Arc::ptr_eq(on, &self.device) {
+            self.claim
+        } else {
+            None
+        };
         if !contiguous {
             return pool
                 .claiming(claim, |pool| pool.take_refs(shape.pool, u64::from(slots)))
@@ -332,7 +336,10 @@ impl Roles {
     /// ([`Self::prepare_unpark`]) and what its placement reads
     /// ([`Self::unpark_pieces`]): one order.
     #[allow(clippy::type_complexity)]
-    pub(super) fn unpark_order(&self, holder: Holder) -> (Vec<(Owner, bool, Vec<Part>)>, Vec<(usize, usize)>) {
+    pub(super) fn unpark_order(
+        &self,
+        holder: Holder,
+    ) -> (Vec<(Owner, bool, Vec<Part>)>, Vec<(usize, usize)>) {
         // Items that shed their dead parts at the park take fresh ones in
         // their class, their live parts where they lie: nothing is copied.
         // So does one on the device with a dead part its rebind must name
@@ -430,7 +437,10 @@ impl Roles {
         &self,
         holder: Holder,
         takes: &[(super::super::slots::ShapeId, u64)],
-    ) -> (Vec<super::super::slots::OwnPiece>, super::super::slots::Placement) {
+    ) -> (
+        Vec<super::super::slots::OwnPiece>,
+        super::super::slots::Placement,
+    ) {
         use super::super::slots::OwnPiece;
         let own: Vec<OwnPiece> = takes
             .iter()
@@ -452,14 +462,19 @@ impl Roles {
         let own: Vec<OwnPiece> = self
             .unpark_pieces(holder)
             .into_iter()
-            .chain(bind.iter().map(|&(run, pieces)| OwnPiece::Chunks { run, pieces }))
+            .chain(
+                bind.iter()
+                    .map(|&(run, pieces)| OwnPiece::Chunks { run, pieces }),
+            )
             .collect();
         let mut device = self.device.lock().unwrap();
         let placement = device.pool().place(&own);
         if !placement.stands() {
             return false;
         }
-        let ticket = device.pool_mut().reserve_chunks(placement.opened.iter().copied());
+        let ticket = device
+            .pool_mut()
+            .reserve_chunks(placement.opened.iter().copied());
         drop(device);
         self.claims.insert(holder, ticket);
         true
@@ -472,7 +487,11 @@ impl Roles {
     /// without its own reservation, a restore whose bind runs are held for
     /// it would find none of them, every serve (`PendingBindShort`).
     #[must_use]
-    pub fn place_claimed(&self, holder: Holder, own: &[super::super::slots::OwnPiece]) -> super::super::slots::Placement {
+    pub fn place_claimed(
+        &self,
+        holder: Holder,
+        own: &[super::super::slots::OwnPiece],
+    ) -> super::super::slots::Placement {
         let ticket = self.claims.get(&holder).copied();
         self.device
             .lock()
@@ -484,7 +503,11 @@ impl Roles {
     /// `holder`'s reservation, its chunks not yet taken, goes back.
     pub fn release_claim(&mut self, holder: Holder) {
         if let Some(ticket) = self.claims.remove(&holder) {
-            self.device.lock().unwrap().pool_mut().release_reservation(ticket);
+            self.device
+                .lock()
+                .unwrap()
+                .pool_mut()
+                .release_reservation(ticket);
         }
     }
 
@@ -518,7 +541,12 @@ impl Roles {
                     )
                 })
                 .collect();
-            items.push(format!("{owner:?}@{:?}{}[{}]", item.tier, if item.shed { "(shed)" } else { "" }, parts.join(",")));
+            items.push(format!(
+                "{owner:?}@{:?}{}[{}]",
+                item.tier,
+                if item.shed { "(shed)" } else { "" },
+                parts.join(",")
+            ));
         }
         let beside = need.map(|(run, pieces)| self.fits_beside_unpark(holder, run, pieces));
         let free_runs = need.map(|(run, _)| self.free_runs(run));
@@ -527,7 +555,10 @@ impl Roles {
             .filter_map(|role| {
                 let shape = self.shapes.of(role)?;
                 let pool = self.device.lock().unwrap();
-                Some(format!("{role:?}:free_slots={}", pool.pool().available(shape.pool)))
+                Some(format!(
+                    "{role:?}:free_slots={}",
+                    pool.pool().available(shape.pool)
+                ))
             })
             .collect();
         format!(

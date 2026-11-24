@@ -59,8 +59,7 @@ impl SlotPool {
                 SingleChunk {
                     logical: logical as u32,
                     used: meta.used,
-                    settled: !self.fenced.get(physical)
-                        && !self.moving_out.contains_key(&physical),
+                    settled: !self.fenced.get(physical) && !self.moving_out.contains_key(&physical),
                 }
             })
             .collect()
@@ -99,7 +98,12 @@ impl SlotPool {
             if taken.len() as u64 == n {
                 break;
             }
-            self.fill(logical, holder.is_live(), n - taken.len() as u64, &mut taken);
+            self.fill(
+                logical,
+                holder.is_live(),
+                n - taken.len() as u64,
+                &mut taken,
+            );
         }
         if n > 0 {
             *self.holders.entry(holder).or_default() += n;
@@ -164,7 +168,12 @@ impl SlotPool {
     /// of that length takes exactly, and a chunk whose runs all leave is
     /// free whole again. What [`Self::acquire_run`] takes, and what
     /// [`Self::chunk_runs_beside`] places on its view.
-    pub(super) fn partial_run(&self, shape: ShapeId, n: u32, held: impl Fn(u32, u32) -> bool) -> Option<(u32, u32)> {
+    pub(super) fn partial_run(
+        &self,
+        shape: ShapeId,
+        n: u32,
+        held: impl Fn(u32, u32) -> bool,
+    ) -> Option<(u32, u32)> {
         let state = self.shapes.get(shape as usize)?;
         state.partial.get(&n).and_then(|chunks| {
             chunks.iter().find_map(|&(_, _, logical)| {
@@ -192,7 +201,13 @@ impl SlotPool {
     }
 
     /// [`Self::runs_where`] below physical chunk `below` (and the ceiling).
-    pub(super) fn runs_below(&self, run: u32, room: u32, below: u32, free: impl Fn(u32) -> bool) -> Vec<u32> {
+    pub(super) fn runs_below(
+        &self,
+        run: u32,
+        room: u32,
+        below: u32,
+        free: impl Fn(u32) -> bool,
+    ) -> Vec<u32> {
         let run = run.max(1);
         if run > self.segments.segment_chunks() {
             return Vec::new();
@@ -288,7 +303,11 @@ impl SlotPool {
                 OwnPiece::Slots { .. } => {}
             }
         }
-        let spc = |shape: ShapeId| self.shapes.get(shape as usize).map_or(1, |state| u64::from(state.spc().max(1)));
+        let spc = |shape: ShapeId| {
+            self.shapes
+                .get(shape as usize)
+                .map_or(1, |state| u64::from(state.spc().max(1)))
+        };
         for (shape, slots) in takes {
             chunks += slots.div_ceil(spc(shape));
         }
@@ -299,7 +318,10 @@ impl SlotPool {
         u32::try_from(chunks).unwrap_or(u32::MAX)
     }
 
-    pub(super) fn free_beside(&self, own: &[OwnPiece]) -> Option<(std::collections::BTreeSet<u32>, u32)> {
+    pub(super) fn free_beside(
+        &self,
+        own: &[OwnPiece],
+    ) -> Option<(std::collections::BTreeSet<u32>, u32)> {
         let placement = self.place(own);
         placement
             .stands()
@@ -320,17 +342,15 @@ impl SlotPool {
         let mut placed = 0usize;
         for piece in own {
             let took = match *piece {
-                OwnPiece::Take { shape, slots } => {
-                    scratch.acquire(PLACING, shape, slots).map(drop)
-                }
-                OwnPiece::Slots { shape, slots } => {
-                    scratch.acquire_run(PLACING, shape, u64::from(slots)).map(drop)
-                }
+                OwnPiece::Take { shape, slots } => scratch.acquire(PLACING, shape, slots).map(drop),
+                OwnPiece::Slots { shape, slots } => scratch
+                    .acquire_run(PLACING, shape, u64::from(slots))
+                    .map(drop),
                 // Whole chunks are placed alike whatever shape opens
                 // them (no slot of another class shares one): the first.
-                OwnPiece::Chunks { run, pieces } => {
-                    scratch.acquire_chunk_runs(PLACING, 0, run, pieces).map(drop)
-                }
+                OwnPiece::Chunks { run, pieces } => scratch
+                    .acquire_chunk_runs(PLACING, 0, run, pieces)
+                    .map(drop),
             };
             if took.is_err() {
                 break;
@@ -431,7 +451,11 @@ impl SlotPool {
                 range.end.min(limit).saturating_sub(range.start) / run
             })
             .sum();
-        let lent: u32 = self.lent_unbacked().iter().map(|&(_, chunks)| chunks / run).sum();
+        let lent: u32 = self
+            .lent_unbacked()
+            .iter()
+            .map(|&(_, chunks)| chunks / run)
+            .sum();
         (prefix + lent).min(self.growable_chunks() / run)
     }
 

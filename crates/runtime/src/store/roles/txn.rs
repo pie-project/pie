@@ -84,9 +84,7 @@ impl Roles {
                 let dead: Vec<Part> = parts
                     .into_iter()
                     .zip(had.iter().map(Some).chain(std::iter::repeat(None)))
-                    .filter(|(part, had)| {
-                        part.dead() && had.is_none_or(|had| had.refs.is_empty())
-                    })
+                    .filter(|(part, had)| part.dead() && had.is_none_or(|had| had.refs.is_empty()))
                     .map(|(part, _)| part)
                     .collect();
                 let device = Arc::clone(&self.device);

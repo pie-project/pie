@@ -58,7 +58,9 @@ impl SlotPool {
     /// below the activation the rung lends and the ceiling.
     #[must_use]
     pub fn state_open_chunks(&self) -> Vec<u32> {
-        self.open.iter_in(0, self.state_limit().min(self.ceiling)).collect()
+        self.open
+            .iter_in(0, self.state_limit().min(self.ceiling))
+            .collect()
     }
 
     /// The logical -> physical table the engine keeps: a permutation, free

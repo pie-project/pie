@@ -64,7 +64,10 @@ impl Roles {
                             part.role
                         ));
                     }
-                    if !device.pool().is_held(shape.pool, device.slot(shape.pool, slot_ref)) {
+                    if !device
+                        .pool()
+                        .is_held(shape.pool, device.slot(shape.pool, slot_ref))
+                    {
                         said.push(format!(
                             "{:?} slot {slot_ref} held by {owner:?} is free in the pool",
                             part.role
@@ -161,6 +164,14 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let taken = take_bind(roles, engine, binding, registered, holder, |_| true, |_, _| false)?;
+    let taken = take_bind(
+        roles,
+        engine,
+        binding,
+        registered,
+        holder,
+        |_| true,
+        |_, _| false,
+    )?;
     bind_taken(roles, engine, binding, holder, taken)
 }

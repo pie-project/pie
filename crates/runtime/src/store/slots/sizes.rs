@@ -248,7 +248,11 @@ impl SlotPool {
         (0..self.segments.count())
             .map(|segment| {
                 let range = self.segments.range(segment);
-                range.end.min(limit).saturating_sub(range.start.max(self.reserved)) / run
+                range
+                    .end
+                    .min(limit)
+                    .saturating_sub(range.start.max(self.reserved))
+                    / run
             })
             .sum()
     }
@@ -263,7 +267,10 @@ impl SlotPool {
         (0..self.segments.count())
             .map(|segment| {
                 let range = self.segments.range(segment);
-                range.end.min(limit).saturating_sub(range.start.max(self.reserved))
+                range
+                    .end
+                    .min(limit)
+                    .saturating_sub(range.start.max(self.reserved))
             })
             .max()
             .unwrap_or(0)

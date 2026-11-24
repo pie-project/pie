@@ -11,7 +11,11 @@ impl Roles {
     pub(crate) fn fire_slots_of(
         &self,
         id: InstanceId,
-    ) -> Vec<(String, super::super::slots::ShapeId, super::super::slots::Slot)> {
+    ) -> Vec<(
+        String,
+        super::super::slots::ShapeId,
+        super::super::slots::Slot,
+    )> {
         let device = self.device.lock().unwrap();
         let mut out = Vec::new();
         let Some(instance) = self.items.get(&Owner::Instance(id)) else {
@@ -19,7 +23,12 @@ impl Roles {
         };
         let mut owners = vec![Owner::Instance(id)];
         owners.extend(instance.pair.map(Owner::Pair));
-        owners.extend(instance.channels.iter().map(|&channel| Owner::Channel(channel)));
+        owners.extend(
+            instance
+                .channels
+                .iter()
+                .map(|&channel| Owner::Channel(channel)),
+        );
         owners.extend(instance.adapter.map(Owner::Adapter));
         for owner in owners {
             let Some(item) = self.items.get(&owner) else {
@@ -59,14 +68,19 @@ impl Roles {
                 .parts
                 .iter()
                 .map(|part| {
-                    let chunks: BTreeSet<u32> = match (item.tier == Tier::Device, self.shapes.of(part.role)) {
-                        (true, Some(shape)) => part
-                            .refs
-                            .iter()
-                            .filter_map(|&slot_ref| device.pool().physical(device.slot(shape.pool, slot_ref).chunk))
-                            .collect(),
-                        _ => BTreeSet::new(),
-                    };
+                    let chunks: BTreeSet<u32> =
+                        match (item.tier == Tier::Device, self.shapes.of(part.role)) {
+                            (true, Some(shape)) => part
+                                .refs
+                                .iter()
+                                .filter_map(|&slot_ref| {
+                                    device
+                                        .pool()
+                                        .physical(device.slot(shape.pool, slot_ref).chunk)
+                                })
+                                .collect(),
+                            _ => BTreeSet::new(),
+                        };
                     format!(
                         "{:?} {} refs={} chunks={chunks:?}",
                         part.role,
@@ -75,7 +89,12 @@ impl Roles {
                     )
                 })
                 .collect();
-            out.push(format!("{owner:?} tier={:?} shed={} [{}]", item.tier, item.shed, parts.join("; ")));
+            out.push(format!(
+                "{owner:?} tier={:?} shed={} [{}]",
+                item.tier,
+                item.shed,
+                parts.join("; ")
+            ));
         }
         out.join(" | ")
     }
