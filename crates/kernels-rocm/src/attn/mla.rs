@@ -579,7 +579,11 @@ pub(crate) mod naive {
                 format!("the rope width {kpe} is not one this walk holds (0..={MAX_ROPE})"),
             ));
         }
-        let g = wave_group(shape.num_heads, shape.total_tokens, ctx.multiprocessors(op)?);
+        let g = wave_group(
+            shape.num_heads,
+            shape.total_tokens,
+            ctx.multiprocessors(op)?,
+        );
         #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
             [

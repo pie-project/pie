@@ -1475,8 +1475,10 @@ fn stage_lt(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
-        Fire::at(kernel(FILE, &format!("::pie::linear::moe_lt_scatter<{t}>")))
-            .apply(Launch::grid([copy_blocks(rows, k, ctx.multiprocessors(op)?), 1, 1], [256, 1, 1])),
+        Fire::at(kernel(FILE, &format!("::pie::linear::moe_lt_scatter<{t}>"))).apply(Launch::grid(
+            [copy_blocks(rows, k, ctx.multiprocessors(op)?), 1, 1],
+            [256, 1, 1],
+        )),
         &[
             x.arg(),
             ArgValue::Ptr(ordered.order),
