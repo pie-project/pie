@@ -1340,6 +1340,23 @@ impl Engine for Cuda {
         true
     }
 
+    fn measures_behind(&self) -> bool {
+        self.shell.as_ref().is_some_and(Shell::measures_behind)
+    }
+
+    /// One point of what the load serves from a stale figure, timed on the
+    /// shell's own stream where nothing of a frame is pending and the
+    /// stream is idle ([`Shell::measure_behind`]).
+    fn measure_behind(&mut self, others: &dyn Fn() -> u64) -> EngineResult<bool> {
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        match self.shell.as_mut() {
+            Some(shell) => shell.measure_behind(others).map_err(fault),
+            None => Ok(false),
+        }
+    }
+
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         self.sink = Some(sink);
     }

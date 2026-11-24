@@ -1,4 +1,5 @@
 mod arming;
+mod behind;
 mod boot;
 pub(crate) mod btrace;
 pub mod diag;
@@ -246,6 +247,9 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
+    /// What this load serves from figures stored under a stale key and
+    /// times again behind serving (`Engine::measure_behind`).
+    behind: behind::Behind,
     /// What this load timed, each by name (the device's rates where no
     /// layer stated them, the decode products' times): its last line's.
     pub(crate) measured: std::cell::RefCell<Vec<String>>,
