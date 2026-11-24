@@ -2225,7 +2225,9 @@ enum HostChunks<B: Backend> {
     Heap(Vec<u8>),
 }
 
-/// The bytes a batched spill stages at once.
+/// The bytes a batched spill stages at once: rows enough that a spill of
+/// thousands is a handful of copies, in one staging buffer every device
+/// allocates (its smallest `maxMemoryAllocationSize` is 1 GiB).
 const STAGE_BYTES: usize = 32 << 20;
 
 /// The aligned span of the slot file the bytes `[at, at + len)` lie in:

@@ -4,6 +4,8 @@ pub struct Runahead {
 }
 
 impl Runahead {
+    /// The most steps one frame carries: what a staged engine's ring lays
+    /// per frame ([`Self::MAX_FRAMES`] is bounded by it).
     pub const STEPS_MAX: u8 = 4;
 
     #[must_use]
@@ -25,6 +27,8 @@ impl Runahead {
         frames_in_flight: 1,
     };
 
+    /// Frames in flight where the deployment states none: one landing while
+    /// the next is formed, the least that runs ahead.
     pub const DEFAULT_FRAMES_IN_FLIGHT: u8 = 2;
 
     #[must_use]

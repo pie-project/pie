@@ -747,7 +747,11 @@ pub(super) mod device {
         live: &[usize],
         launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
     ) -> Result<Vec<f64>, String> {
+        /// Timed frames a candidate takes; its median is kept (odd, so one
+        /// frame is the median).
         const ROUNDS: usize = 7;
+        /// A timed frame's span: launches enough that one launch's spread
+        /// averages out, short of a phone's 2 s submit bound by far.
         const FRAME_S: f64 = 0.002;
         /// A candidate this much slower than the fastest is timed once.
         const SLOWER: f64 = 3.0;
