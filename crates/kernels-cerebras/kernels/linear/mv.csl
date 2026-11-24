@@ -1,0 +1,32 @@
+// wafer/ops/mv.csl: the tile matvec (README.md), every weight and head PE's. A tile is R rows of
+// N 16-bit words, a row an x element (row-major: the matvec walks its rows with a DSR); acc
+// gets A^T x over the tile's rows, x f16. The f16 form accumulates in f16 (@fmach: the MV 1 /
+// HACC16 path), the f32 one in f32 (@fmachs).
+//
+// mac16 / mac32 add into acc; tile16 / tile32 start acc at zero.
+const mv_dest = @get_dsr(dsr_dest, 1);
+const mv_src0 = @get_dsr(dsr_src0, 1);
+const mv_src1 = @get_dsr(dsr_src1, 1);
+fn s_step(xv: @fp16()) void { @fmachs(mv_dest, mv_src0, mv_src1, xv); }
+fn h_step(xv: @fp16()) void { @fmach(mv_dest, mv_src0, mv_src1, xv); }
+
+inline fn mac16(acc: mem1d_dsd, a: mem1d_dsd, x: mem1d_dsd) void {
+  @load_to_dsr(mv_dest, acc, .{ .save_address = false });
+  @load_to_dsr(mv_src0, acc, .{ .save_address = false });
+  @load_to_dsr(mv_src1, a, .{ .save_address = true });
+  @map(h_step, x);
+}
+inline fn mac32(acc: mem1d_dsd, a: mem1d_dsd, x: mem1d_dsd) void {
+  @load_to_dsr(mv_dest, acc, .{ .save_address = false });
+  @load_to_dsr(mv_src0, acc, .{ .save_address = false });
+  @load_to_dsr(mv_src1, a, .{ .save_address = true });
+  @map(s_step, x);
+}
+inline fn tile16(acc: mem1d_dsd, a: mem1d_dsd, x: mem1d_dsd) void {
+  @fmovh(acc, @as(@fp16(), 0.0));
+  mac16(acc, a, x);
+}
+inline fn tile32(acc: mem1d_dsd, a: mem1d_dsd, x: mem1d_dsd) void {
+  @fmovs(acc, 0.0);
+  mac32(acc, a, x);
+}

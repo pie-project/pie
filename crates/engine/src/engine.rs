@@ -63,6 +63,12 @@ pub trait Engine: Send {
         None
     }
 
+    /// Whether the engine keeps a disk kv tier. One that keeps none is not
+    /// handed the default `disk_kv_dir`; a stated one it still refuses.
+    fn disk_kv_tier(&self) -> bool {
+        true
+    }
+
     fn export_kv_handle(&self) -> Option<KvHandle> {
         None
     }

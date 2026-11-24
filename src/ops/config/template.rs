@@ -98,12 +98,13 @@ const DEFAULT_FRAMES: &str = r#"# frame_size               = 2     # guest contr
 "#;
 
 // The wafer's token loops answer each lane as far as its guest has posted:
-// at the runtime's most (4 steps a frame, 15 frames) every lane keeps posted
-// past a loop's end, so each continuation carries every lane (the 8B pipeline
-// ring's 12 streams, 12 lanes a launch; at 2 and 2 or 2 and 15, fewer).
+// at the runtime's most steps a frame (4), and unstated the engine's depth
+// (the most it takes, 127), every lane keeps posted past a loop's
+// end, so each continuation carries every lane (the 8B pipeline ring's 12
+// streams, 12 lanes a launch; at 2 and 2 or 2 and 15, fewer).
 #[cfg(any(feature = "cerebras", test))]
 const CEREBRAS_FRAMES: &str = r#"frame_size               = 4     # the most: each lane posts this far
-frame_dispatch_depth     = 15    # ahead, so every lane rides each wafer loop
+# frame_dispatch_depth     = 127   # ahead; unstated: the engine's (127)
 "#;
 
 const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
@@ -323,14 +324,14 @@ mod tests {
             "{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{RUNTIME}{CEREBRAS_FRAMES}{TAIL}"
         );
         let config = worker::Config::parse(&content).expect("the cerebras template must parse");
-        // The runtime's most (`Runahead::STEPS_MAX`, `MAX_FRAMES`), which the
-        // worker's boot advises for cerebras.
+        // The runtime's most steps a frame (`Runahead::STEPS_MAX`), and the
+        // engine's depth, which the worker's boot advises for cerebras.
         assert_eq!(
             (
                 config.runtime.frame_size,
                 config.runtime.frame_dispatch_depth
             ),
-            (4, 15)
+            (4, None)
         );
     }
 

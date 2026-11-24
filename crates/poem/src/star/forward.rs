@@ -32,6 +32,8 @@ pub(crate) struct Trail {
 
 thread_local! {
     pub(crate) static TRAIL: RefCell<Trail> = RefCell::default();
+    /// While a deployment cut to a depth traces (`-l{n}`): how many first layers a fold keeps.
+    pub(crate) static DEPTH: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 fn with<R>(f: impl FnOnce(&mut Trail) -> R) -> R {
@@ -243,7 +245,8 @@ fn input_methods(builder: &mut MethodsBuilder) {
     }
 
     /// `block(l, layer, carried)` over every layer in turn, each traced as
-    /// that layer's, its result carried to the next; the last result.
+    /// that layer's, its result carried to the next; the last result. A
+    /// deployment cut to a depth folds its first layers alone.
     fn fold_layers<'v>(
         this: &InputHandle,
         #[starlark(require = pos)] layers: UnpackList<Star<'v>>,
@@ -254,7 +257,10 @@ fn input_methods(builder: &mut MethodsBuilder) {
         let rec = input_of(*this).recorder().clone();
         let heap = eval.heap();
         let mut carried = carried;
-        for (l, layer) in layers.items.into_iter().enumerate() {
+        let keep = DEPTH
+            .with(std::cell::Cell::get)
+            .map_or(usize::MAX, |n| n as usize);
+        for (l, layer) in layers.items.into_iter().enumerate().take(keep) {
             rec.enter(l as u32);
             let out = eval.eval_function(block, &[heap.alloc(l as u32), layer, carried], &[]);
             rec.leave();

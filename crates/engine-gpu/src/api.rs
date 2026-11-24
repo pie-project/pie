@@ -503,6 +503,7 @@ where
                 max_context: paging.context(),
                 prefill_rows: 0,
                 max_readouts,
+                dispatch_depth: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,

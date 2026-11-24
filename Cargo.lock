@@ -1744,22 +1744,25 @@ dependencies = [
  "blake3",
  "checkpoint",
  "engine",
+ "engine-cpu",
  "eta-compiler",
  "eta-exec",
  "kernels-cerebras",
  "libc",
  "libloading 0.9.0",
  "pie-dtype",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "toml",
  "tracing",
+ "ztensor",
 ]
 
 [[package]]
@@ -3051,8 +3054,10 @@ name = "kernels-cerebras"
 version = "0.6.0"
 dependencies = [
  "blake3",
+ "kernels-ir",
  "pie-poem-compiler",
  "pie-poem-ir",
+ "pie-profile",
  "serde",
  "serde_json",
 ]

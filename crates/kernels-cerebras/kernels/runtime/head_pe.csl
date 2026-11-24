@@ -1,0 +1,309 @@
+// wafer/head_pe.csl: a head weight PE. The head block is HC columns of HDc hidden dims (a control
+// column, head_ctl.csl, in the middle) by HR rows of VR vocabulary rows. A PE holds its VR x HDc
+// lm_head tile (f16, [dim][vocab row]) and the final norm's (1 + w), takes x's dims, and sends its
+// VR logit partials into its row's reduction. The final norm's rsqrt is a positive scalar of the
+// token, so the greedy argmax skips it (the host applies it to `lgt`).
+// x roles (rcfg): 0 take the column multicast; 1 relay A: take the odd CX row's half (HX), send it
+// north (HN); 2 relay B: take the even row's half and A's, multicast them along the column (HM).
+// Token loop (flags bit 0): the PE also holds its embedding tile (bf16, [vocab row][dim]). The
+// control PE's row word (iq7) is the winner's offset j, -(1 + its row), or < -1e8 (last step). The
+// winner row sends row j north on VA to row 0, south on VS to the column's CX pair (te = unit 0's
+// CX row 2c, to = 2c + 1), then west on HE / HS. The VA route goes back only after oq4 has drained
+// and the next step's x is in.
+//
+// rcfg from RQ: [0..5) iq2..iq6, [5] oq2, [6] oq3, [7] row role, [8] x role, [9] spare colour,
+// [10] iq7, [11] loop flags (bit 0 on, 1 VA sink, 2 te, 3 to), [12] head row, [13..17) oq4..oq7.
+// Queues: iq2 / iq3 row reduction (level 1 / FIFO end), iq4 HX, iq5 HN, iq6 HM, iq7 row word; oq2
+// row reduction send, oq3 HN / HM, oq4 VA, oq5 VS, oq6 HE, oq7 HS.
+//
+// BAND 1 (the split layout's head): HDR dims-rows by HVC vocabulary columns, the control row in
+// the middle; logits reduce along a column. x roles: 0 the dims-row multicast (iq6), 2 x from the
+// north (iq4), multicast along the dims-row (oq3). The winner column sends row j west on the bus
+// (oq4) to column 0, the bus end, which sends it on oq5 to unit 0's MoE relay PE.
+// GRP 1 (head groups): a head column takes the x dims of a group of CX rows (NX <= HDc, rcfg [17],
+// rest zero-padded); the embedding is the tied lm_head tile itself.
+// XSC 1: the tile is 2^15 lm_head and x hg is scaled by 2^-S into f16, the partials back by 2^S.
+// NPX: x in NPX f16 parts with f32 accumulation.
+param memcpy_params;
+param VR: u16;
+param HDc: u16;
+param NPX: u16 = 1;    // x's f16 parts
+param HACC16: u16 = 0; // 1 (measurement): logit partials accumulate in f16, then widen once
+param GRP: u16 = 0;    // 1: head groups and the tied embedding (see the header)
+param BAND: u16 = 0;   // 1: the band head (see the header)
+param XSC: u16 = 0;    // 1: x scaled by a power of two into f16, the partials back
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const matvec = @import_module("ops/mv.csl");
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const tgt = tile_config.target;
+
+var hw = @zeros([VR * HDc + 1]u16);
+var hw_ptr: [*]u16 = &hw;
+var hg = @zeros([HDc]f32);
+var hg_ptr: [*]f32 = &hg;
+var x = @zeros([HDc]f32);
+var xr = @zeros([HDc]f32);
+var xp = @zeros([NPX * HDc]@fp16());
+var y: [VR]f32 align(16) = @zeros([VR]f32);
+const x_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> x[i] });
+const xr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> xr[i] });
+const hg_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> hg[i] });
+const xp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> xp[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> y[i] });
+var a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VR} -> hw[i] });
+
+// (queues: see the header)
+const q_ra = @get_input_queue(2);
+const q_rb = @get_input_queue(3);
+const q_hx = @get_input_queue(4);
+const q_hn = @get_input_queue(5);
+const q_hm = @get_input_queue(6);
+const q_w = @get_input_queue(7);     // the wafer loop's row word
+const q_va = @get_output_queue(4);
+const q_vs = @get_output_queue(5);
+const q_he = @get_output_queue(6);
+const q_hs = @get_output_queue(7);
+const q_ro = @get_output_queue(2);
+const q_xo = @get_output_queue(3);
+const C_PARK: color = @get_color(16);
+const ut_a = @get_ut_id(4);
+const ut_b = @get_ut_id(5);
+const rr = @import_module("ops/red.csl", .{ .fab = fab, .IN1 = q_ra, .IN2 = q_rb, .OUT = q_ro, .UT1 = ut_a, .UT2 = ut_b, .FIFOW = 32 });
+const NR: u16 = 12;
+const RQ: u16 = 1 + 2 * NR;
+var rcfg = @zeros([RQ + 17 - 2 * BAND + GRP]u32);   // (see the header)
+var rcfg_ptr: [*]u32 = &rcfg;
+var role_x: u16 = 0;
+var nx: u16 = 0;   // (GRP 1) the group's x words
+
+fn init() void {
+  if (GRP == 0) {
+    ebw_d = @set_dsd_stride(@set_dsd_base_addr(@set_dsd_length(ebh_d, HDc), @ptrcast([*]u16, &eb)), 2);
+    ebw_d = @increment_dsd_offset(ebw_d, 1, u16);
+  }
+  fab.routes(&rcfg);
+  var fq = [6]u16 { @as(u16, rcfg[RQ]), @as(u16, rcfg[RQ + 1]), @as(u16, rcfg[RQ + 2]), @as(u16, rcfg[RQ + 3]), @as(u16, rcfg[RQ + 4]), @as(u16, rcfg[RQ + 10]) };
+  fab.bind_iqs(&fq, @as(u16, rcfg[RQ + 9]));
+  fab.oqc(2, rcfg[RQ + 5]); fab.oqc(3, rcfg[RQ + 6]);
+  fab.oqc(4, rcfg[RQ + 13]); fab.oqc(5, rcfg[RQ + 14]);
+  if (BAND == 0) { fab.oqc(6, rcfg[RQ + 15]); fab.oqc(7, rcfg[RQ + 16]); }
+  wfl = @as(u16, rcfg[RQ + 11]);
+  va_addr = color_config.get_color_config_addr(@get_color(0)) + @as(u16, rcfg[RQ + 13]);
+  va_orig = @get_config(va_addr, tgt.color_addr_range) & 0xff;
+  timestamp.enable_tsc();
+  rr.role = @as(u16, rcfg[RQ + 7]);
+  role_x = @as(u16, rcfg[RQ + 8]);
+  if (GRP == 1) { nx = @as(u16, rcfg[RQ + 17]); }
+  sys_mod.unblock_cmd_stream();
+}
+
+var y16 = @zeros([if (HACC16 == 1) VR else 1]@fp16());
+const yh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (HACC16 == 1) VR else 1} -> y16[i] });
+
+fn recv_x() void {
+  const H2: u16 = HDc / 2;
+  if (role_x == 0) {
+    @fmovs(x_d, fab.fin(q_hm, HDc));
+  } else if (GRP == 0 and BAND == 0 and role_x == 1) {
+    @fmovs(fab.fout(q_xo, H2), fab.fin(q_hx, H2));
+    @fmovs(x_d, fab.fin(q_hm, HDc));   // B's multicast passes this PE too
+  } else {
+    if (GRP == 1) {
+      @fmovs(@set_dsd_length(x_d, nx), fab.fin(q_hx, nx));
+    } else if (BAND == 1) {
+      @fmovs(x_d, fab.fin(q_hx, HDc));
+    } else {
+      @fmovs(@set_dsd_length(x_d, H2), fab.fin(q_hx, H2));
+      @fmovs(@set_dsd_length(@increment_dsd_offset(x_d, @as(i16, H2), f32), H2), fab.fin(q_hn, H2));
+    }
+    @fmovs(fab.fout(q_xo, HDc), x_d);
+  }
+}
+fn send_r() void { rr.send(y_d, VR); }
+
+// ---------------------------------------------------------------- the wafer token loop
+var hemb = @zeros([if (GRP == 0) VR * HDc + 1 else 1]u16);
+var hemb_ptr: [*]u16 = &hemb;
+var eb: [HDc]f32 align(16) = @zeros([HDc]f32);
+const eb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HDc} -> eb[i] });
+const ebh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (GRP == 0) HDc else 1} -> hemb[i] });
+var ebw_d = ebh_d;
+var wfl: u16 = 0;
+var va_addr: u16 = 0;
+var va_orig: u16 = 0;
+var va_dirty = false;
+var ww = @zeros([1]f32);
+const ww_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ww[i] });
+// (a send returns when its wavelets enter the output queue: the route goes back only once oq4 is
+// empty, and after the next step's x is in)
+fn va_restore() void {
+  if (!va_dirty) { return; }
+  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}   // oq4 empty
+  const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
+  @set_config(va_addr, r | va_orig, tgt.color_addr_range);
+  va_dirty = false;
+}
+// The band's loop: the bus end (sink) sends the winner's row on oq5, its own or the bus's (iq5).
+fn hloop_band() void {
+  @fmovs(ww_d, fab.fin(q_w, 1));
+  const w = ww[0];
+  if (w < -1.0e8) { return; }
+  const sink = (wfl & 2) != 0;
+  if (w >= 0.0) {
+    const j = @as(u16, w);
+    @fmovs(eb_d, 0.0);
+    @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16));
+    if (sink) {
+      @fmovs(fab.fout(q_vs, HDc), eb_d);
+    } else {
+      const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
+      @set_config(va_addr, r | 0x80 | (va_orig & 0x1f), tgt.color_addr_range);
+      va_dirty = true;
+      @fmovs(fab.fout(q_va, HDc), eb_d);
+    }
+  } else if (sink) {
+    @fmovs(fab.fout(q_vs, HDc), fab.fin(q_hn, HDc));
+  }
+}
+fn hloop() void {
+  const H2: u16 = HDc / 2;
+  @fmovs(ww_d, fab.fin(q_w, 1));
+  const w = ww[0];
+  if (w < -1.0e8) { return; }
+  const sink = (wfl & 2) != 0;
+  const te = (wfl & 4) != 0;
+  const to = (wfl & 8) != 0;
+  var wrow: u16 = 0;
+  if (w >= 0.0) {
+    wrow = @as(u16, rcfg[RQ + 12]);
+    const j = @as(u16, w);
+    if (GRP == 1) {
+      // row j of the tied tile (dim-major: stride VR), f16 widened
+      var d: u16 = 0;
+      while (d < nx) : (d += 1) { eb[d] = @as(f32, @bitcast(@fp16(), hw[d * VR + j])); }
+    } else {
+      // row j of the tile, bf16 bits into the high halves of f32 words
+      @fmovs(eb_d, 0.0);
+      @mov16(ebw_d, @increment_dsd_offset(ebh_d, @as(i16, j * HDc), u16));
+    }
+    if (sink and te) {
+      if (GRP == 1) {
+        @fmovs(fab.fout(q_he, nx), @set_dsd_length(eb_d, nx));
+      } else {
+        @fmovs(fab.fout(q_he, H2), @set_dsd_length(eb_d, H2));
+        @fmovs(fab.fout(q_hs, H2), @set_dsd_length(@increment_dsd_offset(eb_d, @as(i16, H2), f32), H2));
+      }
+    } else if (sink) {
+      if (GRP == 1) { @fmovs(fab.fout(q_vs, nx), @set_dsd_length(eb_d, nx)); } else { @fmovs(fab.fout(q_vs, HDc), eb_d); }
+    } else {
+      const r = @get_config(va_addr, tgt.color_addr_range) & 0xff00;
+      @set_config(va_addr, r | 0x80 | (va_orig & 0x1f), tgt.color_addr_range);
+      va_dirty = true;
+      if (GRP == 1) { @fmovs(fab.fout(q_va, nx), @set_dsd_length(eb_d, nx)); } else { @fmovs(fab.fout(q_va, HDc), eb_d); }
+    }
+  } else {
+    wrow = @as(u16, -w - 1.0);
+  }
+  if (GRP == 1) {
+    if (sink and !te and wrow != 0) { @fmovs(fab.fout(q_vs, nx), fab.fin(q_hn, nx)); }   // (iq5: VA here)
+    if (te and !(sink and wrow == 0)) { @fmovs(fab.fout(q_he, nx), fab.fin(q_hm, nx)); }  // (iq6: VS / VA)
+    return;
+  }
+  if (sink and !te and wrow != 0) { @fmovs(fab.fout(q_vs, HDc), fab.fin(q_hn, HDc)); }   // (iq5: VA here)
+  if (te and !(sink and wrow == 0)) {
+    @fmovs(fab.fout(q_he, H2), fab.fin(q_hm, H2));       // (iq6: VS, or VA in column 0)
+    @fmovs(fab.fout(q_hs, H2), fab.fin(q_hm, H2));
+  }
+  if (to) { @fmovs(fab.fout(q_he, H2), fab.fin(q_hn, H2)); }   // (iq5: HS)
+}
+
+const timestamp = @import_module("<time>");
+var tdbg = @zeros([6]u32);   // TSC of the last step: start, x in, matvec, partial sent, loop done
+var tdbg_ptr: [*]u32 = &tdbg;
+var tsc = @zeros([3]u16);
+fn stamp(i: u16) void { timestamp.get_timestamp(&tsc); tdbg[i] = @as(u32, tsc[0]) | (@as(u32, tsc[1]) << 16); }
+var n_steps: u32 = 0;
+const pass_id: local_task_id = @get_local_task_id(8);
+task pass_task() void {
+  var s: u32 = 0;
+  while (s < n_steps) : (s += 1) {
+    stamp(0);
+    recv_x();
+    stamp(1);
+    va_restore();
+    @fmuls(xr_d, x_d, hg_d);
+    if (XSC == 1) {   // x hg by 2^-S into f16, the partials back by 2^S
+      var mb: u32 = 0;
+      var i: u16 = 0;
+      while (i < HDc) : (i += 1) { const b = @bitcast(u32, xr[i]) & 0x7fffffff; if (b > mb) { mb = b; } }
+      var e: i16 = if (mb == 0) 0 else @as(i16, @as(u16, mb >> 23)) - 127 - 7;
+      if (e < -100) { e = -100; }
+      @fmuls(xr_d, xr_d, @bitcast(f32, @as(u32, @as(u16, 127 - e)) << 23));
+      @fs2h(xp_d, xr_d);
+      @fmovs(y_d, 0.0);
+      const a = @set_dsd_base_addr(a_d, @ptrcast([*]@fp16(), &hw[0]));
+      matvec.mac32(y_d, a, xp_d);
+      @fmuls(y_d, y_d, @bitcast(f32, @as(u32, @as(u16, 127 + e)) << 23));
+    } else {
+      @fmovs(y_d, 0.0);
+      if (HACC16 == 1) { @fmovh(yh_d, @as(@fp16(), 0.0)); }
+      var k: u16 = 0;
+      while (k < NPX) : (k += 1) {
+        @fs2h(xp_d, xr_d);
+        if (k + 1 < NPX) {
+          @fh2s(x_d, xp_d);
+          @fsubs(xr_d, xr_d, x_d);
+        }
+        const a = @set_dsd_base_addr(a_d, @ptrcast([*]@fp16(), &hw[0]));
+        if (HACC16 == 1) {   // f16 accumulation (@fmach): the 32-dim partial in f16
+          matvec.mac16(yh_d, a, xp_d);
+        } else {
+          matvec.mac32(y_d, a, xp_d);
+        }
+      }
+      if (HACC16 == 1) { @fh2s(y_d, yh_d); }
+    }
+    stamp(2);
+    send_r();
+    stamp(3);
+    if ((wfl & 1) != 0) {
+      if (BAND == 1) { hloop_band(); } else { hloop(); }
+    }
+    stamp(4);
+  }
+  sys_mod.unblock_cmd_stream();
+}
+fn compute(steps: u32, start_pos: u32) void {
+  n_steps = steps;
+  @activate(pass_id);
+}
+
+comptime {
+  @comptime_assert(BAND == 0 or GRP == 0);
+  @comptime_assert(XSC == 0 or (NPX == 1 and HACC16 == 0));
+  @bind_local_task(pass_task, pass_id);
+  @initialize_queue(q_ra, .{ .color = @get_color(13) });
+  @initialize_queue(q_rb, .{ .color = @get_color(14) });
+  @initialize_queue(q_hx, .{ .color = @get_color(17) });
+  @initialize_queue(q_hn, .{ .color = @get_color(18) });
+  @initialize_queue(q_hm, .{ .color = @get_color(19) });
+  @initialize_queue(q_ro, .{ .color = C_PARK });
+  @initialize_queue(q_xo, .{ .color = C_PARK });
+  @initialize_queue(q_w, .{ .color = @get_color(20) });
+  @initialize_queue(q_va, .{ .color = C_PARK });
+  @initialize_queue(q_vs, .{ .color = C_PARK });
+  if (BAND == 0) {
+    @initialize_queue(q_he, .{ .color = C_PARK });
+    @initialize_queue(q_hs, .{ .color = C_PARK });
+  }
+  @export_symbol(hemb_ptr, "hemb");
+  @export_symbol(tdbg_ptr, "tdbg");
+  @export_symbol(hw_ptr, "hw");
+  @export_symbol(hg_ptr, "hg");
+  @export_symbol(rcfg_ptr, "rcfg");
+  @export_symbol(init);
+  @export_symbol(compute);
+}

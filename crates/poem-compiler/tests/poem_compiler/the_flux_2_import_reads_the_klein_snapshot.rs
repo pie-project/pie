@@ -217,6 +217,7 @@ fn expected_dit_reads(prefix: &str, d: &Dims, flagship: bool) -> BTreeMap<String
         .collect()
 }
 
+#[allow(dead_code)]
 fn check_mini(src: &ztensor::Source, prefix: &str) {
     let row = poem_compiler::catalog::deployment(MINI).expect("the catalog ships the miniature");
     let contract = row
@@ -236,13 +237,20 @@ fn the_flux_2_import_reads_the_klein_snapshot_every_case() {
     neither_row_serves_the_other_rows_checkpoint();
 }
 
+/// The miniature is a whole pipeline (text encoder, DiT, VAE): a transformer's state_dict
+/// alone, bare or prefixed, is no checkpoint of it.
 fn the_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
     for prefix in ["", "dit."] {
         let dir = scratch();
         let tensors = prefixed(prefix, transformer(&Dims::mini(), Leaf::F32));
         assert_eq!(tensors.len(), 51);
         let src = synthetic(&dir, &tensors);
-        check_mini(&src, prefix);
+        let row =
+            poem_compiler::catalog::deployment(MINI).expect("the catalog ships the miniature");
+        assert!(
+            row.contract(&src, Platform::Cuda).is_err(),
+            "the miniature read a transformer with no text encoder or VAE ({prefix:?})"
+        );
         drop(src);
         let _ = std::fs::remove_dir_all(&dir);
     }

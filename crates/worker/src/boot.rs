@@ -18,21 +18,22 @@ pub(crate) struct LoadedModelEngines {
 }
 
 /// The wafer's token loops answer each lane as far as its guest has posted,
-/// so a cerebras engine serves at the runtime's most (`frame_size` 4,
-/// `frame_dispatch_depth` 15: `pie config init` writes them): below it fewer
-/// lanes ride each loop (the 8B ring's 12 streams took turns, 6 a launch, at
-/// frame_size 2). Advice only; the configuration stands.
+/// so a cerebras engine serves at the runtime's most `frame_size` (4: `pie
+/// config init` writes it) and, unstated, the engine's `frame_dispatch_depth`
+/// (127 with a posted loop): below them fewer lanes ride each loop (the
+/// 8B ring's 12 streams took turns, 6 a launch, at frame_size 2). Advice only;
+/// the configuration stands.
 fn advise_cerebras_frames(runtime: &config::RuntimeConfig) {
     let (size, depth) = (
         u32::from(engine::runahead::Runahead::STEPS_MAX),
         u32::from(engine::runahead::Runahead::MAX_FRAMES),
     );
-    if runtime.frame_size < size || runtime.frame_dispatch_depth < depth {
+    if runtime.frame_size < size || runtime.frame_dispatch_depth.is_some_and(|d| d < depth) {
         tracing::warn!(
             frame_size = runtime.frame_size,
-            frame_dispatch_depth = runtime.frame_dispatch_depth,
-            "cerebras serves at [runtime] frame_size = {size}, frame_dispatch_depth = {depth}: \
-             below them fewer lanes ride each wafer loop"
+            frame_dispatch_depth = runtime.dispatch_depth(0),
+            "cerebras serves at [runtime] frame_size = {size}, frame_dispatch_depth unstated \
+             (the engine's) or at least {depth}: below them fewer lanes ride each wafer loop"
         );
     }
 }
@@ -123,7 +124,7 @@ pub(crate) fn load_model_engines(
                 &snapshot_dir,
                 home,
                 m.adapter_mount().as_deref(),
-                u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
+                u8::try_from(user_cfg.runtime.dispatch_depth(0)).unwrap_or(u8::MAX),
                 &m.adapters,
                 residency,
                 m.patch_ceilings(),
@@ -160,7 +161,7 @@ pub(crate) fn load_model_engines(
                 &snapshot_dir,
                 home,
                 tp_degree,
-                u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
+                u8::try_from(user_cfg.runtime.dispatch_depth(0)).unwrap_or(u8::MAX),
                 opened.take(),
             )?);
         }
