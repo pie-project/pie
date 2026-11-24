@@ -2004,6 +2004,7 @@ template <typename T, int SG, int VROWS>
                                    size_t(lane0 + r) * size_t(k_heads) * size_t(table_rows) * 4 + at.uown
                              : nullptr;
   (void)uoff;
+  float4 o4, u4o;
   for (int v = 0; v < VROWS; ++v) {
     float pa = 0.0f, po = 0.0f;
     for (int i = 0; i < PER; ++i) {
@@ -2015,16 +2016,20 @@ template <typename T, int SG, int VROWS>
     const float val = float(qkv[vbase + size_t(dv_base + v)]);
     const float u = beta * (val - mem);
     const float o = qs + kq * u;
-    if (lane == 0) {
-      y[row_out + size_t(dv_base + v)] = o;
-      if (urow != nullptr) {
-        urow[size_t(hv) * D + size_t(dv_base + v)] = u;
-      }
-    }
+    o4[v] = o;
+    u4o[v] = u;
     if (keep == rep + 1) {
       for (int i = 0; i < PER; ++i) {
         st[v][i] = g_own * st[v][i] + kn[i] * u;
       }
+    }
+  }
+  // The row's VROWS values a simdgroup, one store each: four scalar
+  // stores from one lane cost the scan more than its steps.
+  if (lane == 0) {
+    *reinterpret_cast<device float4*>(y + row_out + size_t(dv_base)) = o4;
+    if (urow != nullptr) {
+      *reinterpret_cast<device float4*>(urow + size_t(hv) * D + size_t(dv_base)) = u4o;
     }
   }
   if (keep == rep + 1) {
