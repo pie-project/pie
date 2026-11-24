@@ -829,6 +829,7 @@ impl ResidencyPlanner {
             // has fired once.
             if let Some(proc) = inner.procs.get_mut(&pid) {
                 proc.unfired = true;
+                proc.binds_served += 1;
             }
             Some(notify)
         });

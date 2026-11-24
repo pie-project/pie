@@ -166,6 +166,8 @@ pub(super) struct Proc {
     /// served while that head waits unserved (the rule's second half),
     /// whatever key the head waits under now.
     pub(super) evicted_for: Option<ProcessId>,
+    /// Binds served it so far ([`super::ResidencyPlanner::serve_bind_room`]).
+    pub(super) binds_served: u64,
     /// The head this one was evicted for, its restore served ahead of it
     /// while that head stood passed over with no move to make
     /// ([`super::ResidencyPlanner::stuck_head`]): no victim for that
@@ -286,6 +288,7 @@ impl Proc {
             bind_room: None,
             unfired: false,
             evicted_for: None,
+            binds_served: 0,
             restored_past: None,
             last_resort_for: None,
         }
