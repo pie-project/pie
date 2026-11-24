@@ -523,7 +523,10 @@ fn idle_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
 /// prompting class's (a one-row piece of a prompt among them; an image's
 /// tower too), a decoding class's beside a prompting class's, and every
 /// class at once (a wide composition). An expert-parallel rank's idle step
-/// rides each bucket.
+/// rides each bucket. Crossed with every kind, not the stated step's: a key
+/// names the classes present (`record::Ladder`), which a `StepKind` does not,
+/// so a stated step of one kind forms keys of another's composition (a
+/// prefill step's lanes of several classes keys as the wide one).
 const ARMS: [fn(&Deployment, u32, &mut Targets); Kind::COUNT] = [
     decode_keys,
     prefill_keys,
