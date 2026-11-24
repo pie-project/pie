@@ -1,4 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 use anyhow::{Result, ensure};
 
@@ -158,6 +157,8 @@ pub struct ModelConfig {
     pub metadata: ModelMetadata,
     pub engines: Vec<EngineConfig>,
     pub scheduler: SchedulerConfig,
+    /// The CUDA device a media encode (NVENC) runs on: the engine's own.
+    pub media_device: u32,
 }
 
 pub struct EngineConfig {
@@ -316,7 +317,17 @@ impl BootstrapHandle {
 /// its engines load: what the sandbox pool leaves the rest of the process
 /// to grow by. Call
 /// it before the engines load; [`bootstrap`] comes after them.
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 pub use crate::sandbox_pool::note_maps_before_engines;
+/// No sandbox pool sizes itself by the process's maps on this target.
+#[cfg(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+))]
+pub fn note_maps_before_engines() {}
 
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
     bootstrap_inner(config).await
@@ -379,7 +390,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         metadata,
         engines: mut engine_configs,
         scheduler,
+        media_device,
     } = config.model;
+    crate::inferlet::host::frames::set_media_device(media_device);
 
     // The library forms programs are planned with: what every engine served
     // here states (`pipeline::program::serve_forms`), before any program
@@ -634,8 +647,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         engine_configs.iter().map(|d| d.chunks.clone()).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
         engine_configs.iter().map(|d| d.disk_kept.clone()).collect();
-    // Each engine's pools as chunks: what it states, else today's pools as
-    // the degenerate mode's pinned shapes.
+    // Each engine's pools as chunks: the shared pool it states.
     let arena_stores = engine_configs
         .iter()
         .zip(&readouts)
@@ -1665,6 +1677,7 @@ fn init_tracing(
 /// gateway heartbeat. A filter that names either target keeps its own say,
 /// and one whose base level is already as quiet gets nothing added: a quiet
 /// target is never made louder than the operator's level.
+#[cfg(not(target_arch = "wasm32"))]
 const QUIET: [(&str, tracing_subscriber::filter::LevelFilter); 2] = [
     ("naga", tracing_subscriber::filter::LevelFilter::WARN),
     ("tarpc", tracing_subscriber::filter::LevelFilter::INFO),
@@ -1684,6 +1697,7 @@ pub fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
 /// the last directive with no target (`off` where there is none, as an
 /// `EnvFilter` reads it); a directive's target is what precedes its `[`
 /// span or its `=`.
+#[cfg(not(target_arch = "wasm32"))]
 fn quieted(filter: &str) -> String {
     use tracing_subscriber::filter::LevelFilter;
 
@@ -1822,23 +1836,12 @@ mod tests {
         )
     }
 
-    /// A pool that lays a state shape for a dense model (records of some
-    /// size beside its kv) still says the model holds no state: its RsCaps
-    /// state nothing (no rs working set, no rs count a fire is held to). A
-    /// hybrid's record bytes are its RsCaps' state size, a record's and not
-    /// a slot's.
+    /// A load whose records take no bytes says the model holds no state:
+    /// its RsCaps state nothing (no rs working set, no rs count a fire is
+    /// held to). A hybrid's record bytes are its RsCaps' state size.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
-        let mut facts =
-            ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
-                kv_pages: 8,
-                kv_page_size: 16,
-                kv_page_bytes: 4096,
-                state_slots: 4,
-                state_slot_bytes: 1 << 20,
-                ..::engine::chunk::DegeneratePools::default()
-            });
-        facts.record_bytes = 0;
+        let mut facts = ::engine::chunk::ChunkFacts::default();
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");
 

@@ -550,10 +550,7 @@ pub(crate) fn set_bind_release_hold(hold: bool) {
     drop(drained);
 }
 
-#[cfg_attr(
-    target_arch = "wasm32",
-    allow(dead_code, reason = "no policy runs in the browser")
-)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "no policy runs in the browser"))]
 pub(crate) fn regrant_admission() {
     for gate in [&PREWARM_ADMISSION, &BIND_ADMISSION, &ADMISSION] {
         if let Some(Some(semaphore)) = gate.get() {

@@ -44,6 +44,7 @@ pub fn build_without_engine(
         metadata,
         engines: Vec::new(),
         scheduler: scheduler(&user.runtime),
+        media_device: media_device(&user.engine),
     };
     runtime_config(user, home, builtins, model)
 }
@@ -194,7 +195,22 @@ fn build_model(
         metadata,
         engines,
         scheduler: scheduler(runtime),
+        media_device: media_device(&user.engine),
     })
+}
+
+/// The CUDA device a media encode runs on: the cuda engine's first device
+/// (`cuda:<n>`), else device 0.
+fn media_device(engine: &config::EngineConfig) -> u32 {
+    if engine.kind != config::EngineKind::Cuda {
+        return 0;
+    }
+    engine
+        .device
+        .first()
+        .and_then(|device| device.strip_prefix("cuda:"))
+        .and_then(|index| index.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The disk tier `g` keeps for the next run, its journal beside its slot

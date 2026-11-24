@@ -83,7 +83,7 @@ type Runs = SmallVec<[Range<u32>; 2]>;
 
 /// A page as a snapshot keeps it.
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ExportedPage {
     pub backing: KvPageBacking,
     pub key: Option<Hash256>,
@@ -91,7 +91,7 @@ pub struct ExportedPage {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ExportedSet {
     pub pages: Vec<ExportedPage>,
     pub page_len: u64,
@@ -965,6 +965,7 @@ impl KvPageTable {
     }
 
     /// The owners of the live working sets.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn working_set_owners(&self) -> impl Iterator<Item = ProcessId> + '_ {
         self.working_sets.iter().filter_map(|(_, entry)| entry.owner)
     }
@@ -2154,7 +2155,7 @@ impl KvPageTable {
     }
 
     /// Every page of `ws`, first to last, and what the table knows of it.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn exported(&self, ws: WorkingSetId) -> Result<ExportedSet, KvTableError> {
         let entry = self.entry(ws)?;
         if entry.unsettled > 0 {
@@ -2185,7 +2186,7 @@ impl KvPageTable {
 
     /// A working set of `pages`' own, as [`Self::exported`] said one stood,
     /// with every page at `backings`.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn imported(
         &mut self,
         set: ExportedSet,

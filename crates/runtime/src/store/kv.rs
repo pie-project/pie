@@ -499,7 +499,7 @@ struct SetScope {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CachedWorkingSet {
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "an idle cache is demoted on native targets alone"))]
     pub owner: ProcessId,
     pub entries: usize,
     pub pages: u64,
@@ -1039,7 +1039,7 @@ impl KvStore {
         sets.into_values().collect()
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn owns_cache(&self, owner: ProcessId) -> bool {
         self.owners.contains_key(&owner)
     }
@@ -1048,7 +1048,7 @@ impl KvStore {
     /// not yet released. A process's last fire settles after it exits, and
     /// only then is what it leaves cached: until then its working set is
     /// still here, not gone.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn holds_kv_of(&self, owner: ProcessId) -> bool {
         self.owns_cache(owner)
             || self
@@ -2408,7 +2408,7 @@ impl KvStore {
     /// planner's: kv list slots of its host tier, whose bytes the engine
     /// reads and writes by those refs (`Engine::read_tier_slots`), not by
     /// `read_host_kv`. `None` off a shared pool, or if the host lacks them.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     pub fn alloc_tier_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {
         self.shape?;
         self.host_pool.try_alloc_n(n)
@@ -2547,7 +2547,7 @@ impl KvStore {
 
     /// `ws` as a snapshot reads it, pinned where it stands until the pin is
     /// released.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn export(
         &mut self,
         ws: WorkingSetId,
@@ -2558,7 +2558,7 @@ impl KvStore {
     }
 
     /// A working set of its own from what `slots` hold.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn import(
         &mut self,
         set: page_table::ExportedSet,
