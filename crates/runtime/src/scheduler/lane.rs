@@ -690,6 +690,27 @@ fn fail_request(request: LaneRequest, why: &str) {
 /// on its queues until something came.
 pub(crate) static LANE_SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The requests an engine lane found waiting at once after a slice of what
+/// its engine measures behind serving (`Engine::measure_behind`): each
+/// arrived while the slice ran, and waited at most its length.
+pub(crate) static BEHIND_WAITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Every lane's submissions to its engine, all engines together: a point an
+/// engine times behind serving that sees it move ran beside other work.
+static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the runtime is ready: measuring behind serving runs only after
+/// (nothing of it lengthens a boot, or lies beside the host cover's warm
+/// runs).
+static BEHIND_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The runtime is ready: the engines' lanes may run what their engines
+/// measure behind serving, where they idle.
+pub(crate) fn open_behind() {
+    BEHIND_OPEN.store(true, std::sync::atomic::Ordering::Release);
+}
+
 /// The times an engine lane found nothing queued and stayed awake: a fire
 /// of its own owed its landing, or fires it settled that its scheduler has
 /// not parked since.
@@ -849,15 +870,32 @@ impl Lane {
         control_rx: &crate::rt::channel::Receiver<LaneRequest>,
         turn: &mut LaneTurn,
         awake: impl Fn() -> bool,
+        mut behind: impl FnMut() -> Option<std::time::Duration>,
     ) -> std::result::Result<LaneRequest, ()> {
         use crate::rt::channel::TryRecvError;
         use std::sync::atomic::Ordering::Relaxed;
         let mut awaited = false;
+        // The slice of measuring behind serving that just ran: a request
+        // found at once after it arrived while it ran, and waited at most
+        // its length.
+        let mut sliced: Option<std::time::Duration> = None;
+        let waited = |sliced: Option<std::time::Duration>| {
+            if let Some(slice) = sliced {
+                BEHIND_WAITS.fetch_add(1, Relaxed);
+                tracing::info!(
+                    waited_most_ms = slice.as_secs_f64() * 1e3,
+                    waits = BEHIND_WAITS.load(Relaxed),
+                    "a request arrived while the engine measured behind serving: it waited one \
+                     slice at most"
+                );
+            }
+        };
         loop {
             if turn.control_due() {
                 match control_rx.try_recv() {
                     Ok(request) => {
                         turn.took_control();
+                        waited(sliced);
                         return Ok(request);
                     }
                     Err(TryRecvError::Disconnected) => {
@@ -869,6 +907,7 @@ impl Lane {
             match launch_rx.try_recv() {
                 Ok(request) => {
                     turn.took_launch();
+                    waited(sliced);
                     return Ok(request);
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -879,6 +918,7 @@ impl Lane {
             match control_rx.try_recv() {
                 Ok(request) => {
                     turn.took_control();
+                    waited(sliced);
                     return Ok(request);
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -896,11 +936,58 @@ impl Lane {
                 std::hint::spin_loop();
                 continue;
             }
+            // Idle: one slice of what the engine measures behind serving,
+            // then the channels again; asleep once it has none to run.
+            sliced = behind();
+            if sliced.is_some() {
+                continue;
+            }
             LANE_SLEEPS.fetch_add(1, Relaxed);
             let mut select = crate::rt::channel::Select::new();
             select.recv(launch_rx);
             select.recv(control_rx);
             select.ready();
+        }
+    }
+
+    /// One slice of what the engine measures behind serving, where it has
+    /// any and the runtime holds no slot of the engine's pool (no working
+    /// set, cache entry, snapshot, store table or weight lies in any chunk,
+    /// and no waiter is short of one): the slice's length where it fired.
+    /// A fault in it ends that measuring, said; serving goes on.
+    fn measure_behind(
+        engine_idx: usize,
+        engine: &mut Option<EngineBox>,
+    ) -> Option<std::time::Duration> {
+        if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let engine = engine.as_mut()?;
+        if !engine.measures_behind() {
+            return None;
+        }
+        let quiet = crate::store::registry::try_get(0, engine_idx)
+            .and_then(|stores| stores.shared)
+            .is_some_and(|shared| {
+                let pool = shared.lock().unwrap();
+                pool.pool().holds_nothing() && !pool.pool().waiting()
+            });
+        if !quiet {
+            return None;
+        }
+        let began = Instant::now();
+        let others = || SUBMITS.load(std::sync::atomic::Ordering::Acquire);
+        match engine.measure_behind(&others) {
+            Ok(true) => Some(began.elapsed()),
+            Ok(false) => None,
+            Err(error) => {
+                tracing::warn!(
+                    engine_idx,
+                    %error,
+                    "measuring behind serving failed; it stops, and the load serves on as it stood"
+                );
+                None
+            }
         }
     }
 
@@ -998,7 +1085,8 @@ impl Lane {
                 None => {
                     let owed = !landed_instances.is_empty();
                     let awake = || owed || settled_at == Some(parks.count());
-                    match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, awake) {
+                    let behind = || Self::measure_behind(engine_idx, &mut engine);
+                    match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, awake, behind) {
                         Ok(request) => request,
                         Err(()) => break,
                     }
@@ -1106,6 +1194,9 @@ impl Lane {
                 LaneRequest::Control { item, reply } => {
                     let _in = InCall::new(engine_idx, control_call(&item));
                     let on_panic = Self::commit_on_failure(&item, LANE_PANICKED);
+                    // A control call may put work on the device (a copy, an
+                    // evacuation): counted beside the fires.
+                    SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Release);
                     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         Self::execute_control(
                             engine_idx,
@@ -1218,7 +1309,7 @@ impl Lane {
         std::mem::forget(engine);
         drop(channels);
         let mut turn = LaneTurn::default();
-        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn, || false) {
+        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn, || false, || None) {
             if let LaneRequest::Shutdown { response } = request {
                 let _ = response.send((None, ChannelJoin::new()));
                 return;
@@ -1319,6 +1410,7 @@ impl Lane {
             // A refusal of lanes names lanes of the first step that did not
             // fire: the frame fired the steps before it (`Engine::submit`).
             let submit_start = crate::rt::Instant::now();
+            SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Release);
             let submit_result = engine.submit(&submitted);
             tracing::debug!(
                 target: "pie::launch",

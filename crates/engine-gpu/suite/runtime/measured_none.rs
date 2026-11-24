@@ -45,9 +45,9 @@ fn two_models_exported_boot_a_clean_home_measuring_nothing() {
         let Some(mut loaded) = loaded_boot("measured-none", &Outputs, lanes, boot(&measured)) else {
             return;
         };
-        first.push(loaded.engine.loaded_mut().expect("loaded").measured_at_load());
+        first.push(super::outputs::measure_behind(&mut loaded.engine));
     }
-    assert!(first[0].iter().any(|m| m == "settle"), "the first model settles: {first:?}");
+    assert!(first[0] > 0, "the first model settles behind serving: {first:?}");
     let stored = stored_file(&measured);
     let text = std::fs::read_to_string(&stored).expect("the stored profile reads");
     let (exported, report) =

@@ -187,6 +187,15 @@ impl Serve for Api {
         crate::rates::save_rates(device, boot.profiles.as_deref(), rates)
     }
 
+    fn measure_rates(
+        device: &Context,
+        tuning: &crate::tuning::Tuning,
+        max_submit: Option<std::time::Duration>,
+        stated: &profile::fire::Rates,
+    ) -> Result<engine::rates::Measured> {
+        crate::rates::measure(device, tuning, max_submit, stated)
+    }
+
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {
         boot.chunk_bytes
     }

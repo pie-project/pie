@@ -945,6 +945,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     assert_eq!(
         p.rates(),
         profile::fire::Rates {
+            stale: None,
             landing: None,
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0), (4096, 50.0)])]),
             attn_tflops_by_keys: Some(vec![(2048, 20.0)]),

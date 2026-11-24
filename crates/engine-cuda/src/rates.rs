@@ -172,7 +172,10 @@ fn ensure_by(
         Some(room),
         None,
         measuring,
-        |_max_submit| {
+        // Nothing is timed behind serving on CUDA yet: a stale key is
+        // measured before ready.
+        false,
+        |_max_submit, _| {
             Ok(engine::rates::Measured {
                 rates: keys.stamp(measure(&measure_chip)?),
                 unsettled: false,
@@ -1249,6 +1252,7 @@ mod ensure_tests {
 
     fn measured() -> Rates {
         Rates {
+            stale: None,
             landing: None,
             load_width: None,
             launch_ns: Some(900),

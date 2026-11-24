@@ -45,6 +45,7 @@ fn a_guest_input_model_settles_and_stores_and_a_second_boot_measures_nothing() {
     let Some(mut first) = loaded_boot("guest-settle", &Outputs, 4, boot()) else {
         return;
     };
+    super::outputs::measure_behind(&mut first.engine);
     let shell = first.engine.loaded_mut().expect("loaded");
     let settled = shell.settled().to_vec();
     assert!(
