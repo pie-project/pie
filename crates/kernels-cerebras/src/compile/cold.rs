@@ -13,25 +13,30 @@ pub const FABRIC_ROWS: u32 = 1153;
 /// Its columns.
 pub const FABRIC_COLS: u32 = 750;
 
+/// A posted token loop's most steps (`LOOP`), every kernel set's: a loop's rows come back when it
+/// ends, so a longer one holds a stream's last tokens back (back-to-back posted loops already hide
+/// a launch's fixed cost).
+pub const LOOP: u32 = 32;
+
 /// A kernel set's levers and the keys no partition moves: the kernels' defaults.
 #[must_use]
 pub fn defaults(set: KernelSet) -> (&'static str, &'static [(&'static str, f64)]) {
     match set {
         KernelSet::Own => (
             "NPX:1,DIAG:0,TSTAMP:0,XKEEP:0,HACC16:0,ATTL:2",
-            &[("G2", 12.0), ("WL", 1.0)],
+            &[("G2", 12.0), ("WL", 1.0), ("LOOP", LOOP as f64)],
         ),
-        KernelSet::Shared => ("", &[("G2", 12.0), ("G2W", 24.0), ("LOOP", 64.0)]),
+        KernelSet::Shared => ("", &[("G2", 12.0), ("G2W", 24.0), ("LOOP", LOOP as f64)]),
         KernelSet::Windows => (
             "DIAG:0,GELUT:1",
-            &[("G2", 16.0), ("G2W", 24.0), ("LOOP", 64.0)],
+            &[("G2", 16.0), ("G2W", 24.0), ("LOOP", LOOP as f64)],
         ),
         KernelSet::Experts => (
             "DIAG:0,GLUV:1,CYV:2",
             &[
                 ("G2", 16.0),
                 ("G2W", 24.0),
-                ("LOOP", 64.0),
+                ("LOOP", LOOP as f64),
                 ("NLV", 5.0),
                 ("HSCALE", 32768.0),
             ],

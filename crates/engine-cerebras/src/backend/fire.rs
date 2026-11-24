@@ -17,8 +17,32 @@ use crate::wafer;
 /// Steps a sequence's first token loop runs past its row.
 const FIRST_LOOP: usize = 8;
 
-/// The token loop's most steps past a greedy lane's row when the config states none.
-pub(super) const DEFAULT_LOOKAHEAD: usize = 32;
+/// The token loop's most steps past a greedy lane's row when the config states none and the
+/// program names no loop of its own.
+const DEFAULT_LOOKAHEAD: usize = 32;
+
+/// The lookahead when the config states none: the program's posted loop (`LOOP`), else
+/// [`DEFAULT_LOOKAHEAD`].
+pub(super) fn default_lookahead(posted_loop: usize) -> usize {
+    if posted_loop > 0 {
+        posted_loop
+    } else {
+        DEFAULT_LOOKAHEAD
+    }
+}
+
+/// The frames the runtime keeps posted when its config states none: with a posted loop, the most
+/// the engine takes ([`Runahead::UNSTAGED_MAX_FRAMES`]), so every lane keeps posted past a loop's
+/// end (0: no posted loop, the runtime's own).
+///
+/// [`Runahead::UNSTAGED_MAX_FRAMES`]: engine::runahead::Runahead::UNSTAGED_MAX_FRAMES
+pub(super) fn dispatch_depth(posted_loop: usize, lookahead: usize) -> u32 {
+    if posted_loop.min(lookahead) > 1 {
+        u32::from(engine::runahead::Runahead::UNSTAGED_MAX_FRAMES)
+    } else {
+        0
+    }
+}
 
 /// A logits row of `width` standing in for an argmax: 1 at `token`, 0
 /// elsewhere (all 0 without one).
@@ -265,13 +289,12 @@ impl CerebrasEngine {
     }
 
     /// The most steps a greedy lane's token loop runs past its row (0: none):
-    /// the config's `lookahead`, else [`DEFAULT_LOOKAHEAD`] once a model is loaded.
+    /// the config's `lookahead`, else once a model is loaded [`default_lookahead`]'s.
     pub(super) fn lookahead(&self) -> usize {
-        let default = if self.model.is_some() {
-            DEFAULT_LOOKAHEAD
-        } else {
-            0
-        };
+        let default = self
+            .model
+            .as_ref()
+            .map_or(0, |w| default_lookahead(w.posted_loop));
         self.cfg.lookahead.unwrap_or(default)
     }
 

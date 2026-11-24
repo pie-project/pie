@@ -216,7 +216,13 @@ impl Engine for CerebrasEngine {
                 )
                 .map_err(|e| Error::Load(format!("the wafer model: {e}")))?;
                 // a program without the token loop serves only with the lookahead off: refused here
-                if !w.token_loop && self.cfg.lookahead.unwrap_or(fire::DEFAULT_LOOKAHEAD) > 0 {
+                if !w.token_loop
+                    && self
+                        .cfg
+                        .lookahead
+                        .unwrap_or(fire::default_lookahead(w.posted_loop))
+                        > 0
+                {
                     return Err(Error::Load(format!(
                         "{}: built without the token loop (a WL build), and the lookahead is on \
                          ([cerebras] lookahead = 0 serves it without one)",
@@ -293,8 +299,17 @@ impl Engine for CerebrasEngine {
         let wafer_pages = w.paging;
         // (a unit program's state slots its lane slots)
         let wafer_lanes = w.lanes;
+        let posted_loop = w.posted_loop;
         self.model = Some(w);
         self.kv = Kv::default();
+        let lookahead = self.lookahead();
+        let dispatch_depth = fire::dispatch_depth(posted_loop, lookahead);
+        tracing::info!(
+            posted_loop,
+            lookahead,
+            dispatch_depth,
+            "cerebras: posted loops"
+        );
 
         let trace_name = facts.trace().name.clone();
         let paging = facts.paging();
@@ -340,6 +355,7 @@ impl Engine for CerebrasEngine {
                     .map_or(paging.context().min(model_context), |(_, p, s)| p * s),
                 prefill_rows: 0,
                 max_readouts: budgets.max_tokens,
+                dispatch_depth,
             },
             has_lora: false,
             has_attn_page_mask: false,

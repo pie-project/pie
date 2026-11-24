@@ -118,7 +118,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         rope_levels,
         rope_bits,
         cap: pr.int("CAP").unwrap_or(256),
-        loop_len: pr.int("LOOP").unwrap_or(32),
+        loop_len: pr.int("LOOP").unwrap_or(crate::compile::cold::LOOP),
         token_loop: pr.int("WL").unwrap_or(0) != 0,
         logit_scale: 1.0,
     };

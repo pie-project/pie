@@ -44,7 +44,7 @@ pub fn build_without_engine(
         tokenizer_path: artifact.to_path_buf(),
         metadata,
         engines: Vec::new(),
-        scheduler: scheduler(&user.runtime),
+        scheduler: scheduler(&user.runtime, 0),
     };
     runtime_config(user, home, builtins, model)
 }
@@ -115,13 +115,23 @@ fn runtime_config(
     })
 }
 
-fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerConfig {
-    runtime::bootstrap::SchedulerConfig {
+/// The runtime's scheduler knobs; `engine_depth`: the engine's preferred dispatch depth (0: none).
+fn scheduler(
+    runtime: &config::RuntimeConfig,
+    engine_depth: u32,
+) -> runtime::bootstrap::SchedulerConfig {
+    let c = runtime::bootstrap::SchedulerConfig {
         submit_deadline_us: runtime.submit_deadline.as_micros(),
         silence_timeout_secs: runtime.silence_timeout.as_secs(),
         frame_size: runtime.frame_size,
-        frame_dispatch_depth: runtime.frame_dispatch_depth,
-    }
+        frame_dispatch_depth: runtime.dispatch_depth(engine_depth),
+    };
+    tracing::info!(
+        frame_size = c.frame_size,
+        frame_dispatch_depth = c.frame_dispatch_depth,
+        "runtime frames"
+    );
+    c
 }
 
 fn build_model(
@@ -196,7 +206,7 @@ fn build_model(
         tokenizer_path,
         metadata,
         engines,
-        scheduler: scheduler(runtime),
+        scheduler: scheduler(runtime, group0_caps.limits.dispatch_depth),
     })
 }
 

@@ -820,6 +820,7 @@ impl CerebrasEngine {
                 max_context: paging.context(),
                 prefill_rows: 0,
                 max_readouts: max_tokens,
+                dispatch_depth: 0,
             },
             has_lora: false,
             has_attn_page_mask: false,

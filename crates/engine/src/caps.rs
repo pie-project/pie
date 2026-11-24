@@ -32,6 +32,10 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
+    /// The frames the engine would have the runtime keep posted where
+    /// `[runtime] frame_dispatch_depth` is not stated (0: the runtime's own).
+    #[serde(default)]
+    pub dispatch_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
