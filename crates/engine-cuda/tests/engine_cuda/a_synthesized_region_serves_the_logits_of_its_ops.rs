@@ -173,8 +173,14 @@ fn load(fixture: &Fixture, overrides: &str, tokens: u32) -> Shell {
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
+        // The fixture's own profile directory: the first load times each
+        // decode product's kernels and keeps its picks there, and every
+        // later load of the model serves them. Unkept, each load picks
+        // again by times a few percent apart, and a product another kernel
+        // runs rounds its sums another way.
         knobs: engine_cuda::Knobs {
             chip: Some(engine_cuda::chip::profile(overrides)),
+            profiles: Some(fixture._dir.0.clone()),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
