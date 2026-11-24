@@ -855,6 +855,23 @@ pub(crate) fn give_behind(stores: &crate::store::registry::Stores, taken: Behind
 /// runs).
 static BEHIND_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a lane said its behind work waits for a live process.
+static BEHIND_SAID_LIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Every lane turned once ([`LaneRequest::Behind`]) once the runtime is
+/// ready: where the last live process's pipeline parked or closed, so a lane
+/// asleep since takes up its engine's behind work without waiting for a
+/// request. Nothing before ready.
+pub(crate) fn turn_behind() {
+    if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if let Ok(mut lanes) = LANES.try_lock() {
+        lanes.retain(|lane| lane.send(LaneRequest::Behind).is_ok());
+    }
+}
+
 /// Whether a lane said its behind work waits for ready.
 static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1146,15 +1163,27 @@ impl Lane {
         }
         let began = Instant::now();
         let stores = crate::store::registry::try_get(0, engine_idx);
-        // No process live on the engine: no working set or snapshot holds a
-        // slot (idle cache alone does) and no waiter is short of one.
-        let alone = stores
-            .as_ref()
-            .and_then(|stores| stores.shared.as_ref())
-            .is_some_and(|shared| {
-                let pool = shared.lock().unwrap();
-                pool.pool().demand().live == 0 && !pool.pool().waiting()
-            });
+        // Behind work of any kind runs only while no process has work
+        // outstanding (no pipeline open; idle cache, resting handles and
+        // snapshots are no process) and no waiter is short of a slot: never
+        // between the steps of live traffic. The last pipeline to park or
+        // close turns the lanes ([`turn_behind`]).
+        let alone = crate::pipeline::none_active()
+            && !stores
+                .as_ref()
+                .and_then(|stores| stores.shared.as_ref())
+                .is_some_and(|shared| shared.lock().unwrap().pool().waiting());
+        if !alone {
+            if !BEHIND_SAID_LIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    engine_idx,
+                    "behind serving: waiting: a process has work outstanding (behind work runs \
+                     only once none has)"
+                );
+            }
+            return None;
+        }
+        BEHIND_SAID_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         // A point longer than one decode step waits for no live process:
         // nothing is taken for it before then.
         let taken = engine
