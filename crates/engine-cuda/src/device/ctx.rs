@@ -480,9 +480,7 @@ impl Drop for Context {
                     if !side.cublas.is_null() {
                         give_blas(self.ordinal, side.cublas);
                     }
-                    if !side.stream.is_null() {
-                        let _ = crate::device::rt::cudaStreamDestroy(side.stream.cast());
-                    }
+                    crate::device::held::destroy_unadopted_stream(side.stream);
                 }
                 if !self.cublas.is_null() {
                     give_blas(self.ordinal, self.cublas);
@@ -490,15 +488,9 @@ impl Drop for Context {
                 if !self.stream.is_null() {
                     destroy_stream(self.ordinal, self.stream);
                 }
-                if !self.notify.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.notify.cast());
-                }
-                if !self.tap.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.tap.cast());
-                }
-                if !self.swap.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.swap.cast());
-                }
+                crate::device::held::destroy_unadopted_stream(self.notify);
+                crate::device::held::destroy_unadopted_stream(self.tap);
+                crate::device::held::destroy_unadopted_stream(self.swap);
             }
         }
     }

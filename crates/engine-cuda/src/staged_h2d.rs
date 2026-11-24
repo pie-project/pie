@@ -225,7 +225,7 @@ impl Drop for Lanes {
                 // SAFETY: handle from this module's own cudaStreamCreate,
                 // destroyed exactly once; every pump drained before returning.
                 unsafe {
-                    let _ = crate::device::rt::cudaStreamDestroy(lane.stream.cast());
+                    crate::device::held::destroy_unadopted_stream(lane.stream);
                 }
             }
         }
