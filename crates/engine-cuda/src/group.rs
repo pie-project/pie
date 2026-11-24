@@ -377,6 +377,12 @@ impl Engine for Group {
         &[]
     }
 
+    /// Not tracked for a tensor-parallel group: its ranks measure at every boot (`measure =
+    /// false` is refused for one), said so by name.
+    fn measured_at_load(&self) -> Vec<String> {
+        vec!["cuda (a tensor-parallel group): what it measured is not tracked".to_string()]
+    }
+
     fn skips_measuring(&self) -> bool {
         false
     }

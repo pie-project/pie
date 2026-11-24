@@ -237,6 +237,33 @@ pub fn settle_code(kernels: u32, dense: &Dense) -> u32 {
     profile::fire::fingerprint(format!("kernels {kernels:#010x}|picks {}", dense.canonical()).as_bytes())
 }
 
+/// Which of a settle's candidates' timings (`samples`, each candidate's
+/// fires, the incumbent first) decides its range: the one whose median
+/// widened by its spread (`median · (1 + spread)`) lies under every other's
+/// median narrowed by its own (`median · (1 − spread)`), so no repeat's noise
+/// could turn the two around; `None` where no candidate separates so (a tie
+/// inside the spreads: the incumbent stands). A candidate with no timing
+/// takes no part. Derived from the measured spreads alone, no margin chosen.
+#[must_use]
+pub fn settle_pick(samples: &[Vec<f64>]) -> Option<usize> {
+    let timed: Vec<(usize, f64, f64)> = samples
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .map(|(i, s)| {
+            let (median, spread) = crate::rates::median_spread(s);
+            (i, median, spread)
+        })
+        .collect();
+    let &(winner, median, spread) = timed.iter().min_by(|a, b| a.1.total_cmp(&b.1))?;
+    let high = median * (1.0 + spread);
+    timed
+        .iter()
+        .filter(|&&(i, ..)| i != winner)
+        .all(|&(_, m, sp)| high < m * (1.0 - sp))
+        .then_some(winner)
+}
+
 /// The name a kernel is said by.
 pub(crate) fn name(tactic: &Tactic) -> String {
     match (tactic.vector, tactic.tier, tactic.wide) {
@@ -1271,6 +1298,31 @@ mod tests {
             .unwrap_err(),
             UNREACHED
         );
+    }
+
+    /// A settle's pick: candidates whose timings overlap inside their
+    /// spreads tie (the incumbent stands); separated ones take the faster;
+    /// a noise-swamped trial (every spread wide) replaces nothing.
+    #[test]
+    fn a_settle_picks_only_past_the_spreads() {
+        // Overlapping: 100 ±10% against 105 ±10%.
+        assert_eq!(settle_pick(&[vec![95.0, 100.0, 105.0], vec![100.0, 105.0, 110.0]]), None);
+        // Separated: the second clearly faster.
+        assert_eq!(settle_pick(&[vec![100.0, 101.0, 102.0], vec![80.0, 81.0, 82.0]]), Some(1));
+        // The incumbent clearly fastest: decided, kept.
+        assert_eq!(settle_pick(&[vec![50.0, 51.0, 52.0], vec![80.0, 81.0, 82.0]]), Some(0));
+        // Windows' B trial: every candidate ~25% spread, a 20% median gap.
+        assert_eq!(
+            settle_pick(&[
+                vec![32000.0, 36000.0, 40000.0],
+                vec![29000.0, 32272.0, 37000.0],
+                vec![34000.0, 38873.0, 44000.0],
+            ]),
+            None,
+            "a noise-swamped trial replaces nothing"
+        );
+        // An untimed candidate takes no part.
+        assert_eq!(settle_pick(&[vec![100.0, 101.0], Vec::new(), vec![60.0, 61.0]]), Some(2));
     }
 
     /// A settle is keyed by its model alone and checked by the picks it was

@@ -875,8 +875,11 @@ where
         B::committed_covers()
     }
 
-    fn measured_at_load(&self) -> Option<Vec<String>> {
-        self.shell.as_ref().map(crate::serve::Shell::measured_at_load)
+    fn measured_at_load(&self) -> Vec<String> {
+        self.shell
+            .as_ref()
+            .map(crate::serve::Shell::measured_at_load)
+            .unwrap_or_default()
     }
 
     fn skips_measuring(&self) -> bool {
