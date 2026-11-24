@@ -10678,6 +10678,16 @@ impl<B: Serve> Shell<B> {
                     "the arm walk so far"
                 );
             }
+            if at % 256 == 0 {
+                tracing::info!(
+                    walked = at,
+                    of = shapes.len(),
+                    shapes_recording = armed_shapes.len(),
+                    host_bytes = rss().saturating_sub(before),
+                    dearest,
+                    "the arm walk so far"
+                );
+            }
             let families = self.recorded;
             for arm in 0..depth {
                 let ahead = rss();

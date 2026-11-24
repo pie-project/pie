@@ -2775,8 +2775,10 @@ impl Frame {
     /// commands would carry, each dispatch's group counts, each readout
     /// copy's regions hashed, the block's image, and the cuts it made.
     #[must_use]
-    pub fn into_fill(self) -> Fill {
+    pub fn into_fill(mut self) -> Fill {
         use std::hash::Hasher;
+        // A fill walk's buffer recorded nothing: it goes unended, as meant.
+        self.open = false;
         Fill {
             baked: self.baked.borrow().finish(),
             trail: std::mem::take(&mut *self.trail.borrow_mut()),
@@ -3177,7 +3179,28 @@ impl Frame {
         if self.dry {
             return Ok(());
         }
-        let set = self.descriptor_set(self.copier.set_layout)?;
+        // A recording's copier set is the device's for every recording that
+        // copies alike on the arm (its table lies in the arm's block); a
+        // score room's source by its tag, a replay writing it.
+        let set = if self.kept {
+            use ash::vk::Handle;
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let source = if room_src && self.copier.rooms & 1 != 0 { 0 } else { src.buffer.as_raw() };
+            (
+                source,
+                src_range,
+                dst.buffer.as_raw(),
+                dst_range,
+                table_buffer.as_raw(),
+                table_place.1,
+                table.len(),
+            )
+                .hash(&mut h);
+            self.shared_set(self.copier.set_layout, h.finish())?
+        } else {
+            self.descriptor_set(self.copier.set_layout)?
+        };
         if room_src && self.kept && self.copier.rooms & 1 != 0 {
             self.room_binds(set, 0, 0, u64::MAX);
         } else if room_src && self.kept {
@@ -3688,8 +3711,7 @@ impl Drop for Frame {
         // buffer may be in no state to end (a driver that failed an
         // allocation inside it, or a flush that ended it and failed before
         // the next began), and ending it there faults in the driver.
-        if self.open {
-            self.open = false;
+        if std::mem::take(&mut self.open) && !self.dry {
             tracing::warn!(
                 recording = self.inner.recording.load(Ordering::Acquire),
                 "vulkan: an open frame dropped uncommitted; its buffer freed unended"
