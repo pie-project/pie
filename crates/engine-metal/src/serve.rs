@@ -7503,6 +7503,10 @@ impl engine::frame::Shell for Shell {
                 lanes.join(" ")
             )
         });
+        // The profile printed below is this fire's alone: what the device
+        // ran since the last fire (the load's tuning and warm runs before
+        // the first, behind-serving slices between fires) is let go.
+        crate::encode::reset_kernel_profile();
         let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
