@@ -864,6 +864,7 @@ impl Shell {
                 };
                 while batch(knee).is_some() {}
                 let loaded = loaded.load(SeqCst);
+                let left = queue.len().saturating_sub(loaded);
                 tracing::info!(
                     loaded,
                     of = queue.len(),
@@ -871,7 +872,7 @@ impl Shell {
                     stopped = stop.load(SeqCst),
                     host_full = full.load(SeqCst),
                     hold_per_kib = room.per_kib(),
-                    "xla warm programs loaded behind serving"
+                    "xla parked programs loaded before ready; {left} programs left parked, each loads on its first fire"
                 );
             });
         match spawned {
