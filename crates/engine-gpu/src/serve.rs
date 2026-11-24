@@ -4527,8 +4527,8 @@ impl<B: Serve> Shell<B> {
     /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
     /// [`Pools::disk_division`] lay them; stated at load. Unstated
     /// `budget`: the disk chunks `seats` sequences' kv pages at `context`
-    /// and their state take, within the free disk
-    /// ([`engine::disk::derived_budget`]). One that cannot be seated is
+    /// and their state take, within the free disk less the platform's
+    /// reserve ([`engine::disk::derived_need`], [`engine::disk::room`]). One that cannot be seated is
     /// refused by name, stated or not. The disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
@@ -4552,19 +4552,20 @@ impl<B: Serve> Shell<B> {
             // The guest state the device can hold live (the room a guest
             // program binds within): evicted, it has a home.
             let guest = self.pool_chunk_facts().guest_room_bytes();
-            let bytes = engine::disk::unstated_budget(
-                dir,
-                0,
-                0,
-                pages.div_ceil(per_list) + state,
-                chunk,
-                guest,
-            );
+            let room = engine::disk::room(dir);
+            let need =
+                engine::disk::derived_need(0, 0, pages.div_ceil(per_list) + state, chunk, guest);
+            let bytes = need.min(room.for_us());
             // Its inputs, stated at load: what the field rules on.
             eprintln!(
-                "engine-gpu: the unstated disk tier: {bytes} bytes = {seats} seats x {context}                  tokens: {pages} kv pages in {} chunks and {state} chunks of state ({} B a seat),                  and {guest} B of guest state the device holds live, chunks of {chunk} B",
+                "engine-gpu: the unstated disk tier: {bytes} bytes of a derived need of {need} \
+                 bytes ({seats} seats x {context} tokens: {pages} kv pages in {} chunks and \
+                 {state} chunks of state ({} B a seat), and {guest} B of guest state the device \
+                 holds live, chunks of {chunk} B), within {} under {}: {room}",
                 pages.div_ceil(per_list),
                 self.state_slot_bytes(),
+                room.for_us(),
+                dir.display(),
             );
             bytes
         });

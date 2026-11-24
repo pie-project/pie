@@ -6,7 +6,7 @@
 )]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 // Unsafe only where an OS reading has no safe call: `pressure`'s macOS
-// sysctl, allowed there by name.
+// sysctl and `disk`'s Windows free space, allowed there by name.
 #![deny(unsafe_code)]
 
 pub mod beam;

@@ -2991,7 +2991,8 @@ impl Shell {
     }
 
     /// Unstated `budget`: `seats` sequences' state and kv at `context`,
-    /// within the free space ([`engine::disk::derived_budget`]).
+    /// within the free space less the platform's reserve
+    /// ([`engine::disk::derived_need`], [`engine::disk::room`]).
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
@@ -3016,22 +3017,22 @@ impl Shell {
                 let pages =
                     u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
                 let page_bytes = self.pools.page_bytes()?;
-                let free = engine::disk::free_space(dir);
+                let room = engine::disk::room(dir);
                 // The guest state the device can hold live (the room a
                 // guest program binds within): evicted, it has a home.
                 let guest = self.pools.chunk_facts().guest_room_bytes();
-                let bytes = engine::disk::derived_budget(
-                    state_rows,
-                    state_bytes,
-                    pages,
-                    page_bytes,
-                    guest,
-                    free,
-                );
+                let need =
+                    engine::disk::derived_need(state_rows, state_bytes, pages, page_bytes, guest);
+                let bytes = need.min(room.for_us());
                 // Its inputs, stated at load: what the field rules on.
                 eprintln!(
-                    "engine-metal: the unstated disk tier: {bytes} bytes = {seats} seats x                      (state {state_bytes} B + {context} tokens of kv in {} pages of {page_bytes} B)                      + {guest} B of guest state the device holds live, within {free} bytes free",
+                    "engine-metal: the unstated disk tier: {bytes} bytes of a derived need of \
+                     {need} bytes ({seats} seats x (state {state_bytes} B + {context} tokens of \
+                     kv in {} pages of {page_bytes} B) + {guest} B of guest state the device \
+                     holds live), within {} under {}: {room}",
                     context.div_ceil(paging.page_size.max(1)),
+                    room.for_us(),
+                    dir.display(),
                 );
                 bytes
             }

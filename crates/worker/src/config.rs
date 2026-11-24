@@ -964,7 +964,9 @@ pub struct MemoryConfig {
     /// under `disk_path`. Omitted: the engine derives it from what can be
     /// parked (every seat's state and kv at the full context, and the guest
     /// state the device holds live), within the free space under
-    /// `disk_path`. 0: no disk tier (the tiers are the device and, where
+    /// `disk_path` less the OS's own low-storage reserve (Android's
+    /// low-storage threshold; elsewhere what the filesystem keeps from an
+    /// unprivileged process), named in the boot line. 0: no disk tier (the tiers are the device and, where
     /// there is one, the host), so kv pressure on a device with no host
     /// tier restarts processes.
     pub budget_disk: Option<ByteSize>,
