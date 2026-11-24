@@ -340,6 +340,7 @@ impl FireBlock {
         core: &Arc<Core>,
         bytes: &[u8],
         align: u64,
+        kept: usize,
     ) -> Result<(Slab, usize, u64)> {
         let len = bytes.len() as u64;
         match &mut self.place {
@@ -352,7 +353,8 @@ impl FireBlock {
                         have: arm.bytes(),
                     });
                 }
-                self.image.lay_sparse(at, bytes);
+                self.image.lay_sparse(at, &bytes[..kept.min(bytes.len())]);
+                self.image.extent = self.image.extent.max(at + len);
                 Ok((Arc::clone(arm.block.slab()), 0, at))
             }
             Place::Own(chunks) => {

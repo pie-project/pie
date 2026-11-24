@@ -69,8 +69,21 @@ pub fn family_log(line: &str) {
 /// The arm walk's host time by phase (prepare, enqueue, settle, read back,
 /// the fill walk, the backend's fill, its plan), in ns: a diagnostic the
 /// load logs at ready under `PIE_VK_KERNEL_PROFILE`.
-pub static WALK_PHASES: [std::sync::atomic::AtomicU64; 8] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+pub static WALK_PHASES: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Whether the walk's phases are timed: under `PIE_VK_KERNEL_PROFILE`.
+pub fn phases_timed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_VK_KERNEL_PROFILE").is_some())
+}
+
+/// Credits `since`'s elapsed time to phase `phase`, where phases are timed.
+pub fn phase_if(phase: usize, since: std::time::Instant) {
+    if phases_timed() {
+        self::phase(phase, since);
+    }
+}
 
 /// Credits `since`'s elapsed time to phase `phase`.
 pub fn phase(phase: usize, since: std::time::Instant) {

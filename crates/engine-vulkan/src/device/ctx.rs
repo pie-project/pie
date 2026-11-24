@@ -2699,10 +2699,21 @@ impl Frame {
     /// chunk's buffer, and its place among the chunks with the offset, which
     /// is the same in every walk laid alike.
     pub(crate) fn lay(&self, bytes: &[u8], align: u64) -> Result<(vk::Buffer, (usize, u64))> {
+        self.lay_kept(bytes, align, bytes.len())
+    }
+
+    /// [`Self::lay`], the bytes past `kept` zero: an arm's image keeps them
+    /// unscanned.
+    pub(crate) fn lay_kept(
+        &self,
+        bytes: &[u8],
+        align: u64,
+        kept: usize,
+    ) -> Result<(vk::Buffer, (usize, u64))> {
         let (slab, chunk, at) = self
             .block
             .borrow_mut()
-            .lay(&self.inner.core, bytes, align)?;
+            .lay(&self.inner.core, bytes, align, kept)?;
         self.retain(&slab);
         Ok((slab.buffer, (chunk, at)))
     }

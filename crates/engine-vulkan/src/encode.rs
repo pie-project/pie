@@ -203,10 +203,12 @@ struct Scratch {
 /// What stands for a pool segment's buffer in a frame's hash: its place,
 /// never the buffer, which a commit or a release changes under a recording
 /// that is rebound ([`crate::device::Context::rebind_segments`]).
+#[cfg(feature = "vulkan")]
 const SEGMENT_TAG: u64 = 0xffff_ffff_0000_0000;
 
 /// What stands for a score room's buffer in a frame's hash: the room's place
 /// is the fire's ([`crate::device::Kept::bind_room`]).
+#[cfg(feature = "vulkan")]
 const ROOM_TAG: u64 = 0xffff_fffe_0000_0000;
 
 #[cfg(feature = "vulkan")]
@@ -390,6 +392,8 @@ impl Sink<'_> {
         scratch.writes.clear();
         scratch.segments.clear();
         scratch.rooms.clear();
+        // Where a fired table's zero rows start in the scalars, if any.
+        let mut zeros_from: Option<usize> = None;
         let (infos, writes_at, extents, push, segments, rooms) = (
             &mut scratch.infos,
             &mut scratch.writes_at,
@@ -485,9 +489,25 @@ impl Sink<'_> {
                         self.frame.retain(slab);
                     }
                 }
-                ArgValue::I32(v) => push.extend_from_slice(&v.to_le_bytes()),
-                ArgValue::U32(v) => push.extend_from_slice(&v.to_le_bytes()),
-                ArgValue::F32(v) => push.extend_from_slice(&v.to_le_bytes()),
+                // A scalar after zeros: the zeros lie inside what is kept.
+                ArgValue::I32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::U32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::F32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::Zeros(words) => {
+                    // What a lay keeps runs through the last non-zero byte:
+                    // the zeros are laid, not scanned.
+                    zeros_from.get_or_insert(push.len());
+                    push.resize(push.len() + words as usize * 4, 0);
+                }
             }
         }
 
@@ -548,7 +568,11 @@ impl Sink<'_> {
                 }
                 let (buffer, place) = self
                     .frame
-                    .lay(push, limits.min_uniform_buffer_offset_alignment)
+                    .lay_kept(
+                        push,
+                        limits.min_uniform_buffer_offset_alignment,
+                        zeros_from.unwrap_or(push.len()),
+                    )
                     .map_err(|fault| Sink::refuse(fire, fault))?;
                 fired_buffer = Some(buffer);
                 infos.resize(
