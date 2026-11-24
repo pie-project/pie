@@ -941,7 +941,7 @@ impl Serve for Api {
             // run.
             drop(frame);
             shell.kept_none();
-            return shell.device.frame()?.commit_async(Some(on_done));
+            return shell.device.landed(Some(on_done));
         }
         match keep {
             Some(shape) => {
@@ -1021,7 +1021,7 @@ impl Serve for Api {
                         } else {
                             shell.kept_none();
                         }
-                        shell.device.frame()?.commit_async(Some(on_done))?
+                        shell.device.landed(Some(on_done))?
                     }
                     Act::Fill => {
                         shell.kept_none();

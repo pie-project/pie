@@ -774,6 +774,9 @@ pub struct Context {
     /// Whether the next frame's rows are constants of its commands
     /// ([`Context::fixed_next`]).
     fixed_next: Mutex<Option<bool>>,
+    /// A frame submitted empty and landed, once: what a fire that runs
+    /// nothing lands on ([`Context::landed`]).
+    landed_frame: Mutex<Option<Arc<Inner>>>,
     /// The workgroups the device holds at once, as the load's rates step
     /// measured them ([`Context::resident`]).
     resident: std::sync::OnceLock<u32>,
@@ -1502,6 +1505,7 @@ impl Context {
             arm_next: Mutex::new(None),
             room_next: Mutex::new(None),
             fixed_next: Mutex::new(None),
+            landed_frame: Mutex::new(None),
             resident: std::sync::OnceLock::new(),
         })
     }
@@ -1882,6 +1886,31 @@ impl Context {
 
     pub fn frame(&self) -> Result<Frame> {
         self.frame_with(true)
+    }
+
+    /// A submission already landed: what a fire that runs nothing (the arm
+    /// walk's) lands on, `on_done` run by the watcher as for any other,
+    /// with no command buffer, no submit and no wait on the device. It
+    /// takes what the next frame would of the settings laid for it.
+    pub fn landed(&self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        self.arm_next.lock().expect("arm lock poisoned").take();
+        self.room_next.lock().expect("room lock poisoned").take();
+        self.fixed_next.lock().expect("fixed lock poisoned").take();
+        self.indirect_next.lock().expect("indirect lock poisoned").take();
+        let inner = {
+            let mut held = self.landed_frame.lock().expect("landed lock poisoned");
+            match held.as_ref() {
+                Some(inner) => Arc::clone(inner),
+                None => {
+                    let pending = self.frame_with(true)?.commit_async(None)?;
+                    pending.wait()?;
+                    let inner = Arc::clone(&pending.submission.inner);
+                    *held = Some(Arc::clone(&inner));
+                    inner
+                }
+            }
+        };
+        Ok(Pending::watched(Pending::of_frame(&inner), on_done))
     }
 
     /// The dispatches, by their place in the walk, the next frame opened
@@ -2908,6 +2937,10 @@ impl Frame {
     }
 
     pub(crate) fn retain(&self, slab: &Slab) {
+        // A fill walk's frame is never submitted: it holds nothing.
+        if self.dry {
+            return;
+        }
         let key = Arc::as_ptr(slab) as usize;
         if !self.retained.borrow_mut().insert(key) {
             return;

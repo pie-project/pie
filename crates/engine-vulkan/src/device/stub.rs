@@ -158,6 +158,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn landed(&self, _on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        match self.never {}
+    }
+
     pub fn spanned(&self) -> Result<Frame> {
         match self.never {}
     }
