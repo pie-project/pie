@@ -2933,8 +2933,17 @@ impl Shell {
         let staged = crate::mask::stage(&masks, mask_width).map_err(|fault| fault.of_rows(composition.lanes()))?;
         // The mask plane is one row of `stride` key bytes per token row (at
         // least one column), and the enable flags one byte per token row.
+        // A mixed fire (prompt rows beside decodes) on a load whose classes
+        // read a mask stages the whole plane whether a lane of it is masked
+        // or not, every row's flag off where none is: the mask is data of
+        // the fire's shape, so a masked lane's mixed fire (a beam's rescore
+        // beside other groups' decodes) is the program the warm ladder laid
+        // for the plain one.
+        let mixed = descriptor.lanes.iter().any(|l| l.rows > 1)
+            && descriptor.lanes.iter().any(|l| l.rows == 1);
         let (mask_bytes, enabled_bytes, mask_stride) = match &staged {
             Some(staged) => (staged.bytes.clone(), staged.enabled.clone(), staged.stride),
+            None if mixed && !self.masked.is_empty() => (Vec::new(), Vec::new(), mask_width),
             None => (Vec::new(), Vec::new(), 0),
         };
         let columns = mask_stride.max(1);
