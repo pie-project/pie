@@ -128,9 +128,6 @@ pub fn conv1d_fold(
     if groups == 0 {
         return Ok(());
     }
-    if (conv_width.saturating_sub(1)) * dilation + 1 > 8 {
-        return Err(refuse(OP, format!("a {conv_width}-tap window of dilation {dilation}, past the 8 cells a fold stores")));
-    }
     let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
     ctx.fire(
         OP,
