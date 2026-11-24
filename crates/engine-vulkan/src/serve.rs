@@ -439,6 +439,11 @@ impl Serve for Api {
         (live, (most > 0).then_some(u64::from(most)))
     }
 
+    fn max_maps(shell: &Shell<Api>) -> Option<u64> {
+        let most = shell.tuning.profile().get::<crate::tuning::MaxMapCount>().0;
+        (most > 0).then_some(u64::from(most))
+    }
+
     fn spent() -> bool {
         crate::device::take_spent()
     }

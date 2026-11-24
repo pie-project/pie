@@ -17,3 +17,7 @@ sdpa.decode.split_min_keys = 128
 # vkBeginCommandBuffer faults in the driver. The arm walk stops below it.
 [engine]
 max_live_command_buffers = 4096
+# Measured on an Adreno TM-840 (Android 16), which does not let the process
+# read vm.max_map_count: the kernel's default. A held command buffer takes
+# about 29 maps there.
+max_map_count = 65530

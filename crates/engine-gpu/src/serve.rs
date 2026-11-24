@@ -411,6 +411,12 @@ pub trait Serve: Backend {
         false
     }
 
+    /// The most memory maps the device's host lets a process hold, where
+    /// its profile states it (a host that hides vm.max_map_count).
+    fn max_maps(_shell: &Shell<Self>) -> Option<u64> {
+        None
+    }
+
     /// The command buffers the backend holds live now, and the most its
     /// device holds (stated in its profile; `None` where none is stated).
     fn command_buffers(_shell: &Shell<Self>) -> (u64, Option<u64>) {
@@ -10728,7 +10734,8 @@ impl<B: Serve> Shell<B> {
         };
         let max_maps = std::fs::read_to_string("/proc/sys/vm/max_map_count")
             .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok());
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .or_else(|| B::max_maps(self));
         let maps_before = map_count().unwrap_or(0);
         let mut dearest_maps = 0u64;
         let before = rss();
