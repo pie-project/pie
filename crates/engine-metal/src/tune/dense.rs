@@ -218,23 +218,16 @@ pub(super) fn measure(
     depth: Depth,
     say: &mut dyn FnMut(&str),
 ) -> Result<Measured, String> {
-    measure_at(device, base, cores, SHAPES, &rows(depth), None, say)
+    measure_at(device, base, cores, SHAPES, &rows(depth), say)
 }
 
-/// Why a shape's curves behind serving stopped: a request arrived before a
-/// row count's frames ([`curves_behind`]). Timed again whole later.
-pub(crate) const YIELDED: &str = "a request arrived: the dense curves behind serving yield to it";
-
-/// [`measure`] over `shapes` at the row counts `grid`. `arrived`, behind
-/// serving: read before each row count's frames (every candidate's at
-/// it), an arrival stopping the step with [`YIELDED`].
+/// [`measure`] over `shapes` at the row counts `grid`.
 fn measure_at(
     device: &Context,
     base: &Profile,
     cores: Option<u32>,
     shapes: &[(u32, u32)],
     grid: &[u32],
-    arrived: Option<&dyn Fn() -> bool>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Measured, String> {
     let family = device.family();
@@ -322,9 +315,6 @@ fn measure_at(
         };
         let first = out.points.len();
         for &m in grid {
-            if arrived.is_some_and(|arrived| arrived()) {
-                return Err(YIELDED.to_string());
-            }
             let launch = launch_at(m);
             let mut live: Vec<usize> = Vec::new();
             for (c, d) in candidates.iter().enumerate() {
@@ -837,34 +827,6 @@ fn winners(measured: &Measured, today: &kernels_metal::Tuning) -> (String, Strin
 /// weight budget). A kernel that answers wrongly refuses the load; a
 /// measurement that fails otherwise (memory refused at boot) leaves the
 /// profile's route serving, said.
-/// The prefix of a `profile::fire::Tuned::behind` entry naming a model
-/// shape whose dense curves are timed again behind serving:
-/// `curve <n>x<k>`.
-pub(crate) const CURVE_BEHIND: &str = "curve ";
-
-/// Behind serving: the dense curves of every candidate at the shape `n x k`
-/// a [`CURVE_BEHIND`] entry names, timed by the step a load times them by
-/// ([`measure_at`] over [`LOAD_ROWS`], the same grid, rounds and checks),
-/// `arrived` read before each row count's frames ([`YIELDED`]).
-pub(crate) fn curves_behind(
-    device: &Context,
-    chip: &Profile,
-    shape: &str,
-    arrived: &dyn Fn() -> bool,
-) -> Result<Vec<profile::fire::KernelCurve>, String> {
-    let (n, k) = shape
-        .split_once('x')
-        .and_then(|(n, k)| Some((n.parse::<u32>().ok()?, k.parse::<u32>().ok()?)))
-        .ok_or_else(|| format!("`{CURVE_BEHIND}{shape}` names no n x k shape"))?;
-    let measured = measure_at(device, chip, device.cores(), &[(n, k)], &LOAD_ROWS, Some(arrived), &mut |_| {})?;
-    if let Some((body, at, first)) = measured.wrong.first() {
-        return Err(format!(
-            "kernel.dense behind serving: `{body}` answered wrongly at {at} points; first at {first}"
-        ));
-    }
-    Ok(curves_of(&measured))
-}
-
 pub(crate) fn at_load(
     device: &Context,
     chip: Profile,
@@ -902,11 +864,12 @@ pub(crate) fn at_load(
     let mut chip = chip;
     let mut curves = stated;
     // A shape whose curves are stored under a stale key (a kernel's code or
-    // the method changed) serves by those figures, a fair estimate, and is
-    // timed again behind serving by this same step (`curves_behind`,
-    // `profile::fire::Tuned::behind`, `curve <n>x<k>`): nothing is timed
-    // before ready that a figure exists for. Only a shape no layer states
-    // at all is timed here.
+    // the method changed) serves by those figures, a fair estimate, until
+    // the next export round or `pie tune` refreshes them
+    // (`engine::rates::StaleRates::Served`): nothing is timed before ready
+    // that a figure exists for, and nothing behind serving (a timing lays
+    // buffers of its own, and nothing is laid after ready). Only a shape no
+    // layer states at all is timed here.
     let stale: Vec<profile::fire::KernelCurve> = chip
         .rates()
         .stale
@@ -924,21 +887,12 @@ pub(crate) fn at_load(
         let (still, served): (Vec<(u32, u32)>, Vec<(u32, u32)>) =
             lacking.iter().partition(|&&(n, k)| lacks(&with, n, k));
         if !served.is_empty() {
-            let mut tuned = chip.tuned().clone();
             for &(n, k) in &served {
                 tracing::info!(
-                    "kernel.dense: {n}x{k}: served by the curves stored under their stale key{}",
-                    if measuring == engine::rates::Measuring::Time {
-                        "; timed again behind serving, stored for the next load"
-                    } else {
-                        " (`[engine] measure = false`: not timed again)"
-                    }
+                    "kernel.dense: {n}x{k}: served by the curves stored under their stale key, \
+                     until the next export round or `pie tune` times them again"
                 );
-                if measuring == engine::rates::Measuring::Time {
-                    tuned.behind.push(format!("{CURVE_BEHIND}{n}x{k}"));
-                }
             }
-            chip = chip.with_tuned(tuned);
             curves = with;
         }
         still
@@ -956,7 +910,7 @@ pub(crate) fn at_load(
     } else if !lacking.is_empty() {
         let began = std::time::Instant::now();
         let measured =
-            match measure_at(device, &chip, device.cores(), &lacking, &LOAD_ROWS, None, &mut |_| {}) {
+            match measure_at(device, &chip, device.cores(), &lacking, &LOAD_ROWS, &mut |_| {}) {
                 Ok(m) => m,
                 Err(why) => {
                     eprintln!("{name}: kernel.dense not measured: {why}; the profile's route serves");
@@ -999,7 +953,7 @@ pub(crate) fn at_load(
     } else {
         tracing::info!(
             "kernel.dense: every curve of the model's {} bf16 shapes stored or committed (a stale \
-             one served by its figure and timed behind serving); none timed before ready",
+             one served by its figure until the next export); none timed",
             shapes.len()
         );
     }
