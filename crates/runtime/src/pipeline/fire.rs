@@ -2839,6 +2839,10 @@ impl Drop for Unplaced {
 /// dropped before that, the engine being done with it.
 struct RsDeviceFold {
     ws: crate::store::rs::RsWorkingSetId,
+    /// Checkpoints of `ws` taken ahead of the fire's later fires
+    /// ([`checkpoints_ahead`]), forked before the fold: each folds by the
+    /// same count.
+    followers: Vec<crate::store::rs::RsWorkingSetId>,
     submitted: Option<(
         std::sync::Arc<std::sync::Mutex<crate::store::rs::RsStore>>,
         crate::engine::WorkItemCompletion,
@@ -2859,8 +2863,13 @@ impl RsDeviceFold {
     fn planned(ws: crate::store::rs::RsWorkingSetId) -> Self {
         Self {
             ws,
+            followers: Vec::new(),
             submitted: None,
         }
+    }
+
+    fn sets(&self) -> impl Iterator<Item = crate::store::rs::RsWorkingSetId> + '_ {
+        std::iter::once(self.ws).chain(self.followers.iter().copied())
     }
 
     fn submitted(
@@ -2868,7 +2877,11 @@ impl RsDeviceFold {
         stores: &crate::store::registry::Stores,
         completion: &crate::engine::WorkItemCompletion,
     ) {
-        stores.rs.lock().unwrap().begin_device_fold(self.ws);
+        let mut store = stores.rs.lock().unwrap();
+        for ws in self.sets() {
+            store.begin_device_fold(ws);
+        }
+        drop(store);
         self.submitted = Some((stores.rs.clone(), completion.clone()));
     }
 
@@ -2876,10 +2889,10 @@ impl RsDeviceFold {
     /// `failure` why it did not run.
     fn settle(mut self, slots: Option<u32>, failure: Option<&str>) {
         if let Some((store, _)) = self.submitted.take() {
-            store
-                .lock()
-                .unwrap()
-                .end_device_fold(self.ws, slots, failure);
+            let mut store = store.lock().unwrap();
+            for ws in self.sets() {
+                store.end_device_fold(ws, slots, failure);
+            }
         }
     }
 }
@@ -2889,13 +2902,56 @@ impl Drop for RsDeviceFold {
         let Some((store, completion)) = self.submitted.take() else {
             return;
         };
-        let ws = self.ws;
+        let sets: Vec<_> = self.sets().collect();
         completion.on_settled(move || {
-            store
-                .lock()
-                .unwrap()
-                .end_device_fold(ws, None, Some(Self::DROPPED));
+            let mut store = store.lock().unwrap();
+            for ws in sets {
+                store.end_device_fold(ws, None, Some(Self::DROPPED));
+            }
         });
+    }
+}
+
+/// The checkpoints of a recurrent state (a record: a folded state, or a
+/// ring-only window) at the end of the fire `parts` describes, just
+/// submitted, taken now ([`crate::store::rs::RsStore::checkpoint_ahead`]):
+/// before any later fire of the set is laid, a cut pass's next piece or a
+/// decode run ahead, which would otherwise write the record in place
+/// before the take at this fire's settle could fork it. The later fire
+/// finds the record shared and copies it on the device, behind this one;
+/// nothing waits. Called before the fire's device folds are marked, so a
+/// fold the device counts is followed by the fork. One refused stays to be
+/// taken at the settle, which names why.
+fn checkpoints_ahead(
+    stores: &crate::store::registry::Stores,
+    checkpoints: &mut [TakeCheckpoint],
+    parts: &mut [FireWs],
+) {
+    for checkpoint in checkpoints
+        .iter_mut()
+        .filter(|checkpoint| !checkpoint.snapshot && checkpoint.window_at.is_none())
+    {
+        let forked = stores.rs.lock().unwrap().checkpoint_ahead(checkpoint.rs);
+        let snapshot = match forked {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::debug!(%error, "pipeline: a checkpoint taken ahead of the next fire");
+                continue;
+            }
+        };
+        for part in parts.iter_mut() {
+            if let Some(FoldAt {
+                by: FoldBy::Settled { rs: Some(fold), .. },
+                ..
+            }) = &mut part.fold
+                && fold.ws == checkpoint.rs
+            {
+                fold.followers.push(snapshot);
+            }
+        }
+        checkpoint.rs = snapshot;
+        checkpoint.snapshot = true;
     }
 }
 
@@ -3030,30 +3086,39 @@ impl Drop for ReportTag {
     }
 }
 
-/// A snapshot no checkpoint takes is released.
+/// A snapshot no checkpoint takes is released. A checkpoint the pass asked
+/// and its fire ran to is kept, or refused by name: never let go unsaid.
 pub(crate) fn take_checkpoint(
     stores: &crate::store::registry::Stores,
     checkpoint: &TakeCheckpoint,
     success: bool,
-) {
+) -> Result<(), String> {
     let release = || {
         if checkpoint.snapshot {
             stores.rs.lock().unwrap().release_working_set(checkpoint.rs);
         }
     };
     if !success {
-        return release();
+        release();
+        return Ok(());
     }
     let owner = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
         kv.owner_of(checkpoint.kv)
     });
     let taken = if checkpoint.snapshot {
-        stores
-            .rs
-            .lock()
-            .unwrap()
-            .keep(checkpoint.rs, checkpoint.key, owner);
-        Ok(true)
+        let mut rs = stores.rs.lock().unwrap();
+        // A fork that followed a fold the device counted, which went
+        // unreported, states no length its record stands at.
+        match rs.device_fold_gate(checkpoint.rs) {
+            Ok(()) => {
+                rs.keep(checkpoint.rs, checkpoint.key, owner);
+                Ok(true)
+            }
+            Err(error) => {
+                rs.release_working_set(checkpoint.rs);
+                Err(error)
+            }
+        }
     } else {
         let mut rs = stores.rs.lock().unwrap();
         match checkpoint.window_at {
@@ -3066,9 +3131,14 @@ pub(crate) fn take_checkpoint(
             crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                 kv.keep_checkpoint(checkpoint.kv, checkpoint.pages, owner);
             });
+            Ok(())
         }
-        Ok(false) => {}
-        Err(error) => tracing::debug!(%error, "pipeline: keeping a checkpoint"),
+        // A state that holds nothing yet: nothing to keep.
+        Ok(false) => Ok(()),
+        Err(error) => Err(format!(
+            "pipeline: the checkpoint asked at page {}: {error}",
+            checkpoint.pages
+        )),
     }
 }
 
@@ -5500,6 +5570,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             for part in &mut parts {
                 part.kvtxn.retire_on(&completion);
             }
+            // Before the next piece is laid, which would write the record
+            // the checkpoint keeps.
+            checkpoints_ahead(&stores, &mut checkpoints_here, &mut parts);
             mark_device_folds(&stores, &completion, &mut parts);
             unsettle(&stores, &completion, &mut parts);
             submitted.push(completion.clone());
@@ -6396,6 +6469,8 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
     });
     let success = failure_reason.is_none();
     let mut leases = Vec::with_capacity(kv.len());
+    // A checkpoint the pass asked and could not keep fails it by name.
+    let mut refused = None;
 
     {
         let stores = crate::store::registry::get(model, engine);
@@ -6477,9 +6552,12 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
             );
         }
         for checkpoint in &checkpoints {
-            take_checkpoint(&stores, checkpoint, success);
+            if let Err(refusal) = take_checkpoint(&stores, checkpoint, success) {
+                refused.get_or_insert(refusal);
+            }
         }
     }
+    let failure_reason = failure_reason.or(refused);
 
     for planner in crate::planner::planners() {
         planner.pages_freed();
@@ -9118,6 +9196,8 @@ pub(crate) mod fold_tests {
         a_piece_inside_the_frozen_prefix_begins_nothing();
         a_pass_supplied_from_the_cache_folds_what_it_states();
         a_state_resumes_no_further_than_its_pass_folds();
+        a_record_checkpoint_on_a_cut_is_kept_with_the_next_piece_on_its_way();
+        a_checkpoint_taken_ahead_follows_the_fold_the_device_counts();
     }
 
     fn a_fire_carrying_a_span_leaves_its_lag() {
@@ -10371,6 +10451,160 @@ pub(crate) mod fold_tests {
         assert_eq!(resume(&stores, ws, rs, &[[8; 32], [9; 32]], 2, 16), 0);
         assert_eq!(both(ws, rs), (0, 0));
         assert_eq!(stores.kv.lock().mapped_len(ws).unwrap(), 0);
+    }
+
+    /// An engine that lands no state inside a fire (`rs_snapshots` 0) has a
+    /// pass over a record state (a folded state, or a ring-only window) cut
+    /// at its asked checkpoint row, 32 here: the first piece (0..32) takes it
+    /// as it settles, and the next (32..64) is laid before then. Taken at
+    /// the settle, the record was already the next piece's to write in
+    /// place, and the take was dropped unsaid; now it is refused by name.
+    /// Taken ahead, as the first piece is submitted, the next piece finds
+    /// the record shared and copies it on the device behind the first: the
+    /// checkpoint is kept while the next piece is on its way, and a later
+    /// request maps it.
+    fn a_record_checkpoint_on_a_cut_is_kept_with_the_next_piece_on_its_way() {
+        let model = crate::store::registry::register_model(16, &[16], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let geometry = crate::store::rs::RsGeometry {
+            state_size: 8,
+            buffer_page_tokens: 4,
+        };
+        let tokens: Vec<u32> = (0..64).map(|t| 1900 + t).collect();
+        let (slots, keys) = sealed_prompt(&stores, &tokens);
+        // A piece of 32 rows, folding them, laid and on its way.
+        let piece = |rs| {
+            let mut store = stores.rs.lock().unwrap();
+            let prepared = store
+                .prepare_group(rs, true, false, Some(32), None, None)
+                .unwrap();
+            let state = *prepared.state().unwrap();
+            let (published, folds) = store.publish_batch(vec![prepared]).unwrap();
+            store.commit_folds(folds);
+            (published, state)
+        };
+        let pass = |ahead: bool| {
+            let kv = stores.kv.lock().create_working_set();
+            let rs = stores.rs.lock().unwrap().create_working_set(geometry);
+            let (first, written) = piece(rs);
+            let mut checkpoints = vec![TakeCheckpoint {
+                kv,
+                rs,
+                snapshot: false,
+                pages: 2,
+                key: keys[1],
+                window_at: None,
+            }];
+            if ahead {
+                checkpoints_ahead(&stores, &mut checkpoints, &mut []);
+                assert!(checkpoints[0].snapshot, "forked as the piece is submitted");
+            }
+            let (next, copied) = piece(rs);
+            let mut store = stores.rs.lock().unwrap();
+            store.settle(first);
+            drop(store);
+            (rs, written, next, copied, checkpoints)
+        };
+
+        // Taken at the settle: the next piece writes the record in place.
+        let (rs, written, next, copied, checkpoints) = pass(false);
+        assert_eq!(copied.slot, written.slot, "nothing shared it: written in place");
+        let refused = take_checkpoint(&stores, &checkpoints[0], true).unwrap_err();
+        assert!(
+            refused.contains("a fire on its way writes the state it would keep"),
+            "{refused}"
+        );
+        assert!(!stores.rs.lock().unwrap().has_checkpoint(&keys[1]));
+        let mut store = stores.rs.lock().unwrap();
+        store.settle(next);
+        store.release_working_set(rs);
+        drop(store);
+
+        // Taken ahead: the next piece copies the record first.
+        let (rs, written, next, copied, checkpoints) = pass(true);
+        assert_ne!(copied.slot, written.slot);
+        assert_eq!(copied.copy_from, Some(written.slot), "copied on the device");
+        assert_eq!(take_checkpoint(&stores, &checkpoints[0], true), Ok(()));
+        assert!(
+            stores.rs.lock().unwrap().has_checkpoint(&keys[1]),
+            "kept while the next piece is on its way"
+        );
+        let kept = stores.rs.lock().unwrap().frozen(checkpoints[0].rs);
+        assert_eq!(kept, Ok(32), "the state as of the cut");
+        let ws = stores.kv.lock().create_working_set();
+        let resumed = stores.rs.lock().unwrap().create_working_set(geometry);
+        let supplied = supply(
+            &stores,
+            ws,
+            &rows(0, &tokens),
+            &slots,
+            Attach::Checkpoint(resumed),
+            64,
+            16,
+        );
+        assert_eq!(supplied.rows, 32, "a later request maps it");
+        let mut store = stores.rs.lock().unwrap();
+        assert_eq!(store.frozen(resumed), Ok(32));
+        assert_eq!(store.folded_slot(resumed), Ok(Some(written.slot)));
+        assert_eq!(store.folded_slot(rs), Ok(Some(copied.slot)));
+        store.settle(next);
+        assert_eq!(store.frozen(rs), Ok(64), "the set went on");
+    }
+
+    /// A checkpoint taken ahead of a fire whose fold the device counts is
+    /// forked before that fold: it follows the fold, refused as a
+    /// checkpoint until the count lands, then standing where it left the
+    /// set. One whose fold went unreported is refused by name.
+    fn a_checkpoint_taken_ahead_follows_the_fold_the_device_counts() {
+        let model = crate::store::registry::register_model(16, &[16], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        for reported in [Some(3), None] {
+            let kv = stores.kv.lock().create_working_set();
+            let rs = state_at(&stores, 4);
+            {
+                let mut store = stores.rs.lock().unwrap();
+                let prepared = store
+                    .prepare_group(rs, true, false, None, None, None)
+                    .unwrap();
+                let published = store.publish_prepared(prepared).unwrap();
+                store.settle(published);
+            }
+            let key = [0x5a + u8::from(reported.is_none()); 32];
+            let mut checkpoints = vec![TakeCheckpoint {
+                kv,
+                rs,
+                snapshot: false,
+                pages: 1,
+                key,
+                window_at: None,
+            }];
+            checkpoints_ahead(&stores, &mut checkpoints, &mut []);
+            let snapshot = checkpoints[0].rs;
+            let mut fold = RsDeviceFold::planned(rs);
+            fold.followers.push(snapshot);
+            let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+            fold.submitted(&stores, &completion);
+            assert_eq!(
+                stores.rs.lock().unwrap().device_fold_gate(snapshot),
+                Err(RsError::DeviceFoldUnsettled)
+            );
+            let failure = reported.is_none().then_some(RsDeviceFold::UNREPORTED);
+            fold.settle(reported, failure);
+            let taken = take_checkpoint(&stores, &checkpoints[0], true);
+            let store = stores.rs.lock().unwrap();
+            match reported {
+                Some(count) => {
+                    assert_eq!(taken, Ok(()));
+                    assert!(store.has_checkpoint(&key));
+                    assert_eq!(store.frozen(snapshot), Ok(4 + count));
+                    assert_eq!(store.frozen(rs), Ok(4 + count));
+                }
+                None => {
+                    assert!(taken.unwrap_err().contains("did not report"));
+                    assert!(!store.has_checkpoint(&key));
+                }
+            }
+        }
     }
 
     // A fold the device counts, between its fire's submit and its settle:
