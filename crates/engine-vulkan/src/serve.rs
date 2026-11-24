@@ -8,10 +8,6 @@ use engine_gpu::serve::{Landed, Launch, Plan, Prepared, ReadSpan, Serve, Shell, 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
 
-/// The tables of runs (a recurrent copy's scalars, [`kernels_slang::gather::rows::copy_runs`])
-/// an arm's fire block holds room for in one fire: a recurrent layer's
-/// extends and lands.
-const RUN_TABLES: u64 = 512;
 
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
@@ -360,11 +356,10 @@ impl Serve for Api {
         // take.
         let most = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
         let scalars = most.min(512);
-        let tables = if most > scalars {
-            RUN_TABLES * most.next_multiple_of(uniform)
-        } else {
-            0
-        };
+        // The recurrent copies' run tables, each its own place in the block
+        // at the uniform alignment, as many as the widest fire lays
+        // (`engine_gpu::rs::run_tables`, the bound a fire's seat copies by).
+        let tables = fires.run_tables * (fires.run_table_bytes.next_multiple_of(uniform) + uniform);
         let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
         // A recording moves every readout copy with the copier (its table,
         // count and group counts laid in the block, each at its alignment):

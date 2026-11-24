@@ -442,6 +442,10 @@ pub trait Serve: Backend {
 pub struct FireBound {
     pub dispatches: u32,
     pub readout_rows: u64,
+    /// The run tables the widest fire's recurrent copies lay
+    /// ([`crate::rs::run_tables`]), and the bytes of the largest.
+    pub run_tables: u64,
+    pub run_table_bytes: u64,
 }
 
 /// How a step goes to the device ([`Serve::plan`]).
@@ -2932,7 +2936,16 @@ impl<B: Serve> Shell<B> {
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         let weights_stream = weights.streams() || weights.gathered().is_some();
+        let (run_tables, run_table_bytes) = rs_layout.as_deref().map_or((0, 0), |layout| {
+            crate::rs::run_tables(
+                layout.in_of.len() + layout.out_of.len(),
+                span.rungs().last().map_or(1, |rung| rung.tokens),
+                boot.budget.max_lanes,
+            )
+        });
         let fires = FireBound {
+            run_tables,
+            run_table_bytes,
             dispatches: asks.dispatches + readouts.len() as u32,
             readout_rows: span.rungs().last().map_or(0, |rung| u64::from(rung.tokens))
                 * readouts
