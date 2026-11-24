@@ -185,16 +185,23 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
     // Past the ring's wrap, within the load's context.
     let past = ring_rows + 2 * page;
     let steps = past.saturating_sub(prompt).max(24).min(context - prompt - 1);
-    let mut fed: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
+    // The prompt in pieces a fire of both lanes takes, each lane folding
+    // every piece; then the decodes, lane 1 trailing.
+    let piece = (shell.budgets().tokens.max_tokens / 2).max(1);
+    let prompt_tokens: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
+    let mut pieces = prompt_tokens.chunks(piece as usize).map(<[u32]>::to_vec).collect::<Vec<_>>().into_iter();
+    let mut fed: Vec<u32> = pieces.next().expect("a prompt");
     let mut have = 0u32;
     let mut folded = [0u32; 2];
     let mut logits: [Vec<Vec<f32>>; 2] = [Vec::new(), Vec::new()];
-    for step in 0..=steps {
+    let mut decodes = 0u32;
+    loop {
         let rows = fed.len() as u32;
         let end = have + rows;
+        let prefilling = end <= prompt;
         let advance = [
             end - folded[0],
-            if step == 0 { rows } else { end.saturating_sub(LAG).saturating_sub(folded[1]) },
+            if prefilling { end - folded[1] } else { end.saturating_sub(LAG).saturating_sub(folded[1]) },
         ];
         let plan: Vec<(WindowFold, Vec<Vec<u32>>)> = (0..2)
             .map(|lane| {
@@ -238,6 +245,14 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
             logits[lane].push(got[lane].clone());
         }
         have = end;
+        if let Some(next) = pieces.next() {
+            fed = next;
+            continue;
+        }
+        if decodes == steps {
+            break;
+        }
+        decodes += 1;
         // Both lanes take lane 0's token: the same rows, step by step.
         fed = vec![argmax(&got[0])];
     }

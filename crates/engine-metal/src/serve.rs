@@ -306,6 +306,10 @@ pub struct Shell {
     /// the device's rates and the model's kernel.dense curves where it
     /// measured them; nothing where a stored or committed entry served each.
     measured_at_load: Vec<String>,
+    /// The `[rates]` keys this load serves by a figure stored under a stale
+    /// key (`profile::fire::Tuned::behind`), to time behind serving
+    /// (`engine::Engine::measure_behind`), each gone once timed and stored.
+    rates_behind: Vec<String>,
     /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
     /// seat-addressed fire backs only what the walk backed for it.
     warming: bool,
@@ -1773,6 +1777,7 @@ impl PreparedLoad<'_> {
         let shell = Shell {
             weighed,
             measured_at_load: chip.tuned().timed.clone(),
+            rates_behind: chip.tuned().behind.clone(),
             tuning,
             device,
             outside,
@@ -1900,6 +1905,25 @@ impl Shell {
             });
         }
         Ok(record[0])
+    }
+
+    /// The next `[rates]` key this load serves by a stale figure, to time
+    /// behind serving; `None` where none is left.
+    #[must_use]
+    pub fn rates_behind(&self) -> Option<&str> {
+        self.rates_behind.first().map(String::as_str)
+    }
+
+    /// `key` timed behind serving and stored: how many are left.
+    pub fn rate_timed(&mut self, key: &str) -> usize {
+        self.rates_behind.retain(|k| k != key);
+        self.rates_behind.len()
+    }
+
+    /// The device the load serves on.
+    #[must_use]
+    pub fn device(&self) -> &Context {
+        &self.device
     }
 
     /// What this load timed, each by name; empty where it measured nothing.
