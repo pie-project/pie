@@ -661,7 +661,7 @@ pub(super) fn knobs() -> engine_cuda::Knobs {
     // No weight shape stated: the tables and routed banks dense on the
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
-    knobs.dense_weights = true;
+    knobs.weights = engine_cuda::WeightPin::Dense;
     knobs.chip = picked(&cache_dir(), knobs.profiles.as_deref());
     knobs
 }
@@ -3054,8 +3054,7 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
     // The table's rows alone: the model's routed experts dense, as the
     // base engine seats them.
     let mut knobs = knobs();
-    knobs.dense_weights = false;
-    knobs.diagnostics.dense_experts = true;
+    knobs.weights = engine_cuda::WeightPin::DenseExperts;
     let mut shell = load_with(fixture, cache, knobs);
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
@@ -3202,7 +3201,7 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     let began = std::time::Instant::now();
     use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency};
     let mut knobs = knobs();
-    knobs.dense_weights = false;
+    knobs.weights = engine_cuda::WeightPin::Cached;
     knobs.weights_held = told;
     let mut shell = load_with(fixture, cache, knobs);
     let loaded = began.elapsed();
@@ -3426,7 +3425,7 @@ fn golden_measuring_refit() {
         std::fs::create_dir_all(&own).unwrap_or_else(|why| panic!("{}: {why}", own.display()));
         let told = || {
             let mut knobs = knobs();
-            knobs.dense_weights = false;
+            knobs.weights = engine_cuda::WeightPin::Cached;
             knobs.weights_held = true;
             knobs
         };
@@ -4008,8 +4007,7 @@ fn golden_budget_probe() {
         for &budget in &budgets {
             let mut knobs = knobs();
             if std::env::var_os("PIE_GOLDEN_UNTABLED").is_some() {
-                knobs.dense_weights = false;
-                knobs.diagnostics.untabled_experts = true;
+                knobs.weights = engine_cuda::WeightPin::UntabledExperts;
             }
             let allowance = engine::Allowance {
                 budget: Some(budget),
@@ -4045,8 +4043,7 @@ fn least_budget(
     let knobs = || {
         let mut knobs = knobs();
         if untabled {
-            knobs.dense_weights = false;
-            knobs.diagnostics.untabled_experts = true;
+            knobs.weights = engine_cuda::WeightPin::UntabledExperts;
         }
         knobs
     };
@@ -4106,7 +4103,7 @@ fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
 /// The staged-experts probe: `PIE_GOLDEN_MODELS` (quantized MoE miniatures;
 /// DeepSeek-V4-Flash's u4g64 one by default) loaded with its routed banks on
 /// the host tier and no table of the weight cache reading them
-/// (`untabled-experts`), so each fire stages the experts it routes to into
+/// (`WeightPin::UntabledExperts`), so each fire stages the experts it routes to into
 /// the run the load laid. The staging is the bound times its streams, the
 /// steps serve the device-resident banks' logits, a fire past the first
 /// round takes no device memory, the ledger enters it, no budget loads it
@@ -4139,8 +4136,7 @@ fn golden_staged_experts() {
 
         let staged = || {
             let mut knobs = knobs();
-            knobs.dense_weights = false;
-            knobs.diagnostics.untabled_experts = true;
+            knobs.weights = engine_cuda::WeightPin::UntabledExperts;
             knobs
         };
         let mut shell = load_with(&fixture, &cache, staged());

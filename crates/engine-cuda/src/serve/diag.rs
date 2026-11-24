@@ -22,13 +22,6 @@ pub struct Diagnostics {
     /// device profile's: a small one cuts a miniature's records into the
     /// pieces only a full model's take.
     pub chunk_bytes: Option<u64>,
-    /// States no expert shape: the routed banks stay dense on the device,
-    /// while the tables streamed by their rows are stated.
-    pub dense_experts: bool,
-    /// States no expert shape and still moves the routed banks the weight
-    /// cache would stream to the host tier: no table reads them, and each
-    /// fire stages the experts it routes to (`experts::staging`).
-    pub untabled_experts: bool,
     /// Copies between the device and the host tier ride the compute stream,
     /// ahead of every fire after them, not the swap stream beside those
     /// fires: to weigh the overlap.
@@ -70,8 +63,6 @@ impl Default for Diagnostics {
             fuse_chains: true,
             sync_guard: None,
             chunk_bytes: None,
-            dense_experts: false,
-            untabled_experts: false,
             tier_inline: false,
             unwritten_nan: false,
         }
@@ -125,12 +116,6 @@ impl Diagnostics {
         if let Some(bytes) = self.chunk_bytes {
             words.push(format!("chunk-bytes={bytes}"));
         }
-        if self.dense_experts {
-            words.push("dense-experts".to_string());
-        }
-        if self.untabled_experts {
-            words.push("untabled-experts".to_string());
-        }
         if self.tier_inline {
             words.push("tier-inline".to_string());
         }
@@ -156,7 +141,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, \
-     `dense-experts`, `untabled-experts`, `tier-inline`, `unwritten-nan`";
+     `tier-inline`, `unwritten-nan`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -180,8 +165,6 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
-                "dense-experts" => diag.dense_experts = switch(word, value)?,
-                "untabled-experts" => diag.untabled_experts = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
                 "unwritten-nan" => diag.unwritten_nan = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,

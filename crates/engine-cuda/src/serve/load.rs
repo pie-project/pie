@@ -158,7 +158,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         }
     }
     // So do the routed banks it streams an expert at a time.
-    if !boot.knobs.dense_weights() && !boot.knobs.diagnostics.dense_experts {
+    if !boot.knobs.dense_experts() {
         let banks = crate::store::layout::streamed_experts(&boot.trace);
         match host_copy(boot, &banks)? {
             HostCopy::Filed => {
@@ -1371,9 +1371,9 @@ impl Shell {
             &budgets,
             arena_bytes,
             boot.knobs.diagnostics.chunk_bytes,
-            // `untabled-experts`: the banks stay on the host tier with no
-            // shape, so no table reads them.
-            if boot.knobs.diagnostics.untabled_experts {
+            // A test's untabled experts: the banks stay on the host tier
+            // with no shape, so no table reads them.
+            if boot.knobs.weight_pin() == super::WeightPin::UntabledExperts {
                 &[]
             } else {
                 boot.residency.cached_experts()

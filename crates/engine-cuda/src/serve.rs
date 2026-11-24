@@ -25,7 +25,7 @@ mod settle;
 mod stats;
 
 pub use arming::{Armed, Kind, Seal};
-pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, QueueMasks, Recording};
+pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, QueueMasks, Recording, WeightPin};
 pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};

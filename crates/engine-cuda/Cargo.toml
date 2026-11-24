@@ -65,7 +65,7 @@ device = []
 # sees it. Off, no build writes those bytes.
 test-slot-fill = []
 
-# A test build's pins (`Knobs::pin`, `Knobs::dense_weights`): fires launched
+# A test build's pins (`Knobs::pin`, `Knobs::weights`): fires launched
 # eagerly, or a load with no weight shape. No profile or config reaches them;
 # serving captures every fire. The crate's own tests turn it on below.
 test-pins = []
