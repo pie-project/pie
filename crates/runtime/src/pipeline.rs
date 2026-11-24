@@ -15,6 +15,42 @@ use fire::{PendingFireQueue, PendingFires, PipelineFailure};
 /// closed. What `pipeline.speculation-advised` reads.
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether no process has work outstanding: no pipeline open (each parks
+/// or closes once its process has nothing in flight). What the engines'
+/// work behind serving waits for.
+#[must_use]
+pub fn none_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed) == 0
+}
+
+/// Every pipeline opened or made active again so far: what a turn delayed
+/// for a grace ([`crate::scheduler::lane::turn_behind_after`]) is cancelled
+/// by.
+static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When the last active pipeline parked or closed (none active since).
+static IDLE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// How many pipelines have opened so far ([`OPENED`]).
+#[must_use]
+pub fn opened() -> u64 {
+    OPENED.load(Ordering::Acquire)
+}
+
+/// How long no pipeline has been active; `None` while one is.
+#[must_use]
+pub fn idle_for() -> Option<std::time::Duration> {
+    if !none_active() {
+        return None;
+    }
+    IDLE_AT.lock().unwrap().map(|at| at.elapsed())
+}
+
+fn opening() {
+    OPENED.fetch_add(1, Ordering::AcqRel);
+    *IDLE_AT.lock().unwrap() = None;
+}
+
 pub struct Pipeline {
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,
@@ -31,7 +67,7 @@ pub struct Pipeline {
     /// working set, in submission order: what `retract` takes back. No more
     /// than the run-ahead window are kept, the most a program runs ahead
     /// of what it reads.
-    pub(crate) written: Mutex<std::collections::VecDeque<fire::FireWrites>>,
+    pub(crate) written: Mutex<std::collections::VecDeque<fire::WrittenFire>>,
 }
 
 impl Pipeline {
@@ -40,6 +76,7 @@ impl Pipeline {
         let weak_fires = Arc::downgrade(&fires);
         let failure: PipelineFailure = Arc::new(Mutex::new(None));
         ACTIVE.fetch_add(1, Ordering::Relaxed);
+        opening();
         Self {
             fires,
             scope: crate::store::PipelineScope::failing_as(failure.clone(), move || {
@@ -59,8 +96,14 @@ impl Pipeline {
         if self.active.swap(active, Ordering::Relaxed) != active {
             if active {
                 ACTIVE.fetch_add(1, Ordering::Relaxed);
-            } else {
-                ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                opening();
+            } else if ACTIVE.fetch_sub(1, Ordering::Relaxed) == 1 {
+                // The last one parked or closed: nothing is live. What the
+                // engines measure behind serving starts once a grace of one
+                // served step has passed with none opening (a back-to-back
+                // request opens inside it and pays nothing).
+                *IDLE_AT.lock().unwrap() = Some(std::time::Instant::now());
+                crate::scheduler::lane::turn_behind_after();
             }
         }
     }

@@ -172,9 +172,10 @@ fn ensure_by(
         Some(room),
         None,
         measuring,
-        // Nothing is timed behind serving on CUDA yet: a stale key is
-        // measured before ready.
-        false,
+        // A stale roofline key's figure serves; the engine times it again behind
+        // serving (`Shell::measure_behind`). Product banks are served stale
+        // and refreshed by the export round (not keys of this step).
+        engine::rates::StaleRates::TimedBehind,
         |_max_submit, _| {
             Ok(engine::rates::Measured {
                 rates: keys.stamp(measure(&measure_chip)?),
@@ -183,6 +184,25 @@ fn ensure_by(
             })
         },
     )
+}
+
+/// `rates` (a roofline key timed behind serving, keyed) saved in device
+/// `device`'s user profile under `profiles`; the path, or `None` where the
+/// load names no profile directory.
+pub fn save_behind(
+    profiles: Option<&std::path::Path>,
+    device: &str,
+    rates: &Rates,
+) -> Result<Option<String>, String> {
+    let Some(profiles) = profiles else {
+        return Ok(None);
+    };
+    let save = engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, device),
+        provenance: provenance(device),
+        registry: crate::chip::registry(),
+    };
+    engine::rates::save_rates(&save, rates).map(Some)
 }
 
 /// What a load measured of its decode products (`Shell::routes_by_body`):
@@ -335,6 +355,70 @@ pub fn measure(
     }
 }
 
+/// What a rates step behind serving fails with where a request arrived
+/// before one of its timings ([`measure_behind`]): it is abandoned there,
+/// the request waiting at most one burst, and timed again later.
+pub const YIELDED: &str = "yielded to an arriving request";
+
+/// One `[rates]` key timed behind serving: its figure, keyed by this
+/// build, and where the device's clock moved under it (its warm-up matmul
+/// read warmed before and again after, `engine::rates::clock_moved`), by
+/// how much.
+pub struct KeyTimed {
+    pub rates: Rates,
+    pub moved: Option<f64>,
+}
+
+/// `key` (of [`KEYS`]) of the device `device` serves on, timed on its
+/// stream through a context of slabs of its own
+/// (`crate::device::Context::apart`), so nothing serving launches through
+/// changes; the launch's cost taken off it as `launch_ns` states it.
+/// `arrived` is read before every timed burst: once a request has arrived
+/// the step stops there, failing with [`YIELDED`]. The
+/// step's buffers are its own, laid where the device's free memory holds
+/// them (else refused by name), and given back to the driver after.
+pub fn measure_behind(
+    device: &crate::device::Context,
+    keys: &crate::stored::Keys,
+    key: &str,
+    launch_ns: Option<u64>,
+    arrived: &dyn Fn() -> bool,
+) -> Result<KeyTimed, String> {
+    #[cfg(feature = "device")]
+    {
+        // The step lays at most `step_bytes`, the clock's reference beside it.
+        let wants = 2 * engine::rates::step_bytes();
+        let (free, _) = crate::store::device_memory().map_err(|e| e.to_string())?;
+        if free < wants {
+            return Err(format!(
+                "the device has {} MiB free, and the rates step behind serving lays up to {} MiB",
+                free >> 20,
+                wants >> 20
+            ));
+        }
+        let (ctx, slabs) = device.apart();
+        let measured = on_device::measure_on(device, &ctx, &[key], launch_ns, true, arrived);
+        // SAFETY: the step synchronized its stream before it returned (or
+        // faulted out of it), and nothing launches through `ctx` again.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = crate::device::ctx::sync(device.stream());
+            slabs.release();
+        }
+        crate::device::held::release_idle();
+        let (measured, clock) = measured?;
+        Ok(KeyTimed {
+            rates: keys.stamp(measured.rates),
+            moved: clock.and_then(|(before, after)| engine::rates::clock_moved(before, after)),
+        })
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (device, keys, key, launch_ns, arrived);
+        Err(crate::error::Fault::Runtimeless.to_string())
+    }
+}
+
 #[cfg(feature = "device")]
 #[allow(unsafe_code)]
 mod on_device {
@@ -391,14 +475,17 @@ mod on_device {
     }
 
     /// Two events on a stream, timing the work between them.
-    struct Clock {
+    struct Clock<'a> {
         start: rt::cudaEvent_t,
         stop: rt::cudaEvent_t,
         stream: *mut c_void,
+        /// Read before every timing: once it answers true, no timing
+        /// starts, the step is abandoned ([`super::YIELDED`]).
+        arrived: &'a dyn Fn() -> bool,
     }
 
-    impl Clock {
-        fn new(stream: *mut c_void) -> Result<Clock, String> {
+    impl<'a> Clock<'a> {
+        fn new(stream: *mut c_void, arrived: &'a dyn Fn() -> bool) -> Result<Clock<'a>, String> {
             let mut start: rt::cudaEvent_t = core::ptr::null_mut();
             let mut stop: rt::cudaEvent_t = core::ptr::null_mut();
             // SAFETY: live out-parameters; this thread bound the device.
@@ -412,11 +499,15 @@ mod on_device {
                 start,
                 stop,
                 stream,
+                arrived,
             })
         }
 
         /// The ns `work` takes on the stream.
         fn time(&self, work: &mut dyn FnMut() -> Result<(), String>) -> Result<f64, String> {
+            if (self.arrived)() {
+                return Err(super::YIELDED.to_string());
+            }
             let mut ms = 0f32;
             // SAFETY: the events are this clock's, the stream the context's.
             unsafe {
@@ -489,7 +580,7 @@ mod on_device {
         }
     }
 
-    impl Drop for Clock {
+    impl Drop for Clock<'_> {
         fn drop(&mut self) {
             // SAFETY: created by `new`, destroyed once, after the last sync.
             unsafe {
@@ -578,60 +669,107 @@ mod on_device {
     pub(super) fn measure(ordinal: i32, chip: &profile::Profile) -> Result<Measured, String> {
         let mut device = Context::bind(ordinal, None).map_err(say("the device"))?;
         device.set_tuning(kernels_cuda::tuning::Tuning::of(chip));
+        measure_on(&device, device.ctx(), &KEYS, None, false, &|| false).map(|(measured, _)| measured)
+    }
+
+    /// The `wanted` rates of `device` (of [`KEYS`]), each launched through
+    /// `ctx` on `device`'s stream; the launch's cost taken off each as
+    /// `launch_ns` states it where the launch is not wanted. Where
+    /// `clocked`, the device's clock read off the warm-up's matmul before
+    /// (warmed, `engine::rates::warmed`) and after them.
+    pub(super) fn measure_on(
+        device: &Context,
+        ctx: &Ctx,
+        wanted: &[&str],
+        launch_ns: Option<u64>,
+        clocked: bool,
+        arrived: &dyn Fn() -> bool,
+    ) -> Result<(Measured, Option<(engine::rates::ClockRead, engine::rates::ClockRead)>), String> {
+        let wants = |key: &str| wanted.contains(&key);
         let stream = device.stream();
-        let clock = Clock::new(stream)?;
+        let clock = Clock::new(stream, arrived)?;
         let mut held = Vec::new();
         let random = Random::new(stream)?;
         // The launch first: every rate below takes its dispatches' launches
         // off (engine::rates::rate_from).
-        let launch = launch(device.ctx(), stream, &clock, &mut held)?;
+        let launch = match launch_ns {
+            Some(ns) if !wants("launch_ns") => ns,
+            _ => launch(ctx, stream, &clock, &mut held)?,
+        };
         let gap = launch as f64;
-        let warmed = warm(device.ctx(), &clock, &random, &mut held)?;
+        let reference = Reference::lay(&random)?;
+        let warmed = warm(ctx, &clock, &reference, &mut held)?;
+        // Held past the warm-up only where it reads the clock.
+        let reference = clocked.then_some(reference);
         eprintln!(
             "[rates]: warm-up: {} rotations of the {}^3 matmul, settled at {:.1} TFLOP/s",
             warmed.rotations,
             engine::rates::WARM_SHAPE.0,
             warmed.rate / 1e3
         );
+        let before = match &reference {
+            Some(reference) => Some(engine::rates::warmed(|| clock_read(ctx, &clock, reference))?),
+            None => None,
+        };
         let mut gemm = Vec::new();
-        for w in engine::rates::GEMM_WIDTHS {
-            let mut planes = Planes::lay(&random, (w, w))?;
-            let mut curve = Vec::new();
-            for m in engine::rates::GEMM_ROWS {
-                let rate = planes.at(device.ctx(), &clock, &random, &mut held, m, gap)?;
-                curve.push((m, rate));
+        if wants("gemm_tflops_by_rows") {
+            for w in engine::rates::GEMM_WIDTHS {
+                let mut planes = Planes::lay(&random, (w, w))?;
+                let mut curve = Vec::new();
+                for m in engine::rates::GEMM_ROWS {
+                    let rate = planes.at(ctx, &clock, &random, &mut held, m, gap)?;
+                    curve.push((m, rate));
+                }
+                gemm.push((w, curve));
             }
-            gemm.push((w, curve));
         }
         let mut attn = Vec::new();
-        for keys in engine::rates::ATTN_KEYS {
-            let rate = attention(&device, &clock, &random, &mut held, keys, 128, gap)?;
-            attn.push((keys, rate));
-        }
-        let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
         let mut attn_by_dim = Vec::new();
-        for d in engine::rates::ATTN_DIMS {
-            let rate = match attn.last() {
-                Some(&(_, rate)) if d == 128 => rate,
-                _ => attention(&device, &clock, &random, &mut held, longest, d, gap)?,
-            };
-            attn_by_dim.push((d, rate / 1e3));
+        if wants("attn_tflops_by_keys") {
+            for keys in engine::rates::ATTN_KEYS {
+                let rate = attention(device, ctx, &clock, &random, &mut held, keys, 128, gap)?;
+                attn.push((keys, rate));
+            }
+            let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
+            for d in engine::rates::ATTN_DIMS {
+                let rate = match attn.last() {
+                    Some(&(_, rate)) if d == 128 => rate,
+                    _ => attention(device, ctx, &clock, &random, &mut held, longest, d, gap)?,
+                };
+                attn_by_dim.push((d, rate / 1e3));
+            }
         }
-        let elementwise = elementwise(device.ctx(), &clock, &random, &mut held, gap)?;
-        let scan = scan(device.ctx(), &clock, &random, &mut held, SCAN_SHAPE, gap)?;
-        let bytes = copy(stream, &clock, gap)?;
+        let elementwise = wants("elementwise_gbps")
+            .then(|| elementwise(ctx, &clock, &random, &mut held, gap))
+            .transpose()?;
+        let scan = wants("scan_gelems")
+            .then(|| scan(ctx, &clock, &random, &mut held, SCAN_SHAPE, gap))
+            .transpose()?;
+        let bytes = wants("hbm_gbps")
+            .then(|| copy(stream, &clock, gap))
+            .transpose()?;
         #[cfg(feature = "rocm")]
-        let cached = Some(cached(device.ctx(), &clock, gap)?);
+        let cached = wants("cached_gbps")
+            .then(|| cached(ctx, &clock, gap))
+            .transpose()?;
         #[cfg(not(feature = "rocm"))]
         let cached: Option<f64> = None;
-        let (few_row, resident) = few_rows(device.ctx(), &clock, &random, &mut held, gap)?;
-        eprintln!(
-            "[rates]: the few-rows kernel at {FEW_ROWS} x {w} x {w}: {:.1} TFLOP/s, {resident} \
-             blocks a multiprocessor",
-            few_row / 1e3,
-            w = engine::rates::GEMM_WIDTH
-        );
-        device.synchronize().map_err(say("the device"))?;
+        let few = (wants("few_row_tflops") || wants("workgroups_per_core"))
+            .then(|| few_rows(ctx, &clock, &random, &mut held, gap))
+            .transpose()?;
+        if let Some((few_row, resident)) = few {
+            eprintln!(
+                "[rates]: the few-rows kernel at {FEW_ROWS} x {w} x {w}: {:.1} TFLOP/s, {resident} \
+                 blocks a multiprocessor",
+                few_row / 1e3,
+                w = engine::rates::GEMM_WIDTH
+            );
+        }
+        let after = match &reference {
+            Some(reference) => Some(clock_read(ctx, &clock, reference)?),
+            None => None,
+        };
+        crate::device::ctx::sync(stream).map_err(say("the device"))?;
         eprintln!(
             "[rates]: the step held at most {} MiB of device buffers ({} MiB of slabs at its end)",
             PEAK.load(Ordering::Relaxed) >> 20,
@@ -645,35 +783,27 @@ mod on_device {
                 .map(|(x, r)| (x, tenth(r / 1e3)))
                 .collect()
         };
-        Ok(Measured {
-            rates: Rates {
-                landing: None,
-                stale: None,
-                load_width: None,
-                launch_ns: Some(launch),
-                gemm_tflops_by_rows: Some(
-                    gemm.into_iter()
-                        .map(|(w, curve)| (w, tflops(curve)))
-                        .collect(),
-                ),
-                attn_tflops_by_keys: Some(tflops(attn)),
-                hbm_gbps: Some(tenth(bytes)),
-                cached_gbps: cached.map(tenth),
-                elementwise_gbps: Some(tenth(elementwise)),
-                scan_gelems: Some(tenth(scan)),
-                few_row_tflops: Some(tenth(few_row / 1e3)),
-                workgroups_per_core: Some(f64::from(resident)),
-                submit_worst_ratio: None,
-                resident_workgroups: None,
-                attn_tflops_by_rows_keys: None,
-                product_ns: None,
-                kernel_tflops_by_shape: None,
-                dense_settled: Vec::new(),
-                measured_on: None,
-                measured_by: None,
-            },
-            attn_by_dim,
-        })
+        let rates = Rates {
+            launch_ns: wants("launch_ns").then_some(launch),
+            gemm_tflops_by_rows: (!gemm.is_empty()).then(|| {
+                gemm.into_iter()
+                    .map(|(w, curve)| (w, tflops(curve)))
+                    .collect()
+            }),
+            attn_tflops_by_keys: (!attn.is_empty()).then(|| tflops(attn)),
+            hbm_gbps: bytes.map(tenth),
+            cached_gbps: cached.map(tenth),
+            elementwise_gbps: elementwise.map(tenth),
+            scan_gelems: scan.map(tenth),
+            few_row_tflops: few
+                .filter(|_| wants("few_row_tflops"))
+                .map(|(rate, _)| tenth(rate / 1e3)),
+            workgroups_per_core: few
+                .filter(|_| wants("workgroups_per_core"))
+                .map(|(_, resident)| f64::from(resident)),
+            ..Rates::default()
+        };
+        Ok((Measured { rates, attn_by_dim }, before.zip(after)))
     }
 
     /// The per-row ops' bandwidth: the rmsnorm, then the swiglu, at
@@ -724,34 +854,76 @@ mod on_device {
         )
     }
 
+    /// The warm-up's matmul at `engine::rates::WARM_SHAPE` over its
+    /// rotation of weight planes, laid once: the device's warm-up and its
+    /// clock's reference.
+    struct Reference {
+        act: Buffer,
+        y: Buffer,
+        weights: Vec<Buffer>,
+    }
+
+    impl Reference {
+        fn lay(random: &Random) -> Result<Reference, String> {
+            let (m, n, k) = engine::rates::WARM_SHAPE;
+            Ok(Reference {
+                act: random.operand(m as usize * k as usize * 2)?,
+                y: zeroed(m as usize * n as usize * 2)?,
+                weights: (0..weights_at(n, k))
+                    .map(|_| random.operand(n as usize * k as usize * 2))
+                    .collect::<Result<Vec<Buffer>, String>>()?,
+            })
+        }
+
+        fn fire(&self, ctx: &Ctx, w: usize) -> Result<(), Kernel> {
+            let (m, n, k) = engine::rates::WARM_SHAPE;
+            kernels_cuda::linear::gemm::matmul(
+                ctx,
+                Tensor::new(self.act.ptr(), m, k, Dtype::Bf16),
+                Tensor::new(self.weights[w % self.weights.len()].ptr(), n, k, Dtype::Bf16),
+                &mut Tensor::new(self.y.ptr(), m, n, Dtype::Bf16),
+            )
+        }
+
+        /// The ns of one rotation over every plane.
+        fn rotation(&self, ctx: &Ctx, clock: &Clock) -> Result<f64, String> {
+            clock.time(&mut || {
+                (0..self.weights.len()).try_for_each(|w| self.fire(ctx, w).map_err(say("the matmul")))
+            })
+        }
+    }
+
     /// The device warmed (engine::rates::warm_up): bursts of the widest
     /// matmul over its planes until its rate stops falling.
     fn warm(
         ctx: &Ctx,
         clock: &Clock,
-        random: &Random,
+        reference: &Reference,
         held: &mut Vec<Buffer>,
     ) -> Result<engine::rates::Warmed, String> {
         let (m, n, k) = engine::rates::WARM_SHAPE;
-        let act = random.operand(m as usize * k as usize * 2)?;
-        let y = zeroed(m as usize * n as usize * 2)?;
-        let planes = weights_at(n, k);
-        let weights = (0..planes)
-            .map(|_| random.operand(n as usize * k as usize * 2))
-            .collect::<Result<Vec<Buffer>, String>>()?;
-        let fire = |w: usize| {
-            kernels_cuda::linear::gemm::matmul(
-                ctx,
-                Tensor::new(act.ptr(), m, k, Dtype::Bf16),
-                Tensor::new(weights[w % planes].ptr(), n, k, Dtype::Bf16),
-                &mut Tensor::new(y.ptr(), m, n, Dtype::Bf16),
-            )
-        };
-        lay(held, || fire(0))?;
+        lay(held, || reference.fire(ctx, 0))?;
         engine::rates::warm_up(|| {
-            let ns = clock
-                .time(&mut || (0..planes).try_for_each(|w| fire(w).map_err(say("the matmul"))))?;
-            Ok(engine::rates::gemm_flops(m, n, k) * planes as f64 / ns.max(1.0))
+            let ns = reference.rotation(ctx, clock)?;
+            Ok(engine::rates::gemm_flops(m, n, k) * reference.weights.len() as f64 / ns.max(1.0))
+        })
+    }
+
+    /// The device's clock read off the warm-up's matmul: the fastest of
+    /// [`ROUNDS`] rotations and their spread.
+    fn clock_read(
+        ctx: &Ctx,
+        clock: &Clock,
+        reference: &Reference,
+    ) -> Result<engine::rates::ClockRead, String> {
+        let times = (0..ROUNDS)
+            .map(|_| reference.rotation(ctx, clock))
+            .collect::<Result<Vec<f64>, String>>()?;
+        let fastest = times.iter().copied().fold(f64::INFINITY, f64::min);
+        let slowest = times.iter().copied().fold(0.0, f64::max);
+        Ok(engine::rates::ClockRead {
+            fastest_ns: fastest,
+            spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
         })
     }
 
@@ -833,8 +1005,10 @@ mod on_device {
     }
 
     /// The attention's rate at `keys_n` keys and width `head_dim`.
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         device: &Context,
+        ctx: &Ctx,
         clock: &Clock,
         random: &Random,
         held: &mut Vec<Buffer>,
@@ -842,7 +1016,6 @@ mod on_device {
         head_dim: u32,
         gap: f64,
     ) -> Result<f64, String> {
-        let ctx = device.ctx();
         let at = ATTN_SHAPE.at(keys_n).with_dim(head_dim);
         // One sequence attending its own keys, written before the attention.
         let (rows, d) = (at.rows, at.head_dim);

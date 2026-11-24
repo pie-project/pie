@@ -1211,6 +1211,8 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
             Some(256 << 20),
             Some(dir.path()),
             false,
+            1,
+            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -1429,6 +1431,8 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
             Some(budget),
             Some(dir.path()),
             false,
+            1,
+            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");

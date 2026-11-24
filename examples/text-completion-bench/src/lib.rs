@@ -80,6 +80,12 @@ struct Input {
     /// replay at a steady lag). 0 folds all it writes.
     #[serde(default)]
     fold_lag: u32,
+    /// Whether the prefill and the decode state their rows final
+    /// (`ForwardPass::final_rows`): the bench never takes a row back, so it
+    /// does unless asked not to (`false`: the lagged fold, for an A/B
+    /// against it) or a `fold_lag` holds rows unfolded on purpose.
+    #[serde(default = "stated_final")]
+    final_rows: bool,
     /// For a plane whose channel rings belong to the pass instance, not the channel.
     #[serde(default)]
     host_first_token: bool,
@@ -411,6 +417,15 @@ async fn run_one(
     fwd_p
         .state(&[&ws], geometry(lag, &prefill_fold))
         .context("bind prefill state")?;
+    // The bench never takes a row back, the prompt's included: a prefill
+    // stated final as its decodes are leaves no row for the first decode to
+    // carry, so no steady step catches one buffered (CONTRACT-BC 25).
+    let final_rows = input.final_rows && lag == 0;
+    if final_rows {
+        fwd_p
+            .final_rows()
+            .context("state the prefill's rows final")?;
+    }
     if input.checkpoint_prompt_end {
         let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
         fwd_p.checkpoints(&[end]).context("ask the prompt end's checkpoint")?;
@@ -436,6 +451,9 @@ async fn run_one(
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], geometry(lag, &decode_fold))
                 .context("bind decode state")?;
+            if final_rows {
+                fwd.final_rows().context("state the decode's rows final")?;
+            }
             let knobs = SampleKnobs::new(temperature, top_p, top_k);
             fwd.epilogue(move || {
                 sampler::decode(
@@ -653,6 +671,11 @@ async fn run_one(
         token_monotonic_ns,
         prologue_us,
     })
+}
+
+/// The bench's decode only appends: its rows are final unless asked.
+fn stated_final() -> bool {
+    true
 }
 
 /// The decode fires after the prefill's sample, which is the first token:

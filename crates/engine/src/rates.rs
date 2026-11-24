@@ -1147,9 +1147,23 @@ pub fn rates_at_load(
         room,
         max_submit,
         Measuring::Time,
-        false,
+        StaleRates::Measured,
         |max_submit, _| measure(max_submit),
     )
+}
+
+/// What an engine does with a rate (or curve) a layer states of its device
+/// under a stale key (a kernel's code or the measuring method changed): a
+/// statement of the engine's, by platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRates {
+    /// Served by the stale figure, and timed again behind serving.
+    TimedBehind,
+    /// Served by the stale figure, not timed again by this load (the next
+    /// export round refreshes it).
+    Served,
+    /// Measured again before ready, as a key no layer states.
+    Measured,
 }
 
 /// Whether a load times what no layer states (`[engine] measure`, `pie
@@ -1190,7 +1204,7 @@ pub fn resolve_at_load(
     room: Option<u64>,
     max_submit: Option<std::time::Duration>,
     measuring: Measuring,
-    times_behind: bool,
+    stale_rates: StaleRates,
     measure: impl FnOnce(Option<std::time::Duration>, &profile::fire::Rates) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
     // A checked-in file this device takes states a rate this pie does not
@@ -1212,13 +1226,13 @@ pub fn resolve_at_load(
     // estimate, and timed again behind serving
     // (`profile::fire::Tuned::behind`): a load never measures before ready
     // what it holds a figure for. Only a key no layer states at all is
-    // measured here. An engine that times nothing behind serving
-    // (`times_behind` false) measures them here too.
+    // measured here. What the engine does with such a key is its own
+    // statement ([`StaleRates`]).
     let stale = stated
         .stale
         .as_deref()
         .cloned()
-        .filter(|_| times_behind || measuring == Measuring::Skip)
+        .filter(|_| stale_rates != StaleRates::Measured || measuring == Measuring::Skip)
         .unwrap_or_default();
     let estimated: Vec<&'static str> =
         lacked.iter().copied().filter(|key| stale.states(key)).collect();
@@ -1229,17 +1243,22 @@ pub fn resolve_at_load(
             tracing::info!(
                 "rates: `[rates] {key}`: served by the figure stored under its stale key (the \
                  stored measurements' lines say why it is stale){}",
-                if measuring == Measuring::Time {
-                    "; timed again behind serving, stored for the next load"
-                } else {
-                    " (`[engine] measure = false`: not timed again)"
+                match (measuring, stale_rates) {
+                    (Measuring::Time, StaleRates::TimedBehind) => {
+                        "; timed again behind serving, stored for the next load"
+                    }
+                    (Measuring::Time, _) => {
+                        " (this engine does not time it behind serving here: the next export \
+                         round refreshes it)"
+                    }
+                    (Measuring::Skip, _) => " (`[engine] measure = false`: not timed again)",
                 }
             );
         }
         let stated = stated.over(stale.only(&estimated));
         let mut tuned = chip.tuned().clone();
         tuned.rates = stated.clone();
-        if measuring == Measuring::Time {
+        if measuring == Measuring::Time && stale_rates == StaleRates::TimedBehind {
             tuned
                 .behind
                 .extend(estimated.iter().map(|key| (*key).to_string()));
@@ -1391,6 +1410,78 @@ fn civil(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let y = yoe + era * 400 + i64::from(m <= 2);
     (y, m, d)
+}
+
+
+/// A device's clock read off a reference kernel (a backend's own: engine-gpu's
+/// smallest shape on the matmul curve, CUDA's point's own body): the fastest
+/// of a few single fires and their spread, `(slowest - fastest) / fastest`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockRead {
+    pub fastest_ns: f64,
+    pub spread: f64,
+}
+
+/// Reads of `read` taken until two in a row agree within their own spread
+/// (either way: a ramp still rising and a boost still falling both move by
+/// more): the settled clock, the median of the settled pair, at the wider
+/// spread. No process-wide fastest is kept: the reference is the clock
+/// measured right around the phase. A clock settles (a ramp has a top, a
+/// boost a sustained floor), so the reads end.
+pub fn warmed<E>(read: impl FnMut() -> Result<ClockRead, E>) -> Result<ClockRead, E> {
+    warmed_until(read, &|| false).map(|read| read.expect("never stopped"))
+}
+
+/// [`warmed`] behind serving, `stop` read before each read (a request
+/// arrived): `None` where it stopped, so an arrival waits at most one read.
+pub fn warmed_until<E>(
+    mut read: impl FnMut() -> Result<ClockRead, E>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>, E> {
+    if stop() {
+        return Ok(None);
+    }
+    let mut last = read()?;
+    loop {
+        if stop() {
+            return Ok(None);
+        }
+        let next = read()?;
+        let noise = last.spread.max(next.spread);
+        let low = last.fastest_ns.min(next.fastest_ns);
+        let high = last.fastest_ns.max(next.fastest_ns);
+        if high <= low * (1.0 + noise) {
+            return Ok(Some(ClockRead {
+                fastest_ns: (low + high) / 2.0,
+                spread: noise,
+            }));
+        }
+        last = next;
+    }
+}
+
+/// Whether a point's clock moved under it: its own warmed `before` read
+/// and its `after` read differ, either way, by more than their own spread
+/// (a boost ending, a ramp still rising, a sag): `Some(after over
+/// before)`. A point timed across a clock transition measures the
+/// transition, not the kernel, and is discarded.
+#[must_use]
+pub fn clock_moved(before: ClockRead, after: ClockRead) -> Option<f64> {
+    let noise = before.spread.max(after.spread);
+    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
+    (ratio > 1.0 + noise || ratio < 1.0 / (1.0 + noise)).then_some(ratio)
+}
+
+/// Whether a measuring phase ran throttled: its reference kernel read
+/// `before` it (warmed, a backend's warmed read, [`warmed`]) and `after` it. Throttling builds
+/// during a phase: throttled where the after read is slower than the
+/// before by more than the reads' own spread (the reference's noise, no
+/// margin chosen): `Some(after over before)`.
+#[must_use]
+pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
+    let noise = before.spread.max(after.spread);
+    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
+    (ratio > 1.0 + noise).then_some(ratio)
 }
 
 #[cfg(test)]
@@ -1746,17 +1837,16 @@ mod tests {
         build: &Build,
         measuring: Measuring,
     ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
-        load_behind(shelf, dir, build, measuring, false)
+        load_behind(shelf, dir, build, measuring, StaleRates::Measured)
     }
 
-    /// [`load_from`] by an engine that times a stale key behind serving
-    /// where `times_behind`.
+    /// [`load_from`] by an engine that does `stale_rates` with a stale key.
     fn load_behind(
         shelf: &profile::Shelf,
         dir: &std::path::Path,
         build: &Build,
         measuring: Measuring,
-        times_behind: bool,
+        stale_rates: StaleRates,
     ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
         let registry = profile::Registry::new("toy", &[], &[]);
         let facts = profile::Facts::of(&registry);
@@ -1773,7 +1863,7 @@ mod tests {
             None,
             None,
             measuring,
-            times_behind,
+            stale_rates,
             |_, stated| {
                 let lacked = stated.missing(&profile::fire::KEYS);
                 measured.set(lacked.clone());
@@ -1807,7 +1897,7 @@ mod tests {
             code: vec![("gemm", 8), ("copy", 9)],
             ..exported
         };
-        let (measured, loaded, report) = load_behind(shelf, &dir, &now, Measuring::Time, true);
+        let (measured, loaded, report) = load_behind(shelf, &dir, &now, Measuring::Time, StaleRates::TimedBehind);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(measured, Vec::<&str>::new(), "nothing before ready: {:#?}", report.stored);
         assert_eq!(loaded.rates().gemm_tflops_by_rows, all().gemm_tflops_by_rows);

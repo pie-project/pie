@@ -634,6 +634,10 @@ fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn pro
             i32::try_from(index).unwrap_or(0),
             device,
         ))),
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        "metal" => Some(Box::new(engine_metal::stored::Keys {
+            on: engine_metal::stored::measured_on(device),
+        })),
         _ => None,
     }
 }
@@ -680,6 +684,9 @@ pub fn export_bodies(backend: &Backend, cache_dir: &Path, out: &Path) -> Result<
     match backend.name {
         #[cfg(feature = "engine-cuda")]
         "cuda" => engine_cuda::serve::export_bodies(cache_dir, out)
+            .map_err(|e| format!("{}: {e}", out.display())),
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::armed::export(cache_dir, out)
             .map_err(|e| format!("{}: {e}", out.display())),
         _ => {
             let _ = (cache_dir, out);

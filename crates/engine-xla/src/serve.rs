@@ -343,8 +343,6 @@ pub struct Shell {
     behind: Behind,
     tuning: kernels_xla::tuning::Tuning,
     pad: crate::chip::Pad,
-    /// `chip::Engine::seats`.
-    seats: [bool; 3],
     tpu: crate::chip::Tpu,
     handles: Handles,
     trace: Trace,
@@ -561,12 +559,6 @@ impl Shell {
                 })
             })
             .collect()
-    }
-
-    /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
-    #[must_use]
-    pub fn seats(&self) -> [bool; 3] {
-        self.seats
     }
 
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
@@ -1257,7 +1249,6 @@ impl Shell {
         Ok(Shell {
             tuning,
             pad,
-            seats: engine.seats,
             tpu,
             device: std::sync::Arc::new(device),
             handles,
@@ -5241,8 +5232,8 @@ impl Shell {
         h.update(format!("{:?}", self.budgets).as_bytes());
         h.update(
             format!(
-                "{:?}|{:?}|{:?}|{:?}",
-                self.tuning, self.pad, self.seats, self.tpu
+                "{:?}|{:?}|{:?}",
+                self.tuning, self.pad, self.tpu
             )
             .as_bytes(),
         );

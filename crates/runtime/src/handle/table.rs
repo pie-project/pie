@@ -95,7 +95,6 @@ pub(crate) type Encode = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
 /// client sent them.
 #[derive(Debug)]
 pub(crate) struct Table {
-    client: ClientId,
     tenant: String,
     slots: HashMap<HandleName, Slot>,
     meta: HashMap<HandleName, Meta>,
@@ -106,14 +105,13 @@ pub(crate) struct Table {
 
 impl Default for Table {
     fn default() -> Self {
-        Table::new(0, String::new())
+        Table::new(String::new())
     }
 }
 
 impl Table {
-    pub(crate) fn new(client: ClientId, tenant: String) -> Self {
+    pub(crate) fn new(tenant: String) -> Self {
         Table {
-            client,
             tenant,
             slots: HashMap::new(),
             meta: HashMap::new(),
@@ -135,33 +133,17 @@ impl Table {
         else {
             return;
         };
-        let (tokens, folded, slots) = held.measure();
+        let (tokens, folded) = held.measure();
         policy::report(Event::HandleRested(
             meta.id,
             Resting {
-                client: self.client,
                 tenant: self.tenant.clone(),
                 session: meta.session.clone(),
                 props: meta.props.clone(),
                 tokens,
                 folded,
-                slots,
             },
         ));
-    }
-
-    /// The worker policy dropped the working set it knows as `id`. One a
-    /// process has by now is out of its reach: a policy ends that process.
-    pub(crate) fn discard(&mut self, id: ProcessId, why: String) {
-        let found = self.meta.iter().find_map(|(&name, meta)| {
-            (meta.id == id && matches!(self.slots.get(&name), Some(Slot::Parked(_))))
-                .then_some(name)
-        });
-        if let Some(name) = found {
-            self.slots.insert(name, Slot::Dead(why));
-            self.meta.remove(&name);
-            policy::report(Event::HandleGone(id, By::Policy));
-        }
     }
 
     pub(crate) fn lent(&self, name: HandleName) -> bool {
@@ -731,15 +713,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_policy_reaches_a_handle_only_at_rest() {
-        let mut table = Table::default();
-        answer(&mut table, new(1)).await;
-        let id = table.meta[&1].id;
-        table.discard(id, "gone".to_string());
-        assert!(
-            matches!(table.slots.get(&1), Some(Slot::Unborn(_))),
-            "nothing was there to drop"
-        );
-    }
 }

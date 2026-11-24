@@ -4046,6 +4046,34 @@ fn lagged_fold(
     geometry::Fold::Host(counts)
 }
 
+/// What a host-placed fire folds, `fold` as its pass states it, on sets
+/// that hold unfolded rows (`lags`: a recurrent state or windows). A
+/// run-ahead fire (`run_ahead`, its tokens the device's) folds no further
+/// than its program has accepted ([`lagged_fold`]), unless its pass stated
+/// its rows final (CONTRACT-BC 25): then, as a fire whose tokens the host
+/// places, it folds what it states at fire and accepts every row its sets
+/// hold, so its next fire carries nothing in.
+fn pass_fold(
+    fold: geometry::Fold,
+    lags: bool,
+    run_ahead: bool,
+    final_rows: bool,
+    lanes: &PassLanes,
+    groups: &LaneGroups,
+    landings: &[geometry::Landing],
+) -> geometry::Fold {
+    if !lags {
+        return fold;
+    }
+    if run_ahead && !final_rows {
+        return lagged_fold(&fold, lanes, groups, landings);
+    }
+    for cursor in &lanes.cursors {
+        cursor.lock().unwrap().accept_all();
+    }
+    fold
+}
+
 /// The outputs a fire just reserved its moves for publishes to the host:
 /// the program accepts the fire's rows as it takes them.
 fn host_reads(
@@ -4394,13 +4422,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         if placed_by_device {
             let pipeline = this.rep();
+            let final_rows = ctx.resources().get(&fwd)?.bindings.final_rows;
             let submitted = if ctx.resources().get(&fwd)?.devgeo.is_some() {
                 fire_device_geometry(ctx, this, fwd, frame).await?
             } else {
                 float::fire_float_lane(ctx, this, fwd, frame).await?
             };
             if submitted.is_ok() {
-                record_writes(ctx, pipeline, None)?;
+                record_writes(ctx, pipeline, None, final_rows)?;
             }
             return Ok(submitted);
         }
@@ -4677,17 +4706,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // take back the rest; a fire whose tokens the host places is
         // accepted as it is submitted, and everything before it with it.
         // A state that buffers no row folds every row as before.
+        // A pass whose program stated its rows final (CONTRACT-BC 25) takes
+        // no lag: its rows are never taken back, so it folds at fire what
+        // it states, as a host-placed fire does, and its next fire carries
+        // nothing in.
         let lags = !rs_ws_ids.is_empty() && stores.rs.lock().unwrap().holds_unfolded();
-        let fold = match (!lags, decode_envelope.is_some()) {
-            (true, _) => fold,
-            (false, true) => lagged_fold(&fold, &pass_lanes, &groups, &landings),
-            (false, false) => {
-                for cursor in &pass_lanes.cursors {
-                    cursor.lock().unwrap().accept_all();
-                }
-                fold
-            }
-        };
+        let final_rows = ctx.resources().get(&fwd)?.bindings.final_rows;
+        let fold = pass_fold(
+            fold,
+            lags,
+            decode_envelope.is_some(),
+            final_rows,
+            &pass_lanes,
+            &groups,
+            &landings,
+        );
         let window_state = crate::model::model().rs_caps().window_state;
         let window_only = window_only(&stores, window_state);
         // A long host pass runs as several fires; all but the last run the
@@ -5538,7 +5571,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             // A run-ahead fire's rows on a set with a recurrent state or
             // windows wait for the program to take what it publishes.
-            let run_ahead_reads = (last && decode_envelope.is_some() && lags)
+            let run_ahead_reads = (last && decode_envelope.is_some() && lags && !final_rows)
                 .then(|| host_reads(&cells, &accesses));
 
             let scheduler_clock = crate::scheduler::probe::ProbeClock::start();
@@ -5668,7 +5701,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
             }
         }
-        record_writes(ctx, this.rep(), Some(writes))?;
+        record_writes(ctx, this.rep(), Some(writes), final_rows)?;
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
         crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
@@ -6014,11 +6047,27 @@ pub(crate) struct SetStart {
 /// What one fire wrote, set by set: `None` where the device placed its rows.
 pub(crate) type FireWrites = Option<Vec<SetStart>>;
 
-fn record_writes<C: FireContext>(ctx: &mut C, pipeline: u32, writes: FireWrites) -> Anyhow<()> {
+/// One fire a pipeline keeps for `retract`: what it wrote, and whether its
+/// pass stated its rows final (CONTRACT-BC 25), which no retract reaches.
+#[derive(Clone)]
+pub(crate) struct WrittenFire {
+    pub(crate) sets: FireWrites,
+    pub(crate) final_rows: bool,
+}
+
+fn record_writes<C: FireContext>(
+    ctx: &mut C,
+    pipeline: u32,
+    writes: FireWrites,
+    final_rows: bool,
+) -> Anyhow<()> {
     let pipeline: Resource<Pipeline> = Resource::new_borrow(pipeline);
     let pipeline = ctx.resources().get(&pipeline)?;
     let mut written = pipeline.written.lock().unwrap();
-    written.push_back(writes);
+    written.push_back(WrittenFire {
+        sets: writes,
+        final_rows,
+    });
     // A fire further back than the run-ahead window is one the program
     // read past before submitting the newest: never taken back.
     let window = crate::scheduler::run_ahead_window();
@@ -6032,12 +6081,12 @@ fn record_writes<C: FireContext>(ctx: &mut C, pipeline: u32, writes: FireWrites)
 /// are taken back: where the first of them began writing it. `Err` names
 /// what cannot be taken back.
 fn retracted_ends(
-    written: &std::collections::VecDeque<FireWrites>,
+    written: &std::collections::VecDeque<WrittenFire>,
     fires: usize,
 ) -> Result<Vec<SetStart>, String> {
     let mut ends: Vec<SetStart> = Vec::new();
     for (at, fire) in written.iter().skip(written.len() - fires).enumerate() {
-        let Some(sets) = fire else {
+        let Some(sets) = &fire.sets else {
             return Err(format!(
                 "the {} fire from the end placed its rows where the device says, which the \
                  host cannot take back",
@@ -6052,6 +6101,17 @@ fn retracted_ends(
         }
     }
     Ok(ends)
+}
+
+/// Which of the last `fires` fires (counted from the end, 1 the last) is
+/// the latest whose pass stated its rows final, if any.
+fn final_fire(written: &std::collections::VecDeque<WrittenFire>, fires: usize) -> Option<usize> {
+    written
+        .iter()
+        .rev()
+        .take(fires)
+        .position(|fire| fire.final_rows)
+        .map(|at| at + 1)
 }
 
 /// Takes back what the last `fires` fires submitted on the closed pipeline
@@ -6081,6 +6141,14 @@ pub async fn pipeline_retract<C: FireContext>(
                  fires submitted, up to its run-ahead window of {}",
                 written.len(),
                 crate::scheduler::run_ahead_window()
+            )));
+        }
+        // A fire whose pass stated its rows final is never taken back:
+        // refused by name before anything is cut (CONTRACT-BC 25).
+        if let Some(at) = final_fire(&written, fires) {
+            return Ok(Err(format!(
+                "final rows: pipeline: retract of {fires} fire(s) reaches the {at} fire from the \
+                 end, whose pass stated its sampled rows final; they are never taken back"
             )));
         }
         (
@@ -7746,6 +7814,16 @@ pub(crate) mod lifecycle_tests {
     /// and its decodes fold nothing (the lagged fold: the program accepted
     /// none of them yet).
     fn run_ahead(fires: u32, state: Option<u32>) -> anyhow::Result<RunAhead> {
+        run_ahead_stating(fires, state, &[])
+    }
+
+    /// [`run_ahead`], the fires `finals` names (from 0) a final pass's
+    /// (CONTRACT-BC 25).
+    fn run_ahead_stating(
+        fires: u32,
+        state: Option<u32>,
+        finals: &[u32],
+    ) -> anyhow::Result<RunAhead> {
         let model = crate::store::registry::register_model_with_swap(
             16,
             &[64],
@@ -7850,6 +7928,7 @@ pub(crate) mod lifecycle_tests {
                     start,
                     rs,
                 }]),
+                finals.contains(&at),
             )?;
             completions.push(completion);
         }
@@ -7998,6 +8077,33 @@ pub(crate) mod lifecycle_tests {
         let (folded, logged, _) = run.length();
         assert_eq!((folded, logged), (20, 23), "the three rows kept stay buffered");
         assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
+        Ok(())
+    }
+
+    /// A retract reaching a fire whose pass stated its rows final is
+    /// refused by name before anything is cut: the set keeps every row,
+    /// the pipeline is not failed. One stopping short of it takes back the
+    /// lagged fires after it as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retract_over_a_final_fire_is_refused_by_name() -> anyhow::Result<()> {
+        let mut run = run_ahead_stating(5, Some(20), &[2])?;
+        for completion in &run.completions {
+            resolve_test_completion(completion, false);
+        }
+        let pipeline = run.pipeline;
+        let before = run.length();
+        let refused = pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 3)
+            .await?
+            .unwrap_err();
+        assert!(refused.starts_with("final rows:"), "{refused}");
+        assert!(refused.contains("the 3 fire from the end"), "{refused}");
+        assert_eq!(run.length(), before, "nothing cut");
+        assert_eq!(run.failure(), None, "the pipeline is not failed");
+        pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(run.failure(), None);
+        assert_eq!(run.cursor.lock().unwrap().tail, Some(23), "the final row kept");
         Ok(())
     }
 
@@ -12773,6 +12879,213 @@ mod unfolded_tests {
             assert_eq!(matches!(by, Some(FoldBy::Settled { .. })), counts, "{what}");
             assert_eq!(req.lanes[0].reports != 0, counts, "{what}");
             assert_eq!(untagged_device_fold(&req), None, "{what}");
+        }
+    }
+
+    /// A decode run ahead four fires on two recurrent sets, the host's read
+    /// of every output still to come: one pass stated its rows final
+    /// (CONTRACT-BC 25), the other did not (a stop string's). The final
+    /// lane folds its row at each fire and carries none into the next: its
+    /// verb is `Fold` and its step alone is classed folded. The lagged
+    /// lane folds nothing it has not read: it carries one more row each
+    /// fire and buffers. A step of both is buffered, each lane by its own
+    /// verb: the final lane's still `Fold`, carrying nothing.
+    #[test]
+    fn a_final_lane_folds_at_fire_and_a_lagged_one_beside_it_carries() {
+        use ::engine::fire::RsVerb;
+        use ::engine::shapes::{StepComposition, Treatment};
+        let stores = pool_of_one_row_rs_pages();
+        let ring = Arc::new(Mutex::new(crate::pipeline::channel::ChannelCell::new(
+            vec![1],
+            eta_ir::types::Dtype::I32,
+            8,
+        )));
+        let lane_of = |final_rows: bool| {
+            let kv = stores.kv.lock().create_working_set();
+            let ws = stores
+                .rs
+                .lock()
+                .unwrap()
+                .create_working_set(crate::store::rs::RsGeometry {
+                    state_size: 1 << 10,
+                    buffer_page_tokens: 1,
+                });
+            // The prompt is folded through 10.
+            stores.rs.lock().unwrap().fold(ws, 10);
+            (final_rows, kv, ws, Arc::new(Mutex::new(Cursor::default())))
+        };
+        let lanes = [lane_of(true), lane_of(false)];
+        for step in 0..4u32 {
+            let start = 10 + step;
+            let mut fired = Vec::new();
+            for (final_rows, kv, ws, cursor) in &lanes {
+                let ids = [*ws];
+                let groups_of = lane_groups(&[*kv]);
+                let frozen = stores.rs.lock().unwrap().frozen(*ws).unwrap();
+                let pass = PassLanes {
+                    places: vec![geometry::Place {
+                        folded: frozen,
+                        folded_exact: true,
+                        tail: None,
+                        shared: false,
+                        spans: Vec::new(),
+                        readable: start,
+                        readable_known: true,
+                        set: 1,
+                    }],
+                    cursors: vec![cursor.clone()],
+                    kv: Vec::new(),
+                };
+                let landings = [geometry::Landing { start, rows: 1 }];
+                // Every decode states the folding geometry: all it writes.
+                let fold = pass_fold(
+                    geometry::Fold::Host(vec![u32::MAX]),
+                    true,
+                    true,
+                    *final_rows,
+                    &pass,
+                    &groups_of,
+                    &landings,
+                );
+                let mut req = lane(start, 1);
+                let plan = host_rs_plan(&stores, &ids, &groups_of, &req, &fold, &[], None, None)
+                    .unwrap();
+                let frozen_at = lanes_frozen(&stores, &ids, &groups_of, 1, false).unwrap();
+                let counted = piece_rows(&req, &[Some((0, 1))], &frozen_at, false);
+                let mut store = stores.rs.lock().unwrap();
+                let prepared = rs::prepare_many(&mut store, &ids, &plan, None).unwrap();
+                prepared.apply_to(&mut req);
+                rs::settle(&mut store, prepared.txn);
+                drop(store);
+                // What the fire's submit records: a lagged run-ahead fire's
+                // rows wait for the host to take its output.
+                if !*final_rows {
+                    cursor.lock().unwrap().run_ahead(
+                        start,
+                        start + 1,
+                        vec![crate::inferlet::host::working_set::HostRead {
+                            cell: Arc::downgrade(&ring),
+                            index: u64::from(step),
+                        }],
+                    );
+                }
+                let replayed = req.lanes[0]
+                    .lane
+                    .replay_stated
+                    .map_or(0, |stated| stated.replayed);
+                if *final_rows {
+                    assert_eq!(frozen_at, [Some(start)], "step {step}: folded through its first row");
+                    assert_eq!(counted.carried, 0, "step {step}");
+                    assert_eq!(req.lanes[0].lane.rs, RsVerb::Fold, "step {step}");
+                    assert_eq!(replayed, 0, "step {step}");
+                    assert_eq!(
+                        stores.rs.lock().unwrap().frozen(*ws).unwrap(),
+                        start + 1,
+                        "step {step}: its row folded at fire"
+                    );
+                    let alone = StepComposition::of([&req.lanes[0].lane]);
+                    assert_eq!((alone.treatment, alone.carried), (Treatment::Folds, 0));
+                } else {
+                    assert_eq!(frozen_at, [Some(10)], "step {step}: nothing read, nothing folded");
+                    assert_eq!(replayed, step, "step {step}: every row before it carried");
+                    assert!(matches!(req.lanes[0].lane.rs, RsVerb::Buffer { .. }), "step {step}");
+                    let alone = StepComposition::of([&req.lanes[0].lane]);
+                    assert_eq!(alone.treatment, Treatment::Buffers);
+                }
+                fired.push(req.lanes[0].lane.clone());
+            }
+            let mixed = StepComposition::of(&fired);
+            assert_eq!(mixed.treatment, Treatment::Buffers, "step {step}: a mixed step buffers");
+            assert_eq!(mixed.decode_lanes, 2);
+        }
+    }
+
+    /// A prompt's prefill and its decodes, every pass stated final
+    /// (CONTRACT-BC 25), on a recurrent set: the prefill folds its rows at
+    /// fire, so the first decode, staged on the prompt's end, carries none
+    /// of them in. It folds its own row, its verb is `Fold` and its step is
+    /// the plain folded one, and so is every decode after it.
+    #[test]
+    fn a_final_prefill_leaves_its_first_decode_nothing_to_carry() {
+        use ::engine::fire::RsVerb;
+        use ::engine::shapes::{StepComposition, Treatment};
+        const PROMPT: u32 = 10;
+        let stores = pool_of_one_row_rs_pages();
+        let kv = stores.kv.lock().create_working_set();
+        let ws = stores
+            .rs
+            .lock()
+            .unwrap()
+            .create_working_set(crate::store::rs::RsGeometry {
+                state_size: 1 << 10,
+                buffer_page_tokens: 1,
+            });
+        let cursor = Arc::new(Mutex::new(Cursor::default()));
+        let ids = [ws];
+        let groups_of = lane_groups(&[kv]);
+        // One fire of `rows` rows from `start`, the folding geometry, its
+        // pass final; `run_ahead` where its tokens are the device's.
+        let fire = |start: u32, rows: u32, run_ahead: bool| {
+            let frozen = stores.rs.lock().unwrap().frozen(ws).unwrap();
+            let pass = PassLanes {
+                places: vec![geometry::Place {
+                    folded: frozen,
+                    folded_exact: true,
+                    tail: None,
+                    shared: false,
+                    spans: Vec::new(),
+                    readable: start,
+                    readable_known: true,
+                    set: 1,
+                }],
+                cursors: vec![cursor.clone()],
+                kv: Vec::new(),
+            };
+            let landings = [geometry::Landing { start, rows }];
+            let fold = pass_fold(
+                geometry::Fold::Host(vec![u32::MAX]),
+                true,
+                run_ahead,
+                true,
+                &pass,
+                &groups_of,
+                &landings,
+            );
+            let mut req = lane(start, rows);
+            let plan =
+                host_rs_plan(&stores, &ids, &groups_of, &req, &fold, &[], None, None).unwrap();
+            let frozen_at = lanes_frozen(&stores, &ids, &groups_of, 1, false).unwrap();
+            let counted = piece_rows(&req, &[Some((0, rows))], &frozen_at, false);
+            let mut store = stores.rs.lock().unwrap();
+            let prepared = rs::prepare_many(&mut store, &ids, &plan, None).unwrap();
+            prepared.apply_to(&mut req);
+            rs::settle(&mut store, prepared.txn);
+            (req, counted)
+        };
+        let (prefill, _) = fire(0, PROMPT, false);
+        assert_eq!(
+            stores.rs.lock().unwrap().frozen(ws).unwrap(),
+            PROMPT,
+            "the prefill folded every prompt row at fire"
+        );
+        assert_eq!(prefill.lanes[0].lane.rs, RsVerb::Fold);
+        for step in 0..3u32 {
+            let start = PROMPT + step;
+            let (req, counted) = fire(start, 1, true);
+            assert_eq!(counted.carried, 0, "decode {step} carries no row in");
+            assert_eq!(req.lanes[0].lane.rs, RsVerb::Fold, "decode {step}");
+            let replayed = req.lanes[0]
+                .lane
+                .replay_stated
+                .map_or(0, |stated| stated.replayed);
+            assert_eq!(replayed, 0, "decode {step}");
+            let alone = StepComposition::of([&req.lanes[0].lane]);
+            assert_eq!(
+                (alone.treatment, alone.carried),
+                (Treatment::Folds, 0),
+                "decode {step}"
+            );
+            assert_eq!(stores.rs.lock().unwrap().frozen(ws).unwrap(), start + 1);
         }
     }
 

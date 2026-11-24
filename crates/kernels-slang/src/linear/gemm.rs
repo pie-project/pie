@@ -195,17 +195,22 @@ pub fn act_x_wt(
     if m == 0 {
         return Ok(());
     }
-    ctx.fire(
-        kernel(target, tactic, op, m, n, k)?,
-        &[
-            act.arg(),
-            w.arg(),
-            y.arg_mut(),
-            stated(op, m)?.arg(),
-            stated(op, n)?.arg(),
-            stated(op, k)?.arg(),
-        ],
-    )
+    // A fire whose rows are its commands' own carries M so; one whose rows
+    // vary within its body reads M from the fire block
+    // (`linear/gemm.slang`'s kernels; the others carry their rows).
+    let fixed = if ctx.fixed_rows() { m } else { 0 };
+    let fire = kernel(target, tactic, op, m, n, k)?;
+    let args = [
+        act.arg(),
+        w.arg(),
+        y.arg_mut(),
+        stated(op, m)?.arg(),
+        stated(op, n)?.arg(),
+        stated(op, k)?.arg(),
+        stated(op, fixed)?.arg(),
+    ];
+    let takes = if fire.file == GEMM { args.len() } else { args.len() - 1 };
+    ctx.fire(fire, &args[..takes])
 }
 
 /// Every kernel a projection of `n` columns over a contraction of `k`

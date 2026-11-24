@@ -7,12 +7,6 @@ assumes = { generation = 5, hbm_gib = 16 }
 # 128-row rungs from 512 run it at 640, and from 1024 three 553-token prompts at 1664 rows, not 1792
 [engine]
 pad.row_steps = 8
-# a process starts only while the pools hold the started ones to the pages a finished one held, a
-# decoding lane's pages before a waiting prompt's, the starts past them spread over a life: the engine
-# keeps no kv on the host, and gemma-4-E4B's 548 pages restarted the processes they ran short for
-seated_first = true
-seat_to_end = true
-seat_spread = true
 # gemma-4-E4B's pool seats 17-18 lanes, which a powers-of-two ladder ran as 32-lane decodes: a 24-lane
 # rung runs them at 24 (c256 928 -> 1027 tok/s)
 pad.half_rungs = 32
@@ -69,9 +63,6 @@ norm.rope_from = 640
 measured = [
   "engine.pad.half_rungs",
   "engine.pad.row_steps",
-  "engine.seat_spread",
-  "engine.seat_to_end",
-  "engine.seated_first",
   "kernel.attn.flash_narrow_rows",
   "kernel.attn.unrolled_blocks",
   "kernel.linear.dot_barrier_rows",

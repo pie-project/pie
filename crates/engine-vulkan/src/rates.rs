@@ -72,8 +72,10 @@ pub fn at_load(
         max_submit,
         measuring,
         // A stale key's figure serves; the engine times it again behind
-        // serving (`engine_gpu::serve::Shell::measure_behind`).
-        true,
+        // serving (`engine_gpu::serve::Shell::measure_behind`), except where
+        // the platform states a bound on one submission
+        // (`engine_gpu::rates::stale_rates`).
+        engine_gpu::rates::stale_rates(max_submit),
         |max_submit, stated| measure(device, &tuning, max_submit, stated).map_err(|e| e.to_string()),
     )
     .map_err(|why| engine_gpu::error::Fault::Device {

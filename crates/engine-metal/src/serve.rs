@@ -306,6 +306,10 @@ pub struct Shell {
     /// the device's rates and the model's kernel.dense curves where it
     /// measured them; nothing where a stored or committed entry served each.
     measured_at_load: Vec<String>,
+    /// The `[rates]` keys this load serves by a figure stored under a stale
+    /// key (`profile::fire::Tuned::behind`), to time behind serving
+    /// (`engine::Engine::measure_behind`), each gone once timed and stored.
+    rates_behind: Vec<String>,
     /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
     /// seat-addressed fire backs only what the walk backed for it.
     warming: bool,
@@ -1773,6 +1777,7 @@ impl PreparedLoad<'_> {
         let shell = Shell {
             weighed,
             measured_at_load: chip.tuned().timed.clone(),
+            rates_behind: chip.tuned().behind.clone(),
             tuning,
             device,
             outside,
@@ -1900,6 +1905,25 @@ impl Shell {
             });
         }
         Ok(record[0])
+    }
+
+    /// The next `[rates]` key this load serves by a stale figure, to time
+    /// behind serving; `None` where none is left.
+    #[must_use]
+    pub fn rates_behind(&self) -> Option<&str> {
+        self.rates_behind.first().map(String::as_str)
+    }
+
+    /// `key` timed behind serving and stored: how many are left.
+    pub fn rate_timed(&mut self, key: &str) -> usize {
+        self.rates_behind.retain(|k| k != key);
+        self.rates_behind.len()
+    }
+
+    /// The device the load serves on.
+    #[must_use]
+    pub fn device(&self) -> &Context {
+        &self.device
     }
 
     /// What this load timed, each by name; empty where it measured nothing.
@@ -2990,15 +3014,51 @@ impl Shell {
         Ok(())
     }
 
-    /// The disk tier of a stated `budget` under `dir`; none (or 0) is no
-    /// disk tier.
+    /// Unstated `budget`: `seats` sequences' state and kv at `context`,
+    /// within the free space ([`engine::disk::derived_budget`]).
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
+        seats: u32,
+        context: u32,
     ) -> Result<u32> {
-        let (Some(budget), Some(dir)) = (budget.filter(|&bytes| bytes > 0), dir) else {
+        // A stated 0 is no disk tier; unstated is derived below.
+        let (Some(dir), false) = (dir, budget == Some(0)) else {
             return Ok(0);
+        };
+        let paging = self.pools.paging();
+        let buffered = self
+            .rs_buffers
+            .as_ref()
+            .map_or(0, crate::rs::Buffers::page_bytes);
+        let budget = match budget {
+            Some(bytes) => bytes,
+            None => {
+                let state_bytes = self.pools.state_slot_bytes() + buffered;
+                let state_rows = if state_bytes > 0 { u64::from(seats) } else { 0 };
+                let pages =
+                    u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let page_bytes = self.pools.page_bytes()?;
+                let free = engine::disk::free_space(dir);
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.pools.chunk_facts().guest_room_bytes();
+                let bytes = engine::disk::derived_budget(
+                    state_rows,
+                    state_bytes,
+                    pages,
+                    page_bytes,
+                    guest,
+                    free,
+                );
+                // Its inputs, stated at load: what the field rules on.
+                eprintln!(
+                    "engine-metal: the unstated disk tier: {bytes} bytes = {seats} seats x                      (state {state_bytes} B + {context} tokens of kv in {} pages of {page_bytes} B)                      + {guest} B of guest state the device holds live, within {free} bytes free",
+                    context.div_ceil(paging.page_size.max(1)),
+                );
+                bytes
+            }
         };
         self.pools.seat_disk(dir, budget)
     }
@@ -7443,6 +7503,10 @@ impl engine::frame::Shell for Shell {
                 lanes.join(" ")
             )
         });
+        // The profile printed below is this fire's alone: what the device
+        // ran since the last fire (the load's tuning and warm runs before
+        // the first, behind-serving slices between fires) is let go.
+        crate::encode::reset_kernel_profile();
         let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();

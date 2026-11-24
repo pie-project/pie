@@ -1,4 +1,5 @@
 mod arming;
+mod behind;
 mod boot;
 pub(crate) mod btrace;
 pub mod diag;
@@ -159,12 +160,6 @@ pub struct Shell {
     exports: Exports,
     graphs: Graphs,
     copies: bool,
-    /// `engine.seated_first`.
-    seated_first: bool,
-    /// `engine.seat_to_end`.
-    seat_to_end: bool,
-    /// `engine.seat_spread`.
-    seat_spread: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
     /// `engine.fire_lanes` (`Shell::fire_lanes`).
@@ -251,6 +246,9 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
+    /// What this load serves from figures stored under a stale key and
+    /// times again behind serving (`Engine::measure_behind`).
+    behind: behind::Behind,
     /// What this load timed, each by name (`engine::Engine::measured_at_load`):
     /// the device's rates where no layer stated them, the decode products'
     /// times (`[rates] product_ns`) where the profile held none, and the
@@ -440,6 +438,7 @@ impl Shell {
                     attachments: &[],
                     media: &[],
                     voxels: &[],
+                    shape: None,
                 },
                 None,
             )?;
@@ -507,27 +506,6 @@ impl Shell {
 
     pub fn on_tapped(&mut self, sink: engine::TapSink) {
         self.tap_sink = Some(sink);
-    }
-
-    /// Whether this load asks the planner to serve a decoding lane's pages
-    /// before a prompt waiting to be seated (`engine.seated_first`).
-    #[must_use]
-    pub fn seated_first(&self) -> bool {
-        self.seated_first
-    }
-
-    /// Whether this load asks the planner to start a process only while the
-    /// pools hold the started ones to the end (`engine.seat_to_end`).
-    #[must_use]
-    pub fn seat_to_end(&self) -> bool {
-        self.seat_to_end
-    }
-
-    /// Whether this load asks the planner to spread the starts the pools do
-    /// not hold to the end at once over a life (`engine.seat_spread`).
-    #[must_use]
-    pub fn seat_spread(&self) -> bool {
-        self.seat_spread
     }
 
     #[must_use]
@@ -679,8 +657,7 @@ impl Shell {
         self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
-    /// Seats this rank's share of `budget` disk bytes under `dir`, where a
-    /// positive budget is stated (none, or 0: no disk tier): disk
+    /// Seats this rank's share of `budget` disk bytes under `dir`: disk
     /// chunks of a pool chunk each, any state shape's slots in any chunk,
     /// laid out as the device's (CONTRACT-BC 22), the division stated at
     /// load. `persistent` keeps its slot file for the next run. Answers
@@ -690,19 +667,70 @@ impl Shell {
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
         persistent: bool,
+        seats: u32,
+        context: u32,
         world: crate::World,
     ) -> Result<u32> {
         let ranks = u64::from(world.size.max(1));
         let keep =
             persistent.then(|| format!("{} rank {}/{}", self.trace().name, world.rank, ranks));
         let keep = keep.as_deref();
-        // The tier is stated config only: no budget (or 0) is no disk tier.
         let stated = match (budget, dir) {
-            (Some(bytes), Some(dir)) if bytes > 0 => {
+            (Some(0), _) | (_, None) => None,
+            (Some(bytes), Some(dir)) => {
                 self.pools.seat_disk(dir, world.rank, bytes / ranks, keep)?;
                 Some(bytes / ranks)
             }
-            _ => None,
+            (None, Some(dir)) => {
+                // What kept files take already is theirs again, so a restart
+                // sizes the tier as the run that wrote it did.
+                let kept: u64 = if persistent {
+                    (0..world.size.max(1))
+                        .map(|rank| engine::disk::kept_bytes(dir, &crate::store::disk_file(rank)))
+                        .sum()
+                } else {
+                    0
+                };
+                // Derived on its own ([`engine::disk::derived_budget`]): the
+                // disk chunks `seats` sequences' kv pages at `context` and
+                // their state take, within this rank's share of the free
+                // disk; nothing of the device pool enters it. Never four times the host
+                // tier (a host budget below one chunk seated no disk tier)
+                // nor a quarter of the disk. One that cannot be seated is
+                // refused by name.
+                let free = engine::disk::free_space(dir).saturating_add(kept);
+                let paging = self.pools.paging();
+                let pages = u64::from(seats)
+                    * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let per_chunk = self
+                    .pools
+                    .chunk_layout()
+                    .list
+                    .as_ref()
+                    .map_or(1, |list| u64::from(list.per_chunk.max(1)));
+                let chunk = self.pools.disk_chunk_bytes();
+                let state = (u64::from(seats) * self.state_row_bytes()).div_ceil(chunk.max(1));
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.chunk_facts()?.guest_room_bytes();
+                let bytes = engine::disk::derived_budget(
+                    0,
+                    0,
+                    pages.div_ceil(per_chunk) + state,
+                    chunk,
+                    guest,
+                    free / ranks,
+                );
+                // Its inputs, stated at load: what the field rules on.
+                eprintln!(
+                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), and {guest} B of guest state the device holds live, chunks of {chunk} B, within {} bytes free a rank",
+                    pages.div_ceil(per_chunk),
+                    self.state_row_bytes(),
+                    free / ranks,
+                );
+                self.pools.seat_disk(dir, world.rank, bytes, keep)?;
+                Some(bytes)
+            }
         };
         let chunks = self.pools.disk_chunks();
         if let (Some(budget), true) = (stated, chunks > 0) {
@@ -1296,6 +1324,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels,
+                shape: None,
             },
             None,
         )?;
@@ -1321,6 +1350,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels: &[],
+                shape: None,
             },
             None,
         )?;
@@ -1343,6 +1373,7 @@ impl Shell {
             attachments,
             media,
             voxels: &[],
+            shape: None,
         })
     }
 
@@ -1359,6 +1390,7 @@ impl Shell {
             attachments: &[],
             media,
             voxels,
+            shape: None,
         })
     }
 
@@ -1385,6 +1417,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels: &[],
+                shape: None,
             },
             None,
         )?;
@@ -1436,6 +1469,11 @@ pub struct StepView<'a> {
     pub attachments: &'a [Attached],
     pub media: &'a [Media<'a>],
     pub voxels: &'a [Clips<'a>],
+    /// The stated shape the runtime stamped the step with (CONTRACT-BC 24):
+    /// what treatment its body keys and the bucket a buffering step with a
+    /// prompt's rows composes at are read from. `None` on a fire built by
+    /// hand (arming's, a test's): read from its lanes.
+    pub shape: Option<engine::FireShape>,
 }
 
 #[derive(Debug, Default, Clone)]

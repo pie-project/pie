@@ -190,7 +190,9 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         page_size: PAGE,
         context: CEILING,
         slots: 1,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
+        // The one sequence's tokens, whatever the model's state slots take
+        // beside them (a hybrid's records outgrow a fixed pool's bytes).
+        kv_budget: Some(engine_cuda::store::KvSize::Tokens(u64::from(CEILING))),
         allowance: engine::Allowance::WHOLE,
         context_declared: false,
         ordinal: 0,
@@ -333,10 +335,14 @@ fn check(name: &str) {
             .max_by(|&a, &b| l[a].total_cmp(&l[b]))
             .expect("a vocabulary")
     };
-    assert_eq!(
-        top(&apart),
-        top(&together),
-        "{name}: the joined model picks the same token"
+    // The joined model's top token is its legs', or one their logits hold
+    // within twice the worst gap of it: both logits may move by that, so a
+    // near tie that close either form may break.
+    let (top_apart, top_joined) = (top(&apart), top(&together));
+    let tie = apart[top_apart] - apart[top_joined];
+    assert!(
+        top_apart == top_joined || tie <= 2.0 * worst,
+        "{name}: the joined model picks token {top_joined}, its legs token {top_apart} by {tie}"
     );
     // A routed row a last-bit difference may send to other experts than its
     // legs' (as the anchored regions' test lets a routed step through): past

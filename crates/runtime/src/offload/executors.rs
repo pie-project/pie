@@ -1,7 +1,7 @@
 //! The workers a process's passes may run on: the worker policy's
-//! executors for it, else those the cluster's placement named, else the
-//! peer this worker's configuration dialed. Workers named by id are reached
-//! through the [`Dialer`] the worker's link layer installs.
+//! executors for it, else those the cluster's placement named
+//! (`placement/helpers`). Workers named by id are reached through the
+//! [`Dialer`] the worker's link layer installs.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -28,7 +28,7 @@ pub fn set_dialer(dialer: Option<Arc<dyn Dialer>>) {
 
 /// Whether passes can go anywhere but home.
 pub fn reachable() -> bool {
-    DIALER.read().unwrap().is_some() || super::prefill::has_peer()
+    DIALER.read().unwrap().is_some()
 }
 
 pub(crate) fn set(pid: ProcessId, workers: Vec<String>) {
@@ -37,8 +37,8 @@ pub(crate) fn set(pid: ProcessId, workers: Vec<String>) {
     }
 }
 
-/// The cluster names `pid`'s helpers anew (empty: the worker's
-/// configuration decides again).
+/// The cluster names `pid`'s helpers anew (empty: none, so its passes stay
+/// home).
 pub fn name(pid: ProcessId, workers: Vec<String>) {
     let mut named = NAMED.lock().unwrap();
     if workers.is_empty() {
@@ -52,9 +52,9 @@ pub(crate) fn forget(pid: ProcessId) {
     NAMED.lock().unwrap().remove(&pid);
 }
 
-/// Where `pid`'s pass may go, best first, each by the worker's id (the
-/// configured peer by "peer"); `policy` is the worker policy's executors for
-/// it. A worker that cannot be reached is passed over.
+/// Where `pid`'s pass may go, best first, each by the worker's id; `policy`
+/// is the worker policy's executors for it. A worker that cannot be reached
+/// (this one among them) is passed over.
 pub(crate) async fn candidates(
     pid: ProcessId,
     policy: &[String],
@@ -64,10 +64,7 @@ pub(crate) async fn candidates(
         some => some.to_vec(),
     };
     if named.is_empty() {
-        return super::prefill::configured_peer()
-            .map(|peer| ("peer".to_string(), peer))
-            .into_iter()
-            .collect();
+        return Vec::new();
     }
     let Some(dialer) = DIALER.read().unwrap().clone() else {
         return Vec::new();

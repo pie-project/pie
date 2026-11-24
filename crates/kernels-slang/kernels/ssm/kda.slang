@@ -289,6 +289,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     }
 #else
+    // A padding row holds no record (its slot -1): it folds nothing.
+    if (pie_state_none(r)) {
+        return;
+    }
     token(tid, r, h, pie_state_atom(r, h, cells));
 #endif
 }

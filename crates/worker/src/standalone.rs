@@ -108,11 +108,9 @@ impl PolicyReload {
     /// (`[cluster] cluster_policies`) and the worker's `[runtime]
     /// worker_policy`.
     pub async fn reload(&self, config: &crate::Config) -> Result<()> {
-        if !config.cluster.cluster_policies.is_empty() {
-            self.controller
-                .reload_policies(&config.cluster.cluster_policies)
-                .await?;
-        }
+        self.controller
+            .reload_policies(&config.cluster.policies())
+            .await?;
         crate::reload_policy(config).await
     }
 }
@@ -200,7 +198,7 @@ pub fn derive_standalone(
 ) -> Result<(controller::Config, gateway::Config, crate::Config)> {
     let worker = crate::Config::parse_file(combined, path).context("parsing config")?;
     let mut controller = controller::Config::parse("").context("controller defaults")?;
-    controller.cluster_policies = worker.cluster.cluster_policies.clone();
+    controller.cluster_policies = worker.cluster.policies();
     let gateway = gateway::Config::parse("").context("gateway defaults")?;
     Ok((controller, gateway, worker))
 }

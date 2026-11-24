@@ -34,11 +34,50 @@ pub fn ordinals(ranks: u32) -> Vec<i32> {
     (0..ranks).map(|rank| (rank % count) as i32).collect()
 }
 
-/// What a load may take of its device (`[engine.memory] budget_device`):
-/// small and fixed, so the ranks sharing a device fit beside each other.
-pub const ALLOWANCE: engine::Allowance = engine::Allowance {
-    budget: Some(1 << 30),
-};
+/// What a load may take of its device past what this process's context
+/// and modules charge it (`[engine.memory] budget_device`): small and
+/// fixed, so the ranks sharing a device fit beside each other.
+const ROOM: u64 = 1 << 30;
+
+/// What a load may take of its device: [`ROOM`] past the charge the engine
+/// states for this process's context and modules ([`charged`]), so the
+/// ranks get the same room on any card, whatever its context takes.
+pub fn allowance() -> engine::Allowance {
+    engine::Allowance {
+        budget: Some(charged() + ROOM),
+    }
+}
+
+/// What this process's context and modules charge a load's budget, as the
+/// engine states it in its room line ("N MiB of it this process's context
+/// and modules"): read once, off a load of the micro on the first rank's
+/// device under a budget nothing fits.
+fn charged() -> u64 {
+    static CHARGED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CHARGED.get_or_init(|| {
+        let whole =
+            poem_compiler::catalog::trace_of(MICRO, Dtype::Bf16, Dtype::Bf16, Platform::Cuda);
+        let (_dir, path) = checkpoint(&whole, "charge");
+        let mut probe =
+            engine_cuda::open(boot(ordinals(1)[0]), contract_for).expect("the engine opens");
+        let tiny = engine::Allowance {
+            budget: Some(1 << 20),
+        };
+        let why = match probe.load(request_under(&whole, &path, tiny)) {
+            Ok(_) => panic!("a 1 MiB budget served the micro"),
+            Err(why) => why.to_string(),
+        };
+        let mib = why
+            .split(" MiB of it this process's context and modules")
+            .next()
+            .filter(|head| head.len() < why.len())
+            .and_then(|head| head.rsplit(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("the refusal states no context and modules charge: {why}"));
+        println!("this process's context and modules: {mib} MiB of the budget");
+        mib << 20
+    })
+}
 
 /// Each load's kv.
 pub const KV: u64 = 64 << 20;
@@ -144,6 +183,11 @@ pub fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String>
 }
 
 pub fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
+    request_under(trace, checkpoint, allowance())
+}
+
+/// [`request`] under `device`.
+fn request_under(trace: &Trace, checkpoint: &Path, device: engine::Allowance) -> LoadRequest {
     LoadRequest {
         trace: trace.clone(),
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
@@ -163,7 +207,7 @@ pub fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
         },
         // Ranks sharing a device: each a small budget of it, and a small kv.
         residency: Residency {
-            device: ALLOWANCE,
+            device,
             device_kv_budget: Some(KV),
             host_kv_budget: Some(64 << 20),
             disk_kv_budget: Some(0),

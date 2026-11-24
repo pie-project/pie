@@ -13,6 +13,7 @@ fn an_operator_declared_adapter_is_refused() {
             adapter_dir: None,
             profiles: None,
             measure: engine::rates::Measuring::Time,
+            ..DeviceBoot::default()
         },
         |_, _| Err("no contract: nothing loads here".to_string()),
     );

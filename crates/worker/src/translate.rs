@@ -69,9 +69,9 @@ fn runtime_config(
     model: runtime::bootstrap::ModelConfig,
 ) -> Result<runtime::bootstrap::Config> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = match user.runtime.worker_policy.as_deref() {
-        Some(spec) => Some((spec.to_string(), builtins::policy_component(spec)?)),
-        None => None,
+    let policy = {
+        let spec = &user.runtime.worker_policy;
+        Some((spec.clone(), builtins::policy_component(spec)?))
     };
     // The browser runs no policy.
     #[cfg(target_arch = "wasm32")]
@@ -152,9 +152,6 @@ fn build_model(
                 window_tokens: g.caps.pools.window_tokens,
                 windowed_state: g.caps.windowed_state,
                 disk_kept,
-                seated_first: g.caps.pools.seated_first,
-                seat_to_end: g.caps.pools.seat_to_end,
-                seat_spread: g.caps.pools.seat_spread,
                 draft_block: g.caps.draft_block,
                 draft_mask_token: g.caps.draft_mask_token,
                 draft_proposals_from: g.caps.draft_proposals_from,

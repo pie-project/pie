@@ -90,16 +90,28 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     .map_err(Fault::Card)?;
     // What the rates step timed (none where every rate was stated).
     let timed_at_open = chip.tuned().timed.clone();
+    // The roofline keys served by a stale figure, timed behind serving.
+    let behind = super::behind::Behind::of(&chip);
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
     let products = chip.rates().product_ns.clone().unwrap_or_default();
+    // The product times stored under a stale key (a kernel's code changed)
+    // answer what the matching ones lack: a fair estimate, served (and said,
+    // `Shell::queue_behind`) until `pie tune` or a re-export times them
+    // again; never timed before ready.
+    let estimates = chip
+        .rates()
+        .stale
+        .as_ref()
+        .and_then(|stale| stale.product_ns.clone())
+        .unwrap_or_default();
     // How the device's profile says this machine lands weights, under a
     // matching key: a load that finds it measures nothing of it.
     let landing = chip.rates().landing;
     device.set_routes(std::sync::Arc::new(
-        kernels_cuda::linear::routes::Routes::of(&products),
+        kernels_cuda::linear::routes::Routes::estimating(&products, &estimates),
     ));
     let engine = crate::chip::Engine::of(&chip);
     // The most rows one prompt lays: its context, where the model keeps a
@@ -635,6 +647,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         ceiling,
         weighed,
         timed_at_open,
+        behind,
     })
 }
 
@@ -1015,6 +1028,7 @@ impl Shell {
     pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
         let rules = boot.steps.clone();
+        let expert_ranks = boot.expert.size;
         crate::program::launch::state_queue_masks(&boot.knobs.queue_masks);
         let Baked {
             mut device,
@@ -1031,6 +1045,7 @@ impl Shell {
             ceiling,
             weighed,
             timed_at_open,
+            behind,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -1697,6 +1712,7 @@ impl Shell {
             keys,
             products,
             routes_measuring: boot.knobs.measuring,
+            behind,
             measured: timed_at_open,
             forced_bucket: None,
             budget: budgets.tokens.clone(),
@@ -1744,9 +1760,6 @@ impl Shell {
             exports,
             graphs,
             copies: engine.copies,
-            seated_first: engine.seated_first,
-            seat_to_end: engine.seat_to_end,
-            seat_spread: engine.seat_spread,
             prefill_lanes: engine.prefill_lanes,
             fire_lanes: engine.fire_lanes,
             pad: recording.pad(),
@@ -1903,6 +1916,11 @@ impl Shell {
         // The step compositions the runtime's builder forms over this load
         // (CONTRACT-BC 24): what the size-only walk and arming take their
         // targets from.
+        // Expert parallelism seats its buffers in the arena laid at the
+        // span's start: no smaller rung, for the set, the walk and serving.
+        if expert_ranks > 1 {
+            shell.drop_rungs();
+        }
         shell.walk_steps(&rules);
         let walked = if shell.pools.fresh() {
             shell.size_arming()?
@@ -2170,6 +2188,7 @@ impl Staged {
             shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
         if deferred {
             shell.arm_deferred = true;
+            shell.queue_behind(std::collections::BTreeMap::new(), profiles.as_deref());
             eprintln!(
                 "engine-cuda: this load streams its weights; its bodies arm at the starting \
                  weight residency, over the slots the cache holds then"
@@ -2179,7 +2198,16 @@ impl Staged {
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
+            // What arming's picks read an estimate of, before the products'
+            // measuring lays a table of its own.
+            let noted = shell
+                .device
+                .ctx()
+                .routes()
+                .map(|routes| routes.behind())
+                .unwrap_or_default();
             shell.routes_measured(profiles.as_deref())?;
+            shell.queue_behind(noted, profiles.as_deref());
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
             }
@@ -2203,14 +2231,9 @@ impl Staged {
             // fire has backed yet (`Shell::settle_fit` lifts it). The
             // state's chunks then end where the activation starts, so what
             // a rung lends and what lies under it are one span.
-            let fitted = shell.pools.fit_the_card(
-                shell.bodies_hold(),
-                shell.held_for_fires,
-                false,
-                &resident,
-            )?;
-            shell.pools.state_whole();
-            fitted
+            shell
+                .pools
+                .fit_to_state_whole(shell.bodies_hold(), shell.held_for_fires, &resident)?
         } else {
             // Everything the load puts on the device is there, its bodies
             // among it: the pool is what the card has left, and the range
@@ -2970,6 +2993,8 @@ pub(super) struct Baked {
     pub(super) weighed: Option<crate::top::Weighed>,
     /// What the rates step timed at open (none where every rate was stated).
     pub(super) timed_at_open: Vec<String>,
+    /// The roofline keys served by a stale figure.
+    pub(super) behind: super::behind::Behind,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

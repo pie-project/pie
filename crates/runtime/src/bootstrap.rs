@@ -105,6 +105,8 @@ pub struct Config {
     pub model: ModelConfig,
     pub skip_tracing: bool,
     pub max_concurrent_processes: Option<usize>,
+    /// The worker policy (name, component). Every native worker runs one
+    /// (`noop` writes no rows); the browser runs none.
     pub policy: Option<(String, Cow<'static, [u8]>)>,
 }
 
@@ -172,15 +174,6 @@ pub struct EngineConfig {
     pub windowed_state: bool,
     /// The disk tier is kept for the next run (`disk_kv_persistent`).
     pub disk_kept: Option<KeptDisk>,
-    /// The engine asks the planner to serve a decoding lane's pages before a
-    /// prompt waiting to be seated (`PoolFacts::seated_first`).
-    pub seated_first: bool,
-    /// The engine asks the planner to start a process only while the pools
-    /// hold the started ones to the end (`PoolFacts::seat_to_end`).
-    pub seat_to_end: bool,
-    /// The engine asks the planner to spread the starts the pools do not hold
-    /// to the end at once over a life (`PoolFacts::seat_spread`).
-    pub seat_spread: bool,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
@@ -716,9 +709,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             d.chunks.kv_host_pages() > 0 || d.chunks.kv_disk_pages() > 0
         }
     });
-    let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
-    let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
-    let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
     if let Some(d) = engine_configs.first() {
         // What the planner admits against on a shared pool (its total,
         // `SharedPool::room`), beside the facts' count: the two count the
@@ -916,21 +906,18 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             arena_model_idx,
             engine,
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(pool))
-                .seated_first(seated_first)
-                .seat_to_end(seat_to_end)
-                .seat_spread(seat_spread)
                 .weight_shed(steered.shed_hook()),
         );
         governed.push(steered);
     }
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some((name, component)) = &config.policy {
+    {
+        let (name, component) = config
+            .policy
+            .as_ref()
+            .context("a worker names its policy (`noop` writes no rows)")?;
         crate::policy::start(name, component).with_context(|| format!("worker policy {name}"))?;
-    } else {
-        // No policy: the thread still keeps its record, and the default
-        // responder answers tier pressure.
-        crate::policy::start_default().context("the default worker policy thread")?;
     }
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()

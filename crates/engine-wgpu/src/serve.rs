@@ -218,6 +218,16 @@ impl Serve for Api {
         crate::rates::stated_submit_bound()
     }
 
+    fn fires_stated(boot: &crate::api::DeviceBoot) -> bool {
+        #[cfg(feature = "test-limits")]
+        return boot.fires_stated;
+        #[cfg(not(feature = "test-limits"))]
+        {
+            let _ = boot;
+            false
+        }
+    }
+
     fn tier(device: &Context) -> kernels_slang::Tier {
         if device.chip().subgroups_32() {
             kernels_slang::Tier::Subgroup
@@ -338,6 +348,7 @@ impl Serve for Api {
         pipelines: &Pipelines,
         readout: &[Buffer],
         _weights_stream: bool,
+        _fires: engine_gpu::serve::FireBound,
         guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
         // A frame takes a scratch chunk from the ring: stocked for each frame

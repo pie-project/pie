@@ -2026,15 +2026,24 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         } else {
             let mut tuned = chip.tuned().clone();
             for curve in &served {
+                let behind = measuring == engine::rates::Measuring::Time
+                    && stale_rates(max_submit) == engine::rates::StaleRates::TimedBehind;
                 tracing::info!(
                     "rates: gemm curve {curve}: served by the curve stored under its stale key{}",
-                    if measuring == engine::rates::Measuring::Time {
-                        "; timed again behind serving, stored for the next load"
-                    } else {
-                        " (`[engine] measure = false`: not timed again)"
+                    match (measuring, behind) {
+                        (engine::rates::Measuring::Time, true) => {
+                            "; timed again behind serving, stored for the next load"
+                        }
+                        (engine::rates::Measuring::Time, false) => {
+                            " (not timed again where the platform bounds one submission: the \
+                             next export round refreshes it)"
+                        }
+                        (engine::rates::Measuring::Skip, _) => {
+                            " (`[engine] measure = false`: not timed again)"
+                        }
                     }
                 );
-                if measuring == engine::rates::Measuring::Time {
+                if behind {
                     tuned.behind.push(format!("{CURVE_BEHIND}{curve}"));
                 }
             }
@@ -2258,6 +2267,21 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     measure_yielding::<B, T>(device, tactics, tier, timer, max_submit, stated, say, None)
 }
 
+/// What a load on this engine does with a rate or curve stored under a
+/// stale key: served by its figure and timed again behind serving; where
+/// the platform states a bound on one submission (`max_submit`), served
+/// and not timed again (a rates step's frames are sized to that bound, so
+/// one frame would hold a serving request for as long; the next export
+/// round refreshes it).
+#[must_use]
+pub fn stale_rates(max_submit: Option<std::time::Duration>) -> engine::rates::StaleRates {
+    if max_submit.is_some() {
+        engine::rates::StaleRates::Served
+    } else {
+        engine::rates::StaleRates::TimedBehind
+    }
+}
+
 /// The prefix of a `profile::fire::Tuned::behind` entry naming a dense
 /// kernel's curve (`<kind>/<key> at <n>x<k>`) served by a stale figure.
 pub const CURVE_BEHIND: &str = "curve ";
@@ -2311,7 +2335,15 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     // rates are this load's alone where the after read is slower than the
     // warmed before read.
     let reference = tactics.gemm(tier, crate::submit::PROBE.0);
-    let clock_before = clock_warmed::<B>(device, reference)?;
+    let clock_before = match yield_to {
+        Some(stop) => clock_warmed_until::<B>(device, reference, stop)?.ok_or_else(|| {
+            Fault::Device {
+                call: "measuring behind serving",
+                why: YIELDED.to_string(),
+            }
+        })?,
+        None => clock_warmed::<B>(device, reference)?,
+    };
     let mut rig = Rig::<B>::new(device, max_submit);
     rig.yield_to = yield_to;
     // Under a stated bound, the probe first: every estimate grows from it.
@@ -3862,13 +3894,8 @@ pub fn resident_for_skip<B: Serve, T: Tactics + ?Sized>(
 }
 
 /// The device's clock read off its reference kernel ([`crate::submit::Probe`],
-/// the smallest shape on the matmul curve): the fastest of [`ROUNDS`] single
-/// fires and their spread, `(slowest - fastest) / fastest`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClockRead {
-    pub fastest_ns: f64,
-    pub spread: f64,
-}
+/// the smallest shape on the matmul curve): `engine::rates`' shared reading.
+pub use engine::rates::{ClockRead, clock_moved, throttled};
 
 /// `device`'s clock now ([`ClockRead`]), its reference kernel under `tactic`:
 /// one read, as a phase's after read is taken.
@@ -3905,52 +3932,23 @@ pub fn clock_warmed<B: Serve>(
     warmed(|| read_clock(device, &probe))
 }
 
-/// Reads of `read` taken until two in a row agree within their own spread
-/// (either way: a ramp still rising and a boost still falling both move by
-/// more): the settled clock, the median of the settled pair, at the wider
-/// spread. No process-wide fastest is kept: the reference is the clock
-/// measured right around the phase. A clock settles (a ramp has a top, a
-/// boost a sustained floor), so the reads end.
-pub fn warmed(mut read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
-    let mut last = read()?;
-    loop {
-        let next = read()?;
-        let noise = last.spread.max(next.spread);
-        let low = last.fastest_ns.min(next.fastest_ns);
-        let high = last.fastest_ns.max(next.fastest_ns);
-        if high <= low * (1.0 + noise) {
-            return Ok(ClockRead {
-                fastest_ns: (low + high) / 2.0,
-                spread: noise,
-            });
-        }
-        last = next;
-    }
+/// [`clock_warmed`] behind serving: `stop` read before each read, `None`
+/// where it stopped it (a request arrived), so an arrival waits at most one
+/// read of the reference.
+pub fn clock_warmed_until<B: Serve>(
+    device: &B::Context,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>> {
+    let probe = crate::submit::Probe::<B>::new(device, tactic)?;
+    engine::rates::warmed_until(|| read_clock(device, &probe), stop)
 }
 
-/// Whether a point's clock moved under it: its own warmed `before` read
-/// and its `after` read differ, either way, by more than their own spread
-/// (a boost ending, a ramp still rising, a sag): `Some(after over
-/// before)`. A point timed across a clock transition measures the
-/// transition, not the kernel, and is discarded.
-#[must_use]
-pub fn clock_moved(before: ClockRead, after: ClockRead) -> Option<f64> {
-    let noise = before.spread.max(after.spread);
-    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
-    (ratio > 1.0 + noise || ratio < 1.0 / (1.0 + noise)).then_some(ratio)
+/// `engine::rates::warmed` over this crate's faults.
+pub fn warmed(read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
+    engine::rates::warmed(read)
 }
 
-/// Whether a measuring phase ran throttled: its reference kernel read
-/// `before` it (warmed, [`clock_warmed`]) and `after` it. Throttling builds
-/// during a phase: throttled where the after read is slower than the
-/// before by more than the reads' own spread (the reference's noise, no
-/// margin chosen): `Some(after over before)`.
-#[must_use]
-pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
-    let noise = before.spread.max(after.spread);
-    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
-    (ratio > 1.0 + noise).then_some(ratio)
-}
 
 /// The fires a warm-up rotation's next frame holds of `left`: as many as fit
 /// under `bound` at `per_fire` ns a fire (the slowest the rotation measured)

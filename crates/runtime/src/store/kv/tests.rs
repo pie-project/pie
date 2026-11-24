@@ -92,7 +92,7 @@ fn tests_every_case() {
     a_set_never_ends_inside_a_sealed_page();
     a_fire_that_never_settled_leaves_the_log_cut();
     a_hit_refreshes_only_the_entries_it_used_whole();
-    what_decode_wrote_is_reclaimed_before_the_prompt();
+    what_decode_wrote_is_reclaimed_before_the_prompt_where_a_row_keys_it_below();
     a_sweep_suspends_only_the_readers_of_what_it_moves();
     idle_cache_goes_to_the_host_and_comes_back_on_a_hit();
     a_set_moved_down_says_it_is_off_the_device();
@@ -107,7 +107,7 @@ fn tests_every_case() {
     a_demote_keeps_off_the_disk_what_its_row_keeps_off_it();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
-    an_answer_goes_before_an_older_prompt();
+    among_equal_keys_the_least_recently_used_goes_first_answer_or_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
     a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
     a_beams_finish_copies_the_chosen_pages_another_reads();
@@ -1333,7 +1333,16 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
     );
 }
 
-fn what_decode_wrote_is_reclaimed_before_the_prompt() {
+/// A16: what a decode wrote goes before the prompt only where a row says
+/// so (`default`'s tail keyed below its prompt); unkeyed, the set's cache
+/// is one group by its keys, and goes together.
+fn what_decode_wrote_is_reclaimed_before_the_prompt_where_a_row_keys_it_below() {
+    struct TailBelow;
+    impl Keys for TailBelow {
+        fn key_at(&self, _: Option<ProcessId>, at: u64) -> i64 {
+            if at < 16 { 0 } else { -1 }
+        }
+    }
     let mut store = KvStore::new(16, h(28));
     let tokens: Vec<u32> = (0..48).map(|t| 1200 + t).collect();
     let ws = decoded(&mut store, &tokens, 20, 40);
@@ -1344,7 +1353,7 @@ fn what_decode_wrote_is_reclaimed_before_the_prompt() {
     let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 1);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, TailBelow), 1);
     assert_eq!(store.cached_run(&keys).len(), 1, "the prompt's page stays");
 }
 
@@ -1695,7 +1704,11 @@ fn idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted() {
     );
 }
 
-fn an_answer_goes_before_an_older_prompt() {
+/// A16: what a decode wrote has no order of its own over a prompt. Among
+/// equal retention keys the least recently used goes first, the engine's
+/// own tie: the older prompt before the newer answer. (`default` keys a
+/// decoded tail below its prompt with a row.)
+fn among_equal_keys_the_least_recently_used_goes_first_answer_or_prompt() {
     let mut store = KvStore::new(16, h(36));
     let other: Vec<u32> = (0..32).map(|t| 1700 + t).collect();
     let ws = decoded(&mut store, &other, 32, 32);
@@ -1706,8 +1719,9 @@ fn an_answer_goes_before_an_older_prompt() {
     store.fold(ws, 40, true).unwrap();
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 1);
-    assert_eq!(on_device(&mut store, &other), 2, "the older prompt stays");
+    assert!(store.reclaim_cache(store.current_epoch(), 1, |_| 0) >= 1);
+    assert_eq!(on_device(&mut store, &other), 0, "the older prompt goes first");
+    assert_eq!(on_device(&mut store, &tokens), 2, "the newer answer stays");
 }
 
 #[test]
@@ -2578,4 +2592,330 @@ fn only_a_shared_sets_sealed_keys_are_published() {
     assert!(shared_keys.iter().all(|key| published.contains(key)));
     assert!(private_keys.iter().all(|key| !published.contains(key)));
     assert_eq!(published.len(), 2, "the shared set's two pages, nothing more");
+}
+
+/// A shared pool of `pages` kv list slots (one a chunk), its stores as a
+/// load registers them.
+fn behind_stores(pages: u32) -> crate::store::registry::Stores {
+    use ::engine::chunk::{
+        ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
+        SlotShape,
+    };
+    let kind = SlotKind::List {
+        tokens: 16,
+        rate: 1,
+        window: None,
+    };
+    let facts = ChunkFacts {
+        chunk_bytes: 1 << 20,
+        total_chunks: pages + 1,
+        segment_chunks: pages + 1,
+        segments: SegmentFacts {
+            committed: 1,
+            max: 1,
+            growth: Growth::Fixed,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
+        }],
+        shapes: vec![SlotShape {
+            id: ShapeId(0),
+            kind,
+            slot_bytes: 1 << 20,
+            slots_per_chunk: 1,
+            sets_per_working_set: kind.sets_per_working_set(),
+            rows: Vec::new(),
+            pinned: None,
+            role: SlotRole::State,
+        }],
+        ..ChunkFacts::default()
+    };
+    let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(pool));
+    crate::store::registry::shared_stores(
+        &shared,
+        &crate::store::shared::Tiers::default(),
+        16,
+        1024,
+    )
+}
+
+/// A point behind serving (the dense settle's, `Engine::behind_need`) whose
+/// slots the pool holds none of, idle cache filling it: idle cache yields
+/// what one point takes and no more, the point's slots go back after it,
+/// and while a waiter is short of a slot (an arrival, a parked process) it
+/// takes nothing at all.
+#[test]
+fn a_point_behind_serving_takes_idle_cache_for_its_slots_and_no_more() {
+    use crate::scheduler::lane::{give_behind, take_behind};
+    let stores = behind_stores(8);
+    {
+        let mut kv = stores.kv.lock();
+        for seed in 0..4u32 {
+            kept_and_gone(&mut kv, 40 + seed, 2, ProcessId::from_u128(u128::from(seed) + 1));
+        }
+        assert_eq!(kv.available_pages(), 0, "idle cache fills the pool");
+    }
+    // Two lanes of 16 rows: a page each.
+    let need = ::engine::BehindNeed {
+        lanes: 2,
+        tokens: 16,
+        long: false,
+    };
+    let taken = take_behind(&stores, need);
+    assert_eq!(taken.seats.len(), 2, "the point's slots were taken");
+    assert!(taken.seats.iter().all(|seat| seat.pages.len() == 1));
+    assert_eq!(
+        stores.kv.lock().available_pages(),
+        0,
+        "what idle cache yielded went to the point"
+    );
+    give_behind(&stores, taken);
+    assert_eq!(
+        stores.kv.lock().available_pages(),
+        2,
+        "one point's worth (two pages) yielded and came back, the rest still cached"
+    );
+
+    // A waiter short of a slot comes first: nothing is taken for the point.
+    stores.shared.as_ref().unwrap().lock().unwrap().pool_mut().wait(1, 0, 1);
+    let taken = take_behind(&stores, need);
+    assert!(taken.seats.is_empty(), "a waiter outranks the point");
+    assert_eq!(stores.kv.lock().available_pages(), 2, "no cache yielded for it");
+}
+
+/// The reports of one process that exits with `prompt` prompt rows and
+/// `decoded` more, and one that stays live.
+fn an_exit_and_a_live_one(
+    exited: ProcessId,
+    live: ProcessId,
+    prompt: u64,
+    decoded: u64,
+) -> Vec<crate::policy::Event> {
+    use crate::policy::{Arrival, Event, Outcome};
+    vec![
+        Event::Arrived(exited, Arrival::default()),
+        Event::Arrived(live, Arrival::default()),
+        Event::Started(exited),
+        Event::Started(live),
+        Event::Fired(exited, prompt, 1),
+        Event::Fired(exited, decoded, decoded),
+        Event::Fired(live, prompt, 1),
+        Event::Exited(exited, Outcome::Completed),
+    ]
+}
+
+/// A built-in policy, run over `events` and enacted.
+fn run_policy(name: &str, events: Vec<crate::policy::Event>) {
+    let policy = builtins::policy(name).expect("a built-in policy");
+    crate::policy::port::testing::enact(name, policy.component, events);
+}
+
+/// Under the shipped `default` policy the cache an exited process left is
+/// kept on the device alone: when the device wants its room it is dropped,
+/// not demoted, while a live process's set still suspends to the host; a
+/// resting handle's rows are the column's own. Its prompt outranks its
+/// decoded tail (A16). Under `noop` the same cache moves down a tier.
+#[test]
+fn the_default_policy_drops_what_an_exit_left_and_noop_demotes_it() {
+    use crate::policy::retention::{DEVICE, Installed, install};
+    let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();
+    install(None);
+    let (exited, live, handle) = (
+        ProcessId::from_u128(0xdef1),
+        ProcessId::from_u128(0xdef2),
+        ProcessId::from_u128(0xdef3),
+    );
+    let mut events = an_exit_and_a_live_one(exited, live, 32, 16);
+    events.push(crate::policy::Event::HandleRested(
+        handle,
+        crate::policy::Resting {
+            tenant: "t".into(),
+            session: None,
+            props: client_api::Props::default(),
+            tokens: 32,
+            folded: 0,
+        },
+    ));
+    run_policy("default", events);
+    assert_eq!(Installed.tiers_at(Some(exited), 0), DEVICE, "kept on the device alone");
+    assert_eq!(Installed.key_at(Some(exited), 31), 0, "the prompt");
+    assert_eq!(Installed.key_at(Some(exited), 32), -1, "the decoded tail goes first");
+    // The column's own, as for an owner nothing names.
+    let own = Installed.tiers_at(Some(ProcessId::from_u128(0xdeff)), 0);
+    assert_eq!(Installed.tiers_at(Some(live), 0), own, "a live set: no row");
+    assert_eq!(Installed.key_at(Some(live), 0), 0);
+    assert_eq!(Installed.tiers_at(Some(handle), 0), own, "a resting handle: no row");
+    assert_eq!(Installed.key_at(Some(handle), 0), 0);
+
+    // Device pressure: the exit's cache finds no tier below it and is
+    // dropped; the host is left to the live set, which still suspends.
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdef));
+    let tokens = kept_and_gone(&mut store, 70, 3, exited);
+    assert!(
+        store.prepare_demote(8, Installed).unwrap().is_none(),
+        "nothing moves: its row keeps it off the host"
+    );
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, Installed), 3, "dropped");
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    assert!(store.cached_working_sets().is_empty());
+    assert_eq!(store.host_swap_available(), 8, "nothing went to the host");
+    let ws = store.create_shared_working_set();
+    store.set_owner(ws, live).unwrap();
+    commit_fresh(&mut store, ws, 2, 1);
+    let txn = store
+        .prepare_suspend(&HashSet::from([ws]), Installed)
+        .unwrap()
+        .expect("a live set suspends");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    assert_eq!(store.host_swap_available(), 6, "on the host");
+
+    // `noop` writes no rows: the columns' own defaults demote the same
+    // cache to the host.
+    install(None);
+    let (exited, live) = (ProcessId::from_u128(0xdef4), ProcessId::from_u128(0xdef5));
+    run_policy("noop", an_exit_and_a_live_one(exited, live, 32, 16));
+    assert_eq!(Installed.tiers_at(Some(exited), 0), own, "no row: the column's own");
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdee));
+    let tokens = kept_and_gone(&mut store, 71, 3, exited);
+    let txn = store
+        .prepare_demote(8, Installed)
+        .unwrap()
+        .expect("every tier: it moves down");
+    store.commit_suspend(txn).unwrap();
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    assert_eq!(store.host_swap_available(), 5, "kept on the host");
+    install(None);
+}
+
+/// No runtime responder answers tier pressure (A1): under `noop` (no rows,
+/// so every tier and least recently used among equals), a device full of
+/// idle cache is pressure the stores answer themselves. A process short of
+/// pages waits in the planner, which moves the idle cache down to the host
+/// (not dropped: its tiers name the host) and serves it there.
+#[tokio::test(flavor = "current_thread")]
+async fn under_noop_device_pressure_moves_idle_cache_down_and_the_waiter_is_served() {
+    use crate::planner::{Acquired, Demand, RegistryPool, ResidencyPlanner};
+    use crate::scheduler::worker::test_lane::TestLane;
+    use crate::store::registry;
+    use std::sync::Arc;
+
+    let _lock = crate::policy::schedule::TEST_LOCK.write().await;
+    crate::policy::retention::install(None);
+    crate::policy::schedule::install(None);
+    let model = registry::register_model_with_swap(
+        16,
+        &[8],
+        &[8],
+        &[0],
+        &[registry::StatePool::default()],
+        &[0],
+    );
+    let stores = registry::get(model, 0);
+    // An exit left eight pages of idle cache: the device has none free.
+    let owner = ProcessId::from_u128(0xa1);
+    registry::with_kv_lock(&stores.kv, "test", |kv| {
+        kept_and_gone(kv, 0xa1, 8, owner);
+        assert_eq!(kv.reclaimable_cache_pages(), 8, "the device is all idle cache");
+    });
+    let mut lane = TestLane::install(0);
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(model, 0, true))));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let p = planner.clone();
+    let ask = crate::rt::spawn(async move {
+        p.acquire(
+            pid,
+            pid,
+            Demand {
+                kv_pages: 4,
+                rs: Default::default(),
+            },
+        )
+        .await
+    });
+    for _ in 0..400 {
+        crate::rt::yield_now().await;
+        for copy in lane.take(&mut |_| Ok(())) {
+            copy.land();
+        }
+        if ask.is_finished() {
+            break;
+        }
+        planner.pages_freed();
+    }
+    assert!(ask.is_finished(), "the waiter is served, with no responder");
+    let granted = ask.await.unwrap().expect("no refusal");
+    assert!(matches!(granted, Acquired::Granted(_)), "its pages granted");
+    registry::with_kv_lock(&stores.kv, "test", |kv| {
+        assert!(kv.host_cache_pages() > 0, "the idle cache moved down to the host");
+        assert!(
+            kv.cached_working_sets().iter().any(|set| set.owner == owner),
+            "and is kept there, not dropped"
+        );
+    });
+}
+
+#[test]
+/// A unified device (no host tier) with a default home: the disk tier the
+/// engine derives when budget_disk is unstated ([`engine::disk::derived_budget`]:
+/// every seat's kv at the full context, within the free disk) takes a
+/// suspend under kv pressure whole, so the process is suspended to disk,
+/// not restarted, and reads back whole.
+fn a_unified_load_with_defaults_suspends_kv_to_disk() {
+    const SEATS: u64 = 1;
+    const PAGES_A_SEAT: u64 = 3;
+    let page = ::engine::disk::ALIGN as u64;
+    let derived = ::engine::disk::derived_budget(0, 0, SEATS * PAGES_A_SEAT, page, 0, u64::MAX);
+    let disk = (derived / page) as u32;
+    assert_eq!(disk, 3, "every seat's kv at the full context");
+    let mut store = KvStore::new_with_swap(4, 0, disk, h(65));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, PAGES_A_SEAT, 1);
+    let sets = HashSet::from([ws]);
+    let txn = store
+        .prepare_suspend(&sets, floor)
+        .expect("a disk tier takes it, not a refusal")
+        .expect("three resident pages suspend");
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    use ::engine::transfer::MemoryDomain::LocalDisk;
+    assert_eq!(tiers, [(LocalDisk, 3)], "straight to the disk");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 3);
+    assert_eq!(store.swapped_page_count(&sets).unwrap(), 3);
+    store.retire_idle();
+    let mut granted = store.reserve_device_pages(3).unwrap();
+    let txn = store.prepare_restore(&sets, &mut granted).unwrap();
+    assert_eq!(store.commit_restore(txn).unwrap(), 3, "read back whole");
+}
+
+/// Reclaim frees what is short and no more (policy-out A18): asked for two
+/// pages of four exited sets' idle cache (two pages each), it frees one
+/// set's two pages, oldest first, and every other set stays cached under
+/// its owner. A set's kept checkpoint and the sealed prefix it stands on go
+/// together (dropping one alone frees nothing), and sealed prefixes of
+/// different sets are never pooled into one group.
+#[test]
+fn reclaim_frees_what_is_short_and_keeps_the_rest_of_the_cache() {
+    let mut store = KvStore::new(8, h(41));
+    let owners: Vec<ProcessId> = (1..=4u128).map(ProcessId::from_u128).collect();
+    for (seed, &owner) in owners.iter().enumerate() {
+        kept_and_gone(&mut store, 60 + seed as u32, 2, owner);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(store.available_pages(), 0, "idle cache fills the store");
+    let freed = store.reclaim_cache(store.current_epoch(), 2, crate::policy::retention::Installed);
+    assert_eq!(freed, 2, "exactly what is short");
+    assert_eq!(store.available_pages(), 2);
+    assert!(!store.owns_cache(owners[0]), "the oldest set went");
+    for &owner in &owners[1..] {
+        assert!(store.owns_cache(owner), "{owner:?} stays cached");
+    }
 }

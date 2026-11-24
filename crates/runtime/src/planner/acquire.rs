@@ -70,15 +70,6 @@ impl ResidencyPlanner {
         }
         let uncontended = self.returns.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
-        if !self.seated_first {
-            if !uncontended {
-                self.note_progress(pid);
-            }
-            if uncontended && let Some(grant) = self.try_reserve(demand) {
-                return Some(grant);
-            }
-            return None;
-        }
         if uncontended {
             // The room read, the growth held back and the grant taken as one
             // step: a burst of prompts read apart from their grants would each
@@ -387,35 +378,17 @@ impl ResidencyPlanner {
     /// Sleeps until what a non-resident process waits on changes: its own
     /// residency (`signal`, told as it is evicted, restored, rolled back or
     /// gone, or as its queued restore is found past the device pool). No
-    /// clock: a planner poke for another process, the shortfall standing, or
-    /// the policy answering a shortfall does not wake it. (On a 100 ms
-    /// re-report it woke each waiter ten times a second while it stayed
-    /// evicted.)
-    async fn await_residency_change(
-        signal: &Notify,
-        settled: impl Fn() -> bool,
-        answered: impl Fn(),
-    ) {
+    /// clock: a planner poke for another process, or the shortfall
+    /// standing, does not wake it. (On a 100 ms re-report it woke each
+    /// waiter ten times a second while it stayed evicted.)
+    async fn await_residency_change(signal: &Notify, settled: impl Fn() -> bool) {
         let notified = signal.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        loop {
-            let policy = crate::policy::pressure::answered();
-            tokio::pin!(policy);
-            policy.as_mut().enable();
-            if settled() {
-                return;
-            }
-            // The policy answering a shortfall plans again, as the give-up's
-            // check did (a grow, a commit or a move tried again), and
-            // refuses nothing.
-            tokio::select! {
-                // In order, never at random: a seeded run takes the same branch.
-                biased;
-                () = &mut notified => return,
-                () = &mut policy => answered(),
-            }
+        if settled() {
+            return;
         }
+        notified.await;
     }
 
     fn collect_outcome(&self, key: EntryKey) -> Collect {
@@ -436,8 +409,7 @@ impl ResidencyPlanner {
                 Some(outcome) => {
                     let pid = waiter.pid;
                     inner.queue.remove(&key);
-                    if self.seated_first
-                        && outcome.is_ok()
+                    if outcome.is_ok()
                         && let Some(proc) = inner.procs.get_mut(&pid)
                     {
                         proc.seated = true;
@@ -556,18 +528,9 @@ impl ResidencyPlanner {
             self.stats.gate_parks.fetch_add(1, Ordering::Relaxed);
             // Waiting its restore turn: its owner is parked here.
             let _parked = crate::inferlet::process::parks_here();
-            Self::await_residency_change(
-                &signal,
-                || self.is_resident(pid) || self.restore_never_fits_now(pid),
-                // The policy answered nothing freed: plan again only where
-                // room came free since the last pass (else a pass said the
-                // shortfall again and drew the next such answer, a loop).
-                || {
-                    if self.returns.freed_since_plan() {
-                        self.wake_planner();
-                    }
-                },
-            )
+            Self::await_residency_change(&signal, || {
+                self.is_resident(pid) || self.restore_never_fits_now(pid)
+            })
             .await;
         }
     }

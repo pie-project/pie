@@ -21,9 +21,6 @@ impl Shell {
                 .map(|&(_, adapters, _)| adapters)
                 .min()
                 .unwrap_or(0),
-            seated_first: false,
-            seat_to_end: false,
-            seat_spread: false,
             // The sliding rows are paged in full here: the model's window
             // is a fact of the model, its pool is not.
             window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),

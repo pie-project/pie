@@ -83,6 +83,12 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::cores(self).unwrap_or(1)
     }
 
+    /// Only where the device writes a recording's pool segment descriptors
+    /// after it binds them (update-after-bind storage buffers).
+    fn resizes_pool(&self) -> bool {
+        Context::rebinds_segments(self)
+    }
+
     fn resident(&self) -> Option<u32> {
         Context::resident(self)
     }
@@ -135,6 +141,16 @@ impl engine_gpu::backend::Frame<Api> for Frame {
         regions: &[(u64, u64, u64)],
     ) -> Result<()> {
         Frame::copy_regions(self, source, into, regions)
+    }
+
+    fn copy_rows(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+        most: usize,
+    ) -> Result<()> {
+        Frame::copy_rows(self, source, into, regions, most)
     }
 
     fn fill_zero(&mut self, into: &Buffer, at: u64, len: u64) -> Result<()> {
@@ -198,6 +214,14 @@ fn copy_unretained(
     source.span(source_at, len)?;
     into.span(into_at, len)?;
     let (source, into) = (source.slab(), into.slab());
+    frame.bake(&(
+        "copy",
+        ash::vk::Handle::as_raw(source.buffer),
+        ash::vk::Handle::as_raw(into.buffer),
+        source_at,
+        into_at,
+        len,
+    ));
     let d = &frame.core().device;
     let cmd = frame.cmd();
 

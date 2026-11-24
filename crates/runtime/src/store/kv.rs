@@ -474,9 +474,6 @@ struct KeptEntry {
     path: KeptPath,
     owner: Option<ProcessId>,
     last_use: Instant,
-    /// Reclaimed before prompts among equals: an answer is shared less than a
-    /// prompt.
-    decoded: bool,
 }
 
 /// The reclaim order ([`KvStore::reclaim_order`]) a reclaim left, and the
@@ -1060,7 +1057,9 @@ impl KvStore {
                 .any(|of| crate::policy::schedule::plex_id(of) == owner)
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    /// Drops every idle entry `owner` left, at once (tests set a store up
+    /// with it; no runtime path drops cache unasked by its rows).
+    #[cfg(test)]
     pub fn discard_cache(&mut self, owner: ProcessId, by: By) -> usize {
         let keys: Vec<u64> = self
             .cache
@@ -1086,9 +1085,11 @@ impl KvStore {
         freed
     }
 
-    /// Frees `short` device pages of idle cache, and no more than the last
-    /// group it reaches holds: only what no live working set reads, lowest
-    /// key first, then least recently used. The runtime runs it once a
+    /// Frees `short` device pages of idle cache and no more (policy-out
+    /// A18: exactly what is short): only what no live working set reads,
+    /// lowest key first, then least recently used, a set at a time (the
+    /// entries that hold one set's pages go together, oldest set first),
+    /// stopping once what is short is freed. The runtime runs it once a
     /// demote had nothing to move (`prepare_demote` goes first where the
     /// planner demotes): what may sit on a lower tier with room moved there,
     /// so what is left has none, and cached KV yields to running work,
@@ -1147,7 +1148,25 @@ impl KvStore {
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
                         .collect();
                     tracing::debug!(target: "pie::kv", key, entries = ids.len(), "reclaim drops");
-                    freed += self.drop_entries(ids, By::Host, epoch);
+                    // A set at a time, oldest first: every entry that holds
+                    // the set's pages (a kept checkpoint and the sealed
+                    // prefix it stands on name the same pages) goes with
+                    // it, since dropping one alone frees nothing.
+                    for id in ids {
+                        let Some(terminal) = self.cache.get(&id).map(|e| e.path.terminal) else {
+                            continue;
+                        };
+                        let set: Vec<u64> = self
+                            .cache
+                            .iter()
+                            .filter(|(_, e)| e.path.terminal == terminal)
+                            .map(|(&id, _)| id)
+                            .collect();
+                        freed += self.drop_entries(set, By::Host, epoch);
+                        if freed >= short {
+                            break;
+                        }
+                    }
                     reached.push(at);
                 }
                 if freed >= short {
@@ -1357,8 +1376,8 @@ impl KvStore {
         }
     }
 
-    /// An owner's answers before its prompts; one wholly below the device
-    /// never. Groups that free no device page go last: the callers ask as
+    /// Lowest retention priority first, least recently used among equals;
+    /// one wholly below the device never. Groups that free no device page go last: the callers ask as
     /// they go, so a reclaim that stops early asks only the groups it reaches.
     fn reclaim_order(&self, keys: &impl Keys) -> Vec<(i64, Vec<u64>)> {
         self.order_where(keys, KvPageTable::holds_resident)
@@ -1376,7 +1395,10 @@ impl KvStore {
             return Vec::new();
         }
         type Group = (Vec<u64>, Instant);
-        let mut groups: HashMap<(Option<ProcessId>, i64, bool), Group> = HashMap::new();
+        // An owner's entries group by their row's key; an entry no process
+        // owns (a sealed prefix an exited set left) is a group of its own,
+        // never pooled with every other exited set's.
+        let mut groups: HashMap<(Result<ProcessId, u64>, i64), Group> = HashMap::new();
         for (&id, entry) in &self.cache {
             let root = entry.path.terminal;
             if !unused.contains(&root) || self.table.in_move_at(root) || !held(&self.table, root) {
@@ -1384,18 +1406,21 @@ impl KvStore {
             }
             let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
             let group = groups
-                .entry((entry.owner, key, entry.decoded))
+                .entry((entry.owner.ok_or(id), key))
                 .or_insert_with(|| (Vec::new(), entry.last_use));
             group.0.push(id);
             group.1 = group.1.max(entry.last_use);
         }
-        // Ties (one key, one last use) go oldest entry first, never by the
-        // map's order.
+        // Lowest retention priority first, then least recently used (the
+        // engine's own tie, PLEX 1.1 §4.2): what a decode wrote has no order
+        // of its own over a prompt unless a row says so (`default` keys the
+        // decoded tail below the prompt). Ties (one key, one last use) go
+        // oldest entry first, never by the map's order.
         let mut order: Vec<_> = groups
             .into_iter()
-            .map(|((_, key, decoded), (mut ids, last_use))| {
+            .map(|((_, key), (mut ids, last_use))| {
                 ids.sort_unstable();
-                ((key, !decoded, last_use, ids.first().copied()), (key, ids))
+                ((key, last_use, ids.first().copied()), (key, ids))
             })
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
@@ -2477,7 +2502,6 @@ impl KvStore {
                 },
                 owner: None,
                 last_use: Instant::now(),
-                decoded: false,
             },
         );
         self.note_change(node, true);
@@ -2722,14 +2746,14 @@ impl KvStore {
         let all = self.table.sealed_resident_prefix(ws).unwrap_or(0);
         let prompt = self.table.prompt_pages(ws).unwrap_or(0).min(all);
         if prompt > 0 {
-            self.keep(ws, prompt, owner, false);
+            self.keep(ws, prompt, owner);
         }
         if all > prompt {
-            self.keep(ws, all, owner, true);
+            self.keep(ws, all, owner);
         }
     }
 
-    fn keep(&mut self, ws: WorkingSetId, pages: u64, owner: Option<ProcessId>, decoded: bool) {
+    fn keep(&mut self, ws: WorkingSetId, pages: u64, owner: Option<ProcessId>) {
         let Ok(path) = self.table.keep_prefix(ws, pages) else {
             return;
         };
@@ -2739,7 +2763,7 @@ impl KvStore {
         }
         self.kept += 1;
         self.list(self.kept, path.terminal);
-        tracing::debug!(target: "pie::kv", pages, decoded, "kept");
+        tracing::debug!(target: "pie::kv", pages, "kept");
         retention::idle_cache_appeared();
         let terminal = path.terminal;
         self.cache.insert(
@@ -2748,7 +2772,6 @@ impl KvStore {
                 path,
                 owner,
                 last_use: Instant::now(),
-                decoded,
             },
         );
         self.note_change(terminal, true);
@@ -2783,7 +2806,7 @@ impl KvStore {
             .sealed_resident_prefix(ws)
             .is_ok_and(|sealed| sealed >= pages)
         {
-            self.keep(ws, pages, owner, false);
+            self.keep(ws, pages, owner);
         }
     }
 
@@ -2847,8 +2870,7 @@ impl KvStore {
         Ok(self.table.folded_exact(ws)?)
     }
 
-    /// `decoded` when a decode wrote them, which the cache lets go before a
-    /// prompt. What a decode folds is frozen and not sealed: a decode runs
+    /// `decoded` when a decode wrote them. What a decode folds is frozen and not sealed: a decode runs
     /// ahead of the program that reads its tokens, which may take back the
     /// rows past where it stops ([`Self::truncate`]). Its rows seal with the
     /// next prompt the set folds, or as the set is released.

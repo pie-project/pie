@@ -37,6 +37,24 @@ pub struct DeviceBoot {
     /// `[metal] measure`: whether a load times what no stored or committed
     /// profile states under a matching key.
     pub measure: engine::rates::Measuring,
+    /// Tests only (`test-limits`): the top rung a load serves, `None` the
+    /// ruling's (`Top::Ruled`, as every served load). A test that hand-builds
+    /// frames wider than a miniature's ruled top (which the runtime's step
+    /// builder never forms) loads every rung (`Top::EveryRung`), as the shell
+    /// tests do.
+    #[cfg(feature = "test-limits")]
+    pub top: Option<crate::Top>,
+}
+
+impl DeviceBoot {
+    /// The top rung a load serves: the ruling's, but where a test states one.
+    fn top(&self) -> crate::Top {
+        #[cfg(feature = "test-limits")]
+        if let Some(top) = self.top {
+            return top;
+        }
+        crate::Top::Ruled
+    }
 }
 
 struct PendingStep {
@@ -471,6 +489,111 @@ impl Engine for Metal {
         "metal"
     }
 
+    /// Whether a `[rates]` key the load serves by a stale figure is left to
+    /// time behind serving (`Shell::rates_behind`).
+    fn measures_behind(&self) -> bool {
+        self.shell
+            .as_ref()
+            .is_some_and(|shell| shell.rates_behind().is_some())
+    }
+
+    /// One slice behind serving: the rates step timing the next stale
+    /// `[rates]` key alone (`rates::measure_keys`), each frame reading
+    /// whether a request arrived and stopping where one did, so an arrival
+    /// waits at most the frame in flight; the key is timed again whole at a
+    /// later idle turn. Kept only where it had the device alone at a steady
+    /// clock: the runtime turns it only where nothing landing is owed, no other lane
+    /// submitting while it runs, and the clock read after it no slower than
+    /// the settled one before it (`rates::throttled`). Kept: stored in the
+    /// user's profile for the next load; this load serves on by the stale
+    /// figure. Else discarded and timed again later.
+    fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
+        // No guard on the open frame (`self.pending`): it stays open past
+        // its settle until the next submit, so at idle it always is, and the
+        // runtime turns this lane only where nothing landing is owed. A
+        // slice fires on buffers of its own alone, never the pool's seats or
+        // a frame's readout, so the open frame's numbers stand.
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        let Some(key) = shell.rates_behind().map(str::to_string) else {
+            return Ok(false);
+        };
+        let profile = shell.tuning().profile().clone();
+        let device = shell.device();
+        let submitted = (behind.others)();
+        let began = std::time::Instant::now();
+        // A `curve <n>x<k>` entry: that shape's dense curves, timed by the
+        // step a load times them by (`tune::dense::curves_behind`); else
+        // one `[rates]` key.
+        let timed = crate::rates::clock_rate(device, profile.clone(), true, Some(behind.arrived)).and_then(|before| {
+            let rates = match key.strip_prefix(crate::tune::dense::CURVE_BEHIND) {
+                Some(shape) => profile::fire::Rates {
+                    kernel_tflops_by_shape: Some(crate::tune::dense::curves_behind(
+                        device,
+                        &profile,
+                        shape,
+                        behind.arrived,
+                    )?),
+                    ..profile::fire::Rates::default()
+                },
+                None => crate::rates::measure_keys(
+                    device,
+                    profile.clone(),
+                    &[key.as_str()],
+                    Some(behind.arrived),
+                    &mut |_| {},
+                )?,
+            };
+            Ok((before, rates))
+        });
+        let ms = began.elapsed().as_secs_f64() * 1e3;
+        let (before, rates) = match timed {
+            Ok(timed) => timed,
+            Err(why) if crate::rates::yielded(&why) || why == crate::tune::dense::YIELDED => {
+                tracing::info!(
+                    key = %key,
+                    ms,
+                    "rates behind serving: `{key}` yielded to an arrival; timed again later"
+                );
+                return Ok(true);
+            }
+            Err(why) => {
+                return Err(Error::Load(format!(
+                    "rates behind serving: `{key}` was not timed: {why}"
+                )));
+            }
+        };
+        let after = crate::rates::clock_rate(device, profile, false, None).map_err(Error::Load)?;
+        let why = if (behind.others)() != submitted {
+            Some("another lane submitted while it ran".to_string())
+        } else {
+            crate::rates::throttled(before, after).map(|ratio| {
+                format!("the device's clock {ratio:.2}x slower after it than its settled start")
+            })
+        };
+        if let Some(why) = why {
+            tracing::info!(
+                key = %key,
+                ms,
+                "rates behind serving: `{key}` discarded ({why}); timed again later"
+            );
+            return Ok(true);
+        }
+        if let Err(why) = crate::rates::save_rates(device, self.boot.profiles.as_deref(), &rates) {
+            tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
+        }
+        let left = shell.rate_timed(&key);
+        tracing::info!(
+            key = %key,
+            ms,
+            left,
+            "rates behind serving: `{key}` timed and stored for the next load (this load serves \
+             on by its stale figure); {left} left"
+        );
+        Ok(true)
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }
@@ -631,7 +754,7 @@ impl Engine for Metal {
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
-                    top: crate::Top::Ruled,
+                    top: self.boot.top(),
                     measure: self.boot.measure,
                 })
                 .map_err(fault)?;
@@ -682,7 +805,12 @@ impl Engine for Metal {
         told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
         shell
-            .seat_disk_kv(residency.disk_kv_budget, residency.disk_kv_dir.as_deref())
+            .seat_disk_kv(
+                residency.disk_kv_budget,
+                residency.disk_kv_dir.as_deref(),
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                budgets.max_context,
+            )
             .map_err(fault)?;
 
         if crate::diag::on().tier_trace {
@@ -1813,7 +1941,7 @@ fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
         Some(budget) => Err(Error::Load(format!(
             "budget_host ({budget} bytes) on Metal: the device's memory is the host's, so \
              there is no host kv tier (a move there would copy within the same memory and \
-             free nothing); suspended state goes to the disk tier where budget_disk states one. Remove \
+             free nothing); suspended state goes to the disk tier (budget_disk). Remove \
              budget_host from [engine.memory]"
         ))),
         None => Ok(()),

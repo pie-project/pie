@@ -859,7 +859,7 @@ fn scores_rig() -> Option<ScoresRig> {
         )),
         "{SCORES_MODEL} captures scores"
     );
-    let mut engine = backend::Engine::new(boot, super::outputs::contract_for);
+    let mut engine = backend::Engine::new(crate::gpu::fires_stated(boot), super::outputs::contract_for);
     let loaded = engine
         .load(LoadRequest {
             trace: fixture.trace.clone(),

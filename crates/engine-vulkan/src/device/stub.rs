@@ -187,6 +187,45 @@ impl Context {
     pub fn frame_kept(&self) -> Result<Frame> {
         match self.never {}
     }
+
+    pub fn frame_dry(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn room_next(&self, _room: Option<(&Buffer, u64)>) {
+        match self.never {}
+    }
+
+    pub fn rebind_segments(&self, _segments: &[(Option<&Buffer>, &Buffer)]) -> Result<u64> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn rebinds_segments(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn indirect_next(&self, _at: Option<std::sync::Arc<Vec<bool>>>) {
+        match self.never {}
+    }
+
+    pub fn arm_next(&self, _arm: Option<std::sync::Arc<ArmBlock>>) {
+        match self.never {}
+    }
+
+    pub fn fixed_next(&self, _fixed: bool) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fire_alignments(&self) -> (u64, u64) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn copier_scalars(&self) -> u32 {
+        match self.never {}
+    }
 }
 
 pub struct Frame {
@@ -196,7 +235,35 @@ pub struct Frame {
 #[derive(Clone, Debug)]
 pub enum Stamps {}
 
+/// No frame keeps a trail with no device.
+#[must_use]
+pub fn trailing() -> bool {
+    false
+}
+
+/// What a fill walk laid: none, with no device.
+#[derive(Debug)]
+pub struct Fill {
+    pub baked: u64,
+    pub trail: Vec<String>,
+    pub groups: Vec<[u32; 3]>,
+    pub copies: Vec<[u32; 3]>,
+    pub image: Image,
+    pub cuts: usize,
+    pub room_pasts: Vec<u64>,
+}
+
 impl Frame {
+    #[must_use]
+    pub fn room_pasts(&self) -> Vec<u64> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn into_fill(self) -> Fill {
+        match self.never {}
+    }
+
     pub fn flush_settled(&self) -> Result<()> {
         self.flush()
     }
@@ -255,6 +322,16 @@ impl Frame {
         match self.never {}
     }
 
+    pub fn copy_rows(
+        &mut self,
+        _source: &Buffer,
+        _into: &Buffer,
+        _regions: &[(u64, u64, u64)],
+        _most: usize,
+    ) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn fill_zero(&mut self, _into: &Buffer, _at: u64, _len: u64) -> Result<()> {
         match self.never {}
     }
@@ -273,9 +350,84 @@ pub struct Kept {
     never: std::convert::Infallible,
 }
 
+/// What a walk laid in a fire block: none, with no device.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Image;
+
+impl Image {
+    #[must_use]
+    pub fn sealed(&self) -> Image {
+        Image
+    }
+}
+
+/// An arm's fire block: none, with no device.
+pub struct ArmBlock {
+    never: std::convert::Infallible,
+}
+
+impl ArmBlock {
+    pub fn new(device: &Context, _bytes: u64) -> Result<std::sync::Arc<ArmBlock>> {
+        match device.never {}
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        match self.never {}
+    }
+}
+
 impl Kept {
+    pub fn bind_room(&self, _room: Option<(&Buffer, u64)>, _pasts: &[u64]) -> Result<bool> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn trail(&self) -> &[String] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn pinned(&self) -> Option<String> {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn baked(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn image(&self) -> &Image {
+        match self.never {}
+    }
+
+    pub fn stage(&self, _image: &Image) -> Result<()> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn copies(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fixed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn indirect(&self, _at: usize) -> bool {
         match self.never {}
     }
 
@@ -485,6 +637,11 @@ impl Pipelines {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.compiles.get()
+    }
+
+    #[must_use]
+    pub fn most_scalars(&self) -> u32 {
+        0
     }
 
     /// The kernels built after `from`: none, since a device-less build

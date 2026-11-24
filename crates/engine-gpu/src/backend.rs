@@ -129,6 +129,14 @@ pub trait Context<B: Backend> {
 
     fn cores(&self) -> u32;
 
+    /// Whether the state pool may commit and release segments while serving
+    /// on this device, where its backend's pool resizes
+    /// ([`Backend::RESIZES_POOL`]): a device that cannot rebind what a
+    /// recording binds of the pool lays it whole, as it states at load.
+    fn resizes_pool(&self) -> bool {
+        true
+    }
+
     /// The workgroups the device holds at once, as the load laid them
     /// (measured, stored, committed or estimated): what a guest step's grid
     /// strides over. `None` before the load has.
@@ -194,6 +202,21 @@ pub trait Frame<B: Backend>: 'static {
             self.copy(source, source_at, into, into_at, len)?;
         }
         Ok(())
+    }
+
+    /// [`Frame::copy_regions`] for the rows a fire reads out, which move
+    /// by the fire's lanes: at most `most` regions for any fire of the
+    /// frame's shape. A backend whose recordings keep what a fire changes
+    /// apart from their commands moves them so.
+    fn copy_rows(
+        &mut self,
+        source: &B::Buffer,
+        into: &B::Buffer,
+        regions: &[(u64, u64, u64)],
+        most: usize,
+    ) -> Result<()> {
+        let _ = most;
+        self.copy_regions(source, into, regions)
     }
 
     fn fill_zero(&mut self, into: &B::Buffer, at: u64, len: u64) -> Result<()>;

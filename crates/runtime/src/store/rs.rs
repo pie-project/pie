@@ -1668,19 +1668,6 @@ impl RsStore {
         freed
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub fn discard_cache(&mut self, owner: ProcessId) -> usize {
-        let keys: Vec<Hash256> = self
-            .checkpoints
-            .iter()
-            .filter(|(_, entry)| entry.owner == Some(owner))
-            .map(|(&key, _)| key)
-            .collect();
-        let freed = self.drop_keys(&keys);
-        self.retire_idle();
-        freed
-    }
-
     fn unsettled(&self, snapshot: RsWorkingSetId) -> bool {
         let busy = self.busy_slots();
         self.working_sets

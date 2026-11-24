@@ -4173,6 +4173,7 @@ mod tests {
         an_unframed_piece_waits_for_its_pipelines_framed_fire_queued_ahead();
         a_pass_that_only_reorders_lets_the_worker_park();
         what_a_frame_settled_inside_submit_wrote_is_kept_when_it_is_answered();
+        a_served_step_counts_by_its_stated_treatment();
         a_step_wider_than_the_rung_the_engine_holds_never_reaches_it();
     }
 
@@ -4553,6 +4554,7 @@ mod tests {
     /// it was given what each reporting lane wrote, before it returns.
     struct InlineEngine {
         sink: Option<::engine::CompletionSink>,
+        live: ::engine::live::Live,
     }
 
     impl engine::Engine for InlineEngine {
@@ -4589,6 +4591,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "inline"
+        }
+
+        fn live(&self) -> ::engine::live::Live {
+            self.live.clone()
         }
 
         fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
@@ -4663,7 +4669,10 @@ mod tests {
         const TAG: u64 = u64::MAX - 0x5e77;
         let mut lane = Lane::spawn(
             0,
-            Some(Box::new(InlineEngine { sink: None })),
+            Some(Box::new(InlineEngine {
+                sink: None,
+                live: ::engine::live::Live::armed(),
+            })),
             Arc::new(SchedulerStats::default()),
         );
 
@@ -4704,6 +4713,62 @@ mod tests {
             .expect("what the lane wrote is kept before its fire is answered");
         assert_eq!(kept.fold, Some(4), "the fold the engine told");
 
+        let (_engine, _channels) = lane.shutdown();
+    }
+
+    /// The served census counts each step the engine took by the treatment
+    /// of the stated shape it carries (`fires_folds`, `fires_buffers`); a
+    /// step carrying no stated shape (built by hand) counts under neither.
+    fn a_served_step_counts_by_its_stated_treatment() {
+        use ::engine::live::Tally;
+        use ::engine::shapes::{FireShape, Treatment};
+        let live = ::engine::live::Live::armed();
+        let mut lane = Lane::spawn(
+            0,
+            Some(Box::new(InlineEngine {
+                sink: None,
+                live: live.clone(),
+            })),
+            Arc::new(SchedulerStats::default()),
+        );
+        let step = |shape: Option<FireShape>| crate::engine::StepFire {
+            fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
+            shapes: None,
+            submission: ::engine::Step {
+                lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
+                attachments: Vec::new(),
+                media: Vec::new(),
+                voxels: Vec::new(),
+                shape,
+            },
+            terminal_cells: Vec::new(),
+            completions: Vec::new(),
+            member_lanes: Vec::new(),
+            instances: Vec::new(),
+        };
+        let of = |id, treatment| Some(FireShape { id, treatment });
+        let answer_rx = lane.fire(
+            crate::engine::FrameFire {
+                steps: vec![
+                    step(of(0, Treatment::Folds)),
+                    step(of(3, Treatment::Buffers)),
+                    step(of(1, Treatment::Folds)),
+                    step(None),
+                ],
+            },
+            false,
+        );
+        let result = crate::rt::block_on(async {
+            crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
+        })
+        .expect("the launch is answered")
+        .expect("the launch is answered");
+        if let Err(why) = &result {
+            panic!("the frame fires: {why}");
+        }
+        assert_eq!(live.tallied(Tally::FiresFolds), 2);
+        assert_eq!(live.tallied(Tally::FiresBuffers), 1);
         let (_engine, _channels) = lane.shutdown();
     }
 

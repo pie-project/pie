@@ -1225,6 +1225,10 @@ struct Workload {
     /// (`engine::Landing::Failed`): its destination written with garbage,
     /// its sources left as they were. `None`: every copy lands.
     landing_fails: Option<u64>,
+    /// The built-in `default` worker policy's seat-to-end holds are
+    /// enacted ([`SeatHolds`]); `false` runs as `noop`, no rows. Set for
+    /// every seed by `PIE_SIM_DEFAULT`.
+    default_policy: bool,
 }
 
 impl Workload {
@@ -1389,6 +1393,7 @@ impl Workload {
             target,
             ring,
             landing_fails,
+            default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
         }
     }
 
@@ -1521,6 +1526,7 @@ impl Workload {
             target,
             ring: None,
             landing_fails: None,
+            default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
         }
     }
 
@@ -1896,6 +1902,26 @@ struct Ctx {
     walks: bool,
     /// A two-ended pool's engine view ([`EngineView`]).
     engine_view: Option<Arc<Mutex<EngineView>>>,
+    /// `default`'s seat-to-end holds, where the workload runs it.
+    seats: Option<Mutex<SeatHolds>>,
+}
+
+/// The `schedule/hold` rows the built-in `default` policy writes for
+/// seat-to-end (`crates/builtins/policies/default`), enacted at the start
+/// gate as the runtime's admission gates enact them: while more would run
+/// than the pools hold to their end (`pie/lanes-to-end`, the planner's
+/// [`ResidencyPlanner::to_end_facts`]), a newcomer waits to start, let go
+/// first come, first served as lanes free, one a step where starting
+/// together runs short (`pie/starts-spread`). The policy's rows lag the
+/// pool by a call; here they are read each step.
+#[derive(Default)]
+struct SeatHolds {
+    /// Started and not yet ended.
+    started: usize,
+    /// Waiting to start, in arrival order.
+    waiting: Vec<ProcessId>,
+    /// The step the last one was let go on.
+    released_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -2575,9 +2601,44 @@ async fn owe_raise(ctx: &Ctx, pid: ProcessId) -> Result<(), String> {
 }
 
 /// A process's life by `script`, as the runtime runs one.
+/// Waits while `default`'s seat-to-end holds `pid` ([`SeatHolds`]).
+async fn seat_to_end(ctx: &Ctx, pid: ProcessId) {
+    let Some(seats) = &ctx.seats else {
+        return;
+    };
+    seats.lock().unwrap().waiting.push(pid);
+    loop {
+        let (lanes, spread) = ctx.planner.to_end_facts();
+        let step = ctx.step.load(Ordering::Relaxed);
+        {
+            let mut seats = seats.lock().unwrap();
+            let go = match lanes {
+                // Unknown until one has finished: no hold.
+                None => true,
+                Some(lanes) => {
+                    let lanes = usize::try_from(lanes).unwrap_or(usize::MAX).max(1);
+                    let below = seats.started + seats.waiting.len() <= lanes;
+                    below
+                        || (seats.waiting.first() == Some(&pid)
+                            && seats.started < lanes
+                            && !(spread && seats.released_at == Some(step)))
+                }
+            };
+            if go {
+                seats.waiting.retain(|waiting| *waiting != pid);
+                seats.started += 1;
+                seats.released_at = Some(step);
+                return;
+            }
+        }
+        ctx.next_step().await;
+    }
+}
+
 async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     let planner = ctx.planner.clone();
     ctx.at(pid, "admit");
+    seat_to_end(&ctx, pid).await;
     planner.admit(pid).await;
     // As the runtime's gates hold a newcomer
     // (`inferlet::process::wait_for_room`): until the capacity gate's last
@@ -2680,6 +2741,10 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     planner.unregister(pid);
     drop(departure);
     unregister_residency(pid);
+    if let Some(seats) = &ctx.seats {
+        let mut seats = seats.lock().unwrap();
+        seats.started = seats.started.saturating_sub(1);
+    }
     let mut log = ctx.log.lock().unwrap();
     log.stages.remove(&pid);
     log.ended += 1;
@@ -3253,6 +3318,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         rng: Mutex::new(Rng(workload.seed ^ 0x5eed)),
         walks: grow.is_some(),
         engine_view,
+        seats: workload.default_policy.then(|| Mutex::new(SeatHolds::default())),
     });
     let mut pid_rng = Rng(workload.seed.wrapping_mul(31).wrapping_add(7));
     let mut fires_before = 0u64;
@@ -4048,14 +4114,19 @@ fn sim_field_seeds_863_and_178_end() {
 /// admitted.
 #[test]
 fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_ends() {
+    // Seated lanes grow before a waiting prompt on every engine now (PLEX
+    // 1.1's no displacement): seed 6's newcomers no longer reach the gate's
+    // last place, seed 2's still do. Both must end clean.
+    let mut waits = 0;
     for seed in [2, 6] {
         let (failures, coverage) = run(&Workload::metal(seed), None);
         for failure in &failures {
             eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
         }
         assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
-        assert!(coverage.admission_waits > 0, "metal seed {seed}: no newcomer waited at the gate");
+        waits += coverage.admission_waits;
     }
+    assert!(waits > 0, "no newcomer waited at the gate");
 }
 
 /// What a run did, as a string two runs of one seed must agree on.
@@ -4266,6 +4337,7 @@ fn run_pieces_workload(
         target: Vec::new(),
         ring: None,
         landing_fails: None,
+        default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
     }
 }
 
@@ -4414,6 +4486,7 @@ fn raise_beside_own_workload(scripts: Vec<Script>) -> Workload {
         target: Vec::new(),
         ring: None,
         landing_fails: None,
+        default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
     }
 }
 

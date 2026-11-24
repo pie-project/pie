@@ -813,6 +813,8 @@ impl Engine for Cuda {
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
                 residency.disk_kv_persistent,
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                context,
                 self.boot.world,
             )
             .map_err(fault)?;
@@ -824,11 +826,6 @@ impl Engine for Cuda {
             );
         }
 
-        // Expert parallelism seats its buffers in the arena laid at the
-        // span's start: no smaller rung.
-        if self.expert.size > 1 {
-            shell.drop_rungs();
-        }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
         chunk_facts.record_bytes = shell.record_bytes();
         chunk_facts.windowed = shell.windowed_layers();
@@ -870,9 +867,6 @@ impl Engine for Cuda {
                     .min()
                     .unwrap_or(0),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
-                seated_first: shell.seated_first(),
-                seat_to_end: shell.seat_to_end(),
-                seat_spread: shell.seat_spread(),
             },
             chunks: chunk_facts,
             limits: FireLimits {
@@ -933,26 +927,27 @@ impl Engine for Cuda {
             ),
             steps: engine::StatedSteps::default(),
         };
-        // The set as the load states it, from its stated facts (the rungs
-        // its activation lends under, known once arming backed the span),
-        // with those the arm walk left eager (CONTRACT-BC 24).
-        let mut caps = caps;
-        caps.steps = shell.stated_steps(engine::StepShapes::of(
+        // The set as the load states it, from its stated facts, with those
+        // the arm walk left eager (CONTRACT-BC 24). It is the set the walk
+        // took: a fire's stamped shape names the walk's shape.
+        let stated = engine::StepShapes::of(
             &steps,
             &engine::StepFacts::stated(&caps, &readout_facts()),
-        ));
+        );
+        if stated != *shell.steps() {
+            return Err(Error::Load(format!(
+                "the load states the step set {} and its arm walk took {}: a fire's stated \
+                 shape would name another walk's shape",
+                stated.census(),
+                shell.steps().census()
+            )));
+        }
+        let mut caps = caps;
+        caps.steps = shell.stated_steps(stated);
         eprintln!(
-            "engine-cuda: step set: {}; {} stated eager{}",
+            "engine-cuda: step set: {}; {} stated eager",
             caps.steps.shapes.census(),
             caps.steps.eager.len(),
-            if caps.steps.shapes == *shell.steps() {
-                String::new()
-            } else {
-                format!(
-                    " (the walk took the set over the arena's rungs, {})",
-                    shell.steps().census()
-                )
-            },
         );
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
@@ -1349,6 +1344,24 @@ impl Engine for Cuda {
 
     fn settles_asynchronously(&self) -> bool {
         true
+    }
+
+    fn measures_behind(&self) -> bool {
+        self.shell.as_ref().is_some_and(Shell::measures_behind)
+    }
+
+    /// One roofline key the load serves from a stale figure, timed on the
+    /// shell's own stream where nothing of a frame is pending and the
+    /// stream is idle, yielding to an arrival between its bursts
+    /// ([`Shell::measure_behind`]).
+    fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        match self.shell.as_mut() {
+            Some(shell) => shell.measure_behind(behind).map_err(fault),
+            None => Ok(false),
+        }
     }
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {
@@ -2065,6 +2078,7 @@ impl Cuda {
                     attachments: &attached,
                     media: &media,
                     voxels: &voxels,
+                    shape: submission.shape,
                 },
                 None,
             )

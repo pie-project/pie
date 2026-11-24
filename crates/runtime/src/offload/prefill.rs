@@ -17,7 +17,7 @@
 //! same prefix on both. Their engines must lay a page out alike: v1 moves a
 //! page's bytes as they are.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -132,21 +132,6 @@ pub trait PrefillPeer: Send + Sync {
         let _ = lease;
         Box::pin(async { Ok(()) })
     }
-}
-
-static PEER: RwLock<Option<Arc<dyn PrefillPeer>>> = RwLock::new(None);
-
-pub fn set_peer(peer: Option<Arc<dyn PrefillPeer>>) {
-    *PEER.write().unwrap() = peer;
-}
-
-/// The peer the worker's configuration dialed (`offload.peers`), if any.
-pub(crate) fn configured_peer() -> Option<Arc<dyn PrefillPeer>> {
-    PEER.read().unwrap().clone()
-}
-
-pub fn has_peer() -> bool {
-    PEER.read().unwrap().is_some()
 }
 
 /// Tokens per kv page on this worker's engine, once one serves a model.
@@ -269,18 +254,13 @@ pub(crate) async fn before_pass(
     }
 }
 
-/// The fewest uncached tokens worth a peer's prefill, and the executors to
-/// try: the worker's configuration (PLEX 1.1 leaves the cutoff to the host;
-/// which helpers a process may use is the cluster's `placement/helpers`);
-/// unstated, 2048. `None`: this process's passes stay home.
+/// The fewest uncached tokens worth a helper's prefill, and the executors
+/// to try: the worker's configuration (PLEX 1.1 leaves the cutoff to the
+/// host; which helpers a process may use is the cluster's
+/// `placement/helpers`). `None`: unstated, so this process's passes stay
+/// home.
 fn rule(_pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)> {
-    Some((
-        match super::prefill_min_suffix_tokens() {
-            0 => 2048,
-            n => n as u64,
-        },
-        Vec::new(),
-    ))
+    Some((super::prefill_min_suffix_tokens()? as u64, Vec::new()))
 }
 
 fn plan(

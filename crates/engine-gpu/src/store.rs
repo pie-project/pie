@@ -806,6 +806,12 @@ impl<B: Backend> Pools<B> {
         &self.layout
     }
 
+    /// The bytes of the host tier's chunks.
+    #[must_use]
+    pub fn host_tier_bytes(&self) -> u64 {
+        u64::from(self.host_chunks) * self.chunk_bytes()
+    }
+
     /// The pool as the runtime counts it.
     #[must_use]
     pub fn chunk_facts(&self) -> ChunkFacts {
@@ -1272,6 +1278,18 @@ impl<B: Backend> Pools<B> {
     /// The pool as kernels bind it.
     pub fn segments(&self, handles: &Handles<B>) -> Result<Segments> {
         self.pool.bind(handles)
+    }
+
+    /// The pool is laid whole: its device cannot rebind what a recording
+    /// binds of it.
+    pub fn lay_whole(&mut self) {
+        self.pool.lay_whole();
+    }
+
+    /// Each pool segment's buffer where it is backed, beside its stand-in.
+    #[must_use]
+    pub fn placed_segments(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.pool.placed()
     }
 
     #[must_use]
@@ -2152,7 +2170,7 @@ impl<B: Backend> Pools<B> {
     /// ([`Backend::RESIZES_POOL`]).
     #[must_use]
     pub fn load_segments(&self) -> u32 {
-        if B::RESIZES_POOL {
+        if self.pool.resizes() {
             1
         } else {
             self.pool.segments()
@@ -2171,8 +2189,9 @@ impl<B: Backend> Pools<B> {
 
     /// Gives back every segment at and past `segments`. The caller drained
     /// every frame, and the runtime evacuated what they held.
-    pub fn release_segments(&mut self, segments: u32) {
-        self.pool.release_segments(segments);
+    #[must_use = "the buffers given back are dropped once nothing binds them"]
+    pub fn release_segments(&mut self, segments: u32) -> Vec<B::Buffer> {
+        self.pool.release_segments(segments)
     }
 
     /// Records each evacuated chunk's copy onto its new physical chunk in

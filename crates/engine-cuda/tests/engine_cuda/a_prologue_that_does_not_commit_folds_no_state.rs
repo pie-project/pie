@@ -241,6 +241,7 @@ fn fire(
             attachments,
             media: &[],
             voxels: &[],
+            shape: None,
         },
         None,
     )

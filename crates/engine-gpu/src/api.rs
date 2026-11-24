@@ -272,9 +272,34 @@ pub struct Gpu<B: Host> {
     /// The rows of the loaded model's widest token table: a token id a
     /// guest resolves at or past it is out of bounds.
     vocab: Option<u32>,
+    /// What the work behind serving was last said to be doing
+    /// ([`Gpu::behind_state`]).
+    said_behind: Option<&'static str>,
 }
 
 impl<B: Host> Gpu<B> {
+    /// The pending frame's numbers, each step's rows read back from its
+    /// readout seats where not read yet ([`Engine::settle_frame`] takes
+    /// them from here): what frees the seats on an idle turn.
+    fn take_pending_rows(&mut self) -> EngineResult<()> {
+        let (Some((_, pending)), Some(shell)) = (self.pending.as_mut(), self.shell.as_mut()) else {
+            return Ok(());
+        };
+        for step in pending.iter_mut().filter(|step| step.rows.is_none()) {
+            step.rows = Some(shell.rows_of(&step.landed).map_err(fault)?);
+        }
+        Ok(())
+    }
+
+    /// What the work left behind serving is doing now, said once each time
+    /// it changes: running, or why it does not run.
+    fn behind_state(&mut self, state: &'static str) {
+        if self.said_behind != Some(state) {
+            self.said_behind = Some(state);
+            tracing::info!(state, "behind serving: {state}");
+        }
+    }
+
     /// One slice behind serving of a `[rates]` key or a dense kernel's curve
     /// the load serves by a figure stored under a stale key
     /// (`profile::fire::Tuned::behind`): the rates step timing that key
@@ -296,15 +321,25 @@ impl<B: Host> Gpu<B> {
             return Ok(false);
         };
         if !crate::backend::Context::idle(shell.device()) {
+            self.behind_state("waiting: the device is busy");
             return Ok(false);
         }
+        self.behind_state("running: the stale rates and curves");
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
         let max_submit = B::submit_bound(&self.boot);
         let mut stated = shell.tuning().profile().rates();
         stated.stale = None;
         let reference = shell.tuning().gemm(shell.tier(), crate::submit::PROBE.0);
         let submitted = (behind.others)();
         let began = std::time::Instant::now();
-        let before = crate::rates::clock_warmed::<B>(shell.device(), reference).map_err(fault)?;
+        let Some(before) =
+            crate::rates::clock_warmed_until::<B>(shell.device(), reference, behind.arrived)
+                .map_err(fault)?
+        else {
+            return Ok(true);
+        };
         let timed: crate::error::Result<profile::fire::Rates> =
             match key.strip_prefix(crate::rates::CURVE_BEHIND) {
                 Some(curve) => {
@@ -537,6 +572,7 @@ impl<B: Host> Gpu<B> {
             guest_built: 0,
             warned_in_fire: false,
             vocab: None,
+            said_behind: None,
         }
     }
 
@@ -581,6 +617,10 @@ impl<B: Host> Gpu<B> {
         if guest > 0 {
             self.live.tally(engine::live::Tally::BuiltInFire, guest);
             self.warn_in_fire("a guest step's pipeline");
+        }
+        let eager = self.shell.as_mut().map_or(0, Shell::eager_serving);
+        if eager > 0 {
+            self.live.tally(engine::live::Tally::Eager, eager);
         }
         // The submit-bound probes, apart from the model's fires: recorded at
         // load where the backend keeps recordings.
@@ -1106,8 +1146,11 @@ where
         // fires of a served load are its own naming walk's, the widest a
         // cut's lanes, and those are the seats it is asked to lay.
         let slots = poem_compiler::state_slots(budgets.slots, &trace, crate::serve::naming_lanes());
-        let (disk_kv_budget, disk_kv_dir) =
-            (residency.disk_kv_budget, residency.disk_kv_dir.clone());
+        let (disk_kv_budget, disk_kv_dir, seats) = (
+            residency.disk_kv_budget,
+            residency.disk_kv_dir.clone(),
+            residency.kv_seats.unwrap_or(budgets.max_lanes),
+        );
         let budget = bake_budgets(&budgets, &trace);
         let mut shell = Shell::load(Boot {
             trace,
@@ -1126,7 +1169,8 @@ where
             residency,
             device: &self.boot,
             handed: self.handed.take(),
-            check: None,
+            check: B::fires_stated(&self.boot)
+                .then_some(crate::serve::CheckRungs::To(budgets.max_tokens)),
             places_programs: true,
         })
         .map_err(fault)?;
@@ -1142,17 +1186,18 @@ where
                 "every fire shape the load serves walked bind-only: what a dispatch binds is built"
             );
         }
-        // What the load itself walked is the load's: serving counts from here.
-        shell.unkept_serving();
-        shell.bound_serving();
-        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
         let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
             .unwrap_or(u32::MAX);
         shell
-            .seat_disk_kv(disk_kv_budget, disk_kv_dir.as_deref())
+            .seat_disk_kv(
+                disk_kv_budget,
+                disk_kv_dir.as_deref(),
+                seats,
+                budgets.max_context,
+            )
             .map_err(fault)?;
         // The dense kernel at each rung as a stored or committed settle of
         // the load's key decided it, else the nearest settle's or the
@@ -1167,9 +1212,6 @@ where
             "load phases: the dense settle's picks (nothing fires before ready)"
         );
         shell.walk_binds().map_err(fault)?;
-        shell.unkept_serving();
-        shell.bound_serving();
-
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let weights_resident = !shell.weights_stream();
@@ -1297,11 +1339,61 @@ where
             &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
         );
         tracing::info!(
-            "engine-gpu: step set: {}; its arm walk does not key on the set yet, so none \
-             of the {} is checked against what it records",
+            "engine-gpu: step set: {}; the arm walk keys on it",
             caps.steps.shapes.census(),
-            caps.steps.shapes.len(),
         );
+        shell.steps = Some(caps.steps.shapes.clone());
+        // The bodies are armed last, once every kernel a fire takes is
+        // settled: a body records the kernels its fires walk.
+        let started = std::time::Instant::now();
+        let records = <B as crate::serve::Serve>::records_dir(&self.boot);
+        let bodies = shell
+            .record_bodies(records.as_deref(), Some(&caps.steps.shapes))
+            .map_err(fault)?;
+        if bodies > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                bodies,
+                recorded = shell.recorded_serving(),
+                ms = started.elapsed().as_millis() as u64,
+                "the load's bodies armed before ready, on every arm, smallest first"
+            );
+        }
+        if B::RECORDS {
+            tracing::info!(
+                engine = B::KIND,
+                "stated eager at load, each fire walked and never recorded: a fire past the \
+                 bodies' allowance (named above where one is), one with a group mask, one \
+                 landing a recurrent snapshot, one whose token table streams with no ring, one \
+                 whose lanes capture scores, a split step"
+            );
+        } else {
+            tracing::info!(
+                engine = B::KIND,
+                "this backend keeps no recording: every fire is encoded as it is served, \
+                 stated eager at load, and nothing is recorded or armed while serving"
+            );
+        }
+        // What the load itself walked is the load's: serving counts from here.
+        shell.recorded_serving();
+        shell.eager_serving();
+        shell.unkept_serving();
+        shell.bound_serving();
+        shell.serving = true;
+        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
+
+        // What the allowance left: the set's tail from a shape on, stated
+        // eager at load by its index.
+        caps.steps.eager = shell.eager_shapes_from();
+        if !caps.steps.eager.is_empty() {
+            tracing::info!(
+                engine = B::KIND,
+                eager = caps.steps.eager.len(),
+                of = caps.steps.shapes.len(),
+                first = %caps.steps.shapes.shapes[caps.steps.eager[0] as usize],
+                "the step shapes past the bodies' allowance run eager, as stated"
+            );
+        }
 
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
@@ -1730,20 +1822,57 @@ where
             .is_some_and(|shell| shell.measures_behind() || shell.rates_behind().is_some())
     }
 
+    fn behind_need(&self) -> Option<engine::BehindNeed> {
+        self.shell.as_ref().and_then(Shell::behind_need)
+    }
+
     fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
-        // A frame whose numbers are not yet taken holds its readout seats.
+        // A frame whose numbers are not yet taken holds its readout seats,
+        // which a settle fire would write: on an idle turn they are taken
+        // now (they are due anyway; the frame's settle reads them back from
+        // here), so the seats are free for what runs behind serving.
         if self.pending.is_some() {
-            return Ok(false);
+            self.take_pending_rows()?;
         }
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
         // The settle's ranges first (decode's rows before the large ones),
-        // then each rate served by a stale figure.
-        if !shell.measures_behind() {
+        // where the runtime took the slots its next fire asks for; else,
+        // and after, each rate and curve served by a stale figure (its step
+        // writes no pool slot: it runs on any idle turn).
+        let need = shell.behind_need();
+        let seats_short = match (need, behind.seats) {
+            (Some(need), Some(seats)) => seats.len() < need.lanes as usize,
+            _ => false,
+        };
+        // A point longer than one decode step runs only with no process
+        // live, so a live request never waits behind it.
+        let long_held = need.is_some_and(|need| need.long) && !behind.alone;
+        if !shell.measures_behind() || seats_short || long_held {
+            if shell.rates_behind().is_none() {
+                if long_held {
+                    self.behind_state(
+                        "waiting: the settle's next point runs longer than one decode step, and \
+                         runs only once no process is live",
+                    );
+                } else if seats_short {
+                    self.behind_state(
+                        "waiting: the pool holds no room for one settle point's slots beyond \
+                         live work (the settle runs on a later idle turn; the fallback picks \
+                         serve)",
+                    );
+                }
+            }
             return self.rate_behind(behind);
         }
-        let fired = shell.measure_behind(behind.others).map_err(fault)?;
+        self.behind_state("running: the dense settle");
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        let fired = shell
+            .measure_behind(behind.others, behind.arrived, behind.seats)
+            .map_err(fault)?;
         // What the settle decided so far, kept in the user's profile for
         // the next load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {
@@ -2385,6 +2514,8 @@ impl<B: Host> Gpu<B> {
                 }
             }
         }
+        // The step's composition, which a stated eager shape is told by.
+        shell.step = Some(engine::StepComposition::of(&submission.lanes));
         // A refused lane still fires (token 0) to keep the composition; one
         // whose program places its rows has no run of its own the host may
         // append to, so its rows land in the null chunk, never its table.
@@ -2453,8 +2584,43 @@ impl<B: Host> Gpu<B> {
                 feed: feeds[at].as_ref(),
                 group: lane.group,
                 inputs: &input_cells[at],
+                pad: false,
             })
             .collect();
+        // A decode of one-row lanes of one class pads to its bucket with
+        // lanes that read as its first and write nothing: every decode of a
+        // bucket is then one body, recorded at load.
+        let mut seated = seated;
+        if submission.media.is_empty()
+            && submission.voxels.is_empty()
+            && let Some(first) = seated.first().copied()
+            && seated.iter().all(|lane| {
+                lane.lane.tokens.len() == 1
+                    && lane.lane.word == first.lane.word
+                    && lane.group.is_none()
+                    && lane.rs_snapshots.is_empty()
+                    && matches!(lane.rs, engine::fire::RsVerb::Fold)
+            })
+            && let Some(bucket) = shell.pad_bucket(seated.len())
+        {
+            const PAD_TOKEN: [u32; 1] = [0];
+            let pad = Seated {
+                lane: Lane {
+                    tokens: &PAD_TOKEN,
+                    ..first.lane
+                },
+                mask: None,
+                readout: None,
+                hosts: false,
+                reads: &[],
+                scores: None,
+                feed: None,
+                inputs: &[],
+                pad: true,
+                ..first
+            };
+            seated.resize(bucket, pad);
+        }
 
         let wrote;
         let mut faulted = faulted.faulted;

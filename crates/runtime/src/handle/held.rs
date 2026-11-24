@@ -169,15 +169,10 @@ impl Held {
     }
 
     /// Its tokens, what of them are folded, and its recurrent slots.
-    pub(super) fn measure(&self) -> (u64, u64, u32) {
-        let Parts { rs, cursor, .. } = self.parts();
-        let slots = rs.as_ref().map_or(0, |rs| {
-            let stores = store_registry::get(rs.model, rs.engine);
-            let held = stores.rs.lock().unwrap().held([rs.id]);
-            held.slots
-        });
+    pub(super) fn measure(&self) -> (u64, u64) {
+        let Parts { cursor, .. } = self.parts();
         let folded = self.folded();
-        (cursor.tail.map_or(folded, u64::from), folded, slots)
+        (cursor.tail.map_or(folded, u64::from), folded)
     }
 
     /// What it has folded: its KV working set's folded length.

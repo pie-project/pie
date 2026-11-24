@@ -122,7 +122,6 @@ measured = [
   "engine.lattice_steps",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
-  "engine.seated_first",
   "engine.working_set_percent",
   "fuse.hc_fold_pre",
   "fuse.hc_gates_norm",

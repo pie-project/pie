@@ -47,29 +47,6 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
-/// Whether a decoding lane's next pages come before seating a waiting prompt,
-/// and a prompt waits rather than suspending a lane
-/// (`PoolFacts::seated_first`). Off keeps arrival order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
-pub struct SeatedFirst;
-
-/// Whether a process starts only while the pools hold the started ones to
-/// the pages a finished one held (`PoolFacts::seat_to_end`), for a card
-/// whose pools seat fewer full lanes than the batch asks. Off starts each
-/// at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
-pub struct SeatToEnd;
-
-/// With `engine.seat_to_end`, whether more processes than the pools hold to
-/// the end at once start spread over a life (`PoolFacts::seat_spread`), so
-/// they finish apart and the pools hold more of them, each midway, than a
-/// wave started at once that runs to its end together. Off seats the wave.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_spread", flag, default = false, tune = engine)]
-pub struct SeatSpread;
-
 /// Whether a windowed pool of short lanes takes a page a lane past its kv
 /// pages (`Paging::spare`), for a card whose ring, not its kv pages, runs
 /// dry first. Off cuts it 1:1.
@@ -136,9 +113,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
-        .add::<SeatedFirst>()
-        .add::<SeatToEnd>()
-        .add::<SeatSpread>()
         .add::<WindowSpare>()
         .add::<WalkFireRows>()
         .add::<FireRows>()
@@ -250,9 +224,6 @@ pub struct Engine {
     pub grouped: bool,
     pub working_set_percent: u32,
     pub lattice_steps: u32,
-    pub seated_first: bool,
-    pub seat_to_end: bool,
-    pub seat_spread: bool,
     pub window_spare: bool,
     pub walk_fire_rows: u32,
     pub fire_rows: u32,
@@ -271,9 +242,6 @@ impl Engine {
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
-            seated_first: profile.on::<SeatedFirst>(&Anywhere),
-            seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
-            seat_spread: profile.on::<SeatSpread>(&Anywhere),
             window_spare: profile.on::<WindowSpare>(&Anywhere),
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             fire_rows: profile.get::<FireRows>().0,
@@ -405,7 +373,9 @@ mod tests {
     }
 
     /// Every fire is captured, its bodies held as the fit holds them: no
-    /// profile turns capture or bodies off or states their memory.
+    /// profile turns capture or bodies off or states their memory. Nor does
+    /// one order the planner: who goes first is the policy's (PLEX), so the
+    /// seating flags a profile once stated are refused by name.
     #[test]
     fn a_profile_stating_graphs_or_recording_is_refused() {
         for (text, id) in [
@@ -415,12 +385,15 @@ mod tests {
                 "engine.recording",
             ),
             ("api = 1\n[engine]\nbodies_mb = 512\n", "engine.bodies_mb"),
+            ("api = 1\n[engine]\nseated_first = true\n", "engine.seated_first"),
+            ("api = 1\n[engine]\nseat_to_end = true\n", "engine.seat_to_end"),
+            ("api = 1\n[engine]\nseat_spread = true\n", "engine.seat_spread"),
         ] {
             let why = registry()
                 .load_user(text, "user.toml")
                 .expect_err("not a decision")
                 .to_string();
-            assert!(why.contains(&format!("`{id}` is not a decision")), "{why}");
+            assert!(why.contains(&format!("`{id}` is not a decision of cuda")), "{why}");
         }
     }
 
@@ -781,9 +754,6 @@ mod tests {
                 grouped: true,
                 working_set_percent: 50,
                 lattice_steps: 1,
-                seated_first: false,
-                seat_to_end: false,
-                seat_spread: false,
                 window_spare: false,
                 walk_fire_rows: 0,
                 fire_rows: 0,
@@ -851,7 +821,6 @@ mod tests {
             tuning.selected_mma(),
             "a B200 walks a selection on the tensor cores"
         );
-        assert!(Engine::of(&b200).seated_first);
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
         assert_eq!(Engine::of(&b200).lattice_steps, 2);
@@ -860,9 +829,6 @@ mod tests {
             Engine {
                 lattice_steps: 1,
                 prefill_lattice_from: Engine::of(&family).prefill_lattice_from,
-                seated_first: false,
-                seat_to_end: false,
-                seat_spread: false,
                 window_spare: false,
                 walk_fire_rows: 0,
                 fire_rows: 0,
@@ -871,10 +837,9 @@ mod tests {
                 ..Engine::of(&b200)
             },
             Engine::of(&family),
-            "only the row lattice, the state seating, the planner's order, the fire width and \
+            "only the row lattice, the state seating, the fire width and \
              the host planes differ from the family's engine"
         );
-        assert!(!Engine::of(&family).seated_first);
         assert!(!Engine::of(&family).host_planes);
         assert_eq!(Engine::of(&family).lattice_steps, 1);
     }
@@ -1099,7 +1064,6 @@ mod tests {
                 Engine {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
-                    seated_first: std::ptr::eq(p, &l40s),
                     ..Engine::of(&registry().defaults())
                 }
             );
@@ -1160,7 +1124,6 @@ mod tests {
                     || (spec.id == "kernel.sdpa.pool_mma" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.moe.mxfp4_fp8_from" && std::ptr::eq(p, &l40s))
                     || spec.id == "kernel.ssm.kda_chunked"
-                    || (spec.id == "engine.seated_first" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_lse"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_window"

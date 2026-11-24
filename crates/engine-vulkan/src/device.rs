@@ -1,6 +1,8 @@
 #[cfg(feature = "vulkan")]
 pub mod alloc;
 #[cfg(feature = "vulkan")]
+pub mod block;
+#[cfg(feature = "vulkan")]
 pub mod ctx;
 #[cfg(feature = "vulkan")]
 pub mod pipelines;
@@ -9,6 +11,8 @@ pub mod spirv;
 
 #[cfg(feature = "vulkan")]
 pub use alloc::{Buffer, FileWriter, Memory};
+#[cfg(feature = "vulkan")]
+pub use block::{ArmBlock, Image};
 #[cfg(feature = "vulkan")]
 pub use ctx::{Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations};
 #[cfg(feature = "vulkan")]
@@ -19,7 +23,9 @@ mod stub;
 
 #[cfg(not(feature = "vulkan"))]
 pub mod ctx {
-    pub use super::stub::{Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations};
+    pub use super::stub::{
+        Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations, trailing,
+    };
 }
 #[cfg(not(feature = "vulkan"))]
 pub mod alloc {
@@ -32,8 +38,8 @@ pub mod pipelines {
 
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
-    Buffer, Context, Enabled, FileWriter, Frame, Kept, Memory, Pending, Pipeline, Pipelines,
-    Stamps, present, reservations,
+    ArmBlock, Buffer, Context, Enabled, FileWriter, Frame, Image, Kept, Memory, Pending, Pipeline,
+    Pipelines, Stamps, present, reservations,
 };
 
 /// The shared engine's view of this API.
