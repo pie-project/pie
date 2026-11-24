@@ -230,6 +230,7 @@ pub fn step(slot: u32, word: u64, tokens: &[u32]) -> Step {
         attachments: Vec::new(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     }
 }
 

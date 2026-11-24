@@ -221,6 +221,7 @@ fn one_program_driving_eight_lanes_settles_every_step() {
             .collect(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     };
 
     // The failure is a hang inside a submit or a settle, where nothing

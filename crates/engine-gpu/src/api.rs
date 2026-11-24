@@ -1866,6 +1866,11 @@ where
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
         if let Some(shell) = self.shell.as_ref() {
             let facts = &shell.trace().facts;
             for step in &frame.steps {

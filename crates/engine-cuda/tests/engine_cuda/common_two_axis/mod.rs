@@ -608,6 +608,7 @@ pub fn frame(
         attachments,
         media: Vec::new(),
         voxels,
+        shape: None,
     })
 }
 

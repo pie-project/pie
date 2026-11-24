@@ -356,6 +356,7 @@ impl Model {
                     .collect(),
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         if !self.asynchronous {
@@ -1132,6 +1133,7 @@ fn a_step_of_two_hybrid_prompts_past_the_bound_is_cut_lane_by_lane_and_serves_al
                     attachments: Vec::new(),
                     media: Vec::new(),
                     voxels: Vec::new(),
+                    shape: None,
                 }))
                 .unwrap_or_else(|why| panic!("the step fires: {why}"));
             model.engine.settle_frame(&mut ticket).expect("the step settles");

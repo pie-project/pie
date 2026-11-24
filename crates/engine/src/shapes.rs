@@ -745,6 +745,65 @@ impl StepShapes {
     }
 }
 
+/// The stated shape a fire's step is of (CONTRACT-BC 24): its index in the
+/// load's stated set ([`StatedSteps::shapes`]) and that shape's treatment,
+/// set by the runtime as it forms the step from what
+/// [`StepShapes::shape_of`] answers for the step's composition. A fire
+/// carries its stated shape; an engine keys its recorded body on it rather
+/// than computing a key of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FireShape {
+    /// The shape's index in the stated set's order.
+    pub id: u32,
+    /// The shape's treatment: whether any lane buffers its recurrent rows.
+    pub treatment: Treatment,
+}
+
+impl StepShapes {
+    /// The stated shape holding `step`, as a fire carries it; else the gap.
+    pub fn fire_shape(&self, step: &StepComposition) -> Result<FireShape, StepGap> {
+        let at = self.holds(step)?;
+        Ok(FireShape {
+            id: u32::try_from(at).unwrap_or(u32::MAX),
+            treatment: self.shapes[at].treatment,
+        })
+    }
+
+    /// Whether `shape`, carried by a fire of `lanes`, is the stated shape
+    /// this set holds those lanes in: an engine's cross-check of the
+    /// runtime's stamp against its own reading of the step. Else why, by
+    /// name.
+    pub fn agrees(&self, shape: FireShape, lanes: &[Lane]) -> Result<(), String> {
+        let step = StepComposition::of(lanes);
+        let Some(stated) = self.shapes.get(shape.id as usize) else {
+            return Err(format!(
+                "a fire carries stated shape {} of the {} the load stated: {step}",
+                shape.id,
+                self.len()
+            ));
+        };
+        if stated.treatment != shape.treatment {
+            return Err(format!(
+                "a fire carries stated shape {} as {} where the set states it {}",
+                shape.id, shape.treatment, stated.treatment
+            ));
+        }
+        match self.shape_of(&step) {
+            Some(at) if at == shape.id as usize => Ok(()),
+            Some(at) => Err(format!(
+                "a fire carries stated shape {} [{stated}] where its lanes make shape {at} \
+                 [{}]: {step}",
+                shape.id, self.shapes[at]
+            )),
+            None => Err(format!(
+                "a fire carries stated shape {} [{stated}] and no stated shape holds its \
+                 lanes: {step}",
+                shape.id
+            )),
+        }
+    }
+}
+
 /// A composition no stated shape holds: a contract bug, named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepGap {

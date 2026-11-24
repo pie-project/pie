@@ -266,6 +266,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");

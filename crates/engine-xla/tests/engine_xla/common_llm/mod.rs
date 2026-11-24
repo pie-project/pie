@@ -418,6 +418,7 @@ impl Model {
                 attachments: Vec::new(),
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         self.engine

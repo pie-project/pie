@@ -264,6 +264,16 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       (`StepShape::misses`); a piece past one fire's tokens or lanes is refused, as before, by those bounds. Under the contract check (debug builds or
       `PIE_CHECK_REPLAY`, which gates both cross-checks: the engines' replay check and this one, `shapes::check_on`), every step formed is checked, a gap failing with the composition and
       the nearest stated shapes (`StepGap`).
+    - **A fire carries its stated shape; an engine keys its recorded body on it.** The runtime stamps each step
+      it forms with its shape (`Step.shape: Option<FireShape { id, treatment }>`: `id` the index in the stated
+      set's order, `treatment` that shape's, for an engine that keys on the treatment alone), what
+      `StepShapes::shape_of` answers for the composition `StepGroup::accepts` held to the set
+      (`StepShapes::fire_shape`); a step its refused members are stripped from is stated again from its kept
+      lanes. It is always one of the stated set: a formed step outside it is a runtime bug, a debug build
+      stopping on it and a release build failing its fires by name, never posting an unstated shape. `None` only
+      on a fire built by hand (a test, a load stating no set). Engines cross-check the stamp in debug builds
+      (`FrameSubmission::debug_check_shapes`, `StepShapes::agrees`) and switch their body keys from their own
+      computed key to it, each backend's owner in its own branch.
     - **CUDA.** The walk takes its targets from the set (`Shell::walk_steps`, before arming; `lattice_targets`):
       each shape at each bucket its rows pad to, crossed with the load's classes whatever its kind (a body keys its
       bucket, its lanes' classes and their treatment, never a lane's rows: each decoding class alone, each prompting

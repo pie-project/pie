@@ -75,6 +75,7 @@ fn a_fire_the_load_did_not_prepare_is_counted() {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }));
     assert!(refused.is_err(), "a lane past the load's slots is refused");
     assert_eq!(live.tallied(Tally::Refused), 1);

@@ -945,6 +945,7 @@ mod tests {
                 .collect(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         };
         let (_, outcome) = spatial
             .fire_step(&step)
