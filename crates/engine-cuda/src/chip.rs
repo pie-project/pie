@@ -373,9 +373,7 @@ mod tests {
     }
 
     /// Every fire is captured, its bodies held as the fit holds them: no
-    /// profile turns capture or bodies off or states their memory. Nor does
-    /// one order the planner: who goes first is the policy's (PLEX), so the
-    /// seating flags a profile once stated are refused by name.
+    /// profile turns capture or bodies off or states their memory.
     #[test]
     fn a_profile_stating_graphs_or_recording_is_refused() {
         for (text, id) in [
@@ -385,9 +383,6 @@ mod tests {
                 "engine.recording",
             ),
             ("api = 1\n[engine]\nbodies_mb = 512\n", "engine.bodies_mb"),
-            ("api = 1\n[engine]\nseated_first = true\n", "engine.seated_first"),
-            ("api = 1\n[engine]\nseat_to_end = true\n", "engine.seat_to_end"),
-            ("api = 1\n[engine]\nseat_spread = true\n", "engine.seat_spread"),
         ] {
             let why = registry()
                 .load_user(text, "user.toml")

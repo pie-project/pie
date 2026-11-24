@@ -285,7 +285,7 @@ fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
         "and therefore a lattice point",
     );
     assert_eq!(
-        BodyKey::of_axes(
+        BodyKey::of(
             first.classes(),
             first.bucket(),
             &no_decode_class(),
@@ -293,7 +293,7 @@ fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
             &plain(),
             None
         ),
-        BodyKey::of_axes(
+        BodyKey::of(
             second.classes(),
             second.bucket(),
             &no_decode_class(),

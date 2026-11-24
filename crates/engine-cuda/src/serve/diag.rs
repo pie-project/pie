@@ -173,7 +173,8 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, \
-     `dense-experts`, `untabled-experts`, `one-window`, `tier-inline`, `unwritten-nan`";
+     `dense-experts`, `untabled-experts`, `one-window`, `windowed-state`, `tier-inline`, \
+     `unwritten-nan`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;

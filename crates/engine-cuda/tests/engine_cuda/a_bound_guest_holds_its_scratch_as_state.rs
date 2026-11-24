@@ -620,8 +620,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
 /// back; instance B binds into exactly that scratch and pair without an
 /// overlap refusal; A's unpark rebinds it to fresh room, claimed again,
 /// and it fires there. Unparked without the park said, B's bind would be
-/// refused by name on A's stale claim (Metal and Vulkan under pressure on
-/// 720d94565).
+/// refused by name on A's stale claim.
 #[test]
 fn a_parked_instance_s_shed_room_is_another_s_and_its_unpark_claims_again() {
     if !engine_cuda::device::present() {

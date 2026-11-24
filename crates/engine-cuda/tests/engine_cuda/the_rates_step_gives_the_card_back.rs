@@ -2,10 +2,8 @@
 //! The rates a first boot measures (`rates::measure`, before the load reads
 //! the card's room) leave the card as the step found it: none of its
 //! buffers is a cell of the device heap, whose chunks the process keeps, and
-//! none is left in the idle store. An L40S's first boot at a 40960 context
-//! fit beside 7.5 GiB the step no longer held (2.5 GiB of heap chunks, the
-//! rest idle) and found no rung with room for one sequence; the next boot,
-//! reading the saved rates, measured nothing and served.
+//! none is left in the idle store, so the fit after it counts none of them
+//! as held.
 
 use engine_cuda::device::{Context, held};
 
