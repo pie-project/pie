@@ -275,6 +275,7 @@ pub struct Gpu<B: Host> {
     /// What the work behind serving was last said to be doing
     /// ([`Gpu::behind_state`]).
     said_behind: Option<&'static str>,
+
 }
 
 impl<B: Host> Gpu<B> {
@@ -300,141 +301,6 @@ impl<B: Host> Gpu<B> {
         }
     }
 
-    /// One slice behind serving of a `[rates]` key or a dense kernel's curve
-    /// the load serves by a figure stored under a stale key
-    /// (`profile::fire::Tuned::behind`): the rates step timing that key
-    /// alone over the rates the load serves by, or that curve alone. Each
-    /// frame of it reads whether a request arrived and stops the slice where
-    /// one did (`crate::rates::yielded`), so an arrival waits at most the
-    /// frame in flight; the key is timed again whole at a later idle turn.
-    /// Kept only where it had the device alone at a steady clock (the
-    /// device idle as it starts, no other lane submitting while it runs,
-    /// the device's settled clock before it no faster than after it): stored
-    /// for the next load; else discarded and timed again later. This load
-    /// serves on by the stale figure.
-    fn rate_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
-        use crate::backend::Tactics as _;
-        let Some(shell) = self.shell.as_mut() else {
-            return Ok(false);
-        };
-        let Some(key) = shell.rates_behind() else {
-            return Ok(false);
-        };
-        if !crate::backend::Context::idle(shell.device()) {
-            self.behind_state("waiting: the device is busy");
-            return Ok(false);
-        }
-        self.behind_state("running: the stale rates and curves");
-        let Some(shell) = self.shell.as_mut() else {
-            return Ok(false);
-        };
-        let max_submit = B::submit_bound(&self.boot);
-        let mut stated = shell.tuning().profile().rates();
-        stated.stale = None;
-        let reference = shell.tuning().gemm(shell.tier(), crate::submit::PROBE.0);
-        let submitted = (behind.others)();
-        let began = std::time::Instant::now();
-        let Some(before) =
-            crate::rates::clock_warmed_until::<B>(shell.device(), reference, behind.arrived)
-                .map_err(fault)?
-        else {
-            return Ok(true);
-        };
-        let timed: crate::error::Result<profile::fire::Rates> =
-            match key.strip_prefix(crate::rates::CURVE_BEHIND) {
-                Some(curve) => {
-                    let Some(wanted) = shell.curve_behind(curve) else {
-                        tracing::warn!(
-                            curve,
-                            "rates behind serving: the curve names no kernel of this load; not timed"
-                        );
-                        shell.rate_timed(&key);
-                        return Ok(true);
-                    };
-                    stated.kernel_tflops_by_shape = stated.kernel_tflops_by_shape.map(|all| {
-                        all.into_iter().filter(|c| c.name() != curve).collect()
-                    });
-                    B::measure_curves(
-                        shell.device(),
-                        shell.tuning(),
-                        max_submit,
-                        &stated,
-                        &[wanted],
-                        shell.curve_top(),
-                        behind.arrived,
-                    )
-                    .map(|curves| profile::fire::Rates {
-                        kernel_tflops_by_shape: Some(curves),
-                        ..profile::fire::Rates::default()
-                    })
-                }
-                None => {
-                    stated.unstate(&key);
-                    B::measure_rates(
-                        shell.device(),
-                        shell.tuning(),
-                        max_submit,
-                        &stated,
-                        behind.arrived,
-                    )
-                    .and_then(|measured| match measured.throttled {
-                        None => Ok(measured.rates),
-                        Some(ratio) => Err(crate::error::Fault::Device {
-                            call: "rates behind serving",
-                            why: format!(
-                                "the device's clock {ratio:.2}x slower at its end than its \
-                                 settled start"
-                            ),
-                        }),
-                    })
-                }
-            };
-        let ms = began.elapsed().as_secs_f64() * 1e3;
-        let timed = match timed {
-            Ok(rates) => rates,
-            Err(why) if crate::rates::yielded(&why) => {
-                tracing::info!(
-                    key = %key,
-                    ms,
-                    "rates behind serving: `{key}` yielded to an arrival; timed again later"
-                );
-                return Ok(true);
-            }
-            Err(why @ crate::error::Fault::Device { call: "rates behind serving", .. }) => {
-                tracing::info!(key = %key, ms, "rates behind serving: `{key}` discarded ({why})");
-                return Ok(true);
-            }
-            Err(why) => return Err(fault(why)),
-        };
-        let after = crate::rates::clock_read::<B>(shell.device(), reference).map_err(fault)?;
-        let why = if (behind.others)() != submitted {
-            Some("another lane submitted while it ran".to_string())
-        } else {
-            crate::rates::throttled(before, after).map(|ratio| {
-                format!("the device's clock {ratio:.2}x slower after it than its settled start")
-            })
-        };
-        if let Some(why) = why {
-            tracing::info!(
-                key = %key,
-                ms,
-                "rates behind serving: `{key}` discarded ({why}); timed again later"
-            );
-            return Ok(true);
-        }
-        if let Err(why) = B::save_rates(shell.device(), &self.boot, &timed) {
-            tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
-        }
-        let left = shell.rate_timed(&key);
-        tracing::info!(
-            key = %key,
-            ms,
-            left,
-            "rates behind serving: `{key}` timed and stored for the next load (this load serves \
-             on by its stale figure); {left} left"
-        );
-        Ok(true)
-    }
     /// `step` held to the platform's bound on one submission, where the
     /// load states one (`crate::submit`): the shell told to walk it a layer
     /// at a time where it is past the bound whole, and its lanes' refusal,
@@ -573,6 +439,7 @@ impl<B: Host> Gpu<B> {
             warned_in_fire: false,
             vocab: None,
             said_behind: None,
+
         }
     }
 
@@ -1207,6 +1074,7 @@ where
         // second bind walk, and what it walked is the load's.
         let settling = std::time::Instant::now();
         shell.settle_dense().map_err(fault)?;
+        shell.lay_behind_probe().map_err(fault)?;
         tracing::info!(
             settle_ms = settling.elapsed().as_millis() as u64,
             "load phases: the dense settle's picks (nothing fires before ready)"
@@ -1817,9 +1685,7 @@ where
     }
 
     fn measures_behind(&self) -> bool {
-        self.shell
-            .as_ref()
-            .is_some_and(|shell| shell.measures_behind() || shell.rates_behind().is_some())
+        self.shell.as_ref().is_some_and(Shell::measures_behind)
     }
 
     fn behind_need(&self) -> Option<engine::BehindNeed> {
@@ -1837,34 +1703,35 @@ where
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
-        // The settle's ranges first (decode's rows before the large ones),
-        // where the runtime took the slots its next fire asks for; else,
-        // and after, each rate and curve served by a stale figure (its step
-        // writes no pool slot: it runs on any idle turn).
+        shell.set_served_step(behind.step);
+        // The settle's ranges, decode's rows before the large ones, where
+        // the runtime took the slots its next fire asks for. Behind serving
+        // is the settle alone: a stale rate or curve needs device buffers
+        // of its own, which nothing lays after ready, and is served by its
+        // stale figure until the export round or `pie tune`.
         let need = shell.behind_need();
         let seats_short = match (need, behind.seats) {
             (Some(need), Some(seats)) => seats.len() < need.lanes as usize,
             _ => false,
         };
-        // A point longer than one decode step runs only with no process
-        // live, so a live request never waits behind it.
-        let long_held = need.is_some_and(|need| need.long) && !behind.alone;
-        if !shell.measures_behind() || seats_short || long_held {
-            if shell.rates_behind().is_none() {
-                if long_held {
-                    self.behind_state(
-                        "waiting: the settle's next point runs longer than one decode step, and \
-                         runs only once no process is live",
-                    );
-                } else if seats_short {
-                    self.behind_state(
-                        "waiting: the pool holds no room for one settle point's slots beyond \
-                         live work (the settle runs on a later idle turn; the fallback picks \
-                         serve)",
-                    );
-                }
-            }
-            return self.rate_behind(behind);
+        // A point longer than one decode step never runs behind serving
+        // (an arrival landing on it would wait for it): the settle ends
+        // there, what it decided stored, the rest of its ranges serving
+        // the fallback picks until the export round or `pie tune` weighs
+        // them.
+        if need.is_some_and(|need| need.long) {
+            shell.end_behind_settle();
+            return Ok(false);
+        }
+        if !shell.measures_behind() {
+            return Ok(false);
+        }
+        if seats_short {
+            self.behind_state(
+                "waiting: the pool holds no room for one settle point's slots beyond live work \
+                 (the settle runs on a later idle turn; the fallback picks serve)",
+            );
+            return Ok(false);
         }
         self.behind_state("running: the dense settle");
         let Some(shell) = self.shell.as_mut() else {

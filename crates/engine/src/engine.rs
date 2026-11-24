@@ -207,11 +207,10 @@ pub struct BehindServing<'a> {
     /// Fewer than asked (the pool had no room beyond live work): a slice
     /// that fires does not run now.
     pub seats: Option<&'a [BehindSeat]>,
-    /// Whether no process is live on the engine at all (none running,
-    /// queued or parked; only idle cache holds the pool): what a slice
-    /// longer than one decode step of the load waits for, so a live
-    /// request never waits behind it.
-    pub alone: bool,
+    /// One served step as the runtime saw it lately (the longest of its
+    /// recent steps): no fire behind serving runs longer, so an arrival
+    /// never waits more than one step. `None` before any step is served.
+    pub step: Option<std::time::Duration>,
 }
 
 /// One lane's slots the runtime took for a fire behind serving

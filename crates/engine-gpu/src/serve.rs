@@ -159,33 +159,6 @@ pub trait Serve: Backend {
         rates: &profile::fire::Rates,
     ) -> Result<()>;
 
-    /// The rates of `device` that `stated` lacks, under `tuning`'s tactics,
-    /// each timed frame under `max_submit` (the backend's rates step,
-    /// `crate::rates::measure_yielding`): what a load times behind serving
-    /// of a key it served by a stale figure (`profile::fire::Tuned::behind`).
-    /// `yield_to` is read before each frame: an arrival stops the step
-    /// (`crate::rates::yielded`).
-    fn measure_rates(
-        device: &Self::Context,
-        tuning: &Self::Tuning,
-        max_submit: Option<std::time::Duration>,
-        stated: &profile::fire::Rates,
-        yield_to: &dyn Fn() -> bool,
-    ) -> Result<engine::rates::Measured>;
-
-    /// Each of `wanted`'s dense kernel curves to `top` rows on `device`
-    /// (`crate::rates::measure_shapes`), behind serving as
-    /// [`Serve::measure_rates`] is.
-    fn measure_curves(
-        device: &Self::Context,
-        tuning: &Self::Tuning,
-        max_submit: Option<std::time::Duration>,
-        stated: &profile::fire::Rates,
-        wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
-        top: u32,
-        yield_to: &dyn Fn() -> bool,
-    ) -> Result<Vec<profile::fire::KernelCurve>>;
-
     /// `tuning` with each dense kernel's rate curve at each of the model's
     /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
     /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
@@ -754,11 +727,36 @@ fn tier_of(number: u32) -> kernels_slang::Tier {
 /// kernel it takes over its range where it replaced the curves' one.
 fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
     let [_, _, replaced, vector, wide, tier] = row;
-    (replaced != 0).then(|| kernels_slang::linear::gemm::Tactic {
+    (replaced == ROW_REPLACED || replaced == ROW_KEPT).then(|| kernels_slang::linear::gemm::Tactic {
         tier: tier_of(tier),
         vector,
         wide: wide != 0,
     })
+}
+
+/// A stored settle row's third field: the range kept the curves' kernel,
+/// not named (a row written before the kept kernel was recorded, or a range
+/// whose planes took different kernels): the curves' pick serves it.
+const ROW_KEPT_UNNAMED: u32 = 0;
+/// The range replaced the curves' kernel with the one the row names.
+const ROW_REPLACED: u32 = 1;
+/// The range kept the curves' kernel, which the row names (every plane
+/// took the same one): what a load whose curves moved serves it by.
+const ROW_KEPT: u32 = 2;
+
+/// The row of a range `bottom..=top` that kept `standing`'s kernel: named
+/// where every plane takes one kernel over the range, else unnamed.
+fn kept_row(standing: &crate::dense::Dense, bottom: u32, top: u32) -> [u32; 6] {
+    let mut kernels: Vec<kernels_slang::linear::gemm::Tactic> = Vec::new();
+    for t in (bottom..=top).flat_map(|r| standing.tactics_at(r)) {
+        if !kernels.contains(&t) {
+            kernels.push(t);
+        }
+    }
+    match kernels.as_slice() {
+        [t] => [bottom, top, ROW_KEPT, t.vector, u32::from(t.wide), tier_number(t.tier)],
+        _ => [bottom, top, ROW_KEPT_UNNAMED, 0, 0, 0],
+    }
 }
 
 /// The dense settle left to weigh behind serving ([`Shell::measure_behind`]):
@@ -1171,9 +1169,15 @@ pub struct Shell<B: Serve> {
     /// The dense settle left to weigh behind serving, where no stored or
     /// committed settle of the load's key decided every range.
     behind: Option<Behind>,
-    /// The `[rates]` keys this load serves by a figure stored under a stale
-    /// key, left to time behind serving (`profile::fire::Tuned::behind`).
-    rates_behind: Vec<String>,
+    /// The reference kernel the work behind serving reads the device's
+    /// clock by, laid at load where any is left (nothing is laid or
+    /// compiled after ready).
+    behind_probe: Option<crate::submit::Probe<B>>,
+    /// The arms' timestamps the settle behind serving times its fires by,
+    /// laid at load where the load lays none of its own.
+    behind_stamps: Vec<B::Stamps>,
+    /// One served step as the runtime last told it ([`Shell::set_served_step`]).
+    served_step_ns: Option<f64>,
 
     pipelines: B::Pipelines,
 
@@ -3046,10 +3050,6 @@ impl<B: Serve> Shell<B> {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
-        let rates_behind = {
-            use crate::backend::Tactics as _;
-            tuning.profile().tuned().behind.clone()
-        };
         let mut shell = Shell {
             preseated: Vec::new(),
             tuning,
@@ -3069,7 +3069,9 @@ impl<B: Serve> Shell<B> {
             settled: Vec::new(),
             to_store: None,
             behind: None,
-            rates_behind,
+            behind_probe: None,
+            behind_stamps: Vec::new(),
+            served_step_ns: None,
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -3273,7 +3275,7 @@ impl<B: Serve> Shell<B> {
                 self.dense = self.dense.with_rows(row[0], row[1], tactic);
             }
         }
-        let replaced = stored.iter().filter(|r| r[2] != 0).count();
+        let replaced = stored.iter().filter(|r| r[2] == ROW_REPLACED).count();
         // Skipped: nothing fires, now or behind serving; each range the
         // settle would weigh keeps the kernel the curves (or the profile
         // path) chose, said by name.
@@ -3480,43 +3482,72 @@ impl<B: Serve> Shell<B> {
         kernels
     }
 
-    /// The next `[rates]` key this load serves by a figure stored under a
-    /// stale key, to time behind serving (`profile::fire::Tuned::behind`);
-    /// `None` where none is left.
+    /// The settle left behind serving ends here: its next point runs longer
+    /// than one decode step, which behind serving never runs. What it
+    /// decided stays stored; its other ranges serve the fallback picks
+    /// until the export round or `pie tune` weighs them.
+    pub fn end_behind_settle(&mut self) {
+        if let Some(behind) = self.behind.take() {
+            tracing::info!(
+                pending = behind.pending,
+                stored = behind.stored,
+                "dense settle behind serving: ends with {} of {} ranges weighed; the rest's points \
+                 run longer than one decode step of this load, which behind serving never runs, \
+                 and serve the fallback picks until the export round or `pie tune` weighs them",
+                behind.stored,
+                behind.pending
+            );
+        }
+    }
+
+    /// Lays the reference the work behind serving reads the device's clock
+    /// by, and the timestamps its fires are timed by, where a settle is
+    /// left: at load, before ready (nothing is laid or compiled after).
+    pub fn lay_behind_probe(&mut self) -> Result<()> {
+        use crate::backend::Tactics as _;
+        if self.behind_probe.is_none() && self.behind.is_some() {
+            let reference = self.tuning.gemm(self.tier, crate::submit::PROBE.0);
+            self.behind_probe = Some(crate::submit::Probe::<B>::new(&self.device, reference)?);
+            if self.stamps.is_empty() {
+                self.behind_stamps = (0..self.inputs.len())
+                    .map(|_| B::lay_stamps(&self.device, 1))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The reference laid for the work behind serving
+    /// ([`Shell::lay_behind_probe`]).
     #[must_use]
-    pub fn rates_behind(&self) -> Option<String> {
-        self.rates_behind.first().cloned()
+    pub fn behind_probe(&self) -> Option<&crate::submit::Probe<B>> {
+        self.behind_probe.as_ref()
     }
 
-    /// The kernel and plane the curve `name` (`<kind>/<key> at <n>x<k>`)
-    /// names among this load's dense kernels at its planes, to time behind
-    /// serving.
+    /// One decode step of this load, ns: the settle's first point (at its
+    /// fewest rows) where it ran, else the device time of the last served
+    /// step read back (under a platform's bound, every step's is). `None`
+    /// where neither is known yet.
     #[must_use]
-    pub fn curve_behind(&self, name: &str) -> Option<(kernels_slang::linear::gemm::Tactic, u32, u32)> {
-        let kernels = crate::rates::dense_kernels(B::TARGET, &self.tuning, self.tier, self.curve_top());
-        let shapes: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
-        crate::rates::curve_named(B::TARGET, &kernels, &shapes, name)
+    pub fn decode_step_ns(&self) -> Option<f64> {
+        self.served_step_ns
+            .or_else(|| self.behind.as_ref().and_then(|b| b.decode_ns))
+            .or(self.last_landed.map(|ns| ns as f64))
     }
 
-    /// The rows a curve of this load is timed to: its widest rung.
-    #[must_use]
-    pub fn curve_top(&self) -> u32 {
-        self.dense.entries().into_iter().max().unwrap_or(1)
+    /// One served step as the runtime saw it lately
+    /// (`engine::BehindServing::step`): what no fire behind serving may
+    /// outlast.
+    pub fn set_served_step(&mut self, step: Option<std::time::Duration>) {
+        self.served_step_ns = step.map(|s| s.as_nanos() as f64);
     }
 
-    /// `key` timed behind serving and stored: how many are left.
-    pub fn rate_timed(&mut self, key: &str) -> usize {
-        self.rates_behind.retain(|k| k != key);
-        self.rates_behind.len()
-    }
-
-    /// Whether `tactic`'s entry at every dense plane of this load is built:
-    /// a pick this load may serve without building after ready.
+    /// Whether `tactic` has an entry at every dense plane of this load: a
+    /// pick the load may serve. One not built yet is built by the load's
+    /// second bind walk, before ready (`Gpu::load`, `walk_binds`).
     fn tactic_built(&self, tactic: kernels_slang::linear::gemm::Tactic) -> bool {
-        let built = B::built_since(&self.pipelines, 0);
         self.dense_planes.iter().all(|&(n, k, ..)| {
-            kernels_slang::linear::gemm::entry(B::TARGET, tactic, n, k)
-                .is_ok_and(|fire| built.iter().any(|kernel| kernel.starts_with(fire.entrypoint)))
+            kernels_slang::linear::gemm::entry(B::TARGET, tactic, n, k).is_ok()
         })
     }
 
@@ -3563,17 +3594,16 @@ impl<B: Serve> Shell<B> {
         let serving = self.dense.clone();
         let split = (self.split_next, self.split_layers);
         let walk_only = std::mem::replace(&mut self.walk_only, true);
+        // Each fire timed by the arms' timestamps: the load's own where a
+        // bound laid them, else those laid at load for the work behind
+        // serving (nothing is laid after ready).
         let laid = self.stamps.is_empty();
-        let slice = (|| -> Result<bool> {
-            if laid {
-                self.stamps = (0..self.inputs.len())
-                    .map(|_| B::lay_stamps(&self.device, 1))
-                    .collect::<Result<Vec<_>>>()?;
-            }
-            self.behind_slice(&mut behind, others, arrived, seats)
-        })();
         if laid {
-            self.stamps.clear();
+            std::mem::swap(&mut self.stamps, &mut self.behind_stamps);
+        }
+        let slice = self.behind_slice(&mut behind, others, arrived, seats);
+        if laid {
+            std::mem::swap(&mut self.stamps, &mut self.behind_stamps);
         }
         self.spans = None;
         self.walk_only = walk_only;
@@ -3659,7 +3689,7 @@ impl<B: Serve> Shell<B> {
                 .map(|(top, ns)| ns * f64::from(trial.top) / f64::from(top.max(1)))
         });
         let long = matches!(
-            (expected, behind.decode_ns),
+            (expected, self.decode_step_ns()),
             (Some(expected), Some(decode)) if expected > decode
         );
         Some(engine::BehindNeed {
@@ -3856,7 +3886,7 @@ impl<B: Serve> Shell<B> {
             });
             // A range no whole served step weighs keeps the curves' kernel,
             // stored so the next load does not open it again.
-            return Ok(Opened::Kept(Some([bottom, top, 0, 0, 0, 0])));
+            return Ok(Opened::Kept(Some(kept_row(standing, bottom, top))));
         }
         Ok(Opened::Steps(Trial {
             bottom,
@@ -3900,7 +3930,6 @@ impl<B: Serve> Shell<B> {
         arrived: &dyn Fn() -> bool,
         seats: Option<&[engine::BehindSeat]>,
     ) -> Result<Option<(Discard, String)>> {
-        use crate::backend::Tactics as _;
         let timed = trial.round > 0;
         if timed && !crate::backend::Context::idle(&self.device) {
             return Ok(Some((
@@ -3908,7 +3937,6 @@ impl<B: Serve> Shell<B> {
                 "the device had other work as it started".to_string(),
             )));
         }
-        let reference = self.tuning.gemm(self.tier, crate::submit::PROBE.0);
         let decode = self.trace.facts.word(&poem_ir::Request::new(1, false));
         let word = if trial.per_lane == 1 {
             decode
@@ -4017,7 +4045,12 @@ impl<B: Serve> Shell<B> {
             self.fire_seated(&seated)?;
             self.drain()?;
             fresh_seats(self)?;
-            match crate::rates::clock_warmed_until::<B>(&self.device, reference, arrived)? {
+            let Some(probe) = self.behind_probe.as_ref() else {
+                return Err(Fault::Unbound {
+                    what: "the clock's reference behind serving, laid at load".into(),
+                });
+            };
+            match crate::rates::clock_warmed_on::<B>(&self.device, probe, arrived)? {
                 Some(read) => Some(read),
                 None => return yielded(),
             }
@@ -4060,7 +4093,11 @@ impl<B: Serve> Shell<B> {
             )));
         }
         if let Some(before) = clock_before {
-            let after = crate::rates::clock_read::<B>(&self.device, reference)?;
+            let probe = self.behind_probe.as_ref().expect("read before the point");
+            let Some(after) = crate::rates::read_clock_until::<B>(&self.device, probe, &|| false)?
+            else {
+                unreachable!("never stopped");
+            };
             if let Some(ratio) = crate::rates::clock_moved(before, after) {
                 return Ok(Some((
                     Discard::Clock,
@@ -4189,13 +4226,18 @@ impl<B: Serve> Shell<B> {
             kernel,
             decided: pick.is_some(),
         });
-        let (vector, wide, tier) = kernel.map_or((0, 0, 0), |t| {
-            (t.vector, u32::from(t.wide), tier_number(t.tier))
-        });
-        (
-            [bottom, top, u32::from(taken != 0), vector, wide, tier],
-            kernel,
-        )
+        let row = match kernel.filter(|_| taken != 0) {
+            Some(t) => [
+                bottom,
+                top,
+                ROW_REPLACED,
+                t.vector,
+                u32::from(t.wide),
+                tier_number(t.tier),
+            ],
+            None => kept_row(&options[0], bottom, top),
+        };
+        (row, kernel)
     }
     /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, which
     /// model's settle it is (`crate::dense::settle_of`: its planes, the
@@ -11392,6 +11434,37 @@ mod tests {
                     bytes: 16
                 },
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod settle_row_tests {
+    use super::{ROW_KEPT, ROW_KEPT_UNNAMED, ROW_REPLACED, kept_row, row_tactic};
+    use kernels_slang::linear::gemm::Tactic;
+
+    /// A settle row names the kernel it kept where every plane took one, and
+    /// a load reads it back as that kernel; a row that names none (an old
+    /// row's 0) serves the curves' pick, never a guess.
+    #[test]
+    fn a_kept_row_names_its_kernel_and_an_unnamed_one_serves_the_curves() {
+        let gemv = Tactic {
+            tier: kernels_slang::Tier::Baseline,
+            vector: 8,
+            wide: false,
+        };
+        let standing = crate::dense::Dense::path(&[1, 2, 4, 8], |_| gemv);
+        let row = kept_row(&standing, 5, 8);
+        assert_eq!(row[2], ROW_KEPT);
+        assert_eq!(row_tactic(row), Some(gemv), "the kept kernel read back");
+        assert_eq!(row_tactic([5, 8, ROW_KEPT_UNNAMED, 0, 0, 0]), None, "the curves' pick");
+        assert_eq!(
+            row_tactic([5, 8, ROW_REPLACED, 4, 1, 0]),
+            Some(Tactic {
+                tier: kernels_slang::Tier::Baseline,
+                vector: 4,
+                wide: true
+            })
         );
     }
 }

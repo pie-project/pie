@@ -469,32 +469,6 @@ impl<B: Serve> Serve for Named<B> {
         Ok(())
     }
 
-    fn measure_rates(
-        _device: &Facts,
-        _tuning: &B::Tuning,
-        _max_submit: Option<std::time::Duration>,
-        _stated: &profile::fire::Rates,
-        _yield_to: &dyn Fn() -> bool,
-    ) -> Result<engine::rates::Measured> {
-        Err(crate::error::Fault::Unbound {
-            what: "a rates step on a naming load, which runs nothing on a device".into(),
-        })
-    }
-
-    fn measure_curves(
-        _device: &Facts,
-        _tuning: &B::Tuning,
-        _max_submit: Option<std::time::Duration>,
-        _stated: &profile::fire::Rates,
-        _wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
-        _top: u32,
-        _yield_to: &dyn Fn() -> bool,
-    ) -> Result<Vec<profile::fire::KernelCurve>> {
-        Err(crate::error::Fault::Unbound {
-            what: "a curve's timing on a naming load, which runs nothing on a device".into(),
-        })
-    }
-
     fn time_for_bound(
         _device: &Facts,
         _tuning: &B::Tuning,
