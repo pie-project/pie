@@ -313,8 +313,9 @@ fn a_checkpoint_resumes_a_fresh_working_set() {
     let ws = s.create_working_set(geom());
     let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
     let published = s.publish_prepared(prepared).unwrap();
-    assert!(
-        !s.checkpoint(ws, key, None).unwrap(),
+    assert_eq!(
+        s.checkpoint(ws, key, None),
+        Err(RsError::CheckpointUnsettled),
         "a fire still writes it"
     );
     s.settle(published);

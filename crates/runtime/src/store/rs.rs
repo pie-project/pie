@@ -133,6 +133,19 @@ pub enum RsError {
          row folds as it is written, and a fold is not taken back"
     )]
     Unbuffered,
+    #[error(
+        "a checkpoint asked here is not kept: a fire on its way writes the state it would keep \
+         in place, laid before the checkpoint was taken"
+    )]
+    CheckpointUnsettled,
+    #[error("a checkpoint asked here is not kept: its state is parked on the host")]
+    CheckpointOnHost,
+    #[error(
+        "a checkpoint asked at row {at} is not kept: a window slot it reaches back to was let go"
+    )]
+    CheckpointRetired { at: u32 },
+    #[error("a checkpoint asked at row {at} is not kept: the state stands at {committed}")]
+    CheckpointAhead { at: u32, committed: u32 },
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
@@ -1681,11 +1694,14 @@ impl RsStore {
             .is_none_or(|entry| Self::slots(entry).any(|id| busy.contains(&id)))
     }
 
-    /// Not when a fire on its way still writes it, or a suspend took it to the
-    /// host. A window's checkpoint is its pages within the window, shared by
+    /// Refused by name when a fire on its way still writes it (one laid
+    /// before the take, which writes it in place: [`Self::checkpoint_ahead`]
+    /// takes it before that fire is laid), or a suspend took it to the host.
+    /// A window's checkpoint is its pages within the window, shared by
     /// refcount like the kv list's (CONTRACT-BC 19); another state's, its
     /// folded state. Refused by name while the frozen length is behind the
-    /// record ([`Self::device_fold_gate`]): a checkpoint is a fork.
+    /// record ([`Self::device_fold_gate`]): a checkpoint is a fork. False
+    /// only for a state that holds nothing yet.
     pub fn checkpoint(
         &mut self,
         ws: RsWorkingSetId,
@@ -1693,18 +1709,48 @@ impl RsStore {
         owner: Option<ProcessId>,
     ) -> Result<bool, RsError> {
         let entry = self.entry(ws)?;
-        let empty = match entry.window {
-            Some(window) => {
-                window.committed == 0 || entry.windows.iter().flatten().all(Option::is_none)
-            }
-            None => entry.folded.is_none(),
-        };
-        if empty || self.holds_host(entry) || self.unsettled(ws) {
+        if Self::empty(entry) {
             return Ok(false);
+        }
+        if self.holds_host(entry) {
+            return Err(RsError::CheckpointOnHost);
+        }
+        if self.unsettled(ws) {
+            return Err(RsError::CheckpointUnsettled);
         }
         let snapshot = self.fork(ws)?;
         self.keep(snapshot, key, owner);
         Ok(true)
+    }
+
+    fn empty(entry: &RsEntry) -> bool {
+        match entry.window {
+            Some(window) => {
+                window.committed == 0 || entry.windows.iter().flatten().all(Option::is_none)
+            }
+            None => entry.folded.is_none(),
+        }
+    }
+
+    /// `ws`'s state as the fires laid so far leave it, forked into a hidden
+    /// set before any later fire is laid: what [`Self::keep`] keeps once
+    /// those fires settle. The fork shares the slots they write; a later
+    /// fire finds them shared and copies them first, on the device and
+    /// ordered behind the fires that write them, so the fork holds the state
+    /// as of here while the set goes on without waiting. A fold the device
+    /// counts, in a fire laid but not yet submitted, is the fork's to follow
+    /// too ([`Self::begin_device_fold`]). None for a state that holds
+    /// nothing yet; refused by name as [`Self::checkpoint`] is, a fire on
+    /// its way aside.
+    pub fn checkpoint_ahead(&mut self, ws: RsWorkingSetId) -> Result<Option<RsWorkingSetId>, RsError> {
+        let entry = self.entry(ws)?;
+        if Self::empty(entry) {
+            return Ok(None);
+        }
+        if self.holds_host(entry) {
+            return Err(RsError::CheckpointOnHost);
+        }
+        self.fork(ws).map(Some)
     }
 
     /// A window's checkpoint as of position `at`, at or behind where its
@@ -1731,8 +1777,17 @@ impl RsStore {
         if at == window.committed {
             return self.checkpoint(ws, key, owner);
         }
-        if at == 0 || at > window.committed || self.holds_host(entry) {
+        if at == 0 {
             return Ok(false);
+        }
+        if at > window.committed {
+            return Err(RsError::CheckpointAhead {
+                at,
+                committed: window.committed,
+            });
+        }
+        if self.holds_host(entry) {
+            return Err(RsError::CheckpointOnHost);
         }
         self.device_fold_gate(ws)?;
         // Only the slots wholly behind `at` must have landed: a later fire of
@@ -1750,7 +1805,7 @@ impl RsStore {
             let first = (at.saturating_sub(geom.window) / tokens) as usize;
             let end = at.div_ceil(tokens) as usize;
             if table.len() < end || table[first..end].iter().any(Option::is_none) {
-                return Ok(false);
+                return Err(RsError::CheckpointRetired { at });
             }
             let whole = (at / tokens) as usize;
             if table[first..whole.max(first)]
@@ -1758,7 +1813,7 @@ impl RsStore {
                 .flatten()
                 .any(|id| busy.contains(id))
             {
-                return Ok(false);
+                return Err(RsError::CheckpointUnsettled);
             }
             table.truncate(end);
             table[..first].iter_mut().for_each(|slot| *slot = None);
@@ -1880,10 +1935,13 @@ impl RsStore {
     }
 
     /// Not one parked on the host with the set it shares state with, or on
-    /// its way there or back: it is read from the device only.
+    /// its way there or back: it is read from the device only. Nor one a
+    /// fire on its way writes, or folds by a count the device computes
+    /// ([`Self::checkpoint_ahead`]): its state is not there yet.
     pub fn has_checkpoint(&self, key: &Hash256) -> bool {
         self.checkpoints.get(key).is_some_and(|entry| {
             !self.unsettled(entry.snapshot)
+                && self.device_fold_gate(entry.snapshot).is_ok()
                 && self.working_sets.get(entry.snapshot).is_some_and(|ws| {
                     !self.holds_host(ws) && Self::slots(ws).all(|id| !self.moving.contains(&id))
                 })
