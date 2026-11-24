@@ -121,8 +121,7 @@ pub fn pool_shapes(weights: &[WeightShape]) -> Vec<SlotShape> {
 /// The pool the weight shapes take their slots from until the pool switch
 /// sets them beside kv and state: the device's chunks above every reserved
 /// and pinned run, short of the activation at the top, in the engine's
-/// chunk ids; [`pool_shapes`] of `facts.weights` from shape 0. The
-/// degenerate mode's pinned runs take every chunk, so it has none.
+/// chunk ids; [`pool_shapes`] of `facts.weights` from shape 0.
 #[must_use]
 pub fn slot_pool(facts: &ChunkFacts) -> SlotPool {
     let total = facts.total_chunks.saturating_sub(facts.act_chunks_max());

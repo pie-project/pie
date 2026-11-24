@@ -5525,12 +5525,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 "a lane whose fold the device counts asks for its report"
             );
             rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
-            rs::apply_pinned(
-                &mut req,
-                stores.pinned_kv.as_ref(),
-                stores.pinned_state.as_ref(),
-                Some(&rs_prepared),
-            );
             checkpoints_here.extend(
                 rs_prepared
                     .snapshots
@@ -7209,12 +7203,6 @@ async fn fire_device_geometry<C: FireContext>(
         "a lane whose fold the device counts asks for its report"
     );
     rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
-    rs::apply_pinned(
-        &mut req,
-        stores.pinned_kv.as_ref(),
-        stores.pinned_state.as_ref(),
-        Some(&rs_prepared),
-    );
     let submit_error = crate::scheduler::submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         &scheduler,
         req,

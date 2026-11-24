@@ -647,8 +647,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         engine_configs.iter().map(|d| d.chunks.clone()).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
         engine_configs.iter().map(|d| d.disk_kept.clone()).collect();
-    // Each engine's pools as chunks: what it states, else today's pools as
-    // the degenerate mode's pinned shapes.
+    // Each engine's pools as chunks: the shared pool it states.
     let arena_stores = engine_configs
         .iter()
         .zip(&readouts)
@@ -1837,23 +1836,12 @@ mod tests {
         )
     }
 
-    /// A pool that lays a state shape for a dense model (records of some
-    /// size beside its kv) still says the model holds no state: its RsCaps
-    /// state nothing (no rs working set, no rs count a fire is held to). A
-    /// hybrid's record bytes are its RsCaps' state size, a record's and not
-    /// a slot's.
+    /// A load whose records take no bytes says the model holds no state:
+    /// its RsCaps state nothing (no rs working set, no rs count a fire is
+    /// held to). A hybrid's record bytes are its RsCaps' state size.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
-        let mut facts =
-            ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
-                kv_pages: 8,
-                kv_page_size: 16,
-                kv_page_bytes: 4096,
-                state_slots: 4,
-                state_slot_bytes: 1 << 20,
-                ..::engine::chunk::DegeneratePools::default()
-            });
-        facts.record_bytes = 0;
+        let mut facts = ::engine::chunk::ChunkFacts::default();
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");
 

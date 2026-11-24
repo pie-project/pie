@@ -503,55 +503,6 @@ fn lower_window(
     }
 }
 
-/// Names each lane's kv pages by the slot refs of `pinned`, the kv run an
-/// engine that pins its pools states (the degenerate mode): its list table
-/// ([`::engine::chunk::DEGENERATE_KV`]), and, where it pins state records
-/// (`state`), each lane's record. Nothing where `pinned` is `None`.
-pub fn apply_pinned(
-    req: &mut crate::engine::FireRequest,
-    pinned: Option<&crate::store::chunks::ShapeRun>,
-    state: Option<&crate::store::chunks::ShapeRun>,
-    rs: Option<&PreparedRs>,
-) {
-    // A load that holds state states every lane's record: the state slot
-    // its rs store bound it, by the pinned run's refs, or none.
-    if let Some(run) = state {
-        let at = |id: u32| id - run.ids_from + run.ref_from;
-        for (row, lane) in req.lanes.iter_mut().enumerate() {
-            lane.record = match rs.and_then(|rs| rs.run_cow(row)) {
-                Some((read, write)) => ::engine::LaneRecord::Pieces(vec![(
-                    ::engine::chunk::DEGENERATE_STATE,
-                    vec![[at(read), at(write)]],
-                )]),
-                None => ::engine::LaneRecord::Null,
-            };
-        }
-    }
-    let Some(run) = pinned else {
-        return;
-    };
-    for lane in &mut req.lanes {
-        lane.lane.list = if lane.translation.is_empty() {
-            ::engine::ListKind::Pages
-        } else {
-            ::engine::ListKind::Translation
-        };
-        let list = if lane.translation.is_empty() {
-            &lane.pages
-        } else {
-            &lane.translation
-        };
-        if list.is_empty() {
-            continue;
-        }
-        let refs = list
-            .iter()
-            .map(|&id| id - run.ids_from + run.ref_from)
-            .collect();
-        lane.tables = vec![(::engine::chunk::DEGENERATE_KV, refs)];
-    }
-}
-
 /// Records every slot the batch hands the engine as read by it, so a
 /// slot one of its fires reads outlives that fire however it is dropped.
 fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {

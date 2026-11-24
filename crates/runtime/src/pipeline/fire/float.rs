@@ -305,12 +305,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     }
     rs_prepared.apply_to(&mut req);
     super::rs::apply_shared(&mut req, stores.shared.as_ref(), Some(&rs_prepared));
-    super::rs::apply_pinned(
-        &mut req,
-        stores.pinned_kv.as_ref(),
-        stores.pinned_state.as_ref(),
-        Some(&rs_prepared),
-    );
     let rs_copy = rs_prepared.state_copy();
     let rstxn = super::RsTxnsGuard::new(model, engine, rs_prepared.txn);
     let lanes_of = every_lane(&req);

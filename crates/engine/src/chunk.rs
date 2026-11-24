@@ -17,9 +17,6 @@
 //! of a segment to release it ([`Evacuation`]) never renames a slot a holder
 //! keeps.
 //!
-//! Until each backend's pool switch, [`ChunkFacts::degenerate`] states today's
-//! pools as chunks: one slot a chunk, every pool a run of chunks of its own
-//! ([`Pinned`]) whose slots keep the ids the engine numbers them by today.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,8 +55,7 @@ impl std::fmt::Display for ShapeId {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkFacts {
     /// What one chunk takes. A load-time constant the compiler chose for
-    /// the model and device; in the degenerate mode, the largest of today's
-    /// slots and pages, each of which is one chunk.
+    /// the model and device.
     pub chunk_bytes: u64,
     /// Every chunk id there is, reserved and activation chunks included:
     /// `state chunks + act_chunks(rung) <= total_chunks`.
@@ -326,8 +322,8 @@ pub struct SlotShape {
     #[serde(default)]
     pub rows: Vec<u32>,
     /// The chunks this shape is held to, where its slots cannot share the
-    /// pool (the degenerate mode, or a backend whose planes are sized per
-    /// shape at load); `None` takes chunks from the shared pool.
+    /// pool (a backend whose planes are sized per shape at load); `None`
+    /// takes chunks from the shared pool.
     #[serde(default)]
     pub pinned: Option<Pinned>,
     /// What the shape holds, where its kind alone does not say: a list
@@ -601,127 +597,6 @@ impl ChunkFacts {
         self.total_chunks
             .saturating_sub(self.reserved_chunks())
             .saturating_sub(self.act_chunks_max())
-    }
-
-    /// States pinned pools as chunks, one slot a chunk, each pool a pinned
-    /// run whose slots keep the engine's ids: chunk 0 null, then the kv pages
-    /// (a list shape, with its host and disk tiers pinned alike, ids from
-    /// 0), the state slots and the rs buffer pages (fixed shapes, device
-    /// only). One segment, whole from the load; activation lives apart.
-    #[must_use]
-    pub fn degenerate(pools: &DegeneratePools) -> ChunkFacts {
-        let mut device = 1u32;
-        let mut host = 0u32;
-        let mut shapes = Vec::new();
-        let mut push = |id: ShapeId,
-                        kind: SlotKind,
-                        slot_bytes: u64,
-                        slots: u32,
-                        host_slots: u32,
-                        disk: ChunkRun,
-                        ids_from: u32| {
-            if slots == 0 && host_slots == 0 {
-                return;
-            }
-            let pinned = Pinned {
-                device: ChunkRun {
-                    first: device,
-                    chunks: slots,
-                },
-                host: ChunkRun {
-                    first: host,
-                    chunks: host_slots,
-                },
-                disk,
-                ids_from,
-            };
-            device = device.saturating_add(slots);
-            host = host.saturating_add(host_slots);
-            shapes.push(SlotShape {
-                id,
-                kind,
-                slot_bytes,
-                slots_per_chunk: 1,
-                sets_per_working_set: kind.sets_per_working_set(),
-                rows: Vec::new(),
-                pinned: Some(pinned),
-                role: SlotRole::State,
-            });
-        };
-        let kv = pools.kv_pages > 0 || pools.host_kv_pages > 0;
-        let disk_chunks = if kv { pools.disk_kv_pages } else { 0 };
-        let disk = ChunkRun {
-            first: 0,
-            chunks: disk_chunks,
-        };
-        push(
-            DEGENERATE_KV,
-            SlotKind::List {
-                tokens: pools.kv_page_size,
-                rate: 1,
-                window: None,
-            },
-            pools.kv_page_bytes,
-            pools.kv_pages,
-            pools.host_kv_pages,
-            disk,
-            0,
-        );
-        push(
-            DEGENERATE_STATE,
-            SlotKind::Fixed { pieces: 1 },
-            pools.state_slot_bytes,
-            pools.state_slots,
-            0,
-            ChunkRun::default(),
-            0,
-        );
-        push(
-            DEGENERATE_BUFFER,
-            SlotKind::Fixed { pieces: 1 },
-            pools.buffer_page_bytes,
-            pools.buffer_pages,
-            0,
-            ChunkRun::default(),
-            0,
-        );
-        let chunk_bytes = shapes.iter().map(|s| s.slot_bytes).max().unwrap_or(0);
-        ChunkFacts {
-            chunk_bytes,
-            total_chunks: device,
-            segment_chunks: device,
-            segments: SegmentFacts {
-                committed: 1,
-                max: 1,
-                growth: Growth::Fixed,
-            },
-            reserved: vec![ReservedRun {
-                what: Reserved::Null,
-                first: 0,
-                chunks: 1,
-            }],
-            shapes,
-            act_chunks: Vec::new(),
-            act_replay: Vec::new(),
-            rs_compact: false,
-            rs_scratch_per_fire: false,
-            eager_rungs: Vec::new(),
-            held_bytes: 0,
-            outside_bytes: 0,
-            span_backed_on_demand: false,
-            act_span_chunks: None,
-            host_chunks: host,
-            disk_chunks,
-            disk_persistent: pools.disk_persistent,
-            disk_kept: pools.disk_kept,
-            weights: Vec::new(),
-            windowed: Vec::new(),
-            record_bytes: if pools.state_slots > 0 {
-                pools.state_slot_bytes
-            } else {
-                0
-            },
-        }
     }
 
     /// Checks the facts hang together: chunk 0 null, reserved and pinned
@@ -1021,33 +896,6 @@ impl ChunkFacts {
     }
 }
 
-/// The shapes [`ChunkFacts::degenerate`] states today's pools as, each
-/// present only where its pool holds a slot on some tier.
-pub const DEGENERATE_KV: ShapeId = ShapeId(0);
-pub const DEGENERATE_STATE: ShapeId = ShapeId(2);
-pub const DEGENERATE_BUFFER: ShapeId = ShapeId(3);
-
-/// The pinned pools [`ChunkFacts::degenerate`] states as chunks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DegeneratePools {
-    pub kv_pages: u32,
-    /// Tokens a kv page holds.
-    pub kv_page_size: u32,
-    pub kv_page_bytes: u64,
-    pub state_slots: u32,
-    pub state_slot_bytes: u64,
-    /// Buffer pages of `kv_page_size` unfolded rows, beside the state slots.
-    pub buffer_pages: u32,
-    pub buffer_page_bytes: u64,
-    /// Host pages kv can be suspended into, and slot-file pages below them.
-    pub host_kv_pages: u32,
-    pub disk_kv_pages: u32,
-    /// The slot files are kept across runs.
-    pub disk_persistent: bool,
-    /// And what they held when the last run left is there still.
-    pub disk_kept: bool,
-}
-
 /// Where the engine keeps each logical chunk: the runtime names logical
 /// chunks (in slot refs), the kernels address physical ones. Owned by the
 /// engine, starting as the identity; only [`ChunkTable::apply`] changes it,
@@ -1237,18 +1085,43 @@ mod role_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkFacts, DegeneratePools, ShapeId, SlotKind, SlotRole, SlotShape, WindowedLayer,
+        ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
+        SlotShape, WindowedLayer,
     };
 
+    /// A pool of 11 chunks of 4 KiB in one segment: chunk 0 null, a kv
+    /// list of 16 tokens a slot.
     fn facts() -> ChunkFacts {
-        let mut facts = ChunkFacts::degenerate(&DegeneratePools {
-            kv_pages: 8,
-            kv_page_size: 16,
-            kv_page_bytes: 4096,
-            ..DegeneratePools::default()
-        });
-        facts.total_chunks += 2;
-        facts.segment_chunks += 2;
+        let mut facts = ChunkFacts {
+            chunk_bytes: 4096,
+            total_chunks: 11,
+            segment_chunks: 11,
+            segments: SegmentFacts {
+                committed: 1,
+                max: 1,
+                growth: Growth::Fixed,
+            },
+            reserved: vec![ReservedRun {
+                what: Reserved::Null,
+                first: 0,
+                chunks: 1,
+            }],
+            shapes: vec![SlotShape {
+                id: ShapeId(0),
+                kind: SlotKind::List {
+                    tokens: 16,
+                    rate: 1,
+                    window: None,
+                },
+                slot_bytes: 4096,
+                slots_per_chunk: 1,
+                sets_per_working_set: 1,
+                rows: Vec::new(),
+                pinned: None,
+                role: SlotRole::State,
+            }],
+            ..ChunkFacts::default()
+        };
         facts.act_chunks = vec![(64, 1), (256, 2)];
         facts
     }

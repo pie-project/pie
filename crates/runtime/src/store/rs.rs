@@ -152,8 +152,7 @@ pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
 
 /// A count in each recurrent pool: state slots and buffer pages, or, of a
 /// windowed store, its window lists' slots: `pages` their sum and
-/// `windows[l]` list `l`'s (each its own shape's slots). In the degenerate
-/// mode a slot is a chunk, so this is the chunks the shapes ask for.
+/// `windows[l]` list `l`'s (each its own shape's slots).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RsUnits {
     pub slots: u32,
