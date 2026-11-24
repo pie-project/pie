@@ -349,6 +349,27 @@ pub trait Serve: Backend {
         Ok(false)
     }
 
+    /// The frame a lay-only pass walks into ([`Shell::lay_once`]): one that
+    /// lays the fire's block (its dispatches' scalars and group counts) and
+    /// names the kernels it runs, and binds, hashes and records nothing.
+    /// `None` where the backend lays none.
+    fn lay_frame(_device: &Self::Context, _arm: usize) -> Result<Option<Self::Frame>> {
+        Ok(None)
+    }
+
+    /// Takes what a lay-only pass of `prepared` laid in `frame`: where the
+    /// kernels it names are an armed family's, the fire's fill of it, which
+    /// the next [`Serve::plan`] replays. Whether one was.
+    fn lay_fill(
+        _shell: &mut Shell<Self>,
+        _frame: Self::Frame,
+        _prepared: &mut Prepared<'_, Self>,
+        _layout: &[ReadSpan],
+        _launches: u32,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// What a dispatch binds the backend has built and kept so far (its bind
     /// groups): read at ready and after, those built since are a fire's
     /// ([`engine::live::Tally::BoundInFire`]). 0 where it keeps none.
@@ -1261,6 +1282,10 @@ pub struct Shell<B: Serve> {
     pub arm_filled: bool,
     /// Serving fires that walked for their fill, since the last count.
     filled_in_fire: u64,
+    /// Serving fires whose fill a lay-only pass laid, since the last count,
+    /// and the host time those passes took, all told.
+    laid_at_first_fire: u64,
+    pub lay_ns: u64,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
@@ -3149,6 +3174,8 @@ impl<B: Serve> Shell<B> {
             walk_at: None,
             arm_filled: false,
             filled_in_fire: 0,
+            laid_at_first_fire: 0,
+            lay_ns: 0,
             eager: 0,
             eager_next: false,
             armed: false,
@@ -5200,6 +5227,12 @@ impl<B: Serve> Shell<B> {
     /// ([`engine::live::Tally::FilledInFire`]).
     pub fn filled_serving(&mut self) -> u64 {
         std::mem::take(&mut self.filled_in_fire)
+    }
+
+    /// The serving fires since the last count whose fill a lay-only pass
+    /// laid ([`engine::live::Tally::LaidAtFirstFire`]).
+    pub fn laid_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.laid_at_first_fire)
     }
 
     /// A step walked to be kept made no recording: its commands were a held
@@ -8553,6 +8586,54 @@ impl<B: Serve> Shell<B> {
         self.walk_into(frame, p, false, false, &place, &mut Cursor::new(&place))
     }
 
+    /// Lays `prepared`'s fill of the armed family whose kernels it runs
+    /// from a lay-only pass ([`Serve::lay_frame`]): the fire's dispatch
+    /// arguments and group counts, and its readout copies, computed on the
+    /// host from its own rows and reads, with nothing bound, hashed,
+    /// recorded or built. Whether a family took it.
+    fn lay_once(&mut self, prepared: &mut Prepared<'_, B>) -> Result<bool> {
+        let Some(frame) = B::lay_frame(&self.device, prepared.arm)? else {
+            return Ok(false);
+        };
+        let at = std::time::Instant::now();
+        // What the pass mints goes again after it; the fire's own staged
+        // rows stand, for a walk of it the pass fills no family for.
+        let mark = self.handles.len();
+        let place = At::new();
+        let walked = self.walk_into(frame, prepared, false, false, &place, &mut Cursor::new(&place));
+        let walked = match walked {
+            Ok(walked) => walked,
+            Err(fault) => {
+                self.handles.rewind_to(mark);
+                return Err(fault);
+            }
+        };
+        let mut frame = walked.frame.expect("the walk opened a frame");
+        let laid = self.readout_copies(prepared).and_then(|(layout, regions)| {
+            for (from, list, most) in &regions {
+                frame.copy_rows(from, &self.readout[prepared.arm], list, *most)?;
+            }
+            self.copy_pixels(&mut frame, prepared)?;
+            Ok(layout)
+        });
+        self.handles.rewind_to(mark);
+        let layout = laid?;
+        let filled = B::lay_fill(self, frame, prepared, &layout, walked.launches)?;
+        if filled {
+            let ns = at.elapsed().as_nanos() as u64;
+            self.lay_ns = self.lay_ns.saturating_add(ns);
+            self.laid_at_first_fire += 1;
+            tracing::info!(
+                rung = prepared.rung,
+                rows = ?prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
+                us = ns / 1000,
+                "a lay-only pass laid a fire's fill of its armed family (counted \
+                 laid_at_first_fire)"
+            );
+        }
+        Ok(filled)
+    }
+
     /// Fills an armed body for `prepared`'s shape from a walk that records
     /// nothing ([`Plan::Fill`]): the walk, the fire's readout copies and its
     /// pixels laid in a fill frame, and the backend's fill from what they
@@ -9288,7 +9369,21 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // An armed body with no fill for the step's shape fills from a walk
         // that records nothing, then replays.
         let plan = match plan {
+            // A fire of an armed family whose fill the walk did not lay
+            // (a row count it enumerates no composition of) lays it on the
+            // host, once a length.
+            Plan::Fill if self.serving && self.lay_once(&mut prepared)? => {
+                match B::plan(self, &mut prepared)? {
+                    Plan::Fill => self.unarmed(&prepared, "its laid fill replays no body")?,
+                    plan => plan,
+                }
+            }
             Plan::Fill => {
+                // A lay-only pass that laid no fill took what the plan laid
+                // for the next frame: laid again for the fill walk's.
+                if self.serving {
+                    B::ready_fill(self, &prepared);
+                }
                 self.filled_in_fire += 1;
                 if self.serving {
                     let kind = format!(
@@ -10572,12 +10667,22 @@ impl<B: Serve> Shell<B> {
         // Each shape carrying decode lanes is recorded so too.
         let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
         let capturing: Vec<bool> = (0..decoding.len()).map(|class| self.captures(class)).collect();
+        // Each class's outputs a lane of it may read out, captures apart.
+        let readable: Vec<Vec<String>> = (0..decoding.len())
+            .map(|class| {
+                self.readouts
+                    .iter()
+                    .filter(|plane| plane.captured.is_none() && plane.classes.contains(class))
+                    .map(|plane| plane.output.clone())
+                    .collect()
+            })
+            .collect();
         // Where the trace buffers a recurrence, a decode lane carries the
         // rows it has not folded (the lagged fold): its scans are the
         // carried forms, another body. Each shape carrying decode lanes is
         // recorded so too.
         let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
-        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, bool)> = shapes
+        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, u8)> = shapes
             .into_iter()
             .flat_map(|lanes| {
                 let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
@@ -10603,6 +10708,11 @@ impl<B: Serve> Shell<B> {
                 // form of commands).
                 let pageless = [false, true];
                 let captures = lanes.iter().any(|&(class, _)| capturing[class]);
+                // Its lanes reading out nothing, or every output their class
+                // reads out (a sampler on the host reads its logits): what a
+                // lane reads lays its fire's readout data, so a serving fire
+                // finds a fill laid for its reads.
+                let reading = lanes.iter().any(|&(class, _)| !readable[class].is_empty());
                 forms
                     .into_iter()
                     .flat_map(move |form| {
@@ -10612,8 +10722,16 @@ impl<B: Serve> Shell<B> {
                             .filter(move |&keys_only| !keys_only || captures)
                             .flat_map(move |keys_only| {
                                 let lanes = lanes.clone();
-                                std::iter::once((lanes.clone(), false, form, keys_only))
-                                    .chain(fed.then_some((lanes, true, form, keys_only)))
+                                [false, true]
+                                    .into_iter()
+                                    .filter(move |&reads| !reads || reading)
+                                    .flat_map(move |reads| {
+                                        let lanes = lanes.clone();
+                                        let flags = u8::from(keys_only) | u8::from(reads) << 1;
+                                        std::iter::once((lanes.clone(), false, form, flags))
+                                            .chain(fed.then_some((lanes, true, form, flags)))
+                                    })
+                                    .collect::<Vec<_>>()
                             })
                             .collect::<Vec<_>>()
                     })
@@ -10637,21 +10755,21 @@ impl<B: Serve> Shell<B> {
                 };
                 let attachments: Vec<engine::Attachments> =
                     (0..decoding.len()).map(carries).collect();
-                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, bool), usize)> = shapes
+                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, u8), usize)> = shapes
                     .into_iter()
                     .filter_map(|entry| {
                         let step = step_of(&entry.0, entry.2 != Buffering::None, &attachments);
                         steps.shape_of(&step).map(|at| (entry, at))
                     })
                     .collect();
-                tagged.sort_by_key(|((lanes, fed, carried, keys_only), at)| {
+                tagged.sort_by_key(|((lanes, fed, carried, flags), at)| {
                     (
                         *at,
                         lanes.iter().map(|&(_, rows)| rows).sum::<u32>(),
                         std::cmp::Reverse(lanes.len()),
                         *fed,
                         *carried as u8,
-                        *keys_only,
+                        *flags,
                     )
                 });
                 let mut covered = vec![false; steps.len()];
@@ -10819,7 +10937,9 @@ impl<B: Serve> Shell<B> {
                 None => self.eager_rows = known.eager,
             }
         }
-        for (at, (lanes, fed, carried, keys_only)) in shapes.iter().enumerate() {
+        // `flags`: 1 a capturing lane of the pageless form (its key rows
+        // alone), 2 every lane reading out its class's outputs.
+        for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
             // A known lattice states eager what its allowance did; every shape
             // short of it is walked, the ones whose family an earlier shape
             // recorded filling it (their fills kept before ready).
@@ -10916,8 +11036,11 @@ impl<B: Serve> Shell<B> {
                         let mut lane = self.naming_lane(class, rows)?;
                         // A capturing lane of a pageless form reads its key
                         // rows alone: its fire lays no page row.
-                        if *keys_only {
+                        if *flags & 1 != 0 {
                             lane.reads.retain(|read| read != SCORE_PAGES);
+                        }
+                        if *flags & 2 != 0 {
+                            lane.reads.extend(readable[class].iter().cloned());
                         }
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                         if *carried != Buffering::None {
@@ -10954,7 +11077,7 @@ impl<B: Serve> Shell<B> {
                     self.arms.take(before);
                 }
                 crate::kernel_profile::family_log(&format!(
-                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} keys_only {keys_only}"
+                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} flags {flags}"
                 ));
                 self.walk_at = Some(at);
                 let fired = self.fire_seated(&seated);

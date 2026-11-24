@@ -474,6 +474,10 @@ impl<B: Host> Gpu<B> {
             self.live.tally(engine::live::Tally::BoundInFire, bound);
             self.warn_in_fire("what a dispatch binds (a bind group the load's walk did not build)");
         }
+        let laid = self.shell.as_mut().map_or(0, Shell::laid_serving);
+        if laid > 0 {
+            self.live.tally(engine::live::Tally::LaidAtFirstFire, laid);
+        }
         let filled = self.shell.as_mut().map_or(0, Shell::filled_serving);
         if filled > 0 {
             self.live.tally(engine::live::Tally::FilledInFire, filled);
