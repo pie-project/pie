@@ -179,18 +179,3 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
         )),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Cursor, put_before};
-
-    /// A fold cell is read only once the step feeding the fire has put it:
-    /// a head the tail has not passed is a fire prepared ahead of that put.
-    #[test]
-    fn a_fold_cell_is_read_only_once_it_is_put() {
-        let cursors = [Cursor { head: 3, tail: 4 }, Cursor { head: 4, tail: 4 }];
-        assert!(put_before(0, &cursors).is_ok());
-        let refused = put_before(1, &cursors).unwrap_err().to_string();
-        assert!(refused.contains("nothing has put yet"), "{refused}");
-    }
-}

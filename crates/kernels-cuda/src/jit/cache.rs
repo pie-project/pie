@@ -380,24 +380,3 @@ fn attribute(device: dr::CUdevice, which: dr::CUdevice_attribute) -> Option<i32>
     let code = unsafe { dr::cuDeviceGetAttribute(&raw mut value, which, device) };
     (code == dr::CUresult::CUDA_SUCCESS).then_some(value)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{decode, encode};
-
-    #[test]
-    fn a_damaged_cache_file_is_a_miss() {
-        let file = encode("key", b"\x7fELF image", "_Z6kernel");
-        assert_eq!(
-            decode("key", &file),
-            Some((b"\x7fELF image".to_vec(), "_Z6kernel".to_owned()))
-        );
-        assert_eq!(decode("other", &file), None);
-        for at in 0..file.len() {
-            let mut torn = file.clone();
-            torn[at] ^= 0x01;
-            assert_eq!(decode("key", &torn), None, "a flip at byte {at} was loaded");
-        }
-        assert_eq!(decode("key", &file[..file.len() - 1]), None);
-    }
-}

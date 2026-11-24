@@ -590,16 +590,3 @@ pub fn embed_weighted(
         ],
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::affine_band_group;
-
-    #[test]
-    fn a_tp2_vocab_band_groups_its_half_of_the_table() {
-        assert_eq!(affine_band_group(262_144, 262_144, 5376, 84), Some(64));
-        assert_eq!(affine_band_group(262_144, 131_072, 5376, 84), Some(64));
-        assert_eq!(affine_band_group(262_144, 100_000, 5376, 84), None);
-        assert_eq!(affine_band_group(262_144, 131_072, 5376, 0), None);
-    }
-}

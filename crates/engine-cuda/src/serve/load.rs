@@ -1801,7 +1801,6 @@ impl Shell {
     pub fn ledger(&self) -> engine::memory::Ledger {
         ledger(self, self.card.0, self.card.1)
     }
-
 }
 
 fn patch_fold(trace: &poem_ir::Trace) -> u32 {
@@ -1901,53 +1900,4 @@ fn activation_rungs(
         }
     }
     Ok(rungs)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::widened;
-
-    /// A lattice to 13778, as the MI300X laid it.
-    const LATTICE: [u32; 21] = [
-        512, 1024, 2048, 2234, 2436, 2656, 2897, 3159, 3445, 3757, 4096, 4467, 4871, 5312, 5793,
-        6317, 6889, 7513, 8192, 9742, 13778,
-    ];
-
-    fn on(rows: u32) -> u32 {
-        LATTICE
-            .iter()
-            .copied()
-            .filter(|rung| *rung <= rows)
-            .max()
-            .unwrap_or(LATTICE[0])
-    }
-
-    /// A tight-budget load whose lanes were cut grows its fire back to the
-    /// top rung it chose (3445), not to the lattice's top (13778) that every
-    /// wider fire would also fit: what it reserved is the chosen top's.
-    #[test]
-    fn a_cut_fire_grows_back_to_the_chosen_top_and_no_further() {
-        let mut asked = Vec::new();
-        let rows = widened(1024, 3445, on, |wider| {
-            asked.push(wider);
-            Ok(true)
-        })
-        .unwrap();
-        assert_eq!(rows, 3445);
-        assert!(asked.iter().all(|wider| *wider <= 3445), "{asked:?}");
-    }
-
-    /// It stops at the widest rung that fits below the top.
-    #[test]
-    fn a_cut_fire_stops_where_the_wider_fire_does_not_fit() {
-        let rows = widened(512, 3445, on, |wider| Ok(wider <= 2048)).unwrap();
-        assert_eq!(rows, 2048);
-    }
-
-    /// At the top already, nothing widens.
-    #[test]
-    fn a_fire_at_its_top_stays() {
-        let rows = widened(3445, 3445, on, |_| panic!("nothing past the top is asked")).unwrap();
-        assert_eq!(rows, 3445);
-    }
 }

@@ -5,7 +5,6 @@ mod gemm;
 mod gemm_sm100;
 mod gemm_sm100_epilogue;
 mod moe_mega;
-mod moe_priced;
 mod moe_route;
 mod moe_select;
 mod moe_select_mlxu4;

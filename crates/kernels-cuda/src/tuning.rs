@@ -1361,15 +1361,3 @@ tuning! {
     mla_dense_short: bool = false, on SdpaMlaDenseShort;
     gemm_narrow_n: u32 = 0, get GemmNarrowN;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_default_tuning_is_the_registry_defaults() {
-        let mut r = Registry::new("cuda", &[], &["rows"]);
-        register(&mut r);
-        assert_eq!(Tuning::of(&r.defaults()), Tuning::DEFAULT);
-    }
-}

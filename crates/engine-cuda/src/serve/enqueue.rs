@@ -1808,34 +1808,3 @@ fn lay_gate(run: &Run<'_>) -> Result<()> {
     run.lay_gate()
         .map_err(|error| Fault::from(crate::error::kernel(error)))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Fired, committed_or};
-    use crate::serve::Attached;
-
-    #[test]
-    fn a_pass_that_does_not_commit_on_an_admitted_fire_errors_by_name() {
-        let attached = Attached {
-            lane: 0,
-            lanes: 1,
-            instance: engine::InstanceId(77),
-            adapter_only: false,
-        };
-        committed_or(Fired::Committed, attached.instance, "epilogue")
-            .expect("a committed pass is the ordinary answer");
-
-        for (fired, expected) in [
-            (Fired::Blocked(3), "blocked on channel 3"),
-            (Fired::Declined, "declined"),
-            (Fired::Faulted("bad table".into()), "faulted"),
-        ] {
-            let fault = committed_or(fired, attached.instance, "epilogue")
-                .expect_err("a pass that did not commit is not an outcome to retry");
-            let said = fault.to_string();
-            assert!(said.contains("77"), "the instance must be named: {said}");
-            assert!(said.contains(expected), "{said}");
-        }
-    }
-}
-

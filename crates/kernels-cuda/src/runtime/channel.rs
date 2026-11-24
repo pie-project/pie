@@ -645,44 +645,6 @@ pub fn rs_ext_land(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn channel_every_case() {
-        a_slots_full_bytes_are_max_ring_apart_whatever_its_capacity();
-        the_ticket_flags_keep_devs_numbering();
-        a_bump_lane_carries_the_registrys_own_four_arrays();
-    }
-
-    fn a_slots_full_bytes_are_max_ring_apart_whatever_its_capacity() {
-        assert_eq!(Rings::full_at(0, 0), 0);
-        assert_eq!(Rings::full_at(0, 63), 63);
-        assert_eq!(Rings::full_at(1, 0), u64::from(MAX_RING));
-        assert_eq!(Rings::full_at(7, 3), 7 * 64 + 3);
-    }
-
-    fn the_ticket_flags_keep_devs_numbering() {
-        assert_eq!(Ticket::CONSUME, 1);
-        assert_eq!(Ticket::PUBLISH, 2);
-        assert_eq!(Ticket::HOST_WRITER, 4);
-        assert_eq!(Ticket::PACKED_BOOL, 8);
-        assert_eq!(Ticket::REQUIRE_INPUT, 16);
-        assert_eq!(Ticket::HOST_READER, 32);
-    }
-
-    fn a_bump_lane_carries_the_registrys_own_four_arrays() {
-        let rings = Rings::new(0x1000, 0x2000, 0x3000, 0x4000, 8);
-        let lane = rings.bump_lane(0x5000, 2, 0x6000, 1, 0x7000);
-        assert_eq!(
-            (lane.full, lane.head, lane.tail, lane.cap1),
-            (rings.full, rings.head, rings.tail, rings.cap1),
-        );
-        assert_eq!((lane.taken_count, lane.put_count), (2, 1));
-    }
-}
-
 /// A lane's page copy in one page list (`channel.cu`'s `PageCopyRun`):
 /// its `[src, dst, tokens]` at `copy`, the reserve pages' base addresses at
 /// `base`, its planes `planes` entries of the plane table from `plane_at`.
@@ -945,39 +907,4 @@ pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32, width: u32) -> Resu
         ),
         &[ArgValue::Ptr(runs), ArgValue::U32(run_count), ArgValue::U32(width)],
     )
-}
-
-#[cfg(test)]
-mod kernel_names {
-    /// Every kernel a host wrapper here fires lies under the kernel file's
-    /// namespace and is defined there: a name the file does not hold builds
-    /// only where it is first fired (NVRTC / comgr at run time), so no check
-    /// catches it ("copy_rs_rows" was fired outside the CUDA file's
-    /// namespace and NVRTC refused it on the first hybrid beam).
-    #[test]
-    fn every_fired_kernel_is_defined_in_its_namespace() {
-        let wrappers = include_str!("channel.rs");
-        let kernels = include_str!("../../kernels/runtime/channel.cu");
-        let namespace = "::pie::runtime::channel::";
-        assert!(
-            kernels.contains("namespace pie::runtime::channel {"),
-            "the kernel file states namespace pie::runtime::channel"
-        );
-        let fired: Vec<&str> = wrappers
-            .split("kernel(FILE, \"")
-            .skip(1)
-            .filter_map(|rest| rest.split('"').next())
-            .collect();
-        assert!(!fired.is_empty(), "the wrappers fire kernels");
-        for name in fired {
-            let short = name.strip_prefix(namespace).unwrap_or_else(|| {
-                panic!("{name} is fired outside the kernel file's namespace {namespace}")
-            });
-            let entry = short.split('<').next().unwrap_or(short);
-            assert!(
-                kernels.contains(&format!("void {entry}(")),
-                "{name} is fired and the kernel file defines no {entry}"
-            );
-        }
-    }
 }

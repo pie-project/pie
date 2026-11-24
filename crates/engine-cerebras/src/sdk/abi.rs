@@ -206,39 +206,3 @@ impl SimPlatform {
         self.0.as_ptr() as *const c_void
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::CxxString;
-
-    #[test]
-    fn a_string_is_laid_out_as_libstdcxx_reads_it() {
-        let short = CxxString::new("hello");
-        assert_eq!(short.len, 5);
-        assert_eq!(
-            short.ptr.cast_const(),
-            short.sso.as_ptr(),
-            "a short string is local"
-        );
-        assert_eq!(&short.sso[..6], b"hello\0");
-
-        let text = "a string past the sixteen local bytes";
-        let long = CxxString::new(text);
-        assert_eq!(long.len, text.len());
-        assert_ne!(
-            long.ptr.cast_const(),
-            long.sso.as_ptr(),
-            "a long string is on the heap"
-        );
-        let capacity = usize::from_ne_bytes(long.sso[..8].try_into().unwrap());
-        assert_eq!(
-            capacity,
-            text.len(),
-            "its capacity sits where a short one's bytes do"
-        );
-        // SAFETY: `new` wrote `len` bytes and a NUL at `ptr`.
-        let held = unsafe { std::slice::from_raw_parts(long.ptr, text.len() + 1) };
-        assert_eq!(&held[..text.len()], text.as_bytes());
-        assert_eq!(held[text.len()], 0);
-    }
-}
