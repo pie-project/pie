@@ -1121,7 +1121,7 @@ impl EngineConfig {
                 || (self.kind == EngineKind::Cuda && self.device.len() == 1),
             "engine.measure = false skips the measurements a load takes on the vulkan, wgpu, \
              metal and xla engines and a one-device cuda engine; the {} engine{} still measures outside \
-             that path (new-memory/FOLLOWUPS.md), so omit the key",
+             that path, so omit the key",
             self.kind.as_str(),
             if self.kind == EngineKind::Cuda {
                 " across devices"

@@ -153,7 +153,9 @@ export class ForwardPassStub {
     this.checkpointSlots = Array.from(slots);
   }
   finalStated = 0;
+  finalRefusal: string | undefined;
   finalRows() {
+    if (this.finalRefusal) throw Object.assign(new Error(this.finalRefusal), { payload: this.finalRefusal });
     this.finalStated += 1;
   }
   media(lane: number, spans: unknown[]) {

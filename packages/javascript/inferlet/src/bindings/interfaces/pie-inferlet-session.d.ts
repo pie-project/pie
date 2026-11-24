@@ -4,6 +4,7 @@
  */
 export function send(message: string): void;
 /**
+ * Receives an incoming message from the remote user client
  * Sends a file to the remote user client, under a suggested file name
  * if it has one.
  * 
@@ -101,7 +102,7 @@ export type Matcher = import('./pie-inferlet-grammar.js').Matcher;
  * 
  * ## `"pcm"`
  */
-export type HandleKind = 'working-set' | 'matcher' | 'frames' | 'pcm';
+export type HandleKind = "working-set" | "matcher" | "frames" | "pcm";
 /**
  * One handle a launch moved in, or one a process gives back.
  */
