@@ -413,7 +413,6 @@ pub struct Shell {
     /// which landing each instance holds.
     landings: BTreeMap<u32, Landing>,
     held_landing: BTreeMap<engine::InstanceId, u32>,
-    blobs: crate::blob::Store,
     held: Vec<u32>,
     programs: crate::program::Plane,
     /// Each set's written end as far as the fires admitted carried it,
@@ -1857,7 +1856,6 @@ impl PreparedLoad<'_> {
             adapter_fact,
             landings: BTreeMap::new(),
             held_landing: BTreeMap::new(),
-            blobs: crate::blob::Store::new(),
             corrected,
             held: vec![0; paging.slots as usize],
             programs: {

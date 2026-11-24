@@ -31,7 +31,6 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceBoot {
-    pub adapter_dir: Option<std::path::PathBuf>,
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<std::path::PathBuf>,
     /// `[metal] cache`: pie's engine cache directory, where the Neural
@@ -731,7 +730,6 @@ impl Engine for Metal {
         }
 
         told_within(&mut budgets, shell.budget());
-        shell.mount_adapters(self.boot.adapter_dir.clone());
         shell
             .seat_disk_kv(
                 residency.disk_kv_budget,

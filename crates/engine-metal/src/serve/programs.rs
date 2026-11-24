@@ -232,10 +232,6 @@ impl Shell {
         crate::adapter::sink_of(&program.plan.package)
     }
 
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.blobs.mount(root);
-    }
-
     /// The banks the adapter a program's `lora` sink lands fills, in
     /// bank-name order: one `Adapter` slot each. None: it lands none.
     pub fn adapter_banks(
