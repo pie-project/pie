@@ -1758,11 +1758,9 @@ impl BatchScheduler {
             // pool may lower its rung.
             frame_policy.cap_fires(stepped.max_forward_tokens);
             // Nor while a complete frame cut wider than the cap waits
-            // unsealed (capped): lowered under it, the frame went only once
-            // raised again, a raise its owner's eviction could not fund
-            // while that eviction waited on the frame (Mac Pro at 2 GiB on
-            // 4cef0c7d3 and 6c21ebca3: capped frames, evictions waiting on
-            // them, the raise never served). Kept, the walk lifts the cap
+            // unsealed (capped): lowered under it, the frame goes only once
+            // raised again, a raise its owner's eviction cannot fund while
+            // that eviction waits on the frame. Kept, the walk lifts the cap
             // to the frame with no raise at all.
             if in_flight_launches
                 .iter()
@@ -2044,9 +2042,10 @@ impl BatchScheduler {
                                 .saturating_add(Duration::from_secs(60) * stall_dumps)
                         {
                             stall_dumps += 1;
-                            eprintln!(
-                                "[pie-sched] engine {engine_id} stalled for {stalled_for:?} \
-                                 (no progress, work queued or in flight); state:\n{}",
+                            tracing::error!(
+                                engine_id,
+                                "stalled for {stalled_for:?} (no progress, work queued or \
+                                 in flight); state:\n{}",
                                 Self::render_debug_dump(
                                     engine_id,
                                     &pending,
@@ -3887,10 +3886,10 @@ mod tests {
     }
 
     /// A control the lane refuses or drops (a panic on the copy, the
-    /// reply lost) tells what waits on it: a residency move's copy waited
-    /// on a completion that never came, and the move held its items moving
-    /// for good (Mac Pro's M5: every restore of a pair's other holders
-    /// waited on it).
+    /// reply lost) tells what waits on it: else a residency move's copy
+    /// waits on a completion that never comes, and the move holds its items
+    /// moving for good (every restore of a pair's other holders waiting on
+    /// it).
     #[test]
     fn a_refused_control_tells_its_tracked_completion() {
         let tracked = crate::scheduler::ControlCompletion::new();
@@ -4000,10 +3999,10 @@ mod tests {
         refused_frame(fires.iter().map(|&fire| refused_request(fire)).collect(), chunks)
     }
 
-    /// beamx40 on M1 (6ea0b14ef): a frame refused for where state lies went
-    /// again from requests the build had moved its lanes out of, and the
-    /// engine refused it whole, "a fire carries no lanes", poisoning a
-    /// rescore pipeline's channel. A fire refused for placement goes again
+    /// A frame refused for where state lies must not go again from requests
+    /// the build moved its lanes out of: the engine refuses it whole, "a
+    /// fire carries no lanes", poisoning a rescore pipeline's channel. A
+    /// fire refused for placement goes again
     /// with every lane, page and token it was built with; one a refused
     /// lane took out of the frame (failed alone) does not go again; and a
     /// fire with no lanes is never posted, failing alone by name.
@@ -4110,10 +4109,9 @@ mod tests {
         lane.shutdown();
     }
 
-    /// Mac Pro at 5 GiB on 6c21ebca3: one launch refused "impossible
-    /// submission: state chunk 2057 ... inside the activation span's backed
-    /// carve" failed all 42 lanes of its frame and poisoned their channels.
-    /// A batch the engine refuses for where state lies is held, nothing
+    /// One launch refused "impossible submission: state chunk ... inside the
+    /// activation span's backed carve" must not fail every lane of its frame
+    /// and poison their channels. A batch the engine refuses for where state lies is held, nothing
     /// failed, while the pool moves that state down, then fired again as
     /// fires of their own; refused again for a chunk already moved, its
     /// fires go again one by one, and only one the engine still refuses

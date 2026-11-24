@@ -576,8 +576,7 @@ impl ProcessCtx {
         {
             return Ok(Err(UNSHARED_CHECKPOINT.to_string()));
         }
-        // The window-list path's refusal: removed by the windowed-state
-        // change (the integration commit deletes it). A load whose engine
+        // The window-list path's refusal. A load whose engine
         // serves windowed layers as ring + buffer states no window tokens
         // (`RsCaps::window_state`): its beams share one folded window.
         if crate::model::model().rs_caps().window_tokens > 0
@@ -2126,8 +2125,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         for failed in [false, true] {
-            // The channel is visible before the native completion, which is
-            // the ready-Take path that used to remove an unresolved fire.
+            // The channel is visible before the native completion: a
+            // ready Take must not remove an unresolved fire.
             let mirror = Box::new([7i32, 0]);
             let words = Box::new([
                 AtomicU64::new(0),

@@ -732,9 +732,9 @@ pub fn table_apart(engine: &[u32], runtime: &[u32]) -> Option<String> {
 /// the runtime's map as the move left it, never assumed. Apart, said at
 /// ERROR naming the first logical chunk they place apart and `what` moved,
 /// and a debug build stops on it: a fire through a table the runtime does
-/// not share reads and writes chunks it never placed (the M1's NaN: a free
-/// logical id swapped up onto a segment the walk then gave back, taken by
-/// the runtime at a physical the engine did not resolve it to). An engine
+/// not share reads and writes chunks it never placed (e.g. a free logical
+/// id swapped up onto a segment the walk then gave back, taken by the
+/// runtime at a physical the engine did not resolve it to). An engine
 /// that states no table is not checked.
 pub async fn check_moved(shared: &Shared, mover: &impl Mover, what: &str) {
     let runtime = shared.lock().unwrap().pool().chunk_table().to_vec();
@@ -858,10 +858,9 @@ pub async fn carry_raise(
     }
     // The state in the wider carve moves down first, and only then does
     // the engine back the carve over where it lay: told first, a fire still
-    // at the rung in hand that read a chunk not yet moved was refused
-    // inside the carve (Mac Pro at 2 GiB on 6c21ebca3: "state chunk 231
-    // (physical 433) lies inside the activation span's backed carve", a
-    // forward failed and three beams were lost).
+    // at the rung in hand that read a chunk not yet moved would be refused
+    // inside the carve ("state chunk ... lies inside the activation span's
+    // backed carve"), failing its forward.
     if !evacuation.moves.is_empty()
         && let Err(error) = mover.evacuate(SharedPool::rung_moves(evacuation)).await
     {

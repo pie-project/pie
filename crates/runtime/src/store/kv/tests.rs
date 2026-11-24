@@ -115,10 +115,10 @@ fn tests_every_case() {
 }
 
 /// A beam search's finish while its set is suspending waits for the move
-/// to end, and never names a page the move gives back (the M1's beam line:
-/// a relist under a suspend left the chosen pages named by the new tail and
-/// the suspend's pinned old one, and the suspend's commit gave them back
-/// while the set still read them).
+/// to end, and never names a page the move gives back (a relist under a
+/// suspend would leave the chosen pages named by the new tail and the
+/// suspend's pinned old one, and the suspend's commit give them back while
+/// the set still reads them).
 fn a_beams_finish_waits_out_a_suspend_and_names_each_page_once() {
     let mut store = KvStore::new_with_swap(16, 16, 0, h(61));
     let total = store.free_committed();
@@ -717,10 +717,10 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     assert_eq!(swapped(&store, a), 1);
 }
 
-/// The L40S at 3 GiB (disk-only): a prompt-prefix page seven forks share
-/// stayed on the device after every one of them was evicted (each
-/// suspend left it, another reader or a key holding it then), and nothing
-/// moved it: its chunk held a head's need for good. Swept with its
+/// A disk-only load: a prompt-prefix page seven forks share must not stay
+/// on the device after every one of them is evicted (each suspend leaves
+/// it, another reader or a key holding it then) with nothing to move it:
+/// its chunk would hold a head's need for good. Swept with its
 /// readers' sets, it goes down a tier once, every reader's refs pointing
 /// there, the chunk comes free, and a restore reads it back.
 fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {

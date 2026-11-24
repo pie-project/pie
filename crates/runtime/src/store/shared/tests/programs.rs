@@ -1552,7 +1552,7 @@ fn a_steady_one_row_decode_moves_no_rung_and_no_cap() {
     assert!(notices(&engine).is_empty());
 }
 
-/// Mac Pro's serving case (M3): a wave of 256 lanes over 14 pairs of
+/// A Metal serving case: a wave of 256 lanes over 14 pairs of
 /// 9 312 512 bytes a lane and 4 718 592 a fire wanted 1911 chunks at the
 /// 256 rung, of a span of 1758 (3.3 GB): Metal's `Pool::cover` refused it
 /// inside the bind. Held against the span the engine states, the 256 rung

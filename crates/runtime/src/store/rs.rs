@@ -50,8 +50,8 @@ pub const MAX_WINDOW_LISTS: usize = 4;
 /// `tokens` (`T_w`) of them, slot `i` of a set's table rows
 /// `[i * T_w, (i + 1) * T_w)`.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub window: u32,
@@ -62,8 +62,8 @@ pub struct WindowGeometry {
 /// `head` the position written up to, in tokens; `retired[l]` counts the
 /// leading slots of list `l`'s table already given back.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowState {
     retired: [u32; MAX_WINDOW_LISTS],
@@ -81,8 +81,8 @@ pub struct WindowState {
 /// device-positioned fire retires behind `reach`, the first token it may
 /// write, as no row's window reaches back past it.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowAdvance {
     pub(crate) positioned: bool,
@@ -569,9 +569,8 @@ impl RsStore {
     /// set does; the lanes name the pages in `Lane::tables` and the fold in
     /// `Lane::window` ([`crate::pipeline::fire::rs::apply_shared`]).
     ///
-    /// The window-list store (the first kind, `windows` non-empty) is
-    /// removed by the windowed-state change: the integration commit deletes
-    /// it, once every engine states `Capabilities::windowed_state`.
+    /// The window-list store (the first kind, `windows` non-empty) serves
+    /// an engine that does not state `Capabilities::windowed_state`.
     ///
     /// `host`, the engine's host tier (CONTRACT-BC 22), backs the host rows
     /// a suspend parks state in: records, rs list slots and every window
@@ -1742,8 +1741,8 @@ impl RsStore {
     /// needs has retired, or as [`Self::checkpoint`]; at the windows' own
     /// position, [`Self::checkpoint`]. Another state checkpoints only there.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn checkpoint_at(
         &mut self,
         ws: RsWorkingSetId,
@@ -2040,8 +2039,8 @@ impl RsStore {
 
     /// The window slots a fire landing rows `rows` of `ws` takes.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn window_demand(
         &self,
         ws: RsWorkingSetId,
@@ -2057,8 +2056,8 @@ impl RsStore {
     /// from `granted` or the pools; [`Self::window_advance`] moves the
     /// windows once the fire's tables have been read.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn prepare_window(
         &mut self,
         ws: RsWorkingSetId,
@@ -2136,8 +2135,8 @@ impl RsStore {
     /// reads it, in the engine's numbering: slot `i` its rows
     /// `[i * T_w, (i + 1) * T_w)`, 0 where trimmed or not written.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn window_tables(&self, ws: RsWorkingSetId, end: u32) -> Result<Vec<Vec<u32>>, RsError> {
         let entry = self.entry(ws)?;
         if self.live_window(entry).is_none() {
@@ -2174,8 +2173,8 @@ impl RsStore {
     /// slots whose last row lies below the committed position less the
     /// list's own window retire, once no fire still reads them.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn window_advance(&mut self, ws: RsWorkingSetId, advance: WindowAdvance) {
         let lists = self.window.clone();
         let entry = self.entry_mut(ws).expect("batch prevalidated");

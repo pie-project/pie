@@ -565,8 +565,8 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
 /// slots to anyone else, so an engine claiming where each instance lies
 /// (Vulkan, wgpu) takes another process's bind there, and the parked
 /// one's restore rebinds it to fresh slots none other claims. Untold, the
-/// next bind on the freed slots is refused by name: the Vulkan long-prompt
-/// mix on a0bfb512f ("Instance slots ... already hold instance N's run").
+/// next bind on the freed slots is refused by name ("Instance slots ...
+/// already hold instance N's run").
 #[test]
 fn a_park_is_said_to_the_engine_before_its_slots_are_another_s() {
     for told in [true, false] {
@@ -625,8 +625,8 @@ fn a_park_is_said_to_the_engine_before_its_slots_are_another_s() {
 /// its way: with one member's park in flight, another member's park leaves
 /// the pair where it lies, so when the first park is taken back (the tier
 /// below full) its member is resident on its pair, and another program's
-/// bind never takes that run as fresh room (the L40S at 3 GiB on
-/// c8077be0f: CUDA 700, program 4's pair run bound by program 6). Once
+/// bind never takes that run as fresh room (a device fault: one program's
+/// pair run bound by another). Once
 /// every member's park has landed, the run is given back.
 #[test]
 fn a_pair_run_is_never_another_program_s_while_a_member_may_still_fire() {
@@ -1631,11 +1631,11 @@ fn free_and_live(device: &Shared) -> (u32, u64) {
     (pool.pool().free_chunks(), pool.pool().demand().live)
 }
 
-/// guest_mix's warm-up on the M1 Max: a guest bind needing two runs of four
-/// adjacent chunks waits on a segment commit while smaller guest binds keep
-/// arriving. Before the queue, each smaller bind took the fresh segment's
-/// chunks a few at a time, the long runs never stood free, and the long
-/// bind waited for ever. Now it heads the queue: the smaller binds wait
+/// A guest bind needing two runs of four adjacent chunks waits on a segment
+/// commit while smaller guest binds keep arriving. Unqueued, each smaller
+/// bind would take the fresh segment's chunks a few at a time, the long
+/// runs never stand free, and the long bind wait for ever. It heads the
+/// queue: the smaller binds wait
 /// behind it taking nothing (the free count does not drift), it binds in
 /// the committed segment, and they follow in arrival order.
 #[tokio::test(flavor = "current_thread")]
@@ -2013,7 +2013,7 @@ fn a_process_s_guest_chunk_slots_are_all_its_bound_slots() {
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
 }
 
-/// The Spark's beam restores (dbe9c0e93): fragmented Instance chunks, a
+/// Beam restores on unified memory: fragmented Instance chunks, a
 /// parked guest's freed run filled by another bind, then its restore. The
 /// unpark is short and waits, naming the runs of chunks it needs (what the
 /// planner funds, `RolesError::unpark_runs`), never refused; once room
@@ -2301,8 +2301,8 @@ async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() 
     assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
 }
 
-/// A failed process's teardown (Mac Pro's M5: pairs of dead processes left
-/// on the device and the host): the engine refuses its instances' closes
+/// A failed process's teardown (else pairs of dead processes are left on
+/// the device and the host): the engine refuses its instances' closes
 /// (a failed fire left them unusable), and the lane closes their books all
 /// the same. Its slots go back once no step on its way names them (a step
 /// still reads one when the close comes, and lands after), and the pair
@@ -2392,7 +2392,7 @@ fn with_no_host_tier_a_shared_pair_s_state_goes_back_once_every_holder_parked() 
     assert_eq!(held(&device), before);
 }
 
-/// F21's bind at the pool's limit (every segment committed, nothing left
+/// A guest bind's run at the pool's limit (every segment committed, nothing left
 /// to evict for it): free chunks scattered by the binds before it, enough
 /// for its run of 4 but none adjacent. It is short (`BindShort`, to the
 /// planner); the planner asks for a compaction, the walk moves chunks
@@ -3007,7 +3007,7 @@ fn a_bind_short_of_room_asks_for_its_scratch_and_its_pair_together() {
     );
 }
 
-/// The L40S's guest-only restore (kv 0, rs 0, asking 21 one-chunk pieces
+/// A guest-only restore (kv 0, rs 0, asking 21 one-chunk pieces
 /// against 22 state chunks): what an unpark lays fresh is what its parked
 /// parts take, by shape, packed into chunks and into the free slots of the
 /// chunks open for that shape, not a chunk a part. A process of many small
@@ -3043,7 +3043,7 @@ fn an_unpark_asks_the_chunks_it_lays_not_a_chunk_a_part() {
     assert_eq!(asked, laid, "asked what the unpark lays: {asked} vs {laid}");
 }
 
-/// Mac Pro's 2 GiB stall (a restore needing three runs of nine, open
+/// A restore needing three runs of nine (open
 /// stretches of 10, 10 and 9 in three segments, nothing in flight): where
 /// the pool counts the runs a restore needs, the restore's own unpark
 /// seats it there. The count and the take read the same runs
@@ -3088,9 +3088,9 @@ fn a_restore_needing_three_runs_of_nine_is_seated_in_stretches_of_ten_ten_and_ni
     roles.lock().unwrap().commit(back);
 }
 
-/// The L40S's refusal of a run of two its need counted on: an unpark took
-/// its parts in its items' order, and a run of slots opened the lowest free
-/// chunk, splitting the only stretch the run of two stood in. It lays its
+/// A run of two its need counted on is never refused: taking its parts in
+/// its items' order, a run of slots would open the lowest free chunk,
+/// splitting the only stretch the run of two stands in. An unpark lays its
 /// runs of whole chunks first, the longest first, then its runs of slots:
 /// free chunks `c`, `c + 1` and `d` hold a run of two and a run of slots,
 /// and the unpark lands. (Its items lie in a hash map: five runs of slots
@@ -3149,10 +3149,9 @@ fn an_unpark_lays_its_runs_of_chunks_before_its_runs_of_slots() {
     }
 }
 
-/// Mac Pro at 5 GiB on 1e87ab171: a first-frame bind short of a run of
-/// three waited on a segment commit (the segments left within the budget
-/// held three more), the walk then had none left for it, and the bind was
-/// refused to the client. A commit that will not come is no refusal: the
+/// A first-frame bind short of a run of three waits on a segment commit
+/// (the segments left within the budget hold three more), and the walk
+/// then has none left for it. A commit that will not come is no refusal: the
 /// bind goes again, short of room the planner makes, and binds once it
 /// has made it.
 #[tokio::test(flavor = "current_thread")]
@@ -3237,12 +3236,11 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
     assert_eq!(long_engine.borrow().bindings.len(), 1);
 }
 
-/// Mac Pro at 2 GiB disk-only on 1e87ab171: a process's bind short of two
-/// runs of nine Instance chunks, the process evicted to disk and restored
-/// ~95 ms later, then "a restore waits for its instances' rebinds
-/// (InstanceId(5))" until teardown: the restore committed with an instance
-/// whose rebind named a dead part no slots held, and nothing made room for
-/// it. Such an instance's dead parts are its unpark's to take fresh, in
+/// A disk-only load: a process's bind short of two runs of nine Instance
+/// chunks, the process evicted to disk and restored, must not then wait
+/// "for its instances' rebinds" until teardown, committed with an
+/// instance whose rebind names a dead part no slots hold and nothing
+/// making room for it. Such an instance's dead parts are its unpark's to take fresh, in
 /// their class, before the restore commits: its need counts their runs, an
 /// unpark short of them is refused (the restore waits queued for room the
 /// planner makes, nothing committed), and once they stand it unparks, and
@@ -3310,10 +3308,10 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
     assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "nothing left unbound");
 }
 
-/// The L40S on 5aa45805b: a restore's need read [(1, 1)] while its unpark
-/// was refused a run of 465 slots (Slots { slots: 465, committable: 0 }):
-/// counted by the free slots partly filled chunks held, its run asked no
-/// chunk, the map stood the need, and nothing was moved. A restore's need
+/// A restore's need must not read [(1, 1)] while its unpark is refused a
+/// run of 465 slots: counted by the free slots partly filled chunks hold,
+/// its run would ask no chunk, the map stand the need, and nothing move.
+/// A restore's need
 /// and its standing are the pool's own placement of every piece it takes:
 /// a run of slots no partly filled chunk of its class holds asks a free
 /// chunk, and the state its serve takes first is laid before it.
@@ -3364,11 +3362,10 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
     drop(singles_part);
 }
 
-/// The L40S at 3 GiB on c10d7de5d: a beam pair's scratch (73 dead refs)
-/// stayed on chunk 17 for good: its first holder parked while the pair was
-/// still another's, that other then ended, and nothing moved the pair with
-/// the parked one. A move down for the parked holder takes it now, its dead
-/// parts given back.
+/// A beam pair's scratch (73 dead refs) whose first holder parked while
+/// the pair was still another's, that other then ending: nothing else
+/// moves the pair with the parked one. A move down for the parked holder
+/// takes it, its dead parts given back.
 #[test]
 fn a_pair_left_behind_by_a_parked_holder_goes_with_its_move_down() {
     let facts = facts(64);
@@ -3393,9 +3390,8 @@ fn a_pair_left_behind_by_a_parked_holder_goes_with_its_move_down() {
     );
 }
 
-/// The L40S at 3 GiB on c201812ea: a served restore's bind room was taken
-/// by another head between its serve and its unpark (PendingBindShort,
-/// run 1, none after its own unpark). What its placement chose is held for
+/// A served restore's bind room must not be taken by another head between
+/// its serve and its unpark (`PendingBindShort`). What its placement chose is held for
 /// it: another holder's bind cannot take those chunks, its unpark takes
 /// them, and its pending bind's run, held beside them, is its own bind's.
 #[test]
@@ -3446,9 +3442,9 @@ fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
     let _ = device;
 }
 
-/// Mac Pro g2 on bd4f4ffe7: a served restore's bind runs were held for it,
-/// and its pending-bind check, a count of free runs that left them out,
-/// found none (0 of 7 where 5 stood) every serve. Checked by the one
+/// A served restore's bind runs are held for it: a pending-bind check
+/// counting free runs that left them out would find none every serve.
+/// Checked by the one
 /// placement with its own reservation open to it, its bind stands; to any
 /// other take those chunks are not there.
 #[test]
@@ -3536,9 +3532,9 @@ fn a_held_part_round_trips_through_the_host_with_its_place_named() {
 /// A bind taken on a pair its other members hold, whose last member parks
 /// before the bind lands (the planner's moves run on other threads than
 /// the lane's take and bind): the pair stays the bind's. Given back with
-/// that park, its run went to another program's bind while the new member
-/// was bound on it (the L40S at 3 GiB on df488038b: `guest::claims`
-/// refused a rescore's bind over a live pair's run).
+/// that park, its run would go to another program's bind while the new
+/// member is bound on it (`guest::claims` refusing a bind over a live
+/// pair's run).
 #[test]
 fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
     let Pools { device: _, roles } = pools(64);

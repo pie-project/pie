@@ -641,11 +641,10 @@ struct Item {
     /// A pair or an adapter: binds taken on it and not yet bound or given
     /// back ([`Roles::take_instance`] to [`Roles::bound`] or
     /// [`Roles::untake`]). The taker is no member yet, so it is in no
-    /// `attached`: held only by this, the item went with its last member's
-    /// park (or was given back as unheld) while the bind was on its way,
-    /// and the bind named slots another owner took next (the L40S at
-    /// 3 GiB on df488038b: a rescore's instance bound over a live pair's
-    /// run, `guest::claims` refused).
+    /// `attached`: unheld by this, the item would go with its last member's
+    /// park (or be given back as unheld) while the bind is on its way, and
+    /// the bind would name slots another owner takes next (`guest::claims`
+    /// refusing an instance bound over a live pair's run).
     binds: u32,
     /// Which taking of its slots it lies in: a new one each time it is
     /// given fresh slots ([`Roles::next_generation`]). A pair's is the
@@ -679,9 +678,9 @@ impl Item {
     /// state) its rebind must name: parked where it lies ([`Self::shed`]),
     /// or a dead part with no slots. Its unpark takes fresh ones in their
     /// class before its restore commits, the runs counted in its need
-    /// ([`Roles::unpark_need`]): let through, the restore committed and
-    /// waited on a rebind no room was made for (Mac Pro at 2 GiB on
-    /// 1e87ab171: InstanceId(5), its process Restoring until teardown).
+    /// ([`Roles::unpark_need`]): let through, the restore would commit and
+    /// wait on a rebind no room is made for, its process Restoring until
+    /// teardown.
     fn takes_fresh(&self) -> bool {
         self.tier == Tier::Device
             && (self.shed || self.parts.iter().any(|part| part.dead() && part.refs.is_empty()))
@@ -1668,9 +1667,8 @@ impl Roles {
             }),
             // Any other refusal (the budget, a run across a segment's end)
             // is said by name: read as the part's ask alone, its room's
-            // zeros looked like a full device (Mac Pro at 2 GiB on
-            // c10d7de5d: "free_runs: 0, free_chunks: 0, committable: 0" on a
-            // device 310 of 365 pages free).
+            // zeros look like a full device ("free_runs: 0, free_chunks: 0,
+            // committable: 0" on a device mostly free).
             Err(error) => {
                 tracing::warn!(%error, run = like.chunks, pieces = like.pieces, "roles: a guest part's fresh room refused by the pool");
                 Err(like.room())
@@ -1800,9 +1798,9 @@ impl Roles {
     /// where they lie), and the order its parts are taken in: its runs of
     /// whole chunks first, the longest first, then its runs of slots and
     /// its live parts, in the items' order. Taken in the items' order, a
-    /// single chunk opened for a table at the lowest free chunk split the
-    /// only stretch a run of two stood in, and the unpark was refused the
-    /// run its need counted on (the L40S). What the unpark takes
+    /// single chunk opened for a table at the lowest free chunk could split
+    /// the only stretch a run of two stands in, and the unpark be refused
+    /// the run its need counted on. What the unpark takes
     /// ([`Self::prepare_unpark`]) and what its placement reads
     /// ([`Self::unpark_pieces`]): one order.
     #[allow(clippy::type_complexity)]
@@ -1856,8 +1854,8 @@ impl Roles {
     /// open beyond the partly filled ones, in single chunks. A run of 465
     /// slots asks a chunk wherever no partly filled chunk of its class holds
     /// it, whatever free slots other chunks hold: counted by free slots, it
-    /// asked none, the need stood, and the unpark was refused for good (the
-    /// L40S on 5aa45805b: need [(1, 1)], refused a run of 465 slots).
+    /// would ask none, the need would stand, and the unpark be refused for
+    /// good.
     /// Where the pool cannot place them all now, each run of slots and
     /// take asks a chunk of its own.
     #[must_use]
@@ -1943,9 +1941,8 @@ impl Roles {
     /// ([`super::slots::SlotPool::place`]), what is held for its served
     /// restore open to them: the one placement its pending bind is checked
     /// by once its unpark has taken its own. Read as a count of free runs
-    /// without its own reservation, a restore whose bind runs were held for
-    /// it found none of them, every serve (Mac Pro g2 on bd4f4ffe7:
-    /// PendingBindShort, 0 free runs of 7 where 5 stood).
+    /// without its own reservation, a restore whose bind runs are held for
+    /// it would find none of them, every serve (`PendingBindShort`).
     #[must_use]
     pub fn place_claimed(&self, holder: Holder, own: &[super::slots::OwnPiece]) -> super::slots::Placement {
         let ticket = self.claims.get(&holder).copied();
@@ -2668,8 +2665,8 @@ impl Roles {
     /// process's park, its pair given fresh slots at a restore the
     /// instance's bind never named, and those slots went to another
     /// program's bind (the simulation, a yield between a bind's take and
-    /// its bind: `guest::claims` refused an instance over a live pair's
-    /// run, the L40S's claims refusals at 3 GiB).
+    /// its bind: `guest::claims` refusing an instance over a live pair's
+    /// run).
     #[must_use]
     pub fn binds_on_way(&self, holder: Holder) -> bool {
         self.binding.contains_key(&holder)
@@ -2719,10 +2716,9 @@ impl Roles {
             {
                 // Short of its tables' chunk beside the fresh chunks its guest
                 // state took (and gave back): the room asked is all of them,
-                // never the tables' one chunk alone (seed 46 of the
-                // simulation on f152f9631: a scratch chunk and a pair chunk
-                // taken, the tables short of a third, one chunk served, short
-                // again, a spin). Runs of more than one chunk ask one more
+                // never the tables' one chunk alone (else a scratch chunk and
+                // a pair chunk taken, the tables short of a third, one chunk
+                // served, short again: a spin). Runs of more than one chunk ask one more
                 // run of their length for the tables: over, never under.
                 let short = match guest.or((opened > 0).then_some((1, 0))) {
                     Some((run, pieces)) => RolesError::GuestShort {
@@ -2948,9 +2944,8 @@ impl Roles {
             // it. Read as parked, the pair went with another holder's park,
             // the member's park was taken back, and the run, given back
             // under a resident member, was another program's fresh room
-            // (the L40S at 3 GiB on c8077be0f: instance 371's pair run
-            // bound by 372-374 of another program, CUDA 700 on its next
-            // fire). The member's park landing gives it back
+            // (a pair run bound by another program's instances, a device
+            // fault on its next fire). The member's park landing gives it back
             // ([`Self::release_unheld_pairs`]).
             // A bind on its way holds it as a member does.
             Owner::Pair(_) if item.binds > 0 => false,
@@ -2973,9 +2968,8 @@ impl Roles {
                         // Gone (closed) holds it no longer: read as held, a
                         // beam pair's scratch whose other copies had ended
                         // never moved with the last one, and its chunk stayed
-                        // on the device for good (the L40S at 3 GiB on
-                        // c10d7de5d: chunk 17, a pair of 73 dead refs, its
-                        // evicted holder no candidate, the head one chunk short).
+                        // on the device for good (its evicted holder no
+                        // candidate, the head one chunk short).
                         // Parked already and settled, as a pair's: a member
                         // on its way holds it (its park may yet be taken
                         // back), and a member's landing park parks it where
@@ -3116,9 +3110,8 @@ impl Roles {
             // Its live parts to the host where it takes them, else to the
             // disk tier's slot file (no host tier on unified memory, or a
             // host with no room for them): left on the device there, a
-            // process's tables and rings held their chunks until a move
-            // down was asked for them, and none was (the M1: 379 opened
-            // chunks of the Instance shape after 107 evictions).
+            // process's tables and rings would hold their chunks until a
+            // move down is asked for them, and none is.
             let moved = if parts.iter().all(Part::dead) {
                 Some((emptied(&parts), Tier::Host))
             } else {
@@ -3341,9 +3334,8 @@ impl Roles {
         // device that moves with one of these parked holders now, its other
         // holders parked or gone since that holder's park (which left it,
         // shared then). It goes down as a parked item does, its dead parts
-        // given back (the L40S at 3 GiB on c10d7de5d: a beam pair of 73 dead
-        // refs on chunk 17, its last holder evicted, the head one chunk
-        // short for good).
+        // given back (else a beam pair of dead refs, its last holder
+        // evicted, holds the head one chunk short for good).
         let behind: Vec<Owner> = self
             .items
             .iter()
@@ -3986,8 +3978,7 @@ impl Roles {
     /// not take ([`Item::takes_fresh`]), or holding a pair that is not on
     /// the device and not in it. A restore commits only once this is empty
     /// ([`Self::prepare_unpark`] then [`Self::commit`]): committed with
-    /// one, it waited Restoring on a rebind nothing would make (Mac Pro at
-    /// 2 GiB on 1e87ab171, InstanceId(5)).
+    /// one, it would wait Restoring on a rebind nothing makes.
     #[must_use]
     pub fn unbound_after(&self, holder: Holder, txn: Option<&RoleMove>) -> Vec<InstanceId> {
         let moved = |owner: Owner| {
@@ -4076,10 +4067,10 @@ impl Roles {
     /// at the slots it names. One whose item has moved since (parked again
     /// by an eviction or a bind's suspension while its restore waited on
     /// its rebinds, its device slots given back at that park's commit) is
-    /// cancelled: sent, the engine claimed slots the store had handed out
-    /// again, and the next bind there was refused (the L40S and the M1 on
-    /// batch 3: instance slot 12537 rebound 4 ms after its park, the same
-    /// refs, then bound to another instance 1 ms later). The move that
+    /// cancelled: sent, the engine would claim slots the store has handed
+    /// out again, and the next bind there be refused (an instance slot
+    /// rebound just after its park, the same refs, then bound to another
+    /// instance). The move that
     /// brings it back names it anew.
     #[must_use]
     pub fn rebind_stands(&self, rebind: &Rebind) -> bool {
@@ -4673,10 +4664,9 @@ where
                 // planner's to make now, never the client's refusal. It
                 // binds again, and a bind short of room then waits in the
                 // planner (`BindShort`); only a need that can never fit
-                // alone is refused (Mac Pro at 5 GiB on 1e87ab171: two
-                // first-frame binds refused to the client "no segment is
-                // left to commit" beside "the segments left ... hold 3
-                // more", two reads at two instants).
+                // alone is refused (a read of "no segment is left to
+                // commit" beside one of "the segments left ... hold more"
+                // is two reads at two instants, not a refusal).
                 grew = grown(prefix, run) => {
                     if let Err(why) = grew {
                         tracing::debug!(%pid, %why, "a bind's commit will not come: the planner makes its room");

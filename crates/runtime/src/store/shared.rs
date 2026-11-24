@@ -1151,7 +1151,7 @@ impl SharedPool {
             let kind = match shape.kind {
                 SlotKind::List { tokens, window, .. } => {
                     let found = match window {
-                        // Window lists: removed by the windowed-state change.
+                        // Window lists: the window-list path.
                         Some(_) => &mut windows,
                         None if shape.role == SlotRole::RsBuffer => &mut rs_lists,
                         None if shape.role == SlotRole::WindowBuffer => &mut window_buffers,
@@ -1369,9 +1369,8 @@ impl SharedPool {
         self.rs_list.or(self.window_buffer)
     }
 
-    /// The window lists, narrowest window first. Removed by the
-    /// windowed-state change (the integration commit deletes the window
-    /// lists everywhere); do not use in new code.
+    /// The window lists, narrowest window first: an engine that does not
+    /// state `Capabilities::windowed_state`.
     #[must_use]
     pub fn windows(&self) -> &[TokenShape] {
         &self.windows
@@ -2595,9 +2594,8 @@ impl SharedPool {
                     return Some(SegmentMove::NoRoom);
                 };
                 // Refused by the pool's own check (stale, or a run it
-                // would split): said and not moved, never a panic (the M1
-                // on f623134fc: "an evacuation planned under the lock
-                // applies: Stale(11)", then a poisoned lock everywhere).
+                // would split): said and not moved, never a panic (which
+                // would poison the lock everywhere).
                 if let Err(error) = self.pool.apply_evacuation(&evacuation, epoch) {
                     tracing::warn!(%error, segment = last, "store: a segment's evacuation refused by the pool's check");
                     return Some(SegmentMove::NoRoom);
@@ -2624,9 +2622,9 @@ impl SharedPool {
                 }
                 let Some(moves) = self.pool.plan_compaction_for(run, pieces) else {
                     // Asked and no window clears now: the ask is answered,
-                    // never left pending (the M1's run 10: a restore's plan
-                    // ended "compaction asked" every pass for ten minutes,
-                    // the walk sending none). The head's next pass reads the
+                    // never left pending (else a restore's plan ends
+                    // "compaction asked" every pass, the walk sending none).
+                    // The head's next pass reads the
                     // pool as it stands and goes to its eviction.
                     tracing::debug!(
                         run,
@@ -2908,8 +2906,8 @@ impl SharedPool {
         self.walk_target = Some(target);
     }
 
-    /// Whether the walk would commit a segment now: its goal (a pinned
-    /// count, else the governor's target) is past what is mapped. At the
+    /// Whether the walk would commit a segment now: its goal (the
+    /// governor's target) is past what is mapped. At the
     /// target nothing commits, however many segments the pool's own
     /// limits leave uncommitted. Without a walk (a pool none steers), as
     /// the pool's limits say.
@@ -2918,9 +2916,7 @@ impl SharedPool {
         let Some(target) = &self.walk_target else {
             return true;
         };
-        let goal = target::pinned_segments()
-            .unwrap_or_else(|| target.load(std::sync::atomic::Ordering::Acquire));
-        goal > self.mapped_segments()
+        target.load(std::sync::atomic::Ordering::Acquire) > self.mapped_segments()
     }
 
     /// The chunks the governor's target holds back from state: segments
