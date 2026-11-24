@@ -186,19 +186,18 @@ fn bind_and_run(
         })?;
         args.push(Arg::Keep(buffer));
     }
-    let outs = device.run(program, args, wait)?;
-    if let Some(at) = slot {
-        // The slot is free again once this fire has run: its pool (or any
-        // output) is ready.
-        let done = outs.first().map(Buffer::ready).transpose()?;
-        if let Some(ring) = pools.ring() {
-            ring.read_by(at, done);
-        }
+    let (outs, done) = device.run_fenced(program, args, wait)?;
+    // The slots it read are free again once this run has completed on the
+    // device: its own event, whatever it outputs.
+    let done = done.map(crate::store::stage::Done::of);
+    if let Some(at) = slot
+        && let Some(ring) = pools.ring()
+    {
+        ring.read_by(at, done.clone());
     }
     for &(_, at) in &bulk {
-        let done = outs.first().map(Buffer::ready).transpose()?;
         if let Some(ring) = pools.bulk() {
-            ring.read_by(at, done);
+            ring.read_by(at, done.clone());
         }
     }
     let mut extra = Vec::new();

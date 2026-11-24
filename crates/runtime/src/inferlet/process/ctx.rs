@@ -57,6 +57,18 @@ pub struct ProcessCtx {
     limits: wasmtime::StoreLimits,
     /// Prompt tokens this process's fires found cached and mapped in.
     cached_tokens: u64,
+    /// Whom its working sets share as (`working-set.share`): set from its
+    /// arrival before it runs.
+    keying: Option<Keying>,
+}
+
+/// How a process's working sets key what they share.
+#[derive(Debug, Clone)]
+pub(crate) enum Keying {
+    /// Under the scope a set asks, as its authenticated tenant and session.
+    Asker(crate::policy::share::Asker),
+    /// A pass a peer offloaded here: under the asking set's domain.
+    OnBehalf(crate::store::kv::hash::Hash256),
 }
 
 impl Drop for ProcessCtx {
@@ -252,6 +264,7 @@ impl ProcessCtx {
             admission_wait_us: 0,
             residency_flag: None,
             cached_tokens: 0,
+            keying: None,
             limits: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(policy.memory_limit)
                 .build(),
@@ -314,6 +327,14 @@ impl ProcessCtx {
 
     pub(crate) fn set_files(&mut self, files: Arc<client_api::Files>) {
         self.files = files;
+    }
+
+    pub(crate) fn set_keying(&mut self, keying: Keying) {
+        self.keying = Some(keying);
+    }
+
+    pub(crate) fn keying(&self) -> Option<&Keying> {
+        self.keying.as_ref()
     }
 
     pub(crate) fn set_props(&mut self, props: client_api::Props) {

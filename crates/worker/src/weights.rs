@@ -398,7 +398,7 @@ pub(crate) fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
     Ok(identity.map(|bytes| *blake3::hash(&bytes).as_bytes()))
 }
 
-pub(crate) fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
+pub(crate) fn model_artifact_digest(snapshot_dir: &Path, memo: &Path) -> Result<[u8; 32]> {
     if let Some(digest) = manifest_digest(snapshot_dir)? {
         return Ok(digest);
     }
@@ -412,7 +412,16 @@ pub(crate) fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
             }
         }
     }
+    content_digest(snapshot_dir, memo).map(|(digest, _)| digest)
+}
 
+/// The digest of every file under `snapshot_dir`, by name and content, and
+/// how many files it read. Each file's own digest is memoized in `memo` by
+/// its stats (path, length, modification time in nanoseconds, inode and
+/// device): a file whose stats all match is not read again. The memo trusts
+/// the file system's mtime: an edit in place that keeps a file's length and
+/// mtime is not seen, which a memo may miss.
+fn content_digest(snapshot_dir: &Path, memo: &Path) -> Result<([u8; 32], usize)> {
     fn collect_files(current: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
         if current.is_file() {
             files.push(current.to_path_buf());
@@ -442,29 +451,148 @@ pub(crate) fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
     let mut files = Vec::new();
     collect_files(snapshot_dir, &mut files)?;
     files.sort();
+    let mut known = Memo::read(memo);
+    let mut read = 0;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
     for path in files {
-        use std::io::Read;
-
         let relative = path.strip_prefix(snapshot_dir).unwrap_or(&path);
-        hasher.update(relative.to_string_lossy().as_bytes());
-        let mut file = std::fs::File::open(&path)
-            .with_context(|| format!("opening model artifact {path:?}"))?;
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let stats = Stats::of(&path)?;
+        let digest = match known.get(&stats) {
+            Some(digest) => digest,
+            None => {
+                let mut file = std::fs::File::open(&path)
+                    .with_context(|| format!("opening model artifact {path:?}"))?;
+                let mut own = blake3::Hasher::new();
+                std::io::copy(&mut file, &mut own)
+                    .with_context(|| format!("reading model artifact {path:?}"))?;
+                let digest = *own.finalize().as_bytes();
+                known.put(stats, digest);
+                read += 1;
+                digest
             }
-            hasher.update(&buffer[..read]);
+        };
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&digest);
+    }
+    if read > 0 {
+        known.write(memo);
+    }
+    Ok((*hasher.finalize().as_bytes(), read))
+}
+
+/// What names one file's content without reading it, as far as the memo
+/// trusts the file system.
+#[derive(Clone, PartialEq, Eq)]
+struct Stats(String);
+
+impl Stats {
+    fn of(path: &Path) -> Result<Stats> {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let meta =
+            std::fs::metadata(&path).with_context(|| format!("stat model artifact {path:?}"))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_nanos());
+        #[cfg(unix)]
+        let (ino, dev) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.ino(), meta.dev())
+        };
+        #[cfg(not(unix))]
+        let (ino, dev) = (0u64, 0u64);
+        Ok(Stats(format!(
+            "{}\t{}\t{mtime}\t{ino}\t{dev}",
+            path.display(),
+            meta.len()
+        )))
+    }
+}
+
+/// The file digests a home has memoized, one line each: stats, then digest.
+struct Memo(std::collections::BTreeMap<String, [u8; 32]>);
+
+impl Memo {
+    fn read(path: &Path) -> Memo {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        Memo(
+            text.lines()
+                .filter_map(|line| {
+                    let (stats, hex) = line.rsplit_once('\t')?;
+                    let digest = blake3::Hash::from_hex(hex).ok()?;
+                    Some((stats.to_string(), *digest.as_bytes()))
+                })
+                .collect(),
+        )
+    }
+
+    fn get(&self, stats: &Stats) -> Option<[u8; 32]> {
+        self.0.get(&stats.0).copied()
+    }
+
+    fn put(&mut self, stats: Stats, digest: [u8; 32]) {
+        self.0.insert(stats.0, digest);
+    }
+
+    /// Written whole beside and renamed over, so a reader never sees half;
+    /// a memo that cannot be written costs the next boot a read, no more.
+    fn write(&self, path: &Path) {
+        let text: String = self
+            .0
+            .iter()
+            .map(|(stats, digest)| format!("{stats}\t{}\n", blake3::Hash::from(*digest).to_hex()))
+            .collect();
+        let staged = path.with_extension(format!("{}.tmp", std::process::id()));
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&staged, text))
+            .and_then(|()| std::fs::rename(&staged, path));
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&staged);
+            tracing::warn!(%error, memo = %path.display(), "could not memoize checkpoint digests");
         }
     }
-    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boot whose files' stats all match the memo reads none of them; one
+    /// file touched is the only one read again, and the digest follows it.
+    #[test]
+    fn the_checkpoint_digest_reads_only_what_changed() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let model = dir.path().join("model");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("config.json"), b"{}").unwrap();
+        std::fs::write(model.join("a.safetensors"), vec![1u8; 4096]).unwrap();
+        std::fs::write(model.join("b.safetensors"), vec![2u8; 4096]).unwrap();
+        let memo = dir.path().join("kv").join("digests");
+
+        let (first, read) = content_digest(&model, &memo).unwrap();
+        assert_eq!(read, 3, "a cold memo reads every file");
+        let (again, read) = content_digest(&model, &memo).unwrap();
+        assert_eq!((again, read), (first, 0), "unchanged stats read nothing");
+
+        // Rewritten in place, its mtime a second on (a rewrite within one
+        // clock tick of the file system's could keep it).
+        let touched = model.join("b.safetensors");
+        let before = std::fs::metadata(&touched).unwrap().modified().unwrap();
+        std::fs::write(&touched, vec![3u8; 4096]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&touched)
+            .unwrap()
+            .set_modified(before + std::time::Duration::from_secs(1))
+            .unwrap();
+        let (changed, read) = content_digest(&model, &memo).unwrap();
+        assert_eq!(read, 1, "only the touched file is read again");
+        assert_ne!(changed, first, "and the digest follows its content");
+    }
     use checkpoint::file::write::Writer;
     use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
 

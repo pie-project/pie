@@ -28,7 +28,7 @@ pub(crate) mod naive {
 
     pub const MMA_BM: i32 = 16;
 
-    /// `PIE_MLA_MMA_BK`: the keys an mma tile reads.
+    /// The keys an mma tile reads (`kBK`).
     pub const MMA_BK: u32 = 64;
 
     pub const MMA_SMEM_BYTES: u32 = 100_032;

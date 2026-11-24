@@ -153,6 +153,10 @@ pub trait Context<B: Backend> {
         None
     }
 
+    /// Whose memory the device's is: where it is the host's, the load
+    /// states no host tier ([`engine::DeviceMemory::host_tier`]).
+    fn memory(&self) -> engine::DeviceMemory;
+
     /// The bytes of the capacity neither a reservation nor the driver holds.
     fn left(&self) -> u64 {
         self.capacity()

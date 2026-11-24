@@ -1139,6 +1139,12 @@ impl Shell {
         // rows (a hybrid beam's page table starts there, and its rows lie on
         // any of the set's pages, `serve::pages`).
         let mut rs_bases: Vec<Option<(u32, &[u32])>> = vec![None; lanes.len()];
+        // Each seat's lane, and where its rings stand and how far its fire
+        // folds them (`super::ring`), a seat each.
+        let mut seat_sources: Vec<usize> = Vec::with_capacity(lanes.len());
+        let mut window_folds: Vec<Option<(u32, u32)>> = Vec::with_capacity(lanes.len());
+        let mut seat_masked: Vec<bool> = Vec::with_capacity(lanes.len());
+        let ringed_load = self.pools.ring().is_some();
         let mut snapshots = crate::store::rs::SnapTable {
             indptr: vec![0],
             ..Default::default()
@@ -1316,6 +1322,10 @@ impl Shell {
                     word: lane.word,
                 });
             }
+            // Whether the lane tells its rows apart by a mask of its own,
+            // however it came (stated, carried, or resolved on the device),
+            // or a group's (`super::ring::shared_pool`).
+            seat_masked.push(masking.is_some() || seated.group.is_some());
             masks.push(crate::mask::LaneMask {
                 // A mask a group's rows read only is staged with the group
                 // masks (`group_masks`), not over the lane's keys.
@@ -1346,6 +1356,30 @@ impl Shell {
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
+            // The lane's rings: folded where its runtime states, or where a
+            // fold counted on the device not yet settled left them, and
+            // advanced by the fold its fire states (CONTRACT-BC 21).
+            seat_sources.push(source);
+            window_folds.push(match &seated.window_fold {
+                Some(stated) if ringed_load => {
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    let held = fold_held(
+                        &mut self.rs_ahead,
+                        slot,
+                        Some(seated.folded),
+                        seated.rs_reset == RsReset::Fresh,
+                    );
+                    let cell = envelope_of[source].map_or(rs_moves.len(), |(_, at)| at);
+                    let to = held
+                        .saturating_add(stated_fold(stated.fold, cell, port)?)
+                        .min(have + row.rows);
+                    if stated.fold == FoldLen::Device && matches!(seated.rs, RsVerb::Fold) {
+                        self.rs_ahead.insert(slot, to);
+                    }
+                    Some((held, to - held))
+                }
+                _ => None,
+            });
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => {
                     // A lane that folds its rows itself leaves nothing ahead:
@@ -1669,7 +1703,167 @@ impl Shell {
             0
         };
         let mut window_tables: Vec<Vec<Vec<u32>>> = Vec::with_capacity(window_lists);
-        for window in 0..window_lists {
+        // A load serving its windowed rows as ring + buffer composes each
+        // lane's one windowed table (`super::ring`): its entries are page
+        // ids already, and its window pages the buffer slots it names.
+        let mut ring_work = super::ring::Work::default();
+        let mut ring_buffers: Vec<u64> = Vec::new();
+        let ringed = self.pools.ring_window();
+        if let Some((window, page)) = ringed {
+            ring_work.page_bytes = self
+                .pools
+                .ring()
+                .map_or(0, |(_, ring)| ring.page_bytes);
+            let planes = self.pools.ring_planes();
+            let keys: Vec<u32> = seat_sources
+                .iter()
+                .map(|&source| lanes[source].rs_slot.unwrap_or(lanes[source].lane.slot))
+                .collect();
+            let mut null = [0i32];
+            self.pools.page_ids(1, &mut null)?;
+            let null = null[0];
+            let mut own_next = 0u32;
+            // A record a group of lanes shares folds once: the group's
+            // common rows, which its lanes read from slots they share
+            // (CONTRACT-BC 19). Each record's fold, as its first lane states.
+            let mut record_folds: std::collections::HashMap<u32, (u32, u32)> =
+                std::collections::HashMap::new();
+            let pooled: Vec<(u64, u32, bool)> = (0..seats.len())
+                .map(|lane| {
+                    let seated = &lanes[seat_sources[lane]];
+                    (
+                        seated.set,
+                        keys[lane],
+                        seated.window_fold.is_some()
+                            && seat_masked.get(lane).copied().unwrap_or(false),
+                    )
+                })
+                .collect();
+            if let Some((one, other)) = super::ring::shared_pool(&pooled) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "lanes {} and {} read one pool of buffered rows as separate hypotheses \
+                         (one working set, each lane's rows told apart by its mask) on a model \
+                         with windowed layers: a window cuts such a pool by its slots, not by \
+                         each hypothesis's positions. Windowed beams are served by a page list \
+                         a lane",
+                        seat_sources[one], seat_sources[other]
+                    ),
+                });
+            }
+            let mut composed_tables: Vec<Vec<u32>> = Vec::with_capacity(seats.len());
+            for (lane, seat) in seats.iter().enumerate() {
+                let seated = &lanes[seat_sources[lane]];
+                if kv_less_seats[lane] {
+                    composed_tables.push(tables[lane].to_vec());
+                    continue;
+                }
+                let buffer_empty = window_ids[lane].is_empty();
+                let (base, folded, fold) = match (&seated.window_fold, window_folds[lane]) {
+                    // A lane with no buffer slot reads every row below its
+                    // fire from its ring: its buffer starts at its fold's
+                    // page, whatever base it states.
+                    (Some(_), Some((folded, fold))) if buffer_empty => {
+                        (folded / page * page, folded, fold)
+                    }
+                    (Some(stated), Some((folded, fold))) => (stated.base, folded, fold),
+                    // A runtimeless lane folds every row it writes.
+                    _ => {
+                        let base = seat.have / page * page;
+                        (base, seat.have, seat.rows)
+                    }
+                };
+                let ring = self.pools.ring_pages(keys[lane])?;
+                // A lane no runtime states a fold for (a runtimeless or an
+                // arming lane) buffers nothing: it folds every row it
+                // writes, on a record of its own.
+                let stated = seated.window_fold.is_some();
+                let buffer = window_ids[lane]
+                    .iter()
+                    .filter(|_| stated)
+                    .map(|&slot| {
+                        ring_buffers.push(u64::from(slot));
+                        self.pools.window_slot(slot)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let alone =
+                    !stated || keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
+                if !alone && folded + fold > seat.have {
+                    return Err(Fault::program(
+                        "serve::ring",
+                        format!(
+                            "lanes sharing a record fold rows [{folded}, {}) into it, past \
+                             row {} where one of them computes its own in this fire: a group \
+                             folds only the rows its lanes share",
+                            folded + fold,
+                            seat.have
+                        ),
+                    ));
+                }
+                let first_fold = match record_folds.get(&keys[lane]).filter(|_| stated) {
+                    None => {
+                        record_folds.insert(keys[lane], (folded, fold));
+                        true
+                    }
+                    Some(&stated) if stated == (folded, fold) => false,
+                    Some(&(was, by)) => {
+                        return Err(Fault::program(
+                            "serve::ring",
+                            format!(
+                                "lanes sharing a record fold it from {was} by {by} and from \
+                                 {folded} by {fold}: a record folds once a fire"
+                            ),
+                        ));
+                    }
+                };
+                // The snapshots the lane's fire lands: each onto its
+                // record's ring pages.
+                let snap_rings = seated
+                    .rs_snapshots
+                    .iter()
+                    .map(|snap| Ok((snap.row, self.pools.ring_pages(snap.slot)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let snapshots: Vec<(u32, &[(i32, u64)])> = snap_rings
+                    .iter()
+                    .map(|(row, rings)| (*row, rings.as_slice()))
+                    .collect();
+                let pools = &self.pools;
+                let mut own = || {
+                    let at = own_next;
+                    own_next += 1;
+                    Ok((pools.own_page_id(at)?, pools.own_page_at(at)?))
+                };
+                let composed = super::ring::compose(
+                    &super::ring::RingLane {
+                        ring: &ring,
+                        buffer: &buffer,
+                        base,
+                        have: seat.have,
+                        rows: seat.rows,
+                        folded,
+                        fold,
+                        alone,
+                        snapshots: &snapshots,
+                    },
+                    page,
+                    window,
+                    null,
+                    &mut own,
+                )?;
+                self.ring_seen.direct += u64::from(composed.direct);
+                self.ring_seen.own += u64::from(composed.own);
+                self.ring_seen.read_then_folded += u64::from(composed.read_then_folded);
+                // The group's fold is its first lane's; the others read.
+                if first_fold {
+                    ring_work.add(&composed, &planes);
+                } else {
+                    ring_work.fills.extend_from_slice(&composed.fills);
+                }
+                composed_tables.push(composed.table.iter().map(|&id| id as u32).collect());
+            }
+            window_tables.push(composed_tables);
+        }
+        for window in (0..window_lists).filter(|_| ringed.is_none()) {
             let retained = self.pools.window_tokens(window);
             window_tables.push(
                 seats
@@ -1694,8 +1888,11 @@ impl Shell {
         }
         // The windowed pages this fire's tables name, a list's apart, backed
         // as they are first used.
-        let window_pages: Vec<Vec<u64>> = window_tables
-            .iter()
+        let window_pages: Vec<Vec<u64>> = if ringed.is_some() {
+            vec![std::mem::take(&mut ring_buffers)]
+        } else {
+            window_tables
+                .iter()
             .map(|tables| {
                 tables
                     .iter()
@@ -1704,7 +1901,8 @@ impl Shell {
                     .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
                     .collect()
             })
-            .collect();
+            .collect()
+        };
         // A fire's extended run holds the widest bucket's tokens of
         // replayed rows (`store::rs::Buffers::rows_ext`), what each rung
         // states it holds (`ChunkFacts::act_replay`'s `carried_max`, the
@@ -1954,6 +2152,10 @@ impl Shell {
                 .pools
                 .geometry_window(table)
                 .map_or(0, |window| window as u8 + 1);
+            // A composed windowed table names page ids already.
+            if list > 0 && ringed.is_some() {
+                continue;
+            }
             self.pools.page_ids(list, &mut geometry.indices)?;
             self.pools.page_ids(list, &mut geometry.write_page)?;
         }
@@ -2385,6 +2587,7 @@ impl Shell {
             })
             .collect();
         Ok(Prepared {
+            ring_work,
             slot: Some(slot),
             lengths: staged_lens,
             token_injects,
@@ -2433,10 +2636,12 @@ impl Shell {
                     || rs_moves
                         .iter()
                         .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. })),
-                predicated: rs_body.buffers()
-                    || attachments.iter().any(|attached| {
-                        !attached.adapter_only && self.programs.prologue_runs(attached.instance)
-                    }),
+                // Every fire on a load with recurrent state is gated, whatever
+                // its lanes: a prologue's commit holds back its lane's fold on
+                // any body, so every body the load records lays the gate
+                // (`Run::lay_gate`) and none is keyed by whether a lane gates.
+                // A load with none reads no gate.
+                predicated: self.pools.has_state(),
                 truncates: rs_body.buffers(),
                 body: rs_body,
                 group_folds: !rs_folds.is_empty(),

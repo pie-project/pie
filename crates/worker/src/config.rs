@@ -368,9 +368,11 @@ pub struct SandboxConfig {
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
     /// Instances the wasmtime pooling allocator may hold. A ceiling on
-    /// concurrent inferlets, reserved up front.
-    #[serde(default = "default_max_instances")]
-    pub max_instances: u32,
+    /// concurrent inferlets, its address space reserved up front; unset,
+    /// what this process's address space fits. A count that does not fit
+    /// is refused at boot.
+    #[serde(default)]
+    pub max_instances: Option<u32>,
     /// Linear memory one instance may address.
     #[serde(default = "default_max_memory")]
     pub max_memory: ByteSize,
@@ -391,7 +393,7 @@ impl Default for SandboxConfig {
             scratch_dir: default_scratch_dir(),
             allow_network: true,
             network_allowed_hosts: default_network_allowed_hosts(),
-            max_instances: default_max_instances(),
+            max_instances: None,
             max_memory: default_max_memory(),
             warm_memory: default_warm_memory(),
             warm_slots: default_warm_slots(),
@@ -401,7 +403,10 @@ impl Default for SandboxConfig {
 
 impl SandboxConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(self.max_instances > 0, "sandbox.max_instances must be > 0");
+        ensure!(
+            self.max_instances != Some(0),
+            "sandbox.max_instances must be > 0"
+        );
         ensure!(
             self.max_memory.as_bytes() > 0,
             "sandbox.max_memory must be > 0"
@@ -410,9 +415,6 @@ impl SandboxConfig {
     }
 }
 
-fn default_max_instances() -> u32 {
-    2048
-}
 fn default_max_memory() -> ByteSize {
     ByteSize::from_mib(4096)
 }
@@ -805,8 +807,8 @@ pub struct RuntimeConfig {
     /// engine's fire lanes, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
-    /// The worker-plane PLEX policy: a built-in policy's name (`noop`,
-    /// `priority`) or a component path; omit to run none. The cluster
+    /// The worker-plane PLEX 1.1 policy: a built-in policy's name (`noop`)
+    /// or a component path; omit to run none. The cluster
     /// plane's are `[cluster] cluster_policies`.
     #[serde(default)]
     pub worker_policy: Option<String>,
@@ -910,7 +912,8 @@ pub struct EngineConfig {
     /// the next boot. `false` times nothing: each is served by the engine's
     /// estimate, named in the load log, and nothing is stored (`pie serve
     /// --no-measure`). Vulkan, wgpu, and a one-device cuda engine (CUDA or
-    /// ROCm).
+    /// ROCm); xla, whose load times nothing on the device, states it to the
+    /// runtime, which estimates the host cover rather than timing it.
     #[serde(default = "default_measure")]
     pub measure: bool,
     /// `[engine.memory]`: the optional caps for sharing a machine.
@@ -946,9 +949,10 @@ pub struct MemoryConfig {
     /// workers sharing a host each find room). pie cannot compute kv again,
     /// so this is where memory contention goes: it cannot be turned off.
     pub budget_host: Option<ByteSize>,
-    /// The most disk suspended kv may spill into once the host tier is full
-    /// (`"200GiB"`), shared by the ranks, in slot files under `disk_path`.
-    /// Omit for the engine's own share of the free space there.
+    /// The disk tier: the most disk suspended kv may spill into once the
+    /// host tier is full (`"200GiB"`), shared by the ranks, in slot files
+    /// under `disk_path`. Omitted or 0: no disk tier (the tiers are the
+    /// device and, where there is one, the host). Nothing sizes it unstated.
     pub budget_disk: Option<ByteSize>,
     /// Where the disk tier's slot files go. Omit for
     /// `$PIE_HOME/cache/kv/<checkpoint digest>`.
@@ -1012,7 +1016,7 @@ impl MemoryConfig {
             device_kv_tokens: self.kv_device_tokens,
             host_kv_budget: self.budget_host.map(|b| b.as_bytes()),
             kv_seats: None,
-            disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()),
+            disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()).filter(|&b| b > 0),
             disk_kv_dir: self.disk_path.clone(),
             disk_kv_persistent: self.disk_persistent,
             kv_export: false,
@@ -1042,10 +1046,15 @@ impl MemoryConfig {
             "engine.memory.kv_device_tokens = 0 holds no kv; state the tokens the device \
              holds or omit the key"
         );
+        let disk = self.budget_disk.is_some_and(|b| b.as_bytes() > 0);
+        ensure!(
+            disk || (self.disk_path.is_none() && !self.disk_persistent),
+            "engine.memory.disk_path or disk_persistent names a disk tier, but budget_disk \
+             states none (omitted or 0 is no disk tier); state budget_disk or remove them"
+        );
         for (key, budget) in [
             ("budget_device", self.budget_device),
             ("budget_host", self.budget_host),
-            ("budget_disk", self.budget_disk),
         ] {
             ensure!(
                 budget.is_none_or(|b| b.as_bytes() > 0),
@@ -1087,10 +1096,13 @@ impl EngineConfig {
         self.memory.validate()?;
         ensure!(
             self.measure
-                || matches!(self.kind, EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal)
+                || matches!(
+                    self.kind,
+                    EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal | EngineKind::Xla
+                )
                 || (self.kind == EngineKind::Cuda && self.device.len() == 1),
-            "engine.measure = false skips the measurements a load takes on the vulkan, wgpu and \
-             metal engines and a one-device cuda engine; the {} engine{} still measures outside \
+            "engine.measure = false skips the measurements a load takes on the vulkan, wgpu, \
+             metal and xla engines and a one-device cuda engine; the {} engine{} still measures outside \
              that path (new-memory/FOLLOWUPS.md), so omit the key",
             self.kind.as_str(),
             if self.kind == EngineKind::Cuda {
@@ -1318,6 +1330,31 @@ device = ["metal:0"]
         assert!(Config::parse(&zero).is_err(), "zero tokens should be refused");
     }
 
+    /// The disk tier is what `budget_disk` states: omitted or 0 is no disk
+    /// tier (nothing sizes one unstated), a positive budget is its size, and
+    /// a disk path or persistence with no tier is refused by name.
+    #[test]
+    fn the_disk_tier_is_stated_config_only() {
+        let unset = Config::parse(MINIMAL_METAL).unwrap();
+        assert_eq!(unset.engine.memory.residency().disk_kv_budget, None, "no disk tier");
+        let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"0B\"\n");
+        let cfg = Config::parse(&zero).expect("0 is no disk tier, not refused");
+        assert_eq!(cfg.engine.memory.residency().disk_kv_budget, None);
+        let sized = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"2GiB\"\n");
+        let cfg = Config::parse(&sized).unwrap();
+        assert_eq!(cfg.engine.memory.residency().disk_kv_budget, Some(2 << 30));
+        for stray in ["disk_path = \"/nvme/pie\"", "disk_persistent = true"] {
+            for budget in ["", "budget_disk = \"0B\"\n"] {
+                let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{budget}{stray}\n");
+                let refused = Config::parse(&toml).expect_err(stray);
+                assert!(
+                    format!("{refused:#}").contains("budget_disk states none"),
+                    "{stray}: {refused:#}"
+                );
+            }
+        }
+    }
+
     fn the_memory_keys_are_seven_and_prefixed() {
         let keys: Vec<String> = schema::fields(EngineKind::Cuda)
             .into_iter()
@@ -1497,15 +1534,28 @@ device = ["metal:0"]
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.skip_measuring().expect("metal skips");
         assert!(!cfg.engine.measure);
+        let xla = MINIMAL_METAL
+            .replace("type = \"metal\"", "type = \"xla\"")
+            .replace("metal:0", "tpu:0");
+        let mut cfg: Config = toml::from_str(&xla).unwrap();
+        cfg.skip_measuring().expect("xla skips");
+        assert!(!cfg.engine.measure);
         let cuda = MINIMAL_METAL
             .replace("type = \"metal\"", "type = \"cuda\"")
             .replace("metal:0", "cuda:0");
         let mut cfg: Config = toml::from_str(&cuda).unwrap();
+        cfg.skip_measuring().expect("a one-device cuda engine skips");
+        assert!(!cfg.engine.measure);
+        // Still refused by name: a cuda engine over more than one device (a
+        // tensor-parallel group or a lockstep, whose ranks still measure
+        // outside the keyed path).
+        let group = cuda.replace("[\"cuda:0\"]", "[\"cuda:0\", \"cuda:1\"]");
+        let mut cfg: Config = toml::from_str(&group).unwrap();
         let why = cfg
             .skip_measuring()
-            .expect_err("cuda measures outside the skip path yet");
+            .expect_err("a cuda group measures outside the skip path yet");
         assert!(
-            why.to_string().contains("the cuda engine still measures"),
+            why.to_string().contains("the cuda engine across devices still measures"),
             "{why}"
         );
     }

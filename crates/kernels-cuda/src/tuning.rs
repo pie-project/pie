@@ -610,12 +610,6 @@ pub struct SdpaIndexSplitUntil(pub u32);
 #[decision(id = "kernel.gemm.narrow_n", constant(range(0..=8)), default = 0, tune = search)]
 pub struct GemmNarrowN(pub u32);
 
-/// Whether a split decode chunk holds at least 128 keys, as the scheduler
-/// once floored it, rather than one page.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.chunk_floor_128", flag, default = false, tune = search)]
-pub struct DecodeChunkFloor128;
-
 /// How a bf16 GEMV (one activation row) is laid out: `wide` (an 8-warp
 /// split-K block up to `kernel.gemv.splitk_max_n` columns, 4 rows x 4 warps
 /// past it), or `narrow` (4 warps x 2 for both), which Blackwell prefers.
@@ -922,7 +916,6 @@ pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeMxfp4Grouped>()
         .add::<MoeMxfp4Wmma>()
-        .add::<DecodeChunkFloor128>()
         .add::<GemvBf16>()
         .add::<GemvSplitkMaxN>()
         .add::<MlaPath>()
@@ -1225,7 +1218,6 @@ impl std::fmt::Debug for Reads {
 tuning! {
     mxfp4_grouped: bool = true, on MoeMxfp4Grouped;
     mxfp4_wmma: bool = true, on MoeMxfp4Wmma;
-    decode_chunk_floor_128: bool = false, on DecodeChunkFloor128;
     /// `kernel.gemv.bf16 = narrow`.
     gemv_narrow: bool = false, is GemvBf16::Narrow;
     gemv_splitk_max_n: u32 = 4096, get GemvSplitkMaxN;

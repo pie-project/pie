@@ -288,6 +288,9 @@ fn score(
             .expect("attn.mla_prefill enqueues");
         }
     };
+    // Laid as the engine lays a fire's slabs: walked size-only first (a
+    // split arm takes its partial outputs from them).
+    gpu.lay(&ctx, |_| fire(&pool));
     fire(&pool);
     gpu.sync();
     let landed = (

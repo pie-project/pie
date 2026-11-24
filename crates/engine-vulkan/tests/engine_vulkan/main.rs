@@ -33,6 +33,25 @@ mod backend {
         pending.span_ns().expect("its timestamps read")
     }
 
+    /// Every frame this thread waits on from here timed by the device's
+    /// timestamps (`on`), or no longer.
+    pub fn watch_frames(on: bool) {
+        engine_vulkan::encode::profile_kernels(on);
+        let _ = engine_vulkan::encode::take_longest_frame_span_ns();
+    }
+
+    /// The longest device span of a frame this thread waited on since
+    /// [`watch_frames`]; `None` where the backend times none.
+    pub fn longest_frame_ns() -> Option<u64> {
+        Some(engine_vulkan::encode::take_longest_frame_span_ns())
+    }
+
+    /// The backend's profile registry: what a user's or a committed file is
+    /// read against.
+    pub fn registry() -> &'static profile::Registry {
+        engine_vulkan::chip::registry()
+    }
+
     pub const NAME: &str = "vulkan";
     pub const PLATFORM: poem::Platform = poem::Platform::Vulkan;
     /// Kernels compile to SPIR-V: the register-tiled and cooperative-matrix

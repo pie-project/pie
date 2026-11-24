@@ -18,12 +18,48 @@ const ROW: &str = "qwen3-0.6b-bf16-kv-bf16";
 const CEILING: u32 = 256;
 const PAGE: u32 = 16;
 
+/// A load's scratch checkpoint, removed when it drops: at the load's end,
+/// or as a panic anywhere past its creation unwinds.
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Where this process's scratch checkpoints lie: `pie-pack/<pid>` under the
+/// temp dir. A process killed mid-load (a timeout, a signal) drops nothing,
+/// so the first load sweeps every other process's directory whose process
+/// is gone (and the flat `pie-pack-<tag>-<pid>` directories this test laid
+/// before), each some GB.
+fn scratch_root() -> &'static Path {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let temp = std::env::temp_dir();
+        let parent = temp.join("pie-pack");
+        let gone = |pid: &str| {
+            pid.parse::<u32>().is_ok_and(|pid| {
+                pid != std::process::id()
+                    && Path::new("/proc").is_dir()
+                    && !Path::new("/proc").join(pid.to_string()).exists()
+            })
+        };
+        for entry in std::fs::read_dir(&parent).into_iter().flatten().flatten() {
+            if gone(&entry.file_name().to_string_lossy()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        for entry in std::fs::read_dir(&temp).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name.strip_prefix("pie-pack-")
+                && rest.rsplit_once('-').is_some_and(|(_, pid)| gone(pid))
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        parent.join(std::process::id().to_string())
+    })
 }
 
 fn fnv(name: &str) -> u64 {
@@ -132,9 +168,11 @@ fn write_checkpoint(path: &Path, trace: &Trace, joins: &[Join], unjoined: &Trace
 }
 
 fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, Scratch) {
-    let dir = std::env::temp_dir().join(format!("pie-pack-{tag}-{}", std::process::id()));
+    let dir = scratch_root().join(tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the scratch directory");
+    // Held from here, so a panic in the write or the load removes it too.
+    let scratch = Scratch(dir.clone());
     let container = dir.join("model.zt");
     write_checkpoint(&container, trace, joins, unjoined);
     let source = ztensor::Source::open(&container).expect("the fixture opens");
@@ -172,7 +210,7 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         steps: engine::StepRules::runtime(),
     })
     .expect("the model loads");
-    (staged.finish().expect("the model arms"), Scratch(dir))
+    (staged.finish().expect("the model arms"), scratch)
 }
 
 fn logits(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str, prompt: &[u32]) -> Vec<f32> {

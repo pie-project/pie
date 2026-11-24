@@ -49,6 +49,29 @@ impl Shell {
         &self.budget
     }
 
+    /// What the runtime's host cover depends on in this load
+    /// (`engine::Engine::cover_fingerprint`): the device and its kernel
+    /// libraries' code ([`crate::stored::Keys`]; the device a part of its
+    /// own, as `pie tune export` finds a device's covers by), the guest emitter's
+    /// version, the decode products' kernels as picked (their routes'
+    /// table) and the lanes and tokens a fire spans.
+    #[must_use]
+    pub fn cover_fingerprint(&self) -> String {
+        let routes = self
+            .device
+            .ctx()
+            .routes()
+            .map_or(0, |routes| routes.fingerprint());
+        format!(
+            "cuda|{}|kernels {}|emitter {}|routes {routes:#010x}|lanes {} tokens {}",
+            profile::fire::Now::on(&self.keys),
+            self.keys.codes_said(),
+            eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION,
+            self.budget.max_lanes,
+            self.budget.max_tokens,
+        )
+    }
+
     #[must_use]
     pub fn paging(&self) -> Paging {
         self.pools.paging()
@@ -208,6 +231,12 @@ impl Shell {
         self.programs.apply_rebase(rebase);
         self.pools.restage_after_move(stream)?;
         Ok(at)
+    }
+
+    /// The state pool's chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.pools.chunk_table()
     }
 
     /// The state pool as the runtime counts it
@@ -406,7 +435,7 @@ impl Shell {
     /// refs and the load holds state: the null record, ref 0.
     #[must_use]
     pub fn null_record(&self) -> Option<u32> {
-        (self.pools.by_refs() && self.pools.has_state()).then_some(0)
+        (self.pools.by_refs() && self.pools.has_record()).then_some(0)
     }
 
     /// Copies a working set's recurrent record from slot `src` onto `dst`,

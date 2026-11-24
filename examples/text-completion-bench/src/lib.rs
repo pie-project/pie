@@ -83,6 +83,10 @@ struct Input {
     /// For a plane whose channel rings belong to the pass instance, not the channel.
     #[serde(default)]
     host_first_token: bool,
+    /// Ask the runtime to keep the prompt's state at its end (`checkpoints`),
+    /// so a later pass sharing the prompt resumes there.
+    #[serde(default)]
+    checkpoint_prompt_end: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -346,7 +350,8 @@ async fn run_one(
     let prefill_rng = Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]);
     let (temperature, top_p, top_k) = (input.temperature, input.top_p, input.top_k);
 
-    let ws = WorkingSet::new();
+    // A bench's prompts share their prefixes across its requests.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
     let n = prompt_vec.len() as u32;
     step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
     // Nothing to reserve; the empty step keeps `prologue_us`'s shape.
@@ -358,7 +363,7 @@ async fn run_one(
     let embed_indptr_p = Channel::from([0u32, n]);
     // Decode fires: the prefill sample already spends one of the
     // `max_tokens` sampler activations.
-    let budget = input.max_tokens - 1;
+    let budget = decode_budget(input.max_tokens)?;
     // A host-visible channel cannot attach to two passes, so this one is device-only.
     let tok_in = (!input.host_first_token).then(|| Channel::new([1], dtype::i32));
     let g0_ch = Channel::new([1], dtype::i32);
@@ -406,6 +411,10 @@ async fn run_one(
     fwd_p
         .state(&[&ws], geometry(lag, &prefill_fold))
         .context("bind prefill state")?;
+    if input.checkpoint_prompt_end {
+        let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
+        fwd_p.checkpoints(&[end]).context("ask the prompt end's checkpoint")?;
+    }
     let prefill_knobs = SampleKnobs::new(temperature, top_p, top_k);
     fwd_p.epilogue(move || {
         let carried_on = tok_in.map(|tok_in| (tok_in.traced(), None));
@@ -646,9 +655,18 @@ async fn run_one(
     })
 }
 
+/// The decode fires after the prefill's sample, which is the first token:
+/// a request for no tokens has nothing to sample and is refused.
+fn decode_budget(max_tokens: usize) -> Result<usize> {
+    max_tokens
+        .checked_sub(1)
+        .ok_or_else(|| "max_tokens must be at least 1: the prefill samples the first token".into())
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     let main_start = std::time::Instant::now();
+    decode_budget(input.max_tokens)?;
 
     // This program is pure: it reads its input, generates, and returns the
     // token counts in one envelope. Nothing is streamed and nothing outside
@@ -839,4 +857,18 @@ async fn main(input: Input) -> Result<Output> {
         token_monotonic_ns: result.token_monotonic_ns,
         prologue_us: result.prologue_us,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `max_tokens: 0` is refused by name, not wrapped to a run past `usize::MAX`.
+    #[test]
+    fn no_tokens_is_refused() {
+        let err = decode_budget(0).unwrap_err();
+        assert!(err.contains("max_tokens must be at least 1"), "{err}");
+        assert_eq!(decode_budget(1), Ok(0));
+        assert_eq!(decode_budget(256), Ok(255));
+    }
 }

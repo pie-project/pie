@@ -21,7 +21,7 @@ use engine_metal::serve::{Attached, Seated};
 use engine_metal::{Lane, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{
-    Fixture, argmax, fixture_of, load_with, same, word,
+    Fixture, Profiles, argmax, fixture_of, load_stored, same, word,
 };
 
 const CONTEXT: u32 = 256;
@@ -250,8 +250,11 @@ fn a_device_placed_kv_write_lands_in_its_buffer() {
         return;
     }
     let fixture = fixture_of("qwen3-micro-text", None);
+    // Both loads in one profile directory: the second takes the curves the
+    // first measured, so both fire the same kernels and compare to the bit.
+    let profiles = Profiles::new("kv-write");
 
-    let mut whole = load_with(&fixture, CONTEXT);
+    let mut whole = load_stored(&fixture, CONTEXT, None, &profiles);
     let pages = pages_past_the_seats(&mut whole);
     let host = serve(&mut whole, &fixture, &pages, None);
     let vocab = host[0].len() as u32;
@@ -265,7 +268,7 @@ fn a_device_placed_kv_write_lands_in_its_buffer() {
 
     engine_metal::store::pool::cap_parts(1);
     let spread = {
-        let mut shell = load_with(&fixture, CONTEXT);
+        let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
         let pages = pages_past_the_seats(&mut shell);
         let facts = shell.pool_chunk_facts();
         let chunk = pages[0] / shell.pool_layout().list.expect("a kv list").per_chunk;

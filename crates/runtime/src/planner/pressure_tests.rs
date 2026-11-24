@@ -24,6 +24,12 @@ struct TierPool {
 }
 
 impl PoolPort for TierPool {
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
             pages: self.device,
@@ -39,8 +45,8 @@ impl PoolPort for TierPool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         self.device_cache

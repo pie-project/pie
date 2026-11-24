@@ -1306,8 +1306,7 @@ pub fn select_nvfp4(
         )
     {
         use crate::linear::gemm_sm100;
-        // A tcgen05 launch that fails falls back to the arm below.
-        if crate::linear::moe::select_tc5(
+        return crate::linear::moe::select_tc5(
             ctx,
             OP,
             x,
@@ -1319,11 +1318,7 @@ pub fn select_nvfp4(
                 weight_scale: tensor_scales.ptr,
                 ..gemm_sm100::Epilogue::STORE
             },
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
+        );
     }
     nonzero(OP, "N, the bank's output width", n)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };

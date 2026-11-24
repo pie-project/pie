@@ -13,6 +13,8 @@ use crate::pie::inferlet::forward as wit_forward;
 use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::pie::inferlet::working_set as wit_ws;
+/// Who a working set shares with ([`WorkingSet::share`]).
+pub use crate::pie::inferlet::working_set::ShareScope;
 
 pub use eta_dsl::intrinsics;
 
@@ -458,11 +460,26 @@ impl WorkingSet {
         self.ws.folded()
     }
 
-    /// A child sharing the frozen part, with a copy of the buffer.
+    /// A child sharing the frozen part, with a copy of the buffer. It
+    /// shares as this set does.
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {
             ws: Rc::new(self.ws.fork(&on.wit)?),
         })
+    }
+
+    /// Publishes this set's frozen slots within `scope`, and lets its passes
+    /// reuse what that scope holds: prefixes others computed, or are
+    /// computing. Unasked, a set is private. Ask before its first pass.
+    pub fn share(&self, scope: ShareScope) -> Result<(), String> {
+        self.ws.share(&scope)
+    }
+
+    /// [`WorkingSet::new`], shared within `scope` ([`WorkingSet::share`]).
+    pub fn shared(scope: ShareScope) -> Result<WorkingSet, String> {
+        let ws = WorkingSet::new();
+        ws.share(scope)?;
+        Ok(ws)
     }
 }
 
@@ -1235,7 +1252,7 @@ impl Default for Pipeline {
 
 pub mod shared_prelude {
     pub use super::{
-        Channel, Fold, Pipeline, StateGeometry, TOKEN_PAD, WorkingSet, channel_capacity,
+        Channel, Fold, Pipeline, ShareScope, StateGeometry, TOKEN_PAD, WorkingSet, channel_capacity,
         frame_size, kv_page_size, readout_spans,
     };
     pub use crate::{Context, Result, model};

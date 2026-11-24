@@ -359,6 +359,12 @@ macro_rules! seeded {
 
 seeded!("v5e.toml", "v6e.toml", "v7.toml");
 
+/// The host covers committed for TPUs (`profiles/<device>.covers.json`,
+/// `pie tune export --engine xla`), each listed here: the runtime takes a
+/// cover whose key matches where the home's own cache holds none
+/// (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[];
+
 pub static SHELF: Shelf = Shelf {
     backend: "xla",
     seeded: SEEDED,
@@ -370,6 +376,24 @@ pub static SHELF: Shelf = Shelf {
 #[must_use]
 pub fn resolve(kind: &str, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), kind, &Tpu::of(kind).facts(), profiles)
+}
+
+/// [`resolve`] with the stored measurements keyed (`crate::stored`): each
+/// `[rates]` entry is taken from the user's file where its key matches this
+/// plugin on this device, else from the device's committed measured
+/// profile where its key matches, else left for the load to measure; each
+/// is said once, by the layer and key that decided it.
+#[must_use]
+pub fn resolve_keyed(kind: &str, platform: &str, profiles: Option<&Path>) -> (Profile, Report) {
+    let keys = crate::stored::Keys {
+        on: crate::stored::measured_on(kind, platform),
+    };
+    let (profile, report) =
+        SHELF.resolve_keyed(registry(), kind, &Tpu::of(kind).facts(), profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
 }
 
 #[cfg(test)]

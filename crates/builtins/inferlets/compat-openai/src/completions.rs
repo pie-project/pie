@@ -21,15 +21,18 @@
 //! A prompt may be token ids (one array, or an array of one array), used as
 //! they are.
 //!
-//! Refused with 400: more than one prompt, `echo` on token ids, and
-//! `suffix`. Anything a thinking model emits as a thinking block is returned
+//! Refused with 400: more than one prompt, `echo` on token ids, `suffix` and
+//! a non-empty `logit_bias`. Anything a thinking model emits as a thinking block is returned
 //! as text: this API has no other place for it.
 
 use compat::{ApiError, Envelope, Event, Finish, Request, emit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{alternatives, choices, invalid, run_choices, stop_sequences, token_text, usage_of};
+use crate::{
+    alternatives, choices, invalid, no_logit_bias, run_choices, stop_sequences, token_text,
+    usage_of,
+};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -55,6 +58,7 @@ struct Body {
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
+    logit_bias: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -129,6 +133,7 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
                 .ok_or_else(|| invalid("`logprobs` must be an integer", Some("logprobs")))?,
         ),
     };
+    no_logit_bias(&body.logit_bias)?;
     if body.suffix.is_some() {
         return Err(invalid("`suffix` is not supported", Some("suffix")));
     }
@@ -190,6 +195,7 @@ fn finish_reason(finish: Finish) -> &'static str {
     match finish {
         Finish::Stop | Finish::StopSequence | Finish::ToolCalls => "stop",
         Finish::Length => "length",
+        Finish::Abort => "abort",
     }
 }
 
@@ -408,6 +414,9 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                 Value::Null
             };
             let mut choice = json!({"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish_reason(outcome.finish)});
+            if let Some(reason) = &outcome.stop_reason {
+                choice["stop_reason"] = json!(reason);
+            }
             if let Some(top) = parsed.prompt_logprobs {
                 choice["prompt_logprobs"] = crate::vllm_prompt_logprobs(scored, top as usize);
             }
@@ -490,6 +499,17 @@ mod tests {
             json!({"type": "structural_tag", "format": {"type": "triggered_tags"}}),
         ] {
             assert!(parse(json!({"prompt": "Hi", "response_format": format})).is_err());
+        }
+    }
+
+    #[test]
+    fn a_logit_bias_is_refused_by_name() {
+        let refused = parse(json!({"prompt": "Hi", "logit_bias": {"50256": -100}}))
+            .err()
+            .expect("a logit_bias is refused");
+        assert!(refused.body.to_string().contains("logit_bias is not supported"));
+        for bias in [json!(null), json!({})] {
+            assert!(parse(json!({"prompt": "Hi", "logit_bias": bias})).is_ok());
         }
     }
 

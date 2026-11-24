@@ -112,6 +112,20 @@ impl Tuning {
         }
     }
 
+    /// This tuning over `profile` (another resolution of the device's, its
+    /// rates or curves joined): what the load held stays (the decodes whose
+    /// split walk the adapter binds, the workgroup memory it states), so the
+    /// kernels a load names are the same whether its curves were timed this
+    /// load or read from a profile.
+    #[must_use]
+    pub fn with_profile(&self, profile: Profile) -> Tuning {
+        Tuning {
+            splits: self.splits.clone(),
+            workgroup_bytes: self.workgroup_bytes,
+            ..Tuning::new(profile)
+        }
+    }
+
     /// The workgroups the device holds at once, as its profile states them;
     /// `None` before the load's rates step has measured them.
     #[must_use]
@@ -145,16 +159,25 @@ impl Tuning {
         &mut self,
         tier: kernels_slang::Tier,
         decodes: &[(u32, bool)],
+        windowed: &[(u32, bool)],
         limit: u32,
     ) -> engine_gpu::Result<()> {
         use engine_gpu::backend::Tactics as _;
         self.splits.clear();
-        for &(head_dim, lse) in decodes {
+        // A windowed decode's ring form binds one table more: held as the
+        // plain form is, its split taken only where both forms' bind.
+        let forms = decodes
+            .iter()
+            .map(|&decode| (decode, false))
+            .chain(windowed.iter().map(|&decode| (decode, true)));
+        let mut unsplit: Vec<(u32, bool)> = Vec::new();
+        for ((head_dim, lse), ring) in forms {
             let [whole, split] = kernels_slang::attn::sdpa::decode_kernels(
                 kernels_slang::Target::Wgsl,
                 self.sdpa(tier, head_dim),
                 head_dim,
                 lse,
+                ring,
             )?
             .map(|fire| {
                 let key = kernels_slang::key(fire.entrypoint, fire.tier).ok_or(
@@ -180,10 +203,13 @@ impl Tuning {
                 "a decode splits a row's keys where the adapter binds the split walk's storage \
                  buffers"
             );
-            if binds {
+            if !binds {
+                unsplit.push((head_dim, lse));
+            } else if !ring && !self.splits.contains(&(head_dim, lse)) {
                 self.splits.push((head_dim, lse));
             }
         }
+        self.splits.retain(|decode| !unsplit.contains(decode));
         Ok(())
     }
 
@@ -439,7 +465,7 @@ mod tests {
     fn an_adapter_of_10_storage_buffers_refuses_the_plain_decode_by_name() {
         let mut tuning = tuning();
         let refused = tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &[(64, false)], 10)
+            .hold_decodes(kernels_slang::Tier::Baseline, &[(64, false)], &[], 10)
             .unwrap_err();
         assert_eq!(
             refused.to_string(),
@@ -458,7 +484,7 @@ mod tests {
         let decodes = [(64, false), (64, true)];
         let mut tuning = tuning();
         tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 16)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 16)
             .unwrap();
         assert!(tuning.binds_split(64, false) && tuning.binds_split(64, true));
         // A decode the load did not hold is not split.
@@ -466,21 +492,50 @@ mod tests {
 
         // The split walk binds 14, its LSE form 15; the whole LSE walk 13.
         tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 14)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 14)
             .unwrap();
         assert!(tuning.binds_split(64, false) && !tuning.binds_split(64, true));
         tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 13)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 13)
             .unwrap();
         assert!(!tuning.binds_split(64, false) && !tuning.binds_split(64, true));
         let refused = tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, 12)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 12)
             .unwrap_err();
         assert!(
             matches!(
                 &refused,
                 engine_gpu::Fault::StorageBuffers { kernel, own: 9, pool: 4, limit: 12 }
                     if kernel == "attn_sdpa_decode_lse_bf16_d_64"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// A windowed decode's ring form binds one table more than the plain
+    /// form: at 14 both whole walks and the plain split bind and the ring
+    /// split does not, so the decode is walked whole; at 15 it splits; at
+    /// 12 the ring walk is refused by name.
+    #[test]
+    fn a_windowed_decode_splits_where_its_ring_form_binds() {
+        let decodes = [(64, false)];
+        let mut tuning = tuning();
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 14)
+            .unwrap();
+        assert!(!tuning.binds_split(64, false));
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 15)
+            .unwrap();
+        assert!(tuning.binds_split(64, false));
+        let refused = tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 12)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                engine_gpu::Fault::StorageBuffers { kernel, own: 9, pool: 4, limit: 12 }
+                    if kernel == "attn_sdpa_decode_ring_bf16_d_64"
             ),
             "{refused:?}"
         );

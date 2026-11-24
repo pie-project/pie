@@ -79,7 +79,7 @@ const MEMORY: &str = r#"
 # budget_device         = "20GiB"   # per device; omit for the whole device
 # kv_device_tokens      = 51968     # cuda: the device holds exactly this kv; omit to fill it
 # budget_host           = "32GiB"   # suspended kv goes to the host, then the disk
-# budget_disk           = "200GiB"  # the tier is always on
+# budget_disk           = "200GiB"  # the disk tier; omit (or 0) for none
 # disk_path             = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
 # disk_persistent       = false     # keep the disk tier as cache for the next run
 # yield                 = 0.0       # in [0, 1]: device target = floor + (budget - floor)
@@ -125,7 +125,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
                                # in the host stack and bypasses this list
 # scratch_dir     = "/tmp/pie"
 # max_memory      = "4GiB"
-# max_instances   = 1000
+# max_instances   = 1000      # omit: what the address space fits
 # warm_memory     = "0B"
 # warm_slots      = 100
 

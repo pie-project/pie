@@ -232,13 +232,24 @@ impl ResidencyPlanner {
             });
             if !rs_free.covers(demand.rs) && resident && !self.port.grow_rs(demand.rs) {
                 // What this frees may be what an older waiter parked on.
-                if self.reclaim_idle_once() {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
-                }
-                if self.reclaim_own_sharing(pid) {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
+                let short = super::pool::IdleShort {
+                    kv_pages: self.port.rs_as_pages(demand.rs.sub(rs_free)),
+                    rs: true,
+                };
+                match self.reclaim_idle_once(short) {
+                    super::residency_planner::IdleOutcome::Freed => {
+                        self.pages_freed();
+                        return Ok(Acquired::Requote);
+                    }
+                    // Pages a reclaim freed are on their way back: it parks
+                    // for them, and their retirement wakes it.
+                    super::residency_planner::IdleOutcome::Returning => {}
+                    super::residency_planner::IdleOutcome::Nothing => {
+                        if self.reclaim_own_sharing(pid) {
+                            self.pages_freed();
+                            return Ok(Acquired::Requote);
+                        }
+                    }
                 }
             }
         }
@@ -694,9 +705,9 @@ impl ResidencyPlanner {
     where
         F: std::future::Future<Output = T>,
     {
-        let pieces = match self.port.rise_room(rung) {
-            super::pool::RiseRoom::Past { need, total } => {
-                return Err(PlannerError::PastRung { rung, need, total });
+        let pieces = match self.port.rise_room(pid, rung) {
+            super::pool::RiseRoom::Past { need, own, total } => {
+                return Err(PlannerError::PastRung { rung, need, own, total });
             }
             super::pool::RiseRoom::Fits => return Ok(Some(take().await)),
             super::pool::RiseRoom::Short { pieces } => pieces,
@@ -707,8 +718,8 @@ impl ResidencyPlanner {
             return Ok(None);
         }
         // Served: it fits, or (the pool shrank under it) never will.
-        if let super::pool::RiseRoom::Past { need, total } = self.port.rise_room(rung) {
-            return Err(PlannerError::PastRung { rung, need, total });
+        if let super::pool::RiseRoom::Past { need, own, total } = self.port.rise_room(pid, rung) {
+            return Err(PlannerError::PastRung { rung, need, own, total });
         }
         let taken = take().await;
         // Off the queue: the heads behind it are planned again.

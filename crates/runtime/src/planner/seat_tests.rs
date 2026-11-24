@@ -216,6 +216,8 @@ async fn a_fork_the_pool_can_never_copy_is_refused_by_name() {
 /// with no set of its own held.
 struct GrowingPool {
     slots: AtomicU32,
+    /// Tiers sweeps that reached the store.
+    sweeps: AtomicU32,
 }
 
 impl PoolPort for GrowingPool {
@@ -239,8 +241,8 @@ impl PoolPort for GrowingPool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         0
@@ -277,9 +279,47 @@ impl PoolPort for GrowingPool {
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        self.sweeps.fetch_add(1, Ordering::SeqCst);
+        0
+    }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
+}
+
+/// A tiers sweep asked off the runtime (a table installed on the policy
+/// port's thread) is not lost: the next plan, on the runtime, runs it.
+#[test]
+fn a_tiers_sweep_asked_off_the_runtime_runs_at_the_next_plan() {
+    use std::collections::HashMap;
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_write();
+    let pool = Arc::new(GrowingPool {
+        slots: AtomicU32::new(1),
+        sweeps: AtomicU32::new(0),
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let owner = ProcessId::new_v4();
+    crate::policy::retention::install(Some(
+        crate::policy::retention::Table::new(HashMap::new(), None)
+            .with_tiers(HashMap::from([(owner, vec![(None, 0b010)])]), None),
+    ));
+    planner.sweep_tiers();
+    assert_eq!(
+        pool.sweeps.load(Ordering::SeqCst),
+        0,
+        "no runtime: nothing moved yet"
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async { planner.plan() });
+    assert_eq!(pool.sweeps.load(Ordering::SeqCst), 1, "the plan ran it");
+    crate::policy::retention::install(None);
 }
 
 /// A process parked at admission is seated once the pool backs more slots,
@@ -289,6 +329,7 @@ fn a_process_waiting_for_a_seat_is_seated_when_the_pool_grows() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
     let pool = Arc::new(GrowingPool {
         slots: AtomicU32::new(1),
+        sweeps: AtomicU32::new(0),
     });
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
     let (first, second) = (ProcessId::new_v4(), ProcessId::new_v4());
@@ -306,4 +347,32 @@ fn a_process_waiting_for_a_seat_is_seated_when_the_pool_grows() {
         waiting.as_mut().now_or_never().is_some(),
         "the slot the pool backed seats it"
     );
+}
+
+/// A device-only pool (no host tier, no disk tier) serves: a process is
+/// seated and given pages. Persisting a run there is refused by name: there
+/// is no disk tier for a copy to outlive the run in.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pool_with_no_tier_below_the_device_serves_and_refuses_persisting_by_name() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let model = crate::store::registry::register_model(16, &[8], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(
+        model, 0, false,
+    ))));
+    let (pid, _) = process(&planner, model, &[]);
+    assert!(planner.admit(pid).now_or_never().is_some(), "seated");
+    let demand = super::Demand {
+        kv_pages: 4,
+        rs: Default::default(),
+    };
+    let acquired = planner
+        .acquire(pid, pid, demand)
+        .now_or_never()
+        .expect("pages stand free")
+        .expect("served");
+    assert!(matches!(acquired, super::Acquired::Granted(_)), "granted on the device alone");
+    let refused = super::exec::persist(model, 0, Vec::new(), 1)
+        .await
+        .expect_err("no disk tier");
+    assert!(refused.contains("no disk tier"), "{refused}");
 }

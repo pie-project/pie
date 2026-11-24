@@ -682,6 +682,21 @@ impl Rank {
 }
 
 impl Engine for Rank {
+    /// A lockstep rank keys no host cover, and `measure = false` is refused for one by name (worker config).
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Not tracked for a lockstep rank: its ranks measure at every boot (`measure =
+    /// false` is refused for one), said so by name.
+    fn measured_at_load(&self) -> Vec<String> {
+        vec!["cuda (a lockstep rank): what it measured is not tracked".to_string()]
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> &'static str {
         "cuda"
     }
@@ -900,6 +915,15 @@ impl Engine for Rank {
     /// Every rank moves the same chunks and rebases its guests' rings.
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.with(|cuda| cuda.evacuate(evacuation))
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.chunk_table(),
+            None => Err(Error::Program(
+                "a rank is busy: its chunk table is read between frames".to_string(),
+            )),
+        }
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {

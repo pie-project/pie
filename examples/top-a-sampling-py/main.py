@@ -99,14 +99,19 @@ async def main(input: dict) -> dict:
 
     pipe = Pipeline()
     pipe.submit(fwd_p)
-    generated.append(await tok_out_p.take_scalar())
+    # A stop token ends the text and is not part of it, as `top-a-sampling` ends it.
+    stop = set(chat.stop_tokens())
+    g0 = await tok_out_p.take_scalar()
     s1.append(await s1_out_p.take_scalar())
     s2.append(await s2_out_p.take_scalar())
+    stopped = g0 in stop
+    if not stopped:
+        generated.append(g0)
 
     # ── DECODE LOOP (1-wide, run-ahead). ──
-    if len(generated) < max_tokens:
+    if not stopped and len(generated) < max_tokens:
         cap = channel_capacity()
-        tok_in = Channel.from_([generated[0]], dtype.i32)
+        tok_in = Channel.from_([g0], dtype.i32)
         rng = Channel.from_([seed ^ 0x5BD1, 0], dtype.u32)
         tok_out = Channel([1], dtype.i32).capacity(cap)
         s1_out = Channel([1], dtype.f32).capacity(cap)
@@ -130,9 +135,14 @@ async def main(input: dict) -> dict:
             rng.put(r_next)
 
         async def on_token() -> bool:
-            generated.append(await tok_out.take_scalar())
-            s1.append(await s1_out.take_scalar())
-            s2.append(await s2_out.take_scalar())
+            t = await tok_out.take_scalar()
+            kept = await s1_out.take_scalar()
+            mass = await s2_out.take_scalar()
+            if t in stop:
+                return False
+            generated.append(t)
+            s1.append(kept)
+            s2.append(mass)
             return True
 
         await pipe.run_ahead(fwd, max_tokens - 1, on_token)

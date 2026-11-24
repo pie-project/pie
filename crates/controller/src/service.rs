@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use controller_api::{
     Ack, Control, ControlRequest, ControlResponse, GatewayInfo, Neighbors, RoutingTable,
-    ScaleStatus, WorkerInfo, WorkerStatus,
+    WorkerInfo, WorkerStatus,
 };
 use ids::{GatewayId, NodeId, WorkerId};
 
@@ -45,10 +45,6 @@ impl Control for ControlServer {
 
     async fn watch_gateway(self, _: tarpc::context::Context, since: u64) -> RoutingTable {
         self.handle.watch_gateway_poll(since).await
-    }
-
-    async fn scale_status(self, _: tarpc::context::Context) -> Vec<ScaleStatus> {
-        self.handle.scale_status().await
     }
 
     async fn report_state(

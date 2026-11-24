@@ -699,6 +699,9 @@ fn bound_rs_working_sets<C: FireContext>(
 /// sequence precedes, and reads its tables through them.
 /// `keep`: the position a checkpoint inside the fire lands at, whose slots
 /// stay past it.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 fn host_window_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
@@ -953,16 +956,18 @@ fn device_lane_rows(
 
 /// The frozen length of each lane's recurrent state, by the lane's group
 /// (`None` a lane where the pass binds none, or on a model with window
-/// lists, whose rows trim behind their windows and are never replayed).
+/// lists, whose rows trim behind their windows and are never replayed, or
+/// whose windowed layers are ring + buffer, `replays_none`: their buffered
+/// rows' K/V are read from the window buffer, never replayed).
 fn lanes_frozen(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],
     groups: &LaneGroups,
     lanes: usize,
-    windowed: bool,
+    replays_none: bool,
 ) -> Result<Vec<Option<u32>>, String> {
     let mut frozen = vec![None; lanes];
-    if ids.is_empty() || windowed {
+    if ids.is_empty() || replays_none {
         return Ok(frozen);
     }
     let store = stores.rs.lock().unwrap();
@@ -975,6 +980,22 @@ fn lanes_frozen(
         }
     }
     Ok(frozen)
+}
+
+/// Whether the load's only state is windowed layers served as ring +
+/// buffer (`window_state`, its record the rings alone: no recurrent layer,
+/// whatever buffer lists the engine states): its lanes, a beam group's
+/// sharing one record among them, replay nothing, their unfolded rows going
+/// to window-buffer slots on demand, so a pass of several lanes is cut as
+/// one of kv lanes is (CONTRACT-BC 19: a fire too wide is cut like chunked
+/// prefill, never refused). A hybrid's recurrent layers replay the rows its
+/// lanes carry: its lanes are cut as an rs load's.
+pub(crate) fn window_only(stores: &crate::store::registry::Stores, window_state: bool) -> bool {
+    window_state
+        && stores
+            .shared
+            .as_ref()
+            .is_some_and(|shared| !shared.lock().unwrap().recurrent())
 }
 
 /// The rows of one piece of a host pass: each lane's cut of `full`, over a
@@ -1790,6 +1811,33 @@ pub(crate) fn rows_of_lanes(
     req
 }
 
+/// A windowed pass's piece over slots `slots`: the window checkpoint it
+/// takes (the furthest of the pass's `checkpoints` inside it, its own end
+/// included), and the row its advance retires no slot behind (`keep`): the
+/// pass's earliest checkpoint past `held` (where the pass starts) at or
+/// before the piece's end, its own end included and one an earlier piece
+/// takes (its next pieces may be on their way before it settles and takes
+/// it). Its windows reach back from there.
+fn piece_window_rows(
+    checkpoints: &[u64],
+    windowed: bool,
+    held: u64,
+    slots: &std::ops::Range<u64>,
+) -> (Option<u64>, Option<u32>) {
+    let window_at = checkpoints
+        .iter()
+        .copied()
+        .filter(|&row| windowed && slots.start < row && row <= slots.end)
+        .max();
+    let keep = checkpoints
+        .iter()
+        .copied()
+        .filter(|&row| windowed && held < row && row <= slots.end)
+        .min()
+        .and_then(|row| u32::try_from(row).ok());
+    (window_at, keep)
+}
+
 /// Several lanes are cut alike and aligned at their ends, so the last piece
 /// holds every lane's read-out rows.
 pub(crate) fn pass_pieces(
@@ -1877,20 +1925,19 @@ fn keyed_rows(req: &crate::engine::FireRequest) -> u32 {
 }
 
 /// The rows a pass over `rows` keeps its state at: those the inferlet asks
-/// for (`asked`), and with `auto` the pass's end, each floored to whole pages
-/// and within the `keyed` pages the pass keys.
+/// for (`asked`), each floored to whole pages and within the `keyed` pages
+/// the pass keys. The runtime keeps none unasked: where a state is kept is
+/// the inferlet's (and its policy's) to say.
 pub(crate) fn checkpoint_rows(
     asked: &[u32],
     rows: std::ops::Range<u64>,
     page_size: u32,
     keyed: usize,
-    auto: bool,
 ) -> Vec<u64> {
     let page = u64::from(page_size.max(1));
     let mut at: Vec<u64> = asked
         .iter()
         .map(|&row| u64::from(row) / page * page)
-        .chain(auto.then_some(rows.end / page * page))
         .filter(|&row| rows.start < row && row <= rows.end && row / page <= keyed as u64)
         .collect();
     at.sort_unstable();
@@ -2026,7 +2073,11 @@ fn supply(
                 keys
             }
         };
-        let run = kv.cached_run(&keys);
+        // A pass that may map nothing in looks nothing up.
+        let run = match attach {
+            Attach::No => Vec::new(),
+            _ => kv.cached_run(&keys),
+        };
         let clean = held.is_multiple_of(page) && kv.mapped_len(ws)? == held / page;
         let mapped = match attach {
             Attach::Kv if clean && kv.keeps() => {
@@ -2195,6 +2246,7 @@ async fn promote<C: FireContext>(
         crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.commit_promote(txn))
             .map_err(|error| error.to_string())?;
     Ok(Some(Promoted {
+        pages: below as u64,
         stores: stores.clone(),
         pin: Some(pin),
         _lease: lease,
@@ -2256,6 +2308,8 @@ impl Drop for PromoteGuard {
 }
 
 struct Promoted {
+    /// Pages of the run that came up from below the device.
+    pages: u64,
     stores: crate::store::registry::Stores,
     pin: Option<crate::store::kv::ReaderPin>,
     _lease: crate::store::kv::working_set::KvFireLease,
@@ -2594,6 +2648,22 @@ impl PendingOp {
             PendingOp::Fire(fire) => fire.cells.iter().any(|bound| Arc::ptr_eq(bound, cell)),
             #[cfg(test)]
             PendingOp::TestStub => true,
+        }
+    }
+
+    /// Tells the scheduler that the process waits on this fire's output:
+    /// until it settles, its lane submits nothing, and no frame waits on it.
+    pub(crate) fn tell_awaited(&self) {
+        match self {
+            PendingOp::Fire(PendingFire {
+                completion,
+                engine,
+                lane: Some(lane),
+                ..
+            }) => crate::scheduler::worker::notify_lane_waits(*engine, *lane, completion.clone()),
+            PendingOp::Fire(_) => {}
+            #[cfg(test)]
+            PendingOp::TestStub => {}
         }
     }
 
@@ -3056,6 +3126,9 @@ pub struct PendingFire {
     failure: PipelineFailure,
     /// A dropped pass whose last fire this is; it closes when the fire settles.
     retired: Option<Box<crate::pipeline::instance::BoundForwardPass>>,
+    /// The scheduler lane it fired on: a process waiting on its output
+    /// tells that lane's frames not to wait for it.
+    lane: Option<crate::scheduler::ProcessId>,
 }
 
 /// Hands a dropped pass to its last pending fire, or back if none is pending.
@@ -3539,6 +3612,9 @@ fn stamp_lane_translation(
 /// it writes and commit nothing; what each list retires is behind the first
 /// page it writes, where every row lands past, so a decode loop that never
 /// states its positions still holds its windows and not its whole sequence.
+///
+/// Window-list path: removed by the windowed-state change (the integration
+/// commit deletes it once every engine states `Capabilities::windowed_state`).
 fn device_window_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -3654,6 +3730,16 @@ fn trace_channel_wait(waiting_on_reader: bool, waiting_on_fire: bool) {
         waiting_on_fire,
         "guest parks on a channel"
     );
+}
+
+/// The process is about to wait on its pipeline's oldest fire: its lane
+/// tells the scheduler so ([`PendingOp::tell_awaited`]).
+pub(crate) fn tell_front_awaited(fires: Option<&PendingFires>) {
+    if let Some(fires) = fires
+        && let Some(front) = fires.lock().unwrap().front()
+    {
+        front.tell_awaited();
+    }
 }
 
 pub(crate) async fn await_channel_progress(
@@ -4228,6 +4314,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
 ) -> Anyhow<Result<(), String>> {
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
+    if let Some(refusal) = crate::policy::stopped(ctx.process_id()) {
+        return Ok(Err(refusal));
+    }
     {
         let placed_by_device = {
             let pass = ctx.resources().get(&fwd)?;
@@ -4529,9 +4618,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 fold
             }
         };
+        let window_state = crate::model::model().rs_caps().window_state;
+        let window_only = window_only(&stores, window_state);
         // A long host pass runs as several fires; all but the last run the
         // model's forward alone. A recurrent state folding all its rows, or
-        // none, folds each fire's rows in turn.
+        // none, folds each fire's rows in turn; a windowed-only load's
+        // other folds (a beam group's lagged common-ancestor fold) land with
+        // the pass's last piece, its earlier pieces' rows buffered
+        // (`piece_fold`).
         let folds_all = rs_ws_ids.is_empty()
             || [0, u32::MAX]
                 .into_iter()
@@ -4556,18 +4650,25 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && !prologue_moves
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
-            && folds_all;
+            && (folds_all || window_only);
         let mut full = req;
         let keyed = if keyable { keyed_rows(&full) } else { 0 };
+        // Keyed under the set's domain: its scope's, resolved again now,
+        // where it asked to share (`working-set.share`); else its own.
+        let mut shares = false;
+        let mut key_domain = None;
         let mut pass_slots = (keyed > 0)
             .then(|| {
                 let lane = &full.lanes[0];
                 let start = u64::from(lane.kv.held);
                 let root = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+                    let (domain, shared) = kv.pass_domain(ws.id)?;
                     kv.chain_root(ws.id, start, page_size)
-                        .map(|root| root.map(|prev| (kv.domain(), prev)))
+                        .map(|root| root.map(|prev| (domain, shared, prev)))
                 });
-                let (domain, prev) = root.ok().flatten()?;
+                let (domain, shared, prev) = root.ok().flatten()?;
+                shares = shared;
+                key_domain = Some(domain);
                 Some(crate::store::kv::hash::chain_slots(
                     &domain,
                     prev,
@@ -4582,7 +4683,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             [rs] => Some(*rs),
             _ => None,
         };
-        let attach = if !cuttable || !keyable || !plain_rows(&full) {
+        // Only a set that shares maps, waits on, fetches or resumes from
+        // what others computed.
+        let attach = if !shares || !cuttable || !keyable || !plain_rows(&full) {
             Attach::No
         } else if rs_ws_ids.is_empty() {
             Attach::Kv
@@ -4600,6 +4703,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if matches!(attach, Attach::Kv)
             && !carries_media
             && let Some(slots) = &pass_slots
+            && let Some(domain) = key_domain
         {
             let lane = &full.lanes[0];
             // Pages another pass is computing now are waited for, not
@@ -4623,6 +4727,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 pid,
                 &stores,
                 engine,
+                domain,
                 ws.id,
                 u64::from(lane.kv.held),
                 &lane.tokens,
@@ -4670,8 +4775,29 @@ pub async fn submit_pass_stamped<C: FireContext>(
             cursor.tail = Some(end);
             cursor.reserved = cursor.reserved.max(end);
         }
+        // Of the rows mapped in, those on pages that came up from below.
+        if let Some(promoted) = &promoted {
+            let below = (promoted.pages * u64::from(page_size)).min(u64::from(supplied));
+            crate::store::CACHED_FROM_BELOW_TOKENS
+                .fetch_add(below, std::sync::atomic::Ordering::Relaxed);
+        }
         drop(promoted);
-        if pass_slots.is_some() {
+        // What the fire writes and reads out, for the policies' prompt and
+        // generated counts: rows mapped in from the cache are rows of the
+        // prompt too.
+        crate::policy::report(crate::policy::Event::Fired(
+            pid,
+            full.lanes.iter().map(|lane| lane.tokens.len() as u64).sum(),
+            full.lanes
+                .iter()
+                .map(|lane| match &lane.readout {
+                    ::engine::Readout::None => 0,
+                    ::engine::Readout::Last => 1,
+                    ::engine::Readout::Rows(rows) => rows.len() as u64,
+                })
+                .sum(),
+        ));
+        if pass_slots.is_some() && shares {
             // It looked, so what it found is measured, nothing included.
             ctx.note_cached(u64::from(supplied));
             crate::policy::report(crate::policy::Event::Cached(pid, u64::from(supplied)));
@@ -4704,22 +4830,17 @@ pub async fn submit_pass_stamped<C: FireContext>(
             failure: pipeline_failure.clone(),
         });
         let reach = held + full.lanes[0].tokens.len() as u64;
-        // A model whose only state beside its kv is window lists keeps one at
-        // the pass's last page boundary unasked: the refs to its lists' last slots are all a
-        // later prompt sharing the prefix needs, where kv alone resumed it
-        // before windows were trimmed. A recurrent state's would hold its
-        // record, which the pass's next write copies whole: it keeps one
-        // only where the inferlet asks.
-        let auto = windowed && state.is_some() && stores.rs.lock().unwrap().is_window();
+        // Only on a set that shares: a later pass resumes from one only
+        // through its scope. Asking on one that never did is refused at the
+        // ask; one whose scope moved past its rows keeps none.
         let checkpoints: Vec<u64> = match state {
-            Some(_) => checkpoint_rows(
+            Some(_) if shares => checkpoint_rows(
                 &ctx.resources().get(&fwd)?.bindings.checkpoints,
                 held..reach,
                 page_size,
                 keys.len(),
-                auto,
             ),
-            None => Vec::new(),
+            _ => Vec::new(),
         };
         // An engine that lands a lane's state at rows inside a fire is cut only
         // past as many as it lands at once. A window's piece keeps the
@@ -4756,7 +4877,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // A fire asks for the recurrent rows it carries in unfolded too,
         // where they are more than its own: a rung's replay scratch holds
         // its tokens of them. The pass carries these into its first fire.
-        let frozen = match lanes_frozen(&stores, &rs_ws_ids, &groups, full.lanes.len(), windowed) {
+        let frozen = match lanes_frozen(
+            &stores,
+            &rs_ws_ids,
+            &groups,
+            full.lanes.len(),
+            windowed || window_state,
+        ) {
             Ok(frozen) => frozen,
             Err(error) => return Ok(Err(error)),
         };
@@ -4805,7 +4932,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let mut cuts = pass_pieces(
             &full,
             cuttable,
-            rs_ws_ids.is_empty(),
+            rs_ws_ids.is_empty() || window_only,
             mask_share(&full, prefill_share(page_size, engine), &stores, engine),
             page_size,
             &forced,
@@ -4879,11 +5006,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
             if switched.rows_read {
                 why.push("it reads out an output of rows a cut fire would not hold");
             }
-            if !folds_all {
+            if !folds_all && !window_only {
                 why.push("it states where its recurrent state folds");
             }
-            if full.lanes.len() > 1 && !rs_ws_ids.is_empty() {
-                why.push("its lanes carry recurrent state");
+            if full.lanes.len() > 1 && !rs_ws_ids.is_empty() && !window_only {
+                why.push(
+                    "its lanes carry rows its recurrent layers replay, which several lanes do \
+                     not take in pieces",
+                );
             }
             if why.is_empty() {
                 why.push("its rows read one another (attention both ways, a block draft, an attention group, inputs or voxels)");
@@ -5082,14 +5212,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     window_at: None,
                 }
             };
-            // A window's piece keeps the furthest of its rows, which its
-            // windows stand at once it lands, or reach back to from its end
-            // (the slots that window touches retire no earlier).
-            let window_at = checkpoints
-                .iter()
-                .copied()
-                .filter(|&row| windowed && slots.start < row && row <= slots.end)
-                .max();
+            let (window_at, keep) = piece_window_rows(&checkpoints, windowed, held, &slots);
             let mut checkpoints_here: Vec<TakeCheckpoint> = match (state, window_at) {
                 (Some(rs), Some(row)) => vec![TakeCheckpoint {
                     window_at: u32::try_from(row).ok(),
@@ -5100,9 +5223,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 }
                 _ => Vec::new(),
             };
-            let keep = window_at
-                .filter(|&row| row < slots.end)
-                .and_then(|row| u32::try_from(row).ok());
             // The furthest the engine lands of those inside the fire.
             let mut inside: Vec<u32> = checkpoints
                 .iter()
@@ -5121,25 +5241,55 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     (&group_sets[group], written)
                 })
                 .collect();
+            // The piece's lanes' recurrent states, in the piece's lane
+            // order: a cut of several lanes (a windowed-only load's) keeps
+            // only those with rows in it.
+            // What the piece folds: the pass's fold where it folds all it
+            // writes or nothing, else (a windowed-only load's cut of other
+            // folds) nothing before its last piece, which folds as the pass
+            // states, every lane in it.
+            let piece_fold = if folds_all || last {
+                fold.clone()
+            } else {
+                geometry::Fold::None
+            };
+            let piece_rs_ids: Vec<crate::store::rs::RsWorkingSetId> = if rs_ws_ids.is_empty() {
+                Vec::new()
+            } else {
+                kept_lanes.iter().map(|&lane| rs_ws_ids[lane]).collect()
+            };
+            let piece_rs_groups: LaneGroups = piece_groups
+                .iter()
+                .filter(|(_, lanes)| !lanes.is_empty())
+                .cloned()
+                .collect();
+            // Each beam group's pool end and common slot, for the groups the
+            // piece keeps (in `piece_rs_groups`' order).
+            let (piece_beam_ends, piece_beam_commons): (Vec<u32>, Vec<u32>) = piece_groups
+                .iter()
+                .zip(beam_ends.iter().zip(&beam_commons))
+                .filter(|((_, lanes), _)| !lanes.is_empty())
+                .map(|(_, (&end, &common))| (end, common))
+                .unzip();
             // The lanes each set carries, for what their state asks alone.
             let set_lanes: Vec<Vec<usize>> = if rs_ws_ids.is_empty() {
                 Vec::new()
             } else {
-                present.iter().map(|&group| groups[group].1.clone()).collect()
+                present.iter().map(|&group| piece_groups[group].1.clone()).collect()
             };
             let rs_plan = || {
                 if windowed {
-                    host_window_plan(&req, &fold, &rs_ws_ids, keep)
+                    host_window_plan(&req, &piece_fold, &piece_rs_ids, keep)
                 } else {
                     host_rs_plan(
                         &stores,
-                        &rs_ws_ids,
-                        &groups,
+                        &piece_rs_ids,
+                        &piece_rs_groups,
                         &req,
-                        &fold,
+                        &piece_fold,
                         &inside,
-                        (!beam_ends.is_empty()).then_some(beam_ends.as_slice()),
-                        (!beam_ends.is_empty()).then_some(beam_commons.as_slice()),
+                        (!piece_beam_ends.is_empty()).then_some(piece_beam_ends.as_slice()),
+                        (!piece_beam_ends.is_empty()).then_some(piece_beam_commons.as_slice()),
                     )
                 }
             };
@@ -5151,7 +5301,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &pipeline_failure,
                 &sets,
                 &set_lanes,
-                &rs_ws_ids,
+                &piece_rs_ids,
                 rs_plan,
                 windowed,
             )
@@ -5186,7 +5336,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     &pass_lanes,
                     lanes,
                     &landings,
-                    &fold,
+                    &piece_fold,
                     slots.end,
                     last,
                     rs,
@@ -5410,6 +5560,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     cells: cells.clone(),
                     failure: pipeline_failure.clone(),
                     retired: None,
+                    lane: Some(quorum_pipeline_id),
                 },
             );
             // The next piece reads the KV this one writes: they run in
@@ -6234,6 +6385,7 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
         cells,
         failure,
         retired,
+        lane: _,
     } = fire;
     let prior_failure = failure.lock().unwrap().clone();
     let result = completion.await;
@@ -6552,7 +6704,7 @@ async fn fire_device_geometry<C: FireContext>(
         &rs_ws_ids,
         &groups,
         pass_lanes.places.len(),
-        windowed,
+        windowed || crate::model::model().rs_caps().window_state,
     ) {
         Ok(frozen) => frozen,
         Err(error) => return Ok(Err(error)),
@@ -7000,6 +7152,7 @@ async fn fire_device_geometry<C: FireContext>(
             cells,
             failure: pipeline_failure,
             retired: None,
+            lane: Some(quorum_pipeline_id),
         },
     );
     Ok(Ok(()))
@@ -7306,6 +7459,7 @@ pub(crate) mod lifecycle_tests {
                 cells,
                 failure: failure.clone(),
                 retired: None,
+                lane: None,
             }));
         (fires, completion, ws, stores, failure)
     }
@@ -7604,6 +7758,7 @@ pub(crate) mod lifecycle_tests {
                     cells: Vec::new(),
                     failure: failure.clone(),
                     retired: None,
+                    lane: None,
                 }));
             advance_cursor(&cursor, Some(start as u32 + 1), None);
             record_writes(
@@ -8392,6 +8547,57 @@ mod cut_tests {
         a_pass_with_media_is_cut_before_its_first_span();
         a_pass_with_media_keys_the_rows_before_it();
         the_rest_of_a_pass_is_cut_again_wider();
+        a_windowed_cut_on_its_checkpoint_row_keeps_it_through_the_next_piece();
+    }
+
+    /// Each piece of `req` cut as `pass_pieces` cuts a single lane, as slots,
+    /// with the window checkpoint it takes and its keep.
+    fn window_pieces(
+        req: &crate::engine::FireRequest,
+        share: u32,
+        forced: &[u32],
+        checkpoints: &[u64],
+    ) -> Vec<((u64, u64), Option<u64>, Option<u32>)> {
+        let held = u64::from(req.lanes[0].kv.held);
+        pass_pieces(req, true, true, share, 16, forced, &[])
+            .into_iter()
+            .map(|piece| {
+                let (from, to) = piece[0].expect("one lane, in every piece");
+                let slots = held + u64::from(from)..held + u64::from(to);
+                let (at, keep) = piece_window_rows(checkpoints, true, held, &slots);
+                ((slots.start, slots.end), at, keep)
+            })
+            .collect()
+    }
+
+    /// 2050 rows cut at 1024, a checkpoint asked at 2048: it is the second
+    /// piece's own end. That piece takes it and keeps it, and so does the
+    /// last piece, on its way before the second settles; the first keeps
+    /// nothing. Cut a row past it instead, the piece it lies inside takes it
+    /// and every piece from there keeps it.
+    fn a_windowed_cut_on_its_checkpoint_row_keeps_it_through_the_next_piece() {
+        let req = prefill_lane(0, 2050, 16);
+        assert_eq!(
+            window_pieces(&req, 1024, &[], &[2048]),
+            [
+                ((0, 1024), None, None),
+                ((1024, 2048), Some(2048), Some(2048)),
+                ((2048, 2050), None, Some(2048)),
+            ],
+            "cut on the checkpoint row"
+        );
+        assert_eq!(
+            window_pieces(&req, 0, &[2049], &[2048]),
+            [((0, 2049), Some(2048), Some(2048)), ((2049, 2050), None, Some(2048))],
+            "cut a row past it"
+        );
+        // Not windowed: nothing kept, nothing taken here.
+        assert_eq!(
+            piece_window_rows(&[2048], false, 0, &(1024..2048)),
+            (None, None)
+        );
+        // A pass that starts past the checkpoint keeps none of it.
+        assert_eq!(piece_window_rows(&[2048], true, 2048, &(2048..2050)), (None, None));
     }
 
     /// A raise landing mid-pass: what is left from the last cut is cut at
@@ -9612,7 +9818,7 @@ pub(crate) mod fold_tests {
         Vec<crate::store::kv::hash::Hash256>,
         Vec<crate::store::kv::hash::Hash256>,
     ) {
-        let ws = stores.kv.lock().create_working_set();
+        let ws = stores.kv.lock().create_shared_working_set();
         let slots = written(stores, ws, tokens);
         let mut kv = stores.kv.lock();
         kv.seal_rows(ws, 0, &slots, 16).unwrap();
@@ -9651,16 +9857,205 @@ pub(crate) mod fold_tests {
         kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap()
     }
 
-    /// A keyed pass over `tokens` on a fresh set of `stores`: the set, and
-    /// its rows' hashes.
+    /// A keyed pass over `tokens` on a fresh set of `stores`, shared within
+    /// the test tenant: the set, and its rows' hashes.
     fn keyed_pass(
         stores: &Stores,
         tokens: &[u32],
     ) -> (WorkingSetId, Vec<crate::store::kv::hash::Hash256>) {
+        keyed_pass_as(stores, tokens, Some(crate::policy::share::test_tenant()))
+    }
+
+    /// [`keyed_pass`] on a set that shares as `ask` says (`None`: private).
+    fn keyed_pass_as(
+        stores: &Stores,
+        tokens: &[u32],
+        ask: Option<crate::policy::share::ShareAs>,
+    ) -> (WorkingSetId, Vec<crate::store::kv::hash::Hash256>) {
         let mut kv = stores.kv.lock();
         let ws = kv.create_working_set();
+        if let Some(ask) = ask {
+            kv.share(ws, ask).unwrap();
+        }
         let slots = kv.slot_hashes(ws, 0, tokens, 16).unwrap().unwrap();
         (ws, slots)
+    }
+
+    /// Two tenants' identical prompts never share a page: not by a lookup,
+    /// not by a coalesced claim, not by what a released set leaves kept.
+    /// One tenant's tenant-scoped sets share all three ways, and a private
+    /// set with the same prompt shares with no one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenants_never_share_pages_and_one_tenants_sets_do() {
+        use crate::policy::share::tenant_of;
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        let tokens: Vec<u32> = (0..65).map(|t| 2700 + t).collect();
+        let of = |tenant: &str| keyed_pass_as(&stores, &tokens, Some(tenant_of(tenant)));
+        let looked = |ws, slots: &[_]| {
+            supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows
+        };
+        let (a1, a1_slots) = of("a");
+        let claims = crate::pipeline::coalesce::before_pass(&stores, a1, 0, &a1_slots, || {})
+            .await
+            .expect("a's first claims what it computes");
+        // Coalesce: b's identical prompt waits on nothing of a's; a's own
+        // second waits on its first.
+        let (b1, b1_slots) = of("b");
+        assert_ne!(a1_slots, b1_slots, "another tenant keys another chain");
+        let b_claims =
+            crate::pipeline::coalesce::before_pass(&stores, b1, 0, &b1_slots, || {}).await;
+        assert!(b_claims.is_some(), "b claims its own pages");
+        let (a2, a2_slots) = of("a");
+        assert_eq!(a1_slots, a2_slots, "one tenant keys one chain");
+        let a_waits = {
+            let (stores, slots) = (stores.clone(), a2_slots.clone());
+            tokio::spawn(async move {
+                crate::pipeline::coalesce::before_pass(&stores, a2, 0, &slots, || {}).await
+            })
+        };
+        settle_tasks().await;
+        assert!(!a_waits.is_finished(), "a's second waits on a's first");
+        written(&stores, a1, &tokens);
+        stores.kv.lock().freeze(a1, 65).unwrap();
+        SealOnLanding {
+            claims,
+            stores: stores.clone(),
+            ws: a1,
+            start: 0,
+            slots: a1_slots,
+            page_size: 16,
+            failure: PipelineFailure::default(),
+        }
+        .landed(true);
+        assert!(a_waits.await.unwrap().is_none(), "sealed: nothing left to claim");
+        // Lookup, while a's first is live: a's second maps it in, b nothing.
+        assert_eq!(looked(a2, &a2_slots), 64, "a maps a's four sealed pages");
+        let (b2, b2_slots) = of("b");
+        assert_eq!(looked(b2, &b2_slots), 0, "b finds none of a's");
+        // Keep: a's sets gone, their prefix kept for a alone.
+        drop(b_claims);
+        {
+            let mut kv = stores.kv.lock();
+            let epoch = kv.current_epoch();
+            for ws in [a1, a2, b1, b2] {
+                kv.release_working_set(ws, epoch);
+            }
+            kv.retire_idle();
+            assert!(!kv.cached_runs().is_empty(), "a's prefix is kept");
+        }
+        let (b3, b3_slots) = of("b");
+        assert_eq!(looked(b3, &b3_slots), 0, "b finds nothing a kept");
+        let (a3, a3_slots) = of("a");
+        assert_eq!(looked(a3, &a3_slots), 64, "a finds what a kept");
+        // A private set with a prompt of its own: no one maps it while it
+        // lives, it looks nothing up, and it leaves nothing kept.
+        let mine: Vec<u32> = (0..65).map(|t| 2900 + t).collect();
+        let (p1, p1_slots) = keyed_pass_as(&stores, &mine, None);
+        assert_eq!(
+            supply(&stores, p1, &rows(0, &mine), &p1_slots, Attach::No, 65, 16).rows,
+            0,
+            "a private set looks nothing up"
+        );
+        written(&stores, p1, &mine);
+        {
+            let mut kv = stores.kv.lock();
+            kv.freeze(p1, 65).unwrap();
+            kv.seal_rows(p1, 0, &p1_slots, 16).unwrap();
+            assert!(kv.share(p1, tenant_of("a")).is_err(), "too late to ask");
+        }
+        let (a4, a4_slots) = keyed_pass_as(&stores, &mine, Some(tenant_of("a")));
+        assert_ne!(a4_slots, p1_slots);
+        assert_eq!(
+            supply(&stores, a4, &rows(0, &mine), &a4_slots, Attach::Kv, 65, 16).rows,
+            0,
+            "a live private set is no one's to map"
+        );
+        let kept = {
+            let mut kv = stores.kv.lock();
+            let before = kv.cached_runs().len();
+            let epoch = kv.current_epoch();
+            kv.release_working_set(p1, epoch);
+            kv.retire_idle();
+            kv.cached_runs().len() - before
+        };
+        assert_eq!(kept, 0, "a private set keeps nothing at release");
+    }
+
+    /// A group scope crosses tenants only under a grant: two granted
+    /// tenants' sets asking `group(g)` share pages; an ungranted tenant's
+    /// `group(g)` is its own. Once the grant changes (revoked for one
+    /// tenant, a new id for the rest), a set with no rows takes the
+    /// tenant-local domain on its next pass, and a set with rows shares no
+    /// more.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_group_shares_across_tenants_only_while_granted() {
+        use crate::policy::grants;
+        use crate::policy::share::{
+            Asker, SessionId, ShareAs, ShareScope, TenantId, scope_domain,
+        };
+        let _grants = grants::TEST_LOCK.lock();
+        let grant = |version, tenants: &[&str]| {
+            let tenants = tenants.iter().map(|t| t.to_string()).collect();
+            grants::install(version, vec![("g".into(), tenants, version)], None);
+        };
+        grants::withdraw();
+        grant(1, &["a", "b"]);
+        let asker = |tenant: &str| Asker {
+            tenant: TenantId(tenant.into()),
+            session: SessionId::Named("s".into()),
+        };
+        let group = |tenant: &str| ShareAs::Scope(ShareScope::Group("g".into()), asker(tenant));
+        let model = crate::store::registry::register_model(16, &[64], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        stores.kv.lock().set_keeps(true);
+        let tokens: Vec<u32> = (0..65).map(|t| 3100 + t).collect();
+        let of = |tenant: &str| keyed_pass_as(&stores, &tokens, Some(group(tenant)));
+        let looked = |ws, slots: &[_]| {
+            supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows
+        };
+        // a computes and seals the prompt under group(g).
+        let (a1, a1_slots) = of("a");
+        written(&stores, a1, &tokens);
+        {
+            let mut kv = stores.kv.lock();
+            kv.freeze(a1, 65).unwrap();
+            kv.seal_rows(a1, 0, &a1_slots, 16).unwrap();
+        }
+        // b, granted too, keys a's chain and maps a's pages in.
+        let (b1, b1_slots) = of("b");
+        assert_eq!(a1_slots, b1_slots, "granted tenants key one chain");
+        assert_eq!(looked(b1, &b1_slots), 64, "b maps a's four sealed pages");
+        // c, not granted: its group(g) is its own.
+        let (c1, c1_slots) = of("c");
+        assert_ne!(c1_slots, a1_slots, "an ungranted tenant keys its own chain");
+        assert_eq!(looked(c1, &c1_slots), 0, "c finds none of a's");
+        // A set of b's that asked but keyed nothing yet; a1 holds rows.
+        let fresh = {
+            let mut kv = stores.kv.lock();
+            let ws = kv.create_working_set();
+            kv.share(ws, group("b")).unwrap();
+            ws
+        };
+        // b's grant is revoked; a's row is reissued under a new id.
+        grant(2, &["a"]);
+        let mut kv = stores.kv.lock();
+        let local = scope_domain(&kv.domain(), &ShareScope::Group("g".into()), &asker("b"), None);
+        assert_eq!(
+            kv.pass_domain(fresh).unwrap(),
+            (local, true),
+            "a set with no rows takes the tenant-local domain"
+        );
+        assert!(kv.shares(fresh));
+        let (_, shared) = kv.pass_domain(a1).unwrap();
+        assert!(!shared, "a set with rows keyed under the old grant shares no more");
+        assert!(!kv.shares(a1));
+        let fresh_slots = kv.slot_hashes(fresh, 0, &tokens, 16).unwrap().unwrap();
+        drop(kv);
+        assert_ne!(fresh_slots, a1_slots, "b no longer keys the group's chain");
+        assert_eq!(looked(fresh, &fresh_slots), 0, "b finds none of a's now");
+        grants::withdraw();
     }
 
     /// Passes over `prompt(2..5)` that arrive while a first pass over
@@ -10208,6 +10603,7 @@ pub(crate) mod fold_tests {
             cells: Vec::new(),
             failure: failure.clone(),
             retired: None,
+            lane: None,
         };
         // Its rows land where the device says: the cursor no longer knows
         // where they end.

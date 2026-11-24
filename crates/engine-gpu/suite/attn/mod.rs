@@ -4,6 +4,7 @@ mod kv_append;
 mod merge;
 mod mla;
 mod pool;
+mod ring;
 mod score;
 mod sdpa;
 mod voxel;

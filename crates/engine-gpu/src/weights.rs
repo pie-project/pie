@@ -297,6 +297,9 @@ impl<B: Backend> Weights<B> {
                 .streaming()
                 .sink(&mut sink)
                 .run()?;
+            // Each plane's host copy was freed as it landed; the pages go
+            // back before the pool and its spans are reserved beside them.
+            engine::memory::return_freed_heap();
             sink.landed
         } else {
             published(&streaming, &index, places.len())?

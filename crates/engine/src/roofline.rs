@@ -539,6 +539,7 @@ mod tests {
     #[test]
     fn a_rate_stated_at_nothing_is_refused_by_its_key() {
         let all = profile::fire::Rates {
+            landing: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0)]),
@@ -549,6 +550,7 @@ mod tests {
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,

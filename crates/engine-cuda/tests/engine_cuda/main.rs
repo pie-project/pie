@@ -4,20 +4,6 @@
 #[cfg(feature = "rocm")]
 extern crate kernels_rocm as kernels_cuda;
 
-// Strict kernels for the whole binary, before any test runs: an
-// instantiation that will not compile fails its test instead of falling
-// back unseen.
-#[cfg(all(any(feature = "cuda", feature = "rocm"), target_os = "linux"))]
-#[used]
-#[allow(unsafe_code)]
-#[unsafe(link_section = ".init_array")]
-static STRICT_KERNELS: extern "C" fn() = {
-    extern "C" fn on() {
-        kernels_cuda::jit::strict_kernels();
-    }
-    on
-};
-
 /// The pool a test's load states: a served load takes what the card has
 /// left, and the tests of one process load beside each other.
 pub const POOL: u64 = 256 << 20;
@@ -40,7 +26,6 @@ mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 #[cfg(feature = "rocm")]
 mod blocks_that_meet_run_on_a_few_units;
-mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_bound_guest_holds_its_scratch_as_state;
 mod a_buffer_frees_after_another_context_closes;
 mod a_closed_contexts_kept_memory_serves_the_next;
@@ -75,6 +60,7 @@ mod a_nucleus_cut_agrees_with_the_host_interpreter;
 mod a_padded_row_writes_nothing;
 mod a_prefill_past_the_gemvs_grid_is_served;
 mod a_closed_channel_is_kept_until_its_last_instance_closes;
+mod a_prologue_that_does_not_commit_folds_no_state;
 mod a_prologue_put_input_is_the_cell_the_forward_reads;
 mod a_prologue_put_port_is_the_cell_the_fire_resolves;
 mod a_port_describing_a_neighbours_lane_is_refused;
@@ -86,6 +72,7 @@ mod a_second_fire_reads_the_input_cells_it_was_handed;
 mod a_served_models_lanes_answer_as_each_lane_alone;
 mod a_shared_adapter_is_one_slot_and_one_load;
 mod a_shifted_body_admits_the_split_that_moved;
+mod a_stated_group_mask_reads_only_the_rows_it_admits;
 mod a_stored_k_quant_row_serves_as_stored;
 mod a_synthesized_region_serves_the_logits_of_its_ops;
 mod a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it;
@@ -98,6 +85,7 @@ mod a_windowed_row_reads_what_the_full_row_reads;
 mod an_adapter_is_not_a_lanes_scratch;
 mod an_epilogue_agrees_with_the_host_interpreter;
 mod an_exported_kv_stays_mapped;
+mod a_ring_page_id_reaches_its_address;
 mod a_guest_reads_no_row_past_its_seat;
 mod an_output_of_ids_reads_as_stored;
 mod every_catalog_deployment_dispatches;

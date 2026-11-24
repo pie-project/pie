@@ -47,7 +47,7 @@ pub use channel::{ChannelId, ChannelRegistration, ChannelSeed, HostMirror, Regis
 pub use chunk::{
     ChunkFacts, ChunkRun, ChunkTable, Evacuation, Growth, Pinned, Reserved, ReservedRun,
     ResidentWeight, SegmentFacts, ShapeId, SlotCopy, SlotKind, SlotRole, SlotRun, SlotShape,
-    WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses,
+    WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses, WindowedLayer,
 };
 pub use engine::{
     CompletionSink, Engine, HostRoom, KvWrites, Landing, LandingSink, LaneFault, Prepared, ProgramCompile,
@@ -59,8 +59,12 @@ pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
     LaneReadout, LaneRecord, LaneReplay, ListKind, Mask, Masking, MediaEncode, Readout, ReplayBound,
     ReplayPast, ReplayRows, RsReset, RsSnapshot, RsVerb, RungReplay, ScratchBytes, Serves, Step,
+    WindowFold,
 };
-pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use load::{
+    Allowance, Budgets, Checkpoint, DeviceMemory, HostTier, LoadFacts, LoadRequest, Loaded,
+    Residency,
+};
 pub use memory::SAFETY_FLOOR_BYTES;
 pub use shapes::{
     Attachments, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,

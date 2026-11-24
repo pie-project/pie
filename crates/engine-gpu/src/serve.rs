@@ -658,6 +658,16 @@ pub struct Seated<'a, B: Serve> {
 
     pub positions: &'a [u32],
 
+    /// A refused lane whose program places its rows: it fires to keep the
+    /// composition, its tables the null chunk (unit 0, which no table
+    /// names), so it writes nothing a working set holds.
+    pub sunk: bool,
+
+    /// The slot of its working set each row lands at, where its program
+    /// places a one-row lane off the run `held..held + rows` (device
+    /// geometry): `pages` names the slots' pages. `None` appends the run.
+    pub slots: Option<&'a [u32]>,
+
     pub readout: Option<&'a [u32]>,
 
     /// Whether the host reads back what the lane reads out (its readout
@@ -687,10 +697,14 @@ pub struct Seated<'a, B: Serve> {
     /// its seat's runs in the pool.
     pub refs: bool,
 
-    /// The lane's window list tables (CONTRACT-BC 21): each window list's
-    /// shape and its slot refs in its own token order, 0 where trimmed.
-    /// Read where `refs` holds; a list it names not is seat-addressed.
+    /// The lane's tables (`Lane::tables`): the window buffer's, its slot
+    /// refs from its window fold's base (CONTRACT-BC 19, 21). Read where
+    /// `refs` holds.
     pub windows: &'a [(engine::chunk::ShapeId, Vec<u32>)],
+
+    /// How the lane's windowed layers fold this fire (`Lane::window`);
+    /// `None` on a seat-addressed lane, which folds every row it brings.
+    pub window: Option<engine::fire::WindowFold>,
 
     /// The lane's record, one fixed slot ref a piece, the side it writes
     /// (the copy-on-write side where the runtime names two).
@@ -722,6 +736,8 @@ impl<'a, B: Serve> Seated<'a, B> {
             mask: None,
             adapter: None,
             positions: &[],
+            sunk: false,
+            slots: None,
             readout: None,
             hosts: true,
             reads: &[],
@@ -731,6 +747,7 @@ impl<'a, B: Serve> Seated<'a, B> {
             rs_snapshots: &[],
             refs: false,
             windows: &[],
+            window: None,
             record: None,
             record_run: None,
             feed: None,
@@ -886,6 +903,16 @@ pub struct PixelSpans {
     pub spans: Vec<(u64, u32)>,
 }
 
+/// An evacuation staged and not committed ([`Shell::stage_evacuation`]):
+/// its copies in a frame not yet submitted, the chunk table it replaced,
+/// and the weight caches' entries under the new one.
+pub struct StagedEvacuation<B: Backend> {
+    frame: B::Frame,
+    was: engine::chunk::ChunkTable,
+    rows: Vec<Vec<u8>>,
+    experts: Vec<Vec<u8>>,
+}
+
 pub struct Shell<B: Serve> {
     /// Each hybrid beam group's set's rs entries its state holds (§11.1),
     /// by instance: the buffer's base slot they count from and how many, as
@@ -913,6 +940,12 @@ pub struct Shell<B: Serve> {
     /// the user's stored one's key does not match and its own does
     /// (`profile::fire::Tuned::committed_settle`).
     committed_settle: Vec<profile::fire::DenseSettled>,
+    /// The key the settle looked its stored entries up by, once it ran:
+    /// `(of, code)` ([`Shell::settle_key`]).
+    settle_keyed: Option<(u32, u32)>,
+    /// What the shell timed at load beside its profile's
+    /// (`profile::fire::Tuned::timed`): the bound probe, the settle.
+    timed: Vec<String>,
     /// Whether the load times what no stored or committed profile states
     /// (`[engine] measure`): skipped, the settle fires nothing.
     measuring: engine::rates::Measuring,
@@ -1317,7 +1350,17 @@ impl<B: Serve> Shell<B> {
         let mut boot = boot;
         let weights_held = boot.residency.weights_held;
         let kv_budget = boot.residency.device_kv_budget;
-        let host_kv_budget = boot.residency.host_kv_budget;
+        // On a device whose memory is the host's no host tier is seated:
+        // suspended kv goes to the disk, and a stated one is refused here,
+        // by the naming load, before the device holds a byte of the model.
+        let host_kv_budget = match device
+            .memory()
+            .host_tier(boot.residency.host_kv_budget)
+            .map_err(Fault::Residency)?
+        {
+            engine::HostTier::Absent => None,
+            engine::HostTier::Seated(stated) => stated,
+        };
 
         let facts = kv::probe(&boot.trace)?;
 
@@ -1379,20 +1422,14 @@ impl<B: Serve> Shell<B> {
                 .context()
                 .div_ceil(rs_tokens.max(1))
                 .div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-        }) + rows
-            .windows
-            .iter()
-            .map(|w| {
-                let per = u32::try_from(chunk / w.bytes.max(1)).unwrap_or(1).max(1);
-                asked.context().div_ceil(w.tokens.max(1)).div_ceil(per)
-            })
-            .sum::<u32>();
-        // The most pages a lane's table takes: the narrowest slot's.
-        let table_pages = rows
-            .windows
-            .iter()
-            .map(|w| asked.context().div_ceil(w.tokens.max(1)))
-            .fold(asked.pages_per_slot, u32::max);
+        }) + rows.buffer.map_or(0, |b| {
+            let per = u32::try_from(chunk / b.bytes.max(1)).unwrap_or(1).max(1);
+            asked.context().div_ceil(b.tokens.max(1)).div_ceil(per)
+        });
+        // The most pages a lane's table takes: its context's, of the kv
+        // page or the window buffer's (as many rows a slot), and as many
+        // fire slots past them.
+        let table_pages = asked.pages_per_slot + 2 * u32::from(rows.buffer.is_some());
         let least = Paging {
             pages: u64::from(asked.pages_per_slot),
             ..asked
@@ -1489,6 +1526,9 @@ impl<B: Serve> Shell<B> {
                 rows.pieces,
                 capture,
                 rows.rs.as_ref().map(|rs| rs.tokens),
+                rows.buffer
+                    .is_some()
+                    .then(|| u32::try_from(rows.windowed.len()).unwrap_or(u32::MAX)),
                 binding,
                 // Every load lays a fire's beam groups (`crate::beam`): the
                 // kv planes a page holds (each kv row's keys and values) and
@@ -1727,6 +1767,22 @@ impl<B: Serve> Shell<B> {
                 least,
                 &tuning,
             )?;
+            // A fire's own windowed rows lie in slots of its activation
+            // span, laid as the window buffer's (CONTRACT-BC 19).
+            let mut span = span;
+            if let Some(buffer) = rows.buffer {
+                span.with_fire_slots(
+                    buffer.tokens,
+                    budgets.tokens.max_lanes,
+                    buffer.bytes,
+                    crate::store::layout::gcd(rows.chunk_bytes, buffer.bytes),
+                );
+                tracing::info!(
+                    slot_bytes = buffer.bytes,
+                    rungs = ?span.fire_bytes(buffer.bytes),
+                    "each rung's activation holds its fires' own windowed rows: (tokens, bytes)"
+                );
+            }
             // A capturing lane's row is as wide as the load's context, in its
             // pages: the widths the span lays its rows at.
             let class_outputs = poem_exec::feeds::class_outputs(
@@ -2096,6 +2152,7 @@ impl<B: Serve> Shell<B> {
         // for_bound`, single fires, milliseconds), said by name, kept in the
         // bound alone (no other choice reads it) and stored nowhere.
         let mut bound_prefixed: Option<Vec<(u32, Vec<(u32, f64)>)>> = None;
+        let mut bound_timed = false;
         if unweighed
             && B::LANDS
             && let Some(bound) = B::submit_bound(boot.device)
@@ -2157,6 +2214,7 @@ impl<B: Serve> Shell<B> {
             );
             fire_estimate = Some(estimate);
             bound_prefixed = rates.attn_tflops_by_rows_keys;
+            bound_timed = true;
         }
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
@@ -2677,19 +2735,12 @@ impl<B: Serve> Shell<B> {
         )?
         .with_rs(rs_bytes, rs_tokens, asked.pages_per_slot)?
         .with_guests(B::CHANNEL_CELLS)?;
-        let layout = rows
-            .windows
-            .iter()
-            .enumerate()
-            .try_fold(layout, |layout, (k, w)| {
-                layout.with_window(
-                    k,
-                    w.bytes,
-                    w.window,
-                    w.tokens,
-                    asked.context().div_ceil(w.tokens.max(1)),
-                )
-            })?;
+        let layout = match rows.buffer {
+            // No seat-addressed lane names a window-buffer slot (it folds
+            // every row it brings): the shape keeps no seat run.
+            Some(buffer) => layout.with_buffer(buffer.bytes, 0)?,
+            None => layout,
+        };
         layout.seats_within(total.saturating_sub(act_chunks.last().map_or(0, |&(_, c)| c)))?;
         let pages =
             u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total - unindexed);
@@ -2739,6 +2790,12 @@ impl<B: Serve> Shell<B> {
             dense_planes: dense_planes.clone(),
             dense_rates: device_profile.rates(),
             committed_settle: device_profile.tuned().committed_settle.clone(),
+            settle_keyed: None,
+            timed: if bound_timed {
+                vec!["bound probe".to_string()]
+            } else {
+                Vec::new()
+            },
             measuring: B::measuring(boot.device),
             settled: Vec::new(),
             to_store: None,
@@ -2862,6 +2919,7 @@ impl<B: Serve> Shell<B> {
         // the device is the user's file's, `crate::stored`) are taken again
         // without firing; the rest are settled (again) this load.
         let (of, code) = self.settle_key(lanes)?;
+        self.settle_keyed = Some((of, code));
         // The user's stored settle first, then a committed profile's: the
         // first whose key matches is taken, each other said and why.
         let why_not = |stored: &profile::fire::DenseSettled| {
@@ -2870,16 +2928,11 @@ impl<B: Serve> Shell<B> {
                     "its method is version {SETTLE_METHOD} now, {} when stored",
                     stored.method
                 ))
-            } else if stored.of != of {
-                Some(format!(
-                    "what it weighed changed (the curves, the model's planes, the rungs, lanes or \
-                     kernel choice: {:#010x} stored, {of:#010x} now)",
-                    stored.of
-                ))
             } else if stored.code != code {
                 Some(format!(
-                    "the code of the kernels its steps fire changed ({:#010x} stored, \
-                     {code:#010x} now)",
+                    "what its ranges were weighed against changed (the code of the kernels its \
+                     steps fire, or the kernel the curves pick at a range: {:#010x} stored, \
+                     {code:#010x} now); settled again, its entry replaced",
                     stored.code
                 ))
             } else {
@@ -2978,7 +3031,27 @@ impl<B: Serve> Shell<B> {
                 .map(|_| B::lay_stamps(&self.device, 1))
                 .collect::<Result<Vec<_>>>()?;
         }
+        // The device's clock before and after the weighing: a settle
+        // weighed below its nominal clock serves this load alone.
+        let reference = {
+            use crate::backend::Tactics as _;
+            self.tuning.gemm(self.tier, crate::submit::PROBE.0)
+        };
+        let clock_before = crate::rates::clock_read::<B>(&self.device, reference)?;
         let settled = self.settle_dense_to(lanes, &decided);
+        let throttle = crate::rates::throttled(
+            clock_before,
+            crate::rates::clock_read::<B>(&self.device, reference)?,
+        );
+        if let Some(ratio) = throttle {
+            tracing::warn!(
+                ratio,
+                "dense settle: weighed with the device {ratio:.2}x slower than its nominal clock: \
+                 served this load, not stored"
+            );
+            self.timed
+                .push(format!("settle (device {ratio:.2}x below its nominal clock: not stored)"));
+        }
         if laid {
             self.stamps.clear();
         }
@@ -3066,10 +3139,19 @@ impl<B: Serve> Shell<B> {
                 of,
                 code,
                 ranges,
+                planes: {
+                    let mut planes: Vec<(u32, u32)> =
+                        self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
+                    planes.sort_unstable();
+                    planes.dedup();
+                    planes
+                },
             };
             self.dense_rates.dense_settled.retain(|s| s.of != of);
             self.dense_rates.dense_settled.push(keep.clone());
-            self.to_store = Some(keep);
+            if throttle.is_none() {
+                self.to_store = Some(keep);
+            }
         }
         let weighed = self.settled.iter().any(|range| range.checked);
         self.say_served(
@@ -3190,34 +3272,41 @@ impl<B: Serve> Shell<B> {
             (n, k),
             top,
         )?;
+        // Rounds again, twice more at most, while no kernel separates from
+        // every other by their spreads.
+        let mut samples = samples;
+        for _ in 0..2 {
+            if samples[0].is_empty() || crate::dense::settle_pick(&samples).is_some() {
+                break;
+            }
+            let more = B::time_kernels(
+                &self.device,
+                &self.tuning,
+                self.tier,
+                max_submit,
+                launch,
+                &kernels,
+                &pieces,
+                (n, k),
+                top,
+            )?;
+            for (s, m) in samples.iter_mut().zip(more) {
+                s.extend(m);
+            }
+        }
         for (&t, s) in kernels.iter().zip(&samples) {
             if !s.is_empty() {
                 let (ns, _) = crate::rates::median_spread(s);
                 self.alone.push(((t, n, k), top, ns));
             }
         }
-        let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
-        let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
-        let kept_best = fastest(&samples[0]);
-        let mut taken = 0;
-        let mut best = f64::INFINITY;
-        for (i, s) in samples.iter().enumerate().skip(1) {
-            if s.is_empty() {
-                continue;
-            }
-            let (ns, _) = crate::rates::median_spread(s);
-            if slowest(s) < kept_best && ns < best {
-                taken = i;
-                best = ns;
-            }
-        }
-        let decided = !samples[0].is_empty()
-            && (taken == 0
-                || samples
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, s)| i != taken && !s.is_empty())
-                    .all(|(_, s)| slowest(&samples[taken]) < fastest(s)));
+        let pick = if samples[0].is_empty() {
+            None
+        } else {
+            crate::dense::settle_pick(&samples)
+        };
+        let taken = pick.unwrap_or(0);
+        let decided = pick.is_some();
         let weighed: Vec<String> = kernels
             .iter()
             .zip(&samples)
@@ -3235,7 +3324,11 @@ impl<B: Serve> Shell<B> {
         tracing::info!(
             "dense matmul in the served step, {bottom}-{top} rows: weighed on its widest plane \
              {n}x{k} alone at {top} rows (no whole step timed): {} ({})",
-            if taken == 0 { "kept" } else { "replaced" },
+            match pick {
+                None => "tied inside the spreads, kept",
+                Some(0) => "kept",
+                Some(_) => "replaced",
+            },
             weighed.join(" vs ")
         );
         if taken != 0 {
@@ -3254,26 +3347,32 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, a
-    /// fingerprint of what it weighs (the curves, the model's planes, the
-    /// kernels the choice took by them, the rungs and lanes it fires, the
-    /// backend); and `code`, a fingerprint of the code of every kernel the
-    /// load's fires can ask for (`crate::stored::code_of_all`), which each
-    /// weighed step ran. Nothing of the build but its kernels keys it.
+    /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, which
+    /// model's settle it is (`crate::dense::settle_of`: its planes, the
+    /// load's lanes and rows, the backend), one entry a model; and `code`,
+    /// what its ranges were weighed against (`crate::dense::settle_code`:
+    /// the code of every kernel the load's fires can ask for, and the
+    /// kernel the curves picked at each range). Nothing of the build but its
+    /// kernels keys it.
     fn settle_key(&self, lanes: u32) -> Result<(u32, u32)> {
-        // In canonical words: the same content keys the same whatever
-        // layer stated it and in what order (`crate::dense::settle_of`).
         let of = crate::dense::settle_of(
-            self.dense_rates.kernel_tflops_by_shape.as_deref(),
             &self.dense_planes,
-            &self.dense,
             lanes,
             self.budgets.tokens.max_tokens,
             B::TARGET,
         );
         let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
             self.asks.kernels.iter().copied().collect();
-        let code = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        let all = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        let code = crate::dense::settle_code(all, &self.dense);
+        tracing::debug!(
+            of = format_args!("{of:#010x}"),
+            code = format_args!("{code:#010x}"),
+            kernels_code = format_args!("{all:#010x}"),
+            kernels = ?kernels.iter().map(|k| k.key).collect::<Vec<_>>(),
+            picks = %self.dense.canonical(),
+            "dense settle: what its key reads"
+        );
         Ok((of, code))
     }
 
@@ -3356,6 +3455,38 @@ impl<B: Serve> Shell<B> {
                     })
             })
             .collect()
+    }
+
+    /// What this load timed, each by name: its profile's (`rates`, the
+    /// dense curves, `resident_workgroups`) and the shell's (the bound
+    /// probe, the settle where it weighed a range). Empty: it measured
+    /// nothing.
+    #[must_use]
+    pub fn measured_at_load(&self) -> Vec<String> {
+        use crate::backend::Tactics as _;
+        let mut all = self.tuning.profile().tuned().timed.clone();
+        all.extend(self.timed.iter().cloned());
+        if self.settled.iter().any(|range| range.checked) {
+            all.push("settle".to_string());
+        }
+        all
+    }
+
+    /// The key the dense settle looked its stored entries up by, `(of,
+    /// code)`, once it ran.
+    #[must_use]
+    pub fn settle_keyed(&self) -> Option<(u32, u32)> {
+        self.settle_keyed
+    }
+
+    /// Every kernel a fire of this load can ask for, by key, sorted: what
+    /// the settle's code is keyed by.
+    #[must_use]
+    pub fn asked_kernels(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self.asks.kernels.iter().map(|k| k.key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 
     /// Every kernel whose pipeline is built, in the order built.
@@ -3443,7 +3574,10 @@ impl<B: Serve> Shell<B> {
                     // weighed whatever they pad to: every matmul kernel
                     // guards the rows it is given, so a tile past a fire's
                     // rows reads and writes none of them.
-                    if !kernels.contains(&t) && (tile(t) <= widest || paths.contains(&t)) {
+                    // Every kernel the plane supports is offered at every
+                    // range: what a neighbouring range took removes none.
+                    let _ = widest;
+                    if !kernels.contains(&t) {
                         kernels.push(t);
                     }
                 }
@@ -3586,8 +3720,27 @@ impl<B: Serve> Shell<B> {
                     let host_clock = std::cell::Cell::new(false);
                     // The GPU's clock at the range's first fire.
                     let mut clock: Option<u64> = None;
-                    // A first round warms each option, untimed.
-                    for round in 0..=ROUNDS {
+                    // A first round warms each option, untimed. Rounds go
+                    // on, as many again at most twice, while no option's
+                    // times separate from every other's by their spreads
+                    // (`crate::dense::settle_pick`).
+                    let mut limit = ROUNDS;
+                    let mut round = 0;
+                    let mut last_spread = f64::INFINITY;
+                    let widest_spread = |samples: &[Vec<f64>]| {
+                        samples
+                            .iter()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| crate::rates::median_spread(s).1)
+                            .fold(0.0, f64::max)
+                    };
+                    // What else is in flight as the trial times: the
+                    // pipelines built meanwhile and whether the device sat
+                    // idle at its start (a trial timed beside other work
+                    // reads that work's noise).
+                    let built_before = B::compiled(&self.pipelines);
+                    let idle_before = crate::backend::Context::idle(&self.device);
+                    while round <= limit {
                         for (i, option) in options.iter().enumerate() {
                             self.dense = option.clone();
                             let fired = (|| -> Result<f64> {
@@ -3668,23 +3821,25 @@ impl<B: Serve> Shell<B> {
                                 }
                             }
                         }
-                    }
-                    // An option replaces the choice where every fire of it ran
-                    // faster than every fire of the choice (their ranges
-                    // apart: no repeat's noise could turn them around); of
-                    // those, the fastest by its median.
-                    let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
-                    let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
-                    let kept_best = fastest(&samples[0]);
-                    let mut taken = 0;
-                    let mut best = f64::INFINITY;
-                    for (i, s) in samples.iter().enumerate().skip(1) {
-                        let (ns, _) = crate::rates::median_spread(s);
-                        if slowest(s) < kept_best && ns < best {
-                            taken = i;
-                            best = ns;
+                        round += 1;
+                        // Tied: rounds go on while each further set of them
+                        // still narrows the widest spread (the noise is
+                        // averaging out), stopping once one does not.
+                        if round > limit && crate::dense::settle_pick(&samples).is_none() {
+                            let spread = widest_spread(&samples);
+                            if spread < last_spread {
+                                last_spread = spread;
+                                limit += ROUNDS;
+                            }
                         }
                     }
+                    // The option whose times, widened by their spread, lie
+                    // under every other's widened by theirs replaces the
+                    // choice; where none separates (a tie inside the
+                    // spreads, after the further rounds) the choice stands,
+                    // recorded as tied (`crate::dense::settle_pick`).
+                    let pick = crate::dense::settle_pick(&samples);
+                    let taken = pick.unwrap_or(0);
                     let weighed: Vec<String> = options
                         .iter()
                         .zip(&samples)
@@ -3699,9 +3854,16 @@ impl<B: Serve> Shell<B> {
                         })
                         .collect();
                     tracing::info!(
+                        rounds = round.saturating_sub(1),
+                        built_during = B::compiled(&self.pipelines).saturating_sub(built_before),
+                        idle_at_start = idle_before,
                         "dense matmul in the served step, {bottom}-{top} rows: {} ({}; timed by \
                          the {})",
-                        if taken == 0 { "kept" } else { "replaced" },
+                        match pick {
+                            None => "tied inside the spreads, kept",
+                            Some(0) => "kept",
+                            Some(_) => "replaced",
+                        },
                         weighed.join(" vs "),
                         if host_clock.get() {
                             "host's clock (the device stated no span)"
@@ -3713,12 +3875,7 @@ impl<B: Serve> Shell<B> {
                     // it, so the options tie with it or lose), or where the
                     // kernel taken ran apart from every other option too;
                     // undecided where it beat the choice but ties another.
-                    let decided = taken == 0
-                        || samples
-                            .iter()
-                            .enumerate()
-                            .filter(|&(i, _)| i != taken)
-                            .all(|(_, s)| slowest(&samples[taken]) < fastest(s));
+                    let decided = pick.is_some();
                     if let Some(range) = self.settled.last_mut() {
                         range.replaced = taken != 0;
                         range.kernel = taking.get(taken).copied().flatten();
@@ -3791,46 +3948,14 @@ impl<B: Serve> Shell<B> {
 
     /// The disk tier: a slot file of `budget` bytes in disk chunks, any
     /// state shape's slots in any chunk, as [`Pools::disk_chunk_bytes`] and
-    /// [`Pools::disk_division`] lay them; stated at load. Unstated
-    /// `budget`: the disk chunks `seats` sequences' kv pages at `context`
-    /// and their state take, within the free disk
-    /// ([`engine::disk::derived_budget`]). One that cannot be seated is
-    /// refused by name, stated or not. The disk chunks it holds.
-    pub fn seat_disk_kv(
-        &mut self,
-        budget: Option<u64>,
-        dir: Option<&Path>,
-        seats: u32,
-        context: u32,
-    ) -> Result<u32> {
-        let Some(dir) = dir else { return Ok(0) };
-        let paging = self.pools.paging();
-        let layout = *self.pools.layout();
+    /// [`Pools::disk_division`] lay them; stated at load. No budget (or 0)
+    /// is no disk tier. One that cannot be seated is refused by name. The
+    /// disk chunks it holds.
+    pub fn seat_disk_kv(&mut self, budget: Option<u64>, dir: Option<&Path>) -> Result<u32> {
+        let (Some(budget), Some(dir)) = (budget.filter(|&bytes| bytes > 0), dir) else {
+            return Ok(0);
+        };
         let chunk = self.pools.disk_chunk_bytes();
-        let budget = budget.unwrap_or_else(|| {
-            let pages =
-                u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
-            let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
-            let state = (u64::from(seats) * self.state_slot_bytes()).div_ceil(chunk.max(1));
-            // The guest state the device can hold live (the room a guest
-            // program binds within): evicted, it has a home.
-            let guest = self.pool_chunk_facts().guest_room_bytes();
-            let bytes = engine::disk::unstated_budget(
-                dir,
-                0,
-                0,
-                pages.div_ceil(per_list) + state,
-                chunk,
-                guest,
-            );
-            // Its inputs, stated at load: what the field rules on.
-            eprintln!(
-                "engine-gpu: the unstated disk tier: {bytes} bytes = {seats} seats x {context}                  tokens: {pages} kv pages in {} chunks and {state} chunks of state ({} B a seat),                  and {guest} B of guest state the device holds live, chunks of {chunk} B",
-                pages.div_ceil(per_list),
-                self.state_slot_bytes(),
-            );
-            bytes
-        });
         self.pools.seat_disk(&self.device, dir, budget)?;
         let chunks = self.pools.disk_chunks();
         if chunks > 0 {
@@ -4183,20 +4308,72 @@ impl<B: Serve> Shell<B> {
     }
 
     /// Copies each evacuated chunk onto its new physical chunk, on the queue
-    /// before the next fire, and takes the moves into the chunk table.
+    /// before the next fire, and takes the moves into the chunk table:
+    /// [`Self::stage_evacuation`] and [`Self::commit_evacuation`] with
+    /// nothing between, for a caller holding nothing in the pool.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
+        match self.stage_evacuation(evacuation)? {
+            Some(staged) => self.commit_evacuation(staged),
+            None => Ok(()),
+        }
+    }
+
+    /// The first half of an evacuation, nothing committed: each moved
+    /// chunk's copy recorded in a frame not yet submitted, the moves taken
+    /// into the chunk table, and the weight caches' entries resolved
+    /// against it. The caller resolves what else the moves repoint against
+    /// [`Self::pools`] as they now stand, then commits
+    /// ([`Self::commit_evacuation`]) or takes it back
+    /// ([`Self::abort_evacuation`]). Refused with nothing changed; `None`
+    /// where nothing moves.
+    pub fn stage_evacuation(
+        &mut self,
+        evacuation: &engine::chunk::Evacuation,
+    ) -> Result<Option<StagedEvacuation<B>>> {
         if evacuation.moves.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut frame = self.device.frame()?;
-        self.pools.evacuate(&mut frame, evacuation)?;
-        // The weight cache's entries name physical units: those in moved
-        // chunks are rewritten once every fire reading them has landed.
+        let was = self.pools.evacuate(&mut frame, evacuation)?;
+        let entries = self.row_caches.entries(&self.pools).and_then(|rows| {
+            Ok((rows, self.expert_caches.entries(&self.pools)?))
+        });
+        match entries {
+            Ok((rows, experts)) => Ok(Some(StagedEvacuation {
+                frame,
+                was,
+                rows,
+                experts,
+            })),
+            Err(refused) => {
+                self.pools.restore_table(was);
+                Err(refused)
+            }
+        }
+    }
+
+    /// Takes a staged evacuation back: the chunk table as it stood, its
+    /// copies dropped unsubmitted.
+    pub fn abort_evacuation(&mut self, staged: StagedEvacuation<B>) {
+        self.pools.restore_table(staged.was);
+    }
+
+    /// Commits a staged evacuation: its copies go on the queue before the
+    /// next fire, and the weight caches' entries in moved chunks are
+    /// rewritten once every fire reading them has landed. Everything was
+    /// resolved at the stage: a failure here is the device's fault.
+    pub fn commit_evacuation(&mut self, staged: StagedEvacuation<B>) -> Result<()> {
+        let StagedEvacuation {
+            mut frame,
+            rows,
+            experts,
+            ..
+        } = staged;
         if !self.row_caches.is_empty() || !self.expert_caches.is_empty() {
             frame.commit()?;
             self.drain()?;
-            self.row_caches.restage(&self.pools)?;
-            self.expert_caches.restage(&self.pools)?;
+            self.row_caches.write_entries(&rows)?;
+            self.expert_caches.write_entries(&experts)?;
             frame = self.device.frame()?;
         }
         self.grafted = Some(frame.commit_async(None)?);
@@ -4519,6 +4696,17 @@ impl<B: Serve> Shell<B> {
     }
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
+        self.fire_folded(lanes, &[])
+    }
+
+    /// [`Shell::fire_seated`] where lanes fold by a count their programs
+    /// make on the device (`FoldLen::Device`): `folds[i]` lane `i`'s, as the
+    /// engine reads it at the fire.
+    pub fn fire_folded(
+        &mut self,
+        lanes: &[Seated<'_, B>],
+        folds: &[crate::store::frozen::DeviceFold],
+    ) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
         // A served load fired before the engine placed its programs hangs
         // the device on what placing them sets up: refused, by name.
@@ -4543,7 +4731,7 @@ impl<B: Serve> Shell<B> {
 
                 media: &[],
                 clips: &[],
-                folds: &[],
+                folds,
                 done: None,
                 guests: None,
                 beams: &[],
@@ -5055,7 +5243,9 @@ impl<B: Serve> Shell<B> {
         let staged = crate::beam::Staged {
             room,
             tables,
-            windowed: self.pools.tables().iter().any(|paged| paged.window().is_some()),
+            // No load keeps window lists now (its windowed layers are
+            // ring + buffer, CONTRACT-BC 19): no staged table is one.
+            windowed: false,
             page: self.pools.paging().page_size,
             planes,
             unit,
@@ -6036,9 +6226,8 @@ impl<B: Serve> Shell<B> {
         let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
 
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
-        // Each window list's tables, a lane each, by the fire's page tables.
-        let mut window_tables: Vec<Vec<Vec<u32>>> =
-            vec![Vec::with_capacity(lanes.len()); self.pools.tables().len()];
+        // Each lane's windowed rows, where the load has them.
+        let mut ring_lanes: Vec<crate::ring::Seat> = Vec::new();
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -6272,7 +6461,9 @@ impl<B: Serve> Shell<B> {
             let pages = (u64::from(have) + u64::from(row.rows))
                 .div_ceil(u64::from(self.pools.paging().page_size.max(1)))
                 .max(1);
-            tables.push(std::borrow::Cow::Owned(if seated.refs {
+            tables.push(std::borrow::Cow::Owned(if seated.sunk {
+                vec![0; pages as usize]
+            } else if seated.refs {
                 self.pools.kv_pages(seated.pages, None)?
             } else {
                 self.pools.kv_pages(
@@ -6280,42 +6471,86 @@ impl<B: Serve> Shell<B> {
                     Some((lane.slot, u32::try_from(pages).unwrap_or(u32::MAX))),
                 )?
             }));
-            for (at, &paged) in self.pools.tables().iter().enumerate() {
-                let Some(k) = paged.window() else {
-                    continue;
+            // The lane's windowed rows (CONTRACT-BC 19, 21): its fold, and
+            // its window-buffer slots from the table's base. A seat-addressed
+            // lane folds every row it brings, its buffer its seat's run.
+            if self.pools.rings().is_some() && seated.kv_less {
+                // A kv-less lane carries no attention rows: its rows land in
+                // its fire slots, read by nothing past the fire.
+                ring_lanes.push(crate::ring::Seat {
+                    folded: have,
+                    fold: 0,
+                    base: have,
+                    first: have,
+                    rows: row.rows,
+                    buffer: Vec::new(),
+                    reads: Vec::new(),
+                    record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
+                    keeps: false,
+                });
+            } else if self.pools.rings().is_some() {
+                let tokens = self.pools.paging().page_size.max(1);
+                // A lane stating no fold (a seat-addressed one, or one of the
+                // engine's own bind walks; the runtime's are refused at the
+                // fire's validation) folds every row it brings.
+                let window = match seated.window {
+                    Some(window) => window,
+                    None => engine::fire::WindowFold {
+                        base: (have + row.rows) / tokens * tokens,
+                        fold: engine::fire::FoldLen::Host(row.rows),
+                        lineage: engine::fire::Lineage::Set,
+                    },
                 };
-                let shape = crate::store::layout::window_shape(k);
-                let named = seated
-                    .windows
-                    .iter()
-                    .find(|(id, _)| *id == shape)
-                    .map(|(_, refs)| refs.as_slice())
-                    .filter(|_| seated.refs);
-                let table = match named {
-                    _ if seated.kv_less => Vec::new(),
-                    Some(refs) => self.pools.list_pages(paged, refs, None)?,
-                    None if seated.refs => {
-                        return Err(program(
+                let folded = if seated.window.is_some() { seated.folded } else { have };
+                // A fold the device counts: the count its program's `fold`
+                // port holds at the fire, as the recurrent scans take it.
+                let fold = match window.fold {
+                    engine::fire::FoldLen::Host(fold) => fold,
+                    engine::fire::FoldLen::Device => device.count.ok_or_else(|| {
+                        program(
                             "serve::stage",
                             format!(
-                                "lane {source} names its slots by ref and no table of window \
-                                 list {shape}"
+                                "lane {source} folds its windowed layers by a count its \
+                                 program makes on the device, and no attached program holds \
+                                 one at the fire"
                             ),
-                        ));
-                    }
-                    None => {
-                        let tokens = self.pools.paging_of(paged).page_size.max(1);
-                        let pages = (u64::from(have) + u64::from(row.rows))
-                            .div_ceil(u64::from(tokens))
-                            .max(1);
-                        self.pools.list_pages(
-                            paged,
-                            &[],
-                            Some((lane.slot, u32::try_from(pages).unwrap_or(u32::MAX))),
-                        )?
-                    }
+                        )
+                    })?,
                 };
-                window_tables[at].push(table);
+                // The buffered rows its lineage reads, as its recurrent
+                // layers replay them.
+                let reads = engine::fire::buffered_reads(
+                    seated.mask.filter(|_| seated.window.is_some()),
+                    folded,
+                    have,
+                    window.lineage,
+                )
+                .map_err(|why| program("serve::stage", format!("lane {source}: {why}")))?;
+                // A lane stating no fold folds all it brings: it reads and
+                // leaves no buffered row, so it names no buffer slot.
+                let buffer = match seated
+                    .windows
+                    .iter()
+                    .find(|(id, _)| *id == crate::store::layout::WINDOW)
+                    .map(|(_, refs)| refs.as_slice())
+                {
+                    Some(refs) if seated.refs && seated.window.is_some() => {
+                        self.pools.list_pages(crate::store::Paged::Buffer, refs, None)?
+                    }
+                    _ => Vec::new(),
+                };
+                ring_lanes.push(crate::ring::Seat {
+                    folded,
+                    fold,
+                    base: window.base,
+                    first: have,
+                    rows: row.rows,
+                    buffer,
+                    reads,
+                    // The lane's entry of the fire's record table.
+                    record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
+                    keeps: true,
+                });
             }
 
             // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
@@ -6469,7 +6704,13 @@ impl<B: Serve> Shell<B> {
                         request_of_token.push(at_lane);
                         slot_of_row.extend_from_slice(&state);
                     }
-                    writes.extend(std::iter::repeat_n(None, rows_here));
+                    match seated.slots {
+                        None => writes.extend(std::iter::repeat_n(None, rows_here)),
+                        Some(slots) => {
+                            let placed = self.placed_writes(source, seated, slots, rows_here)?;
+                            writes.extend(placed.into_iter().map(Some));
+                        }
+                    }
                 }
             }
         }
@@ -6527,28 +6768,124 @@ impl<B: Serve> Shell<B> {
         };
         self.pools.admit(demand)?;
 
+        // A carrying lane's buffered rows are its decode steps' data, no
+        // rows of the extended run (`engine::fire::lane_carried`).
+        let rows_ext = rows.saturating_add(
+            rs_plans
+                .iter()
+                .zip(&rs_carried)
+                .filter(|(_, carried)| !**carried)
+                .map(|(plan, _)| plan.replay)
+                .sum::<u32>(),
+        );
+        // The lanes whose class captures, compacted in lane order: a key row
+        // each, and a page row each of those whose program reads pages.
+        let scored = Scored::of(composition.lanes().iter().map(|row| {
+            let captures = self.captures(row.class as usize);
+            let pages = captures
+                && lanes[row.source as usize]
+                    .reads
+                    .iter()
+                    .any(|name| name == SCORE_PAGES);
+            (captures, pages)
+        }));
+        let (readout_rows, readout_layout) = readout_table(
+            &composition,
+            lanes,
+            &self.readouts,
+            &scored,
+            |class| self.readout_for(class),
+            |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
+        )?;
+        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
+        let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        if readouts > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for",
+                need: readouts,
+                have: readouts_ceiling,
+            });
+        }
+        let fire_rows = FireRows {
+            tokens: u64::from(rows),
+            lanes: u64::from(lane_count),
+            patches: u64::from(composition.patch_rows()),
+            images: u64::from(composition.images()),
+            voxels: u64::from(composition.voxel_widest()),
+            clips: u64::from(composition.clips()),
+            readouts,
+        };
+        // The narrowest rung that holds the fire: its carve at its fixed
+        // place under the span's end.
+        // Rows carried: the recurrent rows a fire replays, and the windowed
+        // rows its lanes fold from their buffers (CONTRACT-BC 19: a fire
+        // carries at most its rung's tokens).
+        let window_carried: u32 = ring_lanes
+            .iter()
+            .filter(|seat| seat.keeps)
+            .map(|seat| seat.first.saturating_sub(seat.folded))
+            .sum();
+        let rung = self.span.rung_of(
+            fire_rows,
+            if rs_active { rows_ext - rows } else { 0 }.max(window_carried),
+        );
+        // The fire's windowed rows (CONTRACT-BC 19, 21): its own rows in
+        // its rung's fire slots, read and folded as the ring kernels say.
+        let ring = self.stage_rings(&ring_lanes, &slot_ids, rung)?;
+        let ring_layers = if self.pools.rings().is_some() {
+            self.pools.ring_layers()?
+        } else {
+            Vec::new()
+        };
+        if let Some(staged) = &ring {
+            let most = crate::ring::most_jobs(self.span.rung_tokens(rung), self.span.rung_tokens(rung));
+            let jobs = u32::try_from(staged.jobs.first().copied().unwrap_or(0)).unwrap_or(0);
+            if jobs > most {
+                return Err(Fault::Ceiling {
+                    what: "rows a fire folds into its rings and buffers, its rung's own rows and \
+                           as many carried",
+                    need: u64::from(jobs),
+                    have: u64::from(most),
+                });
+            }
+        }
+        let page_size_u32 = self.pools.paging().page_size;
         let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let mut geometries = Vec::with_capacity(self.page_tables);
         for (at, &paged) in self.pools.tables().iter().enumerate() {
             geometries.push(match paged {
                 crate::store::Paged::List => kv::geometry_with(&paging, &seats, &table_refs)?,
-                crate::store::Paged::Window(_) => {
-                    let refs: Vec<&[u32]> = window_tables[at].iter().map(Vec::as_slice).collect();
-                    let list = self.pools.paging_of(paged);
-                    // A fire of kv-less lanes reads no geometry.
-                    let list = if kv_free {
-                        Paging {
-                            page_size: list.page_size,
-                            pages_per_slot: paging
-                                .pages_per_slot
-                                .saturating_mul((paging.page_size / list.page_size.max(1)).max(1)),
-                            ..paging
-                        }
-                    } else {
-                        list
+                // The window buffer's table as the ring kernels read it: each
+                // lane's buffer slots of its carried rows, then its fire
+                // slots; every row of the fire written to its fire slot.
+                crate::store::Paged::Buffer => {
+                    let _ = at;
+                    let staged = ring.as_ref();
+                    let lanes = seats.len();
+                    let mut geometry = kv::Geometry {
+                        indptr: staged.map_or_else(|| vec![0; lanes + 1], |s| s.indptr.clone()),
+                        indices: staged.map_or_else(Vec::new, |s| s.indices.clone()),
+                        last_page_len: vec![narrow(u64::from(page_size_u32)); lanes],
+                        kv_len: seats
+                            .iter()
+                            .map(|seat| narrow(u64::from(seat.have) + u64::from(seat.rows)))
+                            .collect(),
+                        write_page: staged.map_or_else(Vec::new, |s| s.write_page.clone()),
+                        write_offset: staged.map_or_else(Vec::new, |s| s.write_offset.clone()),
                     };
-                    kv::geometry_with(&list, &seats, &refs)?
+                    // Kv-less lanes write no windowed row: their rows point at
+                    // the first fire slot, never read.
+                    if geometry.write_page.len() < rows as usize {
+                        let filler = geometry.indices.first().copied().unwrap_or(0);
+                        geometry.write_page.resize(rows as usize, filler);
+                        geometry.write_offset.resize(rows as usize, 0);
+                    }
+                    if geometry.indptr.len() < lanes + 1 {
+                        let last = geometry.indptr.last().copied().unwrap_or(0);
+                        geometry.indptr.resize(lanes + 1, last);
+                    }
+                    geometry
                 }
             });
         }
@@ -6704,16 +7041,6 @@ impl<B: Serve> Shell<B> {
 
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
-        // A carrying lane's buffered rows are its decode steps' data, no
-        // rows of the extended run (`engine::fire::lane_carried`).
-        let rows_ext = rows.saturating_add(
-            rs_plans
-                .iter()
-                .zip(&rs_carried)
-                .filter(|(_, carried)| !**carried)
-                .map(|(plan, _)| plan.replay)
-                .sum::<u32>(),
-        );
         // The staged rs table: every lane's header, then its carried
         // tokens and its buffer pages. A fire carries no more rows than the
         // widest bucket's tokens, the most the runtime lets one carry.
@@ -6959,30 +7286,11 @@ impl<B: Serve> Shell<B> {
             })
             .collect();
 
-        // The lanes whose class captures, compacted in lane order: a key row
-        // each, and a page row each of those whose program reads pages.
-        let scored = Scored::of(composition.lanes().iter().map(|row| {
-            let captures = self.captures(row.class as usize);
-            let pages = captures
-                && lanes[row.source as usize]
-                    .reads
-                    .iter()
-                    .any(|name| name == SCORE_PAGES);
-            (captures, pages)
-        }));
         // Each capturing lane's rows by their bases in the score room's
         // key and page rows ([`crate::arena::Span::slots`] binds them).
         let capture_table = self.span.capture().map_or_else(Vec::new, |rows| {
             scored.table(&indptr_host, rows.keys, rows.pages)
         });
-        let (readout_rows, readout_layout) = readout_table(
-            &composition,
-            lanes,
-            &self.readouts,
-            &scored,
-            |class| self.readout_for(class),
-            |plane| self.gathers_readout && self.readouts[plane].seam == Kind::Readout,
-        )?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -7019,6 +7327,9 @@ impl<B: Serve> Shell<B> {
                     payload: &voxel_payload,
                 }),
                 capture: &capture_table,
+                ring_lanes: ring.as_ref().map_or(&[], |staged| staged.lanes.as_slice()),
+                ring_jobs: ring.as_ref().map_or(&[], |staged| staged.jobs.as_slice()),
+                ring_layers: &ring_layers,
             },
         )?;
         if let Some(planned) = &planned {
@@ -7055,29 +7366,6 @@ impl<B: Serve> Shell<B> {
             }
         }
 
-        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
-        let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
-        if readouts > readouts_ceiling {
-            return Err(Fault::Ceiling {
-                what: "rows one fire reads logits for",
-                need: readouts,
-                have: readouts_ceiling,
-            });
-        }
-        let fire_rows = FireRows {
-            tokens: u64::from(rows),
-            lanes: u64::from(lane_count),
-            patches: u64::from(composition.patch_rows()),
-            images: u64::from(composition.images()),
-            voxels: u64::from(composition.voxel_widest()),
-            clips: u64::from(composition.clips()),
-            readouts,
-        };
-        // The narrowest rung that holds the fire: its carve at its fixed
-        // place under the span's end.
-        let rung = self
-            .span
-            .rung_of(fire_rows, if rs_active { rows_ext - rows } else { 0 });
         // A fire's capturing lanes' rows lie in the score room of its first
         // capturing lane's pair, laid for the most lanes a fire carries.
         let room = composition
@@ -7201,6 +7489,16 @@ impl<B: Serve> Shell<B> {
             mrope_positions: bound.mrope_positions,
             geometry,
             window_tables: self.pools.window_tables(),
+            // The fold's grid a rung's: its own rows and as many carried.
+            ring_jobs: bound.ring_jobs.map(|(jobs, most)| {
+                (
+                    jobs,
+                    most.min(crate::ring::most_jobs(
+                        self.span.rung_tokens(rung),
+                        self.span.rung_tokens(rung),
+                    )),
+                )
+            }),
             tables: FireTables {
                 request_of_token: bound.request_of_token,
                 mask: bound.mask,
@@ -7313,6 +7611,48 @@ impl<B: Serve> Shell<B> {
         })
     }
 
+    /// The fire's windowed lanes staged for the ring kernels at rung
+    /// `rung`: each lane's rows in fire slots of the rung's own, from a
+    /// slot's first row; `None` where the load has no windowed rows.
+    fn stage_rings(
+        &self,
+        seats: &[crate::ring::Seat],
+        slot_ids: &[i32],
+        rung: usize,
+    ) -> Result<Option<crate::ring::Staged>> {
+        let Some((rows, _)) = self.pools.rings() else {
+            return Ok(None);
+        };
+        let tokens = self.pools.paging().page_size.max(1);
+        let (at, held) = self.span.fire_slots(rung)?;
+        let wants: Vec<u32> = seats.iter().map(|seat| seat.rows.div_ceil(tokens)).collect();
+        let need: u32 = wants.iter().sum();
+        if need > held {
+            return Err(Fault::Ceiling {
+                what: "fire slots of the fire's own windowed rows",
+                need: u64::from(need),
+                have: u64::from(held),
+            });
+        }
+        let units = self.pools.fire_units(at, need)?;
+        let mut from = 0usize;
+        let mut owned = Vec::with_capacity(seats.len());
+        for want in &wants {
+            owned.push(&units[from..from + *want as usize]);
+            from += *want as usize;
+        }
+        let pieces = self.pools.pieces() as usize;
+        let lanes: Vec<crate::ring::Lane<'_>> = seats
+            .iter()
+            .zip(owned)
+            .map(|(seat, fire)| {
+                let at = seat.record as usize * pieces;
+                seat.with(fire, slot_ids.get(at..at + pieces).unwrap_or(&[]))
+            })
+            .collect();
+        crate::ring::stage(&lanes, tokens, rows, &self.pools.windows()).map(Some)
+    }
+
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {
         let place = At::new();
         self.walk_with(p, keep, split, false, &place, &mut Cursor::new(&place))
@@ -7388,6 +7728,7 @@ impl<B: Serve> Shell<B> {
                 cursor,
                 Filter::default(),
             )?;
+            run.fold_rings()?;
             (run.take_cuts(), run.take_picks())
         };
         let (cuts, picks) = cuts;
@@ -8385,6 +8726,59 @@ fn span_copies(
                 })
         })
         .collect()
+}
+
+impl<B: Serve> Shell<B> {
+    /// The explicit write descriptor, `(page, offset)` in the kv list, of
+    /// each of lane `source`'s `rows` rows its program lands at `slots` of
+    /// its working set, whose pages `seated.pages` names.
+    fn placed_writes(
+        &self,
+        source: usize,
+        seated: &Seated<'_, B>,
+        slots: &[u32],
+        rows: usize,
+    ) -> Result<Vec<(i32, i32)>> {
+        if slots.len() != rows {
+            return Err(program(
+                "serve::stage",
+                format!(
+                    "lane {source} places {} slot(s) for its {rows} row(s)",
+                    slots.len()
+                ),
+            ));
+        }
+        if !seated.refs {
+            return Err(program(
+                "serve::stage",
+                format!(
+                    "lane {source} places its rows at working-set slots and is seat-addressed: \
+                     a seat has no working set whose pages the slots index"
+                ),
+            ));
+        }
+        let page = self.pools.paging().page_size.max(1);
+        slots
+            .iter()
+            .map(|&slot| {
+                let named = seated.pages.get((slot / page) as usize).ok_or_else(|| {
+                    program(
+                        "serve::stage",
+                        format!(
+                            "lane {source} places a row at slot {slot}, on page {} of its \
+                             working set, and its table names {} page(s)",
+                            slot / page,
+                            seated.pages.len()
+                        ),
+                    )
+                })?;
+                Ok((
+                    narrow(u64::from(self.pools.kv_page(*named)?)),
+                    narrow(u64::from(slot % page)),
+                ))
+            })
+            .collect()
+    }
 }
 
 fn narrow(n: u64) -> i32 {

@@ -67,13 +67,11 @@ fn idle_snapshots_go_in_retention_order() {
         "the lower-ranked, though newer"
     );
     assert!(s.has_checkpoint(&[1; 32]), "the higher-ranked stays");
-    assert_eq!(
-        s.reclaim_droppable(rank),
-        0,
-        "the runtime leaves what a policy keyed above 0"
-    );
-    assert!(s.has_checkpoint(&[1; 32]));
-    assert_eq!(s.discard_cache(high), 1);
+    // No lower tier for a checkpoint: cached state yields to the next
+    // demand, whatever its key.
+    assert_eq!(s.reclaim_droppable(rank), 1);
+    assert!(!s.has_checkpoint(&[1; 32]));
+    assert_eq!(s.discard_cache(high), 0);
     assert_eq!(s.reclaim_cache(rank), 0);
 }
 
@@ -127,14 +125,8 @@ fn a_checkpoint_is_cache_and_goes_when_idle() {
     write_state(&mut s, other);
     assert!(s.checkpoint(other, o, None).unwrap());
     assert_eq!(s.group_demand(other, true, false, None), Ok(slots(1)));
-    let kept = |_: Option<crate::inferlet::process::ProcessId>| 1;
-    assert_eq!(
-        s.reclaim_sharing(&[other], kept),
-        0,
-        "a checkpoint a policy keeps is not the runtime's to drop"
-    );
-    assert!(s.has_checkpoint(&o));
-    assert_eq!(s.reclaim_sharing(&[other], |_| 0), 1);
+    // Cached state yields to running work, whatever its key.
+    assert_eq!(s.reclaim_sharing(&[other]), 1);
     assert_eq!(
         s.group_demand(other, true, false, None),
         Ok(slots(0)),

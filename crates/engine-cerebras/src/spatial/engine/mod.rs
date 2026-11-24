@@ -99,8 +99,30 @@ impl Spatial {
 const DEFAULT_STATE_SLOTS: u32 = 4;
 
 impl Engine for Spatial {
+    /// Unsupported on Cerebras, by name: it keys no host cover (no committed
+    /// covers) and has no keyed load-time measurements to skip (out of scope
+    /// for this work), so it never skips.
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Cerebras times nothing at load: none.
+    fn measured_at_load(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> &'static str {
         "cerebras-spatial"
+    }
+
+    /// Its pool is degenerate and no evacuation moves a chunk of it: it
+    /// states no table.
+    fn chunk_table(&self) -> engine::Result<engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
     }
 
     fn live(&self) -> engine::live::Live {
@@ -264,6 +286,7 @@ impl Engine for Spatial {
             kv_handle: None,
             media_encode: false,
             rs_verbs: false,
+            windowed_state: false,
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,

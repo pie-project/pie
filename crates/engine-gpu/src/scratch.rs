@@ -536,11 +536,23 @@ const COPY_ALIGN: u64 = 16;
 /// head width and whether it lands its LSE, once.
 #[must_use]
 pub fn decodes(trace: &Trace) -> Vec<(u32, bool)> {
+    decodes_where(trace, |_| true)
+}
+
+/// The decodes of [`decodes`] over a sliding window: those whose keys may
+/// lie in a ring (CONTRACT-BC 19), which take the kernels' ring form.
+#[must_use]
+pub fn windowed_decodes(trace: &Trace) -> Vec<(u32, bool)> {
+    decodes_where(trace, |window| window.is_some())
+}
+
+fn decodes_where(trace: &Trace, keep: impl Fn(Option<u32>) -> bool) -> Vec<(u32, bool)> {
     let mut out: Vec<(u32, bool)> = Vec::new();
     for node in &trace.nodes {
         let Operation::Attn(Attn::Decode {
             head_dim,
             lse,
+            window,
             selection: None,
             bias: None,
             selected: None,
@@ -550,6 +562,9 @@ pub fn decodes(trace: &Trace) -> Vec<(u32, bool)> {
         else {
             continue;
         };
+        if !keep(*window) {
+            continue;
+        }
         let decode = (*head_dim, lse.is_some());
         if !out.contains(&decode) {
             out.push(decode);

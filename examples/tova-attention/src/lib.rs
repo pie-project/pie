@@ -1,6 +1,9 @@
 //! TOVA — Token Omission Via Attention (Oren et al., 2024), <https://arxiv.org/abs/2401.06104>.
 //!
-//! Observes only: nothing is masked, so the text must match `naive-baseline`'s.
+//! Observes only: nothing is masked, so given the same prompt, temperature,
+//! seed and `max_tokens` the text must match `naive-baseline`'s — it draws
+//! from `naive-baseline`'s streams, `seed` for the prefill and `seed ^ 0x5bd1`
+//! for the decode.
 
 use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -120,6 +123,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
+    // `naive-baseline`'s streams, since the text is compared against it.
     let rng_p = Channel::from([input.seed, 0]);
     let tok_out_p = Channel::new([1], dtype::i32);
 
@@ -149,7 +153,7 @@ async fn main(input: Input) -> Result<Output> {
     // ── DECODE LOOP (1-wide, run-ahead), with the TOVA tap. ──
     if generated.len() < max_tokens {
         let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x70a, 0]);
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
         let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
         let scores_out = Channel::new([kv_max], dtype::f32).capacity(channel_capacity() as u32);

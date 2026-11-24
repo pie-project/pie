@@ -262,7 +262,16 @@ pub struct KvStore {
     shape: Option<::engine::chunk::ShapeId>,
     /// `None` while some are off the device.
     flat: HashMap<WorkingSetId, Option<Vec<PhysicalKvPageId>>>,
+    /// The model's domain ([`state::identity::ModelIdentity::domain`]):
+    /// what every set's own domain is derived under, and what the disk
+    /// journal and snapshots are checked against.
     domain: Hash256,
+    /// Each live set's domain, and the scope it asked if it did
+    /// ([`crate::policy::share`]).
+    scopes: HashMap<WorkingSetId, SetScope>,
+    /// Random each run: what a set that asked nothing keys under.
+    private_seed: Hash256,
+    private_nonce: u64,
     /// By entry id. Under test in id order (the order entries were kept),
     /// so a seeded simulation reclaims the same entries on each run.
     cache: CacheMap,
@@ -310,6 +319,21 @@ pub struct KvStore {
     /// The same for idle cache below the device: see
     /// [`Self::below_device_cache_pages`].
     below_cached: std::cell::Cell<Option<(Instant, std::time::Duration, (u32, u32))>>,
+    /// The same for what of it the retention keys let go, and the keys'
+    /// revision it was read under: see [`Self::droppable_below_device`].
+    droppable_below: std::cell::Cell<Option<(Instant, std::time::Duration, u64, (u32, u32))>>,
+    /// The reclaim order the last reclaim left: see [`Self::kept_order`].
+    order: Option<KeptOrder>,
+    /// Bumped as an entry joins or leaves the cache, or is used: what a kept
+    /// order read of the entries stands until it moves.
+    entries_rev: u64,
+    /// Device pages a reclaim freed that wait on a fire's retirement: they
+    /// are returning, and count toward what a waiter is short of, so a
+    /// reclaim for the same shortfall frees none past them
+    /// ([`Self::reclaim_returning`]).
+    returning: HashSet<PhysicalKvPageId>,
+    /// While a reclaim runs, the device pages it lets go.
+    reclaiming: Option<Vec<PhysicalKvPageId>>,
     /// The disk slots whole disk chunks hold for state other than kv
     /// ([`Self::take_disk_chunks`]): a parked guest part's.
     guest_disk_slots: u32,
@@ -455,6 +479,27 @@ struct KeptEntry {
     decoded: bool,
 }
 
+/// The reclaim order ([`KvStore::reclaim_order`]) a reclaim left, and the
+/// revisions it was read under: the table's, the entries' and the keys'.
+/// Any change to what the order reads moves one of them, and the order is
+/// walked again; the reclaim's own drops and settles leave it in order.
+#[derive(Debug)]
+struct KeptOrder {
+    table: u64,
+    entries: u64,
+    keys: u64,
+    groups: Vec<(i64, Vec<u64>)>,
+}
+
+/// A set's domain: where its keys chain from at row 0. A set that asked
+/// nothing has one of its own; one that shares, its scope's, resolved again
+/// at each keyed pass ([`KvStore::pass_domain`]).
+#[derive(Debug, Clone)]
+struct SetScope {
+    domain: Hash256,
+    share: Option<crate::policy::share::ShareAs>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CachedWorkingSet {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -462,6 +507,10 @@ pub struct CachedWorkingSet {
     pub entries: usize,
     pub pages: u64,
     pub last_use: Instant,
+    /// Whether any of its pages sits on the device, or on the host: what
+    /// discarding it can free there.
+    pub on_device: bool,
+    pub on_host: bool,
 }
 
 impl KvStore {
@@ -526,6 +575,9 @@ impl KvStore {
             shape: None,
             flat: HashMap::new(),
             domain: hash::cache_domain(&seed),
+            scopes: HashMap::new(),
+            private_seed: seed,
+            private_nonce: 0,
             cache: CacheMap::new(),
             by_owner: HashMap::new(),
             node_epochs: HashMap::new(),
@@ -546,6 +598,11 @@ impl KvStore {
             hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
             below_cached: std::cell::Cell::new(None),
+            droppable_below: std::cell::Cell::new(None),
+            order: None,
+            entries_rev: 0,
+            returning: HashSet::new(),
+            reclaiming: None,
             guest_disk_slots: 0,
         }
     }
@@ -580,6 +637,104 @@ impl KvStore {
         self.domain = domain;
     }
 
+    /// Whether `ws` has keyed nothing yet: no row logged, no page sealed.
+    fn unkeyed(&self, ws: WorkingSetId) -> Result<bool, KvStoreError> {
+        Ok(self.table.logged(ws)?.is_empty() && self.table.sealed_prefix(ws)? == 0)
+    }
+
+    /// `ws` shares as `ask` says (`working-set.share`): asked before it
+    /// keys anything, since its keys chain from its domain. Asking what it
+    /// shares as already is no change.
+    pub fn share(
+        &mut self,
+        ws: WorkingSetId,
+        ask: crate::policy::share::ShareAs,
+    ) -> Result<(), String> {
+        let domain = crate::policy::share::domain_now(&self.domain, &ask);
+        let unkeyed = self.unkeyed(ws).map_err(|error| error.to_string())?;
+        let Some(entry) = self.scopes.get_mut(&ws) else {
+            return Err("share: the working set is gone".to_string());
+        };
+        if entry.share.as_ref() == Some(&ask) && entry.domain == domain {
+            return Ok(());
+        }
+        if !unkeyed {
+            return Err(
+                "share: the working set holds keyed rows already; ask before its first pass"
+                    .to_string(),
+            );
+        }
+        *entry = SetScope {
+            domain,
+            share: Some(ask),
+        };
+        Ok(())
+    }
+
+    /// A set shared within the test tenant ([`crate::policy::share::test_tenant`]).
+    #[cfg(test)]
+    pub fn create_shared_working_set(&mut self) -> WorkingSetId {
+        let ws = self.create_working_set();
+        self.share(ws, crate::policy::share::test_tenant())
+            .expect("a new set shares");
+        ws
+    }
+
+    /// Whether `ws` shares (asked, and its scope still stands).
+    pub fn shares(&self, ws: WorkingSetId) -> bool {
+        self.scopes.get(&ws).is_some_and(|scope| scope.share.is_some())
+    }
+
+    /// The domain a keyed pass on `ws` hashes its rows under, and whether
+    /// it shares: its scope resolved again (a group's grant may have been
+    /// revoked or reissued). A set that keyed nothing yet takes the scope's
+    /// domain now; one whose rows chain from a domain its scope no longer
+    /// resolves to shares nothing from here on, its rows still keyed where
+    /// they began.
+    pub fn pass_domain(&mut self, ws: WorkingSetId) -> Result<(Hash256, bool), KvStoreError> {
+        let Some(entry) = self.scopes.get(&ws) else {
+            return Err(page_table::KvTableError::UnknownWorkingSet.into());
+        };
+        let Some(ask) = &entry.share else {
+            return Ok((entry.domain, false));
+        };
+        let now = crate::policy::share::domain_now(&self.domain, ask);
+        if now == entry.domain {
+            return Ok((now, true));
+        }
+        let unkeyed = self.unkeyed(ws)?;
+        let entry = self.scopes.get_mut(&ws).expect("looked up above");
+        if unkeyed {
+            entry.domain = now;
+            Ok((now, true))
+        } else {
+            tracing::debug!(target: "pie::kv", "a set's share scope moved past its rows; it shares no more");
+            entry.share = None;
+            Ok((entry.domain, false))
+        }
+    }
+
+    /// `ws` asked nothing: a domain of its own, which no other set keys under.
+    fn private_scope(&mut self, ws: WorkingSetId) {
+        self.private_nonce += 1;
+        let domain = crate::policy::share::private_domain(
+            &self.domain,
+            &self.private_seed,
+            self.private_nonce,
+        );
+        self.scopes.insert(ws, SetScope { domain, share: None });
+    }
+
+    /// Where `ws`'s keys chain from at row 0.
+    /// Every set the store makes has one ([`Self::private_scope`]); a set
+    /// it does not know keys under no scope's domain either.
+    fn domain_of(&self, ws: WorkingSetId) -> Hash256 {
+        self.scopes.get(&ws).map_or_else(
+            || crate::policy::share::private_domain(&self.domain, &self.private_seed, 0),
+            |scope| scope.domain,
+        )
+    }
+
     /// `Some(None)` at slot 0; `None` when that slot is opaque and no hash
     /// names what follows.
     pub fn chain_root(
@@ -610,7 +765,7 @@ impl KvStore {
     ) -> Result<Option<Vec<Hash256>>, KvStoreError> {
         Ok(self
             .chain_root(ws, start, page_size)?
-            .map(|prev| hash::chain_slots(&self.domain, prev, start, tokens)))
+            .map(|prev| hash::chain_slots(&self.domain_of(ws), prev, start, tokens)))
     }
 
     /// A page whose every slot is hashed seals, its hash naming it and all its
@@ -643,7 +798,8 @@ impl KvStore {
             sealed += u32::from(page_hash.is_some());
             pages.push((hashes, page_hash));
         }
-        self.table.commit_hashes(ws, first, pages)?;
+        let published = self.shares(ws);
+        self.table.commit_hashes(ws, first, pages, published)?;
         if sealed > 0 {
             // Passes waiting on these pages look again.
             self.note_cached();
@@ -750,6 +906,7 @@ impl KvStore {
         Ok(sealed)
     }
 
+    /// The model's domain, not any set's: see [`Self::pass_domain`].
     pub fn domain(&self) -> Hash256 {
         self.domain
     }
@@ -785,6 +942,7 @@ impl KvStore {
     pub fn create_working_set(&mut self) -> WorkingSetId {
         let ws = self.table.create_working_set();
         self.flat.insert(ws, Some(Vec::new()));
+        self.private_scope(ws);
         ws
     }
 
@@ -862,17 +1020,23 @@ impl KvStore {
                 continue;
             };
             let pages = entry.path.pages;
+            let on_device = self.table.holds_resident(entry.path.terminal);
+            let on_host = self.table.holds_on_host(entry.path.terminal);
             sets.entry(owner)
                 .and_modify(|set| {
                     set.entries += 1;
                     set.pages = set.pages.max(pages);
                     set.last_use = set.last_use.max(entry.last_use);
+                    set.on_device |= on_device;
+                    set.on_host |= on_host;
                 })
                 .or_insert(CachedWorkingSet {
                     owner,
                     entries: 1,
                     pages,
                     last_use: entry.last_use,
+                    on_device,
+                    on_host,
                 });
         }
         sets.into_values().collect()
@@ -881,6 +1045,19 @@ impl KvStore {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn owns_cache(&self, owner: ProcessId) -> bool {
         self.owners.contains_key(&owner)
+    }
+
+    /// Whether `owner` (a PLEX id) has KV here: cached, or in a working set
+    /// not yet released. A process's last fire settles after it exits, and
+    /// only then is what it leaves cached: until then its working set is
+    /// still here, not gone.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn holds_kv_of(&self, owner: ProcessId) -> bool {
+        self.owns_cache(owner)
+            || self
+                .table
+                .working_set_owners()
+                .any(|of| crate::policy::schedule::plex_id(of) == owner)
     }
 
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -909,63 +1086,137 @@ impl KvStore {
         freed
     }
 
-    /// Only what no live working set reads, lowest key first, then least
-    /// recently used.
-    /// Pages the disk tier keeps a copy of settle there instead, at no cost,
-    /// and their entries stay. The runtime runs it only as
-    /// [`Self::reclaim_droppable`]; this drops whatever the keys order.
+    /// Frees `short` device pages of idle cache, and no more than the last
+    /// group it reaches holds: only what no live working set reads, lowest
+    /// key first, then least recently used. Pages the disk tier keeps a copy
+    /// of settle there instead, at no cost, and their entries stay. The
+    /// runtime runs it only as [`Self::reclaim_droppable`]; this drops
+    /// whatever the keys order.
     #[cfg(test)]
-    pub fn reclaim_cache(&mut self, epoch: u64, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, keys, |_| true)
+    pub fn reclaim_cache(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
+        self.reclaim_cache_where(epoch, short, keys)
     }
 
-    /// [`Self::reclaim_cache`] as the runtime may run it unasked: it drops
-    /// only entries whose key says they may go (`pressure::may_drop`). One
-    /// keyed higher may still settle on its disk copy, which drops nothing.
-    pub fn reclaim_droppable(&mut self, epoch: u64, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, keys, crate::policy::pressure::may_drop)
+    /// [`Self::reclaim_cache`] as the runtime runs it, once a demote had
+    /// nothing to move (`prepare_demote` goes first where the planner
+    /// demotes): cached KV yields to running work, whatever its key, lowest
+    /// key first, then least recently used, for what is `short` and no more.
+    /// Any may still settle on its disk copy, which drops nothing.
+    pub fn reclaim_droppable(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
+        self.reclaim_cache_where(epoch, short, keys)
     }
 
     fn reclaim_cache_where(
         &mut self,
         epoch: u64,
+        short: usize,
         keys: impl Keys,
-        drops: fn(i64) -> bool,
     ) -> usize {
-        self.split_at_steps(&keys);
-        self.split_persisted();
+        // Pages an earlier reclaim freed are on their way back: what they
+        // cover is not short.
+        let short = short.saturating_sub(self.reclaim_returning());
+        if short == 0 {
+            return 0;
+        }
+        self.reclaiming = Some(Vec::new());
         let mut freed = 0;
-        let ordering = Instant::now();
-        let mut groups = self.reclaim_order(&keys);
-        // The order walks every cached entry under the lock every guest's
-        // fire waits on: one that took long frees more for what it took, up
-        // to eight times the step.
-        let steps = (ordering.elapsed().as_micros() / 4_000).clamp(1, 8) as usize;
-        let want = (self.pool.capacity() as usize / 64).max(1) * steps;
+        let mut order = self.kept_order(&keys);
+        // Groups that free no device page go last; the walk stops as soon as
+        // what is short is freed, so it reads only the groups it reaches.
+        let mut later = Vec::new();
+        let mut reached = Vec::new();
         'passes: for last in [false, true] {
-            let mut later = Vec::new();
-            for (key, ids) in std::mem::take(&mut groups) {
-                if !last && !self.table.frees_device_pages(&self.roots(&ids)) {
-                    later.push((key, ids));
+            let walk = if last {
+                std::mem::take(&mut later)
+            } else {
+                Vec::new()
+            };
+            let count = if last { walk.len() } else { order.len() };
+            for at in 0..count {
+                let at = if last { walk[at] } else { at };
+                let (key, ids) = &order[at];
+                let roots = self.roots(ids);
+                // A kept order may name a group its last reclaim settled
+                // whole on disk: it holds no device page now.
+                if roots.iter().all(|&root| !self.table.holds_resident(root)) {
                     continue;
                 }
+                if !last && !self.table.frees_device_pages(&roots) {
+                    later.push(at);
+                    continue;
+                }
+                let key = *key;
                 let before = freed;
-                freed += self.settle_on_disk(&ids, key, &keys, epoch);
-                if freed == before && drops(key) {
-                    let ids = ids
-                        .into_iter()
+                freed += self.settle_on_disk(ids, key, &keys, epoch, short - freed);
+                if freed == before {
+                    let ids: Vec<u64> = ids
+                        .iter()
+                        .copied()
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
                         .collect();
+                    tracing::debug!(target: "pie::kv", key, entries = ids.len(), "reclaim drops");
                     freed += self.drop_entries(ids, By::Host, epoch);
+                    reached.push(at);
                 }
-                if freed >= want {
+                if freed >= short {
                     break 'passes;
                 }
             }
-            groups = later;
         }
-        tracing::debug!(target: "pie::kv", freed, "reclaimed");
+        for at in reached {
+            let cache = &self.cache;
+            order[at].1.retain(|id| cache.contains_key(id));
+        }
+        order.retain(|(_, ids)| !ids.is_empty());
+        self.keep_order(order, &keys);
+        let mut let_go: HashSet<PhysicalKvPageId> =
+            self.reclaiming.take().unwrap_or_default().into_iter().collect();
+        self.pool.retain_pending(&mut let_go);
+        self.returning.extend(let_go);
+        tracing::debug!(target: "pie::kv", short, freed, "reclaimed");
         freed
+    }
+
+    /// The device pages reclaims freed that still wait on a fire's
+    /// retirement: returning, with nothing more to do but wait for it (a
+    /// fire's settle retires them, and tells the planner).
+    pub fn reclaim_returning(&mut self) -> usize {
+        self.pool.retain_pending(&mut self.returning);
+        self.returning.len()
+    }
+
+    /// [`Self::reclaim_order`], walked again (and the entries split at
+    /// their steps and persisted heads first) only when something it reads
+    /// changed since the last reclaim left it: a reclaim short of a page at
+    /// a time walked every cached entry under the lock every guest's fire
+    /// waits on, each time. A split joins entries, so it moves the order;
+    /// what would split again moves one of the revisions too.
+    fn kept_order(&mut self, keys: &impl Keys) -> Vec<(i64, Vec<u64>)> {
+        let table = self.table.revision();
+        let (entries, revision) = (self.entries_rev, keys.revision());
+        if let Some(kept) = self.order.take().filter(|kept| {
+            kept.table == table && kept.entries == entries && Some(kept.keys) == revision
+        }) {
+            return kept.groups;
+        }
+        self.split_at_steps(keys);
+        self.split_persisted();
+        self.reclaim_order(keys)
+    }
+
+    /// Keeps what of `order` a reclaim left (its dropped entries taken out),
+    /// under the revisions it leaves: its settles move pages down, which the
+    /// next reclaim reads as it goes; nothing else it does reorders the rest.
+    fn keep_order(&mut self, groups: Vec<(i64, Vec<u64>)>, keys: &impl Keys) {
+        let Some(revision) = keys.revision() else {
+            return;
+        };
+        self.order = Some(KeptOrder {
+            table: self.table.revision(),
+            entries: self.entries_rev,
+            keys: revision,
+            groups,
+        });
     }
 
     /// The terminals of entries whose key is above `key`: what they cover
@@ -979,9 +1230,16 @@ impl KvStore {
     }
 
     /// Moves the device pages only `ids` read, that the disk tier keeps a
-    /// copy of, onto their copies: no copy is made. Answers the device
-    /// pages freed.
-    fn settle_on_disk(&mut self, ids: &[u64], key: i64, keys: &impl Keys, epoch: u64) -> usize {
+    /// copy of, onto their copies, up to `most`: no copy is made. Answers
+    /// the device pages freed.
+    fn settle_on_disk(
+        &mut self,
+        ids: &[u64],
+        key: i64,
+        keys: &impl Keys,
+        epoch: u64,
+        most: usize,
+    ) -> usize {
         if self.persisted.as_ref().is_none_or(|p| p.by_key.is_empty()) {
             return 0;
         }
@@ -991,6 +1249,7 @@ impl KvStore {
             .cache_only_pages(&self.roots(ids), &above)
             .into_iter()
             .filter_map(|(location, gpu)| Some((location, gpu, self.copy_of(&location)?)))
+            .take(most)
             .collect();
         if moves.is_empty() {
             return 0;
@@ -1017,8 +1276,11 @@ impl KvStore {
             pages = ?moves.iter().map(|&(_, gpu, slot)| (gpu.0, slot.0)).collect::<Vec<_>>(),
             "cache-only device pages settled on their disk copies"
         );
-        self.pool
-            .recycle_after_epoch(moves.into_iter().map(|(_, gpu, _)| gpu).collect(), epoch);
+        let gpu: Vec<PhysicalKvPageId> = moves.into_iter().map(|(_, gpu, _)| gpu).collect();
+        if let Some(reclaiming) = &mut self.reclaiming {
+            reclaiming.extend(&gpu);
+        }
+        self.pool.recycle_after_epoch(gpu, epoch);
         // With no fire in flight the epoch has retired already: the pages
         // are free now, not at a next fire that may wait on them.
         self.retire_idle();
@@ -1097,6 +1359,7 @@ impl KvStore {
             }
             self.kept += 1;
             self.list(self.kept, path.terminal);
+            retention::idle_cache_appeared();
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
             self.note_change(path.terminal, true);
         }
@@ -1144,6 +1407,11 @@ impl KvStore {
             })
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
+        tracing::debug!(
+            target: "pie::retention",
+            order = ?order.iter().map(|((key, ..), (_, ids))| (*key, ids.len())).collect::<Vec<_>>(),
+            "idle cache, lowest key first"
+        );
         order.into_iter().map(|(_, group)| group).collect()
     }
 
@@ -1156,28 +1424,104 @@ impl KvStore {
     /// Moves idle cache off the device, host first and what the host
     /// cannot take to disk (as a suspend's pages go), lowest retention key
     /// first: one group, up to `room` pages. A persistent disk tier keeps
-    /// what lands on disk as its copies, journaled. Only cache keyed above
-    /// the retention floor ([`retention::above_floor`]) moves: the rest is
-    /// dropped when its room is wanted, never copied down.
+    /// what lands on disk as its copies, journaled. Only cache whose tiers
+    /// name the host moves: the rest is dropped when its room is wanted.
     pub fn prepare_demote(
         &mut self,
         room: usize,
         keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        // Free slots only: a demote gives up no copy for idle cache.
-        let room = room.min(self.host_pool.available() + self.disk_pool.available());
+        self.prepare_demote_where(room, keys, false)
+    }
+
+    /// The tiers entry `id`'s KV may sit on.
+    fn tiers_of(&self, id: u64, keys: &impl Keys) -> u8 {
+        self.cache.get(&id).map_or(retention::ALL_TIERS, |entry| {
+            keys.tiers_at(entry.owner, self.key_token(entry.path.pages))
+        })
+    }
+
+    /// Idle cache a `retention/tiers` row keeps off the device, moved down
+    /// now, whatever its key and whether or not its room is wanted.
+    pub fn prepare_demote_now(
+        &mut self,
+        keys: impl Keys,
+    ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        let room = self.host_pool.available() + self.disk_pool.available();
+        self.prepare_demote_where(room, keys, true)
+    }
+
+    /// Idle cache whose row lets it sit nowhere, or not where it is (on
+    /// the host, a row without the host), dropped now. How many entries.
+    pub fn drop_disallowed(&mut self, keys: impl Keys) -> usize {
+        self.split_at_steps(&keys);
+        let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
+        let gone: Vec<u64> = self
+            .cache
+            .iter()
+            .filter(|(_, entry)| unused.contains(&entry.path.terminal))
+            .filter(|(id, entry)| {
+                let tiers = self.tiers_of(**id, &keys);
+                let resident = self.table.holds_resident(entry.path.terminal);
+                tiers == 0 || (!resident && tiers & retention::HOST == 0)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        if gone.is_empty() {
+            return 0;
+        }
+        tracing::debug!(target: "pie::retention", entries = gone.len(), "dropped: their row allows no tier they are on");
+        self.drop_entries(gone, By::Policy, self.current_epoch())
+    }
+
+    /// [`Self::prepare_demote`], or (`now`) only cache whose row keeps it
+    /// off the device and lets it on the host. Cache whose row keeps it off
+    /// the host is never moved down: it is dropped when its room is wanted.
+    fn prepare_demote_where(
+        &mut self,
+        room: usize,
+        keys: impl Keys,
+        now: bool,
+    ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         if room == 0 {
             return Ok(None);
         }
         self.split_at_steps(&keys);
         self.split_persisted();
-        let mut groups = self.reclaim_order(&keys);
+        let order = self.reclaim_order(&keys);
+        // The device holds the highest keys first: idle cache keyed lower
+        // that may not move down is dropped (the caller's reclaim) before
+        // anything keyed above it moves down. A sweep (`now`) moves what its
+        // row keeps off the device whatever lies below.
+        let floor = (!now)
+            .then(|| {
+                order
+                    .iter()
+                    .filter(|(_, ids)| self.table.frees_device_pages(&self.roots(ids)))
+                    .find(|(_, ids)| {
+                        ids.iter().all(|&id| self.tiers_of(id, &keys) & retention::HOST == 0)
+                    })
+                    .map(|(key, _)| *key)
+            })
+            .flatten();
+        let mut groups: Vec<(i64, Vec<u64>)> = order
+            .into_iter()
+            .filter(|(key, _)| floor.is_none_or(|floor| *key < floor))
+            .map(|(key, ids)| {
+                let ids: Vec<u64> = ids
+                    .into_iter()
+                    .filter(|&id| {
+                        let tiers = self.tiers_of(id, &keys);
+                        tiers & retention::HOST != 0 && (!now || tiers & retention::DEVICE == 0)
+                    })
+                    .collect();
+                (key, ids)
+            })
+            .filter(|(_, ids)| !ids.is_empty())
+            .collect();
         for last in [false, true] {
             let mut later = Vec::new();
             for (key, ids) in std::mem::take(&mut groups) {
-                if !retention::above_floor(key) {
-                    continue;
-                }
                 if !last && !self.table.frees_device_pages(&self.roots(&ids)) {
                     later.push((key, ids));
                     continue;
@@ -1191,14 +1535,44 @@ impl KvStore {
                 if pages.is_empty() {
                     continue;
                 }
-                pages.truncate(room);
+                // Each tier holds the highest keys first: short of free slots
+                // below, the group's room comes from idle cache the host
+                // holds keyed lower, lowest first. Keyed alike (no policy),
+                // nothing is displaced and a demote takes free slots only.
+                // Disk is room only for a group every row of which lets it
+                // on disk; the rest moves to the host or nowhere.
+                let disk = if ids.iter().all(|&id| self.tiers_of(id, &keys) & retention::DISK != 0) {
+                    self.disk_pool.available()
+                } else {
+                    0
+                };
+                let want = pages.len().min(room);
+                if self.host_pool.available() + disk < want {
+                    let host = want.saturating_sub(disk);
+                    if self.drop_entries_off_device(host, &keys, Some(key)) > 0 {
+                        // Dropping can compact the pages just listed.
+                        pages = self.table.cache_only_pages(&self.roots(&ids), &above);
+                        pages.retain(|(location, _)| self.copy_of(location).is_none());
+                    }
+                }
+                let free = self.host_pool.available() + disk;
+                if pages.is_empty() {
+                    continue;
+                }
+                // The lowest group finds no room below: it is dropped (the
+                // caller's reclaim) before anything keyed above it moves down.
+                if free == 0 {
+                    return Ok(None);
+                }
+                pages.truncate(room.min(free));
                 tracing::debug!(target: "pie::kv", pages = pages.len(), "demote");
                 let records = self.demote_records(&ids, pages.iter().map(|&(at, _)| at), key);
                 // A run split over the tiers would leave its disk tail
                 // following on from pages a restart loses: a persistent
                 // tier takes a group the host cannot hold whole.
                 let host = self.host_pool.available();
-                let on_host = if pages.len() <= host
+                let on_host = if disk == 0
+                    || pages.len() <= host
                     || records.is_empty()
                     || self.disk_pool.available() < pages.len()
                 {
@@ -1304,9 +1678,9 @@ impl KvStore {
     /// tier a group goes whole or not at all (a run split over host and
     /// disk would leave its disk tail an orphan at restart), so more than
     /// `wanted` may go; what lands is journaled. Only a shared pool's kv
-    /// list moves host -> disk (CONTRACT-BC 22), and only cache keyed above
-    /// the retention floor is copied: floor-keyed cache on the host is
-    /// dropped when the host's room is wanted (`prepare_suspend`). `None`
+    /// list moves host -> disk (CONTRACT-BC 22), and only cache whose tiers
+    /// name the disk is copied: the rest on the host is dropped when the
+    /// host's room is wanted (`prepare_suspend`). `None`
     /// when nothing is left to copy.
     pub fn prepare_spill(&mut self, wanted: usize, keys: impl Keys) -> Option<KvSpillTxn> {
         let shape = self.shape?;
@@ -1320,12 +1694,21 @@ impl KvStore {
             if pages.len() >= wanted || room == 0 {
                 break;
             }
+            // Only what its tiers let on disk goes there: the rest is dropped
+            // when the host's room is wanted.
+            let ids: Vec<u64> = ids
+                .into_iter()
+                .filter(|&id| self.tiers_of(id, &keys) & retention::DISK != 0)
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
             // What a higher key also covers stays with it.
             let above = self.above(key, &keys);
             let mut group = self.table.cache_only_host_slots(&self.roots(&ids), &above);
             group.retain(|(location, _)| !taken.contains(location));
             self.settle_host_on_disk(&mut group);
-            if group.is_empty() || !retention::above_floor(key) {
+            if group.is_empty() {
                 continue;
             }
             let kept = self.demote_records(&ids, group.iter().map(|&(at, _)| at), key);
@@ -1340,6 +1723,7 @@ impl KvStore {
             records.extend(kept);
         }
         self.below_cached.set(None);
+        self.droppable_below.set(None);
         if pages.is_empty() {
             return None;
         }
@@ -1370,6 +1754,7 @@ impl KvStore {
         let per_chunk = per_chunk.max(1);
         let firsts = self.disk_pool.try_alloc_aligned_runs(n, per_chunk)?;
         self.below_cached.set(None);
+        self.droppable_below.set(None);
         self.guest_disk_slots += firsts.len() as u32 * per_chunk;
         Some(firsts.into_iter().map(|slot| slot.0 / per_chunk).collect())
     }
@@ -1388,7 +1773,7 @@ impl KvStore {
             if self.host_pool.capacity() == 0 && self.disk_pool.capacity() == 0 {
                 (0, 0)
             } else {
-                self.table.cache_only_below_device(&roots)
+                self.table.cache_only_below_device(&roots, &[])
             };
         KvCensus {
             held: u64::from(self.pool.out())
@@ -1632,6 +2017,7 @@ impl KvStore {
             .collect();
         self.disk_pool.release_runs(&firsts, per_chunk);
         self.below_cached.set(None);
+        self.droppable_below.set(None);
         self.guest_disk_slots = self
             .guest_disk_slots
             .saturating_sub(firsts.len() as u32 * per_chunk);
@@ -1679,6 +2065,7 @@ impl KvStore {
             pages.extend(group);
         }
         self.below_cached.set(None);
+        self.droppable_below.set(None);
         if pages.is_empty() {
             return None;
         }
@@ -1786,6 +2173,7 @@ impl KvStore {
         self.host_pool
             .release_reserved(txn.pages.into_iter().map(|(_, host, _)| host).collect());
         self.below_cached.set(None);
+        self.droppable_below.set(None);
         self.end_move(freed);
         tracing::debug!(target: "pie::kv", pages = count, "spilled host to disk");
         count
@@ -1821,8 +2209,46 @@ impl KvStore {
         }
         let began = Instant::now();
         let roots = self.table.unused_cache_roots();
-        let pages = self.table.cache_only_below_device(&roots);
+        let pages = self.table.cache_only_below_device(&roots, &[]);
         self.below_cached.set(Some((began, began.elapsed(), pages)));
+        pages
+    }
+
+    /// [`Self::below_device_cache_pages`] of what the retention keys let go
+    /// ([`pressure::may_drop`](crate::policy::pressure::may_drop)): the room
+    /// below the device a demand may take by dropping idle cache
+    /// ([`Self::drop_entries_off_device`]). What cache keyed above the floor
+    /// holds is room only the policy gives. A count stands as
+    /// [`Self::below_device_cache_pages`]' does, under the keys' revision;
+    /// under keys of none it is taken each time.
+    pub fn droppable_below_device(&self, keys: impl Keys) -> (u32, u32) {
+        if self.host_pool.capacity() == 0 && self.disk_pool.capacity() == 0 {
+            return (0, 0);
+        }
+        let revision = keys.revision();
+        if let (Some(revision), Some((at, took, read, pages))) =
+            (revision, self.droppable_below.get())
+            && read == revision
+            && at.elapsed() < std::time::Duration::from_secs(1).max(took * 50)
+        {
+            return pages;
+        }
+        let began = Instant::now();
+        let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
+        let (mut droppable, kept): (Vec<NodeId>, Vec<NodeId>) = (Vec::new(), Vec::new());
+        for entry in self.cache.values() {
+            let root = entry.path.terminal;
+            if !unused.contains(&root) {
+                continue;
+            }
+            // Keys order what goes, never keep it (PLEX 1.1): all of it is room.
+            droppable.push(root);
+        }
+        let pages = self.table.cache_only_below_device(&droppable, &kept);
+        if let Some(revision) = revision {
+            self.droppable_below
+                .set(Some((began, began.elapsed(), revision, pages)));
+        }
         pages
     }
 
@@ -1929,6 +2355,11 @@ impl KvStore {
     /// Every sealed page's key in the nodes of `ids` still here, on any tier.
     pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
         self.table.sealed_key_list(ids)
+    }
+
+    /// Those of them off the device: `false` on the host, `true` on disk.
+    pub fn off_device_key_list(&self, ids: &[NodeId]) -> Vec<(Hash256, bool)> {
+        self.table.off_device_key_list(ids)
     }
 
     /// Host slots to land pages in that come from another worker; given
@@ -2043,6 +2474,7 @@ impl KvStore {
         self.kept += 1;
         self.list(self.kept, node);
         tracing::debug!(target: "pie::kv", pages, "imported");
+        retention::idle_cache_appeared();
         self.cache.insert(
             self.kept,
             KeptEntry {
@@ -2118,6 +2550,8 @@ impl KvStore {
         let backings = slots.into_iter().map(KvPageBacking::Swapped).collect();
         let ws = self.table.imported(set, backings)?;
         self.refresh_flat(ws);
+        // Its rows came keyed: it shares nothing until a scope it asks.
+        self.private_scope(ws);
         Ok(ws)
     }
 
@@ -2143,6 +2577,7 @@ impl KvStore {
     /// (before its pages are released): while a prompt waits, its path's
     /// page keys are kept for [`Self::take_changes`].
     fn note_change(&mut self, terminal: NodeId, joined: bool) {
+        self.entries_rev += 1;
         if crate::store::waiting::watched() {
             let keys = self
                 .table
@@ -2194,6 +2629,10 @@ impl KvStore {
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvStoreError> {
         let child = self.table.fork(ws)?;
         self.refresh_flat(child);
+        // The child's rows chain from its parent's, and share as they do.
+        if let Some(scope) = self.scopes.get(&ws).cloned() {
+            self.scopes.insert(child, scope);
+        }
         Ok(child)
     }
 
@@ -2259,7 +2698,8 @@ impl KvStore {
         if let Ok(Some(terminal)) = self.table.terminal(ws) {
             self.stamp_path(terminal, epoch);
         }
-        if self.keeps {
+        // Only a set that shares leaves its prefix for others to find.
+        if self.keeps && self.shares(ws) {
             // What its decodes folded seals as it goes, unless a prompt
             // sealed it already.
             if let Err(error) = self.seal_folded(ws, false) {
@@ -2280,6 +2720,7 @@ impl KvStore {
         // What no fire in flight reads is free now, not at a next fire.
         self.retire_idle();
         self.flat.remove(&ws);
+        self.scopes.remove(&ws);
         self.note_cached();
     }
 
@@ -2306,9 +2747,7 @@ impl KvStore {
         self.kept += 1;
         self.list(self.kept, path.terminal);
         tracing::debug!(target: "pie::kv", pages, decoded, "kept");
-        if let Some(owner) = owner {
-            crate::policy::report(Event::Kept(owner, pages * u64::from(self.page_size)));
-        }
+        retention::idle_cache_appeared();
         let terminal = path.terminal;
         self.cache.insert(
             self.kept,
@@ -2450,7 +2889,7 @@ impl KvStore {
             return Ok(0);
         };
         let tokens = logged[start as usize..(full * page) as usize].to_vec();
-        let slots = hash::chain_slots(&self.domain, prev, start, &tokens);
+        let slots = hash::chain_slots(&self.domain_of(ws), prev, start, &tokens);
         self.seal_rows(ws, start, &slots, self.page_size)?;
         if prompt {
             self.table.reach_prompt(ws, full)?;
@@ -2571,6 +3010,7 @@ impl KvStore {
                         .within(entry.path.terminal, last, run.len() as u64)
                 {
                     entry.last_use = now;
+                    self.entries_rev += 1;
                 }
             }
         }
@@ -2614,6 +3054,9 @@ impl KvStore {
                 KvPageBacking::Resident(id) => resident.push(id),
                 swapped_backing => swapped.push(swapped_backing),
             }
+        }
+        if let Some(reclaiming) = &mut self.reclaiming {
+            reclaiming.extend(&resident);
         }
         self.pool.recycle_after_epoch(resident, epoch);
         self.release_swapped(swapped);
@@ -3296,21 +3739,25 @@ impl KvStore {
         emptied.saturating_sub(u32::try_from(opened).unwrap_or(u32::MAX))
     }
 
+    /// Host room is for what is paused before what is cached, as far as the
+    /// retention keys let the cache go ([`Self::drop_entries_off_device`],
+    /// [`Self::make_swap_room`]): past that the suspend is refused as
+    /// [`KvStoreError::HostSwapFull`], and waits for room.
     pub fn prepare_suspend(
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
+        keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         let mut pages = self.table.movable_resident_pages(working_sets)?;
-        // Host room is for what is paused before what is cached.
         if self.host_pool.available() < pages.len() {
-            self.drop_entries_off_device();
+            self.drop_entries_off_device(pages.len(), &keys, None);
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.movable_resident_pages(working_sets)?;
         }
         if pages.is_empty() {
             return Ok(None);
         }
-        let available = self.make_swap_room(pages.len());
+        let available = self.make_swap_room(pages.len(), &keys);
         if available < pages.len() {
             return Err(KvStoreError::HostSwapFull {
                 requested: pages.len(),
@@ -3327,8 +3774,9 @@ impl KvStore {
         room: usize,
         order: &[(WorkingSetId, u64)],
         wanted: usize,
+        keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        self.prepare_sweep_with(keep, room, order, wanted, true)
+        self.prepare_sweep_with(keep, room, order, wanted, true, &keys)
     }
 
     /// [`Self::prepare_sweep`] of the tails alone: the heads `order` names
@@ -3339,8 +3787,9 @@ impl KvStore {
         room: usize,
         order: &[(WorkingSetId, u64)],
         wanted: usize,
+        keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
-        self.prepare_sweep_with(keep, room, order, wanted, false)
+        self.prepare_sweep_with(keep, room, order, wanted, false, &keys)
     }
 
     fn prepare_sweep_with(
@@ -3350,6 +3799,7 @@ impl KvStore {
         order: &[(WorkingSetId, u64)],
         wanted: usize,
         spare_heads: bool,
+        keys: &impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
         // In tokens as a policy states them, in pages here.
         let page = u64::from(self.page_size.max(1));
@@ -3359,12 +3809,13 @@ impl KvStore {
             .collect();
         let order = &order[..];
         let mut pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
-        if self.swap_available() < pages.len().min(room) {
-            self.drop_entries_off_device();
+        if self.swap_available(keys) < pages.len().min(room) {
+            let wanted = pages.len().min(room).saturating_sub(self.disk_swap_free(keys));
+            self.drop_entries_off_device(wanted, keys, None);
             // Dropping can compact the pages just listed: list them again.
             pages = self.table.stranded_pages(keep, order, wanted, spare_heads);
         }
-        let available = self.make_swap_room(pages.len().min(room));
+        let available = self.make_swap_room(pages.len().min(room), keys);
         pages.truncate(room.min(available));
         if pages.is_empty() {
             return Ok(None);
@@ -3375,25 +3826,29 @@ impl KvStore {
         Ok(Some(self.prepare_move_out(&readers, pages)?))
     }
 
-    fn swap_available(&self) -> usize {
-        self.host_pool.available() + self.disk_swap_available()
+    fn swap_available(&self, keys: &impl Keys) -> usize {
+        self.host_pool.available() + self.disk_swap_free(keys)
     }
 
     /// Frees swap slots for `wanted` pages, giving up the disk tier's copies
-    /// if it must: suspended kv cannot be computed again, so it wins. Answers
-    /// the slots free.
-    fn make_swap_room(&mut self, wanted: usize) -> usize {
+    /// the retention keys let go if it must ([`Self::disk_yield_plan`]):
+    /// a copy kept above the floor stays, whatever waits on its room.
+    /// Answers the slots free.
+    fn make_swap_room(&mut self, wanted: usize, keys: &impl Keys) -> usize {
         let free = self.host_pool.available() + self.disk_pool.available();
         if free < wanted {
-            self.yield_disk(wanted - free);
+            self.yield_disk(wanted - free, keys);
         }
         self.host_pool.available() + self.disk_pool.available()
     }
 
     /// Copies whose pages are held on the device or the host, lowest
     /// retention key first; and the unused entries kept only on disk, at
-    /// the lowest key among their pages, then least recently used.
-    fn disk_yield_plan(&self) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
+    /// the lowest key among their pages, then least recently used. Only
+    /// what may go ([`pressure::may_drop`](crate::policy::pressure::may_drop)):
+    /// a copy by the key it was kept under, an entry by its own key and
+    /// every one of its copies'; dropping it gives them all up.
+    fn disk_yield_plan(&self, _keys: &impl Keys) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
         let Some(persisted) = &self.persisted else {
             return (Vec::new(), Vec::new());
         };
@@ -3409,8 +3864,9 @@ impl KvStore {
             return (spare, Vec::new());
         }
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
-        // An entry goes at the lowest key among its pages' copies.
-        let lowest = |entry: &KeptEntry| {
+        // An entry goes at the lowest key among its pages' copies, and only
+        // where the highest says it may.
+        let copies = |entry: &KeptEntry| -> (i64, i64) {
             self.table
                 .path_keys(entry.path.terminal)
                 .into_iter()
@@ -3418,8 +3874,10 @@ impl KvStore {
                 .take(entry.path.pages as usize)
                 .filter_map(|page| persisted.by_key.get(&page))
                 .map(key)
-                .min()
-                .unwrap_or(0)
+                .fold(None, |range: Option<(i64, i64)>, key| {
+                    Some(range.map_or((key, key), |(lo, hi)| (lo.min(key), hi.max(key))))
+                })
+                .unwrap_or((0, 0))
         };
         let mut whole: Vec<(i64, Instant, u64)> = self
             .cache
@@ -3431,7 +3889,10 @@ impl KvStore {
                     && !self.table.in_move_at(root)
                     && self.persisted_whole(entry)
             })
-            .map(|(&id, entry)| (lowest(entry), entry.last_use, id))
+            .filter_map(|(&id, entry)| {
+                let (lowest, _) = copies(entry);
+                Some((lowest, entry.last_use, id))
+            })
             .collect();
         whole.sort_unstable();
         (
@@ -3442,8 +3903,8 @@ impl KvStore {
 
     /// Gives up the disk tier's copies until `wanted` slots are free:
     /// [`Self::disk_yield_plan`] in order.
-    fn yield_disk(&mut self, wanted: usize) {
-        let (spare, whole) = self.disk_yield_plan();
+    fn yield_disk(&mut self, wanted: usize, keys: &impl Keys) {
+        let (spare, whole) = self.disk_yield_plan(keys);
         let start = self.disk_pool.available();
         let freed = |store: &Self| store.disk_pool.available().saturating_sub(start);
         let spare: Vec<DiskKvSlotId> = spare.into_iter().take(wanted).collect();
@@ -3656,21 +4117,39 @@ impl KvStore {
         self.persisted.as_ref().map_or(0, |p| p.slots.len())
     }
 
-    /// No lookup hits them, and no one will bring them back.
-    fn drop_entries_off_device(&mut self) {
+    /// Drops idle cache held off the device until the host has `wanted`
+    /// slots free: the lowest retention key first, then the least recently
+    /// used, so the host keeps the higher keys as the device does. No
+    /// lookup hits what goes, and no one will bring it back.
+    fn drop_entries_off_device(&mut self, wanted: usize, keys: &impl Keys, below: Option<i64>) -> usize {
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
-        let keys: Vec<u64> = self
+        let mut entries: Vec<(i64, Instant, u64)> = self
             .cache
             .iter()
             .filter(|(_, entry)| {
                 unused.contains(&entry.path.terminal)
                     && !self.table.settled_on_device(entry.path.terminal)
                     && !self.persisted_whole(entry)
+                    // Room made for a demote is host room: only what holds it.
+                    && (below.is_none() || self.table.holds_on_host(entry.path.terminal))
             })
-            .map(|(&key, _)| key)
+            .map(|(&id, entry)| {
+                let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
+                (key, entry.last_use, id)
+            })
+            .filter(|&(key, _, _)| below.is_none_or(|below| key < below))
             .collect();
-        tracing::debug!(target: "pie::kv", entries = keys.len(), "dropped off device");
-        self.drop_entries(keys, By::Host, self.current_epoch());
+        entries.sort_unstable();
+        let mut dropped = Vec::new();
+        for (key, _, id) in entries {
+            if self.host_pool.available() >= wanted {
+                break;
+            }
+            self.drop_entries(vec![id], By::Host, self.current_epoch());
+            dropped.push(key);
+        }
+        tracing::debug!(target: "pie::kv", entries = dropped.len(), keys = ?dropped, wanted, ?below, "dropped off device");
+        dropped.len()
     }
 
     pub fn mark_suspended(&mut self, working_sets: &HashSet<WorkingSetId>) {
@@ -3964,8 +4443,14 @@ impl KvStore {
 
     /// Free disk slots, and those the disk tier's copies would give up for
     /// swap.
-    pub fn disk_swap_available(&self) -> usize {
-        let (spare, whole) = self.disk_yield_plan();
+    /// The disk tier's free slots, and those copies the retention keys let
+    /// go hold ([`Self::disk_yield_plan`]).
+    pub fn disk_swap_available(&self, keys: impl Keys) -> usize {
+        self.disk_swap_free(&keys)
+    }
+
+    fn disk_swap_free(&self, keys: &impl Keys) -> usize {
+        let (spare, whole) = self.disk_yield_plan(keys);
         let mut backing: HashSet<DiskKvSlotId> = HashSet::new();
         if let Some(persisted) = &self.persisted {
             for (_, id) in &whole {

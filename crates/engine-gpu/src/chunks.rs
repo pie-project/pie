@@ -15,9 +15,8 @@ use crate::serve::{Serve, Shell};
 /// The chunk profile of a Vulkan or WebGPU device whose one binding spans
 /// `binding` bytes: chunks of a few MiB, segments no larger than a binding
 /// (a pool is at most four of them, `kernels/prim/pool.slang`), kv pages
-/// of the load's `page_size`, a window list a distinct window narrower than
-/// the `context` (each its own `T_w` and page table, CONTRACT-BC 21), state
-/// rows in f32.
+/// of the load's `page_size`, windowed rows as ring + buffer (CONTRACT-BC
+/// 19, 21: [`Rings`]), state rows in f32.
 #[must_use]
 pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) -> ChunkProfile {
     ChunkProfile {
@@ -60,19 +59,38 @@ pub fn recipe(
         chunk: profile(page_size, context, binding, target),
         ..DeviceProfile::default()
     };
-    poem_compiler::chunk::plan(trace, budgets, &device).map_err(|why| Fault::Unbound {
-        what: format!("the GPU chunk recipe of this trace: {why}"),
+    poem_compiler::chunk::plan_windowed(trace, budgets, &device, &Rings).map_err(|why| {
+        Fault::Unbound {
+            what: format!("the GPU chunk recipe of this trace: {why}"),
+        }
     })
 }
 
+/// What a ring's rows align to inside the record: a row of any kv head
+/// width starts on a word, and a ring at the record's row alignment.
+pub const RING_ALIGN: u64 = 256;
+
+/// This backend's ring hook: the plain per-layer rings, each layer's W rows
+/// of its keys then as many of its values at [`RING_ALIGN`]
+/// (`kernels_slang::Ring`), row `r` at place `r % W`.
+pub struct Rings;
+
+impl poem_compiler::chunk::RingLayout for Rings {
+    fn ring_region(
+        &self,
+        layers: &[poem_compiler::chunk::WindowedRow],
+        _buffer: &poem_compiler::chunk::WindowBufferSlot<'_>,
+    ) -> poem_compiler::chunk::RingRegion {
+        poem_compiler::chunk::plain_rings(layers, RING_ALIGN).region
+    }
+}
+
 impl<B: Serve> Shell<B> {
-    /// What the load states beside its chunk facts: its adapter banks and
-    /// the model's window.
+    /// What the load states beside its chunk facts: its adapter banks (its
+    /// windowed layers are ring + buffer, stated in the chunk facts).
     pub fn pool_facts(&self) -> Result<PoolFacts> {
         Ok(PoolFacts {
             adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
-            // The model's window; its rows lie in window lists.
-            window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
             ..PoolFacts::default()
         })
     }
@@ -80,7 +98,8 @@ impl<B: Serve> Shell<B> {
     /// The pool as chunks: shared slot shapes over one chunk space.
     pub fn chunk_facts(&self) -> Result<ChunkFacts> {
         let mut facts = self.pool_chunk_facts();
-        facts.record_bytes = self.state_slot_bytes();
+        facts.windowed = self.pools().windowed().to_vec();
+        facts.record_bytes = self.state_slot_bytes() + facts.ring_bytes();
         facts.validate().map_err(|why| Fault::Unbound {
             what: format!("the pool's chunk facts: {why}"),
         })?;

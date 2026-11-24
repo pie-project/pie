@@ -1,0 +1,43 @@
+package plex:replication@1.1.0;
+
+/// Where copies of KV are kept. One row per prefix of a working set.
+
+/// The workers that should hold a copy, besides the ones whose processes
+/// made it. Default: none.
+///
+/// A row covers the tokens of its prefix, and a token is wanted on every
+/// worker that a row covering it names. The table asks; each worker's
+/// retention disposes: which tier a copy sits in there, and whether it
+/// stays under pressure, is that worker's to decide (`plex:retention`). A
+/// worker a row no longer names keeps its copy as it keeps any other.
+@since(version = 1.1.0)
+interface workers {
+    use plex:core/types@1.1.0.{prefix, worker-id, error-code};
+
+    @since(version = 1.1.0)
+    get: func(prefix: prefix) -> option<list<worker-id>>;
+
+    @since(version = 1.1.0)
+    set: func(prefix: prefix, value: list<worker-id>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    set-list: func(entries: list<tuple<prefix, list<worker-id>>>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    delete: func(prefix: prefix);
+
+    @since(version = 1.1.0)
+    set-default: func(value: list<worker-id>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    clear: func();
+
+    @since(version = 1.1.0)
+    get-refused: func() -> list<tuple<prefix, error-code>>;
+}
+
+@since(version = 1.1.0)
+world imports {
+    @since(version = 1.1.0)
+    import workers;
+}

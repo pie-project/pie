@@ -6,12 +6,15 @@ use crate::caps::Capabilities;
 
 pub mod armed;
 pub mod check;
+pub mod host_tier;
 pub mod rung;
 pub mod top;
 
+pub use host_tier::{DeviceMemory, HostTier};
+
 pub use rung::{
     CheckFire, FireEstimate, GemmShape, NoRung, RungFacts, Terms, TopRung, TopWhy, fire_top,
-    model_class, pick, scored, shape_table, top_rung,
+    measured_effs, model_class, pick, scored, shape_table, top_rung,
 };
 pub use top::{
     Counts, Kept, Refused, choose, choose_shaped, choose_tiled, estimate, line_of, measured_line, rectangle,
@@ -129,8 +132,8 @@ pub struct Residency {
     #[serde(default)]
     pub kv_seats: Option<u32>,
     /// Bytes of slot files under `disk_kv_dir` kv pages may be suspended
-    /// into below host memory, shared by the ranks; zero turns it off.
-    /// `None`: the engine's default.
+    /// into below host memory, shared by the ranks. `None` or zero: no disk
+    /// tier. Only stated config sizes it; no engine chooses one.
     #[serde(default)]
     pub disk_kv_budget: Option<u64>,
     #[serde(default)]
@@ -183,7 +186,7 @@ impl Residency {
             host_kv_budget: None,
             host_programs: None,
             kv_seats: None,
-            disk_kv_budget: Some(0),
+            disk_kv_budget: None,
             disk_kv_dir: None,
             disk_kv_persistent: false,
             kv_export: false,

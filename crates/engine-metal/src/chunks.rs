@@ -33,7 +33,8 @@ impl Shell {
     /// The pool as chunks: shared slot shapes over one chunk space.
     pub fn chunk_facts(&self) -> Result<ChunkFacts> {
         let mut facts = self.pool_chunk_facts();
-        facts.record_bytes = self.state_slot_bytes();
+        // The record's state bytes beside the rings the pool states.
+        facts.record_bytes += self.state_slot_bytes();
         facts
             .validate()
             .map_err(|why| crate::error::Fault::Unbound {
@@ -100,9 +101,58 @@ pub fn recipe_near(
         chunk,
         ..DeviceProfile::default()
     };
-    poem_compiler::chunk::plan(trace, budgets, &profile).map_err(|why| {
+    poem_compiler::chunk::plan_windowed(trace, budgets, &profile, &MetalRing).map_err(|why| {
         crate::error::Fault::Unbound {
             what: format!("the on-device Metal chunk recipe of this trace: {why}"),
         }
     })
+}
+
+/// Metal's ring hook (CONTRACT-BC 19): a windowed lane's folded rows lie in
+/// its record as pages laid exactly as a window-buffer slot (`P` rows of
+/// every windowed layer's K and V, layer-major), so the attention kernels
+/// read ring pages and buffer pages through one composed page table, at the
+/// window slot's stride. The ring holds `R = ceil(W / P) * P + P` rows (the
+/// widest layer's window, a page of slack so the pages a window touches are
+/// distinct), row `r` at `r mod R`: `R / P` pages, each a whole window slot,
+/// tiled from a chunk's start (the page id grid), so its pieces start at
+/// chunk boundaries and cut only between pages.
+pub struct MetalRing;
+
+impl MetalRing {
+    /// The ring's rows for windows up to `window` over pages of `page` rows.
+    #[must_use]
+    pub fn rows(window: u32, page: u32) -> u32 {
+        let page = page.max(1);
+        window.div_ceil(page) * page + page
+    }
+}
+
+impl poem_compiler::chunk::RingLayout for MetalRing {
+    fn ring_region(
+        &self,
+        layers: &[poem_compiler::chunk::WindowedRow],
+        buffer: &poem_compiler::chunk::WindowBufferSlot<'_>,
+    ) -> poem_compiler::chunk::RingRegion {
+        let page = buffer.tokens.max(1);
+        let widest = layers.iter().map(|layer| layer.window).max().unwrap_or(0);
+        let pages = u64::from(Self::rows(widest, page) / page);
+        let bytes = pages * buffer.bytes;
+        // Each layer's share: its K and V rows over every page; the slot's
+        // padding past the layers' rows with the last.
+        let mut layer_bytes: Vec<u64> = layers
+            .iter()
+            .map(|layer| pages * u64::from(page) * layer.per_token)
+            .collect();
+        let stated: u64 = layer_bytes.iter().sum();
+        if let Some(last) = layer_bytes.last_mut() {
+            *last += bytes.saturating_sub(stated);
+        }
+        poem_compiler::chunk::RingRegion {
+            bytes,
+            atom: buffer.bytes,
+            placement: poem_compiler::chunk::RingPlacement::ChunkStart,
+            layer_bytes,
+        }
+    }
 }

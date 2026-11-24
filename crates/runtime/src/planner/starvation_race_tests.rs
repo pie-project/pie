@@ -133,8 +133,8 @@ impl PoolPort for RacePool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         0
@@ -181,7 +181,7 @@ impl PoolPort for RacePool {
         self.with_rs(|rs| rs.release_reservation(grant));
     }
     fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets))
             .unwrap_or(0)
     }
     fn prepare_sweep(
@@ -192,6 +192,12 @@ impl PoolPort for RacePool {
         _wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
+    }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
     }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
@@ -1522,8 +1528,8 @@ impl PoolPort for RingPool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         0
@@ -1571,6 +1577,12 @@ impl PoolPort for RingPool {
         _wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
+    }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
     }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
@@ -2540,6 +2552,12 @@ struct BindRoomPool {
     /// holder of which it moves (the store's sweep of evicted processes'
     /// kv left on the device), or leaves them on the device.
     sweeps_shared: std::sync::atomic::AtomicBool,
+    /// Where set, what a reclaim frees waits on a fire's retirement
+    /// here (`returning`), as the kv store's pages read by a fire in
+    /// flight do: a reclaim frees only what is short past them.
+    retiring: parking_lot::Mutex<Option<Vec<u32>>>,
+    /// The cache chunks reclaims let go, in all.
+    reclaimed: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2569,7 +2587,17 @@ impl BindRoomPool {
             store_refuses: std::sync::atomic::AtomicBool::new(false),
             shared: parking_lot::Mutex::new(Vec::new()),
             sweeps_shared: std::sync::atomic::AtomicBool::new(true),
+            retiring: parking_lot::Mutex::new(None),
+            reclaimed: AtomicU32::new(0),
         }
+    }
+
+    /// The fire reading what reclaims let go retires: it comes free, and
+    /// the planner hears of it as a settle tells it.
+    fn retire(&self, planner: &Arc<ResidencyPlanner>) {
+        let back = self.retiring.lock().as_mut().map(std::mem::take).unwrap_or_default();
+        self.free.lock().extend(back);
+        planner.pages_freed();
     }
 
     /// The kv chunks of residents no longer on the device go back free,
@@ -2621,6 +2649,12 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     /// Its own retake (`own`, single chunks) takes its chunks first; what
     /// is short is the rest of `need` (the head's need as the planner reads
     /// it, its own retake's single chunks among them), laid in what that
@@ -2790,11 +2824,28 @@ impl PoolPort for BindRoomPool {
         crate::rt::spawn(async move { planner.parked_down_done(true) });
         true
     }
-    fn reclaim_idle(&self) -> u32 {
+    fn reclaim_idle(&self, short: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        if let Some(returning) = self.retiring.lock().as_mut() {
+            let want = (short.kv_pages as usize).saturating_sub(returning.len());
+            let mut cache = self.cache.lock();
+            let take = want.min(cache.len());
+            let dropped: Vec<u32> = cache.drain(..take).collect();
+            self.reclaimed.fetch_add(dropped.len() as u32, Ordering::Relaxed);
+            let freed = dropped.len() as u32;
+            returning.extend(dropped);
+            return super::pool::IdleReclaim {
+                freed,
+                returning: returning.len() as u32,
+            };
+        }
         let dropped: Vec<u32> = std::mem::take(&mut *self.cache.lock());
         let count = dropped.len() as u32;
+        self.reclaimed.fetch_add(count, Ordering::Relaxed);
         self.free.lock().extend(dropped);
-        count
+        super::pool::IdleReclaim {
+            freed: count,
+            returning: 0,
+        }
     }
     fn reclaimable_idle(&self) -> u32 {
         self.cache.lock().len() as u32
@@ -2817,10 +2868,11 @@ impl PoolPort for BindRoomPool {
         (0..).take_while(|&k| self.runs_free(run, k + 1)).count() as u32
     }
     /// A rung here is the free chunks its raise takes, anywhere.
-    fn rise_room(&self, rung: u32) -> super::pool::RiseRoom {
+    fn rise_room(&self, _pid: ProcessId, rung: u32) -> super::pool::RiseRoom {
         if rung > self.total {
             return super::pool::RiseRoom::Past {
                 need: rung,
+                own: 0,
                 total: self.total,
             };
         }
@@ -2987,6 +3039,43 @@ async fn a_bind_short_of_room_lands_once_idle_cache_is_dropped() {
         0,
         "no process was parked"
     );
+}
+
+/// Idle cache fills the pool and what a reclaim lets go waits on a fire's
+/// retirement: the bind short of a run of 3 has 3 chunks reclaimed, and
+/// the next pass for the same shortfall counts them as returning, reclaims
+/// nothing more and waits, never on a clock. Their retirement wakes it,
+/// and it is served in them; the rest of the cache stays.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_waits_for_what_its_reclaim_freed_to_retire_and_reclaims_no_more() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..8, 0));
+    *pool.retiring.lock() = Some(Vec::new());
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let p = planner.clone();
+    let mut waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1, 0).await });
+    for _ in 0..3 {
+        planner.plan();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut waited).await;
+    assert!(early.is_err(), "it waits for the retirement");
+    assert_eq!(pool.reclaimed.load(Ordering::Relaxed), 3, "the shortfall, once");
+    assert_eq!(pool.cache.lock().len(), 5, "no more of the cache went");
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "and no one moved for it"
+    );
+    pool.retire(&planner);
+    waited.await.expect("the wait ends").expect("served");
+    assert_eq!(pool.reclaimed.load(Ordering::Relaxed), 3);
+    assert_eq!(pool.cache.lock().len(), 5);
 }
 
 /// Resident guest state fills the pool and no cache is left: the bind
@@ -3238,6 +3327,7 @@ async fn a_raise_past_the_whole_pool_is_refused_by_name_at_once() {
         PlannerError::PastRung {
             rung: 9,
             need: 9,
+            own: 0,
             total: 8
         }
     );
@@ -9179,9 +9269,9 @@ async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
     );
 }
 
-/// The policy's schedule floor (the test-pause policy of sc/amd-beam-pages
-/// holds a process below it for a while, then lifts it): a process held
-/// below the floor and parked stays parked while room stands free and its
+/// A policy's hold (the test-pause policy of sc/amd-beam-pages
+/// holds a process for a while, then lifts it): a process held
+/// and parked stays parked while room stands free and its
 /// own lanes wait to be resident, and, taking sets that are off the
 /// device, owes them parked; its restore is queued once the policy lifts
 /// it, never before.
@@ -9197,7 +9287,7 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
         rs: RsUnits::default(),
     };
     planner.with_inner(|inner| {
-        inner.reschedule(|_| (0, true));
+        inner.reschedule(None, |_| (0, true));
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Evicted;
         proc.parked = Some(demand);
@@ -9233,7 +9323,7 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
         "parked with what it owes"
     );
     // The policy lifts it: its restore goes.
-    planner.with_inner(|inner| inner.reschedule(|_| (1, false)));
+    planner.with_inner(|inner| inner.reschedule(None, |_| (1, false)));
     assert!(restore_queued(&planner), "lifted: its restore is queued");
     waiting.abort();
 }
@@ -9765,10 +9855,12 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
 /// The L40S at 3 GiB on f623134fc: kv resident 0, the stall's map naming 7
 /// moves for a restore head, the pass ending "no pick: the policy is
 /// asked", nothing in flight, 185 s with no serve. Such an end is a quiet
-/// wait and is counted and said with who the moves name (here a holder no
-/// rule lets the pass move).
+/// wait (a planner bug: no step found) only where the moves named are moves
+/// a step makes: here the map names a holder on its way into its process,
+/// which no rule lets the pass move, and the wait is no bug and not said as
+/// one (the M1 at beam x40: 53 such lines over residents no step moves).
 #[tokio::test(flavor = "current_thread")]
-async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait() {
+async fn a_wait_on_moves_no_step_makes_is_no_quiet_wait() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
     pool.free.lock().extend([0, 1, 2, 3]);
@@ -9806,8 +9898,13 @@ async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait
     }
     let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
     assert!(
-        planner.stats.quiet_waits.load(Ordering::Relaxed) > 0,
-        "counted and said as a quiet wait ({end:?})"
+        end.is_some_and(|end| end.contains("the policy is asked")),
+        "the policy asked ({end:?})"
+    );
+    assert_eq!(
+        planner.stats.quiet_waits.load(Ordering::Relaxed),
+        0,
+        "a holder no step moves: no quiet wait ({end:?})"
     );
 }
 

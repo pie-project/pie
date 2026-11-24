@@ -2,6 +2,18 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// mimalloc returning to the system the pages its freed blocks still hold:
+/// it purges them only from later allocator calls, so the planes a load
+/// lands stay committed through the reservations made right after
+/// ([`engine::memory::return_freed_heap`]).
+#[cfg(feature = "net")]
+#[allow(unsafe_code)]
+fn return_freed_heap() {
+    // SAFETY: `mi_collect` takes no pointers; with `force` it purges this
+    // thread's heap and the segments other threads abandoned.
+    unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
 pub mod backend;
 mod boot;
 pub mod config;

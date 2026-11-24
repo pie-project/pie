@@ -62,7 +62,7 @@ pub fn lanes_of(package: &LaunchPackage) -> Option<u32> {
 }
 
 /// A beam group's resident state where the runtime placed it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Resident<B: Backend> {
     placed: Placed<B>,
     layout: BeamLayout,

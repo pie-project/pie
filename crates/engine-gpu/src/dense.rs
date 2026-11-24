@@ -202,52 +202,17 @@ impl Dense {
     }
 }
 
-/// What a dense settle weighed, keyed (`profile::fire::DenseSettled::of`):
-/// a fingerprint of its content in canonical words, each list sorted and
-/// every number written as it reads back from a profile (the shortest form
-/// of each float), so the key is the same whatever order a layer listed the
-/// curves in and whatever layer (a load's own, a user's file, a committed
-/// export) stated them, and whatever other model's curves the device
-/// stores beside them. The curves at the model's planes (each one's id,
-/// points, spreads and stop; not its stored key, which says what measured
-/// it), the model's
-/// dense planes, the dense choice, the load's lanes, its top rows and the
-/// target.
+/// Which model's settle a stored one is (`profile::fire::DenseSettled::of`):
+/// a fingerprint of the model's dense planes, the load's lanes, its top rows
+/// and the target, in canonical words (each list sorted, every number as it
+/// reads back from a profile). One entry a model a device: a model's settle
+/// stored again replaces its own, never another's, so no entry outlives
+/// its model's last settle. No curve keys it: the curves decide a settle's
+/// outcome only through the kernel each range takes, which its `code` holds
+/// ([`settle_code`]), so another model's curves, or a curve's points that
+/// move no pick, leave it.
 #[must_use]
-pub fn settle_of(
-    curves: Option<&[profile::fire::KernelCurve]>,
-    planes: &[(u32, u32, u32, f64)],
-    dense: &Dense,
-    lanes: u32,
-    top: u32,
-    target: Target,
-) -> u32 {
-    let points = |list: &[(u32, f64)]| {
-        list.iter()
-            .map(|&(r, v)| format!("{r}={v}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    // The curves at the model's own planes alone: another model's curves,
-    // stored on the same device, weigh nothing this settle weighed.
-    let mut curves: Vec<String> = curves
-        .unwrap_or_default()
-        .iter()
-        .filter(|c| planes.iter().any(|&(n, k, ..)| (n, k) == (c.n, c.k)))
-        .map(|c| {
-            format!(
-                "{}/{}@{}x{}[{}]s[{}]{}",
-                c.kind,
-                c.key,
-                c.n,
-                c.k,
-                points(&c.curve),
-                points(&c.spread),
-                c.stop.map_or_else(String::new, |(at, why)| format!("stop{at}:{why}"))
-            )
-        })
-        .collect();
-    curves.sort();
+pub fn settle_of(planes: &[(u32, u32, u32, f64)], lanes: u32, top: u32, target: Target) -> u32 {
     let mut planes: Vec<String> = planes
         .iter()
         .map(|&(n, k, count, bytes)| format!("{n}x{k}*{count}:{bytes}"))
@@ -258,14 +223,45 @@ pub fn settle_of(
         Target::Wgsl => "wgsl",
     };
     profile::fire::fingerprint(
-        format!(
-            "curves {}|planes {}|dense {}|lanes {lanes}|top {top}|{target}",
-            curves.join(" "),
-            planes.join(" "),
-            dense.canonical()
-        )
-        .as_bytes(),
+        format!("planes {}|lanes {lanes}|top {top}|{target}", planes.join(" ")).as_bytes(),
     )
+}
+
+/// What a stored settle's ranges were weighed against
+/// (`profile::fire::DenseSettled::code`): the code of every kernel the
+/// load's fires can ask for (`kernels`, `crate::stored::code_of_all`) and
+/// the kernel the curves picked at each range ([`Dense::canonical`]). A
+/// change of either settles the model again.
+#[must_use]
+pub fn settle_code(kernels: u32, dense: &Dense) -> u32 {
+    profile::fire::fingerprint(format!("kernels {kernels:#010x}|picks {}", dense.canonical()).as_bytes())
+}
+
+/// Which of a settle's candidates' timings (`samples`, each candidate's
+/// fires, the incumbent first) decides its range: the one whose median
+/// widened by its spread (`median · (1 + spread)`) lies under every other's
+/// median narrowed by its own (`median · (1 − spread)`), so no repeat's noise
+/// could turn the two around; `None` where no candidate separates so (a tie
+/// inside the spreads: the incumbent stands). A candidate with no timing
+/// takes no part. Derived from the measured spreads alone, no margin chosen.
+#[must_use]
+pub fn settle_pick(samples: &[Vec<f64>]) -> Option<usize> {
+    let timed: Vec<(usize, f64, f64)> = samples
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .map(|(i, s)| {
+            let (median, spread) = crate::rates::median_spread(s);
+            (i, median, spread)
+        })
+        .collect();
+    let &(winner, median, spread) = timed.iter().min_by(|a, b| a.1.total_cmp(&b.1))?;
+    let high = median * (1.0 + spread);
+    timed
+        .iter()
+        .filter(|&&(i, ..)| i != winner)
+        .all(|&(_, m, sp)| high < m * (1.0 - sp))
+        .then_some(winner)
 }
 
 /// The name a kernel is said by.
@@ -1304,43 +1300,77 @@ mod tests {
         );
     }
 
-    /// A settle's key is its content: the same under any order of the
-    /// curves, and the same once the curves are written to a profile and
-    /// read back (an export from one build, a committed profile read by
-    /// another); a curve whose point moves keys anew.
+    /// A settle's pick: candidates whose timings overlap inside their
+    /// spreads tie (the incumbent stands); separated ones take the faster;
+    /// a noise-swamped trial (every spread wide) replaces nothing.
     #[test]
-    fn the_settle_key_is_stable_under_curve_order_and_a_round_trip() {
-        let mut r = rates(Some(5.0), coopmat_tiles());
-        for (i, c) in r.kernel_tflops_by_shape.iter_mut().flatten().enumerate() {
-            c.spread = c.curve.iter().map(|&(m, _)| (m, 0.01 * (i as f64 + 1.0))).collect();
-        }
+    fn a_settle_picks_only_past_the_spreads() {
+        // Overlapping: 100 ±10% against 105 ±10%.
+        assert_eq!(settle_pick(&[vec![95.0, 100.0, 105.0], vec![100.0, 105.0, 110.0]]), None);
+        // Separated: the second clearly faster.
+        assert_eq!(settle_pick(&[vec![100.0, 101.0, 102.0], vec![80.0, 81.0, 82.0]]), Some(1));
+        // The incumbent clearly fastest: decided, kept.
+        assert_eq!(settle_pick(&[vec![50.0, 51.0, 52.0], vec![80.0, 81.0, 82.0]]), Some(0));
+        // Windows' B trial: every candidate ~25% spread, a 20% median gap.
+        assert_eq!(
+            settle_pick(&[
+                vec![32000.0, 36000.0, 40000.0],
+                vec![29000.0, 32272.0, 37000.0],
+                vec![34000.0, 38873.0, 44000.0],
+            ]),
+            None,
+            "a noise-swamped trial replaces nothing"
+        );
+        // An untimed candidate takes no part.
+        assert_eq!(settle_pick(&[vec![100.0, 101.0], Vec::new(), vec![60.0, 61.0]]), Some(2));
+    }
+
+    /// A settle is keyed by its model alone and checked by the picks it was
+    /// weighed against: a second model measured on the same device (its
+    /// curves joined to the first's, at its planes or the first's) leaves
+    /// the first model's key; the picks key its code, the same under any
+    /// order of the curves and once they are written to a profile and read
+    /// back, anew where a pick moves.
+    #[test]
+    fn a_models_settle_key_is_its_own_and_its_code_its_picks() {
+        let r = rates(Some(5.0), coopmat_tiles());
         let planes = planes(&counts(), None);
         let rungs = [1, 2, 4, 8, 16, 32, 64];
-        let (dense, _) = choose(Target::Spirv, &rungs, coopmat, &r, &planes, true, None).unwrap();
-        let key = |r: &profile::fire::Rates| {
-            settle_of(r.kernel_tflops_by_shape.as_deref(), &planes, &dense, 4, 64, Target::Spirv)
+        let pick = |r: &profile::fire::Rates| {
+            choose(Target::Spirv, &rungs, coopmat, r, &planes, true, None).unwrap().0
         };
-        let first = key(&r);
+        let a = settle_of(&planes, 4, 64, Target::Spirv);
+        let code = |r: &profile::fire::Rates| settle_code(7, &pick(r));
+        let first = code(&r);
+        // Model B measured after A: its curves join A's (another plane, and
+        // A's own plane timed again to more rows at the same rates).
+        let mut joined = r.clone();
+        let mut elsewhere = joined.kernel_tflops_by_shape.as_ref().unwrap()[0].clone();
+        elsewhere.n = 777;
+        joined.kernel_tflops_by_shape.as_mut().unwrap().push(elsewhere);
+        let longer = joined.kernel_tflops_by_shape.as_mut().unwrap();
+        let last = *longer[0].curve.last().unwrap();
+        longer[0].curve.push((last.0 * 2, last.1));
+        assert_eq!(settle_of(&planes, 4, 64, Target::Spirv), a, "B leaves A's key");
+        assert_eq!(code(&joined), first, "B's curves move none of A's picks");
         let mut reversed = r.clone();
         reversed.kernel_tflops_by_shape.as_mut().unwrap().reverse();
-        assert_eq!(key(&reversed), first, "the curves' order keys nothing");
+        assert_eq!(code(&reversed), first, "the curves' order keys nothing");
         let registry = profile::Registry::new("test", &[], &[]);
         let read = registry
             .load_user(&format!("api = 1\n{}", r.toml()), "round trip")
             .expect("the curves read back");
-        assert_eq!(
-            key(&read.rates()),
-            first,
-            "a profile written and read back keys the same"
-        );
-        let mut other = r.clone();
-        let mut elsewhere = other.kernel_tflops_by_shape.as_ref().unwrap()[0].clone();
-        elsewhere.n = 777;
-        other.kernel_tflops_by_shape.as_mut().unwrap().push(elsewhere);
-        assert_eq!(key(&other), first, "another model's curve keys nothing");
-        let mut moved = r.clone();
-        moved.kernel_tflops_by_shape.as_mut().unwrap()[0].curve[0].1 *= 1.5;
-        assert_ne!(key(&moved), first, "a point that moves keys anew");
+        assert_eq!(code(&read.rates()), first, "written and read back, the same");
+        let mut slower = r.clone();
+        for c in slower.kernel_tflops_by_shape.as_mut().unwrap() {
+            if c.kind == profile::fire::KernelCurve::VECTOR {
+                for p in &mut c.curve {
+                    p.1 /= 1000.0;
+                }
+            }
+        }
+        assert_ne!(code(&slower), first, "a moved pick checks the settle anew");
+        assert_ne!(settle_of(&planes, 8, 64, Target::Spirv), a, "other lanes, another load");
     }
 
     /// A rung takes the vector kernels where the tiled one's measured rate

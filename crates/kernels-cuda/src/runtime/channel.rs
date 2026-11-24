@@ -473,6 +473,31 @@ pub struct RsPlane {
 
 const RS_BLOCK: u32 = 128;
 
+/// One run of a windowed fire's ring fold: `bytes` from `src` to `dst`
+/// (`copy_runs`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CopyRun {
+    pub dst: u64,
+    pub src: u64,
+    pub bytes: u64,
+}
+
+/// Copies each of the `count` runs at `runs` (a block a run): a windowed
+/// fire's rows folded onto their ring pages (CONTRACT-BC 19).
+pub fn copy_runs(ctx: &Ctx, runs: DevicePtr, count: u32) -> Result<(), Error> {
+    const OP: &str = "channel.copy_runs";
+    if count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::runtime::channel::copy_runs"))
+            .apply(Launch::grid([count, 1, 1], [RS_BLOCK, 1, 1])),
+        &[ArgValue::Ptr(runs), ArgValue::U32(count)],
+    )
+}
+
 /// Lands each lane's rows of `src` at its buffer tokens (a block a lane, up
 /// to `lanes_stated`; the armed window's live words say how many are live).
 pub fn rs_scatter(

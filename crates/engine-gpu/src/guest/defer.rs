@@ -14,7 +14,7 @@ use engine::program::{Footprint, InstanceId, ProgramId, RingFacts};
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{ChannelState, ExecPlan, InterpInstance, StepOutcome, Value};
 use eta_ir::container::{ChanDType, HostRole};
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 
 use crate::backend::{Backend, Frame as _};
 use crate::error::{Fault, Result};
@@ -213,10 +213,24 @@ impl<B: Backend> Cell<B> {
         }
     }
 
-    pub fn rebind(&mut self, pools: &Pools<B>) -> Result<()> {
-        match &mut self.place {
-            CellPlace::Pooled(held) => held.rebind(pools),
-            CellPlace::Own(_) => Ok(()),
+    /// Where the cell lies under `pools`' chunk table, an evacuation's not
+    /// yet committed; `None` for a cell of its own buffer, which no
+    /// evacuation moves. Nothing changed.
+    pub fn resolve(&self, pools: &Pools<B>) -> Result<Option<Held<B>>> {
+        match &self.place {
+            CellPlace::Pooled(held) => {
+                let mut held = held.clone();
+                held.rebind(pools)?;
+                Ok(Some(held))
+            }
+            CellPlace::Own(_) => Ok(None),
+        }
+    }
+
+    /// Puts a pooled cell where [`Self::resolve`] resolved it.
+    pub fn install(&mut self, held: Held<B>) {
+        if let CellPlace::Pooled(place) = &mut self.place {
+            *place = held;
         }
     }
 
@@ -427,14 +441,12 @@ pub fn keeps(package: &LaunchPackage, channel: u32, bytes: u64) -> bool {
 }
 
 /// Whether a deferred pass keeps `channel`'s puts on the device: every one
-/// the host does not read, at the fire (a `fold` count, an `attn_mask`) or
-/// after.
+/// the host does not read, at the fire (a port of `reads`: a `fold` count,
+/// an `attn_mask`, a device-geometry descriptor) or after.
 #[must_use]
-pub fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
+pub fn host_reads_not(package: &LaunchPackage, channel: u32, reads: PortMask) -> bool {
     let read_at_fire = package.ports.iter().any(|binding| {
-        binding.channel == channel
-            && !binding.is_const
-            && matches!(binding.port, Port::Fold | Port::AttnMask)
+        binding.channel == channel && !binding.is_const && reads.contains(binding.port)
     });
     !read_at_fire
         && package
@@ -686,11 +698,7 @@ where
     }
     let Some(frame) = frame else {
         if let Some(done) = done {
-            let mut outcome = done.settled();
-            for (lanes, instance, why) in &faults {
-                outcome.fault_lanes(lanes.clone(), Some(*instance), why);
-            }
-            (done.sink)(done.at, outcome);
+            tell_settled(done, faults);
         }
         return Ok(());
     };
@@ -717,16 +725,15 @@ where
                     faults.push((lanes, instance, why));
                 }
             }
-            if let Some(done) = done.as_ref() {
+            if let Some(done) = done {
                 if lost.is_some() {
                     done.tell(lost, "guest pass");
                     return;
                 }
-                let mut outcome = done.settled();
-                for (lanes, instance, why) in &faults {
-                    outcome.fault_lanes(lanes.clone(), Some(*instance), why);
-                }
-                (done.sink)(done.at, outcome);
+                // This runs where the frame's readback landed (the thread
+                // that polls the device): the forward's fed ids, read by its
+                // own landing on that thread, are joined, never waited on.
+                tell_settled(done, faults);
             }
         };
         if refused_now {
@@ -754,6 +761,17 @@ where
         depart(instance, pending.clone());
     }
     Ok(())
+}
+
+/// Tells `done`'s sink the step once its forward's fed ids are checked, the
+/// lanes `faults` names faulted beside what the forward says.
+fn tell_settled(done: crate::settle::Done, faults: Vec<HostFault>) {
+    done.when_settled(move |done, mut outcome| {
+        for (lanes, instance, why) in &faults {
+            outcome.fault_lanes(lanes.clone(), Some(*instance), why);
+        }
+        (done.sink)(done.at, outcome);
+    });
 }
 
 /// What a deferred step's outcome says of one pass's run on the host: the

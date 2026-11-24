@@ -22,6 +22,7 @@ mod a_dense_model_reads_no_routed_or_quantized_decision;
 mod a_device_fold_lane_states_its_own_fold;
 mod a_kv_only_lane_reports_its_device_fold;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
+mod a_load_measuring_nothing_admits_its_own_pool;
 mod a_load_walks_its_score_capturing_forms;
 mod a_recurrent_load_walks_its_pipelines;
 mod a_refused_lane_is_refused_alone;
@@ -94,6 +95,7 @@ mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
 mod the_weight_cache_serves_the_dense_logits;
+mod two_models_exported_boot_a_clean_home_measuring_nothing;
 
 /// The `device_kv_budget` a test states for its shell: none, so the chunk
 /// pool spans the room. A sparse pool maps only the segments a fire touches
@@ -118,6 +120,22 @@ pub(crate) fn guest_places(
     program: engine::ProgramId,
     extents: &eta_exec::Extents,
     nth: u32,
+) -> (engine::ScratchPlace, engine::ScratchPlace) {
+    guest_places_of_pair(shell, program, extents, nth, 0)
+}
+
+/// [`guest_places`] for an instance of the `pair`-th pair a test binds: a
+/// pair is a (program, extents), so instances of one program at other
+/// extents are another pair and its state other bytes (the engine refuses
+/// two pairs claiming one run). Pair 0 lies where [`guest_places`] lays it;
+/// each later one past the room 16 instances' own state takes.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn guest_places_of_pair(
+    shell: &mut engine_metal::Shell,
+    program: engine::ProgramId,
+    extents: &eta_exec::Extents,
+    nth: u32,
+    pair: u32,
 ) -> (engine::ScratchPlace, engine::ScratchPlace) {
     let state = shell.guest_state(program, extents).expect("the program's guest state");
     let layout = shell.pool_layout();
@@ -147,10 +165,18 @@ pub(crate) fn guest_places(
             pieces: (0..chunks_of(bytes) / state.run).map(|k| chunk + k * state.run).collect(),
         }
     };
-    let pair_at = layout.free_chunk() + 8;
-    let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
+    let first_pair = layout.free_chunk() + 8;
+    let own_at = first_pair + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
+    let pair_at = if pair == 0 {
+        first_pair
+    } else {
+        first_pair
+            + chunks_of(state.per_pair)
+            + 16 * chunks_of(state.instance_bytes())
+            + (pair - 1) * chunks_of(state.per_pair)
+    };
     let places = (place(state.instance_bytes(), own_at), place(state.per_pair, pair_at));
-    let end = own_at + chunks_of(state.instance_bytes());
+    let end = (own_at + chunks_of(state.instance_bytes())).max(pair_at + chunks_of(state.per_pair));
     shell
         .commit_segments(end.div_ceil(layout.segment_chunks.max(1)))
         .expect("the guest state's segments commit");

@@ -404,7 +404,16 @@ pub struct Tuning {
     wide_range: bool,
     cores: Option<u32>,
     family: u32,
+    /// `kernel.dense`'s pick per `(rows, n, k)` once read: every bf16
+    /// matmul of a fire asks it, and a ladder measured per shape holds a
+    /// rung a shape and row band (Gemma 4 E4B's, 30-50), which a scan on
+    /// every encode pays for on the host. Shared by this tuning's clones;
+    /// a new profile or family starts its own.
+    dense_picks: DensePicks,
 }
+
+/// `kernel.dense`'s picks a tuning has read, by `(rows, n, k)`.
+type DensePicks = std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(u32, u32, u32), Dense>>>;
 
 impl Tuning {
     /// `wide_range`: the model's activations leave the fp16 range (diffusion
@@ -417,6 +426,7 @@ impl Tuning {
             wide_range,
             cores,
             family: 0,
+            dense_picks: std::sync::Arc::default(),
         }
     }
 
@@ -424,7 +434,11 @@ impl Tuning {
     /// device with no tensor-op matmul.
     #[must_use]
     pub fn with_family(self, family: u32) -> Tuning {
-        Tuning { family, ..self }
+        Tuning {
+            family,
+            dense_picks: std::sync::Arc::default(),
+            ..self
+        }
     }
 
     /// Whether the GPU multiplies on the tensor ops' neural accelerators
@@ -456,17 +470,30 @@ impl Tuning {
     /// and that this GPU runs, else the simdgroup tiles.
     #[must_use]
     pub fn dense(&self, rows: u32, n: u32, k: u32) -> Dense {
+        if let Some(pick) = self
+            .dense_picks
+            .read()
+            .ok()
+            .and_then(|picks| picks.get(&(rows, n, k)).copied())
+        {
+            return pick;
+        }
         let at = DenseAt {
             rows: i64::from(rows),
             n: i64::from(n),
             k: i64::from(k),
         };
-        self.profile
+        let pick = self
+            .profile
             .ladder::<Dense>()
             .candidates(&at)
             .find(|d| d.runs_on(self.family))
             .copied()
-            .unwrap_or(Dense::Tile)
+            .unwrap_or(Dense::Tile);
+        if let Ok(mut picks) = self.dense_picks.write() {
+            picks.insert((rows, n, k), pick);
+        }
+        pick
     }
 
     /// The row counts at which `kernel.dense`'s pick may change, past one:

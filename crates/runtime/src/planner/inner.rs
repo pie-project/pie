@@ -50,6 +50,9 @@ pub(super) struct Inner {
     /// dump per head and room change, and again each
     /// [`super::plan::STALL_SAYS_AGAIN`] while it stays unserved.
     pub(super) stall_dumped: Option<(super::wait::EntryKey, u64, crate::rt::Instant)>,
+    /// The head and room the policy was last asked for with no pick
+    /// ([`super::eviction`]): asked once a head and room.
+    pub(super) policy_asked: Option<(super::wait::EntryKey, u64)>,
     /// The head whose stall was last said, and when: said once a stall
     /// episode, whatever room moves meanwhile.
     pub(super) stall_said: Option<(super::wait::EntryKey, crate::rt::Instant)>,
@@ -216,10 +219,19 @@ impl CapacityRead {
     /// Every tier's room past what is held: the room the state leaves,
     /// slack not counted.
     fn free_of_state(&self) -> u64 {
+        // A move under way holds two slots for one item; exactly one comes
+        // back whichever way it ends (a landed move gives back its source,
+        // a refused or aborted one its destination). The order is read after
+        // the moves under way: counted taken, every grant's own eviction or
+        // restore left the next read short by what it put in flight, and the
+        // order turned short before anyone grew (F57: the field mix's seed
+        // 401, least -6 at step 7 with 9 moving). Asks still wait for room on
+        // the tiers themselves until the moves land.
         let taken = self
             .held
             .saturating_sub(self.idle)
-            .saturating_sub(self.gathered);
+            .saturating_sub(self.gathered)
+            .saturating_sub(self.moving);
         self.whole.saturating_sub(taken)
     }
 
@@ -545,9 +557,24 @@ impl Inner {
         self.queue.keys().find(|(_, id)| *id == key.1).copied()
     }
 
-    pub(super) fn reschedule(&mut self, order_of: impl Fn(&ProcessId) -> (i64, bool)) {
-        for (pid, proc) in self.procs.iter_mut().filter(|(_, proc)| !proc.holder) {
-            (proc.key, proc.held) = order_of(pid);
+    /// Reads the keys and holds of the processes `only` names (by PLEX id),
+    /// or all, and reorders what waits by them. Whether any changed.
+    pub(super) fn reschedule(
+        &mut self,
+        only: Option<&std::collections::HashSet<ProcessId>>,
+        order_of: impl Fn(&ProcessId) -> (i64, bool),
+    ) -> bool {
+        let mut changed = false;
+        for (pid, proc) in self.procs.iter_mut().filter(|(pid, proc)| {
+            !proc.holder
+                && only.is_none_or(|only| only.contains(&crate::policy::schedule::plex_id(**pid)))
+        }) {
+            let now = order_of(pid);
+            changed |= (proc.key, proc.held) != now;
+            (proc.key, proc.held) = now;
+        }
+        if !changed {
+            return false;
         }
         let held_restores: Vec<EntryKey> = self
             .queue
@@ -586,6 +613,7 @@ impl Inner {
             .into_iter()
             .map(|((was, pid), notify)| ((rank(&pid, was), pid), notify))
             .collect();
+        true
     }
 
     pub(super) fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
@@ -767,7 +795,39 @@ impl Inner {
                 if served_untaken || !self.nothing_in_flight() {
                     return None;
                 }
-                held
+                // The evictor's restore before its victims': where the head a
+                // held restore waits for is itself a restore waiting, that
+                // one goes (and so on up the chain), never the victim ahead
+                // of the head it was moved for. The oldest held restore
+                // went, took the room its evictor's restore needed, and was
+                // evicted again for it (the simulation's Metal mix, seed 43:
+                // a victim restored past an evicted head, moved for it again
+                // at its restore, 3 times over).
+                let mut key = held;
+                let mut seen = HashSet::new();
+                while seen.insert(key) {
+                    let Some(head) = self
+                        .queue
+                        .get(&key)
+                        .and_then(|waiter| self.procs.get(&waiter.pid))
+                        .and_then(|proc| proc.evicted_for)
+                    else {
+                        break;
+                    };
+                    // One passed over is no head: chosen again, the pass
+                    // over every stuck head chose it for good, a core
+                    // burned (the simulation's seed 4656).
+                    let Some((&up, _)) = self.queue.iter().find(|&(&at, waiter)| {
+                        waiter.pid == head
+                            && waiter.is_unmet()
+                            && matches!(waiter.kind, WaitKind::Restore { .. })
+                            && !self.passed.iter().any(|&(passed, _)| passed == at)
+                    }) else {
+                        break;
+                    };
+                    key = up;
+                }
+                key
             }
         };
         self.queue

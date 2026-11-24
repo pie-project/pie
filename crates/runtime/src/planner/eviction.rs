@@ -179,8 +179,10 @@ impl ResidencyPlanner {
     }
 
     /// Free and total slots suspended kv can go to: host, then disk. The
-    /// slots only idle cache holds there count as free: a suspend makes its
-    /// room by dropping them (`KvStore::make_swap_room`). Counted as full,
+    /// slots only idle cache its keys let go holds there count as free: a
+    /// suspend makes its room by dropping it (`KvStore::make_swap_room`);
+    /// what a key keeps above the floor is full, and asked for with tier
+    /// pressure. Counted as full,
     /// a disk tier holding idle cache made every victim unhostable, and a
     /// head the pool fits alone waited with nothing issued.
     pub(super) fn swap_stats(&self) -> (u32, u32) {
@@ -840,9 +842,23 @@ impl ResidencyPlanner {
                 host_short,
                 &unhostable,
             );
-            self.note_short(victims.head, deficit, host);
-            // The policy asked with nothing in flight while the map of every
-            // process names moves for the head: a quiet wait too, said with
+            // Asked once for a head and room: asked again on the same room,
+            // the ask's answer (none) planned at once, a pass that spun
+            // (the simulation's Metal mix, seed 183: the policy asked
+            // hundreds of thousands of times a minute, nothing moving). The
+            // rest of the pass still reads the fleet (a hog, a starvation:
+            // what changes beside the room); only the ask is not sent again.
+            let gives = self.port.room_gives();
+            let asked_again = self.with_inner(|inner| {
+                let again = inner.policy_asked == Some((victims.head, gives));
+                inner.policy_asked = Some((victims.head, gives));
+                again
+            });
+            if !asked_again {
+                self.note_short(victims.head, deficit, host);
+            }
+            // The policy asked with nothing in flight while the map of what
+            // a step moves names moves for the head: a quiet wait too, said with
             // who those moves name and why this pass moved none of them
             // (the L40S at 3 GiB on f623134fc: kv resident 0, need_moves 7,
             // "no pick: the policy is asked", 185 s with no serve).
@@ -851,16 +867,16 @@ impl ResidencyPlanner {
                 && let Some(need) = shape.as_ref()
                 && self.with_inner(|inner| inner.nothing_in_flight())
             {
-                // Every process but the head: its own parts are no move
-                // made for it.
-                let everyone: Vec<ProcessId> = self.with_inner(|inner| {
-                    inner
-                        .procs
-                        .keys()
-                        .copied()
-                        .filter(|pid| *pid != victims.head_pid)
-                        .collect()
-                });
+                // Only moves a step can make: the victim set's members (the
+                // head's own parts, a process in a fire, one the finisher's
+                // gate or its request keeps, are no move made for it) and
+                // parked state's moves down. Read over every process, the
+                // map named residents no step moves (the M1 at beam x40:
+                // guest channels packed in one chunk beside firing
+                // processes'; the simulation's Metal mix, residents kept in
+                // their requests), and a wait on them was said as a bug.
+                let everyone: Vec<ProcessId> =
+                    victims.members.iter().map(|victim| victim.pid).collect();
                 let mut all = self.occupants(&everyone);
                 all.merge(self.parked_map(victims.head_pid));
                 // A named one whose move found no room below (or nothing to

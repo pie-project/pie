@@ -449,6 +449,24 @@ impl Engine for Metal {
         self.shell.as_ref().map(crate::serve::Shell::cover_fingerprint)
     }
 
+    fn committed_covers(&self) -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    fn skips_measuring(&self) -> bool {
+        self.boot.measure == engine::rates::Measuring::Skip
+    }
+
+    /// What the load timed (`Shell::measured_at_load`): the device's rates
+    /// and the model's kernel.dense curves, each where it measured them.
+    /// Nothing before a load, which has timed nothing yet.
+    fn measured_at_load(&self) -> Vec<String> {
+        self.shell
+            .as_ref()
+            .map(|shell| shell.measured_at_load().to_vec())
+            .unwrap_or_default()
+    }
+
     fn kind(&self) -> &'static str {
         "metal"
     }
@@ -664,12 +682,7 @@ impl Engine for Metal {
         told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
         shell
-            .seat_disk_kv(
-                residency.disk_kv_budget,
-                residency.disk_kv_dir.as_deref(),
-                residency.kv_seats.unwrap_or(budgets.max_lanes),
-                budgets.max_context,
-            )
+            .seat_disk_kv(residency.disk_kv_budget, residency.disk_kv_dir.as_deref())
             .map_err(fault)?;
 
         if crate::diag::on().tier_trace {
@@ -735,6 +748,9 @@ impl Engine for Metal {
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
+            // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): a load
+            // with any states the rings and the window buffer in its facts.
+            windowed_state: shell.pool_ring().is_some(),
             rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: true,
             adapter_attachments: false,
@@ -855,6 +871,10 @@ impl Engine for Metal {
 
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        Ok(self.loaded()?.chunk_table().clone())
     }
 
     /// Waits on the last copy's command buffer: every copy submitted so far
@@ -1469,6 +1489,7 @@ impl Metal {
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut window_of: Vec<Vec<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut ring_of: Vec<Option<Vec<[u32; 2]>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
             pages_of.push(
@@ -1490,6 +1511,30 @@ impl Metal {
                 })
                 .collect();
             window_of.push(windows);
+            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
+                let per = shell.pool_layout().list.map_or(1, |list| list.per_chunk.max(1));
+                let mut chunks: Vec<u32> = pages_of
+                    .last()
+                    .and_then(Option::as_ref)
+                    .map(|refs| refs.iter().filter(|&&r| r != 0).map(|&r| r / per).collect())
+                    .unwrap_or_default();
+                chunks.sort_unstable();
+                chunks.dedup();
+                eprintln!(
+                    "ltrace slot {} list chunks {:?} first refs {:?} slot_copies {:?}",
+                    lane.slot,
+                    chunks,
+                    pages_of.last().and_then(Option::as_ref).map(|r| r.iter().take(3).copied().collect::<Vec<_>>()),
+                    lane.slot_copies
+                );
+            }
+            ring_of.push(match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::RING)
+                    .map(|(_, pieces)| pieces.clone()),
+                _ => None,
+            });
             // A load that holds state is told every lane's record: its
             // pieces, or none (the null record).
             let fixed: Option<Vec<[u32; 2]>> = match &lane.record {
@@ -1527,8 +1572,19 @@ impl Metal {
                 pieces.iter().map(|&[_, cow]| cow).collect()
             }));
         }
-        if !forks.is_empty() {
-            shell.copy_state(&forks).map_err(fault)?;
+        let mut ring_forks: Vec<(u32, u32)> = Vec::new();
+        for pieces in ring_of.iter().flatten() {
+            for &[run, cow] in pieces {
+                if run != cow && !ring_forks.contains(&(run, cow)) {
+                    ring_forks.push((run, cow));
+                }
+            }
+        }
+        if !ring_forks.is_empty() {
+            eprintln!("ringfork {} pair(s), first {:?}", ring_forks.len(), ring_forks.first());
+        }
+        if !forks.is_empty() || !ring_forks.is_empty() {
+            shell.copy_records(&forks, &ring_forks).map_err(fault)?;
         }
         // Tail copies (an rs-list or kv slot a fork shares) land before any
         // lane of the fire reads or writes (CONTRACT-BC 20).
@@ -1537,6 +1593,14 @@ impl Metal {
             .iter()
             .flat_map(|lane| lane.slot_copies.iter().cloned())
             .collect();
+        if !slot_copies.is_empty() || !forks.is_empty() {
+            eprintln!(
+                "wanomaly submit slot_copies {} forks {} first copy {:?}",
+                slot_copies.len(),
+                forks.len(),
+                slot_copies.first()
+            );
+        }
         shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
@@ -1586,6 +1650,8 @@ impl Metal {
                     record: record_of[at].as_deref(),
                     record_run: run_of[at].as_deref(),
                     windows: &window_of[at],
+                    ring: ring_of[at].as_deref(),
+                    window: submission.lanes[at].window,
                     reports: lane.reports,
                 })
             })
@@ -1758,7 +1824,7 @@ fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
         Some(budget) => Err(Error::Load(format!(
             "budget_host ({budget} bytes) on Metal: the device's memory is the host's, so \
              there is no host kv tier (a move there would copy within the same memory and \
-             free nothing); suspended state goes to the disk tier (budget_disk). Remove \
+             free nothing); suspended state goes to the disk tier where budget_disk states one. Remove \
              budget_host from [engine.memory]"
         ))),
         None => Ok(()),

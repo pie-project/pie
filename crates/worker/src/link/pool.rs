@@ -52,10 +52,15 @@ impl WorkerControl for NoTurns {
         Accepted::Reject
     }
     async fn cancel(self, _: tarpc::context::Context, _: ReqId) {}
+    async fn set_executors(self, _: tarpc::context::Context, _: ReqId, _: Vec<WorkerId>) {}
     async fn set_priority(self, _: tarpc::context::Context, _: ReqId, _: Priority) {}
     async fn end_session(self, _: tarpc::context::Context, _: SessionId) {}
     async fn drain(self, _: tarpc::context::Context) {}
     async fn plex_session(self, _: tarpc::context::Context, _: String, _: Option<String>) {}
+
+    /// A pool serves runs by key and keys nothing itself: grants are the
+    /// asking workers' to check.
+    async fn share_groups(self, _: tarpc::context::Context, _: controller_api::ShareGrants) {}
 }
 
 /// Where a pool keeps every page beyond its memory.

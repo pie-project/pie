@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
+use crate::chunk::{ChunkTable, Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
@@ -212,17 +212,19 @@ pub trait Engine: Send {
     /// written by `pie tune export`): each file's text, a JSON list of the
     /// cover cache's own entries (`key`, `cover`, `frame_us`,
     /// `turnaround_us`). A boot whose cover key matches one takes it where
-    /// the home's own cache holds none. None, the default.
-    fn committed_covers(&self) -> &'static [&'static str] {
-        &[]
-    }
+    /// the home's own cache holds none. Every engine states its own (none
+    /// where it keys no cover), so one that forgets is a build error.
+    fn committed_covers(&self) -> &'static [&'static str];
 
     /// Whether this engine's load skips measuring (`[engine] measure =
     /// false`): the runtime then takes its own estimates in place of its
-    /// load-time measurements too, by name. `false`, the default.
-    fn skips_measuring(&self) -> bool {
-        false
-    }
+    /// load-time measurements too, by name. Every engine states it.
+    fn skips_measuring(&self) -> bool;
+
+    /// What this engine's load timed, each by name (empty: it measured
+    /// nothing): what the load's last line says ("load: measured 0" where
+    /// every engine states none). Every engine states its own.
+    fn measured_at_load(&self) -> Vec<String>;
 
     /// The reader of what the host can still give this process, where the
     /// device shares the host's memory and no budget of the device's says
@@ -560,10 +562,27 @@ pub trait Engine: Send {
     /// copy has a completion of its own, which [`Self::release_segments`]
     /// waits on before the evacuated segment goes: the runtime waits on no
     /// later fire for it, so an idle engine's segment goes too.
+    ///
+    /// All or nothing. `Err` means nothing moved: the engine's chunk table,
+    /// claims, program bindings and device bytes are as before the call
+    /// (the runtime takes the move back on that word). An engine resolves
+    /// everything the move needs (its rebind of every table, cell and
+    /// state the moved chunks hold included) against the moved table
+    /// before it commits any copy; a failure after it committed is a bug
+    /// (a fault, not a refusal).
     fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
         let _ = evacuation;
         Err(self.unsupported("evacuate"))
     }
+
+    /// The engine's chunk table as it holds it now ([`ChunkTable`], the
+    /// identity until an evacuation moves chunks): a plain read, no fire
+    /// waited on, which the runtime checks its own logical to physical map
+    /// against where an evacuation was refused ([`Self::evacuate`]). One
+    /// table, the state pool's; an engine whose pool moves no chunk answers
+    /// its identity, one that keeps no pool `Error::Unsupported`. Stated by
+    /// every engine: no default.
+    fn chunk_table(&self) -> Result<ChunkTable>;
 
     /// Copies slots of one shape between tiers or within one; replaces
     /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend
@@ -724,7 +743,8 @@ pub trait Engine: Send {
 
     /// The bytes of host rs rows: `slots`' state, then `pages`' buffers, one
     /// after another, once every copy into them has landed. For a model whose
-    /// state is a window, `pages` are host windowed pages and `slots` empty.
+    /// state is a window, `pages` are host windowed pages and `slots` empty
+    /// (removed by the windowed-state change; do not use in new code).
     fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
         let _ = (slots, pages);
         Err(self.unsupported("read_host_state"))
@@ -742,8 +762,9 @@ pub trait Engine: Send {
     /// as the device slot (what [`Engine::copy_slots`] moves whole), one
     /// slot after another; once every copy into them has landed (the
     /// runtime waits on that copy's completion first). What a shared pool's
-    /// snapshot reads of a set's state: its record's pieces and its rs list
-    /// or window slots, parked on the host.
+    /// snapshot reads of a set's state: its record's pieces (the windowed
+    /// layers' rings among them) and its rs list or window buffer slots,
+    /// parked on the host.
     fn read_tier_slots(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
         let _ = slots;
         Err(self.unsupported("read_tier_slots"))

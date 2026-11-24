@@ -78,7 +78,7 @@ impl Host for Api {
     }
 
     fn ports() -> PortMask {
-        PortMask::DECODE_ENVELOPE
+        PortMask::DEVICE_GEOMETRY
             .with(eta_ir::registry::Port::Fold)
             .with(eta_ir::registry::Port::AttnMask)
             // Each beam's parent: the engine keeps the beams' page lists
@@ -200,6 +200,13 @@ impl Host for Api {
         faulted: &mut engine::StepOutcome,
     ) -> EngineResult<()> {
         for attachment in &step.attachments {
+            // Device geometry resolves every port its lanes read, the
+            // shared engine's ([`engine_gpu::program::device_lanes`]).
+            if gpu.programs.geometry(attachment.instance)
+                == Some(eta_ir::registry::GeometryClass::DeviceGeometry)
+            {
+                continue;
+            }
             // A refusal of this attachment's envelope (its lane count, a
             // mask, its tokens) faults its lanes; the others resolve.
             let refused: Option<String> = 'pass: {

@@ -23,12 +23,13 @@
 //! server, and every compat request runs as tenant `default` unless an
 //! `x-plex-tenant` header names another.
 //!
-//! Props come from `x-plex-prop-<name>` headers (JSON if it parses) over a
+//! Hints (props, to the runtime) come from `x-plex-hint-<name>` headers (JSON if it parses) over a
 //! `plex` body object; `x-plex-session` names the session; `prompt` defaults to
 //! the request's text.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -50,7 +51,7 @@ use worker_api::{Priority, Tokens};
 
 use crate::GatewayState;
 use crate::ingress::identity::REQUEST_ID_HEADER;
-use crate::session::{Affinity, Identity, SessionError, SessionHandle, TokenRx, TurnInput};
+use crate::session::{Affinity, Identity, Resume, SessionError, SessionHandle, TokenRx, TurnInput};
 
 /// Route → the built-in inferlet that serves it.
 pub const ROUTES: &[(&str, &str)] = &[
@@ -94,7 +95,7 @@ fn identity(headers: &HeaderMap) -> Identity {
     }
 }
 
-const PROP_HEADER_PREFIX: &str = "x-plex-prop-";
+const PROP_HEADER_PREFIX: &str = "x-plex-hint-";
 const TENANT_HEADER: &str = "x-plex-tenant";
 const SESSION_HEADER: &str = "x-plex-session";
 
@@ -269,6 +270,8 @@ struct Launch {
     input: Value,
     props: Props,
     session: Option<String>,
+    /// What the client has been sent, across every run of the request.
+    kept: Arc<Mutex<Kept>>,
 }
 
 impl Launch {
@@ -282,6 +285,16 @@ impl Launch {
         if let Some(continuation) = continuation {
             input["continuation"] = continuation;
         }
+        // Each frame the session passes on is kept as it goes, so a turn
+        // moved while running goes on after exactly what the client has.
+        let (kept, base) = (self.kept.clone(), self.input.clone());
+        let resume = Resume(Arc::new(move |value: &str| {
+            let mut kept = kept.lock().unwrap();
+            kept.note(value);
+            let mut input = base.clone();
+            input["continuation"] = kept.continuation()?;
+            Some(input.to_string())
+        }));
         let turn = TurnInput {
             message: ClientMessage::LaunchProcess {
                 corr_id: CORR,
@@ -298,6 +311,7 @@ impl Launch {
             },
             blobs: Vec::new(),
             priority: Priority::Normal,
+            resume: Some(resume),
         };
         self.state
             .sessions
@@ -318,27 +332,26 @@ struct Kept {
 }
 
 impl Kept {
-    /// One frame, its `continuation` taken off and kept: what the client sees.
-    fn frame(&mut self, value: &str) -> Event {
+    /// One frame the client is sent: what its `continuation` covers.
+    fn note(&mut self, value: &str) {
         self.frames += 1;
-        let Ok(mut v) = serde_json::from_str::<Value>(value) else {
-            return frame(value);
+        let Some(covers) = serde_json::from_str::<Value>(value)
+            .ok()
+            .and_then(|v| v.get("continuation").cloned())
+        else {
+            return;
         };
-        if let Some(covers) = v.as_object_mut().and_then(|o| o.remove("continuation")) {
-            if let Some(id) = covers.get("id").and_then(Value::as_str) {
-                self.id = Some(id.to_string());
-            }
-            self.tokens.extend(
-                covers
-                    .get("tokens")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_u64),
-            );
-            return frame(&v.to_string());
+        if let Some(id) = covers.get("id").and_then(Value::as_str) {
+            self.id = Some(id.to_string());
         }
-        frame(value)
+        self.tokens.extend(
+            covers
+                .get("tokens")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_u64),
+        );
     }
 
     /// The input's `continuation`, once a frame has named the id.
@@ -388,6 +401,7 @@ async fn relay(
             .get(SESSION_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
+        kept: Arc::default(),
     };
     let (mut handle, mut rx) = match launch.start(None).await {
         Ok(pair) => pair,
@@ -490,6 +504,18 @@ fn error_response(value: &str) -> Response {
     error_body(StatusCode::INTERNAL_SERVER_ERROR, value)
 }
 
+/// One `message` value as the client sees it: its `continuation` taken off.
+fn client_frame(value: &str) -> Event {
+    if let Ok(mut v) = serde_json::from_str::<Value>(value)
+        && v.as_object_mut()
+            .and_then(|o| o.remove("continuation"))
+            .is_some()
+    {
+        return frame(&v.to_string());
+    }
+    frame(value)
+}
+
 /// One `message` value as an SSE frame.
 fn frame(value: &str) -> Event {
     let Ok(v) = serde_json::from_str::<Value>(value) else {
@@ -522,17 +548,16 @@ fn frames(
     rx: TokenRx,
     handle: SessionHandle,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    let mut kept = Kept::default();
-    let first = kept.frame(&first);
-    let rest = futures::stream::unfold(Some((rx, handle, kept, launch)), |st| async move {
-        let (mut rx, mut handle, mut kept, launch) = st?;
+    let first = client_frame(&first);
+    let rest = futures::stream::unfold(Some((rx, handle, launch)), |st| async move {
+        let (mut rx, mut handle, launch) = st?;
         loop {
             let lost = match rx.recv().await {
                 Some(Tokens::Chunk(ServerMessage::ProcessEvent { event, value, .. })) => {
                     match event.as_str() {
                         "message" => {
-                            let event = kept.frame(&value);
-                            return Some((Ok(event), Some((rx, handle, kept, launch))));
+                            let event = client_frame(&value);
+                            return Some((Ok(event), Some((rx, handle, launch))));
                         }
                         "return" => return None,
                         "error" if rx.lost() => true,
@@ -573,7 +598,8 @@ fn frames(
             }
             // The worker is gone after the client had output: the request
             // runs again elsewhere, going on after what the client has.
-            let again = match kept.continuation() {
+            let continuation = launch.kept.lock().unwrap().continuation();
+            let again = match continuation {
                 Some(continuation) => match launch.start(Some(continuation)).await {
                     Ok(pair) => Some(pair),
                     Err(e) => {
@@ -590,11 +616,7 @@ fn frames(
                 .to_string();
                 return Some((Ok(Event::default().event("error").data(data)), None));
             };
-            tracing::info!(
-                frames = kept.frames,
-                tokens = kept.tokens.len(),
-                "continuing a reply its worker lost"
-            );
+            tracing::info!("continuing a reply its worker lost");
             (handle, rx) = (next_handle, next_rx);
         }
     });
@@ -613,6 +635,7 @@ pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Re
         },
         blobs: Vec::new(),
         priority: Priority::Normal,
+        resume: None,
     };
     let (_handle, mut rx) = match state
         .sessions
@@ -661,9 +684,11 @@ mod tests {
     fn a_reply_keeps_what_its_frames_covered_and_the_client_never_sees_it() {
         let mut kept = Kept::default();
         assert_eq!(kept.continuation(), None, "nothing named yet");
-        let first = kept.frame(r#"{"data":{"x":1},"continuation":{"id":"1a2b","tokens":[]}}"#);
-        let _ = kept.frame(r#"{"event":"delta","data":{"x":2},"continuation":{"tokens":[5,6]}}"#);
-        let _ = kept.frame(r#"{"data":"[DONE]","continuation":{"tokens":[7]}}"#);
+        let first = r#"{"data":{"x":1},"continuation":{"id":"1a2b","tokens":[]}}"#;
+        kept.note(first);
+        kept.note(r#"{"event":"delta","data":{"x":2},"continuation":{"tokens":[5,6]}}"#);
+        kept.note(r#"{"data":"[DONE]","continuation":{"tokens":[7]}}"#);
+        let first = client_frame(first);
         assert_eq!(
             format!("{first:?}"),
             format!("{:?}", frame(r#"{"data":{"x":1}}"#)),
@@ -714,9 +739,9 @@ mod tests {
     #[test]
     fn props_come_from_the_body_and_the_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-plex-prop-priority", "3".parse().unwrap());
-        headers.insert("x-plex-prop-tier", "gold".parse().unwrap());
-        headers.insert("x-plex-prop-tags", r#"["a","b"]"#.parse().unwrap());
+        headers.insert("x-plex-hint-priority", "3".parse().unwrap());
+        headers.insert("x-plex-hint-tier", "gold".parse().unwrap());
+        headers.insert("x-plex-hint-tags", r#"["a","b"]"#.parse().unwrap());
         headers.insert("x-request-id", "r".parse().unwrap());
         let body = json!({"model": "m", "plex": {"priority": 1, "deadline-ms": 500}});
         let expected: Props = serde_json::from_value(json!({
@@ -771,7 +796,7 @@ mod tests {
         );
         assert_eq!(text(&json!({"prompt": "once upon"})), "once upon\n");
         let mut headers = HeaderMap::new();
-        headers.insert("x-plex-prop-prompt", "the client's".parse().unwrap());
+        headers.insert("x-plex-hint-prompt", "the client's".parse().unwrap());
         assert_eq!(props(&headers, &first)["prompt"], json!("the client's"));
         assert!(!props(&HeaderMap::new(), &json!({"model": "m"})).contains_key("prompt"));
     }

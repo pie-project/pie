@@ -9,6 +9,7 @@ pub mod kv_append;
 pub mod merge;
 pub mod mla;
 pub mod pool;
+pub mod ring;
 pub mod score;
 pub mod sdpa;
 pub mod voxel;

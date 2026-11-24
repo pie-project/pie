@@ -32,6 +32,7 @@ use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
@@ -60,22 +61,49 @@ struct Input {
     /// vocabulary in the epilogue.
     #[serde(default)]
     margin: bool,
+    /// `rollback_mode: "ckpt_sync"` when `rollback_mode` is left out.
     #[serde(default)]
     ckpt_sync: bool,
+    /// How a rejected round is rolled back: `flush_free` (the next fire
+    /// overwrites the rejected slots), `ckpt_sync` (each round checkpoints
+    /// the set before its fire and, on a rejection, replays the accepted rows
+    /// on a fork of that checkpoint) or `stop_wait` (the same replay, twice).
+    /// Any other name is refused.
     #[serde(default)]
     rollback_mode: Option<String>,
-    /// Throughput-bench mode, named by the caller and never inferred: every
-    /// round accepts `k - 1` drafts unverified and stop tokens are ignored, so
-    /// the output is NOT the model's answer. Off unless the request says
-    /// `"bench_accept": true`; it takes no `trace`, `margin` or `pad`.
-    #[serde(default)]
-    bench_accept: bool,
 }
 
-/// Bench mode is the caller's explicit choice; a long request with drafts is
-/// an ordinary request and gets verified tokens.
-fn bench_mode(input: &Input, k: u32) -> bool {
-    input.bench_accept && !input.trace && !input.margin && input.pad == 0 && k > 0
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rollback {
+    FlushFree,
+    CkptSync,
+    StopWait,
+}
+
+/// The rollback the request names; a name this program does not run is
+/// refused, never taken for the default.
+fn rollback(input: &Input) -> Result<Rollback> {
+    match input.rollback_mode.as_deref() {
+        None if input.ckpt_sync => Ok(Rollback::CkptSync),
+        None | Some("flush_free") => Ok(Rollback::FlushFree),
+        Some("ckpt_sync") => Ok(Rollback::CkptSync),
+        Some("stop_wait") => Ok(Rollback::StopWait),
+        Some(other) => Err(format!(
+            "unknown rollback_mode `{other}`: this program runs flush_free, ckpt_sync or stop_wait"
+        )),
+    }
+}
+
+/// What a restore replays after a rejected round: the rows of the window the
+/// trunk kept, `window[0..=m]` — the token the round started from, then the
+/// `m` drafts — at the round's own slots, from `base`, the committed length
+/// the round's checkpoint holds. `live` is what the round committed: those
+/// drafts, then the correction.
+fn replay_of(start: u32, live: &[u32], base: u32) -> (Vec<i32>, std::ops::Range<u32>) {
+    let mut rows = vec![start as i32];
+    rows.extend(live[..live.len().saturating_sub(1)].iter().map(|&t| t as i32));
+    let end = base + rows.len() as u32;
+    (rows, base..end)
 }
 
 /// The prompt's prefill spans: with drafts on, runs of at most `limit` rows
@@ -134,6 +162,11 @@ struct Output {
     accepted: usize,
     /// `accepted / drafted`, or zero when nothing was drafted.
     acceptance_rate: f64,
+    /// Restores replayed after a rejected round (`ckpt_sync`, `stop_wait`).
+    restores: usize,
+    /// Of those, the ones whose replay did not answer the round's correction:
+    /// a restore that read the wrong rows or the wrong checkpoint.
+    restore_misses: usize,
     /// The draft-window length the request asked for.
     asked: u32,
     /// The draft-window length this run used: `asked`, capped at `depth`.
@@ -172,6 +205,8 @@ impl Output {
             drafted: 0,
             accepted: 0,
             acceptance_rate: 0.0,
+            restores: 0,
+            restore_misses: 0,
             asked,
             k,
             depth,
@@ -197,6 +232,7 @@ async fn main(input: Input) -> Result<Output> {
     let width = output("mtp.drafts").map_or(0, |drafts| drafts.width);
     let depth = model::draft_depth().min(width);
     let k = working_k(input.k, depth);
+    let mode = rollback(&input)?;
     if input.max_tokens == 0 {
         return Ok(Output::empty(input.k, k, depth));
     }
@@ -276,6 +312,7 @@ async fn main(input: Input) -> Result<Output> {
     let x = seed[0] as u32;
     generated.push(x);
     let (mut rounds, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
+    let (mut restores, mut restore_misses) = (0usize, 0usize);
     let mut margin_trace: Vec<f32> = Vec::new();
     let mut top_trace: Vec<f32> = Vec::new();
     let mut commits_trace: Vec<u32> = Vec::new();
@@ -283,9 +320,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut truth_trace: Vec<Vec<u32>> = Vec::new();
     let tracing = input.trace;
     let margin = input.margin;
-    let bench_accept = bench_mode(&input, k);
-    let mut stopped =
-        (!bench_accept && stop_tokens.contains(&x)) || generated.len() >= input.max_tokens;
+    let mut stopped = stop_tokens.contains(&x) || generated.len() >= input.max_tokens;
 
     // ── DECODE: one window per fire, loop-carried on the device ──────────
     //
@@ -354,12 +389,7 @@ async fn main(input: Input) -> Result<Output> {
                 let proposed = gather(&window, iota(k) + &one); // window[1..=k]
                 let said = gather(&truth, iota(k)); // truth[0..k]
                 let hit = cast(eq(&proposed, &said), dtype::u32);
-                let exact = reshape(reduce_sum(cumprod(&hit)), [1]);
-                if bench_accept {
-                    broadcast(Tensor::constant(k.saturating_sub(1)), [1])
-                } else {
-                    exact
-                }
+                reshape(reduce_sum(cumprod(&hit)), [1])
             } else {
                 broadcast(Tensor::constant(0u32), [1])
             };
@@ -399,28 +429,15 @@ async fn main(input: Input) -> Result<Output> {
             fold.put(&m + &one);
         });
 
-        let budget = if bench_accept && k > 0 {
-            input.max_tokens.div_ceil(k as usize)
-        } else {
-            input.max_tokens
-        };
-        let mode = input
-            .rollback_mode
-            .as_deref()
-            .unwrap_or(if input.ckpt_sync {
-                "ckpt_sync"
-            } else {
-                "flush_free"
-            });
-        let ckpt_sync = mode == "ckpt_sync";
-        let stop_wait = mode == "stop_wait";
-        let held_ckpt = if ckpt_sync || stop_wait {
-            ws.fork(&pipe).ok()
-        } else {
-            None
-        };
-        if ckpt_sync || stop_wait {
+        let budget = input.max_tokens;
+        let stop_wait = mode == Rollback::StopWait;
+        if mode != Rollback::FlushFree {
+            // The round's base, the committed length its checkpoint holds, and
+            // how many of the previous window's rows its fire folds first.
+            let mut round_base = n;
+            let mut round_fold = 0u32;
             for _ in 0..budget {
+                let ckpt_ws = ws.fork(&pipe).context("checkpoint the set before the round's fire")?;
                 fwd.submit(&pipe)?;
                 let committed = out.take_host::<Vec<i32>>().await?;
                 if tracing {
@@ -448,45 +465,50 @@ async fn main(input: Input) -> Result<Output> {
                     .collect();
                 accepted += live.len().saturating_sub(1);
                 commits_trace.push(live.len() as u32);
+                let start = *generated.last().expect("the prefill's token is committed");
                 if k > 0 && live.len() <= k as usize {
-                    if let Some(ref ckpt_ws) = held_ckpt {
-                        let replays = if stop_wait { 2 } else { 1 };
-                        for _ in 0..replays {
-                            if let Ok(restore_ws) = ckpt_ws.fork(&pipe) {
-                                let live_i32: Vec<i32> = live.iter().map(|&t| t as i32).collect();
-                                let r_len = live_i32.len() as u32;
-                                let toks_r = Channel::from(live_i32.as_slice());
-                                let ind_r = Channel::from([0u32, r_len]);
-                                let rd_r = Channel::from([r_len - 1]);
-                                let slots_r = Channel::from_iter(n..n + r_len);
-                                let out_r = Channel::new([1], dtype::i32);
-                                let fwd_r = ForwardPass::new();
-                                fwd_r.embed(&toks_r, &ind_r)?;
-                                fwd_r.readout(&rd_r)?;
-                                fwd_r.state(
-                                    &[&restore_ws],
-                                    StateGeometry {
-                                        slots: Some(&slots_r),
-                                        fold: Fold::None,
-                                        ..StateGeometry::default()
-                                    },
-                                )?;
-                                fwd_r.epilogue(move || {
-                                    out_r.put(reshape(
-                                        reduce_argmax(intrinsics::output(0, "logits")),
-                                        [1],
-                                    ));
-                                });
-                                fwd_r.submit(&pipe)?;
-                                let _ = out_r.take_host::<Vec<i32>>().await?;
-                            }
+                    let replays = if stop_wait { 2 } else { 1 };
+                    let (rows, at) = replay_of(start, &live, round_base);
+                    for _ in 0..replays {
+                        let restore_ws = ckpt_ws.fork(&pipe).context("restore the round's checkpoint")?;
+                        let r_len = rows.len() as u32;
+                        let toks_r = Channel::from(rows.as_slice());
+                        let ind_r = Channel::from([0u32, r_len]);
+                        let rd_r = Channel::from([r_len - 1]);
+                        let slots_r = Channel::from_iter(at.clone());
+                        let fold_r = Channel::from([round_fold]);
+                        let out_r = Channel::new([1], dtype::i32);
+                        let fwd_r = ForwardPass::new();
+                        fwd_r.embed(&toks_r, &ind_r)?;
+                        fwd_r.readout(&rd_r)?;
+                        fwd_r.state(
+                            &[&restore_ws],
+                            StateGeometry {
+                                slots: Some(&slots_r),
+                                fold: Fold::Count(&fold_r),
+                                ..StateGeometry::default()
+                            },
+                        )?;
+                        fwd_r.epilogue(move || {
+                            out_r.put(reshape(
+                                reduce_argmax(intrinsics::output(0, "logits")),
+                                [1],
+                            ));
+                        });
+                        fwd_r.submit(&pipe).context("restore replay")?;
+                        let answer = out_r.take_host::<Vec<i32>>().await?;
+                        restores += 1;
+                        // The trunk after the kept rows says the correction again.
+                        if answer.first().map(|&t| t as u32) != live.last().copied() {
+                            restore_misses += 1;
                         }
                     }
                 }
+                round_base += live.len() as u32;
+                round_fold = live.len() as u32;
                 for t in live {
                     generated.push(t);
-                    if (!bench_accept && stop_tokens.contains(&t))
-                        || generated.len() >= input.max_tokens
+                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens
                     {
                         stopped = true;
                         break;
@@ -495,59 +517,6 @@ async fn main(input: Input) -> Result<Output> {
                 if stopped {
                     break;
                 }
-            }
-        } else if bench_accept {
-            let mut cur_win: Vec<i32> = seed.clone();
-            let mut cur_base: u32 = n;
-            let mut survivors: u32 = 0;
-            let accept_m = k.saturating_sub(1) as usize;
-            while !stopped && generated.len() < input.max_tokens {
-                let ids = Channel::from(cur_win.as_slice());
-                let embed_indptr = Channel::from([0u32, w]);
-                let slots_ch = Channel::from_iter(cur_base..cur_base + w);
-                let readout_ch = Channel::from_iter(0..w);
-                let fold_ch = Channel::from([survivors]);
-                let truth_out = Channel::new([w], dtype::i32);
-                let fwd_fast = ForwardPass::new();
-                fwd_fast.embed(&ids, &embed_indptr)?;
-                fwd_fast.readout(&readout_ch)?;
-                fwd_fast.state(
-                    &[&ws],
-                    StateGeometry {
-                        slots: Some(&slots_ch),
-                        fold: Fold::Count(&fold_ch),
-                        ..StateGeometry::default()
-                    },
-                )?;
-                fwd_fast.epilogue(move || {
-                    let truth = reshape(reduce_argmax(intrinsics::output(0, "logits")), [w]);
-                    let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * width]);
-                    let _ = gather(&chains, iota(w));
-                    truth_out.put(&truth);
-                });
-                fwd_fast.submit(&pipe)?;
-                let truth = truth_out.take_host::<Vec<i32>>().await?;
-                rounds += 1;
-                drafted += k as usize;
-                accepted += accept_m;
-                commits_trace.push((accept_m + 1) as u32);
-                for &tok in &cur_win[1..=accept_m] {
-                    generated.push(tok as u32);
-                    if generated.len() >= input.max_tokens {
-                        stopped = true;
-                        break;
-                    }
-                }
-                let corr = truth[accept_m];
-                if !stopped {
-                    generated.push(corr as u32);
-                    if generated.len() >= input.max_tokens {
-                        stopped = true;
-                    }
-                }
-                cur_base += (accept_m + 1) as u32;
-                survivors = (accept_m + 1) as u32;
-                cur_win.fill(corr);
             }
         } else {
             run_ahead(&pipe, &fwd, budget, async || {
@@ -580,8 +549,7 @@ async fn main(input: Input) -> Result<Output> {
                 commits_trace.push(live.len() as u32);
                 for t in live {
                     generated.push(t);
-                    if (!bench_accept && stop_tokens.contains(&t))
-                        || generated.len() >= input.max_tokens
+                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens
                     {
                         stopped = true;
                         break;
@@ -600,10 +568,8 @@ async fn main(input: Input) -> Result<Output> {
 
     // A stop token ends the text; anything the last window committed past
     // it is not the answer.
-    if !bench_accept {
-        if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
-            generated.truncate(at + 1);
-        }
+    if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
+        generated.truncate(at + 1);
     }
     generated.truncate(input.max_tokens);
     let acceptance_rate = if drafted == 0 {
@@ -620,6 +586,8 @@ async fn main(input: Input) -> Result<Output> {
         drafted,
         accepted,
         acceptance_rate,
+        restores,
+        restore_misses,
         asked: input.k,
         k,
         depth,
@@ -640,21 +608,47 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    /// A long request with drafts is an ordinary request: verified, stopping.
+    /// A key the request does not name is refused by name, not ignored: a
+    /// removed option (`bench_accept`) cannot quietly run something else.
     #[test]
-    fn a_long_request_with_drafts_is_not_a_bench() {
-        let input = request(r#"{"max_tokens": 128, "k": 4}"#);
-        assert!(!bench_mode(&input, working_k(input.k, 4)));
-        let input = request(r#"{"max_tokens": 4096, "k": 4}"#);
-        assert!(!bench_mode(&input, working_k(input.k, 4)));
+    fn an_unknown_key_is_refused() {
+        let why = serde_json::from_str::<Input>(r#"{"bench_accept": true}"#)
+            .err()
+            .expect("an unknown key is refused")
+            .to_string();
+        assert!(why.contains("unknown field `bench_accept`"), "{why}");
     }
 
+    /// A rollback the program does not run is refused by name, not flushed.
     #[test]
-    fn bench_mode_is_named_by_the_caller() {
-        let input = request(r#"{"max_tokens": 16, "k": 4, "bench_accept": true}"#);
-        assert!(bench_mode(&input, working_k(input.k, 4)));
-        let input = request(r#"{"max_tokens": 16, "k": 0, "bench_accept": true}"#);
-        assert!(!bench_mode(&input, working_k(input.k, 4)));
+    fn an_unknown_rollback_mode_is_refused() {
+        let err = rollback(&request(r#"{"rollback_mode": "ckpt"}"#)).unwrap_err();
+        assert!(err.contains("unknown rollback_mode `ckpt`"), "{err}");
+        assert_eq!(rollback(&request("{}")), Ok(Rollback::FlushFree));
+        assert_eq!(rollback(&request(r#"{"ckpt_sync": true}"#)), Ok(Rollback::CkptSync));
+        for (name, mode) in [
+            ("flush_free", Rollback::FlushFree),
+            ("ckpt_sync", Rollback::CkptSync),
+            ("stop_wait", Rollback::StopWait),
+        ] {
+            let json = format!(r#"{{"rollback_mode": "{name}"}}"#);
+            assert_eq!(rollback(&request(&json)), Ok(mode));
+        }
+    }
+
+    /// A restore replays the round's kept rows at the round's own slots: the
+    /// token the round began from, then its accepted drafts — never the
+    /// committed tokens at the prompt's end.
+    #[test]
+    fn a_restore_replays_the_round_from_its_own_base() {
+        // Round at base 20 began from 7; it kept drafts 8, 9 and corrected to 5.
+        let (rows, at) = replay_of(7, &[8, 9, 5], 20);
+        assert_eq!(rows, [7, 8, 9]);
+        assert_eq!(at, 20..23);
+        // Nothing kept: the replay is the round's first row alone.
+        let (rows, at) = replay_of(7, &[4], 31);
+        assert_eq!(rows, [7]);
+        assert_eq!(at, 31..32);
     }
 
     /// With drafts on, every prompt row is in a span the head runs over.

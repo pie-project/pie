@@ -9,7 +9,7 @@ pub mod layout;
 pub mod pool;
 pub mod rows;
 
-use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
+use engine::chunk::{ChunkFacts, ChunkTable, Evacuation, ShapeId, SlotCopy};
 use engine::transfer::{KvRun, MemoryDomain};
 use kernels_slang::{KvPool, Segments, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
@@ -20,7 +20,7 @@ use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use crate::run::{CachePool, CacheTable};
 use crate::store::kv::{Facts, Paging};
-use crate::store::layout::{FIXED, LIST, Layout, RS, Slots, WINDOWS, gcd, window_shape};
+use crate::store::layout::{FIXED, LIST, Layout, RS, Slots, WINDOW, gcd};
 use crate::store::pool::Pool;
 
 /// A layer's recurrent cache as kernels bind it: `state` carries the row's
@@ -81,43 +81,85 @@ pub struct Seats {
     pub slot_ids: Tensor,
 
     pub slot_of_row: Tensor,
+
+    /// `4 + pieces` ints a lane where the fire reads windowed rows: its
+    /// folded index, buffer base, first row of the fire, folded index after
+    /// it, and its record's units (`kernels_slang::Ring::lanes`).
+    pub ring_lanes: Tensor,
 }
 
-/// The list a kv row's pages lie in: the kv list, or window list `k`
-/// (CONTRACT-BC 21).
+/// The list a kv row's pages lie in: the kv list, or the window buffer of
+/// a windowed row (CONTRACT-BC 19, 21), whose keys below a lane's folded
+/// index lie in its ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Paged {
     List,
-    Window(usize),
+    Buffer,
 }
 
 impl Paged {
-    /// The window list this is, if one.
-    #[must_use]
-    pub fn window(self) -> Option<usize> {
-        match self {
-            Paged::List => None,
-            Paged::Window(k) => Some(k),
-        }
-    }
-
     /// The slot shape of this list.
     #[must_use]
     pub fn shape(self) -> ShapeId {
         match self {
             Paged::List => LIST,
-            Paged::Window(k) => window_shape(k),
+            Paged::Buffer => WINDOW,
         }
     }
 }
 
-/// A window list as a load lays it: its slot's bytes, the rows its window
-/// retains, the tokens (`T_w`) a slot holds.
+/// The window buffer as a load lays it: its slot's bytes and the tokens
+/// (`T`, the kv page's) a slot holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowRows {
+pub struct BufferRows {
     pub bytes: u64,
-    pub window: u32,
     pub tokens: u32,
+}
+
+/// A windowed kv row's ring in a lane's record ([`crate::chunks::Rings`]):
+/// `rows` (W) rows of its keys at byte `keys` of record piece `piece`, as
+/// many of its values at byte `values` of piece `values_piece`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingAt {
+    pub rows: u32,
+    pub piece: u32,
+    pub keys: u64,
+    pub values_piece: u32,
+    pub values: u64,
+}
+
+/// Where a windowed layer's ring lies in the recipe's ring run: its bytes
+/// from `at` of the region, cut into pieces between `atom`s as `run` cuts
+/// them.
+#[derive(Debug, Clone)]
+struct RingRun {
+    rows: u32,
+    at: u64,
+    atom: u64,
+    run: poem_compiler::chunk::FixedRun,
+}
+
+impl RingRun {
+    /// The record piece and byte there the region's bytes `[from, from +
+    /// len)` lie at, refused where a piece cut divides them.
+    fn place(&self, from: u64, len: u64, what: &str) -> Result<(u32, u64)> {
+        let per = self.run.atoms_per_piece.max(1);
+        let from = self.at + from;
+        let (first, last) = (from / self.atom, (from + len.max(1) - 1) / self.atom);
+        if first / per != last / per {
+            return Err(disagree(format!("cuts {what} across record pieces")));
+        }
+        let piece = *self
+            .run
+            .slots
+            .get(usize::try_from(first / per).unwrap_or(usize::MAX))
+            .ok_or_else(|| disagree(format!("lays {what} past the record's pieces")))?;
+        let byte = self.run.offset + (first % per) * self.atom + from % self.atom;
+        if byte % 4 != 0 {
+            return Err(disagree(format!("lays {what} at byte {byte}, inside a word")));
+        }
+        Ok((piece, byte))
+    }
 }
 
 /// One cache row's place in a slot.
@@ -136,6 +178,8 @@ enum Row {
         values_width: u64,
         keys_cell: u64,
         values_cell: u64,
+        /// A windowed row's ring (its pages then the window buffer's).
+        ring: Option<RingAt>,
     },
     /// A state row: `stride` elements at `offset` in the record's slots
     /// `first ..`: whole in slot `first`, or cut `piece_atoms` atoms
@@ -183,16 +227,18 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The window lists, narrowest window first.
-    pub windows: Vec<WindowRows>,
+    /// The window buffer, where the load has windowed rows.
+    pub buffer: Option<BufferRows>,
     /// The page tables a fire stages, by the list each pages: the kv
-    /// list's first (the All axis reads it), then each window list's.
+    /// list's first (the All axis reads it), then the window buffer's.
     pub tables: Vec<Paged>,
     pub rs: Option<RsRows>,
     pub kv_rows: Vec<u32>,
-    /// The kv rows each window list lays out, in order.
-    pub window_rows: Vec<Vec<u32>>,
+    /// The kv rows the window buffer lays out, in order.
+    pub buffer_rows: Vec<u32>,
     pub state_rows: Vec<u32>,
+    /// The windowed layers' rings as the facts state them.
+    pub windowed: Vec<engine::chunk::WindowedLayer>,
 }
 
 fn disagree(what: String) -> Fault {
@@ -212,31 +258,29 @@ impl Rows {
         facts: &Facts,
         rs: Option<&crate::rs::Layout>,
     ) -> Result<Rows> {
-        let mut windows = Vec::new();
-        let mut window_runs = Vec::new();
-        for layout in recipe.windows() {
-            if let SlotLayout::List {
-                tokens,
-                bytes,
-                rows,
-                window: Some(window),
-            } = layout
-            {
-                windows.push(WindowRows {
-                    bytes: *bytes,
-                    window: *window,
-                    tokens: *tokens,
-                });
-                window_runs.push(rows.as_slice());
-            }
-        }
-        if windows.len() > WINDOWS {
+        if recipe.windows().next().is_some() {
             return Err(disagree(format!(
-                "keeps {} window lists ({}), where a load holds at most {WINDOWS}",
-                windows.len(),
+                "keeps window lists ({}), where this shell serves windowed rows as ring + \
+                 buffer",
                 recipe.shapes()
             )));
         }
+        let (buffer, buffer_runs) = match recipe.window_buffer() {
+            Some(SlotLayout::List {
+                tokens,
+                bytes,
+                rows,
+                ..
+            }) => (
+                Some(BufferRows {
+                    bytes: *bytes,
+                    tokens: *tokens,
+                }),
+                rows.as_slice(),
+            ),
+            _ => (None, &[][..]),
+        };
+        let rings = rings_of(recipe)?;
         let (tokens, list_bytes, runs) = match recipe.list() {
             Some(SlotLayout::List {
                 tokens,
@@ -255,26 +299,23 @@ impl Rows {
             }) => (*bytes, *pieces_per_ws, rows.as_slice()),
             _ => (0, 0, &[][..]),
         };
-        // Without a kv list the narrowest window list's slot is the kv page.
+        // Without a kv list the window buffer's slot is the kv page.
         let tokens = if list_bytes == 0 {
-            windows.first().map_or(0, |w| w.tokens)
+            buffer.map_or(0, |b| b.tokens)
         } else {
             tokens
         };
-        if let Some(window) = windows
-            .iter()
-            .find(|w| w.tokens == 0 || w.tokens > tokens || tokens % w.tokens != 0)
-        {
+        if let Some(held) = buffer.filter(|b| b.tokens != tokens) {
             return Err(disagree(format!(
-                "pages windowed rows {} tokens a window slot beside {tokens}-token kv pages, \
-                 where a window list's slot divides a kv page",
-                window.tokens
+                "buffers windowed rows {} tokens a slot beside {tokens}-token kv pages, \
+                 where this shell's ring kernels read both as one page",
+                held.tokens
             )));
         }
         let mut tables: Vec<Paged> = Vec::new();
         let mut rows = Vec::with_capacity(trace.caches.len());
         let mut kv_rows = Vec::new();
-        let mut window_rows = vec![Vec::new(); windows.len()];
+        let mut window_rows = Vec::new();
         let mut state_rows = Vec::new();
         for (index, row) in trace.caches.iter().enumerate() {
             let id = RowId::Cache(u32::try_from(index).unwrap_or(u32::MAX));
@@ -311,17 +352,13 @@ impl Rows {
                     let keys_cell = width * element;
                     let values_cell = planes.values * element;
                     let per_token = keys_cell + if own_values { values_cell } else { 0 };
-                    // Where the row lies: a kv list slot or a window list's,
-                    // and the tokens a run there holds.
+                    // Where the row lies: a kv list slot or the window
+                    // buffer's, and the tokens a run there holds.
                     let (paged, run, run_tokens) =
                         if let Some(run) = runs.iter().find(|run| run.row == id) {
                             (Paged::List, run, tokens)
-                        } else if let Some((k, run)) =
-                            window_runs.iter().enumerate().find_map(|(k, runs)| {
-                                runs.iter().find(|run| run.row == id).map(|run| (k, run))
-                            })
-                        {
-                            (Paged::Window(k), run, windows[k].tokens)
+                        } else if let Some(run) = buffer_runs.iter().find(|run| run.row == id) {
+                            (Paged::Buffer, run, tokens)
                         } else {
                             return Err(disagree(format!("lays kv row `{name}` in no slot")));
                         };
@@ -347,10 +384,40 @@ impl Rows {
                         tables.push(paged);
                     }
                     let at = u32::try_from(index).unwrap_or(u32::MAX);
-                    match paged {
-                        Paged::List => kv_rows.push(at),
-                        Paged::Window(k) => window_rows[k].push(at),
-                    }
+                    let ring = match paged {
+                        Paged::List => {
+                            kv_rows.push(at);
+                            None
+                        }
+                        Paged::Buffer => {
+                            window_rows.push(at);
+                            let Some((_, at)) = rings.iter().find(|(row, _)| *row == id) else {
+                                return Err(disagree(format!(
+                                    "buffers windowed kv row `{name}` and gives it no ring"
+                                )));
+                            };
+                            // Keys, then values: a shared plane reads its keys twice.
+                            let half = u64::from(at.rows) * keys_cell;
+                            let (piece, keys) =
+                                at.place(0, half, &format!("kv row `{name}`'s ring keys"))?;
+                            let (values_piece, values) = if own_values {
+                                at.place(
+                                    half,
+                                    u64::from(at.rows) * values_cell,
+                                    &format!("kv row `{name}`'s ring values"),
+                                )?
+                            } else {
+                                (piece, keys)
+                            };
+                            Some(RingAt {
+                                rows: at.rows,
+                                piece,
+                                keys,
+                                values_piece,
+                                values,
+                            })
+                        }
+                    };
                     rows.push(Row::Kv {
                         paged,
                         head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
@@ -365,6 +432,7 @@ impl Rows {
                         } else {
                             values_cell
                         },
+                        ring,
                     });
                 }
                 CacheRow::State {
@@ -432,12 +500,6 @@ impl Rows {
             let (paged, run, run_tokens) = if let Some(run) = runs.iter().find(|run| run.row == id)
             {
                 (Paged::List, run, tokens)
-            } else if let Some((k, run)) = window_runs
-                .iter()
-                .enumerate()
-                .find_map(|(k, runs)| runs.iter().find(|run| run.row == id).map(|run| (k, run)))
-            {
-                (Paged::Window(k), run, windows[k].tokens)
             } else {
                 return Err(disagree(format!(
                     "keeps no compressor state beside kv row {row}, which a pool gather \
@@ -472,22 +534,85 @@ impl Rows {
             tokens,
             fixed_bytes,
             pieces: pieces.max(1),
-            windows,
+            buffer,
             // The kv list's table first: the All axis reads it (or the
-            // narrowest window list's, where no row is in the kv list).
+            // window buffer's, where no row is in the kv list).
             tables: {
                 tables.sort_by_key(|paged| match paged {
                     Paged::List => 0,
-                    Paged::Window(k) => 1 + *k,
+                    Paged::Buffer => 1,
                 });
                 tables
             },
             rs,
             kv_rows,
-            window_rows,
+            buffer_rows: window_rows,
             state_rows,
+            windowed: windowed_of(recipe),
         })
     }
+}
+
+/// The windowed layers' rings as the facts state them: each layer's share
+/// of the ring region ([`crate::chunks::Rings`]).
+fn windowed_of(recipe: &ChunkRecipe) -> Vec<engine::chunk::WindowedLayer> {
+    let Some(windowed) = &recipe.windowed else {
+        return Vec::new();
+    };
+    windowed
+        .layers
+        .iter()
+        .zip(&windowed.region.layer_bytes)
+        .map(|(layer, &bytes)| engine::chunk::WindowedLayer {
+            layer: layer.layer.unwrap_or(u32::MAX),
+            window: layer.window,
+            bytes,
+            ..engine::chunk::WindowedLayer::default()
+        })
+        .collect()
+}
+
+/// Each windowed kv row's ring: the plain per-layer rings
+/// ([`crate::chunks::Rings`]) where the recipe's ring run lays the region.
+fn rings_of(recipe: &ChunkRecipe) -> Result<Vec<(RowId, RingRun)>> {
+    let Some(windowed) = &recipe.windowed else {
+        return Ok(Vec::new());
+    };
+    let plain = poem_compiler::chunk::plain_rings(&windowed.layers, crate::chunks::RING_ALIGN);
+    if plain.region != windowed.region {
+        return Err(disagree(
+            "lays a ring region other than this shell's plain per-layer rings".to_string(),
+        ));
+    }
+    if windowed.ring_shape.is_some() {
+        return Err(disagree(
+            "lays the rings at chunk starts, where this shell reads them inside the record"
+                .to_string(),
+        ));
+    }
+    let run = windowed
+        .ring_run(recipe)
+        .ok_or_else(|| disagree("states windowed layers and no ring run".to_string()))?;
+    let mut out = Vec::new();
+    for (at, layer) in windowed.layers.iter().enumerate() {
+        let [row] = layer.rows.as_slice() else {
+            return Err(disagree(format!(
+                "rings layer {:?} of {} kv rows, where this shell reads a ring a row",
+                layer.layer,
+                layer.rows.len()
+            )));
+        };
+        out.push((
+            *row,
+            RingRun {
+                rows: layer.window,
+                at: plain.offsets[at],
+                atom: windowed.region.atom.max(1),
+                run: run.clone(),
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// The rs planes' places in an rs-list slot, read off the recipe's
@@ -558,8 +683,10 @@ pub struct Pools<B: Backend> {
     pool: Pool<B>,
     layout: Layout,
     /// The cache rows each shape lays out: the kv list's, the record's,
-    /// then each window list's.
+    /// then the window buffer's.
     shape_rows: Vec<Vec<u32>>,
+    /// The windowed layers' rings, as the facts state them.
+    windowed: Vec<engine::chunk::WindowedLayer>,
     /// The page tables a fire stages, by the list each pages.
     tables: Vec<Paged>,
     rs: Option<RsRows>,
@@ -653,10 +780,12 @@ impl<B: Backend> Pools<B> {
                 pages: list_slots.max(1),
                 ..paging
             },
-            shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone()]
-                .into_iter()
-                .chain(rows.window_rows.iter().cloned())
-                .collect(),
+            shape_rows: vec![
+                rows.kv_rows.clone(),
+                rows.state_rows.clone(),
+                rows.buffer_rows.clone(),
+            ],
+            windowed: rows.windowed.clone(),
             tables: rows.tables.clone(),
             rs: rows.rs,
             rows: rows.rows,
@@ -950,69 +1079,130 @@ impl<B: Backend> Pools<B> {
             .unwrap_or(0)
     }
 
-    /// The page table each window list's write descriptors read, by its
-    /// window; a window the recipe kept whole reads the kv list's (table 0).
+    /// The page table each windowed row's write descriptors read, by its
+    /// window: the window buffer's.
     #[must_use]
     pub fn window_tables(&self) -> Vec<(u32, usize)> {
-        (0..WINDOWS)
-            .filter_map(|k| {
-                let list = self.layout.window(k)?;
-                Some((list.window, self.table_of(Paged::Window(k))))
-            })
-            .collect()
+        let mut out: Vec<(u32, usize)> = Vec::new();
+        for row in &self.rows {
+            if let Row::Kv {
+                ring: Some(ring), ..
+            } = row
+                && !out.iter().any(|&(w, _)| w == ring.rows)
+            {
+                out.push((ring.rows, self.table_of(Paged::Buffer)));
+            }
+        }
+        out
     }
 
-    /// The paging of `paged`'s list: the kv page, or window list `k`'s `T_w`
-    /// tokens a page (CONTRACT-BC 21), as many pages a seat as its context
-    /// fills.
+    /// The distinct windows the windowed rows read through.
     #[must_use]
-    pub fn paging_of(&self, paged: Paged) -> Paging {
-        match paged.window().and_then(|k| self.layout.window(k)) {
-            Some(list) => {
-                let tokens = list.tokens.max(1);
-                Paging {
-                    page_size: tokens,
-                    pages_per_slot: self.paging.context().div_ceil(tokens).max(1),
-                    ..self.paging
-                }
-            }
-            None => self.paging,
-        }
+    pub fn windows(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.window_tables().into_iter().map(|(w, _)| w).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The windowed layers' rings, as the facts state them.
+    #[must_use]
+    pub fn windowed(&self) -> &[engine::chunk::WindowedLayer] {
+        &self.windowed
+    }
+
+    /// The widest ring a windowed row holds and the narrowest window, where
+    /// the load has windowed rows: every ring holds at least its window.
+    #[must_use]
+    pub fn rings(&self) -> Option<(u32, u32)> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Kv {
+                    ring: Some(ring), ..
+                } => Some(ring.rows),
+                _ => None,
+            })
+            .fold(None, |held: Option<(u32, u32)>, w| {
+                Some(held.map_or((w, w), |(a, b)| (a.max(w), b.min(w))))
+            })
+    }
+
+    /// The paging of `paged`'s list: the kv page (the window buffer's slot
+    /// holds as many rows), as many pages a seat as its context fills.
+    #[must_use]
+    pub fn paging_of(&self, _paged: Paged) -> Paging {
+        self.paging
     }
 
     /// A lane's pages of `paged`'s list as kernels address them, in token
-    /// order: `refs` (its slot refs; in a window list 0 is a slot trimmed
-    /// behind the window, the null chunk) as units of [`Pools::unit`], or,
-    /// seat-addressed, seat `seat`'s run, `pages` of them.
+    /// order: `refs` (its slot refs) as units of [`Pools::unit`], or,
+    /// seat-addressed, seat `seat`'s run from its page `first`, `pages` of
+    /// them.
     pub fn list_pages(
         &self,
         paged: Paged,
         refs: &[u32],
-        seat: Option<(u32, u32)>,
+        seat: Option<(u32, u32, u32)>,
     ) -> Result<Vec<u32>> {
-        let Paged::Window(k) = paged else {
-            return self.kv_pages(refs, seat);
+        let Paged::Buffer = paged else {
+            return self.kv_pages(refs, seat.map(|(slot, _, pages)| (slot, pages)));
         };
-        let id = window_shape(k);
-        let window = *self.shape(id)?;
-        let unit = |slot: u32| -> Result<u32> {
-            if slot == 0 {
-                return Ok(0);
-            }
-            self.units(id, slot)
-        };
-        if let Some((slot, pages)) = seat
+        let buffer = *self.shape(WINDOW)?;
+        if let Some((slot, first, pages)) = seat
             && refs.is_empty()
         {
-            let first = u64::from(slot) * u64::from(self.paging_of(paged).pages_per_slot);
+            let base = u64::from(slot) * u64::from(self.paging.pages_per_slot) + u64::from(first);
             return (0..pages)
                 .map(|page| {
-                    let at = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
-                    unit(window.seat_ref(at)?)
+                    let at = u32::try_from(base + u64::from(page)).unwrap_or(u32::MAX);
+                    self.units(WINDOW, buffer.seat_ref(at)?)
                 })
                 .collect();
         }
-        refs.iter().map(|&r| unit(r)).collect()
+        refs.iter().map(|&r| self.units(WINDOW, r)).collect()
+    }
+
+    /// The window buffer's slot bytes and its unit (what one of its page ids
+    /// counts), where the load has one.
+    #[must_use]
+    pub fn buffer_slot(&self) -> Option<(u64, u64)> {
+        let shape = self.layout.shape(WINDOW)?;
+        Some((shape.slot_bytes, self.unit(WINDOW).ok()?))
+    }
+
+    /// The fire's own window-buffer-shaped slots, `count` from byte `at`
+    /// of the span's buffer (the first on the next unit), as kernel units.
+    pub fn fire_units(&self, at: u64, count: u32) -> Result<Vec<u32>> {
+        let (_, unit) = self.buffer_slot().ok_or_else(|| Fault::Unbound {
+            what: "the window buffer, which this load holds none of".to_string(),
+        })?;
+        self.units_at((self.pool.span_base() + at).next_multiple_of(unit), count)
+    }
+
+    /// Window-buffer-shaped slots laid at virtual byte `at` of the pool (the
+    /// fire's own, in its activation span), `count` of them, as kernel
+    /// units; `at` a multiple of the unit.
+    pub fn units_at(&self, at: u64, count: u32) -> Result<Vec<u32>> {
+        let (slot, unit) = self.buffer_slot().ok_or_else(|| Fault::Unbound {
+            what: "the window buffer, which this load holds none of".to_string(),
+        })?;
+        if !at.is_multiple_of(unit) || !slot.is_multiple_of(unit) {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "fire slots at byte {at}, off the window buffer's {unit}-byte units"
+                ),
+            });
+        }
+        (0..u64::from(count))
+            .map(|k| {
+                let byte = at + k * slot;
+                u32::try_from(byte / unit).map_err(|_| Fault::Ceiling {
+                    what: "slot units a kernel indexes",
+                    need: byte,
+                    have: u64::from(u32::MAX),
+                })
+            })
+            .collect()
     }
 
     /// The slots a record takes.
@@ -1132,8 +1322,24 @@ impl<B: Backend> Pools<B> {
         Ok(out)
     }
 
+    /// Whether a lane holds a record: recurrent state, or the windowed
+    /// layers' rings.
     #[must_use]
     pub fn has_state(&self) -> bool {
+        self.rows.iter().any(|row| {
+            matches!(
+                row,
+                Row::State { .. } | Row::Kv {
+                    ring: Some(_),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Whether the load holds recurrent state rows.
+    #[must_use]
+    pub fn has_recurrent(&self) -> bool {
         self.rows.iter().any(|row| matches!(row, Row::State { .. }))
     }
 
@@ -1158,6 +1364,46 @@ impl<B: Backend> Pools<B> {
         self.pool.committed_bytes()
     }
 
+    /// Each ring's geometry as the fold reads it (`attn/ring.slang`'s
+    /// layer entries), its rows in order: its keys' and values' origins,
+    /// its slot unit and row words, the pieces and the words its ring's keys
+    /// and values lie at, and its ring rows, every word a u32 of the pool.
+    /// [`Self::table`] binds the same rows in the same order.
+    pub fn ring_layers(&self) -> Result<Vec<i32>> {
+        let mut out = Vec::new();
+        for row in &self.rows {
+            let Row::Kv {
+                paged,
+                head_dim,
+                kv_heads,
+                keys,
+                values,
+                ring: Some(ring),
+                ..
+            } = *row
+            else {
+                continue;
+            };
+            let word = |v: u64| {
+                i32::try_from(v).map_err(|_| Fault::Unbound {
+                    what: format!("ring word {v}, which passes the fold's int"),
+                })
+            };
+            out.extend([
+                word(keys / 4)?,
+                word(values / 4)?,
+                word(self.unit(paged.shape())? / 4)?,
+                word(u64::from(kv_heads) * u64::from(head_dim) / 2)?,
+                word(u64::from(ring.piece))?,
+                word(u64::from(ring.values_piece))?,
+                word(ring.keys / 4)?,
+                word(ring.values / 4)?,
+                word(u64::from(ring.rows))?,
+            ]);
+        }
+        Ok(out)
+    }
+
     /// The cache table one fire binds.
     pub fn table(&self, handles: &Handles<B>, seats: &Seats) -> Result<CacheTable> {
         let segments = self.pool.bind(handles)?;
@@ -1175,6 +1421,7 @@ impl<B: Backend> Pools<B> {
                     keys,
                     values,
                     values_width,
+                    ring,
                     ..
                 } => {
                     let table = self.table_of(paged);
@@ -1207,6 +1454,16 @@ impl<B: Backend> Pools<B> {
                             u32::try_from(keys / 4).unwrap_or(u32::MAX),
                             u32::try_from(values / 4).unwrap_or(u32::MAX),
                         ],
+                        ring: ring.map(|ring| kernels_slang::Ring {
+                            lanes: seats.ring_lanes,
+                            rows: ring.rows,
+                            piece: ring.piece,
+                            values_piece: ring.values_piece,
+                            pieces: self.pieces(),
+                            keys: u32::try_from(ring.keys / 4).unwrap_or(u32::MAX),
+                            values: u32::try_from(ring.values / 4).unwrap_or(u32::MAX),
+                            slot_stride: u32::try_from(fixed_unit / 4).unwrap_or(u32::MAX),
+                        }),
                     })
                 }
                 Row::State {
@@ -1918,13 +2175,24 @@ impl<B: Backend> Pools<B> {
         self.pool.release_segments(segments);
     }
 
-    /// Moves each evacuated chunk onto its new physical chunk in `frame`
-    /// and takes the moves into the chunk table.
-    /// Returns each move as `(from, to)` physical list pages: the first
-    /// page of each chunk moved and the pages a chunk holds.
-    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<()> {
-        self.pool.evacuate(frame, evacuation)?;
-        Ok(())
+    /// Records each evacuated chunk's copy onto its new physical chunk in
+    /// `frame` and takes the moves into the chunk table, handing back the
+    /// table as it stood ([`pool::Pool::evacuate`]): nothing is committed
+    /// until the caller commits `frame`, and [`Pools::restore_table`] puts
+    /// the old table back where it drops `frame` instead.
+    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<ChunkTable> {
+        self.pool.evacuate(frame, evacuation)
+    }
+
+    /// Puts back the table an uncommitted evacuation replaced.
+    pub fn restore_table(&mut self, table: ChunkTable) {
+        self.pool.restore(table);
+    }
+
+    /// The chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &ChunkTable {
+        self.pool.table()
     }
 }
 

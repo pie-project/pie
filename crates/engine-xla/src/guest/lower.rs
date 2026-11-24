@@ -264,6 +264,28 @@ fn op_name(tag: u8) -> &'static str {
     eta_ir::op::spec(tag).map_or("?", |row| row.name)
 }
 
+/// The most rows one of stage `at`'s guest lanes reads of a fire's plane
+/// it is bound to read as `reads` states (its readout rows: a beam group of
+/// `B` beams reads `B`), 1 where it reads none: what a batch of the stage
+/// spans of a fire's rows, a guest lane at a time.
+#[must_use]
+pub fn lane_rows(package: &LaunchPackage, at: usize, reads: &[Read]) -> u32 {
+    roots(package, at)
+        .iter()
+        .filter_map(|&id| package.values.get(id as usize))
+        .filter(|value| value.source == ValueOrigin::Output)
+        .filter_map(|value| {
+            let name = value.output.as_deref().unwrap_or("");
+            let read = reads
+                .iter()
+                .find(|r| r.name == name && r.lane == value.lane)?;
+            let per = read.width as usize * read.layers.max(1) as usize;
+            (per > 0).then(|| numel(&value.shape) / per)
+        })
+        .max()
+        .map_or(1, |rows| u32::try_from(rows.max(1)).unwrap_or(u32::MAX))
+}
+
 /// The values stage `at` reads without computing them, in order of first
 /// use (channel cells, constants, outputs).
 #[must_use]

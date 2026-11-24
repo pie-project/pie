@@ -91,6 +91,19 @@ pub(crate) fn notify_owner_away(pid: ProcessId) {
     broadcast(|| SchedulerItem::OwnerAway(pid));
 }
 
+/// `lane`'s process on `engine` waits on the output of the fire
+/// `completion` settles, having submitted nothing since: no frame on
+/// `engine` waits on the lane until it submits again
+/// ([`super::frame::FramePolicy::on_lane_waits`]).
+pub(crate) fn notify_lane_waits(engine: usize, lane: ProcessId, completion: WorkItemCompletion) {
+    if completion.is_settled() {
+        return;
+    }
+    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
+        let _ = handle.send(SchedulerItem::LaneWaits { lane, completion });
+    }
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -326,6 +339,12 @@ enum SchedulerItem {
     /// frame until each submits again
     /// ([`super::frame::FramePolicy::on_owner_away`]).
     OwnerAway(ProcessId),
+    /// The lane's process waits on the output of the fire the completion
+    /// settles ([`super::frame::FramePolicy::on_lane_waits`]).
+    LaneWaits {
+        lane: ProcessId,
+        completion: WorkItemCompletion,
+    },
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -390,6 +409,11 @@ pub(crate) enum PoolOp {
     /// what an aborted move waits for before it gives back slots a copy may
     /// still be writing.
     SettleCopies,
+    /// The engine's chunk table (`Engine::chunk_table`) checked against the
+    /// runtime's logical to physical map, by logical chunk: refused naming
+    /// the first chunk they place apart. What a refused evacuation is
+    /// checked by, the engine's word that nothing moved not taken on trust.
+    CheckTable(Vec<u32>),
 }
 
 impl PoolOp {
@@ -404,6 +428,7 @@ impl PoolOp {
             Self::Evacuate(_) => "evacuate",
             Self::Rebind(_) => "rebind",
             Self::SettleCopies => "settle copies (waits every copy landed)",
+            Self::CheckTable(_) => "check chunk table",
         }
     }
 }
@@ -1763,6 +1788,14 @@ impl BatchScheduler {
                 &mut slot_buffer,
                 stopping,
             );
+            // A raise to held frames refused by name (it never fits beside
+            // its owner's own state): the frames held for it leave, their
+            // fires failed by that name, never held for good.
+            if let Some((owner, why)) = crate::store::shared::take_refused_owed(engine_id) {
+                let fires = frame_policy.refuse_held(owner);
+                Self::reject_fires_queued(&mut pending, &fires, &why);
+                progress |= !fires.is_empty();
+            }
             // Frames held out under the cap are owed a raise: the cap's
             // owner is told, its walk raising the rung to them (a hold with
             // nothing in flight waited on a raise nothing asked for).
@@ -2295,6 +2328,9 @@ impl BatchScheduler {
             SchedulerItem::OwnerAway(pid) => {
                 frame_policy.on_owner_away(pid);
             }
+            SchedulerItem::LaneWaits { lane, completion } => {
+                frame_policy.on_lane_waits(lane, completion);
+            }
             SchedulerItem::FrameTruncate {
                 lane,
                 seq,
@@ -2362,6 +2398,24 @@ impl BatchScheduler {
                 }
             }
         }
+    }
+
+    /// Fails the queued launches of `fires` by `why`, unsubmitted: a raise
+    /// to the frames they were held in was refused by name.
+    fn reject_fires_queued(pending: &mut PendingQueue, fires: &[u64], why: &str) {
+        if fires.is_empty() {
+            return;
+        }
+        let mut kept = VecDeque::with_capacity(pending.len());
+        while let Some(item) = pending.pop_front() {
+            match item {
+                QueuedItem::Launch(request) if fires.contains(&request.fire_id) => {
+                    request.completion.reject_unsubmitted(format!("scheduler: {why}"));
+                }
+                item => kept.push_back(item),
+            }
+        }
+        pending.replace(kept);
     }
 
     fn reject_pipeline_queued(
@@ -2877,7 +2931,6 @@ impl BatchScheduler {
                 }
                 vec![scan.untracked.clone()]
             } else {
-                frame_policy.bound_batch(crate::policy::batch::tokens());
                 match frame_policy.plan_dispatch(
                     &scan.queued_ids,
                     &scan.blocked_lanes,
@@ -3636,6 +3689,21 @@ mod tests {
     struct PanickingEngine;
 
     impl engine::Engine for PanickingEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -3654,6 +3722,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "panicking"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4338,6 +4410,21 @@ mod tests {
     }
 
     impl engine::Engine for ExhaustedEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4356,6 +4443,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "exhausted"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4454,6 +4545,21 @@ mod tests {
     }
 
     impl engine::Engine for InlineEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4472,6 +4578,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "inline"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4600,6 +4710,21 @@ mod tests {
     }
 
     impl engine::Engine for LaneFaultEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4618,6 +4743,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "lane-fault"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4866,6 +4995,21 @@ mod tests {
     }
 
     impl engine::Engine for LaneRefusalEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -4884,6 +5028,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "lane-refusal"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -5327,6 +5475,21 @@ mod tests {
     struct HoldingEngine;
 
     impl engine::Engine for HoldingEngine {
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         /// A test engine's copies land inside the call: nothing to wait for.
         fn settle_copies(&mut self) -> ::engine::Result<()> {
             Ok(())
@@ -5345,6 +5508,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "holding"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(

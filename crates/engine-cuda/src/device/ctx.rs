@@ -102,6 +102,19 @@ impl Context {
             // the prior calls produced. cudaSetDevice binds this thread.
             unsafe {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
+                // The units this process's queues run on, from its CU masks,
+                // stated before anything reads the device's count (the
+                // probe below, every grid and arena laid after).
+                #[cfg(feature = "rocm")]
+                {
+                    let at = ordinal.unsigned_abs();
+                    let all = kernels_cuda::hip::all_multiprocessors(at)
+                        .map_err(|error| Fault::Unsupported(error.to_string()))?;
+                    kernels_cuda::hip::hold_queue_units(
+                        at,
+                        crate::program::launch::masked_units(all, at),
+                    );
+                }
                 // What the process keeps idle (an earlier shell's dropped
                 // buffers) goes back first: the load measures the card from
                 // here, and fits as it would in a fresh process.
@@ -312,7 +325,7 @@ impl Context {
             };
             let stream: *mut c_void = stream.cast();
             self.slabs.attach(stream);
-            Ok(Side {
+            let mut side = Side {
                 stream,
                 cublas,
                 // a side stream's kernels launch plainly: a programmatic
@@ -333,7 +346,12 @@ impl Context {
                     .with_slabs(self.slabs)
                     .with_tuning(self.ctx.tuning())
                     .with_rank(self.ctx.rank()),
-            })
+            };
+            // The routes the main context holds, as `set_routes` keeps them.
+            if let Some(routes) = self.ctx.routes() {
+                side.ctx.set_routes(routes.clone());
+            }
+            Ok(side)
         }
     }
 
@@ -413,7 +431,13 @@ impl Context {
 
     /// Lay the device's measured product times on this context
     /// (`kernels_cuda::linear::routes`).
+    /// The side streams' contexts take it too: a kernel the table picks (a
+    /// decode product's) launches on whichever stream its fire places it,
+    /// and reads the same choice there.
     pub fn set_routes(&mut self, routes: std::sync::Arc<kernels_cuda::linear::routes::Routes>) {
+        for side in self.side.iter_mut().chain(self.conditional.as_mut()) {
+            side.ctx.set_routes(routes.clone());
+        }
         self.ctx.set_routes(routes);
     }
 
@@ -467,9 +491,7 @@ impl Drop for Context {
                     if !side.cublas.is_null() {
                         give_blas(self.ordinal, side.cublas);
                     }
-                    if !side.stream.is_null() {
-                        let _ = crate::device::rt::cudaStreamDestroy(side.stream.cast());
-                    }
+                    crate::device::held::destroy_unadopted_stream(side.stream);
                 }
                 if !self.cublas.is_null() {
                     give_blas(self.ordinal, self.cublas);
@@ -477,15 +499,9 @@ impl Drop for Context {
                 if !self.stream.is_null() {
                     destroy_stream(self.ordinal, self.stream);
                 }
-                if !self.notify.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.notify.cast());
-                }
-                if !self.tap.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.tap.cast());
-                }
-                if !self.swap.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.swap.cast());
-                }
+                crate::device::held::destroy_unadopted_stream(self.notify);
+                crate::device::held::destroy_unadopted_stream(self.tap);
+                crate::device::held::destroy_unadopted_stream(self.swap);
             }
         }
     }

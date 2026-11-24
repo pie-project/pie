@@ -424,7 +424,7 @@ impl Windows {
         let take = |at: &mut u64, vector: &[i32]| -> Result<Tensor> {
             let rows = vector.len() as u32;
             let bytes = u64::from(rows) * 4;
-            let cut = handles.cut(packed, *at, bytes)?;
+            let cut = handles.window(packed, *at, bytes)?;
             *at += bytes;
             Ok(Tensor::new(cut, rows, 1, Dtype::I32))
         };

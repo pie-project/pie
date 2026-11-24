@@ -47,8 +47,12 @@ struct Input {
     /// Beam width. `1` degenerates to greedy decoding (the beam identity).
     #[serde(default = "default_beams")]
     beams: u32,
+    /// `rollback_mode: "ckpt_sync"` when `rollback_mode` is left out.
     #[serde(default)]
     ckpt_sync: bool,
+    /// `flush_free` (no checkpoint), `ckpt_sync` (each step checkpoints the
+    /// pool and, when a beam changed parent, replays on a fork of it) or
+    /// `stop_wait` (the replay every step). Any other name is refused.
     #[serde(default)]
     rollback_mode: Option<String>,
     /// Rescore each final hypothesis as a lone sequence, one token a fire on
@@ -106,6 +110,27 @@ fn advance<T: Copy>(rows: &[Vec<T>], picked: &[T], parents: &[u32]) -> Result<Ve
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rollback {
+    FlushFree,
+    CkptSync,
+    StopWait,
+}
+
+/// The rollback the request names; a name this program does not run is
+/// refused, never taken for the default.
+fn rollback(input: &Input) -> Result<Rollback> {
+    match input.rollback_mode.as_deref() {
+        None if input.ckpt_sync => Ok(Rollback::CkptSync),
+        None | Some("flush_free") => Ok(Rollback::FlushFree),
+        Some("ckpt_sync") => Ok(Rollback::CkptSync),
+        Some("stop_wait") => Ok(Rollback::StopWait),
+        Some(other) => Err(format!(
+            "unknown rollback_mode `{other}`: this program runs flush_free, ckpt_sync or stop_wait"
+        )),
+    }
+}
+
 fn advance_hypotheses(
     hypotheses: &[Vec<u32>],
     picked: &[i32],
@@ -119,6 +144,7 @@ fn advance_hypotheses(
 async fn main(input: Input) -> Result<String> {
     let max_steps = input.max_tokens;
     let b = input.beams;
+    let mode = rollback(&input)?;
     if b == 0 {
         return Err("beams must be at least 1".into());
     }
@@ -234,7 +260,7 @@ async fn main(input: Input) -> Result<String> {
     // pool outgrew the kv pool (refused by name; the columns before stand).
     let mut stopped: Option<String> = None;
     // The finish's check (`verify`): how far the adopted set's next-token
-    // score lay from an unbranched decode's, and its room.
+    // score lay from a fresh prefill's, and its room.
     let mut finished: Option<(f32, f32, f32)> = None;
     // Under `--corrupt finish`: where the adopted beam's hypothesis parts
     // from the checked one's, of its length.
@@ -315,22 +341,12 @@ async fn main(input: Input) -> Result<String> {
         });
 
         let mut step = 0usize;
-        let mode = input
-            .rollback_mode
-            .as_deref()
-            .unwrap_or(if input.ckpt_sync {
-                "ckpt_sync"
-            } else {
-                "flush_free"
-            });
-        let ckpt_sync = mode == "ckpt_sync";
-        let stop_wait = mode == "stop_wait";
-        if ckpt_sync || stop_wait {
+        let stop_wait = mode == Rollback::StopWait;
+        if mode != Rollback::FlushFree {
             for _ in 0..decodes {
-                // The step's checkpoint, forked before its fire.
                 let ckpt_ws = ws
                     .fork(&pipeline)
-                    .with_context(|| format!("@{step}: checkpoint the pool"))?;
+                    .with_context(|| format!("checkpoint @{step}"))?;
                 fwd.submit(&pipeline).with_context(|| format!("@{step}"))?;
                 let picked = out
                     .take_host::<Vec<i32>>()
@@ -448,8 +464,8 @@ async fn main(input: Input) -> Result<String> {
             }
             // The search's finish (BEAM-PAGE-LISTS.md §6.6), checked under
             // `verify`: the set holds the best beam's hypothesis in its own
-            // order, and a plain fire on it scores the next token as an
-            // unbranched decode of the same tokens does.
+            // order, and a plain fire on it scores the next token as a
+            // fresh prefill of the same tokens does.
             if verify && stopped.is_none() && step > 0 {
                 let best = final_scores
                     .iter()
@@ -507,7 +523,7 @@ async fn main(input: Input) -> Result<String> {
                     _ => FinishRead::Set,
                 };
                 finished = Some(
-                    finish_check(&ws, &prompt, &hypotheses[best], n + fired, b, read).await?,
+                    finish_check(&ws, &prompt, &hypotheses[best], n + fired, read).await?,
                 );
             }
         }
@@ -674,19 +690,18 @@ async fn main(input: Input) -> Result<String> {
 /// After a search's finish, one plain fire on its working set: the last
 /// token of `hypothesis` (the one the search fed no fire) at slot `slot`,
 /// folding, the log-probabilities of its [`FINISH_TOKENS`] likeliest next
-/// tokens, each against an unbranched decode of `prompt` and `hypothesis`
-/// scoring that token there ([`rescore_last`]), each within its own room
+/// tokens, each against a fresh prefill of `prompt` and `hypothesis`
+/// scoring that token there ([`fresh_last`]), each within its own room
 /// ([`Rescored::room`]). How far apart, the room and the score of the one
 /// farthest from its room; past its room it fails, stating what it measured
 /// (the rank, the values, how far past the room). It establishes only that
-/// the set's next-token head differs from the unbranched decode's past
+/// the set's next-token head differs from the fresh prefill's past
 /// rounding, not what made it differ.
 async fn finish_check(
     ws: &WorkingSet,
     prompt: &[u32],
     hypothesis: &[u32],
     slot: u32,
-    width: u32,
     read: FinishRead,
 ) -> Result<(f32, f32, f32)> {
     let v = model::output_vocab_size();
@@ -753,10 +768,11 @@ async fn finish_check(
         return Err("the finished set's fire returned nothing".into());
     }
     let tokens: Vec<u32> = token.iter().map(|&t| t as u32).collect();
-    let wants = rescore_last(prompt, hypothesis, width, &tokens).await?;
-    // The set's fire rounds its logits and log-probabilities as the beam's
-    // fires do, and takes no candidate: each token's room is a step's, with
-    // nothing carried. The farthest from its room is the one reported.
+    let wants = fresh_last(prompt, hypothesis, &tokens).await?;
+    // The set's fire and the fresh prefill each round their logits and
+    // log-probabilities once, as a step does, and take no candidate: each
+    // token's room is a step's, with nothing carried. The farthest from its
+    // room is the one reported.
     let mut farthest: Option<(usize, f32, f32)> = None;
     for (at, (&got, want)) in got.iter().zip(&wants).enumerate() {
         let got = finite(&format!("the finished set's {}-ranked token", at + 1), got)?;
@@ -770,10 +786,10 @@ async fn finish_check(
     let (got, want) = (got[at], &wants[at]);
     if apart > room {
         return Err(format!(
-            "after its finish the set scored its {}-ranked next token ({}) {got:.4} and an \
-             unbranched decode {:.4}: {apart:.4} apart, {:.2} times its room {room:.4} \
+            "after its finish the set scored its {}-ranked next token ({}) {got:.4} and a \
+             fresh prefill {:.4}: {apart:.4} apart, {:.2} times its room {room:.4} \
              ({STEP_ULPS} bf16 gaps at its logits' scale); past rounding, so the set's next-token \
-             head is not the unbranched decode's",
+             head is not the fresh prefill's",
             at + 1,
             tokens[at],
             want.step,
@@ -793,37 +809,58 @@ const FINISH_TOKENS: u32 = 16;
 /// context, and the control is not formed.
 const CONTROL_PARTS_BEFORE: usize = 16;
 
-/// As [`rescore`], at the position after `hypothesis` alone, for each of the
-/// tokens `last` there: each one's log-probability and logit from a 1-row
-/// fire folding every step, the position's largest logit, and (reported,
-/// never a room) how far `width` unfolded copies move each.
-async fn rescore_last(
-    prompt: &[u32],
-    hypothesis: &[u32],
-    width: u32,
-    last: &[u32],
-) -> Result<Vec<Rescored>> {
-    // The forced sequence's last token stands for `last`, the position's
-    // targets.
-    let mut forced = hypothesis.to_vec();
-    forced.push(*last.first().ok_or("no token to score")?);
-    let (one_steps, one) = teacher_forced(prompt, &forced, 1, Fold::All, last).await?;
-    let (_, wide) = teacher_forced(prompt, &forced, width, Fold::None, last).await?;
-    let largest = one_steps.last().ok_or("the rescore returned nothing")?.2;
-    if one.len() != last.len() || wide.len() != last.len() {
-        return Err("the rescore returned fewer targets than it was given".into());
+/// The reference a finish's check reads ([`finish_check`]): `prompt` and
+/// `hypothesis` prefilled as one fire on a working set of its own, folding,
+/// and at its last row, for each of `last`, its log-probability and logit,
+/// beside the row's largest logit. A fire built so, like the set's own fire,
+/// rounds its row once; a decode one token a fire (as [`teacher_forced`]
+/// takes it) carries its own steps' drift on a hybrid model's recurrence,
+/// which the set's check must not be charged with.
+async fn fresh_last(prompt: &[u32], hypothesis: &[u32], last: &[u32]) -> Result<Vec<Rescored>> {
+    let v = model::output_vocab_size();
+    let set = WorkingSet::new();
+    let pipeline = Pipeline::new();
+    let fed: Vec<i32> = prompt.iter().chain(hypothesis).map(|&t| t as i32).collect();
+    let rows = u32::try_from(fed.len()).map_err(|_| "a sequence past u32 rows")?;
+    let count = u32::try_from(last.len()).map_err(|_| "targets past u32")?;
+    let toks = Channel::from(&fed[..]);
+    let indptr = Channel::from([0u32, rows]);
+    let wanted = Channel::from(last);
+    let out = Channel::new([count], dtype::f32);
+    let picked = Channel::new([count], dtype::f32);
+    let largest = Channel::new([1], dtype::f32);
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &indptr)?;
+    fwd.state(&[&set], StateGeometry::folding())
+        .context("bind the fresh prefill")?;
+    fwd.epilogue(move || {
+        // The last row, at the sampler's bf16 grain.
+        let logits = cast(reshape(intrinsics::output(0, "logits"), [v]), dtype::bf16);
+        let wanted = wanted.take();
+        picked.put(cast(&gather(&logits, &wanted), dtype::f32));
+        largest.put(cast(&reshape(reduce_max(&logits), [1]), dtype::f32));
+        out.put(cast(gather(log_softmax(&logits), &wanted), dtype::f32));
+    });
+    fwd.submit(&pipeline).context("fresh-prefill submit")?;
+    let step = out.take_host::<Vec<f32>>().await.context("fresh-prefill drain")?;
+    let picked = picked.take_host::<Vec<f32>>().await.context("fresh-prefill drain")?;
+    let largest = largest.take_host::<Vec<f32>>().await.context("fresh-prefill drain")?;
+    pipeline.close();
+    let largest = *largest.first().ok_or("the fresh prefill returned nothing")?;
+    if step.len() != last.len() || picked.len() != last.len() {
+        return Err("the fresh prefill returned fewer targets than it was given".into());
     }
-    one.iter()
-        .zip(&wide)
+    step.iter()
+        .zip(&picked)
         .enumerate()
-        .map(|(at, (&(step, picked), &(paired, _)))| {
+        .map(|(at, (&step, &picked))| {
             Ok(Rescored {
-                step: finite(&format!("the rescore of target {at}"), step)?,
-                picked: finite(&format!("the rescore of target {at}"), picked)?,
-                largest,
-                spread: (step - paired).abs(),
-                by: "width-copies",
-                unshaped: (step - paired).abs(),
+                step: finite(&format!("the fresh prefill of target {at}"), step)?,
+                picked: finite(&format!("the fresh prefill of target {at}"), picked)?,
+                largest: finite("the fresh prefill's largest logit", largest)?,
+                spread: 0.0,
+                by: "fresh-prefill",
+                unshaped: 0.0,
             })
         })
         .collect()
@@ -1340,4 +1377,26 @@ async fn teacher_forced(
     }
     pipeline.close();
     Ok((steps, finals))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(json: &str) -> Input {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A rollback the program does not run is refused by name, not flushed.
+    #[test]
+    fn an_unknown_rollback_mode_is_refused() {
+        let err = rollback(&request(r#"{"rollback_mode": "ckpt"}"#)).unwrap_err();
+        assert!(err.contains("unknown rollback_mode `ckpt`"), "{err}");
+        assert_eq!(rollback(&request("{}")), Ok(Rollback::FlushFree));
+        assert_eq!(rollback(&request(r#"{"ckpt_sync": true}"#)), Ok(Rollback::CkptSync));
+        assert_eq!(
+            rollback(&request(r#"{"rollback_mode": "stop_wait"}"#)),
+            Ok(Rollback::StopWait)
+        );
+    }
 }

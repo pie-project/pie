@@ -39,6 +39,10 @@ pub struct ResidencyPlanner {
     /// the head and the pages gathered: the step, the map, the wants and
     /// the stall line read it once a pass, not once each.
     pub(super) need_cache: parking_lot::Mutex<Option<(u64, EntryKey, u32, Option<RunNeed>)>>,
+    /// The capacity gate's last place gained room: a newcomer held at a
+    /// gate before its first ask looks again ([`Self::admits`]). Fired on
+    /// every read that raises it and on every departure, never on a clock.
+    pub(super) allowance_rose: Notify,
     /// Events that can change a pass's answer the pool's own counts do not
     /// show: an arrival, a departure, a landing, a policy answer, each a
     /// poke ([`Self::poke`]). Part of [`Self::generation`].
@@ -66,6 +70,9 @@ pub struct ResidencyPlanner {
     /// Room grants give back as they drop, the queue's length and the drain
     /// task's wake: shared with every reservation handed out.
     pub(super) returns: Arc<RoomReturns>,
+    /// The runtime the planner was made on: where a tiers sweep asked from
+    /// off it (the policy port's thread) runs.
+    runtime: Option<tokio::runtime::Handle>,
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
@@ -167,6 +174,7 @@ impl ResidencyPlanner {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             need_cache: parking_lot::Mutex::new(None),
+            allowance_rose: Notify::new(),
             events: AtomicU64::new(0),
             force_moves: AtomicBool::new(false),
             pass_landed: AtomicU64::new(0),
@@ -176,6 +184,7 @@ impl ResidencyPlanner {
             pause_due: AtomicBool::new(false),
             nonresident: AtomicUsize::new(0),
             returns,
+            runtime: tokio::runtime::Handle::try_current().ok(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
@@ -234,6 +243,7 @@ impl ResidencyPlanner {
             slots: total.slots.min(1),
             pages: total.pages.min(1),
             windows,
+            wbuf: 0,
         }
     }
 
@@ -345,6 +355,63 @@ impl ResidencyPlanner {
             gate.spare = last;
             (gate, places.into_iter().collect())
         })
+    }
+
+    /// The gate and its order as a pass reads them, set for the pass's
+    /// asks; a read that gives the last place more than the one before
+    /// wakes the newcomers held for it ([`Self::admits`]).
+    pub(super) fn read_capacity(&self) {
+        let order = self.capacity_order();
+        let rose = self.with_inner(|inner| {
+            let was = inner.capacity.map(|gate| gate.allowance(None));
+            inner.set_capacity(order);
+            let now = inner.capacity.map(|gate| gate.allowance(None));
+            match (was, now) {
+                (Some(was), Some(now)) => now > was,
+                (_, None) => true,
+                (None, Some(_)) => false,
+            }
+        });
+        if rose {
+            self.allowance_rose.notify_waiters();
+        }
+    }
+
+    /// Whether a newcomer may go on to its first ask: what it holds at its
+    /// first step is priced there, by the capacity gate at the order's last
+    /// place with the finisher's headroom and margin
+    /// ([`Self::capacity_holds`]), never at the declared context. Held here
+    /// while the last place has no room for any ask, it takes nothing it
+    /// would hold against the order while it waits. One already in the
+    /// order, or with no gate to read (nothing admitted: it alone may
+    /// finish), goes on.
+    pub fn admits(&self, pid: ProcessId) -> bool {
+        if self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| proc.admitted)) {
+            return true;
+        }
+        self.capacity_order()
+            .is_none_or(|(gate, places)| places.contains_key(&pid) || gate.allowance(None) > 0)
+    }
+
+    /// Waits until [`Self::admits`] lets `pid` on: woken by a read that
+    /// raises the last place (a retire, a grant given back, a move landed,
+    /// a segment committed: each plans a pass) or a departure.
+    pub async fn admitted_to_ask(&self, pid: ProcessId) {
+        let mut counted = false;
+        loop {
+            let rose = self.allowance_rose.notified();
+            tokio::pin!(rose);
+            rose.as_mut().enable();
+            if self.admits(pid) {
+                return;
+            }
+            if !std::mem::replace(&mut counted, true) {
+                self.stats.admission_waits.fetch_add(1, Ordering::Relaxed);
+                // Said once a newcomer: how many the gate held, and when.
+                tracing::info!(%pid, "planner: a newcomer waits for room at the capacity gate's last place");
+            }
+            rose.await;
+        }
     }
 
     /// The figures the capacity gate is read from ([`Self::capacity_gate`]).
@@ -519,12 +586,7 @@ impl ResidencyPlanner {
     pub(super) fn capacity_holds(&self, pid: ProcessId, pages: u32) -> bool {
         // No pass has read it yet: read now, before the first grant.
         if self.with_counts(|inner| inner.capacity.is_none()) {
-            let order = self.capacity_order();
-            self.with_counts(|inner| {
-                if inner.capacity.is_none() {
-                    inner.set_capacity(order);
-                }
-            });
+            self.read_capacity();
         }
         let Some((gate, holds)) = self.with_counts(|inner| {
             let place = inner.capacity_allow.get(&pid).copied();
@@ -1090,6 +1152,11 @@ impl ResidencyPlanner {
         self.port.host_stats().0.saturating_add(self.port.disk_stats().0)
     }
 
+    /// The retention table changed: a sweep is wanted at the next plan.
+    pub fn sweep_wanted(self: &Arc<Self>) {
+        self.poke();
+    }
+
     pub(super) fn poke(self: &Arc<Self>) {
         self.events.fetch_add(1, Ordering::AcqRel);
         self.wake_planner();
@@ -1111,18 +1178,28 @@ impl ResidencyPlanner {
         }
     }
 
-    pub(super) fn reclaim_idle_once(&self) -> bool {
-        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel) || self.port.reclaim_idle() == 0
-        {
-            return false;
+    /// Drops idle cache for what the head is `short` of, past what earlier
+    /// reclaims freed that is still returning, and no more
+    /// ([`super::pool::PoolPort::reclaim_idle`]).
+    pub(super) fn reclaim_idle_once(&self, short: super::pool::IdleShort) -> IdleOutcome {
+        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel) {
+            return IdleOutcome::Nothing;
         }
-        self.idle_reclaim_exhausted.store(false, Ordering::Release);
-        true
+        let reclaim = self.port.reclaim_idle(short);
+        if reclaim.freed > 0 {
+            self.idle_reclaim_exhausted.store(false, Ordering::Release);
+            return IdleOutcome::Freed;
+        }
+        if reclaim.returning > 0 {
+            self.idle_reclaim_exhausted.store(false, Ordering::Release);
+            return IdleOutcome::Returning;
+        }
+        IdleOutcome::Nothing
     }
 
     /// Idle cache the device is short of room for moves down a tier, host
-    /// first then disk, rather than being dropped, where a policy keys it
-    /// above the retention floor (the stores gate it: floor-keyed cache is
+    /// first then disk, rather than being dropped, where its tiers row lets
+    /// it on the host (the stores gate it: what a row keeps off the host is
     /// dropped by [`Self::reclaim_idle_once`] instead, never copied): whether
     /// a move is on its way (its landing frees the pages and pokes the
     /// planner). Only under
@@ -1141,7 +1218,7 @@ impl ResidencyPlanner {
         if self.demoting.swap(true, Ordering::AcqRel) {
             return true;
         }
-        let (mut host_free, host_total) = self.port.host_stats();
+        let (host_free, host_total) = self.port.host_stats();
         let (disk_free, _) = self.port.disk_stats();
         // A full host is under pressure too: its own idle cache, lowest key
         // first, goes on down to disk before the device's lands there, as
@@ -1156,14 +1233,11 @@ impl ResidencyPlanner {
                 exec::spawn_spill(self.clone(), txn, Self::spill_done);
                 return true;
             }
-            // Settling pages on their disk copies may have freed some.
-            host_free = self.port.host_stats().0;
         }
-        let (disk_free, _) = self.port.disk_stats();
-        let room = (host_free + disk_free).min(wanted.max(1));
-        let txn = (room > 0)
-            .then(|| self.port.prepare_demote(room as usize))
-            .flatten();
+        // Short of free slots below, the store makes the room from idle cache
+        // the host holds keyed below what moves down (each tier holds the
+        // highest keys first), or moves nothing.
+        let txn = self.port.prepare_demote(wanted.max(1) as usize);
         let Some(txn) = txn else {
             self.demoting.store(false, Ordering::Release);
             return false;
@@ -1190,6 +1264,70 @@ impl ResidencyPlanner {
             self.spill_failed.store(true, Ordering::Release);
         }
         self.demote_done(moved);
+    }
+
+    /// The retention table changed: idle cache its tiers rows allow
+    /// nowhere it is goes now, and what they keep off the device moves
+    /// down now, with no waiter's want.
+    pub(super) fn sweep_tiers(self: &Arc<Self>) {
+        // A move runs on the runtime: called off it, the sweep goes there,
+        // or (a planner made off any runtime) waits for the next plan that
+        // runs on one.
+        if !crate::rt::has_runtime() {
+            match &self.runtime {
+                Some(runtime) => {
+                    let planner = self.clone();
+                    runtime.spawn(async move { planner.sweep_tiers() });
+                }
+                None => crate::policy::retention::idle_cache_appeared(),
+            }
+            return;
+        }
+        tracing::debug!(target: "pie::retention", busy = self.demoting.load(Ordering::Acquire), "tiers sweep");
+        // A process waiting on its client whose row keeps its KV off the
+        // device is paused, its KV moved down for the wait.
+        let off: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(pid, proc)| proc.idle && Self::kept_off_device(**pid))
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        let idle = self.with_inner(|inner| inner.procs.values().filter(|proc| proc.idle).count());
+        tracing::debug!(target: "pie::retention", idle, off = off.len(), "tiers sweep: idle processes");
+        if !off.is_empty() {
+            self.pause(off, |proc| proc.idle);
+        }
+        if self.port.drop_disallowed() > 0 {
+            self.re_arm_idle_reclaim();
+            self.poke();
+        }
+        if self.demoting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let txn = self.port.prepare_demote_now();
+        tracing::debug!(target: "pie::retention", moves = txn.is_some(), "tiers sweep: demote now");
+        match txn {
+            Some(txn) => exec::spawn_move_out(self.clone(), txn, "demote", Self::tiers_done),
+            None => self.demoting.store(false, Ordering::Release),
+        }
+    }
+
+    /// Whether `pid`'s own working set may not sit on the device.
+    fn kept_off_device(pid: ProcessId) -> bool {
+        use crate::policy::retention::{DEVICE, Installed, Keys};
+        Installed.tiers_at(Some(pid), 0) & DEVICE == 0
+    }
+
+    /// A move a tiers row asked for landed: the next group goes, until none
+    /// is left.
+    fn tiers_done(self: &Arc<Self>, moved: bool) {
+        tracing::debug!(target: "pie::retention", moved, "tiers sweep: demote landed");
+        self.demote_done(moved);
+        if moved {
+            self.sweep_tiers();
+        }
     }
 
     fn demote_done(self: &Arc<Self>, moved: bool) {
@@ -1605,7 +1743,7 @@ impl ResidencyPlanner {
             .into_iter()
             .flat_map(|(_, pid)| {
                 let head = holder_head(pid);
-                crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine)
+                crate::inferlet::process::residency::kv_working_set_ids_in_order(pid, model, engine)
                     .into_iter()
                     .map(move |ws| (ws, head))
             })
@@ -1742,10 +1880,14 @@ impl ResidencyPlanner {
         self.poke();
     }
 
-    /// Reads each holder's retention key again: the table has changed.
-    pub fn rekey_holders(&self) {
+    /// Reads each holder's retention key again, of those `only` names (by
+    /// PLEX id) or all: the table has changed.
+    pub fn rekey_holders(&self, only: Option<&std::collections::HashSet<ProcessId>>) {
         self.with_inner(|inner| {
-            for (pid, proc) in inner.procs.iter_mut().filter(|(_, proc)| proc.holder) {
+            for (pid, proc) in inner.procs.iter_mut().filter(|(pid, proc)| {
+                proc.holder
+                    && only.is_none_or(|only| only.contains(&crate::policy::schedule::plex_id(**pid)))
+            }) {
                 proc.kept = holder_key(*pid);
             }
         });
@@ -2003,6 +2145,17 @@ impl ResidencyPlanner {
         }
     }
 
+    /// What this planner has learned of its processes' footprints: the
+    /// lanes its pools hold to their end at once, and a process's life past
+    /// the gate. `None` until one has finished.
+    pub fn to_end_facts(&self) -> Option<(u64, Option<std::time::Duration>)> {
+        let (_, kv_total) = self.port.device_stats();
+        let (_, rs_total) = self.port.rs_stats();
+        self.with_inner(|inner| {
+            Some((inner.to_end.lanes_to_end(kv_total, rs_total)?, inner.to_end.life()))
+        })
+    }
+
     /// Holds `pid` back, oldest first, until the pools hold it to the end
     /// beside the processes already started.
     async fn admit_to_end(&self, pid: ProcessId) {
@@ -2109,6 +2262,11 @@ impl ResidencyPlanner {
                 return;
             };
             proc.idle = idle;
+            if idle {
+                // A tiers row may keep its working set off the device while
+                // it waits.
+                crate::policy::retention::idle_cache_appeared();
+            }
             if self.seat_to_end {
                 self.to_end_notify.notify_waiters();
             }
@@ -2125,14 +2283,24 @@ impl ResidencyPlanner {
     }
 
     pub fn reschedule(self: &Arc<Self>) {
+        self.reschedule_only(None);
+    }
+
+    /// [`Self::reschedule`] for the processes `only` names (by PLEX id), or
+    /// all: nothing else is read again, and a change that moves no key and
+    /// no hold here reorders nothing.
+    pub fn reschedule_only(self: &Arc<Self>, only: Option<&std::collections::HashSet<ProcessId>>) {
         let schedule = crate::policy::schedule::current();
-        self.with_inner(|inner| {
-            inner.reschedule(|pid| {
+        let changed = self.with_inner(|inner| {
+            inner.reschedule(only, |pid| {
                 schedule
                     .as_ref()
                     .map_or((0, false), |s| (s.key(*pid), s.held(*pid)))
-            });
+            })
         });
+        if !changed {
+            return;
+        }
         self.vacate_held_seats();
         self.pause_due.store(true, Ordering::Release);
         self.poke();
@@ -2398,6 +2566,8 @@ impl ResidencyPlanner {
             self.re_arm_idle_reclaim();
             self.poke();
         }
+        // What it held is back: the last place may hold a newcomer's ask.
+        self.allowance_rose.notify_waiters();
     }
 
     /// `pid` leaves: its client has heard, its seat and asks go now. What
@@ -2407,6 +2577,8 @@ impl ResidencyPlanner {
     /// wedged for pages no one registered holds.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         crate::store::shared::forget_process(pid);
+        // Out of the order: the newcomers held at its last place look again.
+        let _woken = ScopeNotify(&self.allowance_rose);
         // What was held for its restore goes back with it.
         self.port.release_restore(pid);
         let (model, engine) = self.port.locus();
@@ -2601,4 +2773,28 @@ fn holder_head(pid: ProcessId) -> u64 {
         .filter(|&upto| upto > 0 && Installed.key_at(Some(pid), upto - 1) > whole)
         .max()
         .unwrap_or(0)
+}
+
+/// Wakes every waiter of a [`Notify`] as it drops: at the end of the scope
+/// it guards, whichever way that ends.
+struct ScopeNotify<'a>(&'a Notify);
+
+impl Drop for ScopeNotify<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
+/// What one idle reclaim came to ([`ResidencyPlanner::reclaim_idle_once`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IdleOutcome {
+    /// Something went: the head looks again in what it left.
+    Freed,
+    /// Nothing more went: pages earlier reclaims freed cover what is short
+    /// and wait on a fire's retirement. The head waits for it (the settle
+    /// that retires them wakes the planner), never on a clock, and nothing
+    /// else is taken for it meanwhile.
+    Returning,
+    /// Nothing went and nothing is returning.
+    Nothing,
 }
