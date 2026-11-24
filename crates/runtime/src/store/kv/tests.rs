@@ -107,7 +107,7 @@ fn tests_every_case() {
     the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves();
     a_demote_keeps_off_the_disk_what_its_row_keeps_off_it();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
-    idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
+    idle_cache_comes_back_past_the_fires_in_flight();
     among_equal_keys_the_least_recently_used_goes_first_answer_or_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
     a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
@@ -209,7 +209,7 @@ fn new_weights_find_no_page_the_old_ones_sealed() {
     let tokens: Vec<u32> = (0..40).map(|t| 1300 + t).collect();
     let owner = ProcessId::from_u128(41);
     sealed_and_gone(&mut store, &tokens, owner);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let old = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&old).len(), 2);
     assert_eq!(store.live_working_sets(), 1);
@@ -220,7 +220,7 @@ fn new_weights_find_no_page_the_old_ones_sealed() {
     assert_eq!(store.available_pages(), 16);
     assert!(store.cached_working_sets().is_empty());
     assert!(store.cached_run(&old).is_empty());
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let new = keys_ahead(&store, reader, 0, &tokens);
     assert_ne!(
         new, old,
@@ -1209,18 +1209,18 @@ fn a_lookup_follows_one_copy_to_its_children() {
     let opening = prompt(77, 2);
     let mut history = opening.clone();
     history.extend(prompt(78, 2));
-    let first = store.create_working_set();
+    let first = store.create_shared_working_set();
     sealed(&mut store, first, &opening);
     let agent = reader(&mut store, &opening, 2);
     commit_opaque(&mut store, agent, 2);
     seal(&mut store, agent, 32, &history[32..]);
-    let second = store.create_working_set();
+    let second = store.create_shared_working_set();
     sealed(&mut store, second, &opening);
     for ws in [first, agent, second] {
         store.release_working_set(ws, store.current_epoch());
     }
     store.retire_idle();
-    let next = store.create_working_set();
+    let next = store.create_shared_working_set();
     let keys = keys_ahead(&store, next, 0, &history);
     let run = store.cached_run(&keys);
     assert_eq!(run.len(), 4);
@@ -2210,11 +2210,8 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
     assert_eq!(on_device(&mut store, &kept_tokens), 0);
 }
 
-/// Idle cache dropped while fires are in flight goes back once the fires
-/// that could read it have retired, not after every fire handed out since:
-/// what a set last read before the fires in flight began is free at once,
-/// and what a reader read in one of them waits for that one.
-fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
+/// Idle cache dropped while fires are in flight goes back once they retire.
+fn idle_cache_comes_back_past_the_fires_in_flight() {
     let mut store = KvStore::new(8, h(41));
     let owner = ProcessId::from_u128(46);
     kept_and_gone(&mut store, 20, 3, owner);
@@ -2227,11 +2224,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
         3,
         "dropped"
     );
-    assert_eq!(
-        store.available_pages(),
-        8,
-        "back at once: no fire in flight read it"
-    );
+    assert_eq!(store.available_pages(), 5, "fires in flight");
     store.settle(busy);
     store.settle(other);
     store.retire_idle();
