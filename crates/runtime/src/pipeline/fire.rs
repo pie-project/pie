@@ -1747,7 +1747,7 @@ fn tail_row(lane: &::engine::Lane, rows: u32, tail: u32) -> u32 {
 
 /// Every fire but the last runs the model's forward alone: no program stages,
 /// channel values or readout.
-fn rows_of_lanes(
+pub(crate) fn rows_of_lanes(
     full: &crate::engine::FireRequest,
     piece: &[Option<(u32, u32)>],
     last: bool,

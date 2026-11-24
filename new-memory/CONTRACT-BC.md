@@ -256,9 +256,13 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       do not fit eager at load (`eager`, indices; under smallest-first the tail of the order). An eager shape still
       fires, uncaptured and tallied (`live::Tally::Eager`), never refused. A shape is left unstated by no engine.
     - **The builder forms nothing outside it.** `StepGroup::accepts` takes a member only where the step with it
-      stays in the set (`StepShapes::shape_of`), else it goes in a later step; a lone member outside the set is
-      refused at admission by name (the builder cuts no member). Under the contract check (debug builds or
-      `PIE_CHECK_REPLAY`, `shapes::check_on`), every step formed is checked, a gap failing with the composition and
+      stays in the set (`StepShapes::shape_of`), else it goes in a later step. A member reaching the builder is
+      one piece of its pass, already cut to a fire (`pipeline::fire::pass_pieces`): a prompt past every rung is
+      cut and served, never refused. Admission refuses against the set only a piece no cut makes smaller and no
+      shape holds (its sequence readouts past the rows one fire reads out, a buffered step on a load with no rs
+      list, a lane attachment the load does not serve), naming what of the nearest shape it passes
+      (`StepShape::misses`); a piece past one fire's tokens or lanes is refused, as before, by those bounds. Under the contract check (debug builds or
+      `PIE_CHECK_REPLAY`, which gates both cross-checks: the engines' replay check and this one, `shapes::check_on`), every step formed is checked, a gap failing with the composition and
       the nearest stated shapes (`StepGap`).
     - **Engines, interim.** Each engine computes and states the set after its walk and says what it does with it:
       CUDA names each shape whose padded buckets its lattice walk records no body of that kind and treatment for
