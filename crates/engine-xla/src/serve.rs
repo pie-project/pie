@@ -3702,6 +3702,7 @@ impl Shell {
         }
         tracing::debug!(
             rows,
+            buffered = rs_active,
             stage_ms = (t1 - t0).as_secs_f64() * 1e3,
             trace_ms = (t2 - t1).as_secs_f64() * 1e3,
             enqueue_ms = (t3 - t2).as_secs_f64() * 1e3,

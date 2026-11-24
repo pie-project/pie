@@ -712,7 +712,7 @@ impl Engine for Xla {
             "the set computed before the ladder is the one the caps state"
         );
         tracing::info!(
-            "engine-xla: step set: {}; the warm ladder laid its buffered treatment",
+            "engine-xla: step set: {}; the warm ladder lays each shape at the treatments it states",
             caps.steps.shapes.census(),
         );
         self.programs.seat(budgets.max_lanes);
