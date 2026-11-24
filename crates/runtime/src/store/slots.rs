@@ -2355,6 +2355,12 @@ impl SlotPool {
         }
     }
 
+    /// Whether no holder holds a slot of the pool: no working set, cache
+    /// entry, snapshot, store table or weight lies in any chunk.
+    pub fn holds_nothing(&self) -> bool {
+        self.holders.is_empty()
+    }
+
     /// Whether any waiter is parked short of a slot.
     pub fn waiting(&self) -> bool {
         self.shapes.iter().any(|state| state.waiting > 0)

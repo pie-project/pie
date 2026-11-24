@@ -63,6 +63,7 @@ fn a_load_with_no_measurement_under_a_stated_bound_runs_no_frame_past_it() {
             steps: Default::default(),
         })
         .expect("the model loads under the bound");
+    super::outputs::measure_behind(&mut engine);
     let longest = backend::longest_frame_ns();
     backend::watch_frames(false);
     let shell = engine.loaded_mut().expect("loaded");

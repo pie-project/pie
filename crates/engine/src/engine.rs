@@ -189,6 +189,18 @@ pub type TapGroups = Vec<Vec<(u64, u64)>>;
 /// back. An error names the reading that could not be taken.
 pub type HostRoom = std::sync::Arc<dyn Fn() -> std::result::Result<i64, String> + Send + Sync>;
 
+/// What the runtime tells an engine measuring behind serving
+/// ([`Engine::measure_behind`]).
+pub struct BehindServing<'a> {
+    /// The runtime's count of every lane's submissions: a timed point that
+    /// sees it move ran beside other work, and is discarded, never stored.
+    pub others: &'a dyn Fn() -> u64,
+    /// Whether a request for this engine arrived since the slice began: a
+    /// slice of several frames stops at its next frame, so an arrival waits
+    /// at most the one in flight.
+    pub arrived: &'a dyn Fn() -> bool,
+}
+
 pub trait Engine: Send {
     fn kind(&self) -> &'static str;
 
@@ -666,6 +678,26 @@ pub trait Engine: Send {
 
     fn settles_asynchronously(&self) -> bool {
         false
+    }
+
+    /// Whether the load left measuring to run behind serving
+    /// ([`Engine::measure_behind`]): a dense settle no stored or committed
+    /// entry of its key decided. The default: none.
+    fn measures_behind(&self) -> bool {
+        false
+    }
+
+    /// One slice of the measuring the load left behind serving, at most
+    /// one fire. The engine's lane calls it only where it would otherwise
+    /// sleep (no fire or call waits, nothing landing is owed) and only while
+    /// the runtime holds no slot of the engine's pool, so the engine may
+    /// fire on its seat-addressed chunks. Nothing it does changes what the
+    /// load serves, records or builds; what it decides is stored for the
+    /// next load ([`BehindServing`] says what the runtime tells it). Whether
+    /// it fired (`false`: nothing left, or nothing it can fire now).
+    fn measure_behind(&mut self, behind: &BehindServing<'_>) -> Result<bool> {
+        let _ = behind;
+        Ok(false)
     }
 
     /// Where a step's outcome goes. An engine that settles asynchronously

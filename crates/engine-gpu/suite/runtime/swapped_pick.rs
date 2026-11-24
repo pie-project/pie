@@ -50,6 +50,7 @@ fn a_swapped_pick_is_built_before_ready_and_keys_the_cover_anew() {
         .expect("the load keys its host cover");
     let shell = first.engine.loaded_mut().expect("loaded");
     let before = shell.dense_tactics_at(1)[0];
+    super::outputs::measure_behind(&mut first.engine);
     drop(first);
 
     // The one-row range given a vector kernel the first load did not serve

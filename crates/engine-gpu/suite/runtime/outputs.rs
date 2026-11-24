@@ -269,6 +269,24 @@ pub(super) fn loaded_bound(
     loaded_boot(tag, model, lanes, boot)
 }
 
+/// What `engine`'s load left to measure behind serving (the dense settle's
+/// ranges, a stale rate), run to its end as the runtime's idle lane runs
+/// it: one slice a call, no other lane submitting. The slices it ran.
+pub(super) fn measure_behind(engine: &mut impl ::engine::Engine) -> usize {
+    let mut slices = 0;
+    let behind = ::engine::BehindServing {
+        others: &|| 0,
+        arrived: &|| false,
+    };
+    while engine
+        .measure_behind(&behind)
+        .expect("measuring behind serving")
+    {
+        slices += 1;
+    }
+    slices
+}
+
 /// [`loaded_lanes`] on `boot`.
 pub(super) fn loaded_boot(
     tag: &str,
