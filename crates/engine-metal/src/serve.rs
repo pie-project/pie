@@ -1772,14 +1772,7 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
-        let capture = CaptureLayout::of(
-            &device,
-            &outputs,
-            boot.context,
-            page_size,
-            boot.budget.max_lanes,
-            arms,
-        )?;
+        let capture = CaptureLayout::of(&outputs, boot.context, page_size);
         let capture_bytes = capture.as_ref().map_or(0, CaptureLayout::member_bytes);
         let beam_widest = beam_max_lanes(&device)?;
         let weighed = weighed.and_then(|(counts, rungs, live, fire_top)| {
@@ -2677,14 +2670,14 @@ pub struct Clips<'a> {
 /// each one's key row (`keys` f32s, the load's context) and page row
 /// (`pages` f32s), laid together as state of its reader instance, in its
 /// `Instance` slots after its tables ([`crate::program::Plane::facts`]). `classes` are the classes that
-/// compute them: a lane of one captures. Each arm keeps the two tables of
-/// its fire's lanes' row starts the kernels read, one u64 a lane.
+/// compute them: a lane of one captures. The two tables of a fire's lanes'
+/// row starts the kernels read, one u64 a lane, lie in its arm's staged
+/// inputs ([`crate::inputs::Inputs::stage_captures`]).
 pub struct CaptureLayout {
     keys: u32,
     pages: u32,
     page_size: u32,
     classes: poem_ir::ClassSet,
-    tables: Vec<(crate::device::Buffer, crate::device::Buffer)>,
 }
 
 /// What a capturing lane's rows take of its reader's state: its key row and
@@ -2696,13 +2689,10 @@ fn capture_row_bytes(keys: u32, pages: u32) -> (u64, u64) {
 
 impl CaptureLayout {
     fn of(
-        device: &Context,
         outputs: &[poem_exec::feeds::ClassOutput],
         context: u32,
         page_size: u32,
-        lanes: u32,
-        arms: usize,
-    ) -> Result<Option<CaptureLayout>> {
+    ) -> Option<CaptureLayout> {
         let mut classes = poem_ir::ClassSet::default();
         for out in outputs
             .iter()
@@ -2713,19 +2703,14 @@ impl CaptureLayout {
             }
         }
         if classes.is_empty() {
-            return Ok(None);
+            return None;
         }
-        let bytes = u64::from(lanes.max(1)) * 8;
-        let tables = (0..arms.max(1))
-            .map(|_| Ok((Buffer::zeroed(device, bytes)?, Buffer::zeroed(device, bytes)?)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Some(CaptureLayout {
+        Some(CaptureLayout {
             keys: context,
             pages: context.div_ceil(page_size.max(1)),
             page_size: page_size.max(1),
             classes,
-            tables,
-        }))
+        })
     }
 
     /// What a capturing lane's rows take of a guest region, together.
