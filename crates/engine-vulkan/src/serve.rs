@@ -428,6 +428,7 @@ impl Serve for Api {
     /// and none made after: each arm's forward, the feed and the guest
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
+        shell.device().name_descriptor_sets();
         shell
             .device()
             .seal_descriptor_pools(shell.readout.len() + 3)
@@ -463,7 +464,9 @@ impl Serve for Api {
             }
             None => None,
         };
-        if let Some((rows, launches)) = replayable {
+        // The arm walk runs nothing: a fire it filled walks into a frame that
+        // records nothing (`Shell::arm_filled`) and lands empty.
+        if let Some((rows, launches)) = replayable.filter(|_| !shell.arming) {
             let key = key.expect("a fill was found under a key");
             let pixels = shell.pixel_spans(prepared)?;
             shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
@@ -739,6 +742,13 @@ impl Serve for Api {
                 }
                 counts.leave();
             });
+        if frame.is_dry() {
+            // An arm walk that filled a held family: nothing recorded, nothing
+            // run.
+            drop(frame);
+            shell.kept_none();
+            return shell.device.frame()?.commit_async(Some(on_done));
+        }
         match keep {
             Some(shape) => {
                 let room_pasts = frame.room_pasts();
@@ -960,9 +970,18 @@ fn nearest(shell: &Shell<Api>, trail: &[String], prepared: &Prepared<'_, Api>) {
         .map(|(_, recording)| {
             let held = recording.kept.trail();
             let alike = held.iter().zip(trail).take_while(|(a, b)| a == b).count();
-            (alike, held)
+            // Among the families alike as far, the one whose next command is
+            // the walk's kind: the field that parts them is the telling one.
+            let kind = |list: &[String]| {
+                list.get(alike)
+                    .and_then(|entry| entry.split(',').next())
+                    .map(str::to_string)
+            };
+            let same_kind = kind(held) == kind(trail);
+            ((alike, same_kind), held)
         })
-        .max_by_key(|(alike, _)| *alike);
+        .max_by_key(|(rank, _)| *rank)
+        .map(|((alike, _), held)| (alike, held));
     let at = |list: &[String], i: usize| list.get(i).cloned().unwrap_or_else(|| "<end>".into());
     match best {
         Some((alike, held)) => eprintln!(

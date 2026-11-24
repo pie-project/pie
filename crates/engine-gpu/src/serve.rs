@@ -1199,6 +1199,9 @@ pub struct Shell<B: Serve> {
     /// The stated step shapes the load runs eager: the set's tail from this
     /// index on, which its allowance did not hold the bodies of.
     eager_from: Option<usize>,
+    /// The stated shapes the arm walk lays no composition of: stated eager
+    /// at load beside the allowance's tail.
+    eager_bare: Vec<usize>,
     /// The stated step compositions ([`Shell::record_bodies`]).
     pub steps: Option<engine::StepShapes>,
     /// The composition of the step being fired, where its caller states it
@@ -1206,6 +1209,10 @@ pub struct Shell<B: Serve> {
     pub step: Option<engine::StepComposition>,
     /// The load records its bodies: a kept walk is recorded and not run.
     pub arming: bool,
+    /// The arm walk's fire filled a family the load already holds
+    /// ([`Shell::fill_once`] before its plan): its walk lays into a frame
+    /// that records nothing, and nothing runs.
+    pub arm_filled: bool,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
@@ -3077,9 +3084,11 @@ impl<B: Serve> Shell<B> {
             unkept: 0,
             eager_rows: None,
             eager_from: None,
+            eager_bare: Vec::new(),
             steps: None,
             step: None,
             arming: false,
+            arm_filled: false,
             eager: 0,
             eager_next: false,
             armed: false,
@@ -5144,9 +5153,9 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn eager_by_rows(&self, rows: u32) -> bool {
         if let (Some(steps), Some(step)) = (&self.steps, &self.step) {
-            return self
-                .eager_from
-                .is_some_and(|from| steps.shape_of(step).is_some_and(|at| at >= from));
+            return steps.shape_of(step).is_some_and(|at| {
+                self.eager_from.is_some_and(|from| at >= from) || self.eager_bare.contains(&at)
+            });
         }
         self.eager_rows.is_some_and(|eager| rows >= eager)
     }
@@ -5156,8 +5165,12 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn eager_shapes_from(&self) -> Vec<u32> {
         let len = self.steps.as_ref().map_or(0, engine::StepShapes::len);
-        self.eager_from
-            .map_or(0..0, |from| from..len)
+        let mut eager: Vec<usize> = self.eager_from.map_or(0..0, |from| from..len).collect();
+        eager.extend(self.eager_bare.iter().copied().filter(|&at| at < len));
+        eager.sort_unstable();
+        eager.dedup();
+        eager
+            .into_iter()
             .map(|at| u32::try_from(at).unwrap_or(u32::MAX))
             .collect()
     }
@@ -8339,6 +8352,8 @@ impl<B: Serve> Shell<B> {
                         count: u32::try_from(fold_lanes.len()).unwrap_or(u32::MAX),
                     }),
                     fold_lanes,
+                    self.budgets.tokens.max_lanes,
+                    self.span.rung_tokens(rung),
                 )?);
                 Some(seat)
             } else {
@@ -8459,11 +8474,18 @@ impl<B: Serve> Shell<B> {
     /// pixels laid in a fill frame, and the backend's fill from what they
     /// laid. Whether an armed body took it.
     fn fill_once(&mut self, prepared: &mut Prepared<'_, B>) -> Result<bool> {
+        // An arm walk's fill that finds no family is walked again to record
+        // one: the fire's own staged rows stand.
+        let mark = self.arming.then(|| self.handles.len());
+        let rewind = |handles: &Handles<B>| match mark {
+            Some(len) => handles.rewind_to(len),
+            None => handles.rewind(),
+        };
         let walked = self.walk_fill(prepared);
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
-                self.handles.rewind();
+                rewind(&self.handles);
                 return Err(fault);
             }
         };
@@ -8475,7 +8497,7 @@ impl<B: Serve> Shell<B> {
             self.copy_pixels(&mut frame, prepared)?;
             Ok(layout)
         });
-        self.handles.rewind();
+        rewind(&self.handles);
         let layout = laid?;
         B::fill(self, frame, prepared, &layout, walked.launches)
     }
@@ -8540,6 +8562,8 @@ impl<B: Serve> Shell<B> {
     ) -> Result<Walked<B>> {
         let frame = if bind_only {
             B::bind_frame(&self.device)?
+        } else if self.arm_filled {
+            B::fill_frame(&self.device, p.arm)?
         } else {
             B::walk_frame(&self.device, keep, self.stamps.get(p.arm))?
         };
@@ -9151,6 +9175,13 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 keep: None,
                 split: false,
             }
+        } else if self.arming && B::RECORDS {
+            // An arm walk whose commands a held family's are fills that
+            // family (its fill kept before ready, for the serving fires of
+            // its shape) and records nothing: a body is recorded once, each
+            // composition of it a table of data.
+            self.arm_filled = self.fill_once(&mut prepared)?;
+            B::plan(self, &mut prepared)?
         } else {
             B::plan(self, &mut prepared)?
         };
@@ -10455,13 +10486,16 @@ impl<B: Serve> Shell<B> {
                     .filter(|&(_, &covered)| !covered)
                     .map(|(shape, _)| shape.to_string())
                     .collect();
+                // A stated shape the walk lays no composition of has no
+                // body: stated eager at load, its fires counted eager.
+                self.eager_bare = (0..steps.len()).filter(|&at| !covered[at]).collect();
                 if !bare.is_empty() {
-                    tracing::warn!(
+                    tracing::info!(
                         shapes = bare.len(),
                         of = steps.len(),
-                        bare = ?bare,
-                        "stated step shapes the arm walk lays no composition of: a fire of one \
-                         is unarmed"
+                        eager = ?bare,
+                        "stated step shapes the arm walk lays no composition of run eager, \
+                         stated at load"
                     );
                 }
                 tagged
@@ -10547,13 +10581,40 @@ impl<B: Serve> Shell<B> {
                 })
                 .map_or(0, |kib| kib * 1024)
         };
-        let allowance = if self.device.host_room().is_some() {
-            self.device.left()
-        } else {
-            available().saturating_sub(self.pools.host_tier_bytes())
+        // What the host can still give the walk, read live before each
+        // shape: what it has available past what a low-memory killer
+        // defends and under the process's cgroups, less the safety floor
+        // (`host_memory::Room::net`), less what the load still places on
+        // the host after the walk (the host tier, pageable, taken as it
+        // fills). A driver that cannot get host memory for a recording
+        // aborts the process (an allocator's mmap fails inside it, past any
+        // error a call returns), so the walk stays under this before it
+        // records, never finding the line by crossing it.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let host_room: Box<dyn Fn() -> Option<u64>> = match crate::host_memory::reader() {
+            Ok(reader) => Box::new(move || {
+                reader
+                    .read()
+                    .ok()
+                    .map(|room| u64::try_from(room.net()).unwrap_or(0))
+            }),
+            Err(_) => Box::new(|| None),
         };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let host_room: Box<dyn Fn() -> Option<u64>> = Box::new(|| None);
+        let still_placed = if self.device.host_room().is_some() {
+            0
+        } else {
+            self.pools.host_tier_bytes()
+        };
+        let remaining = || -> u64 {
+            let room = host_room().unwrap_or_else(available);
+            room.saturating_sub(still_placed)
+        };
+        let allowance = remaining();
         let before = rss();
         let mut dearest = 0u64;
+        let mut dearest_device = 0u64;
         if let Some(known) = &known {
             match steps {
                 Some(_) => self.eager_from = known.eager.map(|at| at as usize),
@@ -10561,13 +10622,27 @@ impl<B: Serve> Shell<B> {
             }
         }
         for (at, (lanes, fed, carried, keys_only)) in shapes.iter().enumerate() {
-            // A known lattice arms the shapes that recorded a family, and
-            // states eager what its allowance did.
-            if known.as_ref().is_some_and(|known| !known.shapes.contains(&at)) {
-                continue;
+            // A known lattice states eager what its allowance did; every shape
+            // short of it is walked, the ones whose family an earlier shape
+            // recorded filling it (their fills kept before ready).
+            let rows = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
+            if known.as_ref().and_then(|known| known.eager).is_some_and(|from| match tags[at] {
+                Some(shape) => shape >= from as usize,
+                None => rows >= from,
+            }) {
+                break;
             }
             let used = rss().saturating_sub(before);
-            if known.is_none() && used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
+            // The next shape's bodies cost what the dearest so far did, on
+            // each arm: on the host (its resident bytes) and on the device
+            // (what the driver's budget says the process took, live). The
+            // walk stops where either would not hold them, known record or
+            // not: a body the device cannot hold faults the driver.
+            let next = dearest.saturating_mul(depth as u64);
+            let next_device = dearest_device.saturating_mul(depth as u64);
+            let device_short = next_device > 0 && self.device.left() < next_device;
+            let host_short = remaining() < next;
+            if device_short || host_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
@@ -10583,6 +10658,8 @@ impl<B: Serve> Shell<B> {
                 tracing::info!(
                     allowance,
                     used,
+                    device_left = self.device.left(),
+                    next_bodies = next,
                     from_rows = from,
                     eager = ?eager,
                     "the bodies past the allowance run eager: every fire of at least these rows"
@@ -10594,9 +10671,29 @@ impl<B: Serve> Shell<B> {
                 }
                 break;
             }
+            if at % 64 == 0 {
+                tracing::info!(
+                    walked = at,
+                    of = shapes.len(),
+                    families = armed_shapes.len(),
+                    host_bytes = rss().saturating_sub(before),
+                    "the arm walk so far"
+                );
+            }
+            if at % 256 == 0 {
+                tracing::info!(
+                    walked = at,
+                    of = shapes.len(),
+                    shapes_recording = armed_shapes.len(),
+                    host_bytes = rss().saturating_sub(before),
+                    dearest,
+                    "the arm walk so far"
+                );
+            }
             let families = self.recorded;
             for arm in 0..depth {
                 let ahead = rss();
+                let left_ahead = self.device.left();
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
@@ -10641,6 +10738,7 @@ impl<B: Serve> Shell<B> {
                     self.arms.take(before);
                 }
                 let fired = self.fire_seated(&seated);
+                self.arm_filled = false;
                 for before in 0..arm {
                     self.arms.give(before);
                 }
@@ -10654,7 +10752,13 @@ impl<B: Serve> Shell<B> {
                     self.arming = false;
                     return Err(fault);
                 }
-                dearest = dearest.max(rss().saturating_sub(ahead));
+                // A body's cost: what it took of the host's memory or of the
+                // device's (a driver that keeps its command buffers and
+                // descriptors in device-visible memory), whichever is more.
+                let on_device = left_ahead.saturating_sub(self.device.left());
+                let cost = rss().saturating_sub(ahead).max(on_device);
+                dearest = dearest.max(cost);
+                dearest_device = dearest_device.max(on_device);
                 recorded += 1;
             }
             if self.recorded > families {

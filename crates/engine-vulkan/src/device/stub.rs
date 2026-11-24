@@ -188,6 +188,8 @@ impl Context {
         match self.never {}
     }
 
+    pub fn name_descriptor_sets(&self) {}
+
     pub fn frame_dry(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -251,6 +253,12 @@ pub struct Fill {
     pub image: Image,
     pub cuts: usize,
     pub room_pasts: Vec<u64>,
+}
+
+impl Frame {
+    pub fn is_dry(&self) -> bool {
+        false
+    }
 }
 
 impl Frame {

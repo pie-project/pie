@@ -480,6 +480,7 @@ impl Sink<'_> {
         // recording. The group counts lie there too, for an indirect
         // dispatch where the frame's shapes differ in them.
         let limits = &self.device.core.limits;
+        let mut fired_buffer: Option<vk::Buffer> = None;
         let fired = match pipeline.fire.as_ref() {
             Some(block) => {
                 let at = block.binding as usize;
@@ -493,6 +494,7 @@ impl Sink<'_> {
                     .frame
                     .lay(push, limits.min_uniform_buffer_offset_alignment)
                     .map_err(|fault| Sink::refuse(fire, fault))?;
+                fired_buffer = Some(buffer);
                 infos.resize(
                     at,
                     vk::DescriptorBufferInfo::default()
@@ -611,6 +613,20 @@ impl Sink<'_> {
             ));
         }
 
+        // A kept frame's buffer set is the device's for every recording
+        // that binds alike on the arm (its fire block's buffer): keyed by
+        // what the commands bake of its bindings (a pool segment by its
+        // place, a score room by its tag, both written again by a rebind
+        // or a replay).
+        let shared_key = self.frame.kept().then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            scratch.baked.hash(&mut h);
+            fired_buffer.map(ash::vk::Handle::as_raw).hash(&mut h);
+            let key = h.finish();
+            crate::device::ctx::note_tuple(key ^ ash::vk::Handle::as_raw(pipeline.set_layout));
+            key
+        });
         // Where in the room each room binding lies, the fire's data.
         for past in scratch.rooms.iter().take(declared).flatten() {
             self.frame.room_past(*past);
@@ -623,10 +639,30 @@ impl Sink<'_> {
         let core = self.frame.core();
         let d = &core.device;
         let cmd = self.frame.cmd();
-        let set = self
-            .frame
-            .descriptor_set(pipeline.set_layout)
-            .map_err(|fault| Sink::refuse(fire, fault))?;
+        let set = match shared_key {
+            Some(key) => self.frame.shared_set(pipeline.set_layout, key),
+            None => self.frame.descriptor_set(pipeline.set_layout),
+        }
+        .map_err(|fault| Sink::refuse(fire, fault))?;
+        // The fire block's set (set 1), the dispatch's place its dynamic
+        // offset: an arm's block's the device's one for the kernel, an
+        // arm-less frame's its own.
+        let fire_set = match (pipeline.fire_layout, fired, fired_buffer) {
+            (Some(layout), Some(((_, at), _)), Some(buffer)) => {
+                let binding = params_at.expect("a fire layout has its binding") as u32;
+                let range = u64::from(pipeline.fire.as_ref().map_or(0, |block| block.bytes));
+                let set = if self.frame.arms_block() {
+                    self.frame.fire_set(layout, binding, buffer, range)
+                } else {
+                    self.frame.own_fire_set(layout, binding, buffer, range)
+                }
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+                Some((set, u32::try_from(at).map_err(|_| {
+                    Sink::backend(fire, format!("the fire block's place {at} past a u32"))
+                })?))
+            }
+            _ => None,
+        };
         // A recording's pool segments are rebound as they are backed and
         // given back: where its layout lays the binding update-after-bind;
         // elsewhere it stands only while the segments do.
@@ -656,7 +692,7 @@ impl Sink<'_> {
         }
         scratch.sets.clear();
         for (at, info) in infos.iter().enumerate().take(declared) {
-            if !pipeline.used[at] {
+            if !pipeline.used[at] || Some(at) == params_at {
                 continue;
             }
 
@@ -666,11 +702,7 @@ impl Sink<'_> {
             // while `infos` is untouched; `sets` is cleared before `infos`
             // changes again on the next fire, and no one reads it in between.
             let info: &'static vk::DescriptorBufferInfo = unsafe { std::mem::transmute(info) };
-            let ty = if Some(at) == params_at {
-                vk::DescriptorType::UNIFORM_BUFFER
-            } else {
-                vk::DescriptorType::STORAGE_BUFFER
-            };
+            let ty = vk::DescriptorType::STORAGE_BUFFER;
             scratch.sets.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -695,14 +727,24 @@ impl Sink<'_> {
             }
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
             if declared > 0 {
-                d.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline.layout,
-                    0,
-                    &[set],
-                    &[],
-                );
+                match fire_set {
+                    Some((fire_set, at)) => d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline.layout,
+                        0,
+                        &[set, fire_set],
+                        &[at],
+                    ),
+                    None => d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline.layout,
+                        0,
+                        &[set],
+                        &[],
+                    ),
+                }
             }
             if pipeline.push_bytes > 0 {
                 d.cmd_push_constants(
