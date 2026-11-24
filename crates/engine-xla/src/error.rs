@@ -369,6 +369,15 @@ impl fmt::Display for Fault {
 
 impl std::error::Error for Fault {}
 
+impl From<engine::bundle::Refusal> for Fault {
+    fn from(refusal: engine::bundle::Refusal) -> Self {
+        Self::Adapter {
+            bank: refusal.bank,
+            why: refusal.why,
+        }
+    }
+}
+
 impl From<poem_compiler::Error> for Fault {
     fn from(refusal: poem_compiler::Error) -> Self {
         Self::Bake(refusal)

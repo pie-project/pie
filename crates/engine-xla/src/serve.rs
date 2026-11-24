@@ -514,12 +514,7 @@ impl Shell {
                 "class {class} attends both ways under one mask"
             )));
         }
-        let corrected = classes_running(&boot.trace, &compiled, |op| {
-            matches!(
-                op,
-                poem_ir::Operation::Linear(poem_ir::Linear::LoraCorrect { .. })
-            )
-        });
+        let corrected = poem_exec::feeds::adapted_classes(&boot.trace, &compiled);
 
         // Windowed kv rows live in their own pool, a window per sequence
         // (engine-cuda `serve/load.rs`).
@@ -1136,6 +1131,7 @@ impl Shell {
             crate::adapter::Source::Shared { name } => {
                 crate::adapter::Key::Shared(self.blobs.stamp(name)?)
             }
+            crate::adapter::Source::Bundle { bundle } => crate::adapter::Key::Content(bundle.key()),
         };
         let shared = matches!(source, crate::adapter::Source::Shared { .. });
         let grant = self.adapters.acquire(key.clone())?;
@@ -1172,6 +1168,35 @@ impl Shell {
                     }
                     Err(why) => Err(why),
                 }
+            }
+            crate::adapter::Source::Bundle { bundle } => {
+                let seats = self.weights.bank_seats();
+                let banks = crate::adapter::banks(&seats);
+                bundle
+                    .planes(&banks, engine::bundle::Rank::WHOLE)
+                    .map_err(Fault::from)
+                    .and_then(|built| {
+                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
+                            .iter()
+                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
+                                bank: bank.as_str(),
+                                bytes,
+                            })
+                            .collect();
+                        self.weights.register_adapter(
+                            &self.device,
+                            &self.trace,
+                            grant.slot,
+                            &planes,
+                        )?;
+                        tracing::info!(
+                            slot = grant.slot,
+                            named = planes.len(),
+                            zeroed = seats.len() - planes.len(),
+                            "an adapter bundle was written into its slot"
+                        );
+                        Ok(())
+                    })
             }
         };
         match landed {
