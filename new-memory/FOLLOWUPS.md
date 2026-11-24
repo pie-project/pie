@@ -1649,3 +1649,9 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 **Idea.** A sweep per cap on MI300X over the shapes the served models fire (rocprofv3 on the kernel tests, the staging caps against the load's device-memory budget), each value then derived from what it bounds (the budget, the device's CUs, the pipeline's depth) or kept with its measurement stated.
 
 **Why later.** A value change re-measures what it fires; the cleanup PR changes no value.
+
+## F102. Split the large ETA emitter files
+
+**What.** `crates/eta-compiler/src/codegen/metal/streamed.rs` (2,175 lines; two functions under `allow(clippy::too_many_lines)` at :263 and :1157), `codegen/simt/stream.rs` (1,920) and `codegen/wgsl.rs` (1,641) each hold a whole emitter in one file. Split them along their schedule / step-kind seams, emitting byte-identical source (the `emitter_version` fingerprints pin it).
+
+**Why later.** It moves emitter code shared by every backend, so it needs a booted server on every backend; the cleanup pass changes no emitted code.

@@ -95,6 +95,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 
 [dev-dependencies]
 engine-metal = { path = ".", features = ["fault-injection", "test-limits"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
 engine-cpu = { path = "../engine-cpu" }
 media = { path = "../media" }
 poem = { package = "pie-poem", path = "../poem" }
