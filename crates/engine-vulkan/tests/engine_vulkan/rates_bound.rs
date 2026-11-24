@@ -90,7 +90,6 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         None,
         TOP,
         say,
-        None,
     )
     .expect("the shapes' step lands under the bound");
     let longest = longest
