@@ -566,7 +566,8 @@ fn load_declared(
 
 /// A declared context is cut to the room the load's own room line leaves,
 /// past this process's context and modules: under budgets from where the
-/// modules leave no sequence a room to where they leave a long one, a load
+/// modules leave no sequence a room to where they leave a long one (counted
+/// past the modules' charge the engine states), a load
 /// serves the declared context cut to what it seats, or refuses the card by
 /// name, never faulting on residency.
 #[test]
@@ -580,8 +581,39 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
     let cache = cache_dir();
     let model = buffered_model();
     let fixture = fixture(&model, &cache);
+    // An unbounded load first: where the profile states no roofline rates
+    // (a committed profile not taken for this build) it measures them and
+    // keeps them in the probe's profiles, so the budgets below are weighed
+    // on their room alone, not on room to measure.
+    drop(
+        load_declared(&fixture, &cache, engine::Allowance::WHOLE, DECLARED)
+            .unwrap_or_else(|why| panic!("{model}: an unbounded load serves: {why}")),
+    );
+    // The engine states what this process's context and modules charge the
+    // budget in its room line ("N MiB of it this process's context and
+    // modules"): read off a load under a budget nothing fits, the range below
+    // starts past it, so it spans the same rooms on any backend (ROCm's
+    // modules take ~1.5 GiB, CUDA's far less).
+    let charged = match load_declared(
+        &fixture,
+        &cache,
+        engine::Allowance {
+            budget: Some(1 << 20),
+        },
+        DECLARED,
+    ) {
+        Ok(_) => panic!("a 1 MiB budget served the declared context"),
+        Err(why) => why
+            .split(" MiB of it this process's context and modules")
+            .next()
+            .filter(|head| head.len() < why.len())
+            .and_then(|head| head.rsplit(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("the refusal states no context and modules charge: {why}")),
+    };
+    println!("this process's context and modules: {charged} MiB of the budget");
     let mut served = 0;
-    for mib in (512u64..=2048).step_by(128) {
+    for mib in (charged + 512..=charged + 2048).step_by(128) {
         let allowance = engine::Allowance {
             budget: Some(mib << 20),
         };
