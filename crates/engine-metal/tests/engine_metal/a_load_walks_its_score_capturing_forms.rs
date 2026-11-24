@@ -6,32 +6,17 @@
 //! fire after ready meets only pipelines the walk built.
 
 use engine_metal::serve::Seated;
-use engine_metal::{Boot, Lane, Shell};
-use poem_compiler::Budget;
+use engine_metal::{Lane, Shell};
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, fixture_of};
 use super::a_score_reader_holds_its_rows_through_a_park::{at_lane, bind_reader, bind_reader_of_pair, reader};
 
 fn load(fixture: &Fixture) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(4, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: 16,
+    Load {
         context: 1024,
-        slots: 4,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }

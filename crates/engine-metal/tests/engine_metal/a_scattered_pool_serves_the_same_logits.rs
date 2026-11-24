@@ -376,30 +376,75 @@ fn load_boot(
     profiles: Option<PathBuf>,
 ) -> Shell {
     let residency = engine_metal::ResidencyPlan::default();
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(SEATS, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: PAGE,
+    Load {
         context,
-        slots: SEATS,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
         runahead,
         residency: match chunk {
             Some(bytes) => residency.with_chunk_bytes(bytes),
             None => residency,
         },
         profiles,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
+}
+
+/// A test load's settings past its fixture, each as the shell tests lay it
+/// unless the test states its own (`..Load::default()`); every rung served
+/// (`Top::EveryRung`), the whole device allowed.
+pub(super) struct Load {
+    pub(super) budget: Budget,
+    pub(super) page_size: u32,
+    pub(super) context: u32,
+    pub(super) slots: u32,
+    pub(super) kv_budget: Option<u64>,
+    pub(super) runahead: engine::runahead::Runahead,
+    pub(super) residency: engine_metal::ResidencyPlan,
+    pub(super) profiles: Option<PathBuf>,
+    pub(super) measure: engine::rates::Measuring,
+}
+
+impl Default for Load {
+    fn default() -> Load {
+        Load {
+            budget: Budget::new(SEATS, 256),
+            page_size: PAGE,
+            context: CONTEXT,
+            slots: SEATS,
+            kv_budget: None,
+            runahead: engine::runahead::Runahead::F1,
+            residency: engine_metal::ResidencyPlan::default(),
+            profiles: None,
+            measure: engine::rates::Measuring::Time,
+        }
+    }
+}
+
+impl Load {
+    /// `fixture` loaded under these settings.
+    pub(super) fn boot(self, fixture: &Fixture) -> engine_metal::Result<Shell> {
+        Shell::load(Boot {
+            trace: fixture.trace.clone(),
+            contract: &fixture.contract,
+            checkpoint: &fixture.container,
+            budget: self.budget,
+            patches: None,
+            voxels: None,
+            profile: None,
+            page_size: self.page_size,
+            context: self.context,
+            slots: self.slots,
+            kv_budget: self.kv_budget,
+            allowance: engine::Allowance::WHOLE,
+            runahead: self.runahead,
+            residency: self.residency,
+            profiles: self.profiles,
+            top: engine_metal::Top::EveryRung,
+            measure: self.measure,
+        })
+    }
 }
 
 pub(super) fn word(trace: &Trace, rows: u32) -> u64 {

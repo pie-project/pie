@@ -7,12 +7,12 @@
 
 use engine::fire::{Mask, Masking};
 use engine_metal::serve::Seated;
-use engine_metal::{Boot, Lane, Shell};
+use engine_metal::{Lane, Shell};
 use eta_compiler::contract::{Drift, near_tie};
 use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, ops, trace_hybrid};
 use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, argmax, fixture_from};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, argmax, fixture_from};
 
 const VOCAB: u32 = 64;
 const WIDTH: u64 = 128;
@@ -70,25 +70,14 @@ impl ForwardHybrid for Micro {
 }
 
 fn load(fixture: &Fixture) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
+    Load {
         budget: Budget::new(LANES + 1, 64),
-        patches: None,
-        voxels: None,
-        profile: None,
         page_size: PAGE,
         context: CONTEXT,
         slots: SLOTS,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }

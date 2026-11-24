@@ -7,10 +7,10 @@
 //! and a prompt after it answers as on a load that never walked.
 
 use engine_metal::serve::Seated;
-use engine_metal::{Boot, Lane, Shell};
+use engine_metal::{Lane, Shell};
 use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, word};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, fixture_of, word};
 
 /// Seats and context enough that the kv list's seat runs (every seat's, laid
 /// first) reach past what the walk backs: seat 0's record lies beyond them.
@@ -18,25 +18,13 @@ const SEATS: u32 = 64;
 const CONTEXT: u32 = 2048;
 
 fn load(fixture: &Fixture) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
+    Load {
         budget: Budget::new(SEATS, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: 16,
         context: CONTEXT,
         slots: SEATS,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }

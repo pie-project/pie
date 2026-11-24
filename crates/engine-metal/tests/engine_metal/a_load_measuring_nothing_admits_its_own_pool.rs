@@ -7,33 +7,18 @@
 //! every curve stored or committed: a clean home's boot under a committed
 //! profile) is admitted every time.
 
-use engine_metal::{Boot, Shell};
-use poem_compiler::Budget;
+use engine_metal::Shell;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, fixture_of};
 
 const LOADS: u32 = 200;
 
 fn load(fixture: &Fixture) -> Result<Shell, String> {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(4, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: 16,
-        context: 256,
-        slots: 4,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
+    Load {
         measure: engine::rates::Measuring::Skip,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .map_err(|why| why.to_string())
 }
 

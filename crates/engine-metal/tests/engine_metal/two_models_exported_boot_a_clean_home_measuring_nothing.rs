@@ -5,31 +5,16 @@
 //! same keys) boots each measuring nothing (`Shell::measured_at_load` empty,
 //! the load's "measured 0"), as engine-gpu's suite checks the same.
 
-use engine_metal::{Boot, Shell};
-use poem_compiler::Budget;
+use engine_metal::Shell;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, fixture_of};
 
 fn load(fixture: &Fixture, profiles: &std::path::Path) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(4, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: 16,
-        context: 256,
-        slots: 4,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
+    Load {
         profiles: Some(profiles.to_path_buf()),
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
 
