@@ -1206,21 +1206,15 @@ impl Plane {
         if ring.is_empty() {
             self.settle_writers(seat.channels[binding.channel as usize])?;
         }
-        if ring.is_empty() {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: the `parents` ring is empty at the fire"
-            )));
-        }
-        let parents = match ring.front() {
-            eta_exec::Value::U32(cells) => cells,
-            eta_exec::Value::I32(cells) => cells.iter().map(|&p| p as u32).collect(),
-            other => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance}: `parents` holds {:?}, not beams",
-                    other.dtype()
-                )));
-            }
-        };
+        // Parents a deferred pass on the queue puts hold its placeholder in
+        // the ring until that pass lands.
+        let parents = engine_gpu::guest::defer::parents(
+            instance,
+            binding.channel,
+            ring,
+            &seat.landing,
+            &seat.poisoned,
+        )?;
         Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Host(parents))))
     }
 
