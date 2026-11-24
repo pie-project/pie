@@ -333,6 +333,56 @@ pub(super) fn load_ahead(
     chunk: Option<u64>,
     runahead: engine::runahead::Runahead,
 ) -> Shell {
+    load_boot(fixture, context, chunk, runahead, None)
+}
+
+/// [`load_near`] keeping what it measures in `profiles` and taking what an
+/// earlier load stored there. The loads a test compares to the bit share
+/// one: each load otherwise times its own kernel.dense curves and may fit
+/// another ladder (FOLLOWUPS F57: a 40-row prompt on mpp in one load and on
+/// tile in the other), so their logits agree within a tolerance, not to the
+/// bit.
+pub(super) fn load_stored(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    profiles: &Profiles,
+) -> Shell {
+    load_boot(
+        fixture,
+        context,
+        chunk,
+        engine::runahead::Runahead::F1,
+        Some(profiles.0.clone()),
+    )
+}
+
+/// A profile directory of one test's own, gone when dropped: the loads that
+/// test compares share it ([`load_stored`]), and no other test reads what
+/// they stored.
+pub(super) struct Profiles(PathBuf);
+
+impl Profiles {
+    pub(super) fn new(test: &str) -> Profiles {
+        let dir = std::env::temp_dir().join(format!("pie-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Profiles(dir)
+    }
+}
+
+impl Drop for Profiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn load_boot(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    runahead: engine::runahead::Runahead,
+    profiles: Option<PathBuf>,
+) -> Shell {
     let residency = engine_metal::ResidencyPlan::default();
     Shell::load(Boot {
         trace: fixture.trace.clone(),
@@ -352,7 +402,7 @@ pub(super) fn load_ahead(
             Some(bytes) => residency.with_chunk_bytes(bytes),
             None => residency,
         },
-        profiles: None,
+        profiles,
         top: engine_metal::Top::EveryRung,
         measure: engine::rates::Measuring::Time,
     })
@@ -606,15 +656,18 @@ fn check(model: &str, hybrid: bool) {
         eprintln!("skipping: no Metal device");
         return;
     }
-    check_near(model, hybrid, None);
+    check_near(model, hybrid, None, &Profiles::new(&format!("scattered-{model}")));
 }
 
 /// [`check`] over a pool whose chunk aims near `chunk` bytes where stated:
 /// the seats' logits.
-fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
+/// The seats' run and the scattered one are two loads compared to the bit:
+/// both load in `profiles`, so they fire the same kernels (a caller that
+/// compares the result with another `check_near` passes the same one).
+fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles) -> Vec<Vec<f32>> {
     let fixture = fixture(model);
     const STEPS: usize = 12;
-    let load = |fixture: &Fixture| load_near(fixture, CONTEXT, chunk);
+    let load = |fixture: &Fixture| load_stored(fixture, CONTEXT, chunk, profiles);
 
     let mut shell = load(&fixture);
     let facts = shell.pool_chunk_facts();
@@ -731,11 +784,12 @@ fn a_refused_evacuation_moves_nothing() {
     for model in ["qwen3-micro-text", "qwen35-tiny"] {
         let fixture = fixture(model);
         const STEPS: usize = 8;
-        let mut shell = load_near(&fixture, CONTEXT, None);
+        let profiles = Profiles::new(&format!("refused-evacuation-{model}"));
+        let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
         let seats = serve(&mut shell, &fixture.trace, &Placement::Seats, STEPS, usize::MAX, &mut |_| {});
         drop(shell);
 
-        let mut shell = load_near(&fixture, CONTEXT, None);
+        let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
         let facts = shell.pool_chunk_facts();
         let layout = shell.pool_layout();
         let segment = facts.segment_chunks;
@@ -846,7 +900,7 @@ fn split_page_ids_over_buffers_serve_the_same_logits() {
             ids.shift.unwrap_or(0)
         );
         drop(shell);
-        check_near(model, hybrid, Some(chunk));
+        check_near(model, hybrid, Some(chunk), &Profiles::new(&format!("split-{model}")));
     }
 }
 
@@ -899,8 +953,9 @@ fn a_record_in_pieces_serves_the_whole_records_logits() {
         "{model}'s record is whole in a {CHUNK}-byte chunk"
     );
     eprintln!("{model}: the record in {pieces} pieces");
-    let cut = check_near(model, true, Some(CHUNK));
-    let whole = check_near(model, true, None);
+    let profiles = Profiles::new("record-in-pieces");
+    let cut = check_near(model, true, Some(CHUNK), &profiles);
+    let whole = check_near(model, true, None, &profiles);
     same(
         &format!("{model}: the record in {pieces} pieces against whole"),
         &cut,

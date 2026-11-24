@@ -1278,9 +1278,17 @@ impl PreparedLoad<'_> {
         // What every other process's GPU memory takes of the working set
         // they share with this one: none of the load's capacity.
         let others = device.others_allocated();
+        // The working set, read once: the pool is sized to fill it and
+        // admitted against the same reading. `working_set()` derives from
+        // what the process holds now, which the load's own allocations on
+        // the way (the pool layout's host tables, sized by the pool) grow;
+        // read again at admission it came out a few MB below the pool sized
+        // to fill the first reading, and a load that timed nothing was
+        // refused for the bytes it had just allocated itself.
+        let working_set = device.working_set();
         let accounting = |pool: u64| {
             crate::store::accounting::Accounting::of(
-                device.working_set(),
+                working_set,
                 outside.saturating_add(others),
                 boot.allowance.budget,
                 model_bytes,
