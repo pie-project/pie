@@ -10327,16 +10327,23 @@ impl<B: Serve> Shell<B> {
         let table = &self.compiled.classes;
         let mut decoding = vec![false; table.classes.len()];
         let mut prefilling = vec![false; table.classes.len()];
-        // Interim: the walk arms plain classes only. A class whose lanes
-        // carry an attachment (a score capture, a mask, an adapter, a guest
-        // input) binds commands of its own per attachment, which multiplies
+        // Interim: the walk arms classes without a score capture, an adapter
+        // or a guest input. A class whose lanes carry one binds commands of
+        // its own per attachment, which multiplies
         // the bodies past what a device holds; it is stated eager at load
         // until its commands read the attachment as data.
-        let mut attached = vec![false; table.classes.len()];
+        // (A mask is armed: every class of a load that masks carries one.)
+        let attached: Vec<bool> = (0..table.classes.len())
+            .map(|class| {
+                let lane = self.naming_lane(class, 1).ok();
+                self.captures(class)
+                    || lane.as_ref().is_some_and(|lane| lane.adapter.is_some())
+                    || lane.as_ref().is_some_and(|lane| !lane.inputs.is_empty())
+            })
+            .collect();
         for request in facts.requests() {
             if let Some(class) = table.class_of(facts.word(&request) & table.mask) {
-                if !request.plain() {
-                    attached[class] = true;
+                if attached[class] {
                     continue;
                 }
                 if request.query_len() == 1 {
