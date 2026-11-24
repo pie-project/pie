@@ -19,7 +19,7 @@ mod mamba2;
 
 pub use conv1d::conv1d_fold;
 pub use conv1d::{
-    causal_conv1d, causal_conv1d_carried, causal_conv1d_chunked, short_conv, short_conv_carried,
+    causal_conv1d, causal_conv1d_carried, causal_conv1d_chunked, short_conv,
     short_conv_chunked,
 };
 pub use dyn_conv::dyn_conv;
