@@ -921,7 +921,7 @@ __global__ void conv1d_carried_vec8(
 // committed point moves with the set's recurrent state. A thread a channel,
 // folding the groups in turn (the folding ones lead the table; the first of no
 // rows ends it); grid ceil(C / block). `span` is the window's cells,
-// `(K - 1) dil + 1`, at most 8.
+// `(K - 1) dil + 1`, any length (folded in place).
 template <class T>
 __global__ void conv1d_fold(StateRows rows, int C, int span, Carry carry,
                             const GroupFold* __restrict__ folds, int groups)
@@ -939,24 +939,21 @@ __global__ void conv1d_fold(StateRows rows, int C, int span, Carry carry,
     const int cs = rows.atoms;
     const int ci = c % cs;
     T* state = rows.piece<T>(rid, c / cs);
-    T cells[8];
-    #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        if (k >= span) break;
+    // In place, ascending: cell k takes run position n - span + k, which is
+    // a committed cell only as the old cell n + k > k (n >= 1), not yet
+    // written; so any span folds without a copy of the window.
+    for (int k = 0; k < span; ++k) {
         const int t = n - span + k;
+        T cell;
         if (t < 0) {
-            cells[k] = state[(long long)(span + t) * cs + ci];
+            cell = state[(long long)(span + t) * cs + ci];
         } else {
             u64 slot;
             u32 tok;
             carry.fold_at(cl, f.fold_off, t, slot, tok);
-            cells[k] = carry.plane_at<const T>(slot, tok, 0)[c];
+            cell = carry.plane_at<const T>(slot, tok, 0)[c];
         }
-    }
-    #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        if (k >= span) break;
-        state[(long long)k * cs + ci] = cells[k];
+        state[(long long)k * cs + ci] = cell;
     }
     }
 }
