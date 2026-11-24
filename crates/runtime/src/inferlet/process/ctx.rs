@@ -221,11 +221,14 @@ impl ProcessCtx {
         #[cfg(not(target_arch = "wasm32"))]
         let scratch_dir = if policy.fs.allow {
             let scratch_dir = policy.fs.base_dir.join(id.to_string());
-            std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
-
+            std::fs::create_dir_all(&scratch_dir).map_err(|why| {
+                anyhow::anyhow!("scratch dir {}: not created: {why}", scratch_dir.display())
+            })?;
             builder
                 .preopened_dir(&scratch_dir, "/scratch", FsPerms::ReadWrite)
-                .expect("failed to preopen scratch dir");
+                .map_err(|why| {
+                    anyhow::anyhow!("scratch dir {}: not opened: {why}", scratch_dir.display())
+                })?;
             Some(scratch_dir)
         } else {
             None

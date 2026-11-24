@@ -2773,9 +2773,6 @@ fn close(ctx: &Ctx, id: InstanceId) {
 /// table, so a slot ref (a logical chunk's) reads what it read, and the
 /// bytes stand as they lie. Whether it moved chunks.
 fn walk(ctx: &Ctx) -> bool {
-    if std::env::var_os("PIE_SIM_NOWALK").is_some() {
-        return false;
-    }
     let Some(shared) = &ctx.stores.shared else {
         return false;
     };
@@ -2856,22 +2853,6 @@ const LOST_WAKES_FAIL: bool = false;
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
 fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
-    if std::env::var_os("PIE_SIM_CAP").is_some() {
-        eprintln!(
-            "SIMCAP step {step} held {:?} pending {:?} kv {:?} read {:?} census {:?} device {:?} disk {:?} roles {:?}",
-            ctx.stores.roles.as_ref().map(|roles| roles.lock().unwrap().audit_held()),
-            ctx.stores.shared.as_ref().map(|shared| { let shared = shared.lock().unwrap(); (shared.pool().pending_slots(), shared.pool().budget_line(), shared.pool().census(1), shared.pool().held_census()) }),
-            with_kv_lock(&ctx.stores.kv, "sim-cap", |kv| kv.census()),
-            ctx.planner.capacity_read(),
-            ctx.planner.port.capacity_census(),
-            ctx.planner.port.device_stats(),
-            ctx.planner.port.disk_stats(),
-            ctx.stores.roles.as_ref().map(|roles| {
-                let roles = roles.lock().unwrap();
-                (roles.footprint(), roles.footprint_on_disk(), roles.slack())
-            }),
-        );
-    }
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -3730,13 +3711,6 @@ fn replay_seed(seed: u64) -> Vec<Failure> {
     run(&Workload::of(seed), None).0
 }
 
-/// The failure shapes the simulation has found and the planner has not yet
-/// fixed, each with a seed that showed it (its regression test below,
-/// ignored until fixed). The fast sweep fails on any other shape; once a
-/// shape is fixed its entry goes and its test is no longer ignored. None
-/// now.
-const KNOWN: [(&str, u64); 0] = [];
-
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
 const FIXED: [(&str, u64); 35] = [
@@ -3860,31 +3834,21 @@ const FIXED: [(&str, u64); 35] = [
     ("liveness", 431),
 ];
 
-fn known(shape: &str) -> bool {
-    KNOWN.iter().any(|(prefix, _)| shape.starts_with(prefix))
-}
-
-/// The fast sweep: 200 seeds, none failing in a shape not [`KNOWN`].
+/// The fast sweep: 200 seeds, none failing. It covers the [`FIXED`] seeds
+/// below 200, so only those past it have a regression test of their own.
 #[test]
 fn the_simulated_fleet_settles_every_step_on_200_seeds() {
     let (failures, coverage) = sweep(0..200);
     let report = report(&failures, &coverage, false);
     eprintln!("{report}");
-    let new: Vec<_> = failures
-        .iter()
-        .filter(|(_, failure)| !known(&shape_of(failure)))
-        .collect();
-    assert!(
-        new.is_empty(),
-        "failures in a shape not known: {new:?}\n{report}"
-    );
+    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
     assert!(
         coverage.evictions > 0 && coverage.restores > 0,
         "{coverage:?}"
     );
 }
 
-/// Seed `seed` runs clean of the shape `prefix` ([`KNOWN`], [`FIXED`]).
+/// Seed `seed` runs clean of the shape `prefix` ([`FIXED`]).
 fn regression((prefix, seed): (&str, u64)) {
     let failures = replay_seed(seed);
     for failure in &failures {
@@ -3904,36 +3868,6 @@ fn regression((prefix, seed): (&str, u64)) {
 }
 
 #[test]
-fn sim_seed_1_a_bind_s_parts_opening_fresh_chunks_do_not_spin() {
-    regression(FIXED[0]);
-}
-
-#[test]
-fn sim_seed_13_a_bind_suspended_restore_s_need_does_not_ratchet() {
-    regression(FIXED[1]);
-}
-
-#[test]
-fn sim_seed_111_a_bind_suspended_restore_whose_placement_stands_is_sent() {
-    regression(FIXED[2]);
-}
-
-#[test]
-fn sim_seed_188_a_bind_short_of_a_run_is_funded() {
-    regression(FIXED[3]);
-}
-
-#[test]
-fn sim_seed_1_no_guest_state_a_later_fire_reads_is_lost_at_a_park() {
-    regression(FIXED[4]);
-}
-
-#[test]
-fn sim_seed_19_a_pair_taken_anew_is_laid_at_its_new_generation() {
-    regression(FIXED[5]);
-}
-
-#[test]
 fn sim_seed_3364_a_bound_pair_s_slots_are_its_own() {
     regression(FIXED[6]);
 }
@@ -3946,16 +3880,6 @@ fn sim_seed_3999_a_bound_pair_s_slots_are_its_own() {
 #[test]
 fn sim_seed_1711_every_process_ends() {
     regression(FIXED[8]);
-}
-
-#[test]
-fn sim_seed_111_a_restore_short_of_runs_its_unpark_takes_is_compacted_for() {
-    regression(FIXED[9]);
-}
-
-#[test]
-fn sim_seed_134_a_head_no_move_serves_is_passed_over() {
-    regression(FIXED[10]);
 }
 
 #[test]

@@ -91,7 +91,7 @@ pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     context: u32,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     device: &str,
     counts: &Counts,
 ) -> Result<TopRung> {
@@ -172,7 +172,7 @@ mod tests {
             &rungs,
             1 << 33,
             u32::MAX,
-            &profile::fire::Rates::default(),
+            &profile::rates::Rates::default(),
             "Apple X",
             &counts(),
         )
@@ -182,13 +182,13 @@ mod tests {
                 .contains("device Apple X has no rates in its profile"),
             "{err}"
         );
-        let rated = profile::fire::Rates {
+        let rated = profile::rates::Rates {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 2.0), (4096, 5.0)])]),
             attn_tflops_by_keys: Some(vec![(2048, 2.0)]),
             hbm_gbps: Some(400.0),
             elementwise_gbps: Some(200.0),
             launch_ns: Some(5000),
-            ..profile::fire::Rates::default()
+            ..profile::rates::Rates::default()
         };
         let top = choose(&rungs, 1 << 33, u32::MAX, &rated, "Apple X", &counts()).unwrap();
         assert!(matches!(top.tokens, 1024 | 2048));

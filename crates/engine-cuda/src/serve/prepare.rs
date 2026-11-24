@@ -2291,7 +2291,7 @@ impl Shell {
         };
         let lane_ceiling = self.lane_ceiling().min(max_lanes);
         let patches = composition.axis(poem_ir::RowAxis::Patches);
-        let key = record::BodyKey::of_axes(
+        let key = record::BodyKey::of(
             &token_axis.classes,
             token_axis.bucket,
             &self.decoding,

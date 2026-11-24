@@ -446,8 +446,8 @@ async fn acquire_grant<C: FireContext>(
     };
     // A request the planner dropped while its process is still its own
     // (its entry gone under it) is asked again, quoted anew: a wait, never
-    // the client's failure (the L40S on 5aa45805b: a beam failed "prefill
-    // submit ... KV capacity: planner request cancelled"). One whose
+    // the client's failure (a beam must not fail with "planner request
+    // cancelled"). One whose
     // process left the planner is its departure's.
     if matches!(acquired, Err(crate::planner::PlannerError::Cancelled)) && planner.registered(pid) {
         tracing::debug!(%pid, "pipeline: a KV request the planner dropped is asked again");
@@ -483,16 +483,15 @@ pub(crate) async fn relist_beam<C: FireContext>(
     // holds out under the rung's cap among them: built before the finish,
     // its lanes name the set's tail as it stood (each lane's reserve is the
     // set's whole table at its submit), and fired after it, it read the
-    // pages the finish let go (the M1, race5 run 6: a fire 79 s after the
-    // finish named a freed page of the old tail, the swap since putting it
-    // on a released segment).
+    // pages the finish let go (a freed page of the old tail, which a swap
+    // may since have put on a released segment).
     ctx.settle_pipeline_tail()
         .await
         .map_err(|error| format!("a beam's finish waiting for its fires to land: {error:#}"))?;
     // And every fire the set itself has submitted, on any pipeline (a closed
     // one's run-ahead fires included, which the process's tail no longer
-    // lists): each holds a lease on the set until it lands (the M1's run 12:
-    // a fire 4 s after the finish carried the set's pre-relist reserve).
+    // lists): each holds a lease on the set until it lands (a fire landing
+    // after the finish carries the set's pre-relist reserve).
     if let Some(leases) = &leases {
         leases.quiesce().await;
     }
@@ -700,8 +699,8 @@ fn bound_rs_working_sets<C: FireContext>(
 /// `keep`: the position a checkpoint inside the fire lands at, whose slots
 /// stay past it.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 fn host_window_plan(
     req: &crate::engine::FireRequest,
     fold: &geometry::Fold,
@@ -1573,9 +1572,8 @@ impl RungAsk {
             // there: between two waits (the funding's, the watch's) its
             // owner was unblocked, its lanes expected again, and a frame
             // holding three complete fronts waited on a lane whose process
-            // waited on a raise that frame held up (Mac's beamx8 on
-            // e158f45d2: "a frame is held for lanes that have not
-            // submitted", the rung lowered to 8 under a wider ask).
+            // waited on a raise that frame held up (the rung lowered under a
+            // wider ask).
             let mut parked = None;
             loop {
                 let watch = crate::store::shared::rung_watch(engine);
@@ -3683,8 +3681,8 @@ fn stamp_lane_translation(
 /// page it writes, where every row lands past, so a decode loop that never
 /// states its positions still holds its windows and not its whole sequence.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 fn device_window_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -6232,7 +6230,7 @@ async fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> R
     }
     // A set in a move (a suspend or a sweep pins its pages) is cut once
     // the move ends: cut under it, the pages it freed went back again as
-    // the move committed (the M1's beam line: a kv page released twice).
+    // the move committed (a kv page released twice).
     loop {
         kv_out_of_move(stores, end.kv).await;
         match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
@@ -7361,9 +7359,9 @@ pub(crate) mod lifecycle_tests {
     }
 
     /// A beam's finish while a frame the process submitted is held unsealed
-    /// under the rung's cap (the M1, race5 run 6: a 17-row frame of the set
-    /// staged before its finish, fired 79 s later after a raise, its lanes'
-    /// reserve naming the old tail the finish let go). The finish lets
+    /// under the rung's cap (a frame of the set staged before its finish and
+    /// fired after a raise, its lanes' reserve naming the old tail the
+    /// finish would let go). The finish lets
     /// nothing go until that frame lands: the set's table stands as the
     /// frame named it, and once it lands the finish relists.
     #[tokio::test(flavor = "current_thread")]
@@ -7741,8 +7739,8 @@ pub(crate) mod lifecycle_tests {
 
     /// Lanes that all wait on one front fire register their wakers on its
     /// completion before it settles: settling it wakes every one of them,
-    /// not only the last to register (MI300X: 5-7 of 8 lanes slept for good
-    /// on a settled fire while the eighth decoded alone).
+    /// not only the last to register (else all but one lane sleep for good
+    /// on a settled fire while the last decodes alone).
     #[tokio::test(flavor = "current_thread")]
     async fn every_lane_waiting_on_the_front_fire_wakes_when_it_settles() -> anyhow::Result<()> {
         use std::future::Future;
@@ -8577,8 +8575,8 @@ mod rung_wait_tests {
         assert_eq!(crate::store::shared::fire_cap(ENGINE), 1);
     }
 
-    /// The 500-concurrent wedge (MI300X, Qwen3-0.6B, an empty host tier):
-    /// the walk lowered the rung to one row and the span it lent filled
+    /// A wedge under 500 concurrent processes with an empty host tier: the
+    /// walk lowered the rung to one row and the span it lent filled
     /// with kv, admitted against a device total that counted the lent
     /// chunks as kv's; a wide pass then asked the rung back, and its raise
     /// waited in the planner's queue as a kv demand among the waiters it
@@ -8648,7 +8646,7 @@ mod rung_wait_tests {
         drop(ask);
     }
 
-    /// The stack wedge through the planner (MI300X, 500 at once): the rung
+    /// The stack wedge through the planner (500 processes at once): the rung
     /// rose for a pass while nothing waited; a guest bind short of a run of
     /// chunks then waits in the planner's queue. The walk comes down at once
     /// to the live lane's rung, its give-back tells the planner, which
@@ -10565,8 +10563,8 @@ pub(crate) mod fold_tests {
     /// pass over a record state (a folded state, or a ring-only window) cut
     /// at its asked checkpoint row, 32 here: the first piece (0..32) takes it
     /// as it settles, and the next (32..64) is laid before then. Taken at
-    /// the settle, the record was already the next piece's to write in
-    /// place, and the take was dropped unsaid; now it is refused by name.
+    /// the settle, the record is already the next piece's to write in
+    /// place, so such a take is refused by name.
     /// Taken ahead, as the first piece is submitted, the next piece finds
     /// the record shared and copies it on the device behind the first: the
     /// checkpoint is kept while the next piece is on its way, and a later
@@ -11066,12 +11064,13 @@ pub(crate) mod fold_tests {
     /// fire's lease. None ends before the fire settles, and each then reads
     /// the folded length the device's count left, one length in both
     /// stores.
-    /// The M5 soak's stall on f9afad90a: a process fired, then bound a
-    /// program short of room, and the planner evicted it while its bind
-    /// waited. The fire's lease goes back only as the fire is finalized,
-    /// and its finalizer was the guest, in the bind; the eviction's drain
+    /// A soak's stall: a process fires, then binds a
+    /// program short of room, and the planner evicts it while its bind
+    /// waits. The fire's lease goes back only as the fire is finalized,
+    /// and its finalizer is the guest, in the bind; the eviction's drain
     /// finalizes only fires settled as it starts, and none of a pass whose
-    /// geometry the device keeps. The eviction waited on the lease for good.
+    /// geometry the device keeps, so the eviction would wait on the lease
+    /// for good.
     /// A bind about to wait settles its process's fires first: the lease
     /// goes back as the fire lands, and the eviction's wait ends.
     #[tokio::test(flavor = "current_thread")]
@@ -11829,11 +11828,11 @@ pub(crate) mod fold_tests {
         Ok(())
     }
 
-    /// The control. Until the second fire was staged on a lower bound, the
-    /// submit of a recurrent fire first ran the pass's fires in flight to
-    /// their end wherever a frozen length was not exact. In a frame that
-    /// wait is for a fire the scheduler dispatches only once the fire that
-    /// waits has arrived: it does not end, and the frame never fills.
+    /// The control, for staging the second fire on a lower bound: a submit
+    /// of a recurrent fire that first runs the pass's fires in flight to
+    /// their end wherever a frozen length is not exact waits, in a frame,
+    /// for a fire the scheduler dispatches only once the fire that waits
+    /// has arrived: it does not end, and the frame never fills.
     #[tokio::test(flavor = "current_thread")]
     async fn a_fire_that_waited_for_the_fold_before_it_would_hold_its_own_frame() {
         let (flight, mut frames, mut ctx) = first_of_a_frame();
@@ -12599,7 +12598,7 @@ mod unfolded_tests {
         assert!(refused.contains("bytes of rs scratch"), "{refused}");
     }
 
-    /// Mac's measurements (Metal, Qwen3.5-0.8B w8, the old path): its rs
+    /// Measurements of Metal serving Qwen3.5-0.8B w8: its rs
     /// scratch from `rs::Layout`, eight scratch slots of
     /// [12288, 64, 4096, 12288, 128, 128, 8192, 8192] bytes a row, 1 MiB a
     /// lane, each term rounded to 256; rung 256 reserves 291,667,968 bytes,

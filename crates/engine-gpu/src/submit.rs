@@ -600,7 +600,7 @@ impl Measured {
 pub fn rate_at_keys(curve: &[(u32, f64)], keys: u32) -> Option<f64> {
     let &(x1, y1) = curve.last()?;
     if keys <= x1 || curve.len() < 2 {
-        return profile::fire::interpolate(curve, f64::from(keys));
+        return profile::curves::interpolate(curve, f64::from(keys));
     }
     let (x0, y0) = curve[curve.len() - 2];
     if y1 >= y0 {
@@ -628,7 +628,7 @@ pub fn rate_at(by_rows: &[(u32, Vec<(u32, f64)>)], rows: u32, keys: u32) -> Opti
     if rows < narrowest {
         return Some(rate * f64::from(rows.max(1)) / f64::from(narrowest));
     }
-    profile::fire::interpolate(&at, f64::from(rows))
+    profile::curves::interpolate(&at, f64::from(rows))
 }
 
 impl SubmitBound {

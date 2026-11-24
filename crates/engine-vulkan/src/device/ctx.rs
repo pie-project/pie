@@ -1560,7 +1560,7 @@ impl Context {
     }
 
     /// The workgroups the device holds at once, as the load's rates step
-    /// measured them on every device (`profile::fire::RESIDENT_WORKGROUPS`):
+    /// measured them on every device (`profile::rates::RESIDENT_WORKGROUPS`):
     /// what a guest step's grid strides over. `None` before the load has.
     #[must_use]
     pub fn resident(&self) -> Option<u32> {

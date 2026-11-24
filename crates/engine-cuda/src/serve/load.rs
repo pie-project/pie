@@ -2532,7 +2532,7 @@ impl Shell {
     /// test that serves a later load with the same choices.
     #[doc(hidden)]
     #[must_use]
-    pub fn product_times(&self) -> &[profile::fire::ProductTime] {
+    pub fn product_times(&self) -> &[profile::rates::ProductTime] {
         &self.products
     }
 
@@ -2976,9 +2976,9 @@ pub(super) struct Baked {
     pub(super) keys: crate::stored::Keys,
     /// The decode products' times the device's profile states under a
     /// matching key, which a measurement of more joins.
-    pub(super) products: Vec<profile::fire::ProductTime>,
+    pub(super) products: Vec<profile::rates::ProductTime>,
     /// How the device's profile says this machine lands weights.
-    pub(super) landing: Option<profile::fire::Landing>,
+    pub(super) landing: Option<profile::rates::Landing>,
     pub(super) asked: Budget,
     /// What the card may hold in all under the load's allowance, resolved
     /// before the load took anything (`elastic::ceiling_of`).

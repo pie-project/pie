@@ -85,13 +85,17 @@ async fn draw(
 }
 
 /// Writes `tokens` to `ws`, then draws up to `max_tokens` ahead of reading
-/// them, stopping after `stop_after`.
+/// them, stopping after `stop_after`. Drawing none fires nothing, as the
+/// one-at-a-time path does.
 async fn draw_ahead(
     ws: &WorkingSet,
     pipe: &Pipeline,
     input: &Input,
     stop_after: usize,
 ) -> Result<Vec<u32>> {
+    if input.max_tokens == 0 || stop_after == 0 {
+        return Ok(Vec::new());
+    }
     let tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
     let (first, _) = draw(ws, pipe, &tokens, input.seed, input.drawn, input.greedy).await?;
     let mut drawn = vec![first as u32];
@@ -119,7 +123,8 @@ async fn draw_ahead(
     });
     run_ahead(pipe, &fwd, input.max_tokens - 1, async || {
         let t = out.take_host::<Vec<i32>>().await?;
-        drawn.push(*t.first().unwrap_or(&0) as u32);
+        let next = t.first().ok_or("a draw-ahead fire returned no token")?;
+        drawn.push(*next as u32);
         Ok(if drawn.len() >= stop_after {
             ControlFlow::Break(())
         } else {

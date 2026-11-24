@@ -1,11 +1,11 @@
 #![cfg(target_vendor = "apple")]
 
-//! A bank's row stride is its own field now, so the leading columns of a
+//! A bank's row stride is its own field, so the leading columns of a
 //! wider bank are a view: the same planes read narrower at the wide stride.
 //! Every quantized matmul path — one row, a few rows folded, tiled, precast,
 //! split-k — must read that view exactly as it reads a bank copied out of
 //! those columns, since the Neural Engine split hands the GPU such a view of
-//! `down` in place of #837's host copy.
+//! `down`.
 //!
 //! The other cut a split needs is of the output: the leading `KEEP` rows of
 //! the bank landed in the leading `KEEP` columns of a full-width `y`, the
@@ -350,6 +350,5 @@ fn the_leading_output_columns_land_in_place() {
                 "m={m} row {r}: a column past {KEEP} was written"
             );
         }
-        eprintln!("m={m}: leading {KEEP} of {N} columns land in place, the rest untouched");
     }
 }

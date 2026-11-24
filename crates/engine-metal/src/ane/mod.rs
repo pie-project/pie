@@ -125,6 +125,7 @@ pub fn load(
     trace: &poem_ir::Trace,
     weights: &crate::weights::Weights,
     chip: &profile::Profile,
+    cache: Option<&std::path::Path>,
 ) -> Result<Option<Ane>> {
     #[cfg(target_vendor = "apple")]
     {
@@ -155,11 +156,12 @@ pub fn load(
             mlp_split,
             projection_split,
             min_rows,
+            cache,
         )
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        let _ = (device, handles, trace, weights, chip);
+        let _ = (device, handles, trace, weights, chip, cache);
         Ok(None)
     }
 }

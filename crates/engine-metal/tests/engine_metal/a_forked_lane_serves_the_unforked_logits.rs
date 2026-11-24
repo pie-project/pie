@@ -222,10 +222,6 @@ fn check(model: &str) {
         &forked,
         &kept[1..],
     );
-    eprintln!(
-        "{model}: both sides of a fork across buffers = kept over {} rows",
-        forked.len()
-    );
     if fixture
         .trace
         .caches
@@ -238,7 +234,6 @@ fn check(model: &str) {
             kept[1..].to_vec(),
             "{model}: a fork with a blank record moves the logits"
         );
-        eprintln!("{model}: a blank-record fork moves the logits (the control)");
     }
 }
 

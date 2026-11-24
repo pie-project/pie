@@ -1,10 +1,10 @@
-//! What Metal's stored measurements are keyed by (`profile::fire::Now`):
+//! What Metal's stored measurements are keyed by (`profile::rates::Now`):
 //! the device and its OS release, each measuring method's version, and the
 //! Metal source of every kernel a measurement fired. A stored or committed
 //! entry whose key matches this build on this device is taken; any other is
 //! measured anew (`engine::rates::resolve_at_load`).
 
-use profile::fire::{MeasuredBy, Now};
+use profile::rates::{MeasuredBy, Now};
 
 /// The version of the method each `[rates]` key, and each dense curve, is
 /// measured by: a change to how one is timed moves it, and every stored
@@ -43,7 +43,7 @@ impl Now for Keys {
     fn method(&self, what: &str) -> Option<u32> {
         if crate::rates::KEYS.contains(&what) {
             Some(RATES_METHOD)
-        } else if what == profile::fire::KERNEL_CURVES {
+        } else if what == profile::rates::KERNEL_CURVES {
             Some(CURVE_METHOD)
         } else {
             None
@@ -56,7 +56,7 @@ impl Now for Keys {
         kernels_metal::sources::source(kernel)?;
         kernels_metal::sources::resolve(kernel)
             .ok()
-            .map(|text| profile::fire::fingerprint(text.as_bytes()))
+            .map(|text| profile::rates::fingerprint(text.as_bytes()))
     }
 }
 

@@ -105,10 +105,14 @@ impl Run<'_> {
             } => {
                 match self.declared(*plan) {
                     StructKind::AttnDecodePlan => {}
-                    other => panic!(
-                        "`attn.plan_decode` defines a {other:?}, which is no \
-                         decode plan kind"
-                    ),
+                    other => {
+                        return Err(kernels_metal::Error::Backend {
+                            op: "attn.plan_decode",
+                            detail: format!(
+                                "it defines a {other:?}, which is no decode plan kind"
+                            ),
+                        });
+                    }
                 }
                 let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
@@ -138,10 +142,14 @@ impl Run<'_> {
             } => {
                 match self.declared(*plan) {
                     StructKind::AttnPrefillPlan => {}
-                    other => panic!(
-                        "`attn.plan_prefill` defines a {other:?}, which is no \
-                         prefill plan kind"
-                    ),
+                    other => {
+                        return Err(kernels_metal::Error::Backend {
+                            op: "attn.plan_prefill",
+                            detail: format!(
+                                "it defines a {other:?}, which is no prefill plan kind"
+                            ),
+                        });
+                    }
                 }
                 let last_page_len = self.tensor(*last_page_len);
                 let fire = self.bindings();

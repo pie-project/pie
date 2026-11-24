@@ -3,10 +3,8 @@
 //! A windowed lane whose fold lags (CONTRACT-BC 19, 21: rows past `folded`
 //! held in window-buffer slots for some fires, as a run-ahead program's are)
 //! answers each step what the same tokens folded every fire answer, through
-//! its ring and past the ring's wrap. Gemma 4 E4B served through its rings
-//! garbled from its first decode steps on north-star: each fire refilled a
-//! buffer slot whole from its ring page, over the unfolded rows the slot
-//! alone held.
+//! its ring and past the ring's wrap: a fire never refills a buffer slot
+//! whole from its ring page over the unfolded rows the slot alone holds.
 //!
 //! Every windowed load on Metal lays rings (`chunks::MetalRing`), so the
 //! same holds where windowed layers sit beside a kv list (a sliding-window
@@ -26,8 +24,8 @@ use super::a_scattered_pool_serves_the_same_logits::{
     argmax, close, fixture_from, fixture_of, load_with, word, Fixture,
 };
 
-/// Rows a lane's fold trails its written end by (the M1's run-ahead
-/// window less one: the bench's carried rows).
+/// Rows a lane's fold trails its written end by (a run-ahead window less
+/// one).
 const LAG: u32 = 7;
 
 #[test]

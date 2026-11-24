@@ -603,10 +603,10 @@ pub struct SlotPool {
     /// the span is backed on demand, the widest activation set aside since
     /// the engine last narrowed its carve ([`Self::engine_narrowed`]). No
     /// state opens there: a lower the engine was not told (the rung
-    /// standing, a guest term given back) left its carve as wide as
-    /// before, and state lent into it was refused at its first copy (Mac
-    /// Pro at 5 GiB on 5aa45805b: an eviction's copy of chunk 1936, inside
-    /// the engine's carve, refused, and the process failed). Elsewhere it
+    /// standing, a guest term given back) leaves its carve as wide as
+    /// before, and state lent into it would be refused at its first copy
+    /// (an eviction's copy inside the engine's carve, failing the
+    /// process). Elsewhere it
     /// is the activation itself.
     carved: u32,
     /// Physical chunks a residency move's copy (an eviction, parked state
@@ -778,11 +778,10 @@ impl SlotPool {
         // The span starts where the engine pins it: the segment its widest
         // carve with its guests' terms starts in (`act_span_chunks`), when
         // that is wider than the largest rung's activation. Read from the
-        // rungs alone, the M1 at 2 GiB on ba229ff25 counted segment 11
-        // (chunks 385..420) a bottom segment: `commit_segments(12)` backed
-        // Metal's bottom to its span's first chunk, 385, the runtime opened
-        // 385..420 for state, and restores wanting chunks 390-398 were
-        // refused ("the load reserved 385").
+        // rungs alone, a segment inside the span would count as a bottom
+        // segment: the runtime would open its chunks for state that Metal
+        // backs as span, and restores wanting them be refused ("the load
+        // reserved ...").
         let span = act_max.max(facts.act_span.unwrap_or(0)).min(total);
         let top_segment = if span == 0 {
             segments.count()
@@ -1434,9 +1433,8 @@ impl SlotPool {
         // A run of chunks moves whole, to a free run below (its first chunk
         // and every chunk after it at the next physical ones): moved chunk
         // by chunk, a run in the span came back split, its first logical
-        // chunk's run ending past a gap (the L40S at 3 GiB on ca5c710a7:
-        // "a guest item ... lies in a run of 2 chunk(s) ... ends past a
-        // gap"; the M1's corrupted reads).
+        // chunk's run ending past a gap ("a guest item ... lies in a run of
+        // 2 chunk(s) ... ends past a gap", and corrupted reads).
         let targets: BTreeSet<u32> = self.open.iter_in(0, limit).collect();
         let Some(moves) = self.moves_keeping_runs(&sources, targets, false) else {
             return Err(SlotError::NoRoom {
@@ -1526,13 +1524,13 @@ impl SlotPool {
             // Fenced before the move reopens it, as a compaction's: a run's
             // member below the span (moved whole with the one in it) was
             // left open while its copy still read it, another owner's to
-            // take mid-copy (Mac Pro hazard B's test).
+            // take mid-copy.
             self.fenced.set(step.from);
             self.move_chunk(*step);
             // Its destination too, until the copy into it has landed: let
             // go meanwhile, it would reopen and be handed to another owner
-            // whose data the copy then overwrote (the M1 on ca5c710a7:
-            // "the kernel wrote no status at all", rows read apart by 410).
+            // whose data the copy then overwrites ("the kernel wrote no
+            // status at all").
             self.fenced.set(step.to);
         }
         if !evacuation.moves.is_empty() {
@@ -1547,7 +1545,7 @@ impl SlotPool {
 
     /// The fewest chunk moves that stand one free run of `run` adjacent
     /// chunks inside one committed segment, where free chunks are enough
-    /// but scattered (a guest bind's run, F21: pages and slots of many
+    /// but scattered (a guest bind's run: pages and slots of many
     /// owners interleave across chunks). The window of `run` chunks whose
     /// held chunks are fewest is cleared: each held chunk in it moves to a
     /// free chunk outside it, the lowest first. A chunk moves on its
@@ -1567,9 +1565,8 @@ impl SlotPool {
     /// [`Self::plan_compaction`] for a need of `pieces` runs: while fewer
     /// than that stand free, one more is cleared beside those that do,
     /// neither its window nor its moves' destinations in them. Planned only
-    /// where no run stood, a head short of a second run with free and
-    /// emptiable chunks enough waited with no move (the L40S at 3 GiB on
-    /// c201812ea: 119 such lines, compaction_moves None).
+    /// where no run stands, a head short of a second run with free and
+    /// emptiable chunks enough would wait with no move.
     pub fn plan_compaction_for(&self, run: u32, pieces: u32) -> Option<Vec<ChunkMove>> {
         self.plan_compaction_below(run, pieces, self.state_limit())
     }
@@ -1623,9 +1620,9 @@ impl SlotPool {
         // Each run's chunks by physical chunk, its first and its length: a
         // run moves whole, to a free run of its length outside the window
         // ([`Self::moves_keeping_runs`]). Held as unmovable, a pool of runs
-        // laid side by side opened no window for another: a restore of
-        // three runs of 57 chunks with 99 chunks free waited for good (the
-        // M5 at beam w32, its planner finding no step 0.5 M times).
+        // laid side by side would open no window for another: a restore of
+        // three runs of 57 chunks with 99 chunks free would wait for good,
+        // its planner finding no step.
         let mut member_of: HashMap<u32, (u32, u32)> = HashMap::new();
         for (&head, &len) in &self.runs {
             let at = self.logical_to_physical[head as usize];
@@ -1783,8 +1780,8 @@ impl SlotPool {
     /// from its first chunk's first byte); moved, every chunk of it moves,
     /// each to the chunk after its predecessor's destination, in one
     /// segment. Read on the moves alone, whoever planned them: the check
-    /// the movers' own placement does not stand in for (the M1 and the
-    /// L40S on ca5c710a7, runs split by a raise moving them chunk by chunk).
+    /// the movers' own placement does not stand in for (runs split by a
+    /// raise moving them chunk by chunk).
     #[must_use]
     pub fn splits_run(&self, moves: &[ChunkMove]) -> Option<(u32, u32, u32)> {
         let to_of: HashMap<u32, u32> = moves.iter().map(|step| (step.from, step.to)).collect();
@@ -2052,8 +2049,8 @@ impl SlotPool {
         // or was torn down, before the engine took or refused the copy):
         // its logical id goes back as the engine's table has it, both
         // physical chunks free, no shape to keep count of. Read as a shape,
-        // its free id (`NO_SHAPE`) indexed past the shapes and panicked on
-        // a SIGTERM's teardown (Mac Pro at 2 GiB on dc1414ae8).
+        // its free id (`NO_SHAPE`) would index past the shapes and panic
+        // (on a SIGTERM's teardown).
         if meta.shape == NO_SHAPE {
             self.logical_to_physical[step.logical as usize] = step.to;
             self.logical_to_physical[displaced as usize] = step.from;
@@ -2653,9 +2650,8 @@ impl SlotPool {
     /// and shape sharing chunks of their class (a chunk holds `spc / len`
     /// of them). What a never-fits check reads: [`Self::opens_beside`] is
     /// the room now, and a part placed alone in a chunk of its own each was
-    /// no placement (the L40S at 3 GiB on ba229ff25: a beam's 72 runs of
-    /// slots read as 72 whole chunks, 648 pages past a 189-page pool, and
-    /// beams the budget served were refused).
+    /// no placement (a beam's runs of slots each read as a whole chunk,
+    /// past the pool, refusing beams the budget serves).
     #[must_use]
     pub fn opens_alone(&self, own: &[OwnPiece]) -> u32 {
         use std::collections::BTreeMap;
@@ -2697,9 +2693,8 @@ impl SlotPool {
     /// copy of the pool: the one placement every check reads, so what
     /// stands here is what the takes find. A view that mirrored the takes
     /// counted a shape's partly filled slots once per take and stood a
-    /// pending bind's runs the restore's own takes then broke (Mac Pro at
-    /// 2 GiB: PendingBindShort, free runs of three (3, 2) before the
-    /// restore and one after it, its unpark asking no run of three).
+    /// pending bind's runs the restore's own takes then broke
+    /// (`PendingBindShort`, its unpark asking no run).
     /// It stops at the first piece the takes refuse, as a restore does.
     #[must_use]
     pub fn place(&self, own: &[OwnPiece]) -> Placement {
@@ -2862,8 +2857,8 @@ impl SlotPool {
         }
         // Each piece inside one segment, whatever found it: on Metal a
         // segment is a buffer of its own, and a piece across its end reads
-        // past it (the M1 on f623134fc: "a guest piece of 3 chunk(s) ... lies
-        // on physical chunks 419..=421, across the end of its segment").
+        // past it ("a guest piece ... lies across the end of its
+        // segment").
         if let Some(&first) = firsts[..pieces as usize]
             .iter()
             .find(|&&first| self.segments.of(first) != self.segments.of(first + run - 1))
@@ -3184,8 +3179,7 @@ impl SlotPool {
     /// walk committed). Checked at every take and
     /// every move's destination in debug builds, naming the logical chunk,
     /// its physical and the segment: met, a fire on it reads or writes
-    /// memory the engine gave back (the M1 on 6b69c5978: a fire on chunk
-    /// 423 of a segment released 3 ms before).
+    /// memory the engine gave back (a chunk of a segment just released).
     #[track_caller]
     fn assert_backed(&self, what: &str, logical: u32, physical: u32) {
         if cfg!(debug_assertions) {
@@ -3508,8 +3502,8 @@ impl SlotPool {
         // A segment a residency copy still reads or writes is never
         // evacuated: the copy's addresses were resolved at its submit, and
         // a segment released (unmapped) under a copy queued on another
-        // stream is read unmapped (the L40S at 3 GiB on a0bfb512f: CUDA 700
-        // on an eviction's kv-to-disk copy).
+        // stream is read unmapped (a device fault on an eviction's
+        // kv-to-disk copy).
         if self.moving_out.range(range.start..range.end).next().is_some() {
             return None;
         }
@@ -4218,10 +4212,9 @@ mod tests {
         assert_eq!(due, want);
     }
 
-    /// The L40S at 3 GiB on ca5c710a7: "a guest item ... lies in a run of
-    /// 2 chunk(s) ... from logical chunk 11, which lies at range chunk 21
-    /// and ends past a gap": a raise moved a run's chunks one by one, each
-    /// to the lowest free chunk, and split it. A run moves whole, to a free
+    /// "a guest item ... lies in a run of 2 chunk(s) ... and ends past a
+    /// gap": a raise moving a run's chunks one by one, each to the lowest
+    /// free chunk, splits it. A run moves whole, to a free
     /// run of its length below, or the raise waits for one.
     #[test]
     fn a_raise_moves_a_run_whole_or_waits() {
@@ -4254,7 +4247,7 @@ mod tests {
         pool.check();
     }
 
-    /// Mac Pro's hazard B: a run with one chunk below the raise's span and
+    /// A run with one chunk below the raise's span and
     /// one in it moves whole (`moves_keeping_runs` under `plan_rung`): the
     /// member below the limit goes with the one the span takes, never left
     /// behind with its partner moved alone.
@@ -4284,7 +4277,7 @@ mod tests {
         pool.check();
     }
 
-    /// The M1 at 2 GiB on ba229ff25: Metal pins its span's bottom at the
+    /// Metal pins its span's bottom at the
     /// segment its widest carve with its guests' terms starts in
     /// (`act_span_chunks`, 110 chunks: chunk 385), wider than the largest
     /// rung's activation (65: segment 12, chunk 420). The pool's span
@@ -4302,10 +4295,9 @@ mod tests {
         pinned.check();
     }
 
-    /// The L40S at 3 GiB on ba229ff25: a beam-4 process's 72 runs of slots
-    /// were priced a whole chunk each where its placement did not stand now
-    /// (648 pages past a 189-page pool), and beams the budget had served
-    /// were refused as never fitting. Placed alone, runs of one length
+    /// A beam-4 process's 72 runs of slots priced a whole chunk each where
+    /// its placement does not stand now would read past the pool, and
+    /// beams the budget serves be refused as never fitting. Placed alone, runs of one length
     /// share chunks of their class: what held them once holds them again.
     #[test]
     fn small_slot_runs_placed_alone_share_chunks_of_their_class() {
@@ -4357,8 +4349,8 @@ mod tests {
         pool.check();
     }
 
-    /// The M1 on ca5c710a7: guest epilogues found "no status at all" and
-    /// rows read apart by 410 under park and restore churn. A move's
+    /// Under park and restore churn, guest epilogues must not find "no
+    /// status at all" or rows read apart. A move's
     /// destination is fenced with its source until the copy lands: a chunk
     /// let go meanwhile is handed to no other owner the copy would then
     /// overwrite.
@@ -4396,10 +4388,9 @@ mod tests {
         pool.check();
     }
 
-    /// Mac Pro at 2 GiB on dc1414ae8 panicked on SIGTERM ("index out of
-    /// bounds: the len is 4 but the index is 65535"): a chunk moved for a
-    /// compaction was let go before the engine took or refused the copy,
-    /// and taking the move back read its free id as a shape. Taken back, a
+    /// A chunk moved for a compaction and let go before the engine takes or
+    /// refuses the copy: taking the move back must not read its free id as
+    /// a shape ("index out of bounds" on SIGTERM). Taken back, a
     /// chunk let go meanwhile returns to where the engine's table has it,
     /// free, and the pool stays whole.
     #[test]
@@ -4432,9 +4423,8 @@ mod tests {
         assert_eq!(pool.chunk_table()[high as usize], moves[0].from, "where the engine's table has it");
     }
 
-    /// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy of state in chunk
-    /// 1936 refused, "inside the activation span's backed carve", and the
-    /// process failed. With the span backed on demand, a lower the engine
+    /// An eviction's copy of state must not be refused "inside the
+    /// activation span's backed carve", failing the process. With the span backed on demand, a lower the engine
     /// is not told leaves its carve as wide as before: the chunks it gave
     /// back to the rung open for no state until the engine narrows.
     #[test]
@@ -4451,9 +4441,9 @@ mod tests {
         assert_eq!(pool.state_limit(), 16 - 2, "narrowed: the span is lent");
     }
 
-    /// Mac Pro at 5 GiB on 1e87ab171: the planner read a run of four free
-    /// (four free chunks, adjacent) while the restore's unpark found none,
-    /// its serve having taken its state first into the lowest free chunk.
+    /// The planner must not read a run of four free (four free chunks,
+    /// adjacent) while the restore's unpark finds none, its serve having
+    /// taken its state first into the lowest free chunk.
     /// One placement answers both: a restore's state taken as `acquire`
     /// takes it opens the lowest free chunk, and the runs the store says
     /// stand beside it are the runs left after that take.
@@ -4481,10 +4471,10 @@ mod tests {
         assert_eq!(pool.free_chunk_runs(4), 1, "read only");
     }
 
-    /// Mac Pro at 2 GiB (g2): a restore's own single-slot takes of one
-    /// shape, its kv pages and its unpark's, each read as finding the
-    /// shape's partly filled slots, stood two free runs of three the takes
-    /// then broke (PendingBindShort, one run left). Placed by the takes
+    /// A restore's own single-slot takes of one shape, its kv pages and its
+    /// unpark's, each read as finding the shape's partly filled slots,
+    /// would stand two free runs of three the takes then break
+    /// (`PendingBindShort`, one run left). Placed by the takes
     /// themselves, the second take opens the chunk the first left full,
     /// and one run of three is what stands, as the real takes find.
     #[test]
@@ -4572,13 +4562,10 @@ mod tests {
     /// name, and too few free runs are refused naming what was free. An
     /// evacuation moves a run whole onto adjacent free chunks of one lower
     /// segment, its chunks in order.
-    /// Mac Pro's mx and g2 stalls on c201812ea: an unpark's two runs of two
-    /// beside a bind's run of three, the two-stretches lowest. The placement
-    /// is the takes' own: the runs of three it leaves are those the real
-    /// takes leave (the field's disagreement was a refusal taken on another
-    /// pool, refused_on_this_pool=false, not a placement unlike the takes).
-    /// The L40S at 3 GiB on a0bfb512f: CUDA 700 on an eviction's queued
-    /// kv-to-disk copy. A segment a residency copy still reads is neither
+    /// An unpark's two runs of two beside a bind's run of three, the
+    /// two-stretches lowest. The placement is the takes' own: the runs of
+    /// three it leaves are those the real takes leave.
+    /// A device fault on an eviction's queued kv-to-disk copy: a segment a residency copy still reads is neither
     /// evacuated nor released (unmapped) until the copy lands.
     #[test]
     fn a_segment_under_a_copy_is_neither_evacuated_nor_released() {
@@ -4624,8 +4611,7 @@ mod tests {
         pool.check();
     }
 
-    /// The L40S at 3 GiB on bd4f4ffe7 (CUDA 700 under compaction): a
-    /// compaction never moves a chunk an eviction's copy still reads, and a
+    /// A compaction never moves a chunk an eviction's copy still reads, and a
     /// chunk held for a served restore is never its source or destination.
     #[test]
     fn a_compaction_moves_no_chunk_a_copy_reads_and_no_reserved_chunk() {
@@ -4731,16 +4717,16 @@ mod tests {
         );
     }
 
-    /// F21's bind: free chunks enough for a run of 3 but none adjacent
+    /// A guest bind's run: free chunks enough for a run of 3 but none adjacent
     /// (pages and slots of many owners interleave across chunks), nothing
     /// left to evict. The cheapest window is cleared, one held chunk moved
     /// out on its logical id, its chunk closed until the fire carrying the
     /// copy retires; then the run stands and the bind takes it. Every
     /// resident reads its bytes where its refs lead, as before the move.
     /// Free chunks too few for the run whatever moves: no compaction.
-    /// The L40S at 3 GiB on c201812ea: a head short of a second run of its
-    /// length, one standing and free chunks enough elsewhere, was planned
-    /// no compaction (a run stood). One more run is cleared beside the one
+    /// A head short of a second run of its length, one standing and free
+    /// chunks enough elsewhere, is planned a compaction though a run
+    /// stands. One more run is cleared beside the one
     /// standing, which neither its window nor its moves touch.
     #[test]
     fn a_second_run_is_compacted_beside_the_one_standing() {
@@ -4852,39 +4838,6 @@ mod tests {
         assert_eq!(pool.plan_compaction(3), None, "too few free chunks: it waits");
     }
 
-    /// What the room signal adds to a release: acquire and release of a
-    /// slot, timed with no signal and with one shaped as the planner's
-    /// (a counter and three loads). Run with `--ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn the_room_signal_s_cost_on_release() {
-        let holder = Holder::WorkingSet(1);
-        let run = |signal: bool| {
-            let mut pool = run_pool();
-            if signal {
-                let freed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let want = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-                pool.set_room_signal(
-                    RoomSignal(std::sync::Arc::new(move |count| {
-                        freed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                        let _ = count.chunks >= want.load(std::sync::atomic::Ordering::Acquire);
-                    })),
-                    RoomTier::Device,
-                    Some(0),
-                );
-            }
-            let rounds = 200_000u32;
-            let began = std::time::Instant::now();
-            for _ in 0..rounds {
-                let slots = pool.acquire(holder, 0, 1).unwrap();
-                pool.release(holder, &slots, 0);
-            }
-            began.elapsed().as_nanos() / u128::from(rounds)
-        };
-        let (bare, signalled) = (run(false), run(true));
-        eprintln!("release round trip: {bare} ns bare, {signalled} ns with the room signal");
-    }
-
     /// Every return of slots tells the room signal once: a release whose
     /// slots no fire still reads, at once; one a fire still reads, when that
     /// fire's epoch retires, not before. What wakes a planner's waiter
@@ -4927,8 +4880,8 @@ mod tests {
     /// take opens that free logical where it now lies, in segment 1. The
     /// segment is no longer empty, whatever logical ids it holds: its
     /// release is refused, by its physical chunks, never by logical ids
-    /// (the M1: logical 43 swapped onto physical 420 of segment 12, taken
-    /// there, and the segment released under it).
+    /// (a logical swapped onto a physical of the segment, taken there,
+    /// must not have the segment released under it).
     #[test]
     fn a_segment_holding_a_logical_swapped_onto_it_is_not_released() {
         let mut pool = SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1)], &[]));
@@ -4971,8 +4924,8 @@ mod tests {
     }
 
     /// Two runs of thirty asked where one free run of thirty stands among
-    /// scattered free chunks (the M1's run 4b: a restore's guest state of
-    /// two runs of 30, one such run free of 110 free chunks): the placement
+    /// scattered free chunks (a restore's guest state of two runs of 30,
+    /// one such run free of 110 free chunks): the placement
     /// is short, as the takes are; with a second run opened, it stands.
     #[test]
     fn a_placement_of_two_runs_lays_each_disjointly() {
@@ -5009,7 +4962,7 @@ mod tests {
     /// `ChunkTable::apply` of the same list: held chunks moved into holes
     /// among free ones, free logicals swapped up in their place, and moves
     /// whose destination is the physical another move of the list left (a
-    /// chain) or whose logical another moved onto (the M1's 35 chunks into
+    /// chain) or whose logical another moved onto (chunks moved into
     /// scattered holes, then a segment release under the free ids swapped
     /// up).
     #[test]

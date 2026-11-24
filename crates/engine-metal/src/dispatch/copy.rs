@@ -154,7 +154,7 @@ impl Run<'_> {
     }
 
     fn move_rows(&self, region: &Region, out: bool) -> Result<(), kernels_metal::Error> {
-        let index = self.gathered_rows(region);
+        let index = self.gathered_rows(region)?;
         for slot in &self.staged_copy().slots {
             let moving = if out { slot.written } else { slot.read };
             if !moving {
@@ -169,19 +169,21 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn gathered_rows(&self, region: &Region) -> Tensor {
+    /// The row map a copied region's window carries. `Windows::of` and
+    /// `Serve::copies` read the same table, so a copied window without one
+    /// is a mis-carved fire, refused by name.
+    fn gathered_rows(&self, region: &Region) -> Result<Tensor, kernels_metal::Error> {
         self.window()
             .gathered
             .as_ref()
-            .unwrap_or_else(|| {
-                panic!(
-                    "region {} is being copied and its window carries no row map; \
-                     `Windows::of` and `Serve::copies` read the same table and cannot \
-                     disagree",
+            .map(|gathered| gathered.rows)
+            .ok_or_else(|| kernels_metal::Error::Backend {
+                op: "copy",
+                detail: format!(
+                    "region {} is copied and its window carries no row map",
                     region.nodes.start
-                )
+                ),
             })
-            .rows
     }
 }
 

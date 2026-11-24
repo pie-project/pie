@@ -34,6 +34,10 @@ pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<std::path::PathBuf>,
+    /// `[metal] cache`: pie's engine cache directory, where the Neural
+    /// Engine's compiled programs are kept between runs. `None` (a test or
+    /// a tool stating no home): a directory of the system's temporary one.
+    pub cache: Option<std::path::PathBuf>,
     /// `[metal] measure`: whether a load times what no stored or committed
     /// profile states under a matching key.
     pub measure: engine::rates::Measuring,
@@ -675,6 +679,7 @@ impl Engine for Metal {
 
             prepared
                 .set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
+            prepared.set_ane_cache(self.boot.cache.clone());
             match prepared.load() {
                 Ok(shell) => break shell,
                 Err(Fault::FitShort(short)) => {

@@ -3514,17 +3514,12 @@ impl KvStore {
     }
 
     /// Device pages given back must be in no live set's table: one still
-    /// named reads or writes a page another may take (the M1's runs 11 and
-    /// 12: a set's own table named a page whose segment was released). Said
-    /// at ERROR naming the set and the page, in a debug build or with
-    /// PIE_CHECK_SLOT_REFS (a walk of every set's table a give-back).
+    /// named reads or writes a page another may take (a set's own table
+    /// naming a page whose segment was released). Said at ERROR naming the
+    /// set and the page, in a debug build (a walk of every set's table a
+    /// give-back).
     fn check_given_back(&self, ids: &[PhysicalKvPageId], what: &str) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if ids.is_empty()
-            || !*ON.get_or_init(|| {
-                cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
-            })
-        {
+        if ids.is_empty() || !cfg!(debug_assertions) {
             return;
         }
         let given: std::collections::HashSet<u32> = ids.iter().map(|id| id.0).collect();
@@ -3569,9 +3564,9 @@ impl KvStore {
     /// reads moves, nothing copied; one something else reads too (a cache
     /// entry or another set's path through the old tail) is named by its
     /// copy in `copies`, `(page, copy)`, made on the device before this:
-    /// moved, both would name it, and it went back twice (the M1's beam
-    /// line: a suspend committed under a relist gave back the chosen pages
-    /// the new tail still named). `false`, nothing done, where the set is
+    /// moved, both would name it, and it would go back twice (a suspend
+    /// committed under a relist giving back the chosen pages the new tail
+    /// still names). `false`, nothing done, where the set is
     /// in a move or `copies` no longer covers what is shared: the caller
     /// asks [`Self::relist_beam_needs`] again.
     pub fn relist_beam_with(

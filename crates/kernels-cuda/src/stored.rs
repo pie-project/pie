@@ -1,5 +1,5 @@
 //! What a measurement stored in a device's profile is keyed by on CUDA
-//! (`profile::fire::Now`, stated by `engine-cuda`): the device as its
+//! (`profile::rates::Now`, stated by `engine-cuda`): the device as its
 //! measurements depend on it, and the code of what a measurement fired.
 //!
 //! A kernel of this crate is compiled at run time by NVRTC from the text it
@@ -11,7 +11,7 @@
 //! moved between units would leave a per-unit key unchanged while its code
 //! changed. Any change to the carried text measures again what fired it.
 
-use profile::fire::fingerprint;
+use profile::rates::fingerprint;
 
 /// The key a measurement names this crate's kernels by.
 pub const LIBRARY_KERNELS: &str = "kernels-cuda";

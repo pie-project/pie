@@ -457,26 +457,8 @@ pub struct BodyKey {
 }
 
 impl BodyKey {
-    #[cfg(test)]
     #[must_use]
     pub fn of(
-        classes: &WindowTable,
-        bucket: u32,
-        decoding: &poem_ir::ClassSet,
-        lane_ceiling: u32,
-        tiers: &Tiers,
-    ) -> BodyKey {
-        BodyKey {
-            bucket,
-            classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
-            patch: None,
-            islands: Box::default(),
-            rs: RsBody::Folds,
-        }
-    }
-
-    #[must_use]
-    pub fn of_axes(
         classes: &WindowTable,
         bucket: u32,
         decoding: &poem_ir::ClassSet,
@@ -979,7 +961,7 @@ impl Bodies {
         prepare.settle()?;
         crate::serve::btrace::mark("settle");
         let shape = run.schedule_shape();
-        let mut key = BodyKey::of_axes(
+        let mut key = BodyKey::of(
             at.descriptor.table(poem_ir::RowAxis::Tokens),
             at.descriptor.bucket,
             at.decoding,
@@ -1645,19 +1627,19 @@ mod tests {
 
     fn a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one() {
         let decoding = poem_ir::ClassSet::of([0usize]);
-        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers());
+        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers(), None);
         assert_eq!(
             fired.to_string(),
             "b8[c0:4]",
             "the lane ceiling binds below the bucket, and three rows say nothing",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES, &plain_tiers()).to_string(),
+            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES, &plain_tiers(), None).to_string(),
             "b2[c0:2]",
             "and the bucket binds below the lane ceiling",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES, &plain_tiers()).to_string(),
+            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES, &plain_tiers(), None).to_string(),
             "b8[c0:8]",
             "a class the decode arm does not name takes the bucket whole",
         );
@@ -1754,7 +1736,7 @@ mod tests {
     fn the_map_never_inserts_a_body_whose_script_is_empty() {
         let mut graphs = Bodies::new();
         let classes = table(&[(8, 1)]);
-        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers());
+        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers(), None);
         let empty = Body {
             script: Box::new([]),
             gate_step: None,

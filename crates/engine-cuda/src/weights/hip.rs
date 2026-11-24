@@ -422,7 +422,8 @@ pub(super) fn order_mxfp4_banks(
         .collect();
     // A run of whole experts at a time through one staging span of at most
     // `STAGED` bytes (an expert's strips never cross into the next), so the
-    // load holds no bank-sized copy.
+    // load holds no bank-sized copy; 256 MiB is a chosen span, far past the
+    // size at which a pinned copy reaches the link's rate.
     const STAGED: u64 = 256 << 20;
     let Some(widest) = banks.iter().map(|&(_, _, _, n, k)| n * k).max() else {
         return Ok(());

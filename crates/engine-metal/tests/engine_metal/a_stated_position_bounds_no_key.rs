@@ -2,12 +2,11 @@
 
 //! A row's causal bound is its row order, the cache row: a stated position
 //! rotates the row and bounds nothing. Beam search states a cell's depth as
-//! its position while it lands at a pool slot past it, so a bound taken from
-//! the stated position hid keys a row's own lane wrote before it. Here a
-//! lane's four rows land at slots 0..4 and all state position 0: the last
-//! row still reads the three before it, so two lanes whose middle tokens
-//! differ answer differently. Under a bound by stated position the last row
-//! read slot 0 alone, and the two answered the same.
+//! its position while it lands at a pool slot past it, and a bound taken
+//! from the stated position would hide keys a row's own lane wrote before
+//! it. Here a lane's four rows land at slots 0..4 and all state position 0:
+//! the last row still reads the three before it, so two lanes whose middle
+//! tokens differ answer differently.
 
 use engine_metal::serve::Seated;
 use engine_metal::{Lane, Shell};

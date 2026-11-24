@@ -1,6 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2d belt — a packed `KvU4` page MIGRATES correctly through `store::copy_kv`.
+//! A packed `KvU4` page MIGRATES correctly through `store::copy_kv`.
 //!
 //! `copy_kv` (page defrag / fork) sizes a packed page's cell stride from the
 //! head_dim (`head_dim/2 + 2` bytes per head, NOT `width * element`), so a
@@ -24,6 +24,7 @@ use engine_metal::store::{Pools, Rows, Seats, TableSeat};
 use kernels_metal::Tensor;
 use poem_compiler::chunk::{ChunkProfile, ChunkRecipe, RowId, SlotLayout, TokenRun};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
+use crate::common::{f32_to_bf16_bits};
 
 const HEADS: usize = 2; // kv_heads
 const PAGE_SIZE: u32 = 8;
@@ -35,7 +36,7 @@ fn packed_bytes(block: usize) -> usize {
     block / 2 + 2
 }
 
-// --- deterministic outlier-heavy KV data (same mixer as the C2a/C2b tests) ----
+// --- deterministic outlier-heavy KV data (same mixer as the `the_kv_codec_round_trips`/`the_kv_write_round_trips` tests) ----
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
@@ -76,12 +77,6 @@ fn outlier_plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32>
         }
     }
     v
-}
-
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
 }
 
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
@@ -156,7 +151,6 @@ fn seats(rig: &mut Rig) -> Seats {
 
 #[test]
 fn the_packed_kv_page_migrates() {
-    eprintln!("=== C2d belt: a packed KvU4 page migrates byte-exact through copy_kv ===");
     let Some(mut rig) = Rig::open() else {
         eprintln!("skipping: this machine publishes no Metal device");
         return;
@@ -164,7 +158,6 @@ fn the_packed_kv_page_migrates() {
     for &head_dim in &[256usize, 128] {
         migrate_case(&mut rig, head_dim);
     }
-    eprintln!("=== C2d belt done: packed pages migrate at head_dim 128 & 256 ===");
 }
 
 fn migrate_case(rig: &mut Rig, head_dim: usize) {

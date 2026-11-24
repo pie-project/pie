@@ -6,6 +6,10 @@ use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
+/// A host-resident bank's staged experts: their codes, scales and biases
+/// in the staging, and the routes renumbered to their places there.
+type StagedExperts = (Tensor, Tensor, Option<Tensor>, Tensor);
+
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.linear(op).map_err(crate::error::kernel)?;
@@ -1478,7 +1482,7 @@ impl Run<'_> {
         scales: Tensor,
         biases: Option<Tensor>,
         routes: Tensor,
-    ) -> Result<Option<(Tensor, Tensor, Option<Tensor>, Tensor)>, kernels_cuda::Error> {
+    ) -> Result<Option<StagedExperts>, kernels_cuda::Error> {
         const OP: &str = "linear.moe_select";
         if routes.rows == 0 || !crate::device::alloc::is_host_pointer(codes.ptr) {
             return Ok(None);

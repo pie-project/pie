@@ -464,7 +464,7 @@ impl<B: Serve> Serve for Named<B> {
     fn save_rates(
         _device: &Self::Context,
         _boot: &Self::DeviceBoot,
-        _rates: &profile::fire::Rates,
+        _rates: &profile::rates::Rates,
     ) -> Result<()> {
         Ok(())
     }

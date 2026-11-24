@@ -16,10 +16,6 @@ const ROUNDS: u32 = 8;
 const PAGE: u32 = 16;
 
 fn fixture() -> Option<PathBuf> {
-    if let Ok(stated) = std::env::var("PIE_QWEN4_FIXTURE") {
-        let path = PathBuf::from(stated);
-        return path.is_dir().then_some(path);
-    }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-micro");
     path.is_dir().then_some(path)
 }
@@ -73,12 +69,6 @@ fn word(query_len: u32) -> u64 {
 
 /// States `shell`'s model for the helpers below.
 fn serving(shell: Shell, trace: poem::Trace) -> Shell {
-    eprintln!(
-        "recurrent slot: {} bytes; buffered page slab: {:.1} KiB; serves rs verbs: {}",
-        shell.state_slot_bytes(),
-        shell.buffer_bytes() as f64 / 1024.0,
-        shell.serves_rs_verbs()
-    );
     assert!(shell.state_slot_bytes() > 0, "a recurrent plan has recurrent state");
     assert!(
         shell.buffer_bytes() > 0,
@@ -214,12 +204,6 @@ fn spread(a: &[f32], b: &[f32]) -> f32 {
         .zip(b)
         .map(|(x, y)| (x - y).abs())
         .fold(0.0f32, f32::max)
-}
-
-fn argmax(logits: &[f32]) -> usize {
-    (0..logits.len())
-        .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
-        .unwrap_or(0)
 }
 
 const LOGIT_FLOOR: f32 = 0.05;
@@ -402,9 +386,8 @@ fn a_gdn_buffered_fold_is_the_fold_it_replaces() {
 /// decode or a prompt piece of another sequence), answers as it does in a
 /// fire of its own: its logits, and the state its replay folds; the folding
 /// lane answers as alone too. A beam's lanes replay their lineage beside
-/// other sequences' decodes so. (engine-gpu's suite and CUDA's
-/// golden_logits state it so, sc/np-beam-beside 7a77ff0a6: CUDA shared a
-/// scratch plane by index across window shapes.)
+/// other sequences' decodes so (as engine-gpu's suite and CUDA's
+/// golden_logits state it).
 #[test]
 fn a_replaying_lane_beside_a_folding_lane_answers_as_alone() {
     if let Some(shell) = ready_gdn() {
@@ -479,12 +462,6 @@ fn replays_beside_a_fold(mut shell: Shell) {
     let scale = distance(&short, &alone_state, &planes, false).expect("float planes only");
     for (at, (a, b)) in alone.iter().zip(&beside).enumerate() {
         let d = spread(a, b);
-        eprintln!(
-            "replaying row {at} beside a folding lane vs alone, logit spread {d:.4} \
-             (argmax {} vs {})",
-            argmax(b),
-            argmax(a)
-        );
         assert!(
             d <= LOGIT_FLOOR,
             "replaying row {at} answers {d} apart beside a folding lane"
@@ -498,7 +475,6 @@ fn replays_beside_a_fold(mut shell: Shell) {
         scale,
     );
     let d = spread(&peer_alone, &peer_beside);
-    eprintln!("the folding lane beside a replay vs alone, logit spread {d:.4}");
     assert!(
         d <= LOGIT_FLOOR,
         "the folding lane answers {d} apart beside a replay"
@@ -540,7 +516,6 @@ fn holds_the_contract(mut shell: Shell) {
         "a `RsVerb::Buffer` fire perturbed the folded state"
     );
     let d = spread(&reference[0], &buffered[0]);
-    eprintln!("claim 1: buffered window vs folding window, last-row logit spread {d:.4}");
     assert!(
         d <= LOGIT_FLOOR,
         "a buffered fire answers other logits than the fold it defers: {d}"
@@ -585,7 +560,6 @@ fn holds_the_contract(mut shell: Shell) {
         scale,
     );
     let d = spread(&reference[0], &mixed[0]);
-    eprintln!("claim 4: mixed row vs folding window, last-row logit spread {d:.4}");
     assert!(
         d <= LOGIT_FLOOR,
         "the mixed row answers other logits than the fold: {d}"
@@ -613,11 +587,6 @@ fn holds_the_contract(mut shell: Shell) {
         .fire_seated(&[seated_at(6, &second, &fold, RsReset::Held, k)])
         .expect("B folds after it");
     let d = spread(&plain[0], &round[0]);
-    eprintln!(
-        "claim 5: B after replay(A) vs B after fold(A), last-row logit spread {d:.4}; argmax {} vs {}",
-        argmax(&round[0]),
-        argmax(&plain[0])
-    );
     assert!(
         d <= LOGIT_FLOOR,
         "the read path answers other logits than a plain fold of the prefix: {d}"
@@ -650,7 +619,6 @@ fn holds_the_contract(mut shell: Shell) {
         "the buffering peer folded"
     );
     let d = spread(&alone[0], &beside[0]);
-    eprintln!("claim 6: folding lane beside a buffering peer, logit spread {d:.4}");
     assert!(
         d <= LOGIT_FLOOR,
         "a folding lane answers differently beside a buffering peer: {d}"
@@ -682,7 +650,7 @@ fn holds_the_contract(mut shell: Shell) {
         } else {
             buffer_over(held, k + r - 1, 1)
         };
-        let win = shell
+        shell
             .fire_seated(&[seated_at(0, &rows, &verb, RsReset::Held, k + r)])
             .expect("a two-row window with a rejected row fires");
         let mut prefix: Vec<u32> = tokens.clone();
@@ -691,7 +659,7 @@ fn holds_the_contract(mut shell: Shell) {
         shell
             .fire_seated(&[seated(7, &prefix, &fold, RsReset::Fresh)])
             .expect("the prefix folds");
-        let ref1 = shell
+        shell
             .fire_seated(&[seated_at(7, &[junk], &fold, RsReset::Held, prefix.len() as u32)])
             .expect("junk folds alone");
         shell.open(3).expect("slot 3 reopens");
@@ -703,17 +671,9 @@ fn holds_the_contract(mut shell: Shell) {
                 RsReset::Fresh,
             )])
             .expect("the shorter prefix folds");
-        let ref2 = shell
+        shell
             .fire_seated(&[seated_at(3, &rows, &fold, RsReset::Held, prefix.len() as u32 - 1)])
             .expect("[s_r, junk] folds");
-        let d1 = spread(&win[0], &ref1[0]);
-        let d2 = spread(&win[0], &ref2[0]);
-        eprintln!(
-            "claim 9: round {r} junk-row logits: window vs one-row fold {d1:.4} (argmax {} vs {}), vs two-row fold {d2:.4} (argmax {})",
-            argmax(&win[0]),
-            argmax(&ref1[0]),
-            argmax(&ref2[0])
-        );
         if r > 0 {
             shell
                 .fire_seated(&[seated_at(

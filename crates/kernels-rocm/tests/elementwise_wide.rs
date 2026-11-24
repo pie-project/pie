@@ -1,6 +1,5 @@
 //! The flat elementwise kernels over planes of any element count: a plane
-//! past 2^31 elements lands every element, and (by hand) their speed at
-//! Qwen3-8B's widths.
+//! past 2^31 elements lands every element.
 
 #![cfg(feature = "rocm")]
 
@@ -10,100 +9,6 @@ use common::{Gpu, bf16, from_bf16};
 use dtype::Dtype;
 use kernels_rocm::elemwise::{gate, pointwise};
 use kernels_rocm::linear::glu;
-
-const REPS: u32 = 100;
-
-fn ramp(gpu: &Gpu, rows: u32, width: u32, seed: u16) -> kernels_rocm::Tensor {
-    let n = rows as usize * width as usize;
-    let host: Vec<u16> = (0..n)
-        .map(|i| 0x3e00 + ((i as u16).wrapping_mul(31).wrapping_add(seed) & 0x3ff))
-        .collect();
-    gpu.upload(&host, rows, width, Dtype::Bf16)
-}
-
-#[test]
-#[ignore = "a probe run by hand"]
-fn elementwise_wide_bench() {
-    let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
-    for width in [4096u32, 12288] {
-        for rows in [1u32, 64, 512, 4096, 10240] {
-            let a = ramp(&gpu, rows, width, 1);
-            let b = ramp(&gpu, rows, width, 2);
-            let w = u64::from(rows) * u64::from(width);
-            let mut o = gpu.zeros(rows, width, Dtype::Bf16);
-            let mut line = format!("[wide] {rows:>5} x {width:>5}:");
-            let mut put = |name: &str, us: f64, planes: u64| {
-                line += &format!(
-                    " {name} {us:.2}us ({:.0} GB/s)",
-                    (w * 2 * planes) as f64 / (us * 1e3)
-                );
-            };
-            put(
-                "silu",
-                gpu.time(REPS, || pointwise::silu(&ctx, a, &mut o).unwrap()),
-                2,
-            );
-            put(
-                "add",
-                gpu.time(REPS, || pointwise::add(&ctx, a, b, &mut o).unwrap()),
-                3,
-            );
-            put(
-                "mul",
-                gpu.time(REPS, || pointwise::mul(&ctx, a, b, &mut o).unwrap()),
-                3,
-            );
-            put(
-                "clamp",
-                gpu.time(REPS, || pointwise::clamp(&ctx, -1.0, 1.0, &mut o).unwrap()),
-                2,
-            );
-            put(
-                "mul_scalar",
-                gpu.time(REPS, || pointwise::mul_scalar(&ctx, 0.5, &mut o).unwrap()),
-                2,
-            );
-            put(
-                "gate",
-                gpu.time(REPS, || gate::sigmoid_mul(&ctx, a, 1, &mut o).unwrap()),
-                3,
-            );
-            put(
-                "gelu",
-                gpu.time(REPS, || glu::gelu_tanh(&ctx, a, 1, &mut o).unwrap()),
-                2,
-            );
-            put(
-                "geglu",
-                gpu.time(REPS, || glu::geglu_tanh(&ctx, a, b, 1, &mut o).unwrap()),
-                3,
-            );
-            put(
-                "swiglu_clamp",
-                gpu.time(REPS, || {
-                    glu::swiglu_clamp_split(&ctx, a, b, 1, 7.0, &mut o).unwrap()
-                }),
-                3,
-            );
-            put(
-                "clamp_alpha",
-                gpu.time(REPS, || {
-                    glu::swiglu_clamp_alpha_split(&ctx, a, b, 1, 7.0, 1.7, &mut o).unwrap()
-                }),
-                3,
-            );
-            put(
-                "situ",
-                gpu.time(REPS, || {
-                    glu::situ_split(&ctx, a, b, 1, 2.0, None, &mut o).unwrap()
-                }),
-                3,
-            );
-            eprintln!("{line}");
-        }
-    }
-}
 
 /// One plane of 2^31 + 8 elements, 8 wide: each flat kernel lands its last
 /// elements (past any 32-bit index) as it lands its first.

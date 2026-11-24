@@ -837,8 +837,8 @@ impl StorePools {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
-                // Window lists: removed by the windowed-state change (the
-                // integration commit deletes this arm).
+                // Window lists: an engine that does not state
+                // `Capabilities::windowed_state`.
                 SlotKind::List {
                     tokens,
                     window: Some(window),

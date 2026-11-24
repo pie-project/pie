@@ -12,7 +12,7 @@
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{
-    ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer,
 };
 use eta_ir::op::Op;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Port, PortMask, Stage};
@@ -24,19 +24,9 @@ use engine_metal::serve::{Attached, Seated};
 use engine_metal::{Lane, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{fixture_of, load_with, word};
+use crate::common::{const_port};
 
 const ROWS: u32 = 5;
-
-fn const_port(port: Port, words: &[u32]) -> PortBinding {
-    PortBinding {
-        port,
-        source: PortSource::Const {
-            dtype: EtaDtype::U32,
-            shape: Shape::vector(words.len() as u32),
-            data: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        },
-    }
-}
 
 /// A program describing `lanes` lanes of `ROWS` tokens each, whose `fold`
 /// port carries `fold`; its epilogue puts the logits' argmax in a ring.
@@ -261,8 +251,8 @@ fn fire_attached_at(lanes: u32, owned: u32, fold: &[u32]) -> Option<String> {
 }
 
 /// A program attached at one lane whose `embed_indptr` port describes two
-/// would set the second lane's positions and kv slots, another request's
-/// (TPU found it on XLA): refused by name, its own lane alone.
+/// would set the second lane's positions and kv slots, another request's:
+/// refused by name, its own lane alone.
 #[test]
 fn geometry_ports_describing_lanes_past_the_attachment_are_refused() {
     if !engine_metal::device::present() {
@@ -288,7 +278,6 @@ fn a_lane_past_the_fold_ports_list_is_refused() {
         .expect("a lane past a per-lane fold list is refused");
     let why = refusal(&refused);
     assert!(why.contains("lane 2"), "the refusal names the third lane: {why}");
-    eprintln!("refused by name: {why}");
 }
 
 #[test]
@@ -330,5 +319,4 @@ fn a_device_fold_lane_without_a_program_is_refused() {
         .expect_err("a device-fold lane with no program to state its fold is refused");
     let why = refusal(&refused);
     assert!(why.contains("lane 0"), "the refusal names the lane: {why}");
-    eprintln!("refused by name: {why}");
 }

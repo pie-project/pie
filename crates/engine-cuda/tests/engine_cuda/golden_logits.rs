@@ -676,7 +676,7 @@ fn picks_path(cache: &Path) -> PathBuf {
     cache.join("picks")
 }
 
-fn read_picks(cache: &Path) -> Vec<profile::fire::ProductTime> {
+fn read_picks(cache: &Path) -> Vec<profile::rates::ProductTime> {
     let text = std::fs::read_to_string(picks_path(cache)).unwrap_or_default();
     text.lines()
         .filter_map(|line| {
@@ -684,7 +684,7 @@ fn read_picks(cache: &Path) -> Vec<profile::fire::ProductTime> {
             let [kind, rows, k, m, kernel, ns, spread] = w[..] else {
                 return None;
             };
-            Some(profile::fire::ProductTime {
+            Some(profile::rates::ProductTime {
                 kind: kind.parse().ok()?,
                 rows: rows.parse().ok()?,
                 k: k.parse().ok()?,
@@ -737,7 +737,7 @@ fn picked(cache: &Path, profiles: Option<&Path>) -> Option<profile::Profile> {
     }
     let (name, facts) = engine_cuda::chip::probe(0)?;
     let (profile, _) = engine_cuda::chip::resolve(&name, &facts, profiles);
-    let mut tuned = profile::fire::Tuned::default();
+    let mut tuned = profile::rates::Tuned::default();
     tuned.rates.product_ns = Some(picks);
     Some(profile.with_tuned(tuned))
 }

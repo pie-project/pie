@@ -57,8 +57,6 @@ fn a_dense_model_reads_no_routed_or_quantized_decision() {
         return;
     }
     let read = read_by(&fixture_of("qwen3-micro-text", None));
-    let kernel: Vec<&&str> = read.iter().filter(|id| id.starts_with("kernel.")).collect();
-    eprintln!("a dense bf16 model read {kernel:?}");
     let foreign: Vec<&&str> = read
         .iter()
         .filter(|id| {
@@ -69,10 +67,6 @@ fn a_dense_model_reads_no_routed_or_quantized_decision() {
         .collect();
     assert!(foreign.is_empty(), "a dense bf16 model read {foreign:?}");
     let routed = read_by(&deployed_fixture("qwen3-30b-a3b-mini-u4g64-kv-bf16"));
-    eprintln!(
-        "a mixture read {:?}",
-        routed.iter().filter(|id| id.starts_with("kernel.")).collect::<Vec<_>>()
-    );
     assert!(
         routed.iter().any(|id| id.starts_with("kernel.moe")),
         "the mixture reads its routed decisions: {routed:?}"

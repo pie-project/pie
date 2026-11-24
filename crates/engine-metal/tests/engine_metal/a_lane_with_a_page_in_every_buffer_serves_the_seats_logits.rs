@@ -8,10 +8,10 @@
 
 use engine_metal::serve::Seated;
 use engine_metal::store::layout::LIST;
-use engine_metal::{Boot, Lane, Shell};
+use engine_metal::{Lane, Shell};
 use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, argmax, fixture_of, same, word};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, argmax, fixture_of, same, word};
 
 const CONTEXT: u32 = 2048;
 const SEATS: u32 = 4;
@@ -20,25 +20,14 @@ const STEPS: u32 = 3;
 const PROMPT_FIRE: usize = 192;
 
 fn load(fixture: &Fixture, kv_budget: Option<u64>) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
+    Load {
         budget: Budget::new(SEATS, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: 16,
         context: CONTEXT,
         slots: SEATS,
         kv_budget,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
@@ -147,11 +136,6 @@ fn a_lane_with_a_page_in_every_buffer_serves_the_seats_logits() {
     // The prompt reaches the last page; the decodes stay in it.
     let rows = (parts as u32 - 1) * page + 1;
     assert!(rows + STEPS <= parts as u32 * page && rows + STEPS <= CONTEXT);
-    eprintln!(
-        "qwen3-micro-text: {parts} buffers of {segment} chunks, a page id's buffer in {} bits; \
-         one page of {page} tokens in each, chunks {chunks:?}",
-        31 - ids.part_shift
-    );
     let got = serve(&mut shell, &fixture, rows, Some(&pages));
     drop(shell);
     engine_metal::store::pool::cap_parts(0);

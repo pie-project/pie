@@ -386,9 +386,9 @@ fn the_kv_store_s_disk_slots_coming_back_tell_the_room_signal() {
 }
 
 /// What evicting a process empties counts its state's slots too (records,
-/// the state lists), not its kv pages and guest parts alone: the M1's
-/// bind room found 356 opened chunks of a state shape and a map of six,
-/// every candidate's state unattributed. A working set's own device slots
+/// the state lists), not its kv pages and guest parts alone: else a bind
+/// finds many opened chunks of a state shape against a small map, every
+/// candidate's state unattributed. A working set's own device slots
 /// are named, by the engine's shape and ref, each in a chunk the pool
 /// holds used.
 #[test]
@@ -435,9 +435,9 @@ impl crate::store::roles::DiskSlots for DiskFile {
     }
 }
 
-/// The M1 (no host tier, unified memory): an evicted process's records and
-/// rs list slots stayed on the device, their chunks held, since a suspend
-/// found no host row. Where no host row is free its state parks in the
+/// No host tier (unified memory): an evicted process's records and rs list
+/// slots would stay on the device, their chunks held, since a suspend
+/// finds no host row. Where no host row is free its state parks in the
 /// disk tier's slot file, a disk chunk of each shape laid out as the
 /// device's (CONTRACT-BC 22): the move copies to the disk, the device slots
 /// come free, and a restore brings it back and gives the disk chunks back.

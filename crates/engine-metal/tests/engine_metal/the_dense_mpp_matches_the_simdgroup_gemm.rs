@@ -5,22 +5,11 @@ use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::linear::gemm;
 use poem_ir::Dtype;
-
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
+use crate::common::{bf16, noise};
 
 fn value(at: u64, scale: f32) -> f32 {
     let v = (f32::from(noise(at)) - 127.5) * scale;
     f32::from_bits(v.to_bits() & 0xffff_0000)
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
 }
 
 fn read_bf16(bytes: &[u8], at: usize) -> f32 {
@@ -60,7 +49,6 @@ fn a_dense_matmul_on_the_tensor_ops_answers_the_simdgroup_product() {
     ];
     let (mut worst_abs, mut worst_rel, mut worst_vs) = (0.0f64, 0.0f64, 0.0f64);
     let mut worst_simdgroup = 0.0f64;
-    let mut checked = 0u64;
     for &(k, n) in &shapes {
         let weights: Vec<u8> = (0..u64::from(n) * u64::from(k))
             .flat_map(|at| bf16(value(at ^ 0x77, 0.0009)))
@@ -128,7 +116,6 @@ fn a_dense_matmul_on_the_tensor_ops_answers_the_simdgroup_product() {
                     worst_rel = worst_rel.max(error / magnitude.max(1e-12));
                     worst_vs = worst_vs.max((got - simd).abs());
                     worst_simdgroup = worst_simdgroup.max((simd - want).abs());
-                    checked += 1;
                 }
             }
         }
@@ -185,13 +172,7 @@ fn a_dense_matmul_on_the_tensor_ops_answers_the_simdgroup_product() {
                     (actual - want).abs() <= allowance,
                     "page-end M={m} row={row} col={col}: {actual} vs {want}"
                 );
-                checked += 1;
             }
         }
     }
-    eprintln!(
-        "tensor ops {on_tensor_ops}: checked {checked} outputs; max |error| {worst_abs:.3e}, \
-         max |error| / sum |terms| {worst_rel:.3e}, max |tensor ops - simdgroup| {worst_vs:.3e}, \
-         the simdgroup kernels' own max |error| {worst_simdgroup:.3e}"
-    );
 }

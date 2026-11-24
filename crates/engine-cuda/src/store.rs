@@ -5994,15 +5994,9 @@ mod tests {
         stated_tokens_are_backed_whole_at_every_seat_count();
     }
 
-    // Qwen3-0.6B, `kv_device_tokens = 16384`, 16 seats, on the A6000: the
-    // pool was sized for 1024 pages (117 chunks) and the fit backed 1017,
-    // and 16000 tokens backed 990 of 1000; Qwen3-8B, 53853 tokens, backed
-    // 3344 of 3366 pages (424 chunks of 18 MiB). The claim was the chunks'
-    // bytes while the room it left them was counted in the range's map
-    // units, and in pages of each part rounded apart, so the growth of
-    // backing them came past it and the fit gave up chunks. The claim is
-    // what backing them grows the range by, and the room counted once: what
-    // the pool is sized for is what it backs.
+    // The claim is what backing the stated chunks grows the range by, and
+    // the room is counted once: what the pool is sized for is what it backs,
+    // at every seat count.
     fn stated_tokens_are_backed_whole_at_every_seat_count() {
         const MIB: u64 = 1 << 20;
         // A kv page of 16 bf16 tokens' keys and values over 8 heads of 128.

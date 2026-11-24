@@ -234,11 +234,13 @@ fn told_fold(
 ) {
     use std::collections::HashSet;
     use std::sync::Mutex;
-    static TOLD: Mutex<Option<HashSet<(&'static str, i32, i32, i32, bool, u32)>>> = Mutex::new(None);
+    /// The shapes said: (kernel, m, n, k, gated, grid).
+    type Shape = (&'static str, i32, i32, i32, bool, u32);
+    static TOLD: Mutex<Option<HashSet<Shape>>> = Mutex::new(None);
     let mut told = TOLD.lock().expect("told lock poisoned");
     if told.get_or_insert_with(HashSet::new).insert((kernel, m, n, k, gated, grid)) {
-        eprintln!(
-            "kernels-rocm: the norm {} the {m}x{n}x{k} {kernel}{} product: {grid} blocks' redundant {:.2} MB at {gbps} GB/s against a {launch_ns} ns launch",
+        tracing::debug!(
+            "the norm {} the {m}x{n}x{k} {kernel}{} product: {grid} blocks' redundant {:.2} MB at {gbps} GB/s against a {launch_ns} ns launch",
             if folds { "folds into" } else { "stays apart from" },
             if gated { " gated" } else { "" },
             bytes / 1e6

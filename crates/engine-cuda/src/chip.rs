@@ -373,9 +373,7 @@ mod tests {
     }
 
     /// Every fire is captured, its bodies held as the fit holds them: no
-    /// profile turns capture or bodies off or states their memory. Nor does
-    /// one order the planner: who goes first is the policy's (PLEX), so the
-    /// seating flags a profile once stated are refused by name.
+    /// profile turns capture or bodies off or states their memory.
     #[test]
     fn a_profile_stating_graphs_or_recording_is_refused() {
         for (text, id) in [
@@ -385,9 +383,6 @@ mod tests {
                 "engine.recording",
             ),
             ("api = 1\n[engine]\nbodies_mb = 512\n", "engine.bodies_mb"),
-            ("api = 1\n[engine]\nseated_first = true\n", "engine.seated_first"),
-            ("api = 1\n[engine]\nseat_to_end = true\n", "engine.seat_to_end"),
-            ("api = 1\n[engine]\nseat_spread = true\n", "engine.seat_spread"),
         ] {
             let why = registry()
                 .load_user(text, "user.toml")
@@ -431,30 +426,9 @@ mod tests {
     #[cfg(not(feature = "rocm"))]
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
-        // A committed measured profile is a device's keyed measurements, read
-        // as such (`profile::Strict::Measured`, the shelf's check), not a
-        // decision profile.
-        for (name, text) in SEEDED
-            .iter()
-            .filter(|(name, _)| !name.ends_with(profile::MEASURED_SUFFIX))
-        {
-            let p = registry()
-                .load(text, name)
-                .unwrap_or_else(|e| panic!("{e}"));
-            let dumped = profile::render::dump(&p);
-            let again = registry()
-                .parse(&dumped, "dump", profile::Strict::CheckedIn)
-                .unwrap_or_else(|e| panic!("{name}: {e}\n---\n{dumped}"));
-            for (spec, rungs, _) in p.entries() {
-                assert_eq!(
-                    again.entries.get(spec.id).map(Vec::as_slice),
-                    Some(rungs),
-                    "{name}: {}",
-                    spec.id
-                );
-            }
-            assert_eq!(again.target.assumes, p.target().assumes, "{name}");
-        }
+        SHELF
+            .check_dumps(registry())
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[cfg(not(feature = "rocm"))]

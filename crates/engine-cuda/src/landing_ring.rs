@@ -19,8 +19,7 @@ use std::time::Instant;
 
 use crate::device::alloc::{Buffer, Pinned};
 use crate::device::graph::Event;
-#[allow(unused_imports)]
-use crate::error::{Fault, Result};
+use crate::error::Result;
 
 /// The rates the ring was sized by, as it measured them.
 #[derive(Clone, Copy, Debug)]
@@ -240,7 +239,7 @@ fn enqueue(stream: *mut c_void, dst: u64, src: *const u8, bytes: usize) -> Resul
     #[cfg(not(feature = "device"))]
     {
         let _ = (stream, dst, src, bytes);
-        Err(Fault::Runtimeless)
+        Err(crate::error::Fault::Runtimeless)
     }
 }
 

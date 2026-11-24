@@ -241,7 +241,7 @@ pub struct Shell {
     keys: crate::stored::Keys,
     /// The decode products' times the profile states under a matching key:
     /// a load's measurement joins them before it is saved.
-    products: Vec<profile::fire::ProductTime>,
+    products: Vec<profile::rates::ProductTime>,
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,

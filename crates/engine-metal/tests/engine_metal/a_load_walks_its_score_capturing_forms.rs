@@ -2,39 +2,21 @@
 
 //! The load's pipeline walk (`Shell::warm_pipelines`) builds the forms a
 //! request capturing its attention scores fires (the score-capture kernel
-//! beside the plain attention), at a prompt and at one row. The walk fired
-//! plain and drafting words alone before, so trackb-h2o, trackb-snapkv and
-//! snapkv-eviction on Qwen3-0.6B were refused at their first capturing fire
-//! ("`attn_score_capture_bfloat16_d_128` would not enqueue: ... which the
-//! load did not build before ready").
+//! beside the plain attention), at a prompt and at one row, so a capturing
+//! fire after ready meets only pipelines the walk built.
 
 use engine_metal::serve::Seated;
-use engine_metal::{Boot, Lane, Shell};
-use poem_compiler::Budget;
+use engine_metal::{Lane, Shell};
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, fixture_of};
 use super::a_score_reader_holds_its_rows_through_a_park::{at_lane, bind_reader, bind_reader_of_pair, reader};
 
 fn load(fixture: &Fixture) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(4, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: 16,
+    Load {
         context: 1024,
-        slots: 4,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }

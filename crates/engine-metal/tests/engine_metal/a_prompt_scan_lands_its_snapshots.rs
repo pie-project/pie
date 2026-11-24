@@ -344,5 +344,4 @@ fn a_prompt_scan_lands_its_snapshots() {
         window(3),
         "the committed conv lands its window as of the row"
     );
-    eprintln!("snapshots at rows {SNAPS:?} of {T} land every scan's state bit for bit");
 }

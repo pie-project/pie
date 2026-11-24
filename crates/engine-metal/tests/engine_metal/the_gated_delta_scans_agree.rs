@@ -1,5 +1,10 @@
 #![cfg(target_vendor = "apple")]
 
+//! The gated-delta scans agree: each kernel fired directly from its file
+//! (`ssm/gated_delta.metal`'s per-step and committed entries) and each
+//! through `kernels_metal::ssm`'s dispatch (the step, committed and chunked
+//! scans, plain and staged) leave the same bank and output, row by row.
+
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
@@ -18,19 +23,19 @@ const BANK_FLOATS: u64 = V_HEADS as u64 * V_DIM as u64 * K_DIM as u64;
 const T: u32 = 33;
 const J: u32 = 5;
 
-const OLD_FILE: &str = "ssm/gated_delta.metal";
+const KERNEL_FILE: &str = "ssm/gated_delta.metal";
 
 /// The degenerate segment table's length in words: its head and one base.
 const STATE_MAP: [u64; StateMap::HEAD + 1] = [0; StateMap::HEAD + 1];
 
 const SLOTS: u32 = 8;
-const SLOT_OLD_COMMITTED: u32 = 0;
-const SLOT_NEW_COMMITTED: u32 = 1;
-const SLOT_NEW_STEPS: u32 = 2;
-const SLOT_NEW_SCAN: u32 = 3;
-const SLOT_OLD_STEPS: u32 = 4;
-const SLOT_NEW_COMMITTED_J: u32 = 5;
-const SLOT_NEW_STEPS_J: u32 = 6;
+const SLOT_DIRECT_COMMITTED: u32 = 0;
+const SLOT_DISPATCHED_COMMITTED: u32 = 1;
+const SLOT_DISPATCHED_STEPS: u32 = 2;
+const SLOT_DISPATCHED_SCAN: u32 = 3;
+const SLOT_DIRECT_STEPS: u32 = 4;
+const SLOT_DISPATCHED_COMMITTED_J: u32 = 5;
+const SLOT_DISPATCHED_STEPS_J: u32 = 6;
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
@@ -82,19 +87,23 @@ fn compare(want: &[f32], got: &[f32]) -> (f64, f64) {
 
 #[test]
 fn the_scans_agree() {
-    // `PIE_GDN_PACKED=1` runs the staged scan, as an Apple10 profile picks.
-    let tuning = if std::env::var("PIE_GDN_PACKED").as_deref() == Ok("1") {
-        engine_metal::chip::tuning("[kernel]\ngdn.scan = \"staged\"", false)
-    } else {
-        engine_metal::chip::tuning("", false)
-    };
+    scans_agree("");
+}
+
+/// The staged scan, as an Apple10 profile picks it.
+#[test]
+fn the_staged_scans_agree() {
+    scans_agree("[kernel]\ngdn.scan = \"staged\"");
+}
+
+fn scans_agree(kernel: &str) {
+    let tuning = engine_metal::chip::tuning(kernel, false);
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    eprintln!("device: {}", device.name());
 
     let mut qkv_b = Buffer::zeroed(&device, u64::from(T) * u64::from(QKV_WIDTH) * 2).expect("qkv");
     {
@@ -212,19 +221,19 @@ fn the_scans_agree() {
 
     run(&|sink| {
         sink.fire(
-            Fire::at(OLD_FILE, "gated_delta_committed_bfloat16")
+            Fire::at(KERNEL_FILE, "gated_delta_committed_bfloat16")
                 .apply(Grid::of([128, V_HEADS, splits as u32], [128, 1, 1])),
             &[
                 qkv.arg(),
                 indptr.arg(),
                 table(h_replay).arg(),
                 table(h_commit_t).arg(),
-                table(h_slot[SLOT_OLD_COMMITTED as usize]).arg(),
+                table(h_slot[SLOT_DIRECT_COMMITTED as usize]).arg(),
                 0i32.arg(),
                 gates.arg(),
                 state.arg_mut(),
                 work.arg_mut(),
-                y_of(SLOT_OLD_COMMITTED).arg_mut(),
+                y_of(SLOT_DIRECT_COMMITTED).arg_mut(),
                 (K_HEADS as i32).arg(),
                 (V_HEADS as i32).arg(),
                 (K_DIM as i32).arg(),
@@ -235,12 +244,12 @@ fn the_scans_agree() {
                 segments.arg(),
             ],
         )
-        .expect("the old committed kernel");
+        .expect("the direct committed kernel");
     });
 
     for (slot, commit) in [
-        (SLOT_NEW_COMMITTED, h_commit_t),
-        (SLOT_NEW_COMMITTED_J, h_commit_j),
+        (SLOT_DISPATCHED_COMMITTED, h_commit_t),
+        (SLOT_DISPATCHED_COMMITTED_J, h_commit_j),
     ] {
         run(&|sink| {
             ssm::gated_delta_committed(
@@ -262,7 +271,7 @@ fn the_scans_agree() {
         });
     }
 
-    for (slot, steps) in [(SLOT_NEW_STEPS, T), (SLOT_NEW_STEPS_J, J)] {
+    for (slot, steps) in [(SLOT_DISPATCHED_STEPS, T), (SLOT_DISPATCHED_STEPS_J, J)] {
         for t in 0..steps {
             let q = Tensor::new(row(&qkv_b, t, QKV_WIDTH, 2), 1, QKV_WIDTH, Dtype::Bf16);
             let g = Tensor::new(row(&gates_b, t, 2 * V_HEADS, 4), 1, 2 * V_HEADS, Dtype::F32);
@@ -298,12 +307,12 @@ fn the_scans_agree() {
             RaggedTensor { data: qkv, indptr },
             qkv,
             gates,
-            &pool(SLOT_NEW_SCAN),
+            &pool(SLOT_DISPATCHED_SCAN),
             K_HEADS,
             V_HEADS,
             K_DIM,
             V_DIM,
-            y_of(SLOT_NEW_SCAN),
+            y_of(SLOT_DISPATCHED_SCAN),
         )
         .expect("the scan");
     });
@@ -312,20 +321,20 @@ fn the_scans_agree() {
         let q = Tensor::new(row(&qkv_b, t, QKV_WIDTH, 2), 1, QKV_WIDTH, Dtype::Bf16);
         let g = Tensor::new(row(&gates_b, t, 2 * V_HEADS, 4), 1, 2 * V_HEADS, Dtype::F32);
         let y = Tensor::new(
-            row(&y_b[SLOT_OLD_STEPS as usize], t, Y_WIDTH, 4),
+            row(&y_b[SLOT_DIRECT_STEPS as usize], t, Y_WIDTH, 4),
             1,
             Y_WIDTH,
             Dtype::F32,
         );
         run(&|sink| {
             sink.fire(
-                Fire::at(OLD_FILE, "gated_delta_bfloat16")
+                Fire::at(KERNEL_FILE, "gated_delta_bfloat16")
                     .apply(Grid::of([128, V_HEADS, splits as u32], [128, 1, 1])),
                 &[
                     q.arg(),
                     g.arg(),
                     state.arg_mut(),
-                    utable(h_slot[SLOT_OLD_STEPS as usize]).arg(),
+                    utable(h_slot[SLOT_DIRECT_STEPS as usize]).arg(),
                     y.arg_mut(),
                     (K_HEADS as i32).arg(),
                     (V_HEADS as i32).arg(),
@@ -335,7 +344,7 @@ fn the_scans_agree() {
                     segments.arg(),
                 ],
             )
-            .expect("the old step kernel");
+            .expect("the direct step kernel");
         });
     }
 
@@ -359,67 +368,59 @@ fn the_scans_agree() {
     };
     let rows = |v: &[f32], n: u32| v[..(n * Y_WIDTH) as usize].to_vec();
 
-    let steps_bank = bank(SLOT_NEW_STEPS);
-    let steps_y = out(SLOT_NEW_STEPS);
+    let steps_bank = bank(SLOT_DISPATCHED_STEPS);
+    let steps_y = out(SLOT_DISPATCHED_STEPS);
     assert_eq!(
-        bank(SLOT_NEW_COMMITTED),
+        bank(SLOT_DISPATCHED_COMMITTED),
         steps_bank,
         "committed(T) left other bank bits than T steps"
     );
     assert_eq!(
-        out(SLOT_NEW_COMMITTED),
+        out(SLOT_DISPATCHED_COMMITTED),
         steps_y,
         "committed(T) answered other bits than T steps"
     );
     assert_eq!(
-        bank(SLOT_NEW_SCAN),
+        bank(SLOT_DISPATCHED_SCAN),
         steps_bank,
         "the scan left other bank bits than T steps"
     );
     assert_eq!(
-        out(SLOT_NEW_SCAN),
+        out(SLOT_DISPATCHED_SCAN),
         steps_y,
         "the scan answered other bits than T steps"
     );
     assert_eq!(
-        bank(SLOT_NEW_COMMITTED_J),
-        bank(SLOT_NEW_STEPS_J),
+        bank(SLOT_DISPATCHED_COMMITTED_J),
+        bank(SLOT_DISPATCHED_STEPS_J),
         "committed(J) left other bank bits than J steps"
     );
     assert_ne!(
-        bank(SLOT_NEW_COMMITTED_J),
+        bank(SLOT_DISPATCHED_COMMITTED_J),
         steps_bank,
         "J and T steps leave the same bank, so the commit claim can't tell them apart"
     );
     assert_eq!(
-        out(SLOT_NEW_COMMITTED_J),
+        out(SLOT_DISPATCHED_COMMITTED_J),
         steps_y,
         "committed(J) answered the rows past J other bits than the steps"
     );
-    assert_eq!(rows(&out(SLOT_NEW_STEPS_J), J), rows(&steps_y, J));
-    eprintln!(
-        "one arithmetic: {T} steps == committed({T}) == scan; committed({J}) bank == {J} steps  (byte for byte)"
-    );
+    assert_eq!(rows(&out(SLOT_DISPATCHED_STEPS_J), J), rows(&steps_y, J));
 
     let floor = 1e-5f64;
     for (name, old_slot, new_slot) in [
-        ("committed", SLOT_OLD_COMMITTED, SLOT_NEW_COMMITTED),
-        ("step", SLOT_OLD_STEPS, SLOT_NEW_STEPS),
+        ("committed", SLOT_DIRECT_COMMITTED, SLOT_DISPATCHED_COMMITTED),
+        ("step", SLOT_DIRECT_STEPS, SLOT_DISPATCHED_STEPS),
     ] {
-        let (bank_rms, bank_worst) = compare(&bank(old_slot), &bank(new_slot));
-        let (y_rms, y_worst) = compare(&out(old_slot), &out(new_slot));
-        eprintln!(
-            "{name:9} old vs new: bank rel rms {bank_rms:.2e} (worst {bank_worst:.2e}), y rel rms {y_rms:.2e} (worst {y_worst:.2e})"
-        );
+        let (bank_rms, _) = compare(&bank(old_slot), &bank(new_slot));
+        let (y_rms, _) = compare(&out(old_slot), &out(new_slot));
         assert!(
             bank_rms <= floor,
-            "{name}: the new kernel's bank parts from the old by {bank_rms:.2e} rms"
+            "{name}: the dispatched kernel's bank parts from the direct one by {bank_rms:.2e} rms"
         );
         assert!(
             y_rms <= floor,
-            "{name}: the new kernel's output parts from the old by {y_rms:.2e} rms"
+            "{name}: the dispatched kernel's output parts from the direct one by {y_rms:.2e} rms"
         );
     }
-    let (rms, _) = compare(&bank(SLOT_OLD_COMMITTED), &bank(SLOT_OLD_STEPS));
-    eprintln!("old committed vs old steps: bank rel rms {rms:.2e}");
 }

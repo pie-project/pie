@@ -43,6 +43,8 @@ pub type BenchOf = for<'a> fn(
 /// `pie tune` for one backend.
 pub type Tune = fn(&TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String>;
 
+pub use profile::search::Mix;
+
 /// What `pie tune` asks of a backend.
 pub struct TuneRequest<'a> {
     /// Measure the whole grid rather than the quick one.
@@ -67,6 +69,8 @@ pub struct TuneRequest<'a> {
     pub dissect: &'a [u32],
     /// Run the `[rates]` step alone.
     pub rates: bool,
+    /// The serving mix the search judges a candidate by (`--mix`).
+    pub mix: Mix,
 }
 
 impl<'a> TuneRequest<'a> {
@@ -88,6 +92,7 @@ impl<'a> TuneRequest<'a> {
             check_estimate: false,
             dissect: &[],
             rates: false,
+            mix: Mix::default(),
         }
     }
 }
@@ -264,7 +269,7 @@ macro_rules! tune_grid {
             use $engine::tune::{Depth, run};
             let depth = if req.full { Depth::Full } else { Depth::Quick };
             let models = pick_models($backend, req)?;
-            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
+            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, req.mix, say)?;
             Ok(tuned!(out, wrong: out.wrong))
         }
     };
@@ -333,7 +338,7 @@ fn bench_metal<'a>(
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
-    let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
+    let out = engine_cuda::tune::run(Some(req.profiles), &models, req.mix, say)?;
     Ok(tuned!(out, wrong: Vec::new()))
 }
 
@@ -550,7 +555,7 @@ fn held(
     cache: &Path,
     committed: Option<&str>,
     committed_covers: &[&str],
-    now: Option<&dyn profile::fire::Now>,
+    now: Option<&dyn profile::rates::Now>,
     on: impl FnOnce() -> Option<String>,
 ) -> Exported {
     let origin = from.display().to_string();
@@ -578,7 +583,7 @@ fn held(
         let mine = match stored {
             Some(Ok(file)) => file.tuned.rates,
             Some(Err(why)) => return Err(why.to_string()),
-            None => profile::fire::Rates::default(),
+            None => profile::rates::Rates::default(),
         };
         let theirs = match committed_rates {
             Some(Ok(file)) => {
@@ -595,7 +600,7 @@ fn held(
             }
             None => None,
         };
-        if mine == profile::fire::Rates::default() && theirs.is_none() {
+        if mine == profile::rates::Rates::default() && theirs.is_none() {
             return Err(user.clone().err().unwrap_or_else(|| format!("{origin}: stores nothing")));
         }
         let (merged, lines) = profile::merge_committed(mine, theirs, now)?;
@@ -619,10 +624,10 @@ fn held(
 }
 
 /// What this build keys `backend`'s device `index` (named `device`) by
-/// (`profile::fire::Now`): what a committed entry is checked against before
+/// (`profile::rates::Now`): what a committed entry is checked against before
 /// an export carries it. `None` where the engine states none here (its
 /// committed entries are carried unchecked, and a boot checks them).
-fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::fire::Now>> {
+fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::rates::Now>> {
     let _ = (index, device);
     match backend.name {
         #[cfg(feature = "vulkan")]
@@ -666,7 +671,7 @@ fn device_on(backend: &Backend, index: u32, device: &str) -> Option<String> {
         #[cfg(feature = "wgpu")]
         "wgpu" => engine_wgpu::chip::measured_on_at(index),
         #[cfg(feature = "engine-cuda")]
-        "cuda" => Some(profile::fire::Now::on(&engine_cuda::stored::Keys::of(
+        "cuda" => Some(profile::rates::Now::on(&engine_cuda::stored::Keys::of(
             i32::try_from(index).unwrap_or(0),
             device,
         ))),

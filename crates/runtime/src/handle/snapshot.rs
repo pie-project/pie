@@ -185,8 +185,8 @@ struct SavedState {
     frozen: u32,
     bytes: u64,
     /// The windows' position, for a model whose state is one window list:
-    /// `buffer` is then its table, and `window_tokens` the window. The
-    /// window-list path: removed by the windowed-state change.
+    /// `buffer` is then its table, and `window_tokens` the window (the
+    /// window-list path).
     window: Option<WindowState>,
     window_tokens: u32,
     /// The model's windowed layers are ring + buffer (CONTRACT-BC 19, 21):
@@ -448,8 +448,8 @@ async fn read_state(
             "a state of several window lists is not saved to the host",
         ));
     }
-    // A window list's table rides as the buffer (the window-list path:
-    // removed by the windowed-state change). A ring + buffer set's buffer is
+    // A window list's table rides as the buffer (the window-list path). A
+    // ring + buffer set's buffer is
     // its window buffer's unfolded slots, its rings in its record.
     let table = set.windows.first().unwrap_or(&set.buffer);
     let pages: Vec<RsSlotId> = table

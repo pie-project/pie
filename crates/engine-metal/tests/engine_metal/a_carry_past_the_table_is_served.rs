@@ -130,6 +130,5 @@ fn a_carry_past_the_table_is_served() {
         a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale
     };
     let (dy, ds) = (apart(table_y, inline_y), apart(table_state, inline_state));
-    eprintln!("readout {dy:e}, state {ds:e} of their scales apart");
     assert!(dy < 1e-4 && ds < 1e-4, "the in-scan reductions answer as the table: readout {dy:e}, state {ds:e}");
 }

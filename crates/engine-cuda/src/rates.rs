@@ -63,10 +63,10 @@
 
 #[cfg_attr(not(feature = "device"), allow(unused_imports))]
 use engine::rates::{ATTN_SHAPE, SCAN_SHAPE, Touched, weights_at};
-use profile::fire::Rates;
+use profile::rates::Rates;
 
 /// The `[rates]` keys this backend's estimate weighs a fire by (of
-/// `profile::fire::KEYS`, every one):
+/// `profile::rates::KEYS`, every one):
 /// what a load whose profile lacks one measures.
 #[cfg(not(feature = "rocm"))]
 pub const KEYS: [&str; 8] = [
@@ -196,11 +196,11 @@ pub type ProductTimes = Vec<(kernels_cuda::linear::routes::Shape, u32, f64, f64)
 /// decode products are chosen from once it has measured.
 #[must_use]
 pub fn joined_product_times(
-    held: &[profile::fire::ProductTime],
+    held: &[profile::rates::ProductTime],
     measured: &ProductTimes,
-) -> Vec<profile::fire::ProductTime> {
+) -> Vec<profile::rates::ProductTime> {
     let fresh = kernels_cuda::linear::routes::product_times(measured);
-    let mut joined: Vec<profile::fire::ProductTime> = held
+    let mut joined: Vec<profile::rates::ProductTime> = held
         .iter()
         .filter(|old| fresh.iter().all(|new| new.key() != old.key()))
         .cloned()
@@ -219,7 +219,7 @@ pub fn save_product_times(
     profiles: Option<&std::path::Path>,
     device: &str,
     keys: &crate::stored::Keys,
-    held: &[profile::fire::ProductTime],
+    held: &[profile::rates::ProductTime],
     measured: &ProductTimes,
 ) -> Result<Option<String>, String> {
     let Some(profiles) = profiles else {
@@ -252,7 +252,7 @@ pub fn save_landing(
     profiles: Option<&std::path::Path>,
     device: &str,
     keys: &crate::stored::Keys,
-    measured: profile::fire::Landing,
+    measured: profile::rates::Landing,
 ) -> Result<Option<String>, String> {
     let Some(profiles) = profiles else {
         return Ok(None);
@@ -264,7 +264,7 @@ pub fn save_landing(
     let save = engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, device),
         provenance: (
-            profile::fire::LANDING,
+            profile::rates::LANDING,
             format!(
                 "\"measured in place at load, {}\"",
                 engine::rates::build_commit()
@@ -322,10 +322,7 @@ pub fn measure(
         // The step's buffers (laid apart from the device heap, whose chunks
         // the process keeps) went to the idle store as they dropped; the
         // load reads the card's room next (the top rung's fit), so they go
-        // back to the driver first. Kept, an L40S's first boot fit beside
-        // 7.5 GiB the step no longer held (4.6 GiB idle, 2.5 GiB of heap
-        // chunks): at a 40960 context every rung lacked room for one
-        // sequence, while the next boot, reading the saved rates, served.
+        // back to the driver first, or the fit would count them as held.
         crate::device::held::release_idle();
         measured
     }
@@ -1277,9 +1274,9 @@ mod attention_tests {
 
     #[test]
     fn the_attention_sets_and_keys_are_the_shared_rule_at_cudas_page() {
-        // CUDA path unchanged: 63876a684 sized its sets in place, the q rows
-        // and the kv pages as laid whole against ATTN_SET_BYTES, at least 2;
-        // the shared function at its PAGE gives the same.
+        // The sets sized in place: the q rows and the kv pages as laid whole
+        // against ATTN_SET_BYTES, at least 2; the shared function at its
+        // PAGE gives the same.
         for (keys, d) in [(1, 64), (17, 128), (2234, 128), (4467, 256)] {
             let at = engine::rates::ATTN_SHAPE.at(keys).with_dim(d);
             let pages = at.rows.div_ceil(PAGE);
@@ -1321,7 +1318,7 @@ mod ensure_tests {
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
-            kernel_tflops_by_shape: None,
+            kernel_curves: None,
             dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,

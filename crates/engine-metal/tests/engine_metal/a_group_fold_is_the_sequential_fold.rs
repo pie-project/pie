@@ -13,6 +13,7 @@ use kernels_metal::ssm::{self, Corrected, GroupFolds, Paged};
 use kernels_metal::tensor::RecurrentPool;
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
+use crate::common::{bf16_round};
 
 const K_HEADS: u32 = 16;
 const V_HEADS: u32 = 32;
@@ -35,12 +36,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
 }
 
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
@@ -261,7 +256,6 @@ fn gated_delta(bench: &Bench, n: u32) {
         .zip(&want)
         .map(|(&g, &w)| (f64::from(g) - w).abs())
         .fold(0f64, f64::max);
-    eprintln!("gated-delta fold of {n} rows: worst {worst:.3e} of a state of magnitude {scale:.3e}");
     assert!(
         worst <= 1e-5 * scale.max(1.0),
         "the group fold of {n} rows is {worst:e} from the sequential recurrence (scale {scale:e})"

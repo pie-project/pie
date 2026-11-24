@@ -211,17 +211,6 @@ impl Plane {
         }
     }
 
-    /// A result landing `head` columns of every `stride` from `from` of
-    /// each of its rows (a head-major slice: Qwen 3.5's q, interleaved with
-    /// its gate a head), `width` of them in `t`, one head after another.
-    #[must_use]
-    pub fn window_strided(t: &Tensor, from: u32, width: u32, head: u32, stride: u32) -> Self {
-        Self {
-            store: Store::of(kernels_ir::Window::strided(from, width, head, stride), None),
-            ..Self::rows(t)
-        }
-    }
-
     /// A result landing the columns `from..from + width` of each row in
     /// `cache`'s row its page and slot name.
     #[must_use]

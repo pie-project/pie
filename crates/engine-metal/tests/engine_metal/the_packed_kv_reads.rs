@@ -1,9 +1,9 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2c-1 — the DECODE sdpa read over a PACKED 4-bit KV cache.
+//! The sdpa reads over a PACKED 4-bit KV cache: decode, and the tiled prefill.
 //!
-//! C2b proved the quantizing WRITE path leaves a self-consistent 4-bit cache.
-//! This proves the matching READ: the decode sdpa kernel, dispatched on the
+//! `the_kv_write_round_trips` checks the quantizing WRITE path; this file checks
+//! the matching READS. The DECODE read: the decode sdpa kernel, dispatched on the
 //! pool's `KvU4` dtype, byte-indexes each 130-byte block, unpacks the lane's
 //! offset-binary nibbles (`q = nibble - 8`), rescales by the block's inline fp16
 //! scale, and attends with the SAME math as the bf16 decode.
@@ -15,19 +15,29 @@
 //! should reconstruct. If the read dequantizes + attends correctly the two agree
 //! to a bf16-rounding-tight tolerance; a wrong offset or nibble parity shows up
 //! as a large deviation (that is a bug to surface, not a tolerance to loosen).
-//! The packed-vs-original deviation is printed too — that IS the 4-bit quant
-//! error, expected small-but-nonzero.
+//!
+//! The TILED reads, the prefill, the masked prefill and the prefill that also
+//! publishes a log-sum-exp (prefill_lse): those sdpa kernels, dispatched on the pool's `KvU4` dtype,
+//! stage each cached (slot, kv_head) into shared memory by byte-indexing its
+//! 130-byte block, unpacking the offset-binary nibbles (`q = nibble - 8`) and
+//! rescaling by the block's inline fp16 scale — then run the SAME tile matmul,
+//! softmax and lse as the bf16 tiled path.
+//!
+//! ISOLATING DEQUANT FROM QUANT LOSS (as for the decode read). Comparing the
+//! packed read against a bf16 read on the ORIGINAL K/V would fold in the 4-bit
+//! quantization error and could hide a read bug behind it. Instead the reference
+//! is a bf16 read over the K/V UNPACKED FROM THE PACKED CACHE: the exact values
+//! the staging load should reconstruct. A correct dequant + attention agrees with
+//! it to a bf16-rounding-tight tolerance; a wrong offset, nibble parity, byte
+//! index or scale shows up as a large deviation (a bug to surface, not a tolerance
+//! to loosen).
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::attn::{self, DecodePlan};
-use kernels_metal::{KvPool, Tensor};
+use kernels_metal::attn::{self, DecodePlan, PrefillPlan};
+use kernels_metal::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
-
-/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
-fn mask_words(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
+use crate::common::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, mask_words};
 
 const KV_HEADS: usize = 2;
 const Q_HEADS: usize = 4; // gqa = 2
@@ -36,13 +46,31 @@ const PAGE_SIZE: u32 = 32;
 const PAGES: u32 = 1;
 
 /// The head_dims the packed read is proven at. The codec block IS the head_dim,
-/// so this exercises the read shaders stamped at 256 AND 128.
+/// so this exercises the tiled read shaders stamped at 256 AND 128.
 const HEAD_DIMS: [usize; 2] = [256, 128];
 
 /// Packed bytes for one head at codec block `head_dim`: `head_dim/2` nibble bytes
 /// plus one inline fp16 scale (130 at 256, 66 at 128).
 fn packed_bytes(head_dim: usize) -> usize {
     head_dim / 2 + 2
+}
+
+/// The three tiled read ops this path serves — all one shared staging hook.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Prefill,
+    Masked,
+    PrefillLse,
+}
+
+impl Op {
+    fn label(self) -> &'static str {
+        match self {
+            Op::Prefill => "prefill",
+            Op::Masked => "masked",
+            Op::PrefillLse => "prefill_lse",
+        }
+    }
 }
 
 // --- deterministic K/V/Q data ------------------------------------------------
@@ -96,10 +124,10 @@ fn plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32> {
 /// `scale = absmax/7 = S` is exactly the same power of two, quantization is
 /// LOSSLESS (`round(q*S / S) = q`), and every dequant value `q*S` (<=3 mantissa
 /// bits, |q*S| <= 1.75) is representable exactly in bf16. The packed kernel's
-/// fp32 dequant and the bf16 reference therefore see BIT-IDENTICAL K/V — the
+/// fp32 dequant and the bf16 reference therefore stage BIT-IDENTICAL K/V — the
 /// bf16-rounding residual the random case reasons about is removed, so the two
-/// decodes must agree to fp32 accumulation noise. `q` varies deterministically
-/// per (block, element) for coverage.
+/// reads must agree to fp32 accumulation noise. `q` varies deterministically per
+/// (block, element) for coverage.
 fn exact_plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32> {
     const S: f32 = 0.25; // 2^-2, exact in fp16 and bf16
     let mut v = vec![0.0f32; rows * width];
@@ -120,16 +148,6 @@ fn exact_plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32> {
 
 // --- bf16 / fp16 bit helpers -------------------------------------------------
 
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
-}
-
-fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
-
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
         .flat_map(|&f| f32_to_bf16_bits(f).to_le_bytes())
@@ -144,22 +162,12 @@ fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Decode an IEEE binary16 bit pattern to f32 (exact — every f16 is an f32).
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = if (bits >> 15) & 1 == 1 { -1.0f32 } else { 1.0 };
-    let exp = (bits >> 10) & 0x1f;
-    let mant = bits & 0x3ff;
-    if exp == 0 {
-        sign * f32::from(mant) * 2f32.powi(-24)
-    } else if exp == 0x1f {
-        if mant == 0 {
-            sign * f32::INFINITY
-        } else {
-            f32::NAN
-        }
-    } else {
-        sign * (1.0 + f32::from(mant) / 1024.0) * 2f32.powi(i32::from(exp) - 15)
-    }
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn f32_floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// The fp32 K/V a correct read reconstructs from one packed `block`-element head
@@ -252,12 +260,11 @@ fn packed_pool(rig: &mut Rig, head_dim: usize) -> (KvPool, u32, u32, u64) {
     (pool, keys, values, kbytes)
 }
 
-fn bf16_pool(rig: &mut Rig, head_dim: usize) -> (KvPool, u32) {
+fn tiled_bf16_pool(rig: &mut Rig, head_dim: usize) -> KvPool {
     let width = KV_HEADS * head_dim;
     let (keys, _) = rig.zeroed((CELLS as usize * width * 2) as u64);
     let (values, _) = rig.zeroed((CELLS as usize * width * 2) as u64);
-    let pool = pool_over(rig, keys, values, Dtype::Bf16, head_dim);
-    (pool, keys)
+    pool_over(rig, keys, values, Dtype::Bf16, head_dim)
 }
 
 fn pool_over(rig: &mut Rig, keys: u32, values: u32, dtype: Dtype, head_dim: usize) -> KvPool {
@@ -283,6 +290,354 @@ fn write_kv(rig: &Rig, pool: &KvPool, kt: Tensor, vt: Tensor, wpt: Tensor, wot: 
     rig.fire(|s| {
         attn::kv_append(s, kt, vt, pool, wpt, wot).expect("kv_append launch");
     });
+}
+
+// --- the query fire ----------------------------------------------------------
+
+/// Query rows: a batch of prefill tokens for request 0 at varied positions, each
+/// attending causally over the cached KV. `positions` also indexes the mask.
+const POSITIONS: [i32; 4] = [3, 8, 14, (N_KV - 1) as i32];
+
+struct Fires {
+    qt: Tensor,
+    indptr: Tensor,
+    positions: Tensor,
+    request_of_token: Tensor,
+    // mask-disabled tables (prefill / prefill_lse)
+    open_mask: Tensor,
+    open_enabled: Tensor,
+    // mask-enabled tables (masked): one keep byte per (row, key), stride N_KV
+    keep_mask: Tensor,
+    keep_enabled: Tensor,
+    sm_scale: f32,
+    rows: usize,
+    head_dim: usize,
+}
+
+fn build_fires(rig: &mut Rig, head_dim: usize) -> Fires {
+    let rows = POSITIONS.len();
+    let hpos = rig.i32s(&POSITIONS);
+    let hreq = rig.i32s(&[0i32; 4]);
+    let hindptr = rig.u32s(&[0u32, rows as u32]); // one request owning all rows
+
+    let open_mask = rig.u8s(&mask_words(&[0u32; 4])); // never read while disabled
+    let open_enabled = rig.u8s(&mask_words(&[0u32; 4])); // 0 → full causal, mask off
+
+    // A dense all-keep mask, stride N_KV: causal is still enforced by the kernel
+    // (kp > q_pos is rejected independently), so an all-ones mask exercises the
+    // masked kernel's mask-read path while leaving the attended set = causal.
+    let keep_mask = rig.u8s(&[1u8; N_KV * 4]);
+    let keep_enabled = rig.u8s(&mask_words(&[1u32; 4])); // 1 → apply the mask
+
+    // seeded queries, bf16-rounded
+    let q_src: Vec<f32> = (0..(rows * Q_HEADS * head_dim) as u64)
+        .map(|i| 0.5 * gaussian(i ^ 0x0071))
+        .collect();
+    let hq = rig.bf16(&q_src);
+
+    Fires {
+        qt: Tensor::new(hq, rows as u32, (Q_HEADS * head_dim) as u32, Dtype::Bf16),
+        indptr: Tensor::new(hindptr, 2, 1, Dtype::U32),
+        positions: Tensor::new(hpos, rows as u32, 1, Dtype::I32),
+        request_of_token: Tensor::new(hreq, rows as u32, 1, Dtype::I32),
+        open_mask: Tensor::new(open_mask, rows as u32, 1, Dtype::U8),
+        open_enabled: Tensor::new(open_enabled, rows as u32, 1, Dtype::U32),
+        keep_mask: Tensor::new(keep_mask, rows as u32, N_KV as u32, Dtype::U8),
+        keep_enabled: Tensor::new(keep_enabled, rows as u32, 1, Dtype::U32),
+        sm_scale: (head_dim as f32).sqrt().recip(),
+        rows,
+        head_dim,
+    }
+}
+
+/// Fire one tiled read `op` over `pool`; return (output plane f32, optional lse).
+fn read_over(rig: &Rig, pool: &KvPool, op: Op, f: &Fires) -> (Vec<f32>, Option<Vec<f32>>) {
+    let head_dim = f.head_dim;
+    let out_elems = f.rows * Q_HEADS * head_dim;
+    let (ho, obytes) = {
+        let b = Buffer::zeroed(&rig.device, (out_elems * 2) as u64).expect("out");
+        let h = rig.handles.bind(&b, 0, b.bytes()).expect("out handle");
+        Box::leak(Box::new(b)); // outlive the fire (handles index it)
+        (h, (out_elems * 2) as u64)
+    };
+    let ot = Tensor::new(ho, f.rows as u32, (Q_HEADS * head_dim) as u32, Dtype::Bf16);
+
+    let lse_elems = f.rows * Q_HEADS;
+    let (hl, lbytes) = {
+        let b = Buffer::zeroed(&rig.device, (lse_elems * 4) as u64).expect("lse");
+        let h = rig.handles.bind(&b, 0, b.bytes()).expect("lse handle");
+        Box::leak(Box::new(b));
+        (h, (lse_elems * 4) as u64)
+    };
+    let lt = Tensor::new(hl, f.rows as u32, Q_HEADS as u32, Dtype::F32);
+
+    let (plan_open, plan_keep) = (
+        PrefillPlan {
+            positions: f.positions,
+            last_page_len: f.positions,
+            request_of_token: f.request_of_token,
+            mask: f.open_mask,
+            mask_enabled: f.open_enabled,
+            mask_stride: 1,
+        },
+        PrefillPlan {
+            positions: f.positions,
+            last_page_len: f.positions,
+            request_of_token: f.request_of_token,
+            mask: f.keep_mask,
+            mask_enabled: f.keep_enabled,
+            mask_stride: N_KV as u32,
+        },
+    );
+    let qrag = RaggedTensor {
+        data: f.qt,
+        indptr: f.indptr,
+    };
+
+    rig.fire(|s| match op {
+        Op::Prefill => {
+            attn::prefill(
+                s,
+                &engine_metal::chip::tuning("", false),
+                qrag,
+                &plan_open,
+                pool,
+                None,
+                head_dim as u32,
+                KV_HEADS as u32,
+                f.sm_scale,
+                ot,
+            )
+            .expect("prefill launch");
+        }
+        Op::Masked => {
+            attn::masked(
+                s,
+                &engine_metal::chip::tuning("", false),
+                qrag,
+                &plan_keep,
+                f.keep_mask,
+                pool,
+                None,
+                head_dim as u32,
+                true,
+                f.sm_scale,
+                ot,
+            )
+            .expect("masked launch");
+        }
+        Op::PrefillLse => {
+            attn::prefill_lse(
+                s,
+                &engine_metal::chip::tuning("", false),
+                qrag,
+                &plan_open,
+                pool,
+                None,
+                head_dim as u32,
+                KV_HEADS as u32,
+                f.sm_scale,
+                ot,
+                lt,
+            )
+            .expect("prefill_lse launch");
+        }
+    });
+
+    let out = bf16_floats(&rig.handles.read(ho, obytes).expect("read out"));
+    let lse = match op {
+        Op::PrefillLse => Some(f32_floats(&rig.handles.read(hl, lbytes).expect("read lse"))),
+        _ => None,
+    };
+    (out, lse)
+}
+
+fn deviation(a: &[f32], b: &[f32]) -> (f64, f64) {
+    assert_eq!(a.len(), b.len());
+    let mut max = 0.0f64;
+    let mut sum = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        let d = (f64::from(*x) - f64::from(*y)).abs();
+        max = max.max(d);
+        sum += d;
+    }
+    (max, sum / a.len() as f64)
+}
+
+/// The per-(case, op) measurement: pack the seeded K/V, read over the packed
+/// cache, over a bf16 cache holding the K/V UNPACKED from the packed cache (the
+/// isolate reference), and over a bf16 cache holding the ORIGINAL K/V (the
+/// quant-error reference). Returns ((iso max, iso mean), (quant max, quant mean),
+/// optional lse iso max) for the given op.
+fn tiled_case(
+    rig: &mut Rig,
+    _: &str,
+    op: Op,
+    fires: &Fires,
+    k_src: &[f32],
+    v_src: &[f32],
+) -> ((f64, f64), (f64, f64), Option<f64>) {
+    let head_dim = fires.head_dim;
+    let width = (KV_HEADS * head_dim) as u32;
+    let per = packed_bytes(head_dim);
+    // ---- seed the write tables ----------------------------------------------
+    let hk = rig.bf16(k_src);
+    let hv = rig.bf16(v_src);
+    let w_page = rig.u32s(&[0u32; N_KV]);
+    let w_off = rig.u32s(&(0..N_KV as u32).collect::<Vec<_>>());
+    let kt = Tensor::new(hk, N_KV as u32, width, Dtype::Bf16);
+    let vt = Tensor::new(hv, N_KV as u32, width, Dtype::Bf16);
+    let wpt = Tensor::new(w_page, N_KV as u32, 1, Dtype::U32);
+    let wot = Tensor::new(w_off, N_KV as u32, 1, Dtype::U32);
+
+    // ---- the packed cache + the original bf16 cache (same seeded K/V) --------
+    let (packed, keys_h, values_h, kbytes) = packed_pool(rig, head_dim);
+    write_kv(rig, &packed, kt, vt, wpt, wot);
+    let orig_bf16 = tiled_bf16_pool(rig, head_dim);
+    write_kv(rig, &orig_bf16, kt, vt, wpt, wot);
+
+    // ---- reference cache: the K/V UNPACKED from the packed cache -------------
+    // Read the packed bytes back, dequantize each (slot, head) 256-block to fp32,
+    // lay it out as [N_KV, KV_HEADS*HEAD_DIM], and append into a fresh bf16 pool.
+    // Reading over this pool is what a correct packed read must reproduce (up to
+    // bf16 storage rounding of the dequantized values).
+    let keys_raw = rig.handles.read(keys_h, kbytes).expect("read packed keys");
+    let values_raw = rig
+        .handles
+        .read(values_h, kbytes)
+        .expect("read packed values");
+    let mut k_deq = vec![0.0f32; N_KV * KV_HEADS * head_dim];
+    let mut v_deq = vec![0.0f32; N_KV * KV_HEADS * head_dim];
+    for i in 0..N_KV {
+        for h in 0..KV_HEADS {
+            let slot = i; // page 0, offset i
+            let base = (slot * KV_HEADS + h) * per;
+            let kb = unpack_block(&keys_raw[base..base + per], head_dim);
+            let vb = unpack_block(&values_raw[base..base + per], head_dim);
+            let row = i * KV_HEADS * head_dim + h * head_dim;
+            k_deq[row..row + head_dim].copy_from_slice(&kb);
+            v_deq[row..row + head_dim].copy_from_slice(&vb);
+        }
+    }
+    let hkd = rig.bf16(&k_deq);
+    let hvd = rig.bf16(&v_deq);
+    let ktd = Tensor::new(hkd, N_KV as u32, width, Dtype::Bf16);
+    let vtd = Tensor::new(hvd, N_KV as u32, width, Dtype::Bf16);
+    let unpacked_bf16 = tiled_bf16_pool(rig, head_dim);
+    write_kv(rig, &unpacked_bf16, ktd, vtd, wpt, wot);
+
+    // ---- the three reads ----------------------------------------------------
+    let (out_packed, lse_packed) = read_over(rig, &packed, op, fires);
+    let (out_unpacked, lse_unpacked) = read_over(rig, &unpacked_bf16, op, fires);
+    let (out_orig, _) = read_over(rig, &orig_bf16, op, fires);
+
+    let iso = deviation(&out_packed, &out_unpacked);
+    let quant = deviation(&out_packed, &out_orig);
+    let lse_iso = match (lse_packed, lse_unpacked) {
+        (Some(a), Some(b)) => Some(deviation(&a, &b).0),
+        _ => None,
+    };
+
+    (iso, quant, lse_iso)
+}
+
+#[test]
+fn the_packed_kv_tiled_reads() {
+    let Some(mut rig) = Rig::open() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+
+    // The codec block IS the head_dim; prove the packed tiled read at 256 AND 128.
+    for &head_dim in &HEAD_DIMS {
+        let fires = build_fires(&mut rig, head_dim);
+
+        for op in [Op::Prefill, Op::Masked, Op::PrefillLse] {
+            // ---- CASE 1: realistic random K/V (off-grid) ------------------------
+            // Off-grid Gaussians with modest spikes: quantization is lossy (the FYI
+            // quant number is meaty) and the isolate deviation is bounded by bf16
+            // STORAGE rounding of the reconstructed values — the output is a
+            // softmax-convex combination of V, so it cannot deviate by more than the
+            // bf16 ulp of the biggest V it mixes. A wrong offset (q vs q+8), swapped
+            // nibble parity, or a mis-indexed staging element corrupts the
+            // reconstructed K/V across every block and drives the mean up by orders of
+            // magnitude. Assert the mean is tight AND the whole isolate error sits far
+            // below the real 4-bit quant error (the read reconstructs the INTENDED
+            // values, it is not merely landing inside quantization noise).
+            let ((r_iso_max, r_iso_mean), (r_q_max, _), _) = tiled_case(
+                &mut rig,
+                "random",
+                op,
+                &fires,
+                &plane(N_KV, KV_HEADS * head_dim, head_dim, 0x0C2C),
+                &plane(N_KV, KV_HEADS * head_dim, head_dim, 0x0DEC),
+            );
+            assert!(
+                r_iso_mean < 2.0e-3,
+                "{} d={head_dim}: the packed read parts from the bf16 read on the SAME (unpacked) K/V \
+             by mean {r_iso_mean:.3e} — a systematic dequant/offset/parity bug, not bf16 rounding",
+                op.label()
+            );
+            assert!(
+                r_iso_max < 3.0e-2,
+                "{} d={head_dim}: the packed read's worst element parts by {r_iso_max:.3e}, above the \
+             bf16 storage-rounding ceiling — surface it as a read bug, do not loosen",
+                op.label()
+            );
+            assert!(
+                r_iso_max * 6.0 < r_q_max,
+                "{} d={head_dim}: the isolate deviation {r_iso_max:.3e} is not clearly below the 4-bit \
+             quant error {r_q_max:.3e}; the read must reconstruct the intended K/V, not merely \
+             land within quantization noise",
+                op.label()
+            );
+            assert!(
+                r_q_max.is_finite() && r_q_max > 0.0,
+                "{} d={head_dim}: the 4-bit quant error should be finite and nonzero, got {r_q_max:.3e}",
+                op.label()
+            );
+
+            // ---- CASE 2: bf16-EXACT K/V (on-grid) — the unambiguous exactness proof
+            // Every seed is q*S for q in [-7,7], S = 2^-2, with ±7*S planted per block.
+            // Quantization is LOSSLESS and every dequant value is bf16-exact, so the
+            // packed staging load and the bf16 reference stage BIT-IDENTICAL K/V. The
+            // two tiled paths run the SAME fp32 body over the SAME inputs, so they must
+            // agree to fp32-accumulation noise (expected ~0). A TIGHT max here is a
+            // direct proof the dequant (offset, parity, scale, byte-index) is exact.
+            let ((e_iso_max, _), (_e_q_max, _), e_lse_iso) = tiled_case(
+                &mut rig,
+                "bf16-exact",
+                op,
+                &fires,
+                &exact_plane(N_KV, KV_HEADS * head_dim, head_dim, 0x0E7A),
+                &exact_plane(N_KV, KV_HEADS * head_dim, head_dim, 0x0E7B),
+            );
+            assert!(
+                e_iso_max < 1.0e-5,
+                "{} d={head_dim}: the packed read parts from the bf16 read on BIT-IDENTICAL (on-grid) \
+             K/V by max {e_iso_max:.3e} — the dequant is NOT exact (a real \
+             offset/parity/scale/index bug), not a tolerance to loosen",
+                op.label()
+            );
+            if let Some(m) = e_lse_iso {
+                assert!(
+                    m < 1.0e-5,
+                    "{} d={head_dim}: the packed lse parts from the bf16 lse on BIT-IDENTICAL K/V by \
+                 max {m:.3e} — the lse variant's dequant is NOT exact",
+                    op.label()
+                );
+            }
+        }
+    }
+
+}
+
+fn decode_bf16_pool(rig: &mut Rig, head_dim: usize) -> (KvPool, u32) {
+    let width = KV_HEADS * head_dim;
+    let (keys, _) = rig.zeroed((CELLS as usize * width * 2) as u64);
+    let (values, _) = rig.zeroed((CELLS as usize * width * 2) as u64);
+    let pool = pool_over(rig, keys, values, Dtype::Bf16, head_dim);
+    (pool, keys)
 }
 
 /// Decode one output plane over `pool`; returns rows*Q_HEADS*head_dim f32.
@@ -323,25 +678,13 @@ fn decode_over(
     bf16_floats(&rig.handles.read(ho, obytes).expect("read out"))
 }
 
-fn deviation(a: &[f32], b: &[f32]) -> (f64, f64) {
-    assert_eq!(a.len(), b.len());
-    let mut max = 0.0f64;
-    let mut sum = 0.0f64;
-    for (x, y) in a.iter().zip(b) {
-        let d = (f64::from(*x) - f64::from(*y)).abs();
-        max = max.max(d);
-        sum += d;
-    }
-    (max, sum / a.len() as f64)
-}
-
 /// The per-case measurement: pack the seeded K/V, decode over the packed cache,
 /// over a bf16 cache holding the K/V unpacked FROM the packed cache (the isolate
 /// reference), and over a bf16 cache holding the ORIGINAL K/V (the quant-error
 /// reference). Returns ((isolate max, isolate mean), (quant max, quant mean)).
-fn run_case(
+fn decode_case(
     rig: &mut Rig,
-    label: &str,
+    _: &str,
     head_dim: usize,
     k_src: &[f32],
     v_src: &[f32],
@@ -361,7 +704,7 @@ fn run_case(
     // ---- the packed cache + the original bf16 cache (same seeded K/V) --------
     let (packed, keys_h, values_h, kbytes) = packed_pool(rig, head_dim);
     write_kv(rig, &packed, kt, vt, wpt, wot);
-    let (orig_bf16, _) = bf16_pool(rig, head_dim);
+    let (orig_bf16, _) = decode_bf16_pool(rig, head_dim);
     write_kv(rig, &orig_bf16, kt, vt, wpt, wot);
 
     // ---- reference cache: the K/V UNPACKED from the packed cache -------------
@@ -391,7 +734,7 @@ fn run_case(
     let hvd = rig.bf16(&v_deq);
     let ktd = Tensor::new(hkd, N_KV as u32, width, Dtype::Bf16);
     let vtd = Tensor::new(hvd, N_KV as u32, width, Dtype::Bf16);
-    let (unpacked_bf16, _) = bf16_pool(rig, head_dim);
+    let (unpacked_bf16, _) = decode_bf16_pool(rig, head_dim);
     write_kv(rig, &unpacked_bf16, ktd, vtd, wpt, wot);
 
     // ---- decode plan: a few decode queries at varied positions, request 0 ----
@@ -427,31 +770,18 @@ fn run_case(
     // ---- (FYI) packed read vs bf16 decode on the ORIGINAL K/V = 4-bit quant err
     let quant = deviation(&out_packed, &out_orig);
 
-    eprintln!(
-        "[{label:>10} d={head_dim:>3} isolate] packed decode vs bf16-decode-on-unpacked-from-packed: \
-         max={:.3e} mean={:.3e}",
-        iso.0, iso.1
-    );
-    eprintln!(
-        "[{label:>10} d={head_dim:>3} quant  ] packed decode vs bf16-decode-on-original K/V:         \
-         max={:.3e} mean={:.3e}",
-        quant.0, quant.1
-    );
     (iso, quant)
 }
 
 #[test]
 fn the_packed_kv_decode_reads() {
-    eprintln!("=== C2c-1: dequantizing decode read for packed 4-bit KV ===");
     let Some(mut rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");
         return;
     };
-    eprintln!("device: {}", rig.device.name());
 
     // The codec block IS the head_dim; prove the packed decode at 256 AND 128.
     for &head_dim in &HEAD_DIMS {
-        eprintln!("--- head_dim {head_dim} (codec block {head_dim}) ---");
 
         // ---- CASE 1: realistic random K/V (off-grid) ----------------------------
         // Off-grid Gaussians with modest spikes: quantization is lossy (the FYI quant
@@ -464,7 +794,7 @@ fn the_packed_kv_decode_reads() {
         // magnitude. Assert the mean is tight AND the whole isolate error sits far
         // below the real 4-bit quant error (the read reconstructs the INTENDED
         // values, it is not merely landing inside quantization noise).
-        let ((r_iso_max, r_iso_mean), (r_q_max, _)) = run_case(
+        let ((r_iso_max, r_iso_mean), (r_q_max, _)) = decode_case(
             &mut rig,
             "random",
             head_dim,
@@ -504,7 +834,7 @@ fn the_packed_kv_decode_reads() {
         // lossless, the "quant" reference is ALSO bit-identical here — so its number
         // is ~0 too, and there is no lossy error to separate from (the random case
         // above carries that contrast).
-        let ((e_iso_max, e_iso_mean), (e_q_max, _)) = run_case(
+        let ((e_iso_max, _), (_, _)) = decode_case(
             &mut rig,
             "bf16-exact",
             head_dim,
@@ -517,13 +847,6 @@ fn the_packed_kv_decode_reads() {
          (on-grid) K/V by max {e_iso_max:.3e} — the dequant is NOT exact (a real \
          offset/parity/scale/index bug), not a tolerance to loosen"
         );
-        eprintln!(
-            "[bf16-exact d={head_dim:>3}] isolate max {e_iso_max:.3e} mean {e_iso_mean:.3e}, lossless-quant \
-         max {e_q_max:.3e} — dequant is exact on-grid"
-        );
     }
 
-    eprintln!(
-        "=== C2c-1 done: the packed 4-bit KV decode read dequantizes + attends correctly (d=128 & 256) ==="
-    );
 }
