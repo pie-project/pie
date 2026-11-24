@@ -369,6 +369,28 @@ pub enum GdnScan {
     },
 }
 
+/// How a short carry (each lane a decode row over at most a chunk of
+/// carried rows) runs its gated-delta scan: `prepared`, a pass a lane and
+/// value head ahead of it making the scan's inputs once and the scan
+/// reading them dense, or `inline`, every simdgroup of the scan making its
+/// own. The prepared form's two more launches a layer are a fixed cost a
+/// fire of few lanes does not win back, so where it pays is the chip's and
+/// the lanes': `pie tune metal` measures it, and a chip's file states what
+/// was measured on it (the M1 Max's). The default is the form before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.gdn.carried",
+    shape(rows; carried),
+    tune = search,
+    default = r#"[{ use = "inline" }]"#
+)]
+pub enum GdnCarried {
+    /// The scan over a record a lane, made by `gated_delta_carried_prep`.
+    Prepared,
+    /// Every simdgroup makes its own inputs.
+    Inline,
+}
+
 /// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
@@ -395,7 +417,8 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaMma>()
         .add::<SdpaKvQ8>()
         .add::<SdpaSplitBf16>()
-        .add::<GdnScan>();
+        .add::<GdnScan>()
+        .add::<GdnCarried>();
 }
 
 #[derive(Clone, Debug)]
@@ -676,6 +699,22 @@ impl Tuning {
     #[must_use]
     pub fn gdn_scan(&self) -> GdnScan {
         *self.profile.get::<GdnScan>()
+    }
+
+    /// The form a short carry of `lanes` lanes (its rows: one a lane), each
+    /// carrying up to `carried` rows, runs its gated-delta scan in.
+    #[must_use]
+    pub fn gdn_carried(&self, lanes: u32, carried: u32) -> GdnCarried {
+        let at = GdnCarriedAt {
+            rows: i64::from(lanes),
+            carried: i64::from(carried),
+        };
+        self.profile
+            .ladder::<GdnCarried>()
+            .candidates(&at)
+            .next()
+            .copied()
+            .unwrap_or(GdnCarried::Inline)
     }
 }
 

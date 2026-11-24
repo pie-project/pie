@@ -1207,14 +1207,32 @@ pub struct Paged {
     pub page_ints: u32,
 }
 
+/// The floats a lane's short-carry record takes (`GdnShortRecord` in
+/// `ssm/gdn_scan.metal`): the own row's normed q and k a key head, each of
+/// up to [`GDN_CARRIED_INLINE`] carried rows' normed keys a key head and
+/// corrected values a value head, their decays, the own row's scalars, and
+/// the lane's facts.
+fn short_record_floats(k_heads: u32, v_heads: u32) -> u64 {
+    let (k, v, r, d) = (
+        u64::from(k_heads),
+        u64::from(v_heads),
+        u64::from(GDN_CARRIED_INLINE),
+        u64::from(GDN_VERIFY_DIM),
+    );
+    (2 + r) * k * d + r * v * d + r * v + 4 * v + v * d + 8
+}
+
 /// The pipelines [`gated_delta_carried`] dispatches whatever its lanes
 /// carry: both forms (16 value rows a threadgroup, a head's 128) and the
 /// per-head table's prepass. A load that buffers recurrent rows builds them
 /// before ready, a beam's long carry being one its warm walk does not reach.
 #[must_use]
-pub fn carried_pipelines() -> [Fire; 7] {
+pub fn carried_pipelines() -> [Fire; 10] {
     [
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_short_bfloat16_s_8_v_4"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prep_bfloat16"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prepped_bfloat16_s_8_v_4"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_land_bfloat16"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16"),
@@ -1529,6 +1547,7 @@ fn gated_delta_verify_at(
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_carried(
     ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
     qkv: Tensor,
     indptr: Tensor,
     committed: &Committed,
@@ -1582,7 +1601,67 @@ pub fn gated_delta_carried(
         // Four value rows a simdgroup, as the scan step's, eight simdgroups
         // a threadgroup: a head over four threadgroups. On the M1 at c1 / c4
         // it beat 4 x 4, 8 x 2, 8 x 8, 8 x 16 and 2 x 16.
-        let (sg, vrows, name) = (8, 4, "gated_delta_carried_short_bfloat16_s_8_v_4");
+        let (sg, vrows) = (8, 4);
+        // A record a lane in the seat's work area, when it holds one: the
+        // prep makes each lane and value head's inputs once (the own row's
+        // normed q and k, its gates, its landing, the carried rows dense),
+        // which every simdgroup of the short scan otherwise makes for itself.
+        let record = short_record_floats(k_heads, v_heads);
+        let holds = u64::from(k_heads) * u64::from(table.rows) * 4 >= record;
+        // The prepared form where the profile's `kernel.gdn.carried` picks it
+        // at these lanes ([`crate::tuning::GdnCarried`]).
+        if holds && tuning.gdn_carried(lanes, table.max_rep) == crate::tuning::GdnCarried::Prepared {
+            let args = |table_arg| -> Result<Vec<_>, Error> {
+                Ok(vec![
+                    qkv.arg(),
+                    indptr.arg(),
+                    committed.replay.arg(),
+                    committed.commit.arg(),
+                    committed.slots.arg(),
+                    stated(OP, committed.lane0)?.arg(),
+                    gates.ba.arg(),
+                    gates.a_log.arg(),
+                    gates.dt_bias.arg(),
+                    state.state.arg_mut(),
+                    y.arg_mut(),
+                    gates.gates.arg_mut(),
+                    stated(OP, k_heads)?.arg(),
+                    stated(OP, v_heads)?.arg(),
+                    ba_paged.slab.arg_mut(),
+                    ba_paged.pages.arg(),
+                    ba_paged.page_tokens.arg(),
+                    ba_paged.page_bytes.arg(),
+                    ba_paged.row_bytes.arg(),
+                    corrected.keys.arg_mut(),
+                    corrected.key_row_bytes.arg(),
+                    corrected.u.arg_mut(),
+                    corrected.u_row_bytes.arg(),
+                    state.segments.arg(),
+                    ba_paged.page_ints.arg(),
+                    table_arg,
+                    table.rows.arg(),
+                    committed.ext_replay.arg(),
+                    corrected.scalars.arg_mut(),
+                    corrected.scalars_row_bytes.arg(),
+                ])
+            };
+            ctx.fire(
+                Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prep_bfloat16")
+                    .apply(Grid::of([GDN_SCAN_LANES, 1, z], [GDN_SCAN_LANES, 1, 1])),
+                &args(table.table.arg_mut())?,
+            )?;
+            ctx.fire(
+                Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prepped_bfloat16_s_8_v_4")
+                    .apply(gated_delta_verify_grid(sg, vrows, z)),
+                &args(table.table.arg_mut())?,
+            )?;
+            return ctx.fire(
+                Fire::at(GDN_SCAN_FILE, "gated_delta_carried_land_bfloat16")
+                    .apply(Grid::of([GDN_SCAN_LANES, 1, z], [GDN_SCAN_LANES, 1, 1])),
+                &args(table.table.arg())?,
+            );
+        }
+        let name = "gated_delta_carried_short_bfloat16_s_8_v_4";
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, name).apply(gated_delta_verify_grid(sg, vrows, z)),
             &[
