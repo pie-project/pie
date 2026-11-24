@@ -503,9 +503,6 @@ mod tests {
     fn an_unregistered_engine_names_no_devices_memory() {
         let domain = super::device_domain(usize::MAX);
         assert_eq!(domain, ::engine::MemoryDomain::HostPinned);
-        assert_ne!(domain, ::engine::MemoryDomain::CudaDevice(0));
-        assert_ne!(domain, ::engine::MemoryDomain::VulkanDevice(0));
-        assert_ne!(domain, ::engine::MemoryDomain::WgpuDevice(0));
-        assert_ne!(domain, ::engine::MemoryDomain::MetalPrivate);
+        assert!(!matches!(domain, ::engine::MemoryDomain::Device { .. }));
     }
 }

@@ -14,7 +14,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain};
+use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
 use engine::{Channels, Completion, Engine, Pool, Programs, Tiers, WeightCache};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
@@ -115,7 +115,20 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
             "`copy_kv` into host-pinned memory, which needs a swap pool this load does not \
              reserve"
         }
-        (MemoryDomain::MetalPrivate, _) | (_, MemoryDomain::MetalPrivate) => {
+        (
+            MemoryDomain::Device {
+                reach: DeviceReach::Private,
+                ..
+            },
+            _,
+        )
+        | (
+            _,
+            MemoryDomain::Device {
+                reach: DeviceReach::Private,
+                ..
+            },
+        ) => {
             "`copy_kv` with a Metal PRIVATE end, and every reservation this load made is \
              Shared — there are no private pages here to read or write"
         }
@@ -518,7 +531,10 @@ impl Engine for Metal {
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "metal".to_string(),
-                domain: MemoryDomain::MetalShared,
+                domain: MemoryDomain::Device {
+                    ordinal: 0,
+                    reach: DeviceReach::HostShared,
+                },
                 sms: 0,
                 unified_memory: true,
                 fp8_native: false,
@@ -541,6 +557,7 @@ impl Engine for Metal {
                     &budgets, &trace,
                 )))
                 .unwrap_or(u32::MAX),
+                dispatch_depth: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,

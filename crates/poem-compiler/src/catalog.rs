@@ -354,6 +354,67 @@ impl Catalog {
         })
     }
 
+    /// The contract `trace`'s params land from `checkpoint` by: a stamped artifact's own
+    /// planes, else the import contract of the deployment `trace` names.
+    pub fn contract_for(&self, trace: &Trace, checkpoint: &Path) -> Result<ModelContract, String> {
+        let said = |error: &dyn std::fmt::Display| format!("{error:#}");
+        let source = checkpoint::file::snapshot::open(checkpoint)
+            .map_err(|e| format!("open the checkpoint {checkpoint:?}: {e}"))?;
+        if let Some(stamp) = checkpoint::file::serve::stamp_of(checkpoint).map_err(|e| said(&e))? {
+            if stamp.package.is_empty() {
+                return Err(format!(
+                    "{checkpoint:?} names no model package; import the checkpoint again with \
+                     this build"
+                ));
+            }
+            let package = self.package(&stamp.package).ok_or_else(|| {
+                format!(
+                    "{checkpoint:?} was imported with the package `{}`, which this build's \
+                     catalog does not hold",
+                    stamp.package
+                )
+            })?;
+            let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
+                format!(
+                    "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
+                    trace.name,
+                    package.name()
+                )
+            })?;
+            return poem::import::own_contract(&source, &trace.params, deploy.tp, trace.platform)
+                .map_err(|error| {
+                    format!(
+                        "{checkpoint:?} does not hold every plane of {:?}: {error}",
+                        trace.name
+                    )
+                });
+        }
+        let deployment = self.parse(&trace.name).ok_or_else(|| {
+            format!(
+                "{:?} names no deployment of a model this build ships, so a checkpoint's \
+                 tensors cannot be mapped onto its params",
+                trace.name
+            )
+        })?;
+        let ranks = deployment.deploy.tp.max(deployment.deploy.ep);
+        if ranks > 1 {
+            return Err(format!(
+                "{:?} is a {ranks}-rank deployment and {checkpoint:?} is an unconverted \
+                 checkpoint: the ranks band their shares out of a stamped artifact, so convert \
+                 it first (`pie model import`) and serve the artifact",
+                trace.name
+            ));
+        }
+        deployment
+            .contract(&source, trace.platform)
+            .map_err(|error| {
+                format!(
+                    "the import contract for {:?} does not fit {checkpoint:?}: {error}",
+                    trace.name
+                )
+            })
+    }
+
     pub fn published(&self) -> impl Iterator<Item = &Published> {
         self.packages
             .iter()

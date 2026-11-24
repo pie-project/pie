@@ -32,7 +32,7 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain};
+use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
 use engine::{Channels, Completion, Engine, Pool, Programs, Tiers};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
@@ -405,7 +405,10 @@ impl Engine for Xla {
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "xla".to_string(),
-                domain: MemoryDomain::XlaDevice(boot.ordinal),
+                domain: MemoryDomain::Device {
+                    ordinal: boot.ordinal,
+                    reach: DeviceReach::Private,
+                },
                 sms: 1,
                 unified_memory: false,
                 fp8_native: shell.tpu().fp8_native(),
@@ -426,6 +429,7 @@ impl Engine for Xla {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                dispatch_depth: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,

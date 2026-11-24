@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 pub mod backend;
 pub mod channel;
 pub mod completion;
@@ -112,21 +111,16 @@ pub mod verbs {
                         published.capacity
                     ));
                 }
-                // SAFETY: the engine published these addresses for this
-                // registration and holds them until `close_channel`, which
-                // the runtime calls only after dropping the record below.
-                let ring = std::sync::Arc::new(unsafe {
-                    super::channel::HostRing::adopt(
-                        published.mirror,
-                        published.words,
-                        published.cell_bytes,
-                        published.capacity,
+                let ring = super::channel::HostRing::adopt(published).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "channel {}'s engine mirror is shorter than its ring",
+                        registration.id
                     )
-                });
+                })?;
                 Ok(RegisteredChannel::over(
                     engine_id,
                     registration.id,
-                    ring,
+                    std::sync::Arc::new(ring),
                     reader_wait_id,
                     writer_wait_id,
                 ))

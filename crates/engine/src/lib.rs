@@ -51,5 +51,6 @@ pub use program::{
     ProgramRegistration,
 };
 pub use transfer::{
-    KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy, StateMove,
+    DeviceReach, KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain,
+    StateCopy, StateMove,
 };

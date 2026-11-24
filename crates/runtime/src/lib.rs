@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #[cfg(feature = "engine-cuda")]
 extern crate engine_cuda as _;
 

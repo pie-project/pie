@@ -471,8 +471,7 @@ impl Plane {
         let mirror = (registration.host_role != eta_ir::container::HostRole::None
             && registration.capacity > 0)
             .then(|| HostMirror {
-                mirror: ring.cells_ptr() as u64,
-                words: ring.words_ptr() as u64,
+                memory: ring.clone(),
                 cell_bytes: u32::try_from(ring.cell_bytes()).unwrap_or(u32::MAX),
                 capacity: registration.capacity,
             });

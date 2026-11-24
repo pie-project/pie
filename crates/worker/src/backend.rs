@@ -257,14 +257,13 @@ fn land(
         -1,
         frames_in_flight,
     )?;
-    if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
-        let dir = crate::disk::kv_dir(cache_dir, snapshot_dir)?;
-        // Each rank of an expert-parallel group keeps its own requests' kv.
-        request.residency.disk_kv_dir = Some(match overrides.ep {
-            Some(_) => dir.join(format!("rank{}", overrides.rank.unwrap_or(0))),
-            None => dir,
-        });
-    }
+    let ep_rank = overrides.ep.map(|_| overrides.rank.unwrap_or(0));
+    default_disk_kv_dir(
+        &mut request.residency,
+        backend.disk_kv_tier(),
+        ep_rank,
+        || crate::disk::kv_dir(cache_dir, snapshot_dir),
+    )?;
     let deployment = request.trace.name.clone();
     let disk_kv_dir = request.residency.disk_kv_dir.clone();
     let wide = request.trace.nodes.iter().any(|node| {
@@ -281,6 +280,24 @@ fn land(
         ));
     }
     Ok((loaded, deployment, disk_kv_dir))
+}
+
+/// States the disk tier's default directory where the config states none and
+/// the engine keeps the tier: each rank of an expert-parallel group its own.
+fn default_disk_kv_dir(
+    residency: &mut engine::Residency,
+    engine_keeps_tier: bool,
+    ep_rank: Option<u32>,
+    dir: impl FnOnce() -> Result<PathBuf>,
+) -> Result<()> {
+    if engine_keeps_tier && residency.disk_kv_budget != Some(0) && residency.disk_kv_dir.is_none() {
+        let dir = dir()?;
+        residency.disk_kv_dir = Some(match ep_rank {
+            Some(rank) => dir.join(format!("rank{rank}")),
+            None => dir,
+        });
+    }
+    Ok(())
 }
 
 fn register_operator_adapters(
@@ -786,7 +803,9 @@ pub(crate) fn create_engine_backend(
             // PIE home, as wasmtime's do.
             let mut cerebras = toml::Table::new();
             cerebras.insert("target".into(), opts.target.clone().into());
-            cerebras.insert("num_threads".into(), i64::from(opts.num_threads).into());
+            if let Some(n) = opts.num_threads {
+                cerebras.insert("num_threads".into(), i64::from(n).into());
+            }
             cerebras.insert(
                 "cache_dir".into(),
                 crate::disk::engine_cache_dir(home)
@@ -798,13 +817,8 @@ pub(crate) fn create_engine_backend(
             if let Some(cmaddr) = &opts.cmaddr {
                 cerebras.insert("cmaddr".into(), cmaddr.clone().into());
             }
-            for (key, value) in [
-                ("lookahead", opts.lookahead),
-                ("posted_loop", opts.posted_loop),
-            ] {
-                if let Some(v) = value {
-                    cerebras.insert(key.into(), i64::from(v).into());
-                }
+            if let Some(v) = opts.lookahead {
+                cerebras.insert("lookahead".into(), i64::from(v).into());
             }
             if let Some(asynchronous) = opts.asynchronous {
                 cerebras.insert("async".into(), asynchronous.into());
@@ -924,6 +938,29 @@ mod tests {
         the_voxel_ceilings_a_deployment_states_reach_the_budget();
         the_pool_budget_seats_by_state_slots_not_pages();
         an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else();
+        an_engine_without_a_disk_tier_is_handed_no_default_dir();
+    }
+
+    fn an_engine_without_a_disk_tier_is_handed_no_default_dir() {
+        let dir = || Ok(PathBuf::from("/kv"));
+        let open = engine::Residency {
+            disk_kv_budget: None,
+            ..engine::Residency::default()
+        };
+        let mut none = open.clone();
+        default_disk_kv_dir(&mut none, false, None, dir).unwrap();
+        assert_eq!(none.disk_kv_dir, None);
+
+        let mut kept = open.clone();
+        default_disk_kv_dir(&mut kept, true, Some(2), dir).unwrap();
+        assert_eq!(kept.disk_kv_dir, Some(PathBuf::from("/kv/rank2")));
+
+        let mut stated = engine::Residency {
+            disk_kv_dir: Some(PathBuf::from("/mine")),
+            ..open
+        };
+        default_disk_kv_dir(&mut stated, false, None, dir).unwrap();
+        assert_eq!(stated.disk_kv_dir, Some(PathBuf::from("/mine")));
     }
 
     fn the_voxel_ceilings_a_deployment_states_reach_the_budget() {

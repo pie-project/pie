@@ -1,0 +1,23 @@
+[package]
+name = "runtime-sys"
+version.workspace = true
+rust-version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The runtime's calls Rust cannot check: macOS's memory readings and loading a precompiled wasm component, each behind a safe function."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "runtime_sys"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+wasmtime = { version = "49.0.2", default-features = false, features = ["runtime", "component-model"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true
