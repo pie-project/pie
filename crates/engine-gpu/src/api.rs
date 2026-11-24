@@ -1205,8 +1205,11 @@ where
         // fires of a served load are its own naming walk's, the widest a
         // cut's lanes, and those are the seats it is asked to lay.
         let slots = poem_compiler::state_slots(budgets.slots, &trace, crate::serve::naming_lanes());
-        let (disk_kv_budget, disk_kv_dir) =
-            (residency.disk_kv_budget, residency.disk_kv_dir.clone());
+        let (disk_kv_budget, disk_kv_dir, seats) = (
+            residency.disk_kv_budget,
+            residency.disk_kv_dir.clone(),
+            residency.kv_seats.unwrap_or(budgets.max_lanes),
+        );
         let budget = bake_budgets(&budgets, &trace);
         let mut shell = Shell::load(Boot {
             trace,
@@ -1252,7 +1255,12 @@ where
         let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
             .unwrap_or(u32::MAX);
         shell
-            .seat_disk_kv(disk_kv_budget, disk_kv_dir.as_deref())
+            .seat_disk_kv(
+                disk_kv_budget,
+                disk_kv_dir.as_deref(),
+                seats,
+                budgets.max_context,
+            )
             .map_err(fault)?;
         // The dense kernel at each rung as a stored or committed settle of
         // the load's key decided it, else the nearest settle's or the

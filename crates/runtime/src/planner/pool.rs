@@ -487,6 +487,20 @@ impl ChunkMap {
     /// been counted.
     #[must_use]
     pub fn cheapest_need(&self, need: &RunNeed) -> Option<Vec<ProcessId>> {
+        self.cheapest_need_by(need, &|_| (0, 0))
+    }
+
+    /// [`Self::cheapest_need`], its occupants' `priority` read first (the
+    /// policy's, higher kept longer): of the runs that serve the need, those
+    /// whose highest-priority occupant is lowest, then the cheapest among
+    /// them. A free chunk has no occupant. Equal priorities leave the
+    /// cheapest runs, as [`Self::cheapest_need`] lays them.
+    #[must_use]
+    pub fn cheapest_need_by(
+        &self,
+        need: &RunNeed,
+        priority: &dyn Fn(ProcessId) -> (i64, i64),
+    ) -> Option<Vec<ProcessId>> {
         let free: std::collections::BTreeSet<u32> = self.free.iter().copied().collect();
         let held: std::collections::BTreeMap<u32, &ChunkHeld> = self
             .held
@@ -494,11 +508,47 @@ impl ChunkMap {
             .filter(|chunk| chunk.emptiable())
             .map(|chunk| (chunk.chunk, chunk))
             .collect();
+        // Each emptiable chunk's highest-priority occupant.
+        let top: std::collections::BTreeMap<u32, (i64, i64)> = held
+            .iter()
+            .map(|(&chunk, held)| {
+                let top = held.by.iter().map(|&(pid, _)| priority(pid)).max();
+                (chunk, top.unwrap_or((i64::MIN, i64::MIN)))
+            })
+            .collect();
+        let mut levels: Vec<(i64, i64)> = top.values().copied().collect();
+        levels.sort_unstable();
+        levels.dedup();
+        // The lowest ceiling of occupants' priority under which the need is
+        // served: the cheapest runs within it.
+        if levels.len() > 1 {
+            for &level in &levels[..levels.len() - 1] {
+                if let Some(pids) = self.cheapest_within(need, &free, &held, &top, Some(level)) {
+                    return Some(pids);
+                }
+            }
+        }
+        self.cheapest_within(need, &free, &held, &top, None)
+    }
+
+    /// The cheapest runs of `need` among chunks free or emptiable whose
+    /// highest-priority occupant is at most `ceiling` (`None`: any).
+    fn cheapest_within(
+        &self,
+        need: &RunNeed,
+        free: &std::collections::BTreeSet<u32>,
+        held: &std::collections::BTreeMap<u32, &ChunkHeld>,
+        top: &std::collections::BTreeMap<u32, (i64, i64)>,
+        ceiling: Option<(i64, i64)>,
+    ) -> Option<Vec<ProcessId>> {
+        let within = |chunk: u32| ceiling.is_none_or(|ceiling| top.get(&chunk).is_none_or(|&t| t <= ceiling));
         let cost = |chunk: u32| -> Option<u32> {
             if free.contains(&chunk) {
                 Some(0)
-            } else {
+            } else if within(chunk) {
                 held.get(&chunk).map(|held| held.pages())
+            } else {
+                None
             }
         };
         let starts: std::collections::BTreeSet<u32> =
@@ -540,10 +590,10 @@ impl ChunkMap {
         let short = opened.saturating_sub(self.headroom.unwrap_or(u32::MAX));
         let mut elsewhere: Vec<&ChunkHeld> = held
             .values()
-            .filter(|chunk| !in_runs.contains(&chunk.chunk))
+            .filter(|chunk| !in_runs.contains(&chunk.chunk) && within(chunk.chunk))
             .copied()
             .collect();
-        elsewhere.sort_unstable_by_key(|chunk| (chunk.pages(), chunk.chunk));
+        elsewhere.sort_unstable_by_key(|chunk| (top.get(&chunk.chunk).copied(), chunk.pages(), chunk.chunk));
         if (elsewhere.len() as u32) < short {
             return None;
         }

@@ -502,15 +502,17 @@ impl Engine for Metal {
     /// whether a request arrived and stopping where one did, so an arrival
     /// waits at most the frame in flight; the key is timed again whole at a
     /// later idle turn. Kept only where it had the device alone at a steady
-    /// clock: no frame of this engine in flight as it starts, no other lane
+    /// clock: the runtime turns it only where nothing landing is owed, no other lane
     /// submitting while it runs, and the clock read after it no slower than
     /// the settled one before it (`rates::throttled`). Kept: stored in the
     /// user's profile for the next load; this load serves on by the stale
     /// figure. Else discarded and timed again later.
     fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
-        if self.pending.is_some() {
-            return Ok(false);
-        }
+        // No guard on the open frame (`self.pending`): it stays open past
+        // its settle until the next submit, so at idle it always is, and the
+        // runtime turns this lane only where nothing landing is owed. A
+        // slice fires on buffers of its own alone, never the pool's seats or
+        // a frame's readout, so the open frame's numbers stand.
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
@@ -803,7 +805,12 @@ impl Engine for Metal {
         told_within(&mut budgets, shell.budget());
         shell.mount_adapters(self.boot.adapter_dir.clone());
         shell
-            .seat_disk_kv(residency.disk_kv_budget, residency.disk_kv_dir.as_deref())
+            .seat_disk_kv(
+                residency.disk_kv_budget,
+                residency.disk_kv_dir.as_deref(),
+                residency.kv_seats.unwrap_or(budgets.max_lanes),
+                budgets.max_context,
+            )
             .map_err(fault)?;
 
         if crate::diag::on().tier_trace {
@@ -1934,7 +1941,7 @@ fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
         Some(budget) => Err(Error::Load(format!(
             "budget_host ({budget} bytes) on Metal: the device's memory is the host's, so \
              there is no host kv tier (a move there would copy within the same memory and \
-             free nothing); suspended state goes to the disk tier where budget_disk states one. Remove \
+             free nothing); suspended state goes to the disk tier (budget_disk). Remove \
              budget_host from [engine.memory]"
         ))),
         None => Ok(()),

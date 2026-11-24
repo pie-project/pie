@@ -591,6 +591,15 @@ export class ForwardPass {
     wit('checkpoints', () => this.wit.checkpoints(Uint32Array.from(slots)));
   }
 
+  /**
+   * State that this pass's sampled rows are final: the program never takes back a row once
+   * sampled, so its lanes fold every row at fire. Unstated, a pass is not final. Before the program.
+   */
+  finalRows(): void {
+    if (this.programAttached) throw new InferletError('forward pass program is already attached');
+    wit('final-rows', () => this.wit.finalRows());
+  }
+
   /** Set lane `lane`'s model switch `name` to `value`, before the program. */
   switch(lane: number, name: string, value: string): void {
     if (this.programAttached) throw new InferletError('forward pass program is already attached');

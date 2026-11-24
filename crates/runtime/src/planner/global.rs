@@ -170,24 +170,22 @@ pub fn rekey_holders(only: Option<&std::collections::HashSet<ProcessId>>) {
     }
 }
 
-/// The worker's `pie/lanes-to-end` and `pie/starts-spread` (ns): the lanes
-/// every engine's pools hold to their end at once, summed, and the interval
-/// between starts that keeps them finishing apart (a life over the lanes,
-/// the engines' start rates summed). Each `None` until learned, and the
-/// spread `None` while no lane fits.
-pub fn to_end_facts() -> (Option<u64>, Option<u64>) {
-    let facts: Vec<(u64, Option<std::time::Duration>)> =
-        planners().iter().filter_map(|p| p.to_end_facts()).collect();
+/// The worker's `pie/lanes-to-end` and `pie/starts-spread`: the lanes
+/// every engine's pools hold to their end at once, summed (`None` until
+/// learned), and whether starting together runs short: every engine's pool
+/// has no host tier, so a lane run short restarts its process rather than
+/// park below. Runtime facts, read from the pools and what finished; the
+/// engines state no flag for them.
+pub fn to_end_facts() -> (Option<u64>, bool) {
+    let facts: Vec<(Option<u64>, bool)> = planners().iter().map(|p| p.to_end_facts()).collect();
     if facts.is_empty() {
-        return (None, None);
+        return (None, false);
     }
-    let lanes = facts.iter().map(|(lanes, _)| lanes).sum();
-    let rate: f64 = facts
+    let lanes = facts
         .iter()
-        .filter_map(|&(lanes, life)| Some(lanes as f64 / life?.as_nanos().max(1) as f64))
-        .sum();
-    let spread = (rate > 0.0).then(|| (1.0 / rate).round() as u64);
-    (Some(lanes), spread)
+        .map(|(lanes, _)| *lanes)
+        .try_fold(0u64, |sum, lanes| lanes.map(|lanes| sum.saturating_add(lanes)));
+    (lanes, facts.iter().all(|&(_, spread)| spread))
 }
 
 /// Every engine's planner, engine 0's first: for what frees pages or

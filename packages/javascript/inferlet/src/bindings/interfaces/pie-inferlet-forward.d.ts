@@ -127,6 +127,12 @@ export class ForwardPass {
   */
   checkpoints(slots: Uint32Array): void;
   /**
+  * States that this pass's sampled rows are final: the program never
+  * retracts, truncates, rolls back or rewinds below a row once sampled.
+  * Its lanes fold every row at fire. Unstated, a pass is not final.
+  */
+  finalRows(): void;
+  /**
   * Bind embedding token ids and CSR row indptr. Both are channels.
   * Required on a lane that embeds tokens (`model.lane`'s `embeds`),
   * refused on one that does not.

@@ -2,27 +2,18 @@
 //! reads it.
 //!
 //! Three roles share memory. The governor decides how much a tier holds;
-//! PLEX decides what stays in it; the pool decides how it moves. So the
-//! runtime never drops state on its own. A waiter short of room calls
-//! [`raise`] with what its tier is short of. The worker policy hears that as
-//! one `tier-pressure` edge per band crossing, and reads the bytes as attrs
-//! on the worker (`{device,host}-{total,state,live,wanted,act,short}-bytes`
-//! and `-band`), beside the device's two ledger terms
-//! (`{device,host}-{model,outside}-bytes`, [`Ledger`]). It answers with the
-//! verbs it already has: `discard` a working set, or install retention
-//! keys. Attrs are not verbs: the model cache's bytes say what live demand
-//! may take from the weights before it asks for state.
+//! PLEX decides what stays in it; the pool decides how it moves. A waiter
+//! short of room calls [`raise`] with what its tier is short of. The worker
+//! policy reads that as attrs on the worker (`pie/{device,host}-band`),
+//! beside the device's two ledger terms ([`Ledger`]). Attrs are not verbs.
 //!
-//! When no installed policy subscribes to `tier-pressure`, the default
-//! responder answers for it ([`choose`]). It uses the same `discard` verb a
-//! policy would, lowest retention key first, so a parked waiter always has
-//! someone to answer it. This is policy-layer code: it decides what goes, as
-//! a policy would. It is not part of the stores, which only carry out
-//! discards.
-//!
-//! Idle cache the stores reclaim on their own is only what its
-//! `retention/tiers` row lets sit on no lower tier with room; the rest moves
-//! down a tier.
+//! No runtime responder answers pressure: the stores answer it by enacting
+//! the retention columns. Each tier holds the highest `retention/priority`
+//! first; idle cache yields to running work, moves down to the next tier
+//! its `retention/tiers` row names, and is dropped only where it names none
+//! (with no rows: every tier, least recently used first among equals). What
+//! no move can make room for waits at the planner's capacity gate, with no
+//! deadline; only a process that never fits alone is refused, by name.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -207,35 +198,7 @@ impl Gauge {
     }
 }
 
-/// Per tier, how many times the policy (or the default responder) answered
-/// a pressure report and freed nothing: what a short waiter fails on, not a
-/// clock ([`answered_nothing`]).
-static NOTHING_FREED: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// Told on each [`answered_nothing`].
-static ANSWERED: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-/// The policy answered `tier`'s pressure and freed nothing: no discard, no
-/// termination, no new keys. Short waiters it alone could serve fail now.
-pub fn answered_nothing(tier: Tier) {
-    NOTHING_FREED[tier.index()].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    ANSWERED.notify_waiters();
-}
-
-/// How many times `tier`'s pressure was answered with nothing freed.
-#[must_use]
-pub fn nothing_freed(tier: Tier) -> u64 {
-    NOTHING_FREED[tier.index()].load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// The next [`answered_nothing`]: arm it before looking.
-pub fn answered() -> tokio::sync::futures::Notified<'static> {
-    ANSWERED.notified()
-}
-
-/// A shortfall that stands unchanged is reported again this often, so the
-/// default responder looks again when its last discard freed too little.
+/// A shortfall that stands unchanged is reported again this often.
 pub const AGAIN: Duration = Duration::from_millis(100);
 
 static GAUGES: Mutex<[Gauge; 2]> = Mutex::new([Gauge::new(), Gauge::new()]);
@@ -244,8 +207,7 @@ static SCALES: RwLock<Vec<Scale>> = RwLock::new(Vec::new());
 
 /// Says that waiters on `tier` from `from` (an engine's planner) are short
 /// of `short_bytes` in all, now: not an increment. Zero once they are all
-/// served. The worker policy hears of it when the tier's band changes; the
-/// default responder, whenever the shortfall changes or stands for a while.
+/// served. The worker policy reads it when the tier's band changes.
 pub fn raise(tier: Tier, from: usize, short_bytes: u64) {
     let total = meter_bytes(tier).map_or(0, |bytes| bytes.total);
     let reading = {
@@ -408,45 +370,4 @@ pub fn stores(tier: Tier) -> Option<Bytes> {
         };
     }
     Some(sum)
-}
-
-/// The retention key that pins a working set: the default responder never
-/// discards it, however short a tier is. Only a policy that answers
-/// `tier-pressure` itself may let it go.
-pub const PINNED: i64 = i64::MAX;
-
-/// A working set the default responder may discard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Candidate {
-    pub id: String,
-    /// Its retention key: the highest any of its tokens has.
-    pub key: i64,
-    pub last_use_ms: u64,
-    /// What discarding it frees on the pressed tier; `None` where unknown.
-    pub bytes: Option<u64>,
-}
-
-/// The default responder: which working sets to discard so that `short`
-/// bytes come free. Lowest retention key first, so whatever a key `<= 0`
-/// lets go goes before anything a policy keyed higher; then least recently
-/// used. One that frees nothing on the tier, or one [`PINNED`], is passed
-/// over. It stops once
-/// what it chose covers `short`, or after one whose size is unknown: the
-/// waiter's next [`raise`] says whether that was enough.
-pub fn choose(mut candidates: Vec<Candidate>, short: u64) -> Vec<String> {
-    candidates.retain(|c| c.bytes != Some(0) && c.key != PINNED);
-    candidates.sort_by(|a, b| (a.key, a.last_use_ms, &a.id).cmp(&(b.key, b.last_use_ms, &b.id)));
-    let mut chosen = Vec::new();
-    let mut freed: u64 = 0;
-    for candidate in candidates {
-        if freed >= short {
-            break;
-        }
-        chosen.push(candidate.id);
-        match candidate.bytes {
-            Some(bytes) => freed = freed.saturating_add(bytes),
-            None => break,
-        }
-    }
-    chosen
 }

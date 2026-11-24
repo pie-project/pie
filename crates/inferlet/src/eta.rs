@@ -631,6 +631,7 @@ struct ForwardInner {
     adapter_scale_sites: u32,
     inputs: Vec<(u32, String, DslChannel)>,
     switches: Vec<(u32, String, String)>,
+    final_rows: bool,
 }
 
 impl ForwardPass {
@@ -666,6 +667,7 @@ impl ForwardPass {
                 adapter_scale_sites: 0,
                 inputs: Vec::new(),
                 switches: Vec::new(),
+                final_rows: false,
             }),
         }
     }
@@ -1129,18 +1131,18 @@ pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(),
     wit_forward::submit(&on.wit, &borrows)
 }
 
-/// Fires `pass` up to `budget` times, running ahead of `on_token`, whose
-/// `i`-th call reads fire `i`'s output. A break keeps the fires through the
-/// one it read and takes back the rows of those submitted past it
-/// ([`Pipeline::retract`]); the count kept is returned.
+/// Fires `pass` up to `budget` times, never more, running ahead of
+/// `on_token`, whose `i`-th call reads fire `i`'s output. A break keeps the
+/// fires through the one it read and takes back the rows of those
+/// submitted past it ([`Pipeline::retract`]), unless the pass stated its
+/// rows final ([`ForwardPass::final_rows`]): those stay in its sets. The
+/// count kept is returned.
 pub async fn run_ahead(
     on: &Pipeline,
     pass: &ForwardPass,
     budget: usize,
-    mut on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
+    on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
 ) -> Result<usize, String> {
-    use std::ops::ControlFlow;
-
     if budget == 0 {
         return Ok(0);
     }
@@ -1154,16 +1156,63 @@ pub async fn run_ahead(
     let window_fires = crate::model::run_ahead_window() as usize;
     let window_frames = (window_fires / r.max(1)).max(1);
 
+    let final_rows = pass.is_final();
+    run_ahead_driven(
+        Driver {
+            r,
+            window_frames,
+            budget,
+            submit: |live| {
+                let slots: Vec<Option<&ForwardPass>> = vec![Some(pass); live];
+                submit_frame(on, &slots)
+            },
+            close: || on.close(),
+            // A final pass's rows past a break stay in its sets.
+            retract: |fires| {
+                if final_rows {
+                    Ok(())
+                } else {
+                    on.retract(fires)
+                }
+            },
+        },
+        on_token,
+    )
+    .await
+}
+
+/// What [`run_ahead`] drives: frames of `r` fires, no more than
+/// `window_frames` frames unread, `budget` fires in all.
+struct Driver<S, C, R> {
+    r: usize,
+    window_frames: usize,
+    budget: usize,
+    submit: S,
+    close: C,
+    retract: R,
+}
+
+async fn run_ahead_driven<S, C, R>(
+    mut d: Driver<S, C, R>,
+    mut on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
+) -> Result<usize, String>
+where
+    S: FnMut(usize) -> Result<(), String>,
+    C: FnMut(),
+    R: FnMut(u32) -> Result<(), String>,
+{
+    use std::ops::ControlFlow;
+
+    let (r, window_frames, budget) = (d.r, d.window_frames, d.budget);
     let mut submitted = 0usize;
     let mut consumed = 0usize;
 
-    let submit_one_frame = |submitted: &mut usize| -> Result<(), String> {
-        let live = r.min(budget - *submitted);
+    let mut submit_one_frame = |submitted: &mut usize| -> Result<(), String> {
+        let live = frame_fires(r, budget, *submitted);
         if live == 0 {
             return Ok(());
         }
-        let slots: Vec<Option<&ForwardPass>> = vec![Some(pass); live];
-        submit_frame(on, &slots)?;
+        (d.submit)(live)?;
         *submitted += live;
         Ok(())
     };
@@ -1178,19 +1227,19 @@ pub async fn run_ahead(
     let mut ended = false;
 
     if submitted >= budget && !ended {
-        on.close();
+        (d.close)();
         ended = true;
     }
     while consumed < submitted {
         if on_token().await? == ControlFlow::Break(()) {
             if !ended {
-                on.close();
+                (d.close)();
             }
             // The fire whose output broke the loop read a token the program
             // took, so its rows stay; those submitted past it are taken back.
             let kept = consumed + 1;
             if submitted > kept {
-                on.retract(u32::try_from(submitted - kept).unwrap_or(u32::MAX))?;
+                (d.retract)(u32::try_from(submitted - kept).unwrap_or(u32::MAX))?;
             }
             return Ok(kept);
         }
@@ -1199,14 +1248,20 @@ pub async fn run_ahead(
             submit_one_frame(&mut submitted)?;
         }
         if submitted >= budget && !ended {
-            on.close();
+            (d.close)();
             ended = true;
         }
     }
     if !ended {
-        on.close();
+        (d.close)();
     }
     Ok(consumed)
+}
+
+/// The fires the next frame of a run of `budget` fires, `submitted` of
+/// them submitted, holds: a frame of `r`, never past the budget.
+fn frame_fires(r: usize, budget: usize, submitted: usize) -> usize {
+    r.min(budget.saturating_sub(submitted))
 }
 
 pub struct Pipeline {
@@ -1278,6 +1333,31 @@ impl ForwardPass {
     pub fn checkpoints(&self, slots: &[u32]) -> Result<(), String> {
         self.wit.checkpoints(slots)
     }
+
+    /// States that this pass's sampled rows are final: once a fire of it
+    /// samples a row, the program never takes back, truncates, rolls back
+    /// or rewinds its working sets below that row. Its lanes then fold
+    /// every row at fire and carry none into the next fire, the plain
+    /// decode step. Unstated, a pass is not final: on a recurrent or
+    /// windowed set its run-ahead fires fold only what the program has
+    /// read, so a stop can take the rest back. State it on a pass that only
+    /// appends (no stop strings, drafts or beams); a pass that may stop
+    /// short and continue its set must not. [`Pipeline::retract`] over a
+    /// final fire is refused, and [`run_ahead`] leaves a final pass's rows
+    /// past a break in place. Set before the program is attached.
+    pub fn final_rows(&self) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Err("forward pass program is already attached".to_string());
+        }
+        self.wit.final_rows()?;
+        self.inner.borrow_mut().final_rows = true;
+        Ok(())
+    }
+
+    /// Whether [`Self::final_rows`] was stated.
+    pub fn is_final(&self) -> bool {
+        self.inner.borrow().final_rows
+    }
 }
 
 pub mod prelude {
@@ -1339,5 +1419,73 @@ mod tests {
             Some("channel seed: channel is closed")
         );
         assert!(channel_handle(u64::MAX - 1).is_err(), "never declared");
+    }
+
+    fn ready<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match f.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(out) => out,
+            std::task::Poll::Pending => panic!("the driver never waits here"),
+        }
+    }
+
+    /// A run ahead never submits past its budget, whatever its frame, its
+    /// window, or where the program breaks; a break takes back only the
+    /// fires past the one read (none where nothing ran past it).
+    #[test]
+    fn a_run_ahead_never_samples_past_its_budget() {
+        use std::cell::Cell;
+        for r in 1..=4 {
+            for window_frames in 1..=4 {
+                for budget in 0..=13 {
+                    for stop in (0..=budget).map(Some).chain([None]) {
+                        let (fired, taken_back, reads) = (Cell::new(0), Cell::new(0), Cell::new(0));
+                        let driver = Driver {
+                            r,
+                            window_frames,
+                            budget,
+                            submit: |live: usize| {
+                                fired.set(fired.get() + live);
+                                assert!(fired.get() <= budget, "submitted past the budget");
+                                assert!(fired.get() - reads.get() <= window_frames * r);
+                                Ok(())
+                            },
+                            close: || {},
+                            retract: |fires: u32| {
+                                taken_back.set(fires as usize);
+                                Ok(())
+                            },
+                        };
+                        let kept = if budget == 0 {
+                            0
+                        } else {
+                            ready(run_ahead_driven(driver, async || {
+                                reads.set(reads.get() + 1);
+                                Ok(if Some(reads.get()) == stop {
+                                    std::ops::ControlFlow::Break(())
+                                } else {
+                                    std::ops::ControlFlow::Continue(())
+                                })
+                            }))
+                            .unwrap()
+                        };
+                        let what = format!("r {r} window {window_frames} budget {budget} stop {stop:?}");
+                        assert!(fired.get() <= budget, "{what}");
+                        match stop.filter(|&s| s >= 1 && budget > 0) {
+                            Some(s) => {
+                                assert_eq!(kept, s, "{what}");
+                                assert_eq!(taken_back.get(), fired.get() - s, "{what}");
+                            }
+                            None => {
+                                assert_eq!(kept, budget, "{what}");
+                                assert_eq!(fired.get(), budget, "{what}");
+                                assert_eq!(taken_back.get(), 0, "{what}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

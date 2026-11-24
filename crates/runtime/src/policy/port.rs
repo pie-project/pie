@@ -5,8 +5,7 @@
 //! - any runtime thread reports an [`Event`] over a channel, as it did to the
 //!   1.0 policy thread (every call site goes through [`super::report`]);
 //! - this port thread turns each event into a host report, keeps the record
-//!   the host cannot see (cached working sets, resting handles, tier
-//!   pressure), sends the worker's counters when a round waits for them, and
+//!   the host cannot see (cached working sets, resting handles), sends the worker's counters when a round waits for them, and
 //!   takes the rows a round committed;
 //! - the host's own thread calls the policies, off every runtime thread.
 //!
@@ -26,7 +25,6 @@ use plex_host::host::{Config, Counter, Delta, Host};
 use plex_host::runtime::wit::Tier as WitTier;
 use plex_host::tables::{Subject, Value};
 
-use super::pressure::{self, Reading, Tier};
 use super::{By, Event, Outcome, retention, schedule};
 use crate::inferlet::process::{self, ProcessId};
 use crate::store::kv::CachedWorkingSet;
@@ -126,24 +124,6 @@ pub(super) fn report(event: Event) {
     }
 }
 
-/// Per tier, the episode in which the default responder finds nothing left
-/// to discard: said once as it starts and once as it ends.
-static NOTHING_LEFT: std::sync::Mutex<[process::WaitEpisode; 2]> =
-    std::sync::Mutex::new([process::WaitEpisode::new(), process::WaitEpisode::new()]);
-
-/// Ends `tier`'s nothing-left episode, if one is under way, saying how long
-/// it ran and why it ended.
-fn nothing_left_ends(tier: Tier, why: &'static str) {
-    if let Some(lasted) = NOTHING_LEFT.lock().unwrap()[tier.index()].end() {
-        tracing::info!(
-            tier = tier.name(),
-            lasted_ms = lasted.as_millis() as u64,
-            why,
-            "tier pressure: the waiters no longer wait on the governor alone"
-        );
-    }
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -185,12 +165,10 @@ fn hints(props: &Props) -> Vec<(String, Value)> {
 struct Cache {
     owns: fn(ProcessId) -> bool,
     list: fn() -> (Vec<CachedWorkingSet>, u32),
-    discard: fn(ProcessId),
     /// Pages: device capacity and free; host capacity and free; disk
     /// capacity and free.
     rooms: fn() -> [(u64, u64); 3],
     resident: fn(ProcessId) -> Option<bool>,
-    scale: fn() -> Option<pressure::Scale>,
 }
 
 const STORES: Cache = Cache {
@@ -237,21 +215,6 @@ const STORES: Cache = Cache {
         rooms
     },
     resident: |holder| crate::planner::planner_of(holder)?.holder_resident(holder),
-    scale: pressure::common_scale,
-    discard: |owner| {
-        let mut freed = 0;
-        for stores in store_registry::all_for_model(0) {
-            freed += store_registry::with_kv_lock(&stores.kv, "plex-discard", |kv| {
-                kv.discard_cache(owner, By::Policy)
-            });
-            freed += stores.rs.lock().unwrap().discard_cache(owner);
-        }
-        if freed > 0 {
-            for planner in crate::planner::planners() {
-                planner.pages_freed();
-            }
-        }
-    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,8 +254,7 @@ struct Rest {
     since_ms: u64,
 }
 
-/// The port's own record: what the host is told comes from it, and the
-/// default tier-pressure responder reads it.
+/// The port's own record: what the host is told comes from it.
 struct Port {
     host: Host,
     cache: Cache,
@@ -304,9 +266,6 @@ struct Port {
     /// The working sets last put to the host: one gone from the stores
     /// without a report is evicted then.
     put: HashSet<ProcessId>,
-    /// Where each tier's waiters stand, by [`Tier::index`].
-    pressure: [Reading; 2],
-    pressed: [bool; 2],
     /// Offloaded tokens by process, as `pie/offloaded-tokens`.
     offloaded: HashMap<ProcessId, u64>,
     /// The policy loaded, to load again if its successor does not load.
@@ -344,8 +303,6 @@ fn run(host: Host, loaded: (String, Vec<u8>), events: Receiver<Event>) {
         handles: HashMap::new(),
         sessions: HashMap::new(),
         put: HashSet::new(),
-        pressure: [Reading::default(); 2],
-        pressed: [false; 2],
         offloaded: HashMap::new(),
         loaded,
         version: 0,
@@ -364,7 +321,6 @@ fn run(host: Host, loaded: (String, Vec<u8>), events: Receiver<Event>) {
                 event => port.apply(event),
             }
         }
-        port.pressure_round();
         if port.host.due() {
             port.put_worker();
             port.put_working_sets();
@@ -641,9 +597,6 @@ impl Port {
                 let _ = answer.send(Err("a reload reached the port's record".into()));
             }
             Event::TierPressure(tier, reading) => {
-                let at = tier.index();
-                self.pressure[at] = reading;
-                self.pressed[at] |= reading.short > 0;
                 host.attr(
                     Subject::Worker(WORKER.to_string()),
                     &format!("pie/{}-band", tier.name()),
@@ -696,12 +649,16 @@ impl Port {
             "pie/batch-size",
             Some(Value::Int(crate::scheduler::last_batch_size() as i64)),
         );
-        // Runtime-derived facts a policy may pace starts by; absent (not 0)
-        // until learned.
+        // Runtime-derived facts a policy may pace starts by (`default`'s
+        // seat-to-end); the lanes absent (not 0) until learned.
         let (lanes, spread) = crate::planner::to_end_facts();
-        let int = |n: Option<u64>| n.map(|n| Value::Int(i64::try_from(n).unwrap_or(i64::MAX)));
-        self.host.attr(Subject::Worker(WORKER.to_string()), "pie/lanes-to-end", int(lanes));
-        self.host.attr(Subject::Worker(WORKER.to_string()), "pie/starts-spread", int(spread));
+        let lanes = lanes.map(|n| Value::Int(i64::try_from(n).unwrap_or(i64::MAX)));
+        self.host.attr(Subject::Worker(WORKER.to_string()), "pie/lanes-to-end", lanes);
+        self.host.attr(
+            Subject::Worker(WORKER.to_string()),
+            "pie/starts-spread",
+            Some(Value::Boolean(spread)),
+        );
         self.host.put_worker(
             WORKER,
             false,
@@ -855,151 +812,6 @@ impl Port {
             }
         }
     }
-
-    /// Tiers whose waiters are short: the default responder answers them,
-    /// discarding working sets lowest retention key first until what they
-    /// free covers the shortfall (`pressure::choose`). Under PLEX 1.1 no
-    /// policy hears tier pressure: this is the host's own behaviour.
-    fn pressure_round(&mut self) {
-        let pressed: Vec<Tier> = Tier::ALL
-            .into_iter()
-            .filter(|tier| self.pressed[tier.index()] && self.pressure[tier.index()].short > 0)
-            .collect();
-        self.pressed = [false; 2];
-        if pressed.is_empty() {
-            return;
-        }
-        let keys = retention::Installed;
-        let mut discarded: Vec<ProcessId> = Vec::new();
-        for tier in pressed {
-            let short = self.pressure[tier.index()].short;
-            if short == 0 {
-                nothing_left_ends(tier, "the tier is short no more");
-                continue;
-            }
-            let candidates = self
-                .candidates_for(tier, &keys)
-                .into_iter()
-                .filter(|c| ProcessId::from_str(&c.id).is_ok_and(|id| !discarded.contains(&id)))
-                .collect();
-            let chosen = pressure::choose(candidates, short);
-            if chosen.is_empty() {
-                // Said once an episode, as it starts; its repeats at DEBUG.
-                if NOTHING_LEFT.lock().unwrap()[tier.index()].seen() {
-                    tracing::info!(
-                        tier = tier.name(),
-                        short,
-                        "tier pressure: nothing is left to discard; the waiters wait on the governor"
-                    );
-                } else {
-                    tracing::debug!(
-                        tier = tier.name(),
-                        short,
-                        "tier pressure: still nothing left to discard"
-                    );
-                }
-                pressure::answered_nothing(tier);
-            } else {
-                nothing_left_ends(tier, "a working set is discarded");
-            }
-            for id in chosen {
-                let Ok(owner) = ProcessId::from_str(&id) else {
-                    continue;
-                };
-                tracing::info!(
-                    tier = tier.name(),
-                    short,
-                    working_set = %owner,
-                    "tier pressure: the default responder discards a working set"
-                );
-                match self.handles.get(&owner) {
-                    Some(handle) => crate::server::discard_handle(
-                        handle.resting.client,
-                        owner,
-                        "tier pressure: the default responder discarded it".to_string(),
-                    ),
-                    None => (self.cache.discard)(owner),
-                }
-                discarded.push(owner);
-            }
-        }
-    }
-
-    /// What a working set holds, kv bytes then state bytes, where known.
-    fn held_bytes(
-        &self,
-        id: ProcessId,
-        pages: Option<u64>,
-        page: u64,
-    ) -> (Option<u64>, Option<u64>) {
-        let Some(scale) = (self.cache.scale)() else {
-            return (None, None);
-        };
-        let known = |n: u64| (n > 0).then_some(n);
-        if let Some(Rest { resting, .. }) = self.handles.get(&id) {
-            let pages = resting.tokens.div_ceil(page);
-            let state = u64::from(resting.slots).saturating_mul(scale.state_slot_bytes);
-            return (
-                known(scale.kv_page_bytes).map(|b| b.saturating_mul(pages)),
-                (resting.slots == 0 || scale.state_slot_bytes > 0).then_some(state),
-            );
-        }
-        (
-            pages
-                .zip(known(scale.kv_page_bytes))
-                .map(|(p, b)| p.saturating_mul(b)),
-            None,
-        )
-    }
-
-    /// The working sets the default responder may discard to make room on
-    /// `tier`, with their keys and what discarding each frees there.
-    fn candidates_for(&self, tier: Tier, keys: &dyn retention::Keys) -> Vec<pressure::Candidate> {
-        let now = now_ms();
-        let (sets, page) = (self.cache.list)();
-        let page = u64::from(page.max(1));
-        let mut out = Vec::new();
-        for set in sets {
-            let owner = set.owner;
-            // A live process's working set is not the responder's.
-            if self.procs.contains_key(&owner) {
-                continue;
-            }
-            let (kv, _) = self.held_bytes(owner, Some(set.pages), page);
-            let ago = set.last_use.elapsed().as_millis() as u64;
-            // Discarding cache frees room only on the tiers it sits on: one
-            // held below the device frees none there. How much on the host
-            // is not told.
-            let bytes = match tier {
-                Tier::Device if !set.on_device => Some(0),
-                Tier::Device => kv,
-                Tier::Host if !set.on_host => Some(0),
-                Tier::Host => None,
-            };
-            out.push(pressure::Candidate {
-                key: keys.key_at(Some(owner), 0),
-                id: owner.to_string(),
-                last_use_ms: now.saturating_sub(ago),
-                bytes,
-            });
-        }
-        for (&owner, rest) in &self.handles {
-            let (kv, state) = self.held_bytes(owner, None, page);
-            let whole = kv.map(|kv| kv.saturating_add(state.unwrap_or(0)));
-            // A handle frees room only on the tier it rests on.
-            let bytes = match (tier, (self.cache.resident)(owner)) {
-                (Tier::Device, Some(false)) | (Tier::Host, Some(true)) => Some(0),
-                _ => whole,
-            };
-            out.push(pressure::Candidate {
-                key: keys.key_at(Some(owner), 0),
-                id: owner.to_string(),
-                last_use_ms: rest.since_ms,
-                bytes,
-            });
-        }
-        out
-    }
 }
 
 /// A port with no stores behind it, for tests that run a built-in policy
@@ -1012,17 +824,40 @@ pub(crate) mod testing {
         // What an exited process leaves is held: it is retained.
         owns: |_| true,
         list: || (Vec::new(), 1),
-        discard: |_| {},
         rooms: || [(0, 0); 3],
         resident: |_| None,
-        scale: || None,
     };
 
     /// Runs `component` (as `name`) over `events`, the port's own record
     /// told the host after each, then enacts what its calls committed into
     /// the installed tables. Returns once every event was heard.
     pub(crate) fn enact(name: &str, component: &[u8], events: Vec<Event>) {
+        enact_on(name, component, &Worker::default(), events);
+    }
+
+    /// The worker as a test puts it to the host: its attrs, and its time
+    /// per step.
+    #[derive(Default)]
+    pub(crate) struct Worker {
+        pub attrs: Vec<(&'static str, Value)>,
+        pub step_ns: Option<u64>,
+    }
+
+    /// [`enact`] on a worker with a device tier and `worker`'s attrs, put
+    /// before the first event.
+    pub(crate) fn enact_on(name: &str, component: &[u8], worker: &Worker, events: Vec<Event>) {
         let mut host = host();
+        host.put_worker(
+            WORKER,
+            false,
+            vec![(WitTier::Device, Some(1 << 20), 0)],
+            0,
+            0,
+            worker.step_ns,
+        );
+        for (attr, value) in &worker.attrs {
+            host.attr(Subject::Worker(WORKER.to_string()), attr, Some(value.clone()));
+        }
         host.load(name, component).expect("the policy loads");
         host.start();
         let mut port = Port {
@@ -1033,8 +868,6 @@ pub(crate) mod testing {
             handles: HashMap::new(),
             sessions: HashMap::new(),
             put: HashSet::new(),
-            pressure: [Reading::default(); 2],
-            pressed: [false; 2],
             offloaded: HashMap::new(),
             loaded: (name.to_string(), component.to_vec()),
             version: 0,

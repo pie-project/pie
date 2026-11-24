@@ -21,6 +21,9 @@ struct TierPool {
     disk: (u32, u32),
     host_cache: u32,
     disk_cache: u32,
+    /// The capacity gate's end and census (none: no gate).
+    context: Option<u32>,
+    census: Option<super::pool::CapacityCensus>,
 }
 
 impl PoolPort for TierPool {
@@ -85,6 +88,12 @@ impl PoolPort for TierPool {
     }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
+    }
+    fn context_pages(&self) -> Option<u32> {
+        self.context
+    }
+    fn capacity_census(&self) -> Option<super::pool::CapacityCensus> {
+        self.census
     }
 }
 
@@ -166,4 +175,32 @@ fn a_parked_process_alone_holds_no_launch() {
     let b = planner.kv_pressure_bucket();
     assert_eq!(b, 224);
     assert!(b < SATURATED);
+}
+
+/// L1: the capacity gate's first finisher is the highest-priority process
+/// whose need fits (the policy's `schedule/priority`); equal priorities
+/// keep the banker's order, then first come, first served.
+#[test]
+fn the_first_finisher_is_the_highest_priority_that_fits() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let planner = ResidencyPlanner::new(Arc::new(TierPool {
+        device: (64, 64),
+        context: Some(16),
+        census: Some(super::pool::CapacityCensus {
+            whole: 64,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }) as Arc<dyn PoolPort>);
+    let (older, newer) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [older, newer] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let finisher = || planner.capacity_gate().expect("a gate").finisher;
+    assert_eq!(finisher(), older, "equal priorities: first come, first served");
+    planner.with_inner(|inner| inner.procs.get_mut(&newer).unwrap().key = 5);
+    assert_eq!(finisher(), newer, "the higher priority finishes first");
+    planner.with_inner(|inner| inner.procs.get_mut(&older).unwrap().key = 9);
+    assert_eq!(finisher(), older);
 }

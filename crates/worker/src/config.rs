@@ -961,8 +961,12 @@ pub struct MemoryConfig {
     pub budget_host: Option<ByteSize>,
     /// The disk tier: the most disk suspended kv may spill into once the
     /// host tier is full (`"200GiB"`), shared by the ranks, in slot files
-    /// under `disk_path`. Omitted or 0: no disk tier (the tiers are the
-    /// device and, where there is one, the host). Nothing sizes it unstated.
+    /// under `disk_path`. Omitted: the engine derives it from what can be
+    /// parked (every seat's state and kv at the full context, and the guest
+    /// state the device holds live), within the free space under
+    /// `disk_path`. 0: no disk tier (the tiers are the device and, where
+    /// there is one, the host), so kv pressure on a device with no host
+    /// tier restarts processes.
     pub budget_disk: Option<ByteSize>,
     /// Where the disk tier's slot files go. Omit for
     /// `$PIE_HOME/cache/kv/<checkpoint digest>`.
@@ -1027,7 +1031,8 @@ impl MemoryConfig {
             device_kv_tokens: self.kv_device_tokens,
             host_kv_budget: self.budget_host.map(|b| b.as_bytes()),
             kv_seats: None,
-            disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()).filter(|&b| b > 0),
+            // Absent: the engine's derived tier; a stated 0: none.
+            disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()),
             disk_kv_dir: self.disk_path.clone(),
             disk_kv_persistent: self.disk_persistent,
             kv_export: false,
@@ -1057,11 +1062,11 @@ impl MemoryConfig {
             "engine.memory.kv_device_tokens = 0 holds no kv; state the tokens the device \
              holds or omit the key"
         );
-        let disk = self.budget_disk.is_some_and(|b| b.as_bytes() > 0);
+        let none = self.budget_disk.is_some_and(|b| b.as_bytes() == 0);
         ensure!(
-            disk || (self.disk_path.is_none() && !self.disk_persistent),
+            !none || (self.disk_path.is_none() && !self.disk_persistent),
             "engine.memory.disk_path or disk_persistent names a disk tier, but budget_disk \
-             states none (omitted or 0 is no disk tier); state budget_disk or remove them"
+             = 0 states none; omit budget_disk (a derived tier) or remove them"
         );
         for (key, budget) in [
             ("budget_device", self.budget_device),
@@ -1343,28 +1348,35 @@ device = ["metal:0"]
         assert!(Config::parse(&zero).is_err(), "zero tokens should be refused");
     }
 
-    /// The disk tier is what `budget_disk` states: omitted or 0 is no disk
-    /// tier (nothing sizes one unstated), a positive budget is its size, and
-    /// a disk path or persistence with no tier is refused by name.
+    /// A default home has a disk tier: `budget_disk` omitted leaves its size
+    /// to the engine (derived from what can be parked, within the free
+    /// disk), on unified and discrete devices alike, so kv pressure
+    /// suspends to disk rather than restarting processes. A stated 0 is no
+    /// disk tier, a positive budget is its size, and a disk path or
+    /// persistence beside a stated 0 is refused by name.
     #[test]
-    fn the_disk_tier_is_stated_config_only() {
+    fn a_default_home_has_a_disk_tier_and_0_states_none() {
         let unset = Config::parse(MINIMAL_METAL).unwrap();
-        assert_eq!(unset.engine.memory.residency().disk_kv_budget, None, "no disk tier");
+        assert_eq!(
+            unset.engine.memory.residency().disk_kv_budget,
+            None,
+            "unstated: the engine derives the disk tier"
+        );
         let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"0B\"\n");
         let cfg = Config::parse(&zero).expect("0 is no disk tier, not refused");
-        assert_eq!(cfg.engine.memory.residency().disk_kv_budget, None);
+        assert_eq!(cfg.engine.memory.residency().disk_kv_budget, Some(0), "stated: none");
         let sized = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"2GiB\"\n");
         let cfg = Config::parse(&sized).unwrap();
         assert_eq!(cfg.engine.memory.residency().disk_kv_budget, Some(2 << 30));
         for stray in ["disk_path = \"/nvme/pie\"", "disk_persistent = true"] {
-            for budget in ["", "budget_disk = \"0B\"\n"] {
-                let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{budget}{stray}\n");
-                let refused = Config::parse(&toml).expect_err(stray);
-                assert!(
-                    format!("{refused:#}").contains("budget_disk states none"),
-                    "{stray}: {refused:#}"
-                );
-            }
+            let derived = format!("{MINIMAL_METAL}\n[engine.memory]\n{stray}\n");
+            Config::parse(&derived).expect("a path or persistence for the derived tier");
+            let toml = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"0B\"\n{stray}\n");
+            let refused = Config::parse(&toml).expect_err(stray);
+            assert!(
+                format!("{refused:#}").contains("budget_disk = 0 states none"),
+                "{stray}: {refused:#}"
+            );
         }
     }
 

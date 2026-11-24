@@ -1517,3 +1517,11 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **Idea.** Give `measure_shapes` the rates step's `Resume` (each point memoized with the kernels it fired, frames held to one decode step, a point past it deferred until nothing is live), then state curves `TimedBehind` on bounded platforms too.
 
 **Why later.** Accepted for this round (coordinator, 2026-11-24).
+
+## F?? Metal: a yielded rates or curve key behind serving resumes where it stopped
+
+**What.** On Metal, a `[rates]` key or a `curve <n>x<k>` shape timed behind serving that yields to an arrival starts again whole at the next idle turn (`engine-metal` `rates::YIELDED`, `tune::dense::YIELDED`). engine-gpu keeps its finished points and resumes. The widest keys (`gemm_tflops_by_rows`, `attn_tflops_by_keys`; single fires of 100–345 ms on the M1 Max) take minutes, so under arrivals that keep coming in idle gaps they can restart many times before one finishes. They are stale only between a kernel change and the next export round.
+
+**Idea.** Keep a key's settled points across yields (per point, as engine-gpu does) and time only the rest at the next turn, with the clock and overlap checks applying to each point's frames.
+
+**Why later.** Behind work runs only when no process is live, so yields are rare. Each yield already waits for at most one fire (a frame of long fires is cut between them).

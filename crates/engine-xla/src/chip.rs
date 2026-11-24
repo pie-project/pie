@@ -192,27 +192,6 @@ pub struct PadRowSteps(pub u32);
 #[decision(id = "engine.pad.half_rungs", constant(set(0, 32, 64, 128, 256, 512)), default = 0, tune = search)]
 pub struct PadHalfRungs(pub u32);
 
-/// Whether a decoding lane's next pages come before seating a waiting
-/// prompt, and a prompt waits rather than suspending a lane
-/// (`PoolFacts::seated_first`). Off keeps arrival order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
-pub struct SeatedFirst;
-
-/// Whether a process starts only while the pools hold the started ones to
-/// the pages a finished one held (`PoolFacts::seat_to_end`): the engine
-/// keeps no kv on the host, so a lane the pool runs short for restarts its
-/// process. Off starts each at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
-pub struct SeatToEnd;
-
-/// With `engine.seat_to_end`, whether the starts the pools do not hold to
-/// the end at once go spread over a life (`PoolFacts::seat_spread`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_spread", flag, default = false, tune = engine)]
-pub struct SeatSpread;
-
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("xla", FACTS, &["rows"]);
     kernels_xla::tuning::register(&mut r);
@@ -225,10 +204,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PageFloor>()
         .add::<PrefillFloor>()
         .add::<PadRowSteps>()
-        .add::<PadHalfRungs>()
-        .add::<SeatedFirst>()
-        .add::<SeatToEnd>()
-        .add::<SeatSpread>();
+        .add::<PadHalfRungs>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -252,8 +228,6 @@ pub struct Engine {
     pub gemm_transpose: bool,
     pub embed_fold: bool,
     pub pad: Pad,
-    /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
-    pub seats: [bool; 3],
 }
 
 /// How fires are padded to canonical shapes.
@@ -339,11 +313,6 @@ impl Engine {
                 row_steps: profile.get::<PadRowSteps>().0,
                 half_rungs: profile.get::<PadHalfRungs>().0,
             },
-            seats: [
-                profile.on::<SeatedFirst>(any),
-                profile.on::<SeatToEnd>(any),
-                profile.on::<SeatSpread>(any),
-            ],
         }
     }
 }
@@ -403,6 +372,19 @@ mod tests {
     #[test]
     fn the_registry_holds_together() {
         assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    /// Who goes first is the policy's (PLEX), not a profile's: the seating
+    /// flags a profile once stated are refused by name.
+    #[test]
+    fn a_profile_ordering_the_planner_is_refused() {
+        for id in ["seated_first", "seat_to_end", "seat_spread"] {
+            let why = registry()
+                .load_user(&format!("api = 1\n[engine]\n{id} = true\n"), "user.toml")
+                .expect_err("not a decision")
+                .to_string();
+            assert!(why.contains(&format!("`engine.{id}` is not a decision of xla")), "{why}");
+        }
     }
 
     #[test]
