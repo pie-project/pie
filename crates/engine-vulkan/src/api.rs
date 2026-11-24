@@ -78,9 +78,12 @@ impl Host for Api {
     }
 
     fn ports() -> PortMask {
-        PortMask::DECODE_ENVELOPE
+        PortMask::DEVICE_GEOMETRY
             .with(eta_ir::registry::Port::Fold)
             .with(eta_ir::registry::Port::AttnMask)
+            // Each beam's parent: the engine keeps the beams' page lists
+            // (`engine_gpu::beam`).
+            .with(eta_ir::registry::Port::Parents)
     }
 
     fn settles_asynchronously(gpu: &Vulkan) -> bool {
@@ -138,17 +141,20 @@ impl Host for Api {
         } else if defers && let Some(sink) = gpu.sink.as_ref() {
             // The forward's own report was held for the sampler.
             let mut held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut step_pending.wrote),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };
             // Its rows are read: the forward landed.
             if let Some(fed) = step_pending.fed.take() {
                 held = merged(held, fed.faults());
+                held.beam_common = fed.commons();
             }
             (sink)(at, merged(held, faulted));
         } else {
             // Told with the frame's settle, inside the submit.
             let held = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: Vec::new(),
                 faulted: std::mem::take(&mut step_pending.faulted),
             };
@@ -194,6 +200,13 @@ impl Host for Api {
         faulted: &mut engine::StepOutcome,
     ) -> EngineResult<()> {
         for attachment in &step.attachments {
+            // Device geometry resolves every port its lanes read, the
+            // shared engine's ([`engine_gpu::program::device_lanes`]).
+            if gpu.programs.geometry(attachment.instance)
+                == Some(eta_ir::registry::GeometryClass::DeviceGeometry)
+            {
+                continue;
+            }
             // A refusal of this attachment's envelope (its lane count, a
             // mask, its tokens) faults its lanes; the others resolve.
             let refused: Option<String> = 'pass: {

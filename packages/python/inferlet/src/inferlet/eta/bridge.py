@@ -317,8 +317,24 @@ class WorkingSet:
         return self.ws.folded()
 
     def fork(self, on: "Pipeline") -> "WorkingSet":
-        """A child sharing the frozen part, with a copy of the buffer."""
+        """A child sharing the frozen part, with a copy of the buffer; it shares as this set does."""
         return WorkingSet._wrap(_wit(self.ws.fork, on.wit, what="fork"))
+
+    def share(self, scope: Literal["session", "tenant", "group"], group: str | None = None) -> None:
+        """Publishes this set's frozen slots within `scope` (a `group` names its group), and
+        lets its passes reuse what that scope holds. Unasked, a set is private. Ask before its
+        first pass."""
+        if (scope == "group") != (group is not None):
+            raise ValueError("share: a group is named with scope 'group', and only with it")
+        if scope == "session":
+            wire = _wit_ws.ShareScope_Session()
+        elif scope == "tenant":
+            wire = _wit_ws.ShareScope_Tenant()
+        elif scope == "group":
+            wire = _wit_ws.ShareScope_Group(group)
+        else:
+            raise ValueError(f"share: no scope {scope!r}; 'session', 'tenant' or 'group'")
+        _wit(self.ws.share, wire, what="share")
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +352,12 @@ class Pipeline:
     def close(self) -> None:
         """End the stream; already-submitted fires still drain."""
         self.wit.close()
+
+    def retract(self, fires: int) -> None:
+        """Take back what the last `fires` fires submitted on this closed
+        pipeline wrote, once every fire on it has landed: the rows a program
+        ran ahead past its stop."""
+        _wit(self.wit.retract, fires, what="retract")
 
     def park(self) -> None:
         """Leave the frame wait-set until this pipeline submits again."""
@@ -407,7 +429,12 @@ class Pipeline:
             if cont is False:
                 if not ended:
                     self.close()
-                return consumed + 1
+                # The fire whose output broke the loop read a token the
+                # program took, so its rows stay; those past it are taken back.
+                kept = consumed + 1
+                if submitted > kept:
+                    self.retract(submitted - kept)
+                return kept
             consumed += 1
             if submitted < budget and submitted - consumed <= (window_frames - 1) * r:
                 submit_one_frame()
@@ -602,7 +629,11 @@ class ForwardPass:
             self.wit.state,
             [lane.ws for lane in lanes],
             _wit_forward.StateGeometry(
-                positions=wits[0], slots=wits[1], kv_len=wits[2], fold=wits[3]
+                positions=wits[0],
+                slots=wits[1],
+                kv_len=wits[2],
+                fold=wits[3],
+                parents=None,
             ),
             what="state",
         )

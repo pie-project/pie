@@ -13,7 +13,7 @@ use engine_metal::{Boot, Lane, Shell};
 use poem_compiler::Budget;
 
 use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of};
-use super::a_score_reader_holds_its_rows_through_a_park::{at_lane, bind_reader, reader};
+use super::a_score_reader_holds_its_rows_through_a_park::{at_lane, bind_reader, bind_reader_of_pair, reader};
 
 fn load(fixture: &Fixture) -> Shell {
     Shell::load(Boot {
@@ -55,7 +55,7 @@ fn a_load_walks_its_score_capturing_forms() {
     assert!(captures, "the plan has a word capturing its scores");
     let mut shell = load(&fixture);
     shell.warm_pipelines().expect("the walk runs");
-    shell.seal_pipelines();
+    shell.seal_pipelines().expect("the fixed pipelines build");
     let scores = |rows: u32| {
         fixture
             .trace
@@ -65,15 +65,17 @@ fn a_load_walks_its_score_capturing_forms() {
     let tokens: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
     shell.open(0).expect("a slot opens");
     // A capturing lane's rows are its reader's: readers bound after ready,
-    // at the prompt's rows and at one.
+    // at the prompt's rows and at one. At other extents each is its own
+    // pair, its state its own bytes.
     let program = shell
         .register_program(&reader(1024))
         .expect("the reader registers");
     let (prompt_reader, ..) = bind_reader(&mut shell, program, tokens.len() as u32, 1);
-    let (decode_reader, ..) = bind_reader(&mut shell, program, 1, 2);
+    let (decode_reader, ..) = bind_reader_of_pair(&mut shell, program, 1, 2, 1);
     shell
         .fire_attached(
             &[Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane {
                     slot: 0,
@@ -87,6 +89,7 @@ fn a_load_walks_its_score_capturing_forms() {
     shell
         .fire_attached(
             &[Seated {
+                replay_stated: None,
                 held: Some(tokens.len() as u32),
                 ..Seated::of(Lane {
                     slot: 0,

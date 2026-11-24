@@ -133,8 +133,8 @@ impl PoolPort for RacePool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         0
@@ -181,7 +181,7 @@ impl PoolPort for RacePool {
         self.with_rs(|rs| rs.release_reservation(grant));
     }
     fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets))
             .unwrap_or(0)
     }
     fn prepare_sweep(
@@ -192,6 +192,12 @@ impl PoolPort for RacePool {
         _wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
+    }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
     }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
@@ -1522,8 +1528,8 @@ impl PoolPort for RingPool {
     fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
         Default::default()
     }
-    fn reclaim_idle(&self) -> u32 {
-        0
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
     }
     fn reclaimable_idle(&self) -> u32 {
         0
@@ -1571,6 +1577,12 @@ impl PoolPort for RingPool {
         _wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn> {
         None
+    }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
     }
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
@@ -2275,9 +2287,9 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         || planner.wait_resident(pid),
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
         || None,
-        |_, _| false,
-        |_, _| false,
-        |_, _| {
+        |_, _, _| false,
+        |_, _, _| false,
+        |_, _, _| {
             std::future::ready(Err::<crate::planner::BindRoomWait, String>(
                 "no guest state here".into(),
             ))
@@ -2540,6 +2552,12 @@ struct BindRoomPool {
     /// holder of which it moves (the store's sweep of evicted processes'
     /// kv left on the device), or leaves them on the device.
     sweeps_shared: std::sync::atomic::AtomicBool,
+    /// Where set, what a reclaim frees waits on a fire's retirement
+    /// here (`returning`), as the kv store's pages read by a fire in
+    /// flight do: a reclaim frees only what is short past them.
+    retiring: parking_lot::Mutex<Option<Vec<u32>>>,
+    /// The cache chunks reclaims let go, in all.
+    reclaimed: AtomicU32,
 }
 
 impl BindRoomPool {
@@ -2569,7 +2587,17 @@ impl BindRoomPool {
             store_refuses: std::sync::atomic::AtomicBool::new(false),
             shared: parking_lot::Mutex::new(Vec::new()),
             sweeps_shared: std::sync::atomic::AtomicBool::new(true),
+            retiring: parking_lot::Mutex::new(None),
+            reclaimed: AtomicU32::new(0),
         }
+    }
+
+    /// The fire reading what reclaims let go retires: it comes free, and
+    /// the planner hears of it as a settle tells it.
+    fn retire(&self, planner: &Arc<ResidencyPlanner>) {
+        let back = self.retiring.lock().as_mut().map(std::mem::take).unwrap_or_default();
+        self.free.lock().extend(back);
+        planner.pages_freed();
     }
 
     /// The kv chunks of residents no longer on the device go back free,
@@ -2621,6 +2649,12 @@ impl BindRoomPool {
 }
 
 impl PoolPort for BindRoomPool {
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     /// Its own retake (`own`, single chunks) takes its chunks first; what
     /// is short is the rest of `need` (the head's need as the planner reads
     /// it, its own retake's single chunks among them), laid in what that
@@ -2631,7 +2665,7 @@ impl PoolPort for BindRoomPool {
         need: &super::pool::RunNeed,
         state: RsUnits,
         _kv_pages: u32,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
     ) -> super::pool::RestorePlacement {
         let _ = (pid, state, bind);
         let refuses = self.store_refuses.load(Ordering::Relaxed);
@@ -2790,11 +2824,28 @@ impl PoolPort for BindRoomPool {
         crate::rt::spawn(async move { planner.parked_down_done(true) });
         true
     }
-    fn reclaim_idle(&self) -> u32 {
+    fn reclaim_idle(&self, short: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        if let Some(returning) = self.retiring.lock().as_mut() {
+            let want = (short.kv_pages as usize).saturating_sub(returning.len());
+            let mut cache = self.cache.lock();
+            let take = want.min(cache.len());
+            let dropped: Vec<u32> = cache.drain(..take).collect();
+            self.reclaimed.fetch_add(dropped.len() as u32, Ordering::Relaxed);
+            let freed = dropped.len() as u32;
+            returning.extend(dropped);
+            return super::pool::IdleReclaim {
+                freed,
+                returning: returning.len() as u32,
+            };
+        }
         let dropped: Vec<u32> = std::mem::take(&mut *self.cache.lock());
         let count = dropped.len() as u32;
+        self.reclaimed.fetch_add(count, Ordering::Relaxed);
         self.free.lock().extend(dropped);
-        count
+        super::pool::IdleReclaim {
+            freed: count,
+            returning: 0,
+        }
     }
     fn reclaimable_idle(&self) -> u32 {
         self.cache.lock().len() as u32
@@ -2817,10 +2868,11 @@ impl PoolPort for BindRoomPool {
         (0..).take_while(|&k| self.runs_free(run, k + 1)).count() as u32
     }
     /// A rung here is the free chunks its raise takes, anywhere.
-    fn rise_room(&self, rung: u32) -> super::pool::RiseRoom {
+    fn rise_room(&self, _pid: ProcessId, rung: u32) -> super::pool::RiseRoom {
         if rung > self.total {
             return super::pool::RiseRoom::Past {
                 need: rung,
+                own: 0,
                 total: self.total,
             };
         }
@@ -2976,7 +3028,7 @@ async fn a_bind_short_of_room_lands_once_idle_cache_is_dropped() {
     planner.note_admitted(pid);
     assert!(!pool.runs_free(3, 1), "the cache holds every chunk");
     let p = planner.clone();
-    let waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1).await });
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1, 0).await });
     waited.await.expect("the wait ends").expect("served");
     assert!(pool.cache.lock().is_empty(), "the cache was dropped for it");
     assert!(pool.runs_free(3, 1));
@@ -2987,6 +3039,43 @@ async fn a_bind_short_of_room_lands_once_idle_cache_is_dropped() {
         0,
         "no process was parked"
     );
+}
+
+/// Idle cache fills the pool and what a reclaim lets go waits on a fire's
+/// retirement: the bind short of a run of 3 has 3 chunks reclaimed, and
+/// the next pass for the same shortfall counts them as returning, reclaims
+/// nothing more and waits, never on a clock. Their retirement wakes it,
+/// and it is served in them; the rest of the cache stays.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_waits_for_what_its_reclaim_freed_to_retire_and_reclaims_no_more() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..8, 0));
+    *pool.retiring.lock() = Some(Vec::new());
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let p = planner.clone();
+    let mut waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1, 0).await });
+    for _ in 0..3 {
+        planner.plan();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut waited).await;
+    assert!(early.is_err(), "it waits for the retirement");
+    assert_eq!(pool.reclaimed.load(Ordering::Relaxed), 3, "the shortfall, once");
+    assert_eq!(pool.cache.lock().len(), 5, "no more of the cache went");
+    assert_eq!(
+        planner.stats.evictions_started.load(Ordering::Relaxed),
+        0,
+        "and no one moved for it"
+    );
+    pool.retire(&planner);
+    waited.await.expect("the wait ends").expect("served");
+    assert_eq!(pool.reclaimed.load(Ordering::Relaxed), 3);
+    assert_eq!(pool.cache.lock().len(), 5);
 }
 
 /// Resident guest state fills the pool and no cache is left: the bind
@@ -3007,7 +3096,7 @@ async fn a_bind_short_of_room_lands_once_a_resident_is_parked() {
     }
     planner.with_inner(|inner| inner.procs.get_mut(&holder).unwrap().idle = true);
     let p = planner.clone();
-    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.diagnostics().queue.len() == 1 {
@@ -3039,7 +3128,7 @@ async fn a_bind_short_of_room_lands_once_a_resident_is_parked() {
 
     let gone = ProcessId::new_v4();
     assert!(matches!(
-        planner.wait_bind_room(gone, 3, 1).await,
+        planner.wait_bind_room(gone, 3, 1, 0).await,
         Err(PlannerError::Cancelled)
     ));
 }
@@ -3093,7 +3182,7 @@ async fn short_lived_binds_over_a_cache_filled_pool_all_land() {
                     break run;
                 }
                 planner
-                    .wait_bind_room(pid, 2, 1)
+                    .wait_bind_room(pid, 2, 1, 0)
                     .await
                     .map_err(|why| format!("{pid}: {why}"))?;
             };
@@ -3167,7 +3256,7 @@ async fn a_raise_short_of_room_among_waiting_binds_is_funded_and_all_are_served(
                     break run;
                 }
                 planner
-                    .wait_bind_room(pid, 2, 1)
+                    .wait_bind_room(pid, 2, 1, 0)
                     .await
                     .map_err(|why| format!("{pid}: {why}"))?;
             };
@@ -3238,6 +3327,7 @@ async fn a_raise_past_the_whole_pool_is_refused_by_name_at_once() {
         PlannerError::PastRung {
             rung: 9,
             need: 9,
+            own: 0,
             total: 8
         }
     );
@@ -3269,6 +3359,7 @@ async fn a_restore_suspended_for_a_bind_waits_for_the_bind_s_room_too() {
         let proc = inner.procs.get_mut(&binder).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(PendingBind {
+            singles: 0,
             run: 3,
             pieces: 1,
             pages: 3,
@@ -3336,7 +3427,7 @@ async fn a_bind_room_head_with_no_fresh_victim_gets_a_last_resort_pick() {
         .chain(victims.iter().map(|victim| victim.pid))
         .map(|pid| {
             let planner = planner.clone();
-            crate::rt::spawn(async move { planner.wait_bind_room(pid, 3, 1).await })
+            crate::rt::spawn(async move { planner.wait_bind_room(pid, 3, 1, 0).await })
         })
         .collect();
     // Each waits: queued, or, its own process evicted meanwhile, withdrawn
@@ -3488,7 +3579,7 @@ async fn a_bind_short_of_room_is_funded_while_the_fleet_decodes() {
     planner.with_inner(|inner| inner.procs.get_mut(&holder).unwrap().idle = true);
     *pool.occupant.lock() = Some(holder);
     let p = planner.clone();
-    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -3520,7 +3611,7 @@ async fn a_waiting_bind_is_quoted_again_when_the_rung_moves() {
     planner.register(binder);
     planner.note_admitted(binder);
     let p = planner.clone();
-    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
     }
@@ -3561,7 +3652,7 @@ async fn an_older_process_waiting_at_a_bind_is_moved_for_the_head_s_chunks() {
     });
     *pool.occupant.lock() = Some(holder);
     let p = planner.clone();
-    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    let waited = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -3665,6 +3756,7 @@ async fn a_gate_sleeps_through_policy_answers_and_is_refused_only_past_the_pool(
     // and waits for room, however long.
     let key = planner.with_inner(|inner| {
         inner.procs.get_mut(&short).unwrap().roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 1,
             pages: 3,
@@ -3822,6 +3914,7 @@ async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_
         let proc = inner.procs.get_mut(&restoring).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 1,
             pages: 3,
@@ -3918,6 +4011,7 @@ async fn an_understated_need_s_free_runs_send_no_restore_and_the_idle_cache_goes
         let proc = inner.procs.get_mut(&restoring).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 1,
             pieces: 1,
             pages: 1,
@@ -3981,6 +4075,7 @@ async fn parked_state_on_the_device_moves_down_for_the_head_restore_s_run() {
             inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
         }
         inner.procs.get_mut(&head).unwrap().roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 1,
             pages: 3,
@@ -4049,6 +4144,7 @@ async fn with_no_host_tier_parked_role_chunks_go_to_disk_for_a_bind_suspended_he
             inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
         }
         inner.procs.get_mut(&head).unwrap().bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 2,
             pages: 6,
@@ -4099,6 +4195,7 @@ async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_p
             let proc = inner.procs.get_mut(&pid).unwrap();
             proc.state = Residency::Evicted;
             proc.bind_room = Some(super::proc::PendingBind {
+                singles: 0,
                 run: 1,
                 pieces: 1,
                 pages: 1,
@@ -4156,6 +4253,7 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
             let proc = inner.procs.get_mut(&pid).unwrap();
             proc.state = Residency::Evicted;
             proc.bind_room = Some(super::proc::PendingBind {
+                singles: 0,
                 run: 1,
                 pieces: 1,
                 pages: 1,
@@ -4246,6 +4344,7 @@ async fn a_restore_refused_past_the_pool_forgets_what_it_learned_of_the_room() {
     planner.register(pid);
     planner.note_admitted(pid);
     let need = |pieces| super::proc::PendingBind {
+        singles: 0,
         run: 3,
         pieces,
         pages: 3 * pieces,
@@ -4309,6 +4408,7 @@ async fn a_restore_short_of_runs_goes_again_on_free_runs_while_the_fleet_decodes
         let proc = inner.procs.get_mut(&restoring).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 4,
             pieces: 2,
             pages: 8,
@@ -4360,6 +4460,7 @@ async fn a_restored_bind_that_waits_again_lets_the_next_bind_suspended_restore_g
     planner.with_inner(|inner| {
         inner.bind_restoring = Some(restored);
         inner.procs.get_mut(&head).unwrap().bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 1,
             pieces: 1,
             pages: 1,
@@ -4407,6 +4508,7 @@ async fn a_bind_suspended_restore_goes_on_runs_beside_its_own_with_no_room_given
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 2,
             pieces: 2,
             pages: 4,
@@ -4457,6 +4559,7 @@ async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_past_the_p
         let proc = inner.procs.get_mut(&restoring).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 1,
             pages: 3,
@@ -4501,6 +4604,7 @@ async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_past_the_p
     // Past the whole pool (three runs of three in eight chunks): refused.
     planner.with_inner(|inner| {
         inner.procs.get_mut(&restoring).unwrap().roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 3,
             pages: 9,
@@ -4532,6 +4636,7 @@ async fn the_bind_of_the_one_restored_for_it_goes_ahead_of_the_held_restore() {
         let proc = inner.procs.get_mut(&held).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 1,
             pieces: 1,
             pages: 1,
@@ -4544,7 +4649,7 @@ async fn the_bind_of_the_one_restored_for_it_goes_ahead_of_the_held_restore() {
         );
     });
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(restored, 1, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(restored, 1, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if bind.is_finished() {
@@ -4582,6 +4687,7 @@ async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past
     }
     pool.parked.lock().extend([(2, a), (5, b)]);
     let need = |pieces| super::proc::PendingBind {
+        singles: 0,
         run: 3,
         pieces,
         pages: 3 * pieces,
@@ -4719,7 +4825,7 @@ async fn a_need_past_the_whole_pool_is_refused_by_name_at_once() {
     planner.register(pid);
     planner.note_admitted(pid);
     let refused = planner
-        .wait_bind_room(pid, 3, 3)
+        .wait_bind_room(pid, 3, 3, 0)
         .now_or_never()
         .expect("refused at once, no wait");
     match refused {
@@ -4729,7 +4835,7 @@ async fn a_need_past_the_whole_pool_is_refused_by_name_at_once() {
         other => panic!("refused by name: {other:?}"),
     }
     assert!(
-        planner.wait_bind_room(pid, 4, 2).now_or_never().is_none(),
+        planner.wait_bind_room(pid, 4, 2, 0).now_or_never().is_none(),
         "two runs of four fit eight chunks: it waits"
     );
     let other = ProcessId::new_v4();
@@ -4739,6 +4845,7 @@ async fn a_need_past_the_whole_pool_is_refused_by_name_at_once() {
         let proc = inner.procs.get_mut(&other).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 2,
             pages: 6,
@@ -4780,7 +4887,7 @@ async fn a_head_short_only_by_fragmentation_waits_and_is_served_once_eviction_ma
     }
     *pool.occupant.lock() = Some(resident);
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1, 0).await });
     for _ in 0..400 {
         answered_nothing(Tier::Device);
         crate::rt::yield_now().await;
@@ -4848,12 +4955,12 @@ async fn a_bind_waiting_for_room_yields_to_its_own_eviction_and_binds_after_the_
         || planner.wait_resident(pid),
         |_, _| std::future::ready(Err::<(), String>("no grow here".into())),
         || None,
-        |_, _| false,
-        |_, _| false,
-        move |run, pieces| {
+        |_, _, _| false,
+        |_, _, _| false,
+        move |run, pieces, singles| {
             let p = p.clone();
             async move {
-                p.wait_bind_room(pid, run, pieces)
+                p.wait_bind_room(pid, run, pieces, singles)
                     .await
                     .map_err(|why| why.to_string())
             }
@@ -4902,7 +5009,7 @@ async fn a_bind_waiting_for_room_yields_to_its_own_eviction_and_binds_after_the_
     // A bind that asks while its process is evicting waits for the restore
     // at once, queued nowhere.
     assert_eq!(
-        planner.wait_bind_room(pid, 1, 1).await,
+        planner.wait_bind_room(pid, 1, 1, 0).await,
         Ok(crate::planner::BindRoomWait::Withdrawn)
     );
     assert_eq!(bind_rooms(&planner), 0);
@@ -4947,6 +5054,7 @@ async fn a_roles_short_restore_is_funded_beside_a_steady_decoder_once_a_bind_wai
             let proc = inner.procs.get_mut(&restoring).unwrap();
             proc.state = Residency::Evicted;
             proc.roles_short = Some(super::proc::PendingBind {
+                singles: 0,
                 run: 3,
                 pieces: 1,
                 pages: 3,
@@ -5018,6 +5126,7 @@ async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_roo
             let proc = inner.procs.get_mut(&head).unwrap();
             proc.state = Residency::Evicted;
             proc.roles_short = Some(super::proc::PendingBind {
+                singles: 0,
                 run: 3,
                 pieces: 1,
                 pages: 3,
@@ -5284,6 +5393,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                 let proc = inner.procs.get_mut(&head).unwrap();
                 proc.state = Residency::Evicted;
                 proc.roles_short = Some(super::proc::PendingBind {
+                    singles: 0,
                     run,
                     pieces,
                     pages: run * pieces,
@@ -5365,7 +5475,7 @@ async fn the_planner_makes_progress_wherever_the_map_serves_the_head() {
                         .map(drop)
                         .map_err(|error| error.to_string())
                 } else {
-                    p.wait_bind_room(head, run, pieces)
+                    p.wait_bind_room(head, run, pieces, 0)
                         .await
                         .map(drop)
                         .map_err(|error| error.to_string())
@@ -5809,7 +5919,7 @@ async fn a_bind_short_of_a_run_is_funded_by_the_map_never_waiting_on_a_compactio
     planner.with_inner(|inner| inner.procs.get_mut(&resident).unwrap().idle = true);
     *pool.occupant.lock() = Some(resident);
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -5960,6 +6070,7 @@ async fn a_process_suspended_for_its_bind_s_room_is_restored_only_once_the_room_
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 1,
             pages: 3,
@@ -6022,6 +6133,7 @@ async fn a_refused_restore_s_need_is_its_refusal_s_and_the_planner_moves_for_it(
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Restoring;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 1,
             pages: 3,
@@ -6273,7 +6385,7 @@ async fn a_failed_park_down_is_tried_again_once_room_moves() {
     pool.parked.lock().extend([(1, sleeper), (3, sleeper), (5, sleeper), (7, sleeper)]);
     pool.park_down_fails.store(1, Ordering::SeqCst);
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(head, 2, 1).await.map(drop) });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(head, 2, 1, 0).await.map(drop) });
     for _ in 0..200 {
         crate::rt::yield_now().await;
     }
@@ -6312,7 +6424,7 @@ async fn a_disk_tier_full_of_idle_cache_is_room_for_a_victim() {
     }
     *pool.occupant.lock() = Some(resident);
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -6348,7 +6460,7 @@ async fn parked_state_of_a_process_gone_while_parked_moves_down_for_the_head() {
     let gone = ProcessId::new_v4();
     pool.parked.lock().extend([(1, gone), (3, gone), (5, gone), (7, gone)]);
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(head, 2, 1).await.map(drop) });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(head, 2, 1, 0).await.map(drop) });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if bind.is_finished() {
@@ -6437,6 +6549,7 @@ async fn a_bind_suspended_restore_is_funded_beside_its_own_retake() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 2,
             pieces: 2,
             pages: 4,
@@ -6506,6 +6619,7 @@ async fn a_blocked_victim_is_a_candidate_again_once_the_pool_moves() {
             WaitKind::BindRoom {
                 run: 2,
                 pieces: 1,
+                singles: 0,
                 pages: 2,
                 notify: Arc::new(Notify::new()),
                 served: false,
@@ -6554,7 +6668,7 @@ async fn a_head_no_eviction_can_fund_asks_a_compaction() {
     planner.note_admitted(binder);
     // The gaps are held by no candidate (no occupant the planner may move).
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if pool.compactions.load(Ordering::Relaxed) > 0 {
@@ -6712,6 +6826,7 @@ async fn a_roles_short_restore_is_funded_for_its_whole_unpark() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 2,
             pieces: 1,
             pages: 2,
@@ -6760,7 +6875,7 @@ async fn a_head_short_of_runs_is_funded_with_the_swap_full() {
     *pool.occupant.lock() = Some(resident);
     assert_eq!(planner.swap_stats().0, 0, "the swap is full");
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -6826,7 +6941,7 @@ async fn a_bind_never_picks_its_own_process() {
     // Its own state holds the chunks between the free ones.
     *pool.occupant.lock() = Some(binder);
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
     }
@@ -6863,7 +6978,7 @@ async fn with_nothing_in_flight_a_head_is_funded_by_residents_that_made_no_progr
     pool.kv.lock().extend([(1, a), (3, a), (5, b), (7, b)]);
     assert!(planner.with_inner(|inner| inner.nothing_in_flight()));
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 2, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -6971,6 +7086,7 @@ async fn an_evicted_head_s_own_parked_state_moves_down_for_its_runs() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 2,
             pieces: 1,
             pages: 2,
@@ -7071,6 +7187,7 @@ async fn a_restore_is_funded_for_its_runs_and_its_kv_pages_together() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 2,
             pieces: 1,
             pages: 2,
@@ -7239,7 +7356,7 @@ async fn a_head_short_of_runs_with_no_headroom_frees_budget_elsewhere() {
     pool.kv.lock().extend([(8, resident), (9, resident), (10, resident), (11, resident)]);
     assert!(!pool.guest_room_free(4, 1), "runs stand open, the budget opens none");
     let p = planner.clone();
-    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 4, 1).await });
+    let bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 4, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -7280,6 +7397,7 @@ async fn pages_gathered_for_another_head_go_back_for_a_restore_that_needs_none()
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
             run: 1,
             pieces: 6,
             pages: 6,
@@ -7328,6 +7446,7 @@ async fn a_bind_suspended_restore_that_cannot_fire_holds_the_next_no_longer() {
         let proc = inner.procs.get_mut(&second).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 1,
             pieces: 1,
             pages: 1,
@@ -7369,6 +7488,7 @@ fn bench_a_plan_pass_with_nothing_to_do() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 4,
             pieces: 2,
             pages: 8,
@@ -7419,6 +7539,7 @@ fn bench_the_pieces_of_a_plan_pass() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 4,
             pieces: 2,
             pages: 8,
@@ -7672,6 +7793,7 @@ fn bench_a_plan_pass_on_a_shared_store() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 4,
             pieces: 2,
             pages: 8,
@@ -7711,7 +7833,7 @@ fn bench_a_plan_pass_on_a_shared_store() {
          free_chunks={} free runs of 4={} restore_stands={} stalled={stalled}",
         pool.free_chunks(),
         pool.guest_free_runs(4),
-        pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, None),
+        pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, &[]),
     );
 
     let first = std::time::Instant::now();
@@ -7838,10 +7960,10 @@ fn bench_a_plan_pass_on_a_shared_store() {
         let _ = planner.generation();
     });
     time("port.restore_stands", &|| {
-        let _ = pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, None);
+        let _ = pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, &[]);
     });
     time("port.restore_stands(bind 4x2)", &|| {
-        let _ = pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, Some((4, 2)));
+        let _ = pool.restore_stands(head, &super::pool::RunNeed::one(4, 2), RsUnits::default(), 0, &[(4, 2)]);
     });
     time("port.chunk_census(4)", &|| {
         let _ = pool.chunk_census(4);
@@ -8017,6 +8139,7 @@ async fn a_stuck_state_is_said_once_and_costs_no_pass_until_an_event() {
             WaitKind::BindRoom {
                 run: 2,
                 pieces: 1,
+                singles: 0,
                 pages: 2,
                 notify: Arc::new(Notify::new()),
                 served: false,
@@ -8257,6 +8380,7 @@ async fn a_restore_head_whose_need_stands_is_attempted_in_its_first_pass() {
             let proc = inner.procs.get_mut(&head).unwrap();
             proc.state = Residency::Evicted;
             proc.bind_room = Some(super::proc::PendingBind {
+                singles: 0,
                 run: 7,
                 pieces: 1,
                 pages: 7,
@@ -8549,6 +8673,7 @@ async fn an_evicted_process_s_state_left_on_the_device_moves_down_for_the_head()
             inner.procs.get_mut(&pid).unwrap().state = Residency::Evicted;
         }
         inner.procs.get_mut(&head).unwrap().bind_room = Some(PendingBind {
+            singles: 0,
             run: 2,
             pieces: 1,
             pages: 2,
@@ -8647,6 +8772,7 @@ fn a_refused_run_stays_in_the_need_across_a_re_send() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Restoring;
         proc.bind_room = Some(PendingBind {
+            singles: 0,
             run: 7,
             pieces: 1,
             pages: 7,
@@ -8828,6 +8954,7 @@ fn a_process_evicted_while_queued_is_restored_only_behind_the_queue_ahead_of_it(
     let bind = || WaitKind::BindRoom {
         run: 1,
         pieces: 1,
+        singles: 0,
         pages: 1,
         notify: Arc::new(Notify::new()),
         served: false,
@@ -8911,7 +9038,7 @@ async fn a_bind_head_one_queued_resident_away_is_funded_with_nothing_in_flight()
         }
     });
     let p = planner.clone();
-    let _bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1).await });
+    let _bind = crate::rt::spawn(async move { p.wait_bind_room(binder, 3, 1, 0).await });
     for _ in 0..200 {
         crate::rt::yield_now().await;
         if planner.stats.evictions_started.load(Ordering::Relaxed) > 0 {
@@ -8953,6 +9080,7 @@ async fn a_restore_head_one_queued_resident_away_is_funded_with_nothing_in_fligh
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 2,
             pieces: 1,
             pages: 2,
@@ -9048,6 +9176,7 @@ async fn with_no_one_resident_evicted_state_moves_down_for_a_held_restore() {
             proc.evicted_for = Some(other);
         }
         inner.procs.get_mut(&first).unwrap().roles_short = Some(PendingBind {
+            singles: 0,
             run: 2,
             pieces: 1,
             pages: 2,
@@ -9095,6 +9224,7 @@ async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 1,
             pieces: 1,
             pages: 1,
@@ -9139,9 +9269,9 @@ async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
     );
 }
 
-/// The policy's schedule floor (the test-pause policy of sc/amd-beam-pages
-/// holds a process below it for a while, then lifts it): a process held
-/// below the floor and parked stays parked while room stands free and its
+/// A policy's hold (the test-pause policy of sc/amd-beam-pages
+/// holds a process for a while, then lifts it): a process held
+/// and parked stays parked while room stands free and its
 /// own lanes wait to be resident, and, taking sets that are off the
 /// device, owes them parked; its restore is queued once the policy lifts
 /// it, never before.
@@ -9157,7 +9287,7 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
         rs: RsUnits::default(),
     };
     planner.with_inner(|inner| {
-        inner.reschedule(|_| (0, true));
+        inner.reschedule(None, |_| (0, true));
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Evicted;
         proc.parked = Some(demand);
@@ -9193,7 +9323,7 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
         "parked with what it owes"
     );
     // The policy lifts it: its restore goes.
-    planner.with_inner(|inner| inner.reschedule(|_| (1, false)));
+    planner.with_inner(|inner| inner.reschedule(None, |_| (1, false)));
     assert!(restore_queued(&planner), "lifted: its restore is queued");
     waiting.abort();
 }
@@ -9223,6 +9353,7 @@ fn a_restore_waiting_on_its_rebinds_is_nothing_in_flight() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(PendingBind {
+            singles: 0,
             run: 9,
             pieces: 2,
             pages: 18,
@@ -9268,6 +9399,7 @@ async fn four_scattered_free_chunks_and_a_run_of_four_asked_issue_a_plan() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 4,
             pieces: 1,
             pages: 4,
@@ -9319,6 +9451,7 @@ async fn a_pass_that_stops_short_of_the_eviction_plan_says_where() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 4,
             pieces: 1,
             pages: 4,
@@ -9435,6 +9568,7 @@ async fn a_pass_that_sends_a_refused_restore_again_says_so() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 2,
             pieces: 1,
             pages: 2,
@@ -9581,6 +9715,7 @@ async fn a_bind_suspended_restore_is_sent_only_where_its_whole_placement_stands(
         let proc = inner.procs.get_mut(&pid).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(PendingBind {
+            singles: 0,
             run: 7,
             pieces: 2,
             pages: 14,
@@ -9650,6 +9785,7 @@ fn with_nothing_in_flight_a_process_not_yet_admitted_is_a_victim() {
             WaitKind::BindRoom {
                 run: 9,
                 pieces: 2,
+                singles: 0,
                 pages: 18,
                 notify: Arc::new(Notify::new()),
                 served: false,
@@ -9693,6 +9829,7 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
             WaitKind::BindRoom {
                 run: 2,
                 pieces: 1,
+                singles: 0,
                 pages: 2,
                 notify: Arc::new(Notify::new()),
                 served: false,
@@ -9718,10 +9855,12 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
 /// The L40S at 3 GiB on f623134fc: kv resident 0, the stall's map naming 7
 /// moves for a restore head, the pass ending "no pick: the policy is
 /// asked", nothing in flight, 185 s with no serve. Such an end is a quiet
-/// wait and is counted and said with who the moves name (here a holder no
-/// rule lets the pass move).
+/// wait (a planner bug: no step found) only where the moves named are moves
+/// a step makes: here the map names a holder on its way into its process,
+/// which no rule lets the pass move, and the wait is no bug and not said as
+/// one (the M1 at beam x40: 53 such lines over residents no step moves).
 #[tokio::test(flavor = "current_thread")]
-async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait() {
+async fn a_wait_on_moves_no_step_makes_is_no_quiet_wait() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let pool = Arc::new(BindRoomPool::new(6, 0..0, 64));
     pool.free.lock().extend([0, 1, 2, 3]);
@@ -9738,6 +9877,7 @@ async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 1,
             pieces: 5,
             pages: 5,
@@ -9758,8 +9898,13 @@ async fn the_policy_asked_with_nothing_in_flight_and_moves_named_is_a_quiet_wait
     }
     let end = planner.with_inner(|inner| inner.last_plan.as_ref().map(|end| end.ended));
     assert!(
-        planner.stats.quiet_waits.load(Ordering::Relaxed) > 0,
-        "counted and said as a quiet wait ({end:?})"
+        end.is_some_and(|end| end.contains("the policy is asked")),
+        "the policy asked ({end:?})"
+    );
+    assert_eq!(
+        planner.stats.quiet_waits.load(Ordering::Relaxed),
+        0,
+        "a holder no step moves: no quiet wait ({end:?})"
     );
 }
 
@@ -9810,6 +9955,7 @@ async fn one_chunk_short_of_singles_evicts_its_parkable_occupants() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 1,
             pieces: 13,
             pages: 13,
@@ -9851,6 +9997,7 @@ fn a_restore_s_pages_to_gather_are_single_chunks_beside_its_runs() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.roles_short = Some(PendingBind {
+            singles: 0,
             run: 7,
             pieces: 1,
             pages: 7,
@@ -9901,6 +10048,7 @@ async fn a_restore_s_own_take_consumes_a_run_and_its_move_is_issued() {
         let proc = inner.procs.get_mut(&head).unwrap();
         proc.state = Residency::Evicted;
         proc.bind_room = Some(super::proc::PendingBind {
+            singles: 0,
             run: 3,
             pieces: 2,
             pages: 6,
@@ -9995,12 +10143,15 @@ async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
             let proc = inner.procs.get_mut(&head).unwrap();
             proc.state = Residency::Evicted;
             proc.roles_short = Some(PendingBind {
+                singles: 0,
                 run: 1,
                 pieces: 1,
                 pages: 1,
             });
             proc.bind_room = proc.roles_short;
             proc.roles_short_free = Some(6);
+            // Refused in the room as it stands: none given back since.
+            proc.roles_short_gives = Some(PoolPort::room_gives(&*pool));
             proc.roles_short_quiet = quiet;
             inner.enqueue(
                 head,
@@ -10156,6 +10307,7 @@ async fn replay(snap: &StallSnapshot) -> Result<(), String> {
                 let proc = inner.procs.get_mut(&pid).unwrap();
                 proc.state = snap_proc.state;
                 proc.roles_short = snap_proc.refused.map(|(run, pieces)| PendingBind {
+                    singles: 0,
                     run,
                     pieces,
                     pages: run * pieces,
@@ -10340,6 +10492,7 @@ fn a_settled_head_with_nothing_in_flight_fails_a_strict_test() {
             WaitKind::BindRoom {
                 run: 2,
                 pieces: 1,
+                singles: 0,
                 pages: 2,
                 notify: Arc::new(Notify::new()),
                 served: false,

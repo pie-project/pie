@@ -13,6 +13,8 @@ use crate::pie::inferlet::forward as wit_forward;
 use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::pie::inferlet::working_set as wit_ws;
+/// Who a working set shares with ([`WorkingSet::share`]).
+pub use crate::pie::inferlet::working_set::ShareScope;
 
 pub use eta_dsl::intrinsics;
 
@@ -458,11 +460,26 @@ impl WorkingSet {
         self.ws.folded()
     }
 
-    /// A child sharing the frozen part, with a copy of the buffer.
+    /// A child sharing the frozen part, with a copy of the buffer. It
+    /// shares as this set does.
     pub fn fork(&self, on: &Pipeline) -> Result<WorkingSet, String> {
         Ok(WorkingSet {
             ws: Rc::new(self.ws.fork(&on.wit)?),
         })
+    }
+
+    /// Publishes this set's frozen slots within `scope`, and lets its passes
+    /// reuse what that scope holds: prefixes others computed, or are
+    /// computing. Unasked, a set is private. Ask before its first pass.
+    pub fn share(&self, scope: ShareScope) -> Result<(), String> {
+        self.ws.share(&scope)
+    }
+
+    /// [`WorkingSet::new`], shared within `scope` ([`WorkingSet::share`]).
+    pub fn shared(scope: ShareScope) -> Result<WorkingSet, String> {
+        let ws = WorkingSet::new();
+        ws.share(scope)?;
+        Ok(ws)
     }
 }
 
@@ -507,6 +524,12 @@ pub struct StateGeometry<'a> {
     /// Per lane, how many slots the lane reads.
     pub kv_len: Option<&'a Channel>,
     pub fold: Fold<'a>,
+    /// `[lanes]` u32: per lane, the beam of the fire before it continues; the
+    /// engine keeps the beams' own page lists (`forward.wit`, `crate::beam`).
+    pub parents: Option<&'a Channel>,
+    /// With `parents`, the slot past the search's last row: the depth its
+    /// page lists are laid for (`crate::beam::BeamGroup::geometry`).
+    pub parents_end: Option<u32>,
 }
 
 impl StateGeometry<'_> {
@@ -685,6 +708,14 @@ impl ForwardPass {
     }
 
     /// Puts lane `lane` in attention group `id`.
+    /// A beam search's finish: once this pass's last fire has landed, its
+    /// working set holds beam `beam`'s hypothesis at its slots
+    /// `[folded, end)`, in its own order, and the other beams' pages are let
+    /// go (`BEAM-PAGE-LISTS.md` §6.6; [`crate::beam::BeamGroup::finish`]).
+    pub fn adopt_beam(&self, beam: u32, end: u32) -> Result<(), String> {
+        self.wit.adopt_beam(beam, end)
+    }
+
     pub fn group(&self, lane: u32, id: u32) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -756,6 +787,7 @@ impl ForwardPass {
             (Port::Slots, geom.slots.copied()),
             (Port::KvLen, geom.kv_len.copied()),
             (Port::Fold, fold),
+            (Port::Parents, geom.parents.copied()),
         ];
         if !rebind {
             let ports: Vec<Port> = stated
@@ -778,6 +810,8 @@ impl ForwardPass {
                 slots: wits[1].as_deref(),
                 kv_len: wits[2].as_deref(),
                 fold: wits[3].as_deref(),
+                parents: wits[4].as_deref(),
+                parents_end: geom.parents_end,
             },
         )?;
         let mut inner = self.inner.borrow_mut();
@@ -1095,6 +1129,10 @@ pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(),
     wit_forward::submit(&on.wit, &borrows)
 }
 
+/// Fires `pass` up to `budget` times, running ahead of `on_token`, whose
+/// `i`-th call reads fire `i`'s output. A break keeps the fires through the
+/// one it read and takes back the rows of those submitted past it
+/// ([`Pipeline::retract`]); the count kept is returned.
 pub async fn run_ahead(
     on: &Pipeline,
     pass: &ForwardPass,
@@ -1148,7 +1186,13 @@ pub async fn run_ahead(
             if !ended {
                 on.close();
             }
-            return Ok(consumed + 1);
+            // The fire whose output broke the loop read a token the program
+            // took, so its rows stay; those submitted past it are taken back.
+            let kept = consumed + 1;
+            if submitted > kept {
+                on.retract(u32::try_from(submitted - kept).unwrap_or(u32::MAX))?;
+            }
+            return Ok(kept);
         }
         consumed += 1;
         if submitted < budget && submitted - consumed <= (window_frames - 1) * r {
@@ -1180,6 +1224,13 @@ impl Pipeline {
         self.wit.close();
     }
 
+    /// Take back what the last `fires` fires submitted on this closed
+    /// pipeline wrote, once every fire on it has landed: the rows a program
+    /// ran ahead past its stop.
+    pub fn retract(&self, fires: u32) -> Result<(), String> {
+        self.wit.retract(fires)
+    }
+
     pub fn park(&self) {
         wit_forward::park(&self.wit);
     }
@@ -1201,7 +1252,7 @@ impl Default for Pipeline {
 
 pub mod shared_prelude {
     pub use super::{
-        Channel, Fold, Pipeline, StateGeometry, TOKEN_PAD, WorkingSet, channel_capacity,
+        Channel, Fold, Pipeline, ShareScope, StateGeometry, TOKEN_PAD, WorkingSet, channel_capacity,
         frame_size, kv_page_size, readout_spans,
     };
     pub use crate::{Context, Result, model};

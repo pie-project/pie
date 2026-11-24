@@ -287,7 +287,9 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
         Port::EmbedTokens | Port::Positions | Port::Slots => {
             set_first_symbolic(&mut ty, SymbolicExtent::TokenCount)
         }
-        Port::KvLen | Port::Fold => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
+        Port::KvLen | Port::Fold | Port::Parents => {
+            set_first_symbolic(&mut ty, SymbolicExtent::RowCount)
+        }
         Port::Readout => set_first_symbolic(&mut ty, SymbolicExtent::SampledRows),
         Port::AttnMask => {
             if !ty.dims.is_empty() {

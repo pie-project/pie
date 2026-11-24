@@ -110,6 +110,10 @@ pub struct Rates {
     /// only where the platform states such a bound (Android); not one of
     /// [`KEYS`], which the estimate weighs a fire by.
     pub submit_worst_ratio: Option<f64>,
+    /// How many programs a load reads from its disk cache at once behind
+    /// serving (XLA): the width past which the load rate stops rising,
+    /// measured where none is stated.
+    pub load_width: Option<u32>,
     /// The workgroups the device holds at once for a kernel's full rate,
     /// the whole device's, as its rates step measured them: one workgroup
     /// of a compute-bound kernel runs at `1 / S` of the kernel's full rate.
@@ -152,6 +156,10 @@ pub struct Rates {
     /// without walking a fire. A new model's settle joins the others, never
     /// replaces them. Measured; empty where none is stored.
     pub dense_settled: Vec<DenseSettled>,
+    /// How this machine lands a checkpoint's weights on the device
+    /// ([`LANDING`], [`Landing`]): its link's and its reader's rates, as a
+    /// load first measures them. Measured; not one of [`KEYS`].
+    pub landing: Option<Landing>,
     /// The device a user's file's measurements were taken on
     /// ([`MEASURED_ON`]): its vendor, device id and driver, as the backend
     /// states them ([`Now::on`]). A file measured on another device (or
@@ -258,6 +266,10 @@ pub struct DenseSettled {
     pub of: u32,
     pub code: u32,
     pub ranges: Vec<[u32; 6]>,
+    /// The model's dense planes the settle weighed, `(n, k)`, sorted: what a
+    /// boot of that model reads the curves at, so an export can say which
+    /// curves the settle's model needs and whether each is carried.
+    pub planes: Vec<(u32, u32)>,
 }
 
 /// One dense kernel's measured curve at one shape
@@ -372,7 +384,8 @@ pub const KERNEL_CURVES: &str = "kernel_tflops_by_shape_keyed";
 pub const KERNEL_CURVES_PER_DISPATCH: &str = "kernel_tflops_by_shape";
 
 /// The `[rates]` key of [`Rates::dense_settled`]: a list of `[method, of,
-/// code, [[bottom, top, replaced, vector, wide, tier], ...]]`, one per key. The settle an older
+/// code, [[bottom, top, replaced, vector, wide, tier], ...], [[n, k], ...]]`,
+/// one per key. The settle an older
 /// pie stored under `dense_settled`, keyed by its version, is no longer read.
 pub const DENSE_SETTLED: &str = "dense_settled_keyed";
 
@@ -386,7 +399,7 @@ pub const MEASURED_BY: &str = "measured_by";
 /// The rates a stored key covers ([`Rates::measured_by`]): every `[rates]`
 /// key of one value a load measures. The curves and the settle carry their
 /// own keys.
-pub const KEYED: [&str; 13] = [
+pub const KEYED: [&str; 15] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -400,12 +413,77 @@ pub const KEYED: [&str; 13] = [
     RESIDENT_WORKGROUPS,
     ATTN_BY_ROWS_KEYS,
     "product_ns",
+    LANDING,
+    LOAD_WIDTH,
 ];
+
+/// The `[rates]` key of [`Rates::landing`]: `[copy_latency_ns, copy_gbps,
+/// copy_full_bytes, fill_gbps, read_spawn_ns, read_thread_gbps,
+/// read_whole_gbps]`.
+pub const LANDING: &str = "landing";
+
+/// How this machine lands weights ([`Rates::landing`]): a copy to the
+/// device's fixed cost, its rate, and the smallest copy that reaches it; the
+/// rate a pinned slot is filled at; one reading thread's spawn and join, one
+/// thread's read rate, and the most the threads read at together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Landing {
+    pub copy_latency_ns: f64,
+    pub copy_gbps: f64,
+    pub copy_full_bytes: f64,
+    pub fill_gbps: f64,
+    pub read_spawn_ns: f64,
+    pub read_thread_gbps: f64,
+    pub read_whole_gbps: f64,
+}
+
+impl Landing {
+    /// The values in [`LANDING`]'s order.
+    #[must_use]
+    pub fn values(&self) -> [f64; 7] {
+        [
+            self.copy_latency_ns,
+            self.copy_gbps,
+            self.copy_full_bytes,
+            self.fill_gbps,
+            self.read_spawn_ns,
+            self.read_thread_gbps,
+            self.read_whole_gbps,
+        ]
+    }
+
+    /// The landing of `values` in [`LANDING`]'s order.
+    #[must_use]
+    pub fn of(values: [f64; 7]) -> Landing {
+        let [
+            copy_latency_ns,
+            copy_gbps,
+            copy_full_bytes,
+            fill_gbps,
+            read_spawn_ns,
+            read_thread_gbps,
+            read_whole_gbps,
+        ] = values;
+        Landing {
+            copy_latency_ns,
+            copy_gbps,
+            copy_full_bytes,
+            fill_gbps,
+            read_spawn_ns,
+            read_thread_gbps,
+            read_whole_gbps,
+        }
+    }
+}
 
 /// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
 /// platform that states a bound on one submission measures beside the
 /// estimate's [`KEYS`].
 pub const SUBMIT_WORST_RATIO: &str = "submit_worst_ratio";
+
+/// The `[rates]` key of [`Rates::load_width`]: what an XLA load measures as
+/// it loads its cached programs behind serving.
+pub const LOAD_WIDTH: &str = "load_width";
 
 /// The `[rates]` key of [`Rates::attn_tflops_by_rows_keys`]: measured beside
 /// [`SUBMIT_WORST_RATIO`] where the platform states a submit bound.
@@ -430,6 +508,7 @@ impl Rates {
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
             submit_worst_ratio: self.submit_worst_ratio.or(below.submit_worst_ratio),
+            load_width: self.load_width.or(below.load_width),
             resident_workgroups: self.resident_workgroups.or(below.resident_workgroups),
             attn_tflops_by_rows_keys: self
                 .attn_tflops_by_rows_keys
@@ -467,6 +546,7 @@ impl Rates {
             },
             // Entry by entry, by its key: a load's settle joins the others
             // (another model's), its own replacing one of the same key.
+            landing: self.landing.or(below.landing),
             dense_settled: {
                 let mut all: Vec<DenseSettled> = below
                     .dense_settled
@@ -512,9 +592,11 @@ impl Rates {
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
             SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
+            LOAD_WIDTH => self.load_width.is_none(),
             RESIDENT_WORKGROUPS => self.resident_workgroups.is_none(),
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "product_ns" => self.product_ns.is_none(),
+            LANDING => self.landing.is_none(),
             KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
             DENSE_SETTLED => self.dense_settled.is_empty(),
             _ => true,
@@ -534,6 +616,7 @@ impl Rates {
             "few_row_tflops" => self.few_row_tflops = None,
             "workgroups_per_core" => self.workgroups_per_core = None,
             SUBMIT_WORST_RATIO => self.submit_worst_ratio = None,
+            LOAD_WIDTH => self.load_width = None,
             RESIDENT_WORKGROUPS => self.resident_workgroups = None,
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys = None,
             "product_ns" => self.product_ns = None,
@@ -541,6 +624,7 @@ impl Rates {
             DENSE_SETTLED => self.dense_settled = Vec::new(),
             MEASURED_ON => self.measured_on = None,
             MEASURED_BY => self.measured_by = None,
+            LANDING => self.landing = None,
             _ => {}
         }
         if let Some(by) = &mut self.measured_by {
@@ -751,6 +835,7 @@ impl Rates {
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
             submit_worst_ratio: self.submit_worst_ratio.filter(|_| has(SUBMIT_WORST_RATIO)),
+            load_width: self.load_width.filter(|_| has(LOAD_WIDTH)),
             resident_workgroups: self
                 .resident_workgroups
                 .filter(|_| has(RESIDENT_WORKGROUPS)),
@@ -763,6 +848,7 @@ impl Rates {
                 .kernel_tflops_by_shape
                 .clone()
                 .filter(|_| has(KERNEL_CURVES)),
+            landing: self.landing.filter(|_| has(LANDING)),
             dense_settled: if has(DENSE_SETTLED) {
                 self.dense_settled.clone()
             } else {
@@ -799,6 +885,9 @@ impl Rates {
         let mut out = String::from("[rates]\n");
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
+        }
+        if let Some(v) = self.load_width {
+            let _ = writeln!(out, "{LOAD_WIDTH} = {v}");
         }
         let keyed = |out: &mut String, key: &str, v: &Option<Vec<(u32, Vec<(u32, f64)>)>>| {
             if let Some(keyed) = v {
@@ -849,6 +938,10 @@ impl Rates {
                 .collect();
             let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
         }
+        if let Some(landing) = &self.landing {
+            let values: Vec<String> = landing.values().iter().map(|v| format!("{v:?}")).collect();
+            let _ = writeln!(out, "{LANDING} = [{}]", values.join(", "));
+        }
         keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
         if let Some(curves) = &self.kernel_tflops_by_shape {
             let rows: Vec<String> = curves
@@ -895,12 +988,15 @@ impl Rates {
                             )
                         })
                         .collect();
+                    let planes: Vec<String> =
+                        settled.planes.iter().map(|(n, k)| format!("[{n}, {k}]")).collect();
                     format!(
-                        "  [{}, {}, {}, [{}]],\n",
+                        "  [{}, {}, {}, [{}], [{}]],\n",
                         settled.method,
                         settled.of,
                         settled.code,
-                        ranges.join(", ")
+                        ranges.join(", "),
+                        planes.join(", ")
                     )
                 })
                 .collect();
@@ -1024,6 +1120,10 @@ pub struct Tuned {
     /// of under `[engine] measure = false`, each served by the engine's
     /// estimate and named where it is (`engine::rates::Measuring::Skip`).
     pub skipped: Vec<String>,
+    /// What this load timed, each by name (`rates (launch_ns, ...)`,
+    /// `curves (n)`, `resident_workgroups`, `bound probe`, `settle`): what
+    /// the load's last line says it measured ("measured 0" where none).
+    pub timed: Vec<String>,
 }
 
 impl Tuned {
@@ -1038,6 +1138,7 @@ impl Tuned {
             self.committed_settle = upper.committed_settle.clone();
         }
         self.skipped.extend(upper.skipped.iter().cloned());
+        self.timed.extend(upper.timed.iter().cloned());
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -1100,6 +1201,7 @@ mod tests {
     #[test]
     fn the_block_is_a_few_lines() {
         let rates = Rates {
+            landing: None,
             launch_ns: Some(904),
             gemm_tflops_by_rows: Some(vec![
                 (1024, vec![(256, 40.0), (8192, 150.0)]),
@@ -1113,6 +1215,7 @@ mod tests {
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
@@ -1134,6 +1237,7 @@ mod tests {
                 of: 77,
                 code: 9,
                 ranges: vec![[3, 4, 1, 4, 0, 1]],
+                planes: vec![(1024, 2048)],
             }],
             measured_on: Some("vk 10de:2c31 driver 1".into()),
             measured_by: Some(vec![(
@@ -1157,7 +1261,7 @@ mod tests {
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
              workgroups_per_core = 3.3\nkernel_tflops_by_shape_keyed = [\n  [1, 4, 1024, 2048, 512, 1, 1, \
              [[\"linear_gemm_gemv_v_bf16\", 7]], [[1, 0.5]], []],\n]\n\
-             dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]]],\n]\n\
+             dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]], [[1024, 2048]]],\n]\n\
              measured_on = \"vk 10de:2c31 driver 1\"\n\
              measured_by = [\n  [\"launch_ns\", 2, [[\"linear_gemm_tiled_bf16\", 5]]],\n]\n"
         );
@@ -1254,6 +1358,7 @@ mod tests {
                 of: 5,
                 code: 6,
                 ranges: vec![[1, 1, 0, 0, 0, 0]],
+                planes: vec![(1024, 1024)],
             }],
             measured_on: Some(now.on()),
             measured_by: Some(vec![
@@ -1275,6 +1380,7 @@ mod tests {
             of,
             code: 6,
             ranges: vec![[1, 1, replaced, 0, 0, 0]],
+            planes: vec![(1024, 1024)],
         };
         let first = Rates {
             dense_settled: vec![settle(7, 0)],
@@ -1297,15 +1403,128 @@ mod tests {
             .load_user(&format!("api = 1\n{}", both.toml()), "two models")
             .expect("both settles read back");
         assert_eq!(read.rates().dense_settled, both.dense_settled);
-        let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, []], [1, 7, 6, []]]\n";
-        // A key stated twice: the entry is skipped in a user's file (the rest
-        // read), refused whole in a committed one.
-        let read = registry.load_user(twice, "twice").expect("the rest reads");
-        assert!(read.rates().dense_settled.is_empty(), "the entry is skipped");
+        let twice = "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, [], []], [1, 7, 6, [], []]]\n";
+        // A key stated twice: the second entry is skipped, by name (the
+        // first and the rest read); a committed file carrying one fails the
+        // build's check of committed profiles (`skipped_rates`).
+        let file = registry
+            .parse(twice, "twice.toml", crate::Strict::User)
+            .expect("the rest reads");
+        assert_eq!(file.tuned.rates.dense_settled.len(), 1, "the first is read");
         assert!(
-            registry.parse(twice, "c.measured.toml", crate::Strict::Measured).is_err(),
-            "a committed profile stating a key twice is refused"
+            file.skipped_rates.iter().any(|s| s.contains("stated twice")),
+            "{:?}",
+            file.skipped_rates
         );
+    }
+
+    /// A re-export of a home that took its rates from a committed profile
+    /// and measured one model's curves keeps every committed entry still
+    /// keyed for this build (carried) beside the home's (measured), each
+    /// said; a committed rate whose key no longer matches and that the home
+    /// did not measure again refuses the export by name.
+    #[test]
+    fn a_re_export_keeps_the_committed_entries_and_says_each() {
+        let now = build();
+        let committed = stored(&now);
+        let measured = Rates {
+            kernel_tflops_by_shape: committed
+                .kernel_tflops_by_shape
+                .clone()
+                .map(|curves| curves.into_iter().take(1).map(|mut c| {
+                    c.n = 777;
+                    c
+                }).collect()),
+            measured_on: Some(now.on()),
+            ..Rates::default()
+        };
+        let (merged, report) =
+            crate::merge_committed(measured, Some(committed.clone()), Some(&now)).unwrap();
+        assert_eq!(merged.launch_ns, committed.launch_ns, "the committed rate is carried");
+        assert_eq!(merged.hbm_gbps, committed.hbm_gbps);
+        assert_eq!(
+            merged.kernel_tflops_by_shape.as_ref().map(Vec::len),
+            Some(committed.kernel_tflops_by_shape.as_ref().map_or(0, Vec::len) + 1),
+            "the committed curves and the home's"
+        );
+        assert_eq!(merged.dense_settled, committed.dense_settled);
+        assert!(
+            report.iter().any(|l| l == "`launch_ns`: carried from the committed profile"),
+            "{report:#?}"
+        );
+        assert!(report.iter().any(|l| l.contains("1 measured")), "{report:#?}");
+        // A kernel whose code moved: its committed rates no longer match.
+        let mut moved = build();
+        moved.code = vec![("tiled", 11), ("coopmat", 23), ("gemv", 33)];
+        let refused =
+            crate::merge_committed(Rates::default(), Some(committed), Some(&moved)).unwrap_err();
+        assert!(refused.contains("gemm_tflops_by_rows"), "{refused}");
+    }
+
+    /// An export says each model's settle with the curves a boot of it
+    /// reads, and leaves out one whose planes carry no curve.
+    #[test]
+    fn an_export_carries_a_models_settle_only_with_its_curves() {
+        let curve = |n: u32, k: u32| KernelCurve {
+            kind: KernelCurve::VECTOR,
+            key: 1,
+            n,
+            k,
+            curve: vec![(1, 0.5)],
+            stop: None,
+            spread: Vec::new(),
+            by: MeasuredBy::default(),
+        };
+        let settle = |of: u32, planes: Vec<(u32, u32)>| DenseSettled {
+            method: 1,
+            of,
+            code: 2,
+            ranges: vec![[1, 1, 0, 0, 0, 0]],
+            planes,
+        };
+        let mut rates = Rates {
+            kernel_tflops_by_shape: Some(vec![curve(1024, 2048), curve(3072, 1024)]),
+            dense_settled: vec![
+                settle(7, vec![(1024, 2048), (3072, 1024)]),
+                settle(9, vec![(1024, 2048), (5120, 1024)]),
+            ],
+            ..Rates::default()
+        };
+        let report = crate::settles_carried(&mut rates);
+        assert_eq!(rates.dense_settled.len(), 1);
+        assert_eq!(rates.dense_settled[0].of, 7);
+        assert!(report[0].contains("carried") && report[0].contains("3072x1024: 1 curve"), "{report:?}");
+        assert!(report[1].starts_with("WARN") && report[1].contains("5120x1024"), "{report:?}");
+    }
+
+    /// A committed (or user) file with one settle entry in an older form
+    /// beside valid rates: the rates are read, the other entries too, and
+    /// that entry alone is skipped, named, to be settled again.
+    #[test]
+    fn an_old_form_list_entry_is_skipped_alone() {
+        let registry = crate::Registry::new("test", &[], &[]);
+        let text = "api = 1\n[rates]\nlaunch_ns = 900\n\
+                    dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]]],\n  \
+                    [1, 78, 9, [[1, 1, 0, 0, 0, 0]], [[1024, 2048]]],\n]\n";
+        for strict in [crate::Strict::User, crate::Strict::Measured] {
+            let file = registry.parse(text, "home.toml", strict);
+            let file = match (strict, file) {
+                (_, Ok(file)) => file,
+                (crate::Strict::Measured, Err(e)) if e.to_string().contains("keys every entry") => {
+                    // A committed file keys each rate: read past that here.
+                    continue;
+                }
+                (_, Err(e)) => panic!("{strict:?}: {e}"),
+            };
+            assert_eq!(file.tuned.rates.launch_ns, Some(900), "{strict:?}");
+            assert_eq!(file.tuned.rates.dense_settled.len(), 1, "{strict:?}");
+            assert_eq!(file.tuned.rates.dense_settled[0].of, 78);
+            assert!(
+                file.skipped_rates.iter().any(|s| s.starts_with("dense_settled_keyed[0]")),
+                "{strict:?}: {:?}",
+                file.skipped_rates
+            );
+        }
     }
 
     /// A user file one entry of which another pie wrote in another form
@@ -1322,8 +1541,12 @@ mod tests {
         assert_eq!(file.tuned.rates.launch_ns, Some(900));
         assert_eq!(file.tuned.rates.hbm_gbps, Some(700.0));
         assert!(file.tuned.rates.dense_settled.is_empty());
-        assert_eq!(file.skipped_rates.len(), 1, "{:?}", file.skipped_rates);
-        assert!(file.skipped_rates[0].starts_with(DENSE_SETTLED), "{:?}", file.skipped_rates);
+        assert!(!file.skipped_rates.is_empty(), "{:?}", file.skipped_rates);
+        assert!(
+            file.skipped_rates.iter().all(|s| s.starts_with(DENSE_SETTLED)),
+            "{:?}",
+            file.skipped_rates
+        );
         // A committed profile is the build's: refused whole, by name.
         assert!(registry.parse(text, "c.measured.toml", crate::Strict::Measured).is_err());
     }
@@ -1485,6 +1708,7 @@ mod tests {
         let measured = Rates {
             launch_ns: Some(904),
             submit_worst_ratio: Some(1.83),
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: Some(vec![(512, vec![(1024, 0.35), (4096, 0.3)])]),
             ..Rates::default()

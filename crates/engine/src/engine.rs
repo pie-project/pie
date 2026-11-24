@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::AdapterRegistration;
 use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
+use crate::chunk::{ChunkTable, Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
@@ -39,6 +39,11 @@ pub struct StepOutcome {
     /// request by its reason, and poisons its instance; no other lane is
     /// touched.
     pub faulted: Vec<LaneFault>,
+    /// Each beam group's common slot as the step's head step left it
+    /// (`BEAM-PAGE-LISTS.md` §11.3): the slot below which every live beam's
+    /// rows lie on the same pages, by the group's instance. Monotone; the
+    /// runtime folds the group's set to the largest it has seen.
+    pub beam_common: Vec<(InstanceId, u32)>,
 }
 
 /// A lane of a step that faulted: lane `lane` of the step's
@@ -64,6 +69,7 @@ impl StepOutcome {
         StepOutcome {
             wrote,
             faulted: Vec::new(),
+            beam_common: Vec::new(),
         }
     }
 
@@ -75,6 +81,7 @@ impl StepOutcome {
         StepOutcome {
             wrote: Vec::new(),
             faulted: every_lane(lanes, reason.into()),
+            beam_common: Vec::new(),
         }
     }
 
@@ -133,7 +140,7 @@ pub struct KvWrites {
     /// One past the last slot the lane's rows landed at, in the set's own
     /// slot numbering: a position. `None` where the engine does not tell
     /// it; the set is then taken to have written as far as it reserved
-    /// ([`crate::fire::rung_rows`], device geometry). `end` and `fold` are
+    /// ([`crate::fire::rung_holds`], device geometry). `end` and `fold` are
     /// one report: an engine that reports `end` for a lane whose fire
     /// folds on the device reports `fold` too.
     pub end: Option<u32>,
@@ -213,6 +220,11 @@ pub trait Engine: Send {
     /// false`): the runtime then takes its own estimates in place of its
     /// load-time measurements too, by name. Every engine states it.
     fn skips_measuring(&self) -> bool;
+
+    /// What this engine's load timed, each by name (empty: it measured
+    /// nothing): what the load's last line says ("load: measured 0" where
+    /// every engine states none). Every engine states its own.
+    fn measured_at_load(&self) -> Vec<String>;
 
     /// The reader of what the host can still give this process, where the
     /// device shares the host's memory and no budget of the device's says
@@ -447,6 +459,16 @@ pub trait Engine: Send {
         Err(self.unsupported("take_channel"))
     }
 
+    /// Beam `beam`'s page list of instance `instance`'s beam group, as its
+    /// last fire left it (`BEAM-PAGE-LISTS.md` §6.6): the pool page of each
+    /// column, the group's list width of them (columns past the last fire's
+    /// unspecified). Read once a search ends, after its fires have landed;
+    /// an engine waits for them.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let _ = (instance, beam);
+        Err(self.unsupported("beam_list"))
+    }
+
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> Result<()> {
         let _ = registration;
         Err(self.unsupported("register_adapter"))
@@ -540,10 +562,27 @@ pub trait Engine: Send {
     /// copy has a completion of its own, which [`Self::release_segments`]
     /// waits on before the evacuated segment goes: the runtime waits on no
     /// later fire for it, so an idle engine's segment goes too.
+    ///
+    /// All or nothing. `Err` means nothing moved: the engine's chunk table,
+    /// claims, program bindings and device bytes are as before the call
+    /// (the runtime takes the move back on that word). An engine resolves
+    /// everything the move needs (its rebind of every table, cell and
+    /// state the moved chunks hold included) against the moved table
+    /// before it commits any copy; a failure after it committed is a bug
+    /// (a fault, not a refusal).
     fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
         let _ = evacuation;
         Err(self.unsupported("evacuate"))
     }
+
+    /// The engine's chunk table as it holds it now ([`ChunkTable`], the
+    /// identity until an evacuation moves chunks): a plain read, no fire
+    /// waited on, which the runtime checks its own logical to physical map
+    /// against where an evacuation was refused ([`Self::evacuate`]). One
+    /// table, the state pool's; an engine whose pool moves no chunk answers
+    /// its identity, one that keeps no pool `Error::Unsupported`. Stated by
+    /// every engine: no default.
+    fn chunk_table(&self) -> Result<ChunkTable>;
 
     /// Copies slots of one shape between tiers or within one; replaces
     /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend
@@ -704,7 +743,8 @@ pub trait Engine: Send {
 
     /// The bytes of host rs rows: `slots`' state, then `pages`' buffers, one
     /// after another, once every copy into them has landed. For a model whose
-    /// state is a window, `pages` are host windowed pages and `slots` empty.
+    /// state is a window, `pages` are host windowed pages and `slots` empty
+    /// (removed by the windowed-state change; do not use in new code).
     fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
         let _ = (slots, pages);
         Err(self.unsupported("read_host_state"))
@@ -722,8 +762,9 @@ pub trait Engine: Send {
     /// as the device slot (what [`Engine::copy_slots`] moves whole), one
     /// slot after another; once every copy into them has landed (the
     /// runtime waits on that copy's completion first). What a shared pool's
-    /// snapshot reads of a set's state: its record's pieces and its rs list
-    /// or window slots, parked on the host.
+    /// snapshot reads of a set's state: its record's pieces (the windowed
+    /// layers' rings among them) and its rs list or window buffer slots,
+    /// parked on the host.
     fn read_tier_slots(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
         let _ = slots;
         Err(self.unsupported("read_tier_slots"))

@@ -71,7 +71,12 @@ pub enum TuneCmd {
     /// `<out>/<device>.measured.toml`: each entry with its key, in a fixed
     /// order, no date or path. Checked in under
     /// `crates/engine-<backend>/profiles/`, a load of that device takes each
-    /// entry whose key matches and measures nothing more for it.
+    /// entry whose key matches and measures nothing more for it. Every
+    /// model's settle is said with the curves a boot of it reads, and left
+    /// out where one is not carried. Every committed profile is boot-checked
+    /// before it is pushed: a boot on a clean home with only the committed
+    /// file measures nothing and serves c1 / c8 within 2% of the measured
+    /// home it came from.
     Export {
         /// The engine whose stored measurements to write: `vulkan`, `wgpu`,
         /// `cuda` (CUDA or ROCm, as the build hosts it).
@@ -306,6 +311,10 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         }
         Err(why) => format!("no measured profile written: {why}.\n"),
     };
+    let measured = exported
+        .report
+        .iter()
+        .fold(measured, |out, line| format!("{out}{line}\n"));
     let covers = match &exported.covers {
         Some((name, text)) => {
             let at = out.join(name);

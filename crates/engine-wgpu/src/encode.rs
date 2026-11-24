@@ -31,14 +31,10 @@ pub fn host_submit_ns() -> (u64, u64) {
 }
 
 static COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[must_use]
-pub fn host_copies() -> (u64, u64) {
-    (
-        COPIES.load(std::sync::atomic::Ordering::Relaxed),
-        STAGED.load(std::sync::atomic::Ordering::Relaxed),
-    )
+pub fn host_copies() -> u64 {
+    COPIES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static IO: [std::sync::atomic::AtomicU64; 4] = [
@@ -193,7 +189,6 @@ pub fn reset_kernel_profile() {
     SUBMIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     WAIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     COPIES.store(0, std::sync::atomic::Ordering::Relaxed);
-    STAGED.store(0, std::sync::atomic::Ordering::Relaxed);
     for slot in &IO {
         slot.store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -306,8 +301,11 @@ impl Sink<'_> {
 
         let mut views: Vec<(wgpu::Buffer, u64, u64, bool)> = Vec::with_capacity(args.len());
 
-        let mut staged: Vec<(wgpu::Buffer, u64, wgpu::Buffer, u64, u64)> = Vec::new();
-        let mut scratch_views = 0usize;
+        // A window of a value binds the value from its aligned first byte,
+        // the kernel's rebased twin stepping each binding over its element
+        // offset here ([`crate::device::pipelines::Rebased`]).
+        let mut twin: Option<std::sync::Arc<crate::device::pipelines::Rebased>> = None;
+        let mut rebase: Vec<u32> = Vec::new();
         let mut words: Vec<u8> = Vec::with_capacity(64);
         for arg in args {
             match *arg {
@@ -350,68 +348,86 @@ impl Sink<'_> {
                     );
                     storage_view_fits(views.len(), view, max_binding)
                         .map_err(|detail| Sink::backend(fire, detail))?;
-                    if binding.offset().is_multiple_of(storage_align) {
+                    // A view binds its slab from its first byte to the end
+                    // (as Vulkan's descriptors do), up to the largest binding,
+                    // holding at least the `need` bytes the kernel reads: the
+                    // group a dispatch binds names where a value starts, not
+                    // how many rows a fire's window cuts of it, so the load's
+                    // walk builds the one every fire over it binds.
+                    let slab_bytes = binding.buffer().slab().size;
+                    let whole = |from: u64, need: u64| {
+                        let to_end = (slab_bytes.saturating_sub(from) & !3).min(max_binding & !3);
+                        to_end.max(need)
+                    };
+                    // A window of a value (a class region's rows of it) binds
+                    // the value from its aligned first byte and steps the
+                    // kernel over the window's lead, so every region of the
+                    // value binds the one group whatever row it starts at.
+                    let at = binding.offset();
+                    let origin = binding.origin().min(at);
+                    let base = origin - origin % storage_align;
+                    if at == base {
                         views.push((
                             binding.buffer().slab().buffer.clone(),
-                            binding.offset(),
-                            view,
+                            at,
+                            whole(at, view),
                             mutable,
                         ));
                         continue;
                     }
 
-                    let source = binding.buffer().slab().buffer.clone();
-                    let at = binding.offset();
-                    if !at.is_multiple_of(4) {
-                        if mutable {
-                            return Err(Sink::backend(
-                                fire,
-                                format!(
-                                    "argument {} is a write target at offset {at}, which is \
-                                     not 4-aligned; a sub-word cut cannot be staged back",
-                                    views.len()
-                                ),
-                            ));
-                        }
-                        {
-                            let len =
-                                remaining.min(binding.buffer().slab().size.saturating_sub(at));
-                            let mut bytes = vec![0u8; len.next_multiple_of(4) as usize];
-                            binding
-                                .buffer()
-                                .slab()
-                                .read(at, &mut bytes[..len as usize])
-                                .map_err(|fault| Sink::refuse(fire, fault))?;
-                            let staged_len = bytes.len() as u64;
-                            let (chunk, slot) = self
-                                .frame
-                                .scratch_slot_queued(staged_len)
-                                .map_err(|fault| Sink::refuse(fire, fault))?;
-                            core.queue.write_buffer(&chunk, slot, &bytes);
-                            scratch_views += 1;
-                            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            views.push((chunk, slot, staged_len, false));
-                            continue;
-                        }
+                    let slot = views.len();
+                    let lead = at - base;
+                    // A binding the kernel never reads binds no view at all.
+                    if !pipeline.used.get(slot).copied().unwrap_or(false) {
+                        views.push((
+                            binding.buffer().slab().buffer.clone(),
+                            base,
+                            whole(base, lead + view),
+                            mutable,
+                        ));
+                        continue;
                     }
-                    let len = remaining
-                        .next_multiple_of(4)
-                        .min(binding.buffer().slab().size.saturating_sub(at) & !3);
-                    let (chunk, slot) = self
-                        .frame
-                        .scratch_slot(len)
-                        .map_err(|fault| Sink::refuse(fire, fault))?;
-                    self.frame
-                        .encode(|encoder| {
-                            encoder.copy_buffer_to_buffer(&source, at, &chunk, slot, len);
-                        })
-                        .map_err(|fault| Sink::refuse(fire, fault))?;
-                    if mutable {
-                        staged.push((chunk.clone(), slot, source, at, len));
+                    let step = u64::from(pipeline.stride.get(slot).copied().unwrap_or(0));
+                    if step == 0 || !lead.is_multiple_of(step) || lead + view > max_binding {
+                        return Err(Sink::backend(
+                            fire,
+                            format!(
+                                "argument {slot} (handle {handle}) is a window at byte {at} of \
+                                 a value from byte {origin}, {lead} bytes past its aligned \
+                                 first byte {base}: {}",
+                                if step == 0 {
+                                    "the binding is no runtime-sized array, which no element \
+                                     offset steps"
+                                        .to_string()
+                                } else if !lead.is_multiple_of(step) {
+                                    format!("not a whole number of its {step}-byte elements")
+                                } else {
+                                    format!(
+                                        "the value bound from there runs past this device's \
+                                         largest binding of {max_binding} bytes"
+                                    )
+                                }
+                            ),
+                        ));
                     }
-                    scratch_views += 1;
-                    STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    views.push((chunk, slot, len, mutable));
+                    if twin.is_none() {
+                        twin = Some(
+                            self.pipelines
+                                .rebased(self.device, &pipeline, self.frame.bind_only)
+                                .map_err(|fault| Sink::refuse(fire, fault))?,
+                        );
+                    }
+                    if rebase.len() <= slot {
+                        rebase.resize(slot + 1, 0);
+                    }
+                    rebase[slot] = u32::try_from(lead / step).unwrap_or(u32::MAX);
+                    views.push((
+                        binding.buffer().slab().buffer.clone(),
+                        base,
+                        whole(base, lead + view),
+                        mutable,
+                    ));
                 }
                 ArgValue::I32(v) => words.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::U32(v) => words.extend_from_slice(&v.to_le_bytes()),
@@ -490,25 +506,21 @@ impl Sink<'_> {
             .map(|(buffer, offset, size, _)| (buffer.clone(), *offset, *size))
             .collect();
         let uniform_bytes = u64::from(pipeline.push_bytes.max(rounded).max(16));
+        // The twin where a view was rebased: its offsets block beside the
+        // kernel's scalars.
+        let rebased = twin;
         if self.frame.bind_only {
             // A load's bind walk: the group a dispatch over these views binds
-            // is built and kept; nothing is encoded. A fire whose views go
-            // through scratch binds a group of its own frame's either way.
-            if scratch_views == 0 {
-                self.pipelines
-                    .bind_group(core, &pipeline, &keyed, uniform_bytes)
-                    .map_err(|fault| Sink::refuse(fire, fault))?;
-            }
+            // is built and kept (and the kernel's rebased twin, where a view
+            // is a window); nothing is encoded.
+            self.pipelines
+                .bind_group(core, &pipeline, &keyed, uniform_bytes, rebased.as_deref())
+                .map_err(|fault| Sink::refuse(fire, fault))?;
             return Ok(());
         }
-        let group = if scratch_views == 0 {
-            self.pipelines
-                .bind_group(core, &pipeline, &keyed, uniform_bytes)
-        } else {
-            // Its scratch views are this frame's: a group of its own.
-            self.pipelines.note_scratch_group();
-            crate::device::pipelines::group_of(core, &pipeline, &keyed, uniform_bytes)
-        }
+        let group = self
+            .pipelines
+            .bind_group(core, &pipeline, &keyed, uniform_bytes, rebased.as_deref())
         .map_err(|fault| Sink::refuse(fire, fault))?;
         // The scalars in this frame's slot, the group reading them there.
         let mut offsets: Vec<u32> = Vec::with_capacity(1);
@@ -529,7 +541,30 @@ impl Sink<'_> {
                 )
             })?);
         }
+        // The rebased views' element offsets, in their block's slot: bound
+        // past the kernel's uniform, so its dynamic offset follows.
+        if let Some(rebased) = &rebased {
+            let bytes = u64::from(rebased.bytes);
+            let (_, at) = self
+                .frame
+                .uniform_slot(bytes)
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+            rebase.resize(bytes as usize / 4, 0);
+            let block: Vec<u8> = rebase.iter().flat_map(|lead| lead.to_le_bytes()).collect();
+            self.frame
+                .write_uniform(at, &block)
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+            offsets.push(u32::try_from(at).map_err(|_| {
+                Sink::backend(
+                    fire,
+                    format!("a uniform slot at byte {at} is past a u32 offset"),
+                )
+            })?);
+        }
 
+        let compute = rebased
+            .as_ref()
+            .map_or(&pipeline.pipeline, |rebased| &rebased.pipeline);
         let key = label(name, fire, args);
         if let Some((set, at)) = timing().then(|| self.frame.timestamp_slot(&key)).flatten() {
             self.frame
@@ -542,23 +577,14 @@ impl Sink<'_> {
                             end_of_pass_write_index: Some(at + 1),
                         }),
                     });
-                    pass.set_pipeline(&pipeline.pipeline);
+                    pass.set_pipeline(compute);
                     pass.set_bind_group(0, &group, &offsets);
                     pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
                 })
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         } else {
             self.frame
-                .dispatch_at(name, &pipeline.pipeline, &group, &offsets, groups)
-                .map_err(|fault| Sink::refuse(fire, fault))?;
-        }
-        if !staged.is_empty() {
-            self.frame
-                .encode(|encoder| {
-                    for (chunk, slot, home, home_at, len) in &staged {
-                        encoder.copy_buffer_to_buffer(chunk, *slot, home, *home_at, *len);
-                    }
-                })
+                .dispatch_at(name, compute, &group, &offsets, groups)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
         }
         self.frame.dispatches.set(self.frame.dispatches.get() + 1);

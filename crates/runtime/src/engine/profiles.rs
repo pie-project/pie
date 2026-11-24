@@ -365,6 +365,9 @@ pub struct Exported {
     /// where the home stores no measurement of the device (every entry a
     /// load took matched a committed one), with why.
     pub measured: Result<(String, String), String>,
+    /// What a boot of each model the export carries a settle of reads, and
+    /// whether each is carried (`profile::settles_carried`), a line a model.
+    pub report: Vec<String>,
     /// The host covers the home's cache holds for this device
     /// (`<device>.covers.json`, its name and text): each entry whose key
     /// names the device the measurements were taken on. `None` where it
@@ -453,11 +456,20 @@ pub fn export(
         }
     };
     let from = backend.shelf.user_path(profiles, &device);
+    let committed = backend
+        .shelf
+        .seeded
+        .iter()
+        .find(|(path, _)| *path == profile::measured_name(&device))
+        .map(|(_, text)| *text);
+    let now = device_now(backend, index, &device);
     let mut exported = held(
         (backend.registry)(),
         device.clone(),
         from,
         cache,
+        committed,
+        now.as_deref(),
         || device_on(backend, index, &device),
     );
     exported.unprobed = unprobed;
@@ -494,8 +506,11 @@ fn held(
     device: String,
     from: std::path::PathBuf,
     cache: &Path,
+    committed: Option<&str>,
+    now: Option<&dyn profile::fire::Now>,
     on: impl FnOnce() -> Option<String>,
 ) -> Exported {
+    let origin = from.display().to_string();
     let user = std::fs::read_to_string(&from).map_err(|e| {
         format!(
             "{}: {e}: no measurement of `{device}` is stored (a load that took every entry from \
@@ -503,16 +518,49 @@ fn held(
             from.display()
         )
     });
-    let measured = user.as_ref().map_err(Clone::clone).and_then(|user| {
-        profile::export(registry, &device, user, &from.display().to_string())
-            .map(|text| (profile::measured_name(&device), text))
-    });
-    let stored_on = user.as_ref().ok().and_then(|user| {
-        registry
-            .parse(user, &from.display().to_string(), profile::Strict::User)
-            .ok()
-            .and_then(|file| file.tuned.rates.measured_on)
-    });
+    let stored = user
+        .as_ref()
+        .ok()
+        .map(|user| registry.parse(user, &origin, profile::Strict::User));
+    let stored_on = match &stored {
+        Some(Ok(file)) => file.tuned.rates.measured_on.clone(),
+        _ => None,
+    };
+    let committed_rates = committed
+        .map(|text| registry.parse(text, &profile::measured_name(&device), profile::Strict::Measured));
+    let mut report = Vec::new();
+    // The home's measured entries over what of the committed profile still
+    // holds for this build, each said: a re-export never shrinks it.
+    let measured = (|| -> Result<(String, String), String> {
+        let mine = match stored {
+            Some(Ok(file)) => file.tuned.rates,
+            Some(Err(why)) => return Err(why.to_string()),
+            None => profile::fire::Rates::default(),
+        };
+        let theirs = match committed_rates {
+            Some(Ok(file)) => {
+                for line in &file.skipped_rates {
+                    report.push(format!("dropped from the committed profile: {line}"));
+                }
+                Some(file.tuned.rates)
+            }
+            // Not one entry of it reads (each list entry is read alone, so
+            // this is the file as a whole): none carried, said by name.
+            Some(Err(why)) => {
+                report.push(format!("dropped: the committed profile does not read ({why})"));
+                None
+            }
+            None => None,
+        };
+        if mine == profile::fire::Rates::default() && theirs.is_none() {
+            return Err(user.clone().err().unwrap_or_else(|| format!("{origin}: stores nothing")));
+        }
+        let (merged, lines) = profile::merge_committed(mine, theirs, now)?;
+        report.extend(lines);
+        let (text, lines) = profile::export_rates(registry, &device, merged, &origin)?;
+        report.extend(lines);
+        Ok((profile::measured_name(&device), text))
+    })();
     let covers = stored_on
         .or_else(on)
         .and_then(|on| covers_of(cache, &on))
@@ -522,7 +570,28 @@ fn held(
         unprobed: None,
         from,
         measured,
+        report,
         covers,
+    }
+}
+
+/// What this build keys `backend`'s device `index` (named `device`) by
+/// (`profile::fire::Now`): what a committed entry is checked against before
+/// an export carries it. `None` where the engine states none here (its
+/// committed entries are carried unchecked, and a boot checks them).
+fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::fire::Now>> {
+    let _ = (index, device);
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::now_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::now_at(index),
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => Some(Box::new(engine_cuda::stored::Keys::of(
+            i32::try_from(index).unwrap_or(0),
+            device,
+        ))),
+        _ => None,
     }
 }
 
@@ -715,6 +784,8 @@ mod cover_tests {
             "Card X".into(),
             home.join("profiles/toy/user/card-x.toml"),
             &cache,
+            None,
+            None,
             || Some(on.to_string()),
         );
         std::fs::remove_dir_all(&home).unwrap();
@@ -722,5 +793,67 @@ mod cover_tests {
         let (name, text) = exported.covers.expect("the covers are written");
         assert_eq!(name, "card-x.covers.json");
         assert!(text.contains(&key), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod committed_tests {
+    use super::*;
+
+    /// Every committed measured profile this build carries reads whole, as
+    /// committed (`Strict::Measured`): an entry another pie's form left (a
+    /// format change landed without the device files re-exported) fails the
+    /// build here, where a load would skip it and measure it again.
+    #[test]
+    fn every_committed_profile_reads_whole() {
+        for backend in backends() {
+            for (name, text) in backend.shelf.seeded {
+                if !name.ends_with(profile::MEASURED_SUFFIX) {
+                    continue;
+                }
+                let file = (backend.registry)()
+                    .parse(text, name, profile::Strict::Measured)
+                    .unwrap_or_else(|e| panic!("{}: {name}: {e}", backend.name));
+                assert!(
+                    file.skipped_rates.is_empty(),
+                    "{}: {name} carries entries this build skips (re-export it): {:?}",
+                    backend.name,
+                    file.skipped_rates
+                );
+            }
+        }
+    }
+
+    /// Every committed host covers file in the tree is a list of the cover
+    /// cache's entries, each with its key and figures.
+    #[test]
+    fn every_committed_covers_file_reads() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut read = 0;
+        for engine in std::fs::read_dir(&crates).unwrap().flatten() {
+            let profiles = engine.path().join("profiles");
+            for file in std::fs::read_dir(&profiles).into_iter().flatten().flatten() {
+                let path = file.path();
+                if !path.to_string_lossy().ends_with(".covers.json") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let all: Vec<serde_json::Value> = serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                for entry in &all {
+                    let key = entry
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_else(|| panic!("{}: an entry with no key", path.display()));
+                    assert!(
+                        crate::bootstrap::committed_cover(&text, key).is_some(),
+                        "{}: `{key}` does not read as a cover",
+                        path.display()
+                    );
+                }
+                read += 1;
+            }
+        }
+        assert!(read > 0, "no committed covers file found under {}", crates.display());
     }
 }

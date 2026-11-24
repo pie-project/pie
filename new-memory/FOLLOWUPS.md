@@ -963,6 +963,22 @@ by name). engine-cuda nets the page cache in its own reader (`weights.rs` ~372-4
 inactive only (what the kernel reclaims first, before a charge fails: the conservative room) or
 inactive + active (all file cache, which reclaim reaches under pressure).
 
+## F63. Beam page lists: per-group reserve terms against a pool-wide reserve by fires in flight
+
+A beam group's pool (`new-memory/designs/BEAM-PAGE-LISTS.md` §3) grows a
+column at a time to `B (c + 2) + B F + 1` pages: each live column's pages,
+plus `B` pages one fire may hand out and `B F` pages freed in the `F`
+frames in flight, terms every group carries whatever its length. At short
+lengths they are most of the reserve: 64 tokens, B = 4, F = 2 reserves up
+to 33 pages against the earlier shared pool's 18, and the 9 GiB-capped
+200-beam + 300-decode gate on MI300X ran 25-28 s against the tip's 21-22 s
+(uncapped 16 s both: speed parity, a capacity cost). Measure whether the
+`B` handed and `B F` pending terms can come from one pool-wide reserve
+sized by the fires in flight across groups (a fire hands out at most `B`
+pages per group it runs, and frees wait `F` fires whichever group freed
+them) without weakening the per-step guarantee that a fire never opens a
+column it cannot back: the capped gate's walls against the tip, the pages
+the planner counts per group, and the refusals under over-demand.
 ## F47. General per-lane split of a pass whose whole demand exceeds the device
 
 A pass whose whole demand (every lane's kv and state) is past the device while each lane fits
@@ -1133,6 +1149,74 @@ settle exists for. Fix: stage a feed for those channels in the settle's fires (z
 declared shape; the settle only times), or settle through a class that reads none, instead of
 stopping.
 
+## F61. Metal streamed guest passes run far below bandwidth (needs Metal System Trace counters)
+Qwen3.5-0.8B beam-4 on the M1 Max, the beam epilogue's log-softmax region (4 rows x vocab ≈ 1M
+elements), after sc/mac-beam-hybrid 83cbd18f9 / ce84536d1 / 0f6db38c4 (register handover, dropped
+stores, broadcast index once a pass, a pipeline per streamed step, broadcast sinking, length
+classes; guest time 0.81 -> 0.54 ms a fire). The region now runs only the passes it needs (max
+reduce, exponentials, sum reduce, one output pass) and still takes 0.32 ms: each full pass ~70 µs
+and each reduction ~60 µs, against ~10-15 µs of memory traffic each.
+Measured (streamed-repeat / streamed-nop / streamed-groups diagnostics):
+- a dispatch's fixed cost is ~4 µs (streamed-nop), so launches are not it;
+- the group cap is at its optimum: r2 0.68 / 0.45 / 0.33 / 0.32 / 0.42 / 0.87 ms at 8 / 16 / 32 /
+  64 / 256 / 1024 groups of 512 threads, slower both ways;
+- pass count, materialized broadcasts and the per-element broadcast index are gone and moved it
+  little (0.55 -> 0.54 ms for the last two passes removed).
+Not yet separated: memory latency against ALU (the precise exp / log the bit-exact results need,
+the bf16 roundings), and the reductions' three dependent levels. That needs the GPU's counters
+(Metal System Trace / Instruments: occupancy, ALU and memory utilization per dispatch), which a
+headless session cannot capture. The M5 meets the beam rule already (beam-4 / 4-lane 1.023x), so
+this is the M1's and a general guest-codegen item, not a gate.
+
+## F62. Chunked lane scratch through the eta scratch ABI (post-PR)
+
+A guest instance's value scratch lies whole in one run of adjacent chunks inside one segment: the eta
+scratch ABI (`eta-compiler` codegen/lane_scratch.rs) has a grouped kernel address every value of a lane
+from its one base (`scratch = lane_scratch[l]`, value `v` at `scratch + offsets[v]`), so a lane's stage
+scratch is one contiguous run, and a place whose run is past a segment is refused by name (engine-metal
+`Plane::guest_state`). A beam group's scratch grows with its beams (Qwen3-0.6B at 4K context on the M5:
+113 MB at w17, 215 MB at w32, ~6.7 MB a beam of peak-live log-softmax-wide values; liveness packing is
+already on), so its width is bounded by the segment: Metal's 64 MiB (35 chunks of 1.9 MB on the M5) holds
+about w17-w19 at 4K context, CUDA's 1 GiB w96.
+
+Raising Metal's segment to CUDA's 1 GiB (ChunkProfile::ON_DEVICE_METAL.segment_bytes, which
+engine-metal's pool reads) was tried and kept out of the PR: Metal's segment is the elastic pool's grow
+and release step (the governor would yield in 1 GiB steps on unified memory), and the activation span is
+placed against segment boundaries (pool::top_first), so a small pool's span landed on unmapped top heaps
+("mapped bytes of an elastic buffer's top"); two integration tests also assume several segments. Doing it
+means placing the span at heap granularity whatever the segment, with the governor's step decoupled.
+
+`eta_exec::lay_out_chunked` already packs a stage's values into pieces of at most a segment (lifetimes
+shared, each item whole in one piece); no kernel reads that layout. Removing the bound for every engine:
+- the lane table carries a base a (lane, piece), or a per-lane piece table;
+- each value's place is (piece, offset), not one offset;
+- every emitter's value addressing follows: Metal's grouped, streamed and fused forms, CUDA / HIP's SIMT
+  (one ABI), the emitter versions bumped;
+- each engine lays `lay_out_chunked`'s pieces in the place the runtime took (`GuestState::run` the
+  piece run, pieces of a segment at most), and `FireFacts` follow.
+Estimate for Metal and the shared eta change: ~2 days, plus CUDA / HIP's emitter side.
+
+
+## F60. Hybrid beam replay grows with lineage divergence
+
+On a hybrid model each beam lane replays its buffered rows past its group's
+common ancestor every step (`new-memory/designs/BEAM-PAGE-LISTS.md` §11.3,
+`[c, s_t]`). Where two lineages stay apart, the rows grow with the steps
+since they parted: Vulkan Qwen3.5 beam-4 on one prompt carried 4 × 257 rows
+at step 257 and up to 4 × 1018 rows later in the search. engine-gpu serves
+it (a beam lane's carried rows are a span whose pages resolve through its
+list, its set's rs entries in its group's state; the per-fire tables stay
+O(lanes + widest bucket)), but the cost per step grows with the divergence
+(O(steps) replay, O(steps²) over a search). CUDA, Metal and XLA move to the
+same shape. A deep group's resident state (its lists and set entries) lies
+first in its instance's one scratch place (`GuestState::resident`); past a
+chunk that place is whole runs of adjacent chunks, so binding or restoring it
+relies on the planner naming a compaction for a run the free chunks' total
+covers, else it waits on scattered room that never forms a run. A bound by
+design is a spec question for AMD / Leader: per-beam state checkpoints (each
+beam's recurrent state kept at page boundaries, so a beam replays at most a
+page past its last checkpoint) would bound the replay by a page at the cost
+of a state per beam per page.
 
 ## F56. Every engine's load-time measurements through the one keyed resolve path (found 2026-11-22)
 sc/gpu-committed-profiles put engine-gpu (Vulkan, wgpu) behind one path: each stored entry is taken from the user's
@@ -1197,15 +1281,223 @@ What each still times at load or boot, for its owner (paths under `crates/`):
   weigh it (`dense::choose_unrated`). Still open: the Adreno 840's committed profile (`adreno-tm-840`, a
   commented slot in each backend's `SEEDED`) awaits the phone's export.
 
-## F57. Metal's kernel.dense fit turns agreeing curves into different ladders (found 2026-11-22)
-The load's ladder is `tune::dense::fit_at` over the per-shape curves (`profile::tune::fit`, `Options::default()`:
-`min_gain` 1% of the floor, up to 8 rungs). A rung that fixes the 8-row pick alone saves under 1% (one row count of
-six in the decode band), so whether it is kept turns on noise. Two clean measuring boots of Gemma 4 E4B on an M5 Pro
-(sc/macpro-metal-covers, each point the fastest of 7 rounds, a point slower than both neighbours re-timed over 21)
-measured curves that agree (153 points at rows 6-12: median 0.25%, max 1.88% apart; no row count where the fastest
-kernel differs) and fitted a 4-rung ladder serving c8 at 177.8 tok/s and a 5-rung one serving 199.8. A committed
-profile exported from either freezes its ladder. `min_gain` is a chosen threshold, and a fit that serves c8 slower
-than another candidate ladder must never be picked. sc/macpro-dense-fit (held) replaces the fit with the curves'
-per-point winners (no threshold, no cap; ties settled by the neighbouring row count, else the profile's pick): on
-the M5 it served Gemma c8 at 200.0 / 199.9 / 200.1 over three fresh measurements; on an M1 Max it served c8 7.5%
-under 8ed8f8679 with its 8-row fires faster on the device (the loss off the device, unexplained).
+## F57. Metal's kernel.dense ladder from agreeing curves (found 2026-11-22; decided 2026-11-22)
+The load's ladder was `tune::dense::fit_at` over the per-shape curves (`profile::tune::fit`, `min_gain` 1% of the
+floor): a rung that fixes the 8-row pick alone saves under 1%, so noise decided whether it was kept. Two clean
+measuring boots of Gemma 4 E4B on an M5 Pro measured curves that agree (rows 6-12, 153 points: median 0.25%, max
+1.88% apart; the fastest kernel the same at every row count) and fitted ladders serving c8 at 177.8 and 199.8 tok/s.
+Decided (Leader): the load takes each measured point's winner (`tune::dense::winners`, sc/macpro-dense-winners),
+no fit and no threshold; ties within a point's timed rounds go to the neighbouring row count's winner, else the
+profile's pick. Two clean measuring boots now serve Gemma c8 at 199.0 and 200.0. Still open:
+- Their ladders are not byte-identical (50 and 51 rungs): at one point (2560x2048, 16 rows) the two runs' winners
+  differ by more than either run's spread (1.4% one way, 2.5% the other), and at 13 points one run calls two
+  kernels tied and the other does not. Run-to-run variation exceeds a run's own spread (the fastest of 7 rounds);
+  a spread taken from two passes apart in time would state it, measured, at twice the curve pass's time.
+- An M1 Max served c8 7.5% under 8ed8f8679 on a per-point ladder whose 8-row fires were faster on the device:
+  Mac's whole-step capture is to show which row counts or frames the curves mispredict.
+- `pie tune metal`'s cross-model fit (the checked-in device file's generic ladder) still fits under `min_gain`.
+
+## F58. The capacity gate does not charge the room a park to disk opens (planner sim, found 2026-11-23)
+The field mix as it now runs (beam pools bound beside the prefill's instance, frames owing rung raises, two-ended
+pools with the span backed on demand) fails 4 of the 751 seeds without the wide shape: 401 and 645 (liveness: every
+tier full, the finisher a page short), 589 (a victim evicted twice for one head) and 603 (a raise owed to its
+owner's frame never planned: `rung_short` reads the raise as fitting while `plan_rung` finds no free run below for
+a run in the span, so the planner funds nothing and the walk has nothing to move). Seed 401's cause: a park to
+disk lays its guest parts in whole disk chunks per slot class, which raises the census's slack; the gate's margin
+(`CapacityRead::margin`, the largest other resident's move) counts the move's own pages only, so a move under a
+finisher whose spare was 0 left every tier full (free 72 -> 39 in one step, slack +32). Charging a chunk per slot
+class of the mover's held parts in the margin passes 589 and 645 but breaks main seed 134 (a thrash) and leaves 401
+failing: the margin must be the exact granularity a park opens (the classes whose chunks on the tier below have no
+room for its parts), not a bound.
+
+## F59. The safe order turns short with no ask past it: a gate accounting gap, not admission (planner sim, found 2026-11-23)
+
+The field mix's seed 401 (45 processes arriving at once on a 15-chunk device) and the 401 family (589, 645;
+the Metal w17 mix's thrash and liveness seeds, 31 of its first 200: 18, 43, 47, 54, 67, 70, 74, 76, 77, 84,
+88, ...) end with every process short in the banker's order. `PIE_SIM_SHORT=1` says each step the order turns
+short (`ResidencyPlanner::order_least`, the raw least room in the order, negative when some process cannot
+finish in turn) with the gate's read. On 401 it turns short at step 7 already (least -6, free 99, `moving` 9,
+unit 29), again at 10 (-6) and 17 (-21, `moving` 21): before any process grew far, while moves were under way.
+
+Admission at the last place does not explain it: a newcomer appended last needs its end with every other
+process's holdings given back, which fits whenever its end fits the pool, so a banker's check there refuses
+nothing. The order goes short because a step's reads move under the gate: the second slots of moves under way
+(`moving`) and the margin (`unit`, the largest other resident's move) grow with grants the gate let through as
+safe at their own read. A grant's cost (`CapacityGate::cost`) charges the margin for the asker's own move only;
+the read after the grant also counts the moving copies the grant's own eviction or restore opened. The fix is
+in the gate's accounting (charge what a grant will put in flight, or read the order after the moves it starts),
+then admission priced by the same order. Repro: `PIE_SIM_SHORT=1 PIE_SIM_FIELD=1 PIE_SIM_SEED=401` on
+`replay_one_simulated_seed`, and `PIE_SIM_METAL=1` sweeps.
+
+
+## F66. XLA states a replay bound its prepare does not hold to (found 2026-11-24)
+
+sc/rt-rung-carried (6fd1ea355) has each engine state per rung what its replay scratch holds
+(`engine::RungReplay { own_max, carried_max, total_max }` in `ChunkFacts::act_replay`) and the
+runtime picks a rung by `fire::rung_holds` against it. XLA's is stated as own T / carried T / no
+total, but its prepare check counts every lane's carried rows, decode lanes included: stricter
+than the stated floor, so a rung the runtime picks may be refused at prepare. engine-xla should
+state the bound its static scratch shape holds (`rs_compact = false` where it lays every carried
+row; `carried_max` / `total_max` as laid) and check by `rung_holds` too, so nothing the runtime
+chose is refused after. Predates that branch (the runtime never counted decode lanes' replay for
+XLA); after the beam-line merge.
+
+## F65. libtpu miscompiles the affine offset as a dot in gpt-oss's multi-lane decode (found 2026-11-23)
+
+Served gptoss-20b-u4g64 answered garbage to concurrent requests and sense to one at a time. The
+u4g64 head's affine offset (`Σ_g bias[n, g] · Σ_{k∈g} x[m, k]`, a `dot_general` f32 [m, 45] ·
+[201088, 45]ᵀ at HIGHEST) came out wrong in every decode of 2+ lanes: XLA fuses it as a
+convolution over the bf16 biases with the add, the bf16 round trip and the in-place
+dynamic-update-slice into the aliased f32 [32, 201088] logits output. The same op is right
+standalone, in the 1-lane decode (where XLA makes it a reduce) and in the 2-lane prefill; the
+same program returning the offset's operands as extra outputs computes it right. kernels-xla
+`linear::quant::grouped_dot` now adds each group's offset in the partials' own per-group sum, with
+no dot of its own (a workaround, named there; as fast as the dot it replaces, ABBA); the engine test `a_batched_decode_answers_what_each_lane_answers_alone` holds every
+u4g64 mini's multi-lane decode to its single-lane runs. Repro (StableHLO only, two programs one op
+apart, a JAX runner; libtpu 0.0.48, jax 0.11.2): v6e host `/workspace/tpu-tools/repro`. Filing
+upstream is the user's call. Drop the workaround once a libtpu computes `decode2_dot.mlir` as it
+computes `decode2_reduce.mlir`.
+
+
+## F67. An XLA program is the decoder's per-layer code repeated: lower the layer stack as a loop (v6e, found 2026-11-23)
+
+A hybrid Qwen3.5-0.8B ladder's executables are 4–65 MB packed (median prefill 34 MB, 168 MB raw;
+the ladder 8.6 GB packed, 40.4 GB raw over 266 programs). No weights or tables are folded in
+(every plane a parameter; 2 dense literals, 1.5 KB). The HLO text (median 8.9 MB) is 76% Mosaic
+kernel bodies: 102 `tpu_custom_call`s carry 6.8 MB of `backend_config`, 12 of them distinct
+(conv_step, gdn_step, gdn_chunks, pool_gather, pool_scatter 18 times each, a layer each). The
+compiled form repeats at long range: zstd with a 128 MB window takes the 168 MB to 4.4 MB (38x;
+the cache's level 1 34 MB), 57% of its 512-byte blocks duplicates. Loading it is deserializing
+it: 856 thread-s of a record boot's loads against 78 s of reads and 56 s of unpacking. Lowering
+the decoder's layers as one `stablehlo.while` over stacked per-layer weights would hold one
+layer's code a program: an order of magnitude off each executable, its compile, its load and
+the cache. A big lowering change with a steady-state risk on the critical path: after the PR, a
+prototype on one dense model with steady-state numbers against main.
+
+## F68. The XLA loader's width is measured each boot, not kept in the device's profile (v6e, found 2026-11-23)
+
+Loading behind serving grows its width while the fastest of three samples of its load rate
+rises (v6e: 4 or 5 of 40 cores, a first request at 9.4–9.9 s, all 266 of Qwen3.5's programs
+at 74–84 s). The width is a property of the device and its PJRT plugin and belongs in the
+device profile's keyed `[rates]` (device, plugin, method), measured once and committed with the
+v6e profile, not found again each boot; it waits on the keyed profile path (`profile::fire::
+Rates`, `measured_by`) landing with the committed profiles. Beside it: a parked program (the
+host held no room for it) whose disk file is corrupt is built by its first fire, a build on the
+serving path counted as `BuiltInFire`.
+
+## F69. A fresh host cover is timed while programs load behind serving (v6e, found 2026-11-23)
+
+The runtime times the host cover with warm runs as the load becomes ready, while XLA loads its
+cached programs behind serving. With 44 loads at once the cover's frame read 21 ms against 3.7
+ms quiet; at the loader's measured width (4–5) and with fires' loads ahead of it, it reads 3.7
+ms. A cover the cache or a committed file holds is not timed at all. A fresh one should wait for
+the loader (an engine hook the runtime calls before it times the cover); not built, as the
+measured width leaves it unpolluted on v6e.
+
+## F64
+
+The harmony chat decoding leaves channel headers in an OpenAI chat completion's `content`, on main (ecfd6ed57)
+as on the windowed-state line: gpt-oss-20b served greedy through `/v1/chat/completions` answers `content`
+`"<|channel|>analysis"` beside its `reasoning_content`, and, once it reaches its final channel,
+`"<|channel|>analysis<|start|>assistant<|channel|>final<|message|>**17 × 23** …"`. The reasoning is split
+out (`ThinkingDecoder` on `analysis_prefix`, `chat-template/src/harmony.rs:236`), but the tokens before its
+`<|message|>` stay in the content, and nothing strips the `<|end|><|start|>assistant<|channel|>final<|message|>`
+header that opens the final channel: the chat decoder is the generic one (`GenericChatDecoder`, :229), which
+knows only the stop ids. Open: a harmony chat decoder that drops every header a channel opens with (and keeps
+only the final channel's text as content), checked through compat-openai on gpt-oss-20b. Formatting only: the
+tokens drawn are the model's.
+
+## F70. A device with no measured profile serves Qwen3.5 slower than its family's measured device (found 2026-11-23)
+With no profile of its own (`--no-measure`, a clean home, the Adreno 840's committed profile unlisted), the phone
+serves `qualcomm.toml`, whose numbers are not measured on any device. Every `[rates]` key is skipped and served by
+the estimate. The load is safe: the submit bound holds every step, prefills ramped to ~2000 tokens, and gpufaults did
+not change over 12 boots. It is slower, though. Measured ABBA on 05d724218 against the committed profile, ms/step:
+- Qwen3.5: 27% slower at c1 (40.1 vs 31.5) and 4.9% slower at c4 (56.7 vs 54.1). A 1-token request takes 0.35 s vs
+  0.10 s.
+- Qwen3 is unaffected (c1 1% faster, c4 1.2% slower).
+
+Cause: with no rates, the dense rungs pick a kernel by the work's shape alone. Rung 1 takes gemv x1 ("reads no more
+weight … so no bandwidth or flops makes another faster"), where the measured rates pick gemv x8 for 1-64 rows on
+Qwen3.5's shapes. Fix shape: a family-level committed entry, with no hard-coded default. The vendor family file
+(`qualcomm.toml`) carries a measured device's crossover as an estimate, keyed so an exact-device entry (the device's
+own committed or stored profile) wins over it.
+
+## F72. ROCm's causal masked prefill: split or merged, chosen per bucket, picks wrong where live rows decide (frozen, ~1%; MI300X, 2026-11-23)
+A causal masked prefill serves its requests that read no bit either split (`paged_prefill_unmasked_of`
+then the skipping `paged_prefill_masked`, landed in 385b52884) or merged (one launch, the plain body
+behind a branch). Split gains Qwen3-30B-A3B about 4.3 ms at pf2048; merged is about 0.75 ms faster
+on Qwen3-8B served (forced, same build and home: split 71.4 / 71.9 ms, merged 70.9 / 70.9).
+- A per-shape choice keyed and timed per body bucket (prototype: `profile::routes`
+  `Kind::PrefillMasked`, the bucket's prefill body timed on lanes stating no mask, local
+  sc/amd-prefill-split-measured, not pushed) picks split for 8B: equal or faster at every bucket
+  from 64 rows (2048: 56.07 vs 56.35 ms; 2234: 58.07 vs 58.11). Its timing lane fills its bucket;
+  a served 2061-row prompt runs in the 2234 bucket with about 8% of its tiles empty (block_valid).
+  The tradeoff turns on how many query tiles fill 304 CUs at one block a CU against two, which a
+  bucket key cannot see.
+- If reopened (the bar: more than 2%): choose per fire by live tiles against a measured crossover
+  in tiles per CU (stored keyed, measured once by sweeping live rows on one bucket's body), the
+  pick staged as a per-fire word both kernels read, as the mask word is, so one recorded body
+  serves both ways. No constant and no residency guess.
+
+## F73. A product pick decided inside its own measured spread lands either way from boot to boot, and moved served c64 ~2% (MI300X, 2026-11-23)
+Of a kind with F51 (a measured quantity that does not reproduce across boots), on the choosing side:
+`profile::routes` keeps a decode product's stated kernel unless another is faster past the two
+measurements' spread, but where the two kernels sit within a few microseconds of each other the
+measured times land on either side of that line from one measuring boot to the next. Qwen3-30B-A3B,
+two fresh homes of one build family: Normed 128x2048 m8 took the turned kernel in one (5691.4 vs
+5672.4 us) and the skinny kernel in the other (5667.9 vs 5670.4 us). Served c64 between the two
+homes moved about 2% (mean of 10, 6006 vs 5859 tok/s); with both builds on one shared home the
+difference went away (5921 vs 5981, sd 132 / 216), so the profile's pick, not the code, carried it.
+- Bounded mostly by committed profiles: a device's committed `<device>.measured.toml` fixes the
+  pick once per device, so every boot of a shipped build serves the same choice. What stays open
+  is a user's own measuring boot (a home with no committed entry for its key, or a code change that
+  retires the committed one), which can land the other way and serve ~2% differently.
+- If it matters: a pick inside the noise could keep the stated kernel unless the margin holds
+  across repeated rounds (re-time the near-ties, or widen the spread to the rounds' range), so a
+  near-tie stays stated instead of a coin flip; or the export can mark near-ties so a reviewer sees
+  which committed picks are noise-decided.
+
+## F75. Cerebras refuses device-geometry binds until it carries attn_mask / fold
+
+Since engine-gpu carries device geometry, an engine whose port mask lacks a
+port a program's device class needs refuses the bind by name
+(`runtime pipeline/fire/host_geometry.rs` `EngineLacks`) instead of serving
+it host-resolved. Cerebras advertises device geometry without `attn_mask` and
+`fold`, so beam search (a channel-fed mask) and any decode envelope with a
+device fold no longer bind there. It gets them back when its spatial engine
+reads those two ports from the device.
+
+## F77. gemma-4-E4B's logits move with how a prompt is cut into fires (pre-existing on main; explained, no bug; MI300X, 2026-11-23)
+A row's logits on gemma-4-E4B move up to about 2.5 at top-1 (logits 15-25) with how the prompt
+before it is cut into fires: a prefix hit (the cached run re-prefills the prompt's last row in a
+1-row fire), a client splitting the prompt into turns (59 + 1, 30 + 30), or a chunked prefill alike.
+Fresh vs cached on a 60-token prompt, 600 steps: top-1 |diff| up to 2.56 (main ecfd6ed57: 2.16),
+14-19/600 steps bit-identical; one prompt in two parts at row 61-64. A cached run against another
+cached run is bit-identical, and the gap is already at the first cached row (row 59: 15.0000 vs
+14.5625, 1.0859 vs 0.8945, the same on main and 8ed8f8679). It does not grow (per-50-step max 2.16
+to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-20b 1-2 bf16 ulps.
+- Cause, from row 59's activations at every node (one 60-row fire against the 59 + 1 split's 1-row
+  fire, 946 nodes, full-vector relative L2): bf16 rounding accumulating over 42 layers, each op
+  adding about one rounding (2^-8). The residual stream parts by 0.08% at layer 0, 0.4-1.1% from
+  layer 8 on; no layer steps. The per-layer embeddings are bit-identical in every layer; the
+  KV-sharing layers (norm_rope, no K/V write) add nothing past their inputs; the one jump (0.52% to
+  1.54%) is the final norm at |x| 122, amplifying what it is handed. The final hidden state's 1.5%
+  becomes 0.19-0.44 at row 59's logits through the 262144-wide head and softcap. Prefill-shaped and
+  decode-shaped kernels (attn.prefill vs attn.decode, matmul tiling) round differently, so any
+  re-chunking moves a row; gemma's depth, activations (to |x| 662) and logit scale make it visible.
+- Gate criterion: fresh vs cached (and any cut vs uncut) is judged per model, within that model's own
+  re-chunking spread, measured as one fire against a client split of the same prompt on servers with
+  no prefix cache; not a fixed 2 ulps. A pass has no step at the window W and no growth past it.
+  Reference spreads (top-1 |diff|, 60-token prompt): gemma-4-E4B up to 2.5; Qwen3-0.6B 0.125-0.25;
+  gpt-oss-20b 1-2 ulps (0.03-0.125).
+- Not compared directly: attn.prefill against attn.decode (their outputs take other value ids; the
+  projections after them agree to 0.8-1.5%) and the final matmul_softcap (the one-fire run reads it
+  out through gather.rows).
+
+## F78. Fold a run-ahead fire's accepted rows at launch, not at submit
+
+**What.** Under the lagged fold (e4853eb48) a recurrent / windowed fire folds only rows the program has accepted, and the count is frozen when the guest submits the fire (`submit_pass_stamped`, `fold_at`: "frozen as the fire is prepared"). Acceptance itself is at read time (`ChannelCell::take` → `HostRead::taken` → `Cursor::accepted`). With the run-ahead window W = (frames_in_flight + host_cover) × frame_size (8 at the defaults with cover 2), a steady-state decode lane therefore carries about W − 1 = 7 unfolded rows at every width; only ~4 of them are device in-flight depth, and the other ~3 have landed (or are queued) but weren't read when the fire was submitted.
+
+**Idea.** Decide a fire's fold count at launch (or at settle) from `Cursor::accepted` at that moment, staged as data the recorded body reads, so rows read between submit and launch fold too. The carried floor becomes about frames_in_flight × frame_size − 1 ≈ 3, roughly halving replay work on every engine, with no inferlet change.
+
+**Why later.** It moves when fold counts are fixed (a contract change touching every engine's staging). The carried kernels in the dot-product form (O(n·d)) already make n = 7 cost a few % (CUDA 9B, Vulkan). Pull this in only if a backend's kernel can't reach the 2% gate at n = 7.

@@ -1,0 +1,20 @@
+[
+  {
+    "key": "cuda|NVIDIA L40S sm_89 cuda driver 13020|kernels kernels-cuda 0x1c0eb157, cublaslt 0xe2b2558f|emitter 91|routes 0x834c65dc|lanes 512 tokens 1024|qwen35-d9b-vision-mtp-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 262144",
+    "cover": 1,
+    "frame_us": 22806.0,
+    "turnaround_us": 574.0
+  },
+  {
+    "key": "cuda|NVIDIA L40S sm_89 cuda driver 13020|kernels kernels-cuda 0x1c0eb157, cublaslt 0xe2b2558f|emitter 91|routes 0x834c65dc|lanes 512 tokens 2048|qwen3-8b-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 40960",
+    "cover": 1,
+    "frame_us": 42701.0,
+    "turnaround_us": 224.5
+  },
+  {
+    "key": "cuda|NVIDIA L40S sm_89 cuda driver 13020|kernels kernels-cuda 0x1c0eb157, cublaslt 0xe2b2558f|emitter 91|routes 0x834c65dc|lanes 512 tokens 4467|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 262144",
+    "cover": 1,
+    "frame_us": 5973.5,
+    "turnaround_us": 76.0
+  }
+]

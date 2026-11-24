@@ -113,7 +113,7 @@ impl Run<'_> {
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     #[cfg(not(feature = "rocm"))]
                     let max_grid = fa2::decode_max_grid_size(
                         seat.shape.head_dim,
@@ -138,7 +138,7 @@ impl Run<'_> {
                     )?
                 };
                 if crate::serve::diag::on().plan_trace.is_some() {
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     eprintln!(
                         "[plan-trace] decode capture={} rows={} live={:?} window={:?} grant={:?} info={:?}",
                         self.bindings().capture,
@@ -173,7 +173,7 @@ impl Run<'_> {
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     let spans = self.mask_indptr();
                     debug_assert_eq!(seat.live.rows, self.total_tokens());
                     match self.declared(*plan) {
@@ -763,7 +763,7 @@ impl Run<'_> {
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     plan::plan_mla(
                         self.qo_indptr_host(),
                         seat.kv_indptr,

@@ -79,6 +79,18 @@ pub enum EveryRung {
     To(u32),
 }
 
+/// ROCm's queue masks, as words of the process's start
+/// ([`Knobs::queue_masks`]): the visible-devices list naming the HSA agent of
+/// each HIP ordinal (`HIP_VISIBLE_DEVICES`, else `CUDA_VISIBLE_DEVICES`),
+/// and the CU masks HIP and HSA apply to every queue (`ROC_GLOBAL_CU_MASK`,
+/// `HSA_CU_MASK`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueMasks {
+    pub visible_devices: Option<String>,
+    pub hsa_cu_mask: Option<String>,
+    pub global_cu_mask: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Knobs {
     pub diagnostics: Diagnostics,
@@ -110,6 +122,12 @@ pub struct Knobs {
     /// none, CUDA's default): an expert-parallel group whose ranks share a
     /// device wires only when its ranks' streams fit them.
     pub work_queues: Option<u32>,
+    /// The compute units the process's queues are masked to, as the process
+    /// started ROCm with them (the binary reads them; the shell reads no
+    /// environment): a sampler's blocks wait on one another, so they are
+    /// laid over no more units than its queues run on
+    /// (`program::launch::device_units`). Unread on CUDA.
+    pub queue_masks: QueueMasks,
     /// Lay every rung rather than the ruling's top, keeping the rungs and
     /// the estimate weighed ([`crate::Shell::weighed`]): what `pie tune
     /// --check-estimate` times each rung of (`engine::load::check`).

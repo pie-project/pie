@@ -505,10 +505,14 @@ fn direct_wide(
                     pre,
                     "    const M1ValueDesc bo0_{node} = descriptors[{base}];"
                 );
+                let _ = writeln!(
+                    pre,
+                    "    const M4Spread sp_{node} = m4_spread_of(bd0_{node}, bo0_{node});"
+                );
                 let _ = writeln!(compute, "uint x = {mode} == 0u ? 0u : i;");
                 let _ = writeln!(
                     compute,
-                    "if ({mode} == 2u) x = m4_broadcast_index(bd0_{node}, bo0_{node}, i);"
+                    "if ({mode} == 2u) x = m4_spread_index(sp_{node}, bd0_{node}, bo0_{node}, i);"
                 );
                 let _ = writeln!(compute, "{v} = {};", typed_load(dout, &pa(0), "x", d0));
             }
@@ -556,8 +560,18 @@ fn direct_wide(
     })
 }
 
-pub const STEP_STRUCT: &str =
-    "struct M4Step {\n  uint index;\n  uint level;\n  uint groups;\n  uint reserved;\n};\n";
+pub const STEP_STRUCT: &str = "struct M4Step {\n  uint index;\n  uint level;\n  uint groups;\n  uint reserved;\n};\n\
+// A pipeline built for one step states its index (M4_STEP_CONSTANT): its\n\
+// switch keeps that case alone, and so do its registers and threadgroup\n\
+// memory; a pipeline built for all reads the dispatch's step word.\n\
+constant uint m4_fixed_step [[function_constant(20)]];\n\
+inline uint m4_step_index(uint dispatched) {\n\
+  return is_function_constant_defined(m4_fixed_step) ? m4_fixed_step : dispatched;\n\
+}\n";
+
+/// The function constant index a streamed kernel reads its step from where
+/// its pipeline is built for one step (`m4_fixed_step`).
+pub const M4_STEP_CONSTANT: usize = 20;
 
 const BROADCAST_INDEX: &str = r"
 inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uint i) {
@@ -574,6 +588,60 @@ inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uin
     if (source_dim != 1) source_index += coordinate * source_stride[dim];
   }
   return source_index;
+}
+
+// Unsigned division by a divisor fixed for a whole pass, exact for every
+// 32-bit numerator: a multiply-high and two shifts, its magic number and
+// shift made once (the round-up method; a divisor of 1 is the numerator).
+struct M4Divisor {
+  uint magic;
+  uint shift;
+  uint one;
+};
+
+inline M4Divisor m4_divisor(uint d) {
+  M4Divisor out;
+  out.one = d <= 1u ? 1u : 0u;
+  if (d <= 1u) {
+    out.magic = 0u;
+    out.shift = 0u;
+    return out;
+  }
+  const uint l = 32u - clz(d - 1u);
+  out.magic = uint((ulong(1u) << 32) * ((ulong(1u) << l) - ulong(d)) / ulong(d)) + 1u;
+  out.shift = l - 1u;
+  return out;
+}
+
+inline uint m4_divide(const M4Divisor d, uint n) {
+  if (d.one != 0u) return n;
+  const uint t = mulhi(d.magic, n);
+  return (t + ((n - t) >> 1)) >> d.shift;
+}
+
+// How a broadcast maps an output element to its source's, decided once a
+// pass: where the source's dims are the output's leading ones (a row's
+// value along the row, or the same shape), the source element is the
+// output's index over the trailing dims' product, as
+// m4_broadcast_index reckons it; any other shape walks its dims.
+struct M4Spread {
+  M4Divisor inner;
+  uint general;
+};
+
+inline M4Spread m4_spread_of(const M1ValueDesc bd0, const M1ValueDesc bo0) {
+  M4Spread out;
+  out.general = bd0.rank > bo0.rank ? 1u : 0u;
+  for (uint dim = 0; dim < bd0.rank && dim < 4u; ++dim)
+    if (bd0.dims[dim] != bo0.dims[dim]) out.general = 1u;
+  uint inner = 1u;
+  for (uint dim = bd0.rank; dim < bo0.rank && dim < 4u; ++dim) inner *= bo0.dims[dim];
+  out.inner = m4_divisor(max(inner, 1u));
+  return out;
+}
+
+inline uint m4_spread_index(const M4Spread s, const M1ValueDesc bd0, const M1ValueDesc bo0, uint i) {
+  return s.general != 0u ? m4_broadcast_index(bd0, bo0, i) : m4_divide(s.inner, i);
 }
 ";
 
@@ -695,6 +763,8 @@ struct Open {
     loop_len: Option<Vec<Dimension>>,
     /// The nodes this pass computes: what its step publishes.
     nodes: Vec<u32>,
+    /// The nodes it computes in a register alone ([`STEP_FOLD`]).
+    folds: Vec<u32>,
 }
 
 struct Scheduler<'a> {
@@ -713,16 +783,38 @@ struct Scheduler<'a> {
     pending_nodes: Vec<u32>,
     /// Each step's nodes, in step order (`step_node_table`).
     step_nodes: Vec<Vec<u32>>,
+    /// Each step's nodes computed in a register and never written
+    /// ([`STEP_FOLD`]): every reader of theirs reads the register in the
+    /// same loop.
+    step_folds: Vec<Vec<u32>>,
+    /// Each value's readers in the region, and the values read past it.
+    consumers: &'a BTreeMap<u32, usize>,
+    escapes: &'a BTreeSet<u32>,
+    /// The broadcasts computed in each reader's own pass, never written.
+    sunk: BTreeSet<u32>,
+}
+
+/// Whether `op` reads each operand at its own element's index through the
+/// direct form's loads: a loop member before it in the same pass can hand
+/// it the value in a register.
+fn reads_at_own_index(op: &OpView) -> bool {
+    ((tags::EXP..=tags::SELECT).contains(&op.tag) || op.tag == tags::CAST)
+        && !matches!(op.tag, tags::BROADCAST | tags::GATHER | tags::IOTA | tags::CONST)
 }
 
 impl Scheduler<'_> {
     /// A step dispatching `word`, which computes `nodes`.
-    fn push_step(&mut self, word: u32, nodes: Vec<u32>) {
+    fn push_step(&mut self, word: u32, nodes: Vec<u32>, folds: Vec<u32>) {
         self.steps.push(word);
         self.step_nodes.push(nodes);
+        self.step_folds.push(folds);
     }
 
     fn direct(&self, node: u32, base: u32) -> DirectCode {
+        self.direct_with(node, base, &self.regs)
+    }
+
+    fn direct_with(&self, node: u32, base: u32, regs: &BTreeMap<u32, String>) -> DirectCode {
         direct_wide(
             &self.ops[node as usize],
             node as usize,
@@ -730,7 +822,7 @@ impl Scheduler<'_> {
             &self.slots[&node],
             self.value_types,
             self.alias,
-            &self.regs,
+            regs,
         )
         .expect("planned as direct")
     }
@@ -743,20 +835,73 @@ impl Scheduler<'_> {
         let members = core::mem::take(&mut o.loop_members);
         o.loop_len = None;
         let first = members[0].0;
+        // A member's value read by a member after it at its own index is
+        // handed over in a register (every member runs the same elements);
+        // one read nowhere else, and not past the region, is never written.
+        let forwards = |at: usize| -> usize {
+            let base = members[at].1;
+            members[at + 1..]
+                .iter()
+                .filter(|&&(node, _)| reads_at_own_index(&self.ops[node as usize]))
+                .map(|&(node, _)| {
+                    self.ops[node as usize]
+                        .reads()
+                        .into_iter()
+                        .filter(|&arg| self.alias.resolve(arg) == base)
+                        .count()
+                })
+                .sum()
+        };
+        let mut held: BTreeMap<u32, String> = BTreeMap::new();
+        let mut folds: Vec<u32> = Vec::new();
+        // The values never written: a reader handed one in a register names
+        // no bytes of it either.
+        let mut unwritten: Vec<String> = Vec::new();
         let mut pre = String::new();
         let mut body = String::new();
-        for &(node, base) in &members {
-            let code = self.direct(node, base);
-            pre.push_str(&code.pre);
+        for (at, &(node, base)) in members.iter().enumerate() {
+            let code = if reads_at_own_index(&self.ops[node as usize]) && !held.is_empty() {
+                let mut regs = self.regs.clone();
+                regs.extend(held.iter().map(|(&value, bits)| (value, bits.clone())));
+                self.direct_with(node, base, &regs)
+            } else {
+                self.direct(node, base)
+            };
+            let uses = self.consumers.get(&base).copied().unwrap_or(0);
+            let forwarded = forwards(at);
+            let dead = self.sunk.contains(&base)
+                || (forwarded > 0 && forwarded == uses && !self.escapes.contains(&base));
+            let output = format!("po0_{node} ");
+            let forwarded_reader = reads_at_own_index(&self.ops[node as usize]);
+            for line in code.pre.lines() {
+                // Its result takes no bytes where never written, and a value
+                // it is handed in a register is named by none of its lines.
+                let unnamed = (dead && line.contains(&output))
+                    || (forwarded_reader && unwritten.iter().any(|named| line.ends_with(named)));
+                if !unnamed {
+                    let _ = writeln!(pre, "{line}");
+                }
+            }
             body.push_str(&code.decl);
             let _ = writeln!(body, "      if (i < m4_n_{node}) {{");
             for line in code.compute.lines() {
                 let _ = writeln!(body, "        {line}");
             }
-            let _ = writeln!(body, "        {}", code.store);
+            if dead {
+                folds.push(node);
+                unwritten.push(format!("= scratch + offsets[{base}];"));
+            } else {
+                let _ = writeln!(body, "        {}", code.store);
+            }
             body.push_str("      }\n");
+            if forwarded > 0 {
+                let dout = wire_dtype(self.value_types, base).unwrap_or(0);
+                held.insert(base, bits_of(dout, &format!("v_{node}")));
+            }
         }
         let o = self.open.as_mut().expect("open");
+        o.nodes.retain(|node| !folds.contains(node));
+        o.folds.extend(folds);
         o.passes.push_str(&pre);
         let _ = writeln!(
             o.passes,
@@ -772,7 +917,7 @@ impl Scheduler<'_> {
             let _ = writeln!(self.cases, "  case {}u: {{", self.steps.len());
             self.cases.push_str(&o.passes);
             self.cases.push_str("    return;\n  }\n");
-            self.push_step(streamed_step(o.value, o.kind), o.nodes);
+            self.push_step(streamed_step(o.value, o.kind), o.nodes, o.folds);
         }
     }
 
@@ -836,6 +981,7 @@ impl Scheduler<'_> {
             loop_members: Vec::new(),
             loop_len: None,
             nodes,
+            folds: Vec::new(),
         });
     }
 
@@ -856,7 +1002,7 @@ impl Scheduler<'_> {
         self.cases.push_str("    if (m4_group.x != 0) return;\n");
         self.cases.push_str(&text);
         self.cases.push_str("    return;\n  }\n");
-        self.push_step(streamed_step(value, StepKind::Single), nodes);
+        self.push_step(streamed_step(value, StepKind::Single), nodes, Vec::new());
     }
 
     fn reads_pending(&self, reads: &[u32]) -> bool {
@@ -1130,7 +1276,49 @@ pub fn emit_streamed_region(
             .and_then(|&arg| value_types.get(alias.resolve(arg) as usize))
             .is_some_and(|ty| ty.dtype == eta_ir::Dtype::F32)
     };
-    let key_of = |value: u32| length_key(value_types, value);
+    // Lengths one same-index op ties: its operands that are not one element
+    // are read at its own element, so each is as long as its result,
+    // whatever dims spell it (a symbolic row count beside a static one). The
+    // passes compare a length's class, its first spelling.
+    let mut classes: Vec<Vec<Vec<Dimension>>> = Vec::new();
+    for &node in &region.nodes {
+        let node = node.index();
+        let (Some(op), Some(&base)) = (ops.get(node), bases.get(node)) else { continue };
+        if !reads_at_own_index(op) {
+            continue;
+        }
+        let out = length_key(value_types, alias.resolve(base));
+        if out.is_empty() {
+            continue;
+        }
+        for arg in op.reads() {
+            let key = length_key(value_types, alias.resolve(arg));
+            if key.is_empty() || key == out || key.len() != out.len() {
+                continue;
+            }
+            let at = |classes: &Vec<Vec<Vec<Dimension>>>, key: &Vec<Dimension>| {
+                classes.iter().position(|class| class.contains(key))
+            };
+            match (at(&classes, &out), at(&classes, &key)) {
+                (Some(a), Some(b)) if a != b => {
+                    let (keep, fold) = (a.min(b), a.max(b));
+                    let folded = classes.remove(fold);
+                    classes[keep].extend(folded);
+                }
+                (Some(_), Some(_)) => {}
+                (Some(a), None) => classes[a].push(key),
+                (None, Some(b)) => classes[b].push(out.clone()),
+                (None, None) => classes.push(vec![out.clone(), key]),
+            }
+        }
+    }
+    let key_of = |value: u32| {
+        let key = length_key(value_types, value);
+        classes
+            .iter()
+            .find(|class| class.contains(&key))
+            .map_or(key, |class| class[0].clone())
+    };
 
     let mut planned: Vec<(u32, Plan)> = Vec::new();
     let mut planned_slots: BTreeMap<u32, Slots> = BTreeMap::new();
@@ -1176,15 +1364,15 @@ pub fn emit_streamed_region(
                 let (added_decl, added) = match chain.added {
                     Some(added) => (
                         format!(
-                            " const device uchar* la = {}; const M1ValueDesc la_from = descriptors[{}]; const M1ValueDesc la_to = descriptors[{}];",
+                            " const device uchar* la = {}; const M1ValueDesc la_from = descriptors[{}]; const M1ValueDesc la_to = descriptors[{}]; const M4Spread la_spread = m4_spread_of(la_from, la_to);",
                             value_ptr(added.row),
                             added.row,
                             added.spread
                         ),
                         if added.left {
-                            ("m1_load_f(la, la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i), la_from.dtype) + (", ")")
+                            ("m1_load_f(la, la_from.len == 1u ? 0u : m4_spread_index(la_spread, la_from, la_to, i), la_from.dtype) + (", ")")
                         } else {
-                            ("(", ") + m1_load_f(la, la_from.len == 1u ? 0u : m4_broadcast_index(la_from, la_to, i), la_from.dtype)")
+                            ("(", ") + m1_load_f(la, la_from.len == 1u ? 0u : m4_spread_index(la_spread, la_from, la_to, i), la_from.dtype)")
                         },
                     ),
                     None => (String::new(), ("", "")),
@@ -1420,7 +1608,43 @@ pub fn emit_streamed_region(
         open: None,
         pending_nodes: Vec::new(),
         step_nodes: Vec::new(),
+        step_folds: Vec::new(),
+        consumers: &consumers,
+        escapes: &escapes,
+        sunk: BTreeSet::new(),
     };
+    // A broadcast whose every reader is a same-index member of its length,
+    // and read past none of the region, is computed in each reader's own
+    // pass from its source, handed over in a register and never written:
+    // its readers' passes, not a pass of its own, bear it.
+    let mut sunk: BTreeMap<u32, (u32, u32, Vec<u32>)> = BTreeMap::new();
+    for (node, plan) in &planned {
+        let Plan::Direct { base, scalar: false, len, reads, .. } = plan else { continue };
+        if ops.get(*node as usize).is_none_or(|op| op.tag != tags::BROADCAST) || escapes.contains(base) {
+            continue;
+        }
+        let mut readers = 0usize;
+        let mut all_fit = true;
+        for (reader, reader_plan) in &planned {
+            let Some(op) = ops.get(*reader as usize) else { continue };
+            let reads_it = op.reads().into_iter().filter(|&arg| alias.resolve(arg) == *base).count();
+            if reads_it == 0 {
+                continue;
+            }
+            match reader_plan {
+                Plan::Direct { scalar: false, len: reader_len, .. }
+                    if reads_at_own_index(op) && reader_len == len =>
+                {
+                    readers += reads_it;
+                }
+                _ => all_fit = false,
+            }
+        }
+        if all_fit && readers > 0 && consumers.get(base).copied().unwrap_or(0) == readers {
+            sunk.insert(*base, (*node, *base, reads.clone()));
+        }
+    }
+    sched.sunk = sunk.keys().copied().collect();
     let mut planes_used = 0usize;
     let mut select_used = 0usize;
     for (node, plan) in &planned {
@@ -1460,12 +1684,31 @@ pub fn emit_streamed_region(
                 cross,
                 ..
             } => {
+                if sunk.contains_key(base) {
+                    continue;
+                }
+                // The broadcasts it reads that its pass computes: each one's
+                // source is read at another element, so it must not be one
+                // this pass writes.
+                let carried: Vec<(u32, u32, Vec<u32>)> = ops[node as usize]
+                    .reads()
+                    .into_iter()
+                    .map(|arg| alias.resolve(arg))
+                    .filter_map(|value| sunk.get(&value).cloned())
+                    .fold(Vec::new(), |mut held, one| {
+                        if !held.iter().any(|h: &(u32, u32, Vec<u32>)| h.0 == one.0) {
+                            held.push(one);
+                        }
+                        held
+                    });
+                let sources: Vec<u32> = carried.iter().flat_map(|c| c.2.iter().copied()).collect();
                 let regs = sched.regs.clone();
                 sched.ensure_open(*base, StepKind::Wide, len, |o| {
                     o.len.as_ref().is_none_or(|l| l == len)
-                        && !cross.iter().any(|v| o.writes.contains(v))
+                        && !cross.iter().chain(&sources).any(|v| o.writes.contains(v))
                         && !reads
                             .iter()
+                            .chain(&sources)
                             .any(|v| o.prologue_writes.contains(v) && !regs.contains_key(v))
                 });
                 if sched
@@ -1478,6 +1721,12 @@ pub fn emit_streamed_region(
                 let o = sched.open.as_mut().expect("opened");
                 if o.loop_len.is_none() {
                     o.loop_len = Some(len.clone());
+                }
+                for (b_node, b_base, _) in &carried {
+                    if !o.loop_members.iter().any(|&(member, _)| member == *b_node) {
+                        o.loop_members.push((*b_node, *b_base));
+                        o.nodes.push(*b_node);
+                    }
                 }
                 o.loop_members.push((node, *base));
                 o.writes.insert(*base);
@@ -1589,7 +1838,7 @@ pub fn emit_streamed_region(
                     let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                     sched.cases.push_str(two_level);
                     sched.cases.push_str("    return;\n  }\n");
-                    sched.push_step(streamed_step(*input, StepKind::Reduce), vec![node]);
+                    sched.push_step(streamed_step(*input, StepKind::Reduce), vec![node], Vec::new());
                 }
             }
             Plan::Select {
@@ -1610,7 +1859,7 @@ pub fn emit_streamed_region(
                     let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                     sched.cases.push_str(&text);
                     sched.cases.push_str("    return;\n  }\n");
-                    sched.push_step(streamed_step(*input, kind), vec![*node]);
+                    sched.push_step(streamed_step(*input, kind), vec![*node], Vec::new());
                 };
                 // A radix select of the cut: four passes over the row, 8 bits
                 // of the descending key each, whatever the nucleus's size
@@ -1665,27 +1914,27 @@ pub fn emit_streamed_region(
                 let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                 sched.cases.push_str(rmw);
                 sched.cases.push_str("    return;\n  }\n");
-                sched.push_step(streamed_step(*result, StepKind::Single), vec![node]);
+                sched.push_step(streamed_step(*result, StepKind::Single), vec![node], Vec::new());
             }
             Plan::Single(text) => {
                 sched.flush_pending();
                 let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                 sched.cases.push_str(text);
                 sched.cases.push_str("    return;\n  }\n");
-                sched.push_step(streamed_step(0, StepKind::Single), vec![node]);
+                sched.push_step(streamed_step(0, StepKind::Single), vec![node], Vec::new());
             }
             Plan::Argmax { text, input } => {
                 sched.flush_pending();
                 let _ = writeln!(sched.cases, "  case {}u: {{", sched.steps.len());
                 sched.cases.push_str(text);
                 sched.cases.push_str("    return;\n  }\n");
-                sched.push_step(streamed_step(*input, StepKind::Argmax), vec![node]);
+                sched.push_step(streamed_step(*input, StepKind::Argmax), vec![node], Vec::new());
             }
         }
     }
     sched.flush_pending();
 
-    source.push_str("  switch (step.index) {\n");
+    source.push_str("  switch (m4_step_index(step.index)) {\n");
     source.push_str(&sched.cases);
     source.push_str("  default: return;\n  }\n}\n");
     let mut table = sched.steps;
@@ -1711,6 +1960,7 @@ pub fn emit_streamed_region(
         table.push((u32::try_from(step).unwrap_or(u32::MAX) << 8) | STEP_NODES);
         table.extend(nodes.iter().map(|&node| (node << 8) | STEP_NODE));
         table.extend(folded_in[step].iter().map(|&node| (node << 8) | STEP_FOLD));
+        table.extend(sched.step_folds[step].iter().map(|&node| (node << 8) | STEP_FOLD));
     }
     table.extend(
         region

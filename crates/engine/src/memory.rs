@@ -25,6 +25,28 @@ pub const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::OnceLock;
+
+/// The process's allocator returning to the system the pages its freed
+/// blocks hold, as the process that installs the allocator states it.
+static RETURN_FREED_HEAP: OnceLock<fn()> = OnceLock::new();
+
+/// States how the process's allocator returns its freed pages
+/// ([`return_freed_heap`]); the first statement holds.
+pub fn on_return_freed_heap(release: fn()) {
+    let _ = RETURN_FREED_HEAP.set(release);
+}
+
+/// The host memory a load freed goes back to the system now, not when its
+/// allocator next gets round to it: on a device that shares the host's
+/// memory, the reservations that follow are sized by what the system has
+/// available, and freed blocks the allocator keeps committed are counted by
+/// neither. An allocator that returns pages as it frees states nothing.
+pub fn return_freed_heap() {
+    if let Some(release) = RETURN_FREED_HEAP.get() {
+        release();
+    }
+}
 
 use serde::{Deserialize, Serialize};
 

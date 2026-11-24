@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 
 #[cfg(feature = "engine-cuda")]
-use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, Transport, World, ordinal_of};
+use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, QueueMasks, Transport, World, ordinal_of};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
@@ -199,6 +199,14 @@ fn device_boot(
     knobs.work_queues = std::env::var("CUDA_DEVICE_MAX_CONNECTIONS")
         .ok()
         .and_then(|word| word.trim().parse::<u32>().ok());
+    // ROCm's queue masks, as the process started HIP with them: a sampler's
+    // blocks are laid over the units its queues run on.
+    let var = |name: &str| std::env::var(name).ok();
+    knobs.queue_masks = QueueMasks {
+        visible_devices: var("HIP_VISIBLE_DEVICES").or_else(|| var("CUDA_VISIBLE_DEVICES")),
+        hsa_cu_mask: var("HSA_CU_MASK"),
+        global_cu_mask: var("ROC_GLOBAL_CU_MASK"),
+    };
     if let Some(word) = opts.nccl_transport.as_deref() {
         knobs.nccl_transport = word
             .parse::<Transport>()
@@ -247,8 +255,15 @@ fn load_request(
         -1,
         frames_in_flight,
     )?;
-    if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
-        let dir = crate::disk::kv_dir(cache_dir, snapshot_dir)?;
+    // A disk tier only where its budget is stated: none is no tier.
+    if request.residency.disk_kv_budget.is_some_and(|bytes| bytes > 0)
+        && request.residency.disk_kv_dir.is_none()
+    {
+        let dir = crate::disk::kv_dir(
+            cache_dir,
+            snapshot_dir,
+            request.residency.disk_kv_persistent,
+        )?;
         // Each rank of an expert-parallel group keeps its own requests' kv.
         request.residency.disk_kv_dir = Some(match overrides.ep {
             Some(_) => dir.join(format!("rank{}", overrides.rank.unwrap_or(0))),

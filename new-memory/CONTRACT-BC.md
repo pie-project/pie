@@ -75,16 +75,50 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     Fixed records hold state only. Forks share rs-list slots by refcount; a write into a shared, partially filled tail
     slot is preceded by a slot copy (runtime asks via `copy_slots`, or the engine copies a `(src, dst)` pair stated in
     the fire). Contract 15 (group CoW of the state record when a lane folds) still applies to the state record.
-19. **Sliding-window kv is a trimmed list, not a ring (supersedes every ring rule; amends 3, 4, 11, 12).**
-    Facts state window lists as `SlotKind::List` shapes with a `window` (rows retained); one shape per distinct
-    window, layers of that window layer-major inside the slot; T = the kv page size. `Lane.tables` for a window list
-    has the same token-order length as the full table; slots the runtime has trimmed are ref 0 (null chunk) — today's
-    window kernels already skip pages outside the window, so they read it unchanged. The runtime drops a slot from a
-    working set once its last row is below `committed_end - window` (rows of a fire still being decided — spec drafts —
-    are never counted as committed); freeing goes through refcount and the per-fire epoch (17). Prefill longer than the
-    window simply holds more slots until the next trim. Forks / prefix-cache entries share window slots by refcount
-    like the kv list; a write into a shared partially filled tail slot follows the kv list's tail rule. No ring cap,
-    ring addressing, gcd form or `kv.window_copies` remain; a backend's ring path is deleted, not kept.
+19. **A windowed layer is state + buffer, exactly like a recurrent layer (user ruling: "a window model has exactly
+    the same mental model as a recurrent model. Use the buffer. The window holds only folded rows."; supersedes the
+    trimmed window lists of the earlier 19 and the ring shapes, ring addressing and gcd form of 3, 4, 11, 12).**
+    Windowed layers are the sliding-window attention layers (Gemma, gpt-oss, DeepSeek's window attention). Attention
+    over rows chosen by score (index-selected or compressed attention) is no window: it stays kv. Attention sinks
+    that are learned logits (DeepSeek's, gpt-oss's: a weight in the softmax, no stored row) are untouched by this
+    change; no field states sink rows, and a model with stored sink rows gets one when it arrives.
+    - **State.** Per windowed layer the lane's record holds a ring of W rows (that layer's K and V) holding only
+      folded rows, row r at ring place `r mod W`. The rings are record bytes: they copy, park and restore with the
+      record as opaque bytes and are costed in the record's tier. Their layout is the engine's (a plane of its own
+      or inside the state bytes); the contract states only the bytes per windowed layer, at least W times that
+      layer's K + V row bytes, padded as the engine pads them. W need not be a page multiple.
+    - **Buffer.** The windowed layers' K/V rows still unfolded after a fire live in window-buffer slots, a slot list
+      like kv: taken on demand as rows accrue (no carried-rows bound; a fire too wide for the pool is cut like
+      chunked prefill, never refused), named in the lane's tables in token order, every entry a real slot. Rows a
+      fire itself folds take no buffer slot: their K/V live in the fire's own activation scratch while the fire
+      reads them, and only the ring (the last W) receives them at the fold. A fold frees every buffer
+      slot whose rows are all folded. On a hybrid the rs rows keep their own buffer (18, 20); window K/V use this
+      list.
+    - **Fold.** The lane's folded index (`KvDelta.folded`, the one `RsVerb::Buffer.folded` states) is the only
+      source of truth. Advancing folded from f to f' writes rows `[f, f')` (buffered, or the fire's own) into the
+      ring at `row mod W`, dropping the oldest past W, in the same fold step as rs. One fold per lane: the
+      integration commit lifts a single lane-level fold (folded, fold, lineage) out of `RsVerb::Buffer`, so rs and
+      window read one field; until then the two are stated equal and validated so. Lanes sharing a folded window
+      (a beam group: the shared common-ancestor lagged fold) fold once; 12 and 15 order a group's fold after every
+      lane read.
+    - **Read.** Row p of a windowed layer reads keys `[max(0, p - W + 1), p]`: those below folded from the ring,
+      those in `[folded, p]` from the lane's
+      buffer rows in lineage order (the `buffered_reads` lineage the rs replay uses; a lane never reads a sibling's
+      divergent rows) and its own rows. One mask; one softmax over the union.
+    - **Sharing.** A record shared with a prefix-cache entry (or any other owner at a different fold point) is
+      copied once at its first fold (copy-on-first-fold: the record's `cow != run`), so committed state stays
+      immutable. The whole record is copied, rings and rs state together: on a hybrid the fold changes the rs state
+      too. An auto-checkpoint on a windowed model is a snapshot of the ring. A windowed
+      lane's snapshot is its record plus its unfolded buffer slots, as an rs lane's; window tables are not saved.
+    - **Prefill.** A long prefill streams through the ring in the same fire. A fire's activation holds its own
+      folded rows' K/V for the fire's reads: an engine sizes its activation for it, and the runtime cuts a fire
+      whose activation cannot hold it, as chunked prefill. So a long prefill holds at most about one fire's tail of
+      buffer slots.
+    - **Gone.** Window lists, their slot tables, ref-0 trimming, `slot_copies` of window lists, `KvCopy.windowed`
+      and `PoolFacts.window_tokens` go. An engine states that it serves windowed layers as ring + buffer
+      (`Capabilities.windowed_state`); until every engine does, the old window-list fields stay in the engine crate
+      marked "removed by the windowed-state change; do not use in new code", and the integration commit removes
+      them everywhere before anything lands (no dual paths in what lands).
 
 20. **rs-list mechanics (fills in 18).** `SlotShape.role: SlotRole` (serde default `State`); the rs list is
     `SlotKind::List { tokens: T_rs, rate: 1 }` with `role: RsBuffer` (refused on non-List). At most one kv list and
@@ -94,17 +128,61 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     before any lane of the fire reads or writes (after earlier fires); no two copies share a dst; `pages` already
     names dst; `validate_chunks` checks them like table refs. A buffered write no longer forces record CoW. A model
     that buffers rs rows must state an rs-list shape.
-21. **Window-list fields (fills in 19; final after WL2).** `SlotKind::List { tokens, rate, window: Option<u32> }`
-    (serde default None); `window: Some(w)` retains w rows, role State, `tokens` = its own slot size T_w (<= the kv
-    page; compiler picks a power of two >= 16 by waste). `ChunkFacts::validate` refuses two window lists with the
-    same w, `Some(0)`, an RsBuffer with a window, and more than 4 window lists. `Lane.tables` holds the kv list's
-    table and one table per window list, each in that list's own token order: entry i = slot holding rows
-    `[i*T_w, (i+1)*T_w)`, ref 0 (null chunk) where trimmed or not written; `validate_chunks` accepts ref 0 only in a
-    window list's table, never in `slot_copies`. Each list trims on its own: slot i dropped once
-    `(i+1)*T_w - 1 < committed_end - w` (settled commits only; draft rows never count), freed through refcount and
-    the per-fire epoch. Forks / prefix-cache checkpoints share window slots by refcount, list by list. A write into a
-    shared window slot is preceded by a whole-slot copy in `Lane.slot_copies` under that list's shape id (degenerate
-    pools: `KvCopy.windowed` pairs on the pre-launch copy). `KvDelta::window_copies` is removed.
+21. **Windowed-state fields (fills in 19).** `ChunkFacts.windowed: Vec<WindowedLayer { layer, window, bytes }>`
+    (serde default; layers ascending and distinct, `window > 0`, `bytes > 0`), the rings a record holds;
+    `ChunkFacts.record_bytes` counts them (validate refuses rings past it). The window buffer is
+    `SlotKind::List { tokens: T, rate: 1, window: None }` with `role: SlotRole::WindowBuffer`: a slot holds T
+    unfolded rows of every windowed layer's K and V, layer-major as the engine lays it. `ChunkFacts::validate`
+    refuses a window buffer of another kind, two window buffers, a window buffer with no windowed layer and windowed
+    layers with none, and any window list beside windowed layers. A lane states `Lane.window: Option<WindowFold {
+    base, fold, lineage }>` (serde default None), on every seated lane of such a load and on no other:
+    `base` is the row entry 0 of the lane's window-buffer table holds. A lane carrying rows earlier fires buffered
+    (its first row past `kv.folded`): `kv.folded`, the folded index before the fire, rounded down to T; those rows
+    stay named for this fire's reads and the fold frees their slots after. A lane carrying none: the folded index
+    after the fire (`kv.folded` plus a host-counted fold; `kv.folded` for a device-counted one), rounded down to T;
+    rows the fire computes and folds itself take no slot. Validated: a multiple of T, at most the folded index
+    after the fire, and at most `kv.folded` where the lane carries earlier-buffered rows (`kv.held > kv.folded`). A kv-less lane carries no attention rows and states no `window`. `fold` how
+    far the fire advances folded (`FoldLen`, read as `RsVerb::Buffer`'s: a device-counted fold's count reaches the
+    runtime when the fire settles, and the engine keeps the row its rings stand at with the record), `lineage`
+    which buffered rows the windowed layers read. On a hybrid `RsVerb::Buffer` states the same folded, fold and
+    lineage (`Lane::validate` refuses otherwise). The window-buffer table sits in `Lane.tables` under its shape id:
+    entry i = slot of rows `[base + i*T, base + (i+1)*T)`, every entry a real slot (no ref 0). Forks / prefix-cache
+    entries share window-buffer slots by refcount; a write into a shared partly filled slot is preceded by a
+    whole-slot copy in `Lane.slot_copies` under the buffer's shape id (as the rs list's, 20). A copy-on-first-fold
+    of a shared record is the record's `[run, cow]` with `cow != run`, the whole record.
+    `Capabilities.windowed_state` (serde default false; `Serves.windowed_state`): a lane stating `window` to an
+    engine without it is refused by name.
+    **Recipe.** An engine stating `windowed_state` takes `poem_compiler::chunk::plan_windowed(trace, budgets,
+    profile, &dyn RingLayout)` (`plan` keeps window lists for the others until the integration commit). The recipe
+    states the windowed layers (`WindowedRow { layer, rows, window, per_token, shard }`, per_token the layer's K + V
+    bytes of one row) and asks the engine's required hook `RingLayout::ring_region(layers, &WindowBufferSlot {
+    tokens, bytes, rows })` for one ring region a record: `RingRegion { bytes, atom, placement, layer_bytes }`, cut
+    only between atoms, `layer_bytes` the per-layer shares summing to `bytes` (what the engine states as
+    `WindowedLayer.bytes`), `placement` either `Aligned(a)` (inside the state record, its first row, at offset 0
+    of the record's first slot, the record's rows aligned to a) or `ChunkStart` (its own fixed shape of one slot a
+    chunk, every piece starting at a chunk boundary; the record names the ring pieces first, its state pieces
+    after). The layout inside the region is the engine's: an engine indexing per-layer rings takes
+    `plain_rings(layers, align)` (W rows a layer, one after another, the offsets stated); Metal answers pages
+    laid like window-buffer slots on the slot grid, `(ceil(W/P) + 1)` pages of the buffer slot's bytes,
+    `ChunkStart`. The window buffer is `ChunkRecipe.windowed.buffer` (a `SlotLayout::List { tokens: T, window: None
+    }` of the kv page's T rows of every windowed layer, layer-major, each layer's runs in its rows); `recipe.list()`
+    never returns it, `recipe.fixed()` never returns the ring shape. A kv-only window model gets a record. The
+    window buffer and a `ChunkStart` ring shape are weighed in the chunk-size pick like the other shapes (the
+    buffer at a fire's unfolded tail, as the rs list; the ring's whole-chunk pieces as a fixed record). Under
+    tensor parallelism each layer's ring share shrinks by the parts the ranks cut that layer's own rows into
+    (`WindowedRecipe::rank_layer_bytes(recipe, tp)`; `ChunkRecipe::per_rank` sizes the ring from it).
+    **A ring at chunk starts in the facts and the record.** The ring is its own `SlotShape`: `SlotKind::Fixed {
+    pieces }`, `slots_per_chunk = 1` (so every piece starts a chunk), `role: SlotRole::Ring`, stated before the
+    record's state shapes (`ChunkFacts::validate` refuses another kind, more than one slot a chunk, a second ring
+    shape, one after a state fixed shape, and one in a load with no windowed layer). The record spans every fixed
+    shape the load states, as 16 already allows: `LaneRecord::Pieces` names each shape's pieces in its own list,
+    `(ring shape, its pieces)` first, then `(state shape, its pieces)`; a shape the load does not state is absent,
+    and every stated shape is named with all its pieces (no shape implied by position). A kv-only windowed model
+    (Gemma) states the ring shape and no state shape, so its record is the ring's pieces alone; nothing is
+    special-cased. The record is one unit across its shapes: a fork's copy, tier copies (22: one `copy_slots` a
+    fixed shape, pieces paired in order), park, restore and copy-on-first-fold move it whole as opaque bytes, and
+    `[run, cow]` covers the ring pieces as the state pieces (a snapshot's `RsSnapshot.fixed` names both). A ring
+    placed `Aligned` lies inside the state fixed shape, its first row, and no ring shape is stated.
 22. **Host and disk tiers of shared shapes (fills in the tiers part of 12).** `ChunkFacts.host_chunks`: host chunks
     of `chunk_bytes`, ids from 0, none reserved, no ChunkTable (a host ref names its own place); any state shape
     (weights excepted) may open any host chunk; a host ref of shape s is `chunk * s.slots_per_chunk + index` at
@@ -124,3 +202,74 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     lane's tables / Lane.fixed. Byte reads of host refs (read_host_kv / read_host_state) are not stated. copy_kv /
     copy_state to/from host remain only for engines stating degenerate facts. TP: smallest host/disk chunk counts
     across ranks; each rank moves its band.
+23. **A rung's replay scratch is stated; one function checks a fire against it (replaces `fire::rung_rows`).**
+    Each activation rung states what its replay scratch holds, from the engine's own reserve formula:
+    `ChunkFacts.act_replay: Vec<RungReplay { own_max: Option<u32>, carried_max: Option<u32>, scratch:
+    ScratchBytes { slot_bytes: Vec<u64>, lane_bytes, room_bytes, pad } }>`, one a rung of `act_chunks`, in its
+    order; required (no default) of a load with an rs list (`ChunkFacts::validate` refuses one stating none by
+    name). A fire of `rows` scratch rows over `lanes` lanes takes `Σ_slots roundup_pad(rows × slot_bytes) +
+    roundup_pad(lanes × lane_bytes)` bytes (`ScratchBytes::bytes`), and fits where that is at most `room_bytes`;
+    an engine laying no rs scratch past its rung's rows states no slot. A fire's rows are `ReplayRows { own,
+    carried, scratch, lanes }`: `own` every row its lanes compute (never its lane count), `carried` each lane's
+    by `fire::lane_carried` (a decode lane's none), `scratch` `fire::rs_scratch_rows` (own, and each lane's
+    carried rows: on a compact fire `lane_carried`'s, else every one, a decode lane's included). Compactness is
+    the fire's, decided only by `fire::scratch_compact(ChunkFacts.rs_compact, ChunkFacts.rs_scratch_per_fire,
+    every_lane_one_run, any_lane_snapshots)`: the load's layout compact, and where compactness is a fire's
+    (Metal's), every lane's buffered rows one stretch (`fire::lane_one_run(mask, folded, first, lineage)`, from
+    its `RsVerb::Buffer`) and no lane landing an rs snapshot (an auto-checkpoint's included); no engine derives
+    it otherwise. `fire::rung_holds(&RungReplay, ReplayRows)` returns the bound that binds (`ReplayPast { bound:
+    Own | Carried | Scratch, rows, max }`). The runtime runs a fire at the smallest rung that holds it, each
+    piece of a cut pass as cut (the uncut pass's own rows are no piece's), and refuses by name a piece no rung
+    holds, before any step; each engine's submit check calls the same functions against the rung it stages in.
+    Stated: Metal own T, carried T, its rs layout's slots and work term (`Seat::scratch_bytes`), pad 256,
+    compactness a fire's; CUDA own T, carried its widest bucket's tokens, the extended run's row bytes over
+    `rows_ext(max_tokens)` rows, compact (a decoding lane's rows never take it); engine-gpu and XLA own T, carried
+    T, no slot (their replay lies in the rung's own rooms). `FireLimits.replayed_rows` stays the step's bound on
+    every lane's replayed rows.
+24. **The step compositions a load is sent are stated at load, one function computes them (`engine::shapes`).**
+    The runtime states its step builder's rules in the load request (`LoadRequest.steps: StepRules { kinds:
+    [Decode, Mixed, Prefill], treatments: [Folds, Buffers] }`, `StepRules::runtime()`); over the facts the load
+    states of itself (`StepFacts::stated(caps, readouts)`: the rungs of `ChunkFacts.act_chunks` up to the
+    first holding `max_tokens` (one fire's tokens where none is stated), `max_lanes`, `max_tokens`,
+    `ReadoutFacts::fire_rows(max_readouts)`, whether a shape is the rs list, and the attachments it serves), `StepShapes::of(rules, facts)`
+    is the finite set of compositions the builder can form: per rung, per kind (decode lanes only, prompt lanes
+    only, both) and per treatment (every lane folding, or any lane buffering, a decode lane beside a prompt
+    included; buffered only where the load has an rs list), a `StepShape { rung, kind, treatment, rows,
+    decode_lanes, prompt_lanes, prompt_rows, lane_rows, readout_rows, attachments }` of inclusive spans. A decode
+    lane takes one row, a prompt lane two or more; the prompt rows split across the prompt lanes in any way with
+    each lane in `lane_rows` (uneven splits such as [10, 6] and odd lane counts occur at any rung: the builder
+    joins whole members as they come); readout rows are the sequence lanes' (a kv-less lane's land through the
+    readout landing). `attachments: Attachments { mask, adapter, inputs, snapshots, tap, float }` are what the
+    shape's lanes may carry, in any subset on any lane (`Attachments::served(has_lora, inputs declared,
+    rs_snapshots > 0)`: a mask, a tap and a float lane always); an engine whose bodies key on one records the
+    shape with and without it, so a lattice built from plain requests alone is a gap. Lane-word classes are no
+    part of a shape (an engine crosses its classes with each). A folded shape's
+    rows run from past the rung below to its own; a buffered one's from one (its rung holds its carried rows,
+    `fire::rung_holds`). The set is ordered smallest first across kinds: by rung, then decode, mixed, prompt, then
+    folded before buffered.
+    - **Where it is computed.** The engine computes it once its lattice is fixed and before its arm walk, walks it
+      in its order, and states it with those it runs eager (`Capabilities.steps: StatedSteps { shapes, eager }`).
+      The runtime computes it again from the stated facts at bootstrap and refuses a load whose stated set is
+      another by name (`StatedSteps::agrees`). No setter: nothing changes the set after ready.
+    - **The allowance split.** The runtime owns the set and its order; the engine owns its measured allowance.
+      The engine records each shape's bodies in the set's order while they fit, and states the shapes whose bodies
+      do not fit eager at load (`eager`, indices; under smallest-first the tail of the order). An eager shape still
+      fires, uncaptured and tallied (`live::Tally::Eager`), never refused. A shape is left unstated by no engine.
+    - **The builder forms nothing outside it.** `StepGroup::accepts` takes a member only where the step with it
+      stays in the set (`StepShapes::shape_of`), else it goes in a later step. A member reaching the builder is
+      one piece of its pass, already cut to a fire (`pipeline::fire::pass_pieces`): a prompt past every rung is
+      cut and served, never refused. Admission refuses against the set only a piece no cut makes smaller and no
+      shape holds (its sequence readouts past the rows one fire reads out, a buffered step on a load with no rs
+      list, a lane attachment the load does not serve), naming what of the nearest shape it passes
+      (`StepShape::misses`); a piece past one fire's tokens or lanes is refused, as before, by those bounds. Under the contract check (debug builds or
+      `PIE_CHECK_REPLAY`, which gates both cross-checks: the engines' replay check and this one, `shapes::check_on`), every step formed is checked, a gap failing with the composition and
+      the nearest stated shapes (`StepGap`).
+    - **Engines, interim.** Each engine computes and states the set after its walk and says what it does with it:
+      CUDA names each shape whose padded buckets its lattice walk records no body of that kind and treatment for
+      (`Shell::walk_gaps`; today mixed and wide targets are folded only, so buffered mixed shapes are named); Metal,
+      engine-gpu (Vulkan, wgpu), XLA log the set and that their walks do not key on it yet; Cerebras computes it and
+      records no bodies. Each walk then takes its targets from the set in its own branch: CUDA records the buffered
+      treatment of mixed / wide targets; Metal arms each readout-row tier inside a shape's `readout_rows` at its
+      rung; engine-gpu records each shape before ready (sc/gpu-arm-before-ready); XLA lays its warm ladder from it
+      (its laid mixed rungs, `Capabilities.mixed_lanes`, are narrower than the set's mixed shapes, so it states those
+      it cannot lay eager).

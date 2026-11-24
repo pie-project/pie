@@ -171,7 +171,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
     ));
     std::fs::create_dir_all(&dir).expect("a disk tier's dir");
     shell
-        .seat_disk_kv(Some(64 << 20), Some(&dir), 1, CONTEXT)
+        .seat_disk_kv(Some(64 << 20), Some(&dir))
         .expect("the disk tier seats");
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
@@ -246,6 +246,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
             })
             .collect();
         let seated = Seated {
+            replay_stated: None,
             held: Some(0),
             refs: true,
             pages: &own_pages,
@@ -273,6 +274,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
             }
         }
         let seated = Seated {
+            replay_stated: None,
             held: Some(held),
             refs: true,
             pages: &pages,

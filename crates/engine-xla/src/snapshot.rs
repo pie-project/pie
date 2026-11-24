@@ -174,6 +174,9 @@ fn cut(lane: &Lane, from: u32, to: u32, bits: Bits) -> Lane {
         piece.positions = lane.positions[a..b].to_vec();
     }
     piece.rs_snapshots = Vec::new();
+    // The runtime counted the whole lane's replay, not this piece's: the
+    // piece states none, and prepare counts its own.
+    piece.replay_stated = None;
     piece.word = if rows == 1 {
         lane.word | bits.single
     } else {

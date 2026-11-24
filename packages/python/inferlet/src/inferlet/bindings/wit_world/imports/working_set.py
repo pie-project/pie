@@ -13,14 +13,43 @@ import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
+
+@dataclass
+class ShareScope_Session:
+    pass
+
+
+@dataclass
+class ShareScope_Tenant:
+    pass
+
+
+@dataclass
+class ShareScope_Group:
+    value: str
+
+
+ShareScope = Union[ShareScope_Session, ShareScope_Tenant, ShareScope_Group]
+"""
+Who a working set shares its frozen slots with. Each is within the
+process's authenticated tenant, never a tenant the inferlet names:
+`session` within its session (the one its launch named, else the
+process alone); `tenant` within the tenant; `group(name)` within the
+named group, which crosses tenants only where the operator's grant
+covers this tenant, and is the tenant's own otherwise.
+"""
+
+
 class WorkingSet:
     """
     A working set is one sequence's model state: slot `i` holds what the
     model keeps for the `i`-th token. It names no pages; the runtime owns
     where the state lives.
     
-      [0, folded)          frozen: shared, kept after release, moved
-                           between memory tiers.
+      [0, folded)          frozen: immutable; shared only within the
+                           scope `share` names; after release kept, moved
+                           or dropped as the worker policy's retention
+                           says.
       [folded, reserved)   the buffer: this working set's alone; writing a
                            slot again replaces it.
     
@@ -47,7 +76,16 @@ class WorkingSet:
     def fork(self, on: pipeline.Pipeline) -> Self:
         """
         A child that shares the frozen part and gets a copy of the buffer,
-        ordered on `on`.
+        ordered on `on`. It shares as its parent does.
+        
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def share(self, scope: ShareScope) -> None:
+        """
+        Publishes this set's frozen slots under `scope` and lets its passes
+        map, wait on, fetch and resume from what that scope holds. Unasked:
+        private. Asked before the set's first pass; refused after it.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

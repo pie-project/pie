@@ -625,6 +625,15 @@ pub struct MlaPlanInfo {
     pub partial_lse_offset: Option<u32>,
 }
 
+/// Forgets the plan ring of `stream` before the caller destroys it
+/// (`pinned::forget_stream`). A no-op without the device runtime.
+pub fn forget_stream(stream: *mut core::ffi::c_void) {
+    #[cfg(feature = "rocm")]
+    pinned::forget_stream(stream.cast());
+    #[cfg(not(feature = "rocm"))]
+    let _ = stream;
+}
+
 /// The pinned host slots a plan's bytes are staged through, a ring a stream,
 /// each slot guarded by an event recorded after the copy that reads it.
 #[cfg(feature = "rocm")]
@@ -757,6 +766,42 @@ mod pinned {
             unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.host, bytes.len()) };
             Ok(slot.host.cast_const())
         })
+    }
+
+    /// Forgets what `stream` recorded in its ring, before it is destroyed:
+    /// each slot's event waits (the stream still live) and is made again,
+    /// unrecorded, and the ring leaves the map, so a later stream at the
+    /// same address starts a ring of its own. A query of an event whose
+    /// stream was destroyed reads freed state (on ROCm, a lock no thread
+    /// holds, so the query waits forever).
+    pub(crate) fn forget_stream(stream: rt::Stream) {
+        let Ok(device) = crate::jit::cache::current_device() else {
+            return;
+        };
+        let ring = RINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(device, stream as usize));
+        let Some(ring) = ring else {
+            return;
+        };
+        let mut ring = ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for slot in &mut ring.slots {
+            // SAFETY: the slot's own event, recorded only on `stream`, which
+            // is live until its caller destroys it after this returns.
+            unsafe {
+                let _ = rt::hipEventSynchronize(slot.read);
+                let _ = rt::hipEventDestroy(slot.read);
+                if !slot.host.is_null() {
+                    // The slot's last copy ran (the event above).
+                    let _ = rt::hipHostFree(slot.host.cast());
+                }
+            }
+            slot.host = core::ptr::null_mut();
+            slot.bytes = 0;
+        }
+        ring.slots.clear();
+        ring.next = 0;
     }
 
     /// The slot `stage` handed out is read once `stream` runs to here.

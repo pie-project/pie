@@ -79,6 +79,7 @@ fn fire(fixture: &Fixture, which: &[usize]) -> Vec<Vec<f32>> {
             let history: Vec<u32> = (0..HELD).map(|t| (t * 7 + 3 + lane as u32 * 5) % 200).collect();
             shell
                 .fire_seated(&[Seated {
+                    replay_stated: None,
                     held: Some(0),
                     ..Seated::of(Lane {
                         slot: lane as u32,
@@ -92,6 +93,7 @@ fn fire(fixture: &Fixture, which: &[usize]) -> Vec<Vec<f32>> {
     let lanes: Vec<Seated<'_>> = which
         .iter()
         .map(|&lane| Seated {
+            replay_stated: None,
             held: Some(if all[lane].len() == 1 { HELD } else { 0 }),
             ..Seated::of(Lane {
                 slot: lane as u32,

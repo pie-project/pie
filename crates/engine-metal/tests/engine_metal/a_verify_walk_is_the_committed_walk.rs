@@ -261,12 +261,16 @@ struct Buffered {
     window: Tensor,
 }
 
+/// The ints of a lane's page table row here: the kernels take the width the
+/// dispatch passes, so an odd one the load would never derive proves it.
+const PAGE_INTS: u32 = 11;
+
 fn buffered(bench: &Bench, lanes: &Lanes, ext: Tensor) -> Buffered {
     const FIRST: u32 = 2;
     const PLANE_AT: u32 = 256;
     let row = u64::from(ext.width) * ext.dtype.bits() / 8;
     let page_bytes = (u64::from(PLANE_AT) + u64::from(PAGE) * row).next_multiple_of(256);
-    let pages_a_lane = (kernels_metal::ssm::RS_PAGE_INTS - 1) as usize;
+    let pages_a_lane = (PAGE_INTS - 1) as usize;
     let slots = lanes.rows.len() * pages_a_lane;
     let mut slab = vec![0u8; slots * page_bytes as usize];
     let mut table = Vec::new();
@@ -302,6 +306,7 @@ fn buffered(bench: &Bench, lanes: &Lanes, ext: Tensor) -> Buffered {
             page_tokens: PAGE,
             page_bytes: page_bytes as u32,
             row_bytes: row as u32,
+            page_ints: PAGE_INTS,
         },
         window: bench.upload(&window, own, ext.width, ext.dtype),
     }
@@ -311,7 +316,7 @@ impl Buffered {
     /// Whether each lane's own rows landed in its buffer after its replayed
     /// ones.
     fn landed(&self, bench: &Bench, lanes: &Lanes) -> bool {
-        let pages_a_lane = (kernels_metal::ssm::RS_PAGE_INTS - 1) as usize;
+        let pages_a_lane = (PAGE_INTS - 1) as usize;
         let row = u64::from(self.paged.row_bytes);
         lanes
             .spans()
@@ -347,6 +352,7 @@ fn walks_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         commit: bench.i32s(&lanes.commit),
         slots: bench.i32s(slots),
         lane0: 0,
+        ext_replay: bench.i32s(&lanes.replay),
     };
     let ext_gates = bench.zeroed(ext, BA_WIDTH, Dtype::F32);
     let ext_y = bench.zeroed(ext, Y_WIDTH, Dtype::F32);
@@ -390,6 +396,7 @@ fn walks_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             &new,
             &gates,
             None,
+            None,
             &pool(&x, new.slots),
             K_HEADS,
             V_HEADS,
@@ -419,6 +426,7 @@ fn walks_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             &paged,
             &paged_gates,
             Some(ba.paged),
+            None,
             &pool(&x, paged.slots),
             K_HEADS,
             V_HEADS,
@@ -488,6 +496,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
         commit: bench.i32s(&lanes.commit),
         slots: bench.i32s(slots),
         lane0: 0,
+        ext_replay: bench.i32s(&lanes.replay),
     };
     let old_y = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
     let new_y = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
@@ -523,6 +532,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             new_y,
             land,
             snapshots(bench, snaps.map(|s| s.1)),
+            false,
         )
         .expect("the verify conv");
     });
@@ -547,6 +557,7 @@ fn convs_agree(bench: &Bench, lanes: &Lanes, snaps: Option<(&[i32], &[i32])>) {
             paged_y,
             paged_land,
             None,
+            false,
         )
         .expect("the paged verify conv");
     });

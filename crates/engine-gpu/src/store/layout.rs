@@ -5,7 +5,7 @@
 //! only places the shapes:
 //!
 //! - [`LIST`]: a kv page, the recipe's list slot: `page_size` tokens of every
-//!   kv row (windowed rows too: this backend pages them in full), layer-major.
+//!   unwindowed kv row, layer-major.
 //!   A kernel reads row `r` of physical page `q` at `q * slot_bytes +
 //!   offset(r)` of the pool's virtual space ([`kernels_slang::KvPool`]'s page
 //!   stride and origin); a chunk is a whole number of list slots, so `q =
@@ -15,10 +15,9 @@
 //!   row at `unit * gcd(chunk, slot) + offset` ([`kernels_slang::ssm::StatePool`]).
 //! - [`RS`]: the rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of
 //!   every recurrent layer's rs planes a slot.
-//! - [`window_shape`]`(k)`: window list `k` (CONTRACT-BC 19, 21), narrowest
-//!   window first: `T_w` tokens of every row of that window a slot,
-//!   layer-major, a page table of its own; a slot trimmed behind the window
-//!   is ref 0 (the null chunk), which the window kernels never read.
+//! - [`WINDOW`]: the window buffer (CONTRACT-BC 19, 21): a kv page's
+//!   tokens of every windowed row a slot, layer-major, the rows a lane has
+//!   not folded into the rings its record holds.
 //!
 //! - [`INSTANCE`], [`CHANNEL`]: a guest instance's bind-time launch tables
 //!   and the cells a channel keeps on the device (`SlotRole::Instance`,
@@ -41,7 +40,7 @@ use crate::error::{Fault, Result};
 
 pub const LIST: ShapeId = ShapeId(0);
 pub const FIXED: ShapeId = ShapeId(1);
-/// The first (narrowest) window list.
+/// The window buffer.
 pub const WINDOW: ShapeId = ShapeId(2);
 pub const RS: ShapeId = ShapeId(3);
 
@@ -56,24 +55,6 @@ pub const CHANNEL: ShapeId = ShapeId(8);
 pub const INSTANCE_SLOT: u64 = 4 << 10;
 /// A `Channel` slot's bytes.
 pub const CHANNEL_SLOT: u64 = 1 << 10;
-
-/// The most window lists a load holds (`ChunkFacts::validate`'s bound).
-pub const WINDOWS: usize = 4;
-
-/// Window list `k`'s shape: [`WINDOW`], then 4, 5, 6.
-#[must_use]
-pub fn window_shape(k: usize) -> ShapeId {
-    match k {
-        0 => WINDOW,
-        k => ShapeId(3 + u32::try_from(k).unwrap_or(u32::MAX)),
-    }
-}
-
-/// Which window list shape `id` is, if one.
-#[must_use]
-pub fn window_of(id: ShapeId) -> Option<usize> {
-    (0..WINDOWS).find(|&k| window_shape(k) == id)
-}
 
 /// The chunk a GPU recipe aims at.
 pub const TARGET_CHUNK: u64 = 4 << 20;
@@ -131,15 +112,6 @@ impl Slots {
     }
 }
 
-/// A window list's place: its slots, the rows its window retains and the
-/// tokens (`T_w`) a slot holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowList {
-    pub slots: Slots,
-    pub window: u32,
-    pub tokens: u32,
-}
-
 /// The pool's chunk size, its shapes and its extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -152,10 +124,9 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
-    /// The window lists (CONTRACT-BC 19, 21), narrowest window first, list
-    /// `k` shape [`window_shape`]`(k)`: a table in its own token order a
-    /// lane; slots trimmed behind the window are the null chunk.
-    pub windows: [Option<WindowList>; WINDOWS],
+    /// The window buffer (CONTRACT-BC 19, 21): `page_size` unfolded rows of
+    /// every windowed row a slot.
+    pub buffer: Option<Slots>,
     /// The rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of every
     /// recurrent layer's rs planes a slot.
     pub rs: Option<Slots>,
@@ -193,7 +164,7 @@ impl Layout {
             pieces: pieces.max(1),
             list: Slots::of(LIST, list, chunk_bytes),
             fixed: Slots::of(FIXED, fixed, chunk_bytes),
-            windows: [None; WINDOWS],
+            buffer: None,
             rs: None,
             rs_tokens: 0,
             seats,
@@ -222,25 +193,10 @@ impl Layout {
         Ok(layout)
     }
 
-    /// This layout with window list `k` of `bytes` slots of `tokens` rows,
-    /// retaining `window` rows; its seat run, `pages_per_seat` slots a seat,
-    /// after the others.
-    pub fn with_window(
-        mut self,
-        k: usize,
-        bytes: u64,
-        window: u32,
-        tokens: u32,
-        pages_per_seat: u32,
-    ) -> Result<Layout> {
-        if k >= WINDOWS {
-            return Err(Fault::Ceiling {
-                what: "window lists of a load",
-                need: k as u64 + 1,
-                have: WINDOWS as u64,
-            });
-        }
-        let Some(mut slots) = Slots::of(window_shape(k), bytes, self.chunk_bytes) else {
+    /// This layout with the window buffer of `bytes` slots; its seat run,
+    /// `pages_per_seat` slots a seat, after the others.
+    pub fn with_buffer(mut self, bytes: u64, pages_per_seat: u32) -> Result<Layout> {
+        let Some(mut slots) = Slots::of(WINDOW, bytes, self.chunk_bytes) else {
             return Ok(self);
         };
         if slots.per_chunk == 0 {
@@ -252,11 +208,7 @@ impl Layout {
         }
         slots.seat_chunk = 1 + self.seat_chunks();
         slots.seat_slots = self.seats.saturating_mul(pages_per_seat);
-        self.windows[k] = Some(WindowList {
-            slots,
-            window,
-            tokens,
-        });
+        self.buffer = Some(slots);
         Ok(self)
     }
 
@@ -285,12 +237,6 @@ impl Layout {
         Ok(self)
     }
 
-    /// Window list `k`, where the load holds one.
-    #[must_use]
-    pub fn window(&self, k: usize) -> Option<&WindowList> {
-        self.windows.get(k).and_then(Option::as_ref)
-    }
-
     /// This layout with an rs list of `bytes` slots of `tokens` rows; its
     /// seat run, `pages_per_seat` slots a seat, after the others.
     pub fn with_rs(mut self, bytes: u64, tokens: u32, pages_per_seat: u32) -> Result<Layout> {
@@ -315,7 +261,7 @@ impl Layout {
         self.list
             .iter()
             .chain(&self.fixed)
-            .chain(self.windows.iter().flatten().map(|w| &w.slots))
+            .chain(&self.buffer)
             .chain(&self.rs)
             .chain(&self.instance)
             .chain(&self.channel)
@@ -405,20 +351,21 @@ impl Layout {
                 rows.first().unwrap_or(&Vec::new()),
             ));
         }
-        // The window lists: lists of their own slot with their window
-        // (CONTRACT-BC 19, 21).
-        for (k, list) in self.windows.iter().enumerate() {
-            if let Some(list) = list {
-                shapes.push(shape(
-                    &list.slots,
+        // The window buffer: a list of the kv page's rows of every
+        // windowed row (CONTRACT-BC 19, 21).
+        if let Some(buffer) = &self.buffer {
+            shapes.push(SlotShape {
+                role: SlotRole::WindowBuffer,
+                ..shape(
+                    buffer,
                     SlotKind::List {
-                        tokens: list.tokens,
+                        tokens: self.page_size,
                         rate: 1,
-                        window: Some(list.window),
+                        window: None,
                     },
-                    rows.get(2 + k).unwrap_or(&Vec::new()),
-                ));
-            }
+                    rows.get(2).unwrap_or(&Vec::new()),
+                )
+            });
         }
         if let Some(rs) = &self.rs {
             shapes.push(SlotShape {
@@ -484,6 +431,25 @@ impl Layout {
             }],
             shapes,
             act_chunks: act_chunks.to_vec(),
+            // A rung holds its tokens of own rows and of carried rows
+            // (`crate::arena`'s rung check); no bound on the two together.
+            act_replay: act_chunks
+                .iter()
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(tokens),
+                    // The replay lies in the rung's own rooms, laid for its
+                    // tokens of own and of carried rows: no bytes beyond.
+                    scratch: engine::ScratchBytes {
+                        slot_bytes: Vec::new(),
+                        lane_bytes: 0,
+                        room_bytes: 0,
+                        pad: 1,
+                    },
+                })
+                .collect(),
+            rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,
@@ -493,6 +459,7 @@ impl Layout {
             disk_kept: false,
             weights: Vec::new(),
             record_bytes: 0,
+            windowed: Vec::new(),
         }
     }
 }

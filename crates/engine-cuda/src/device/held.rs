@@ -74,11 +74,43 @@ pub fn retire_stream(ordinal: i32, stream: *mut core::ffi::c_void, destroy: impl
     // SAFETY: the stream is live till `destroy`, and no recorder can reach
     // it while `LIVE` is write-held.
     unsafe { rt::cudaStreamSynchronize(stream.cast()) };
-    let stream = stream as usize;
-    pool::forget_stream(stream);
-    recycle::forget_stream(stream);
-    heap::forget_stream(stream);
+    forget_stream(stream);
     destroy();
+}
+
+/// Every mark a store or a staging ring keeps of `stream`, forgotten: the
+/// fences kept memory waits on, and on ROCm the staging rings' slots (the
+/// pageable ring's and the attention plans'), whose events belong to the
+/// stream they were recorded on. The stream must still be live and drained.
+fn forget_stream(stream: *mut core::ffi::c_void) {
+    let at = stream as usize;
+    pool::forget_stream(at);
+    recycle::forget_stream(at);
+    heap::forget_stream(at);
+    #[cfg(feature = "rocm")]
+    {
+        crate::device::hip::held::forget_stream(at);
+        kernels_cuda::attn::plan::forget_stream(stream);
+    }
+}
+
+/// Destroys a stream no context adopted (a side, notify, tap, swap, fan or
+/// staging lane stream): drained, every mark of it forgotten
+/// ([`forget_stream`]), then destroyed, so no later query reaches an event
+/// it recorded.
+///
+/// # Safety
+///
+/// `stream` is a live stream nothing launches on again.
+pub unsafe fn destroy_unadopted_stream(stream: *mut core::ffi::c_void) {
+    if stream.is_null() {
+        return;
+    }
+    // SAFETY: as the caller promises.
+    unsafe { rt::cudaStreamSynchronize(stream.cast()) };
+    forget_stream(stream);
+    // SAFETY: as the caller promises; nothing below reaches it again.
+    let _ = unsafe { rt::cudaStreamDestroy(stream.cast()) };
 }
 
 /// Opens a capture on `stream` with `begin`, the work it holds before the

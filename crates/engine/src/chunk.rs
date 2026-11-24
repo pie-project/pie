@@ -3,8 +3,8 @@
 //! shrink and rearrange it.
 //!
 //! - A **slot** is what the runtime hands out and refcounts: one kv page of
-//!   a list shape (the kv list, a window list, the rs list), one piece of a
-//!   fixed record.
+//!   a list shape (the kv list, the rs list, the window buffer), one piece of
+//!   a fixed record.
 //! - A **chunk** holds the slots of one slot shape, `slots_per_chunk` of
 //!   them; every shape's chunks come from one id space, kv and state alike.
 //!   Slot `i` of chunk `c` is named by its slot ref `c * slots_per_chunk + i`
@@ -75,6 +75,24 @@ pub struct ChunkFacts {
     /// Empty where activation lives in a buffer of its own.
     #[serde(default)]
     pub act_chunks: Vec<(u32, u32)>,
+    /// What each rung's replay scratch holds ([`crate::RungReplay`]), one
+    /// a rung of [`ChunkFacts::act_chunks`] in its order, from the engine's
+    /// own reserve formula: stated by every engine whose rungs replay
+    /// buffered recurrent rows (a load with an rs list), no default
+    /// ([`ChunkFacts::validate`] refuses such a load stating none).
+    #[serde(default)]
+    pub act_replay: Vec<crate::RungReplay>,
+    /// The load's rs scratch layout is compact (every recurrent op on its
+    /// paged forms, its rs page table staged): a fire on it lays only the
+    /// carried rows a rung counts ([`crate::fire::lane_carried`]: a decode
+    /// lane's none) where the fire is compact too
+    /// ([`crate::fire::scratch_compact`], which alone decides it).
+    #[serde(default)]
+    pub rs_compact: bool,
+    /// The load's scratch compactness is a fire's
+    /// ([`crate::fire::scratch_compact`]'s `per_fire`): Metal's.
+    #[serde(default)]
+    pub rs_scratch_per_fire: bool,
     /// The rungs of [`ChunkFacts::act_chunks`] the engine states eager, by
     /// their tokens, ascending; every other rung stated is armed, its
     /// bodies captured before the load returned. Fixed at load: nothing
@@ -150,13 +168,47 @@ pub struct ChunkFacts {
     pub disk_kept: bool,
     /// One recurrent-state record's bytes as the model's state rows take
     /// them (not the slots or chunks a pool lays it in); 0 where the model
-    /// holds no recurrent state.
+    /// holds no recurrent state. Where the engine serves windowed layers as
+    /// ring + buffer ([`crate::Capabilities::windowed_state`]), the record
+    /// holds each windowed layer's ring too, and this counts them
+    /// ([`ChunkFacts::windowed`]).
     #[serde(default)]
     pub record_bytes: u64,
+    /// The windowed (sliding-window attention) layers whose rings the
+    /// lane's record holds (CONTRACT-BC 19, 21), by layer, ascending; empty
+    /// where the model has none or the engine does not serve them as ring +
+    /// buffer. The record carries each ring as opaque bytes: it copies,
+    /// parks and restores with the record, and its layout is the engine's.
+    #[serde(default)]
+    pub windowed: Vec<WindowedLayer>,
     /// The streamable weights' slot shapes ([`WeightShape`]), ids apart
     /// from [`ChunkFacts::shapes`]'. Empty where nothing streams.
     #[serde(default)]
     pub weights: Vec<WeightShape>,
+}
+
+/// One windowed layer's ring in a lane's recurrent-state record
+/// (CONTRACT-BC 19, 21): the layer's K and V of its last `window` folded
+/// rows, row `r` at ring place `r mod window`. Record bytes: they copy,
+/// park and restore with the record and are costed in the record's tier.
+/// The contract states only their bytes; how the rows lie inside them (a
+/// plane of their own or inside the state bytes, padded or not) is the
+/// engine's, and `window` need not be a page multiple. Attention over rows
+/// chosen by score (index-selected or compressed attention) is no window:
+/// it stays kv. Attention sinks that are learned logits (DeepSeek's,
+/// gpt-oss's: a weight in the softmax, no stored row) are untouched by the
+/// ring; a model with stored sink rows gets its field when one arrives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowedLayer {
+    /// The model's layer.
+    pub layer: u32,
+    /// W: the rows the layer attends back over, its own row included; the
+    /// rows the ring holds.
+    pub window: u32,
+    /// The ring's bytes in the record: at least `window` times the layer's
+    /// K and V bytes of one row; an engine that pads them (to a page
+    /// multiple, say) states the padded bytes.
+    pub bytes: u64,
 }
 
 /// How the pool's segments stand and may move.
@@ -184,8 +236,10 @@ pub enum Growth {
 /// What a reserved chunk is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reserved {
-    /// Chunk 0: what a window list's slot trimmed behind its window, or an
-    /// unset table entry, reads (ref 0). Replaces the windowed pool's page 0.
+    /// Chunk 0: what the null record ([`crate::LaneRecord::Null`]), an
+    /// unset table entry, or (removed by the windowed-state change; do not
+    /// use in new code) a window list's slot trimmed behind its window,
+    /// reads (ref 0). Replaces the windowed pool's page 0.
     Null,
     /// State of lanes the runtime does not seat (`Lane::kv_less` lanes that
     /// carry state of their own), `lanes` of them.
@@ -242,12 +296,14 @@ pub enum SlotKind {
     /// compressed pools): a slot holds `tokens` tokens, of which the model
     /// keeps one row every `rate` (`tokens // rate` rows a slot).
     ///
-    /// With a `window`, a **window list** (CONTRACT-BC 19, 21): the rows of
-    /// the layers read through that sliding window, `tokens` (`T_w`) its own
-    /// page size. A lane's table for it is in its own token order, entry
-    /// `i` the slot of rows `[i * T_w, (i + 1) * T_w)`; a slot the runtime
-    /// trimmed (its last row below `committed_end - window`) is ref 0, the
-    /// null chunk.
+    /// `window`: removed by the windowed-state change; do not use in new
+    /// code (windowed layers are ring + buffer: [`ChunkFacts::windowed`],
+    /// [`SlotRole::WindowBuffer`]). With a `window`, a window list: the
+    /// rows of the layers read through that sliding window, `tokens`
+    /// (`T_w`) its own page size. A lane's table for it is in its own token
+    /// order, entry `i` the slot of rows `[i * T_w, (i + 1) * T_w)`; a slot
+    /// the runtime trimmed (its last row below `committed_end - window`) is
+    /// ref 0, the null chunk.
     List {
         tokens: u32,
         rate: u32,
@@ -286,7 +342,8 @@ pub struct SlotShape {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SlotRole {
     /// The state its kind names: kv for a list (a window's for a window
-    /// list), a record for a fixed shape.
+    /// list: removed by the windowed-state change; do not use in new code),
+    /// a record for a fixed shape.
     #[default]
     State,
     /// The rs buffer (a list shape only): a slot holds `tokens` unfolded
@@ -294,6 +351,23 @@ pub enum SlotRole {
     /// slot `(s - base) / tokens` of the lane's `RsVerb::Buffer::pages`, at
     /// row `(s - base) % tokens`.
     RsBuffer,
+    /// The window buffer (a list shape of rate 1 and no `window` only;
+    /// CONTRACT-BC 19, 21): a slot holds `tokens` unfolded rows of every
+    /// windowed layer's K and V ([`ChunkFacts::windowed`]), layer-major as
+    /// the engine lays them. A lane's table of it in [`crate::Lane::tables`]
+    /// is in token order from [`crate::WindowFold::base`]: entry `i`
+    /// holds rows `[base + i * tokens, base + (i + 1) * tokens)`. On a
+    /// hybrid the rs rows keep the rs list; this list holds window K/V
+    /// only.
+    WindowBuffer,
+    /// The windowed layers' ring region where it lies at chunk starts (a
+    /// fixed shape of one slot a chunk; CONTRACT-BC 21): a piece of the
+    /// lane's record beside its state shapes, stated before them, so the
+    /// record names its ring pieces first. The record is one unit across
+    /// every fixed shape it spans: it parks, restores and copies (its
+    /// `[run, cow]`) whole. A kv-only windowed model states the ring shape
+    /// and no state shape.
+    Ring,
     /// One guest instance's bind-time launch tables (a fixed shape): an
     /// instance of `n` slots holds bytes `[k * slot_bytes, (k + 1) *
     /// slot_bytes)` of its tables in slot `k` of
@@ -319,7 +393,7 @@ impl SlotRole {
     #[must_use]
     pub fn replayable(self) -> bool {
         match self {
-            SlotRole::State | SlotRole::RsBuffer => true,
+            SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer | SlotRole::Ring => true,
             SlotRole::Instance | SlotRole::Channel | SlotRole::Adapter => false,
         }
     }
@@ -353,6 +427,7 @@ impl SlotKind {
     }
 
     /// The rows a window list retains; `None` for every other kind.
+    /// Removed by the windowed-state change; do not use in new code.
     #[must_use]
     pub const fn window(self) -> Option<u32> {
         match self {
@@ -405,6 +480,8 @@ impl ChunkFacts {
     /// The kv list: the list shape of full (unwindowed) kv pages.
     #[must_use]
     pub fn kv_list(&self) -> Option<&SlotShape> {
+        // `window: None`: the window-list filter goes with the windowed-state
+        // change's final integration.
         self.shapes.iter().find(|shape| {
             shape.role == SlotRole::State
                 && matches!(shape.kind, SlotKind::List { window: None, .. })
@@ -429,6 +506,23 @@ impl ChunkFacts {
             })
             .or_else(|| self.shapes.iter().find_map(list))
             .unwrap_or(0)
+    }
+
+    /// The window buffer's shape ([`SlotRole::WindowBuffer`]), where the
+    /// engine serves windowed layers as ring + buffer.
+    #[must_use]
+    pub fn window_buffer(&self) -> Option<&SlotShape> {
+        self.shapes
+            .iter()
+            .find(|shape| shape.role == SlotRole::WindowBuffer)
+    }
+
+    /// The bytes of every windowed layer's ring a record holds.
+    #[must_use]
+    pub fn ring_bytes(&self) -> u64 {
+        self.windowed
+            .iter()
+            .fold(0u64, |sum, layer| sum.saturating_add(layer.bytes))
     }
 
     /// The kv pages the device holds: the kv list's slots on its pinned run,
@@ -479,6 +573,13 @@ impl ChunkFacts {
         })
     }
 
+    /// What rung `at` of [`ChunkFacts::act_chunks`] holds of a fire's
+    /// replay, as the engine states it.
+    #[must_use]
+    pub fn rung_replay(&self, at: usize) -> Option<&crate::RungReplay> {
+        self.act_replay.get(at)
+    }
+
     #[must_use]
     pub fn act_chunks_max(&self) -> u32 {
         self.act_chunks.last().map_or(0, |&(_, chunks)| chunks)
@@ -487,8 +588,7 @@ impl ChunkFacts {
     /// The guest state the device can hold live: its state chunks' bytes
     /// less what the engine holds back of them. The room a guest program's
     /// registration binds within, and so the most guest state any seats
-    /// hold on the device, which a disk tier derived on its own gives a
-    /// home when they are evicted.
+    /// hold on the device.
     #[must_use]
     pub fn guest_room_bytes(&self) -> u64 {
         u64::from(self.state_chunks())
@@ -603,6 +703,9 @@ impl ChunkFacts {
             }],
             shapes,
             act_chunks: Vec::new(),
+            act_replay: Vec::new(),
+            rs_compact: false,
+            rs_scratch_per_fire: false,
             eager_rungs: Vec::new(),
             held_bytes: 0,
             outside_bytes: 0,
@@ -613,6 +716,7 @@ impl ChunkFacts {
             disk_persistent: pools.disk_persistent,
             disk_kept: pools.disk_kept,
             weights: Vec::new(),
+            windowed: Vec::new(),
             record_bytes: if pools.state_slots > 0 {
                 pools.state_slot_bytes
             } else {
@@ -628,6 +732,21 @@ impl ChunkFacts {
     /// pool.
     pub fn validate(&self) -> Result<()> {
         let invalid = |what: String| Err(Error::Invalid(format!("chunk facts: {what}")));
+        let replays = self.shapes.iter().any(|shape| shape.role == SlotRole::RsBuffer);
+        if replays && !self.act_chunks.is_empty() && self.act_replay.is_empty() {
+            return invalid(
+                "this engine states no rs scratch model for its rungs (act_replay), and its \
+                 load replays buffered recurrent rows"
+                    .into(),
+            );
+        }
+        if !self.act_replay.is_empty() && self.act_replay.len() != self.act_chunks.len() {
+            return invalid(format!(
+                "{} rungs' replay bounds stated for {} rungs",
+                self.act_replay.len(),
+                self.act_chunks.len()
+            ));
+        }
         let total = u64::from(self.total_chunks);
         if !matches!(
             self.reserved.first(),
@@ -700,6 +819,50 @@ impl ChunkFacts {
                     "shape {} buffers rs rows as {:?}; the rs buffer is a list shape of no window",
                     shape.id, shape.kind
                 ));
+            }
+            if shape.role == SlotRole::WindowBuffer {
+                if !matches!(
+                    shape.kind,
+                    SlotKind::List {
+                        rate: 1,
+                        window: None,
+                        ..
+                    }
+                ) {
+                    return invalid(format!(
+                        "shape {} buffers window rows as {:?}; the window buffer is a list \
+                         shape of rate 1 and no window",
+                        shape.id, shape.kind
+                    ));
+                }
+                if let Some(other) = self.shapes[..at]
+                    .iter()
+                    .find(|s| s.role == SlotRole::WindowBuffer)
+                {
+                    return invalid(format!(
+                        "shapes {} and {} are both the window buffer",
+                        other.id, shape.id
+                    ));
+                }
+            }
+            if shape.role == SlotRole::Ring {
+                if !matches!(shape.kind, SlotKind::Fixed { .. }) || shape.slots_per_chunk != 1 {
+                    return invalid(format!(
+                        "shape {} lays the ring as {:?}, {} a chunk; the ring shape is a fixed \
+                         shape of one slot a chunk",
+                        shape.id, shape.kind, shape.slots_per_chunk
+                    ));
+                }
+                if let Some(other) = self.shapes[..at].iter().find(|s| {
+                    s.role == SlotRole::Ring
+                        || (s.role == SlotRole::State && matches!(s.kind, SlotKind::Fixed { .. }))
+                }) {
+                    return invalid(format!(
+                        "shape {} is the ring shape after shape {}: one ring shape, stated before \
+                         the record's state shapes",
+                        shape.id, other.id
+                    ));
+                }
             }
             if let Some(window) = shape.kind.window()
                 && let Some(other) = self.shapes[..at]
@@ -777,6 +940,7 @@ impl ChunkFacts {
                 self.held_bytes
             ));
         }
+        self.validate_windowed()?;
         if u64::from(self.reserved_chunks()) + u64::from(self.act_chunks_max()) > total {
             return invalid("reserved and activation chunks pass the pool".into());
         }
@@ -789,6 +953,69 @@ impl ChunkFacts {
             return invalid(format!(
                 "segments {segments:?} of {} chunks do not cover the {total} chunks",
                 self.segment_chunks
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ChunkFacts {
+    /// Windowed layers as ring + buffer (CONTRACT-BC 21): layers ascending
+    /// and distinct, each ring of some rows and bytes, the record holding
+    /// every ring, a window buffer stated exactly where a ring is, and no
+    /// window list beside them (one load serves windowed layers one way).
+    fn validate_windowed(&self) -> Result<()> {
+        let invalid = |what: String| Err(Error::Invalid(format!("chunk facts: {what}")));
+        if self
+            .windowed
+            .windows(2)
+            .any(|pair| pair[0].layer >= pair[1].layer)
+        {
+            return invalid("windowed layers are not ascending and distinct".into());
+        }
+        if let Some(layer) = self
+            .windowed
+            .iter()
+            .find(|layer| layer.window == 0 || layer.bytes == 0)
+        {
+            return invalid(format!(
+                "windowed layer {}'s ring of {} rows in {} bytes is empty",
+                layer.layer, layer.window, layer.bytes
+            ));
+        }
+        if self.ring_bytes() > self.record_bytes {
+            return invalid(format!(
+                "the windowed layers' rings take {} bytes, past the record's {}",
+                self.ring_bytes(),
+                self.record_bytes
+            ));
+        }
+        if self.windowed.is_empty()
+            && let Some(ring) = self.shapes.iter().find(|s| s.role == SlotRole::Ring)
+        {
+            return invalid(format!(
+                "shape {} is the ring shape of a load that states no windowed layer",
+                ring.id
+            ));
+        }
+        match (self.windowed.is_empty(), self.window_buffer()) {
+            (true, Some(shape)) => {
+                return invalid(format!(
+                    "shape {} is the window buffer of a load that states no windowed layer",
+                    shape.id
+                ));
+            }
+            (false, None) => {
+                return invalid("windowed layers are stated with no window buffer".into());
+            }
+            _ => {}
+        }
+        if !self.windowed.is_empty()
+            && let Some(list) = self.shapes.iter().find(|s| s.kind.window().is_some())
+        {
+            return invalid(format!(
+                "shape {} is a window list beside windowed layers served as ring + buffer",
+                list.id
             ));
         }
         Ok(())
@@ -1001,6 +1228,8 @@ mod role_tests {
     fn only_state_the_tokens_rebuild_is_replayable() {
         assert!(SlotRole::State.replayable());
         assert!(SlotRole::RsBuffer.replayable());
+        assert!(SlotRole::WindowBuffer.replayable());
+        assert!(SlotRole::Ring.replayable());
         assert!(!SlotRole::Instance.replayable());
         assert!(!SlotRole::Channel.replayable());
     }
@@ -1008,7 +1237,9 @@ mod role_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkFacts, DegeneratePools};
+    use super::{
+        ChunkFacts, DegeneratePools, ShapeId, SlotKind, SlotRole, SlotShape, WindowedLayer,
+    };
 
     fn facts() -> ChunkFacts {
         let mut facts = ChunkFacts::degenerate(&DegeneratePools {
@@ -1038,6 +1269,102 @@ mod tests {
         facts.eager_rungs = vec![256, 64];
         let why = facts.validate().unwrap_err().to_string();
         assert!(why.contains("eager rungs are not ascending"), "{why}");
+    }
+
+    /// `facts()` with a window buffer of 16 rows and two windowed layers
+    /// whose rings fill the record.
+    fn windowed() -> ChunkFacts {
+        let mut facts = facts();
+        facts.shapes.push(SlotShape {
+            id: ShapeId(9),
+            kind: SlotKind::List {
+                tokens: 16,
+                rate: 1,
+                window: None,
+            },
+            slot_bytes: 2048,
+            slots_per_chunk: 2,
+            sets_per_working_set: 1,
+            rows: Vec::new(),
+            pinned: None,
+            role: SlotRole::WindowBuffer,
+        });
+        facts.windowed = vec![
+            WindowedLayer {
+                layer: 0,
+                window: 100,
+                bytes: 100 * 64,
+            },
+            WindowedLayer {
+                layer: 3,
+                window: 128,
+                bytes: 128 * 64,
+            },
+        ];
+        facts.record_bytes = facts.ring_bytes();
+        facts
+    }
+
+    #[test]
+    fn windowed_layers_are_rings_in_the_record_beside_one_window_buffer() {
+        let ok = windowed();
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        assert_eq!(ok.window_buffer().map(|s| s.id), Some(ShapeId(9)));
+        let refused = |facts: ChunkFacts, why: &str| {
+            let said = facts.validate().unwrap_err().to_string();
+            assert!(said.contains(why), "{said}");
+        };
+        let mut small = windowed();
+        small.record_bytes -= 1;
+        refused(small, "past the record's");
+        let mut no_buffer = windowed();
+        no_buffer.shapes.pop();
+        refused(no_buffer, "with no window buffer");
+        let mut no_layer = windowed();
+        no_layer.windowed.clear();
+        refused(no_layer, "states no windowed layer");
+        let mut unsorted = windowed();
+        unsorted.windowed.swap(0, 1);
+        refused(unsorted, "not ascending");
+        let mut rated = windowed();
+        if let Some(shape) = rated.shapes.last_mut() {
+            shape.kind = SlotKind::List {
+                tokens: 16,
+                rate: 2,
+                window: None,
+            };
+        }
+        refused(rated, "list shape of rate 1 and no window");
+        let mut both = windowed();
+        if let SlotKind::List { window, .. } = &mut both.shapes[0].kind {
+            *window = Some(64);
+        }
+        refused(both, "window list beside windowed layers");
+    }
+
+    #[test]
+    fn a_ring_at_chunk_starts_is_one_fixed_shape_of_one_slot_a_chunk() {
+        let ring = |slots_per_chunk| SlotShape {
+            id: ShapeId(10),
+            kind: SlotKind::Fixed { pieces: 2 },
+            slot_bytes: 4096 / u64::from(slots_per_chunk),
+            slots_per_chunk,
+            sets_per_working_set: 1,
+            rows: Vec::new(),
+            pinned: None,
+            role: SlotRole::Ring,
+        };
+        let mut kv_only = windowed();
+        kv_only.shapes.push(ring(1));
+        assert!(kv_only.validate().is_ok(), "{:?}", kv_only.validate());
+        let mut two_a_chunk = windowed();
+        two_a_chunk.shapes.push(ring(2));
+        let why = two_a_chunk.validate().unwrap_err().to_string();
+        assert!(why.contains("one slot a chunk"), "{why}");
+        let mut unwindowed = facts();
+        unwindowed.shapes.push(ring(1));
+        let why = unwindowed.validate().unwrap_err().to_string();
+        assert!(why.contains("states no windowed layer"), "{why}");
     }
 
     #[test]

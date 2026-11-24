@@ -33,13 +33,15 @@ macro_rules! seeded {
     };
 }
 
-seeded!();
+seeded!("nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.measured.toml");
 
 /// The host covers committed for the adapters native wgpu serves
 /// (`profiles/<device>.covers.json`, `pie tune export --engine wgpu`), each
 /// listed here: the runtime takes a cover whose key matches where the
 /// home's own cache holds none (`engine::Engine::committed_covers`).
-pub const COVERS: &[&str] = &[];
+pub const COVERS: &[&str] = &[include_str!(
+    "../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"
+)];
 
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
@@ -109,6 +111,17 @@ pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Pr
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
     probe_at(0)
+}
+
+/// What this build keys device `index`'s stored measurements by
+/// (`profile::fire::Now`: its device and driver, each kernel's code): what a
+/// committed entry is checked against before an export carries it.
+#[must_use]
+pub fn now_at(index: u32) -> Option<Box<dyn profile::fire::Now>> {
+    measured_on_at(index).map(|on| {
+        Box::new(engine_gpu::stored::Keys::new(on, kernels_slang::Target::Wgsl))
+            as Box<dyn profile::fire::Now>
+    })
 }
 
 /// The device and driver device `index`'s measurements are keyed as taken

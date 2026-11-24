@@ -79,6 +79,40 @@ impl ToEnd {
         self.life = Some(self.life.map_or(lived, |life| (life * 3 + lived) / 4));
     }
 
+    /// The most lanes the pools hold to their end at once, each from the
+    /// prompt a finished one held to the pages it held at most
+    /// ([`most_at_once`]); `None` until a process has finished. What a
+    /// policy reads as `pie/lanes-to-end`.
+    pub(super) fn lanes_to_end(&self, kv_total: u32, rs_total: RsUnits) -> Option<u64> {
+        let (end, first) = self.footprint?;
+        let fits = |n: usize| {
+            let mut kv = vec![first.0; n];
+            let mut pages = vec![first.1.pages; n];
+            most_at_once(&mut kv, end.0) <= u64::from(kv_total)
+                && (rs_total.pages == 0
+                    || most_at_once(&mut pages, end.1.pages) <= u64::from(rs_total.pages))
+                && (rs_total.slots == 0
+                    || n as u64 * u64::from(end.1.slots) <= u64::from(rs_total.slots))
+        };
+        // The pools bound it: each lane holds a page at least.
+        let (mut fit, mut over) = (0usize, kv_total as usize + 1);
+        while over - fit > 1 {
+            let mid = fit + (over - fit) / 2;
+            if fits(mid) {
+                fit = mid;
+            } else {
+                over = mid;
+            }
+        }
+        Some(fit as u64)
+    }
+
+    /// How long a finished process lived past the gate, averaged; `None`
+    /// until one has.
+    pub(super) fn life(&self) -> Option<Duration> {
+        self.life
+    }
+
     /// Whether one more process starts now beside the live ones: `Err(None)`
     /// waits for one to leave, `Err(Some(d))` for `d` more of the spread.
     pub(super) fn room(
@@ -208,6 +242,18 @@ impl ToEnd {
 #[cfg(test)]
 mod tests {
     use super::{Duration, Instant, Proc, ProcessId, RsUnits, ToEnd, most_at_once};
+
+    #[test]
+    fn the_lanes_to_the_end_are_what_the_pools_hold_at_their_peak() {
+        let none = RsUnits::default();
+        let mut to_end = ToEnd::default();
+        assert_eq!(to_end.lanes_to_end(1855, none), None, "nothing learned: absent");
+        to_end.learn((27, none), (11, none), Duration::from_secs(20));
+        // Started together, each holds 27 at its end: 1855 / 27.
+        assert_eq!(to_end.lanes_to_end(1855, none), Some(68));
+        assert_eq!(to_end.lanes_to_end(26, none), Some(0), "not one fits to its end");
+        assert_eq!(to_end.life(), Some(Duration::from_secs(20)));
+    }
 
     #[test]
     fn lanes_started_apart_need_less_than_each_to_the_end() {

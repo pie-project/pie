@@ -99,6 +99,11 @@ struct RungGate {
     /// raise to it is funded under in the planner, short of room
     /// ([`crate::planner::ResidencyPlanner::fund_rise`]).
     owed_by: Mutex<Option<uuid::Uuid>>,
+    /// A raise to held frames refused by name (it never fits the pool
+    /// beside its owner's own state, [`crate::planner::PlannerError::PastRung`]):
+    /// the owner and why, for the scheduler to fail the frames held for it
+    /// rather than hold them for good ([`refuse_owed`]).
+    refused: Mutex<Option<(uuid::Uuid, String)>>,
     /// The event every wait on the activation rung waits on: the fire cap
     /// moved, a raise was applied, copied or refused, the rung was lowered,
     /// segments were committed, or room was freed (a fire retired).
@@ -106,6 +111,37 @@ struct RungGate {
     /// The pool's walker is asked to look now ([`ask_walk`]): a bind or a
     /// raise waits on a cut or a lower that is the walk's to take.
     walk: tokio::sync::Notify,
+    /// What the pool's walker awaits now and since when (a lane op's reply:
+    /// a segment move, an evacuation, a rung's notice), `None` between: a
+    /// stall's dump says it ([`walk_waiting`]).
+    walk_waiting: Mutex<Option<(String, std::time::Instant)>>,
+}
+
+/// What `engine`'s walker awaits now and for how long, for a stall's dump:
+/// `None` where it awaits nothing (it waits for its next wake, or runs).
+#[must_use]
+pub fn walk_waiting(engine: usize) -> Option<(String, std::time::Duration)> {
+    rung_gate(engine)
+        .walk_waiting
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(what, since)| (what.clone(), since.elapsed()))
+}
+
+/// Marks `engine`'s walker awaiting `what` until the guard drops.
+pub(crate) fn walk_awaits(engine: usize, what: String) -> WalkAwait {
+    *rung_gate(engine).walk_waiting.lock().unwrap() = Some((what, std::time::Instant::now()));
+    WalkAwait(engine)
+}
+
+/// See [`walk_awaits`].
+pub(crate) struct WalkAwait(usize);
+
+impl Drop for WalkAwait {
+    fn drop(&mut self) {
+        *rung_gate(self.0).walk_waiting.lock().unwrap() = None;
+    }
 }
 
 /// Every engine's rung gate by its id: one for each engine named here,
@@ -131,8 +167,10 @@ fn rung_gate(engine: usize) -> &'static RungGate {
                 held: std::sync::atomic::AtomicU32::new(u32::MAX),
                 owed: std::sync::atomic::AtomicU32::new(0),
                 owed_by: Mutex::new(None),
+                refused: Mutex::new(None),
                 event: tokio::sync::Notify::new(),
                 walk: tokio::sync::Notify::new(),
+                walk_waiting: Mutex::new(None),
             }))
         })
 }
@@ -152,6 +190,22 @@ pub fn owe_cut_rows(engine: usize, rows: u32, by: Option<uuid::Uuid>) {
     if rows > 0 && rows != was {
         ask_walk(engine);
     }
+}
+
+/// The raise to `by`'s held frames is refused by name (`why`): it never
+/// fits. The scheduler fails those frames' fires with it
+/// ([`take_refused_owed`]); the gate's event wakes what waits on the rung.
+pub fn refuse_owed(engine: usize, by: uuid::Uuid, why: String) {
+    let gate = rung_gate(engine);
+    *gate.refused.lock().unwrap() = Some((by, why));
+    gate.event.notify_waiters();
+}
+
+/// The owner and reason of a raise refused by name ([`refuse_owed`]),
+/// taken: told once.
+#[must_use]
+pub fn take_refused_owed(engine: usize) -> Option<(uuid::Uuid, String)> {
+    rung_gate(engine).refused.lock().unwrap().take()
 }
 
 /// The process whose held frame the walk's owed raise is for
@@ -620,6 +674,28 @@ pub enum SharedError {
     },
 }
 
+/// Each activation rung's tokens and what its replay scratch holds,
+/// ascending: stated once at load, shared by every fire that reads it.
+pub type Replays = Arc<Vec<(u32, ::engine::RungReplay)>>;
+
+/// A rung of `tokens` on a load that replays no buffered recurrent row (no
+/// rs list: [`ChunkFacts::validate`] holds a load that does to stating its
+/// rs scratch): its own and carried rows each at most its tokens, no rs
+/// scratch to bind.
+#[must_use]
+pub fn rows_only(tokens: u32) -> ::engine::RungReplay {
+    ::engine::RungReplay {
+        own_max: Some(tokens),
+        carried_max: Some(tokens),
+        scratch: ::engine::ScratchBytes {
+            slot_bytes: Vec::new(),
+            lane_bytes: 0,
+            room_bytes: 0,
+            pad: 1,
+        },
+    }
+}
+
 /// A shared pool's chunks as they divide for good ([`SharedPool::room`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolRoom {
@@ -713,7 +789,7 @@ impl RoleShapes {
             SlotRole::Instance => self.instance,
             SlotRole::Channel => self.channel,
             SlotRole::Adapter => self.adapter,
-            SlotRole::State | SlotRole::RsBuffer => None,
+            SlotRole::State | SlotRole::RsBuffer | SlotRole::WindowBuffer | SlotRole::Ring => None,
         }
     }
 
@@ -843,6 +919,15 @@ pub struct SharedPool {
     list: Option<TokenShape>,
     /// The rs buffer's list shape (CONTRACT-BC 18).
     rs_list: Option<TokenShape>,
+    /// The window buffer's list shape, where the engine serves windowed
+    /// layers as ring + buffer (CONTRACT-BC 19, 21): the rs store's buffer
+    /// pages, each lane's slots of it named in its tables and its fold in
+    /// `Lane::window`; the rings ride in the record's fixed shapes.
+    window_buffer: Option<TokenShape>,
+    /// The record holds recurrent state beside the windowed layers' rings
+    /// (`ChunkFacts::record_bytes` past `ring_bytes`): the model has
+    /// recurrent layers, whose rows replay.
+    recurrent: bool,
     /// The window lists, narrowest window first (CONTRACT-BC 19).
     windows: Vec<TokenShape>,
     /// The fixed shapes of role [`SlotRole::State`]: a record's.
@@ -882,9 +967,11 @@ pub struct SharedPool {
     /// engine holds [`Self::told`], so that rung's activation stays set
     /// aside, no raise is taken past it and no cap is lifted.
     lowering: Option<u32>,
-    /// The engine refused the last `commit_span`: no span segment is asked
-    /// again until room is freed ([`Self::block_span_commit`]).
-    span_commit_blocked: bool,
+    /// The engine refused the last commit (a prefix segment's or the
+    /// span's) while the governor's target stood at this many segments: no
+    /// commit is asked again until something that can change the device's
+    /// answer happens ([`Self::block_commit`]).
+    commit_blocked: Option<u32>,
     /// The head of the guest binds waiting for room, its need as `(run,
     /// pieces)`: runs of `run` adjacent chunks inside one segment. The walk
     /// commits while they do not stand free ([`Self::walk_goal`]), not only
@@ -894,6 +981,12 @@ pub struct SharedPool {
     /// free chunks are enough but no run of them stands
     /// ([`Self::compaction_comes`]): the walk moves chunks until they do.
     compact_for: Option<(u32, u32)>,
+    /// A compaction asked found no window ([`Self::compact_step`]): the
+    /// walk tells the planner, whose head then goes on.
+    compaction_answered: bool,
+    /// The rung a raise waits on a compaction below its activation for
+    /// ([`Self::compaction_for_raise`]).
+    compact_raise: Option<u32>,
     /// Logical chunks the engine refused a fire for, their state where it
     /// will not read or write it (`engine::Error::Placement`): the walk
     /// moves them down ([`Self::refused_step`]); the scheduler holds the
@@ -914,6 +1007,14 @@ pub struct SharedPool {
     /// The engine whose rung gate this pool publishes the rung it holds
     /// to ([`Self::steers`], [`engine_rows`]).
     engine: Option<usize>,
+    /// What each rung's replay scratch holds, by its tokens, ascending
+    /// (`ChunkFacts::act_replay`, or each rung's floor).
+    replay: Replays,
+    /// The load's rs scratch lays only the carried rows a rung counts
+    /// (`ChunkFacts::rs_compact`).
+    rs_compact: bool,
+    /// Its scratch compactness is a fire's (`ChunkFacts::rs_scratch_per_fire`).
+    rs_scratch_per_fire: bool,
 }
 
 /// The fence epoch a raise's moved-off chunks wait on until the engine has
@@ -1043,14 +1144,17 @@ impl SharedPool {
         let mut shapes = Vec::with_capacity(facts.shapes.len() + facts.weights.len());
         let (mut lists, mut rs_lists, mut windows, mut fixed) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut window_buffers = Vec::new();
         let (mut instances, mut channels, mut adapters) = (Vec::new(), Vec::new(), Vec::new());
         for shape in &facts.shapes {
             let pool = ShapeId::try_from(shapes.len()).expect("shapes fit a shape id");
             let kind = match shape.kind {
                 SlotKind::List { tokens, window, .. } => {
                     let found = match window {
+                        // Window lists: removed by the windowed-state change.
                         Some(_) => &mut windows,
                         None if shape.role == SlotRole::RsBuffer => &mut rs_lists,
+                        None if shape.role == SlotRole::WindowBuffer => &mut window_buffers,
                         None => &mut lists,
                     };
                     found.push(TokenShape {
@@ -1068,7 +1172,12 @@ impl SharedPool {
                         SlotRole::Instance => &mut instances,
                         SlotRole::Channel => &mut channels,
                         SlotRole::Adapter => &mut adapters,
-                        SlotRole::State | SlotRole::RsBuffer => &mut fixed,
+                        // The ring shape is a piece of the record, as a
+                        // state shape is (CONTRACT-BC 21).
+                        SlotRole::State
+                        | SlotRole::RsBuffer
+                        | SlotRole::WindowBuffer
+                        | SlotRole::Ring => &mut fixed,
                     };
                     found.push(FixedShape {
                         id: shape.id,
@@ -1085,7 +1194,11 @@ impl SharedPool {
                 slots_per_chunk: shape.slots_per_chunk,
             });
         }
-        for (kind, found) in [("kv list", &lists), ("rs list", &rs_lists)] {
+        for (kind, found) in [
+            ("kv list", &lists),
+            ("rs list", &rs_lists),
+            ("window buffer", &window_buffers),
+        ] {
             if found.len() > 1 {
                 return Err(SharedError::Shapes {
                     kind,
@@ -1141,6 +1254,8 @@ impl SharedPool {
             growth: facts.segments.growth,
             list: lists.first().copied(),
             rs_list: rs_lists.first().copied(),
+            window_buffer: window_buffers.first().copied(),
+            recurrent: facts.record_bytes > facts.ring_bytes(),
             windows,
             fixed,
             roles: RoleShapes {
@@ -1159,15 +1274,32 @@ impl SharedPool {
             told: 0,
             told_from: None,
             lowering: None,
-            span_commit_blocked: false,
+            commit_blocked: None,
             guest_head: None,
             compact_for: None,
+            compaction_answered: false,
+            compact_raise: None,
             refused: BTreeSet::new(),
             refused_moving: BTreeSet::new(),
             refused_stuck: BTreeSet::new(),
             walk_target: None,
             programs: programs::ProgramFires::default(),
             engine: None,
+            replay: Arc::new(
+                facts
+                .act_chunks
+                .iter()
+                .enumerate()
+                .map(|(at, &(tokens, _))| {
+                    (
+                        tokens,
+                        facts.rung_replay(at).cloned().unwrap_or_else(|| rows_only(tokens)),
+                    )
+                })
+                .collect(),
+            ),
+            rs_compact: facts.rs_compact,
+            rs_scratch_per_fire: facts.rs_scratch_per_fire,
         };
         // The engine holds the rung the pool starts at.
         shared.told = shared.pool.rung();
@@ -1213,7 +1345,33 @@ impl SharedPool {
         self.rs_list
     }
 
-    /// The window lists, narrowest window first.
+    /// The window buffer's list shape, where the engine serves windowed
+    /// layers as ring + buffer (CONTRACT-BC 19, 21).
+    #[must_use]
+    pub fn window_buffer(&self) -> Option<TokenShape> {
+        self.window_buffer
+    }
+
+    /// Whether the model has recurrent layers: the record holds state
+    /// beside the windowed layers' rings. A load of windowed layers alone
+    /// holds rings only, and its lanes replay nothing.
+    #[must_use]
+    pub fn recurrent(&self) -> bool {
+        self.recurrent
+    }
+
+    /// The list the rs store's buffer pages are slots of: the rs list, or,
+    /// on a load of windowed layers and no recurrent ones, the window
+    /// buffer. A hybrid's window buffer is a pool of its own beside it
+    /// ([`crate::store::rs::RsUnits::wbuf`]).
+    #[must_use]
+    pub fn buffer_list(&self) -> Option<TokenShape> {
+        self.rs_list.or(self.window_buffer)
+    }
+
+    /// The window lists, narrowest window first. Removed by the
+    /// windowed-state change (the integration commit deletes the window
+    /// lists everywhere); do not use in new code.
     #[must_use]
     pub fn windows(&self) -> &[TokenShape] {
         &self.windows
@@ -1266,8 +1424,11 @@ impl SharedPool {
             for (window, &n) in self.windows.iter().zip(&rs.windows) {
                 takes.push((window.pool, u64::from(n)));
             }
-        } else if let Some(rs_list) = self.rs_list {
-            takes.push((rs_list.pool, u64::from(rs.pages)));
+        } else if let Some(rs_list) = self.buffer_list() {
+            takes.push((rs_list.pool, u64::from(rs.pages.saturating_sub(rs.wbuf))));
+            if let Some(window) = self.rs_list.and(self.window_buffer) {
+                takes.push((window.pool, u64::from(rs.wbuf)));
+            }
         }
         for shape in &self.fixed {
             takes.push((shape.pool, u64::from(rs.slots) * u64::from(shape.pieces)));
@@ -1298,8 +1459,11 @@ impl SharedPool {
             for (window, &n) in self.windows.iter().zip(&rs.windows) {
                 wanted += chunks(window.pool, u64::from(n));
             }
-        } else if let Some(rs_list) = self.rs_list {
-            wanted += chunks(rs_list.pool, u64::from(rs.pages));
+        } else if let Some(rs_list) = self.buffer_list() {
+            wanted += chunks(rs_list.pool, u64::from(rs.pages.saturating_sub(rs.wbuf)));
+            if let Some(window) = self.rs_list.and(self.window_buffer) {
+                wanted += chunks(window.pool, u64::from(rs.wbuf));
+            }
         }
         for shape in &self.fixed {
             wanted += chunks(shape.pool, u64::from(rs.slots) * u64::from(shape.pieces));
@@ -1313,6 +1477,7 @@ impl SharedPool {
         self.list
             .iter()
             .chain(&self.rs_list)
+            .chain(&self.window_buffer)
             .chain(&self.windows)
             .find(|shape| shape.pool == pool)
             .map(|shape| shape.id)
@@ -1467,7 +1632,9 @@ impl SharedPool {
                 per_chunk(u64::from(slots), list.slots_per_chunk)
             })
             .sum();
-        let rs = u64::from(self.rs_list.is_some());
+        // The rs list's or the window buffer's slot of rows a fire leaves
+        // unfolded; a windowed layer's ring rides in the record.
+        let rs = u64::from(self.rs_list.is_some()) + u64::from(self.window_buffer.is_some());
         u32::try_from(list + windows + rs + self.record_chunks(1)).unwrap_or(u32::MAX)
     }
 
@@ -2074,13 +2241,14 @@ impl SharedPool {
     }
 
     /// Where a raise to `rung` stands for the planner
-    /// ([`crate::planner::PoolPort::rise_room`]): past the pool, short of
-    /// the chunks it lacks (its pieces those free now and those to empty),
-    /// or fitting, a raise's copy under way included (nothing to fund).
+    /// ([`crate::planner::PoolPort::rise_room`]): past the pool beside the
+    /// `own` chunks its owner's state takes at that rung, short of the
+    /// chunks it lacks (its pieces those free now and those to empty), or
+    /// fitting, a raise's copy under way included (nothing to fund).
     #[must_use]
-    pub fn rise_room(&self, rung: u32) -> crate::planner::RiseRoom {
-        if let Some((need, total)) = self.pool.rung_past(rung) {
-            return crate::planner::RiseRoom::Past { need, total };
+    pub fn rise_room(&self, rung: u32, own: u32) -> crate::planner::RiseRoom {
+        if let Some((need, total)) = self.pool.rung_past(rung, own) {
+            return crate::planner::RiseRoom::Past { need, own, total };
         }
         if self.copying.is_some() {
             return crate::planner::RiseRoom::Fits;
@@ -2145,6 +2313,7 @@ impl SharedPool {
         self.list
             .iter()
             .chain(&self.rs_list)
+            .chain(&self.window_buffer)
             .chain(&self.windows)
             .find(|shape| shape.id == engine)
             .map(|shape| shape.pool)
@@ -2233,6 +2402,28 @@ impl SharedPool {
             .unwrap_or(u32::MAX);
         goal.min(self.fit_rung())
     }
+
+    /// What each activation rung's replay scratch holds, by its tokens,
+    /// ascending (shared, stated once at load), and the widest a fire may
+    /// take now ([`Self::rung_for`]).
+    #[must_use]
+    pub fn rung_replays(&self) -> (Replays, u32) {
+        (Arc::clone(&self.replay), self.rung_for(u32::MAX))
+    }
+
+    /// Its scratch compactness is a fire's.
+    #[must_use]
+    pub fn rs_scratch_per_fire(&self) -> bool {
+        self.rs_scratch_per_fire
+    }
+
+    /// The load's rs scratch layout is compact
+    /// (`::engine::fire::scratch_compact` decides each fire's).
+    #[must_use]
+    pub fn rs_compact(&self) -> bool {
+        self.rs_compact
+    }
+
 
     /// Every activation rung's tokens, ascending.
     #[must_use]
@@ -2424,12 +2615,45 @@ impl SharedPool {
     /// stand, if one is due: each step clears one run, the next planned
     /// once its moves' fence lifts. Over once the runs stand.
     fn compact_step(&mut self, epoch: u64) -> Option<SegmentMove> {
-        let (run, pieces) = self.compact_for?;
-        if self.pool.free_chunk_runs(run) >= pieces {
-            self.compact_for = None;
-            return None;
-        }
-        let moves = self.pool.plan_compaction_for(run, pieces)?;
+        let moves = match self.compact_for {
+            Some((run, pieces)) if self.pool.free_chunk_runs(run) < pieces => {
+                if self.pool.compacting() {
+                    // One on its way: the next is planned once its fence
+                    // lifts.
+                    return None;
+                }
+                let Some(moves) = self.pool.plan_compaction_for(run, pieces) else {
+                    // Asked and no window clears now: the ask is answered,
+                    // never left pending (the M1's run 10: a restore's plan
+                    // ended "compaction asked" every pass for ten minutes,
+                    // the walk sending none). The head's next pass reads the
+                    // pool as it stands and goes to its eviction.
+                    tracing::debug!(
+                        run,
+                        pieces,
+                        free_runs = self.pool.free_chunk_runs(run),
+                        "store: a compaction asked finds no window to clear; answered no room"
+                    );
+                    self.compact_for = None;
+                    self.compaction_answered = true;
+                    return None;
+                };
+                moves
+            }
+            Some(_) => {
+                self.compact_for = None;
+                return None;
+            }
+            None => {
+                let rung = self.compact_raise?;
+                let Some((run, pieces)) = self.pool.raise_runs_short(rung) else {
+                    self.compact_raise = None;
+                    return None;
+                };
+                let below = self.pool.total_chunks() - self.pool.act_chunks(rung);
+                self.pool.plan_compaction_below(run, pieces, below)?
+            }
+        };
         self.pool
             .apply_compaction(&moves, epoch)
             .expect("a compaction planned under the lock applies");
@@ -2438,6 +2662,28 @@ impl SharedPool {
             applied: moves,
             epoch,
         })
+    }
+
+    /// A raise to `rung` the pool cannot plan as it stands, its way holding
+    /// runs of chunks that find no free run below its activation: the walk
+    /// compacts below that limit until they do
+    /// ([`SlotPool::raise_runs_short`]), and the raise goes once its moves
+    /// plan. Whether such a compaction is plannable now.
+    pub fn compaction_for_raise(&mut self, rung: u32) -> bool {
+        let Some((run, pieces)) = self.pool.raise_runs_short(rung) else {
+            return false;
+        };
+        let below = self.pool.total_chunks() - self.pool.act_chunks(rung);
+        if !self.pool.compacting() && self.pool.plan_compaction_below(run, pieces, below).is_none() {
+            return false;
+        }
+        self.compact_raise = Some(rung);
+        true
+    }
+
+    /// Whether a compaction asked was answered no room since last read.
+    pub fn take_compaction_answered(&mut self) -> bool {
+        std::mem::take(&mut self.compaction_answered)
     }
 
     /// Whether moving chunks stands `pieces` free runs of `run` for a bind
@@ -2561,18 +2807,16 @@ impl SharedPool {
     /// prefix whole, the span the rung lends is backed next (span lending,
     /// [`SlotPool::span_lent`]), for a waiter short of live state as
     /// for the target alone: a fire whose rung needs it takes it back
-    /// first. Not while a refused commit waits for room to be freed.
+    /// first. Neither while a refused commit waits for an event that can
+    /// change the device's answer ([`Self::block_commit`]).
     #[must_use]
     pub fn grow_step(&self, goal: u32) -> Option<GrowStep> {
-        if self.mapped_segments() >= goal {
+        if self.mapped_segments() >= goal || self.commit_blocked.is_some() {
             return None;
         }
         let prefix = self.pool.prefix_segments();
         if prefix < self.pool.top_segment() && self.pool.backs(prefix) {
             return Some(GrowStep::Commit { prefix: prefix + 1 });
-        }
-        if self.span_commit_blocked() {
-            return None;
         }
         let n = self.pool.span_to_commit()?;
         Some(GrowStep::CommitSpan { n })
@@ -2633,11 +2877,24 @@ impl SharedPool {
         self.pool.undo_evacuation(evacuation);
     }
 
-    /// A `commit_span` was refused (`true`): none is asked again until room
-    /// is freed, which lifts it (`false`), the one event that can change the
-    /// answer.
-    pub fn block_span_commit(&mut self, blocked: bool) {
-        self.span_commit_blocked = blocked;
+    /// The engine refused a commit (a prefix segment's or the span's) with
+    /// the governor's target at `target` segments: none is asked again
+    /// until an event that can change what the device backs lifts it
+    /// ([`Self::lift_commit`]): the governor's target moving off `target`
+    /// (a fresh read of the system's memory), or device memory the engine
+    /// gave back landing (a release, a lowered rung's carve). Room freed
+    /// inside the pool (an eviction, a fire retired) and a governor tick
+    /// that leaves the target where it stood do not: they change nothing
+    /// the device backs, and re-asking on them spins the walk against the
+    /// same refusal.
+    pub fn block_commit(&mut self, target: u32) {
+        self.commit_blocked = Some(target);
+    }
+
+    /// An event that can change the device's answer to a refused commit
+    /// happened: the walk may ask again ([`Self::block_commit`]).
+    pub fn lift_commit(&mut self) {
+        self.commit_blocked = None;
     }
 
     /// The head guest bind's need, `(run, pieces)`; `None` where none waits
@@ -2708,10 +2965,12 @@ impl SharedPool {
         planner || self.guest_head.is_some()
     }
 
-    /// Whether a refused `commit_span` waits for room to be freed.
+    /// The governor's target a refused commit was refused at, while it
+    /// waits for an event that can change the device's answer
+    /// ([`Self::block_commit`]).
     #[must_use]
-    pub fn span_commit_blocked(&self) -> bool {
-        self.span_commit_blocked
+    pub fn commit_blocked(&self) -> Option<u32> {
+        self.commit_blocked
     }
 
     /// The engine backed the top `n` span segments: the chunks of theirs the

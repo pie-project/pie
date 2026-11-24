@@ -377,6 +377,12 @@ impl Engine for Group {
         &[]
     }
 
+    /// Not tracked for a tensor-parallel group: its ranks measure at every boot (`measure =
+    /// false` is refused for one), said so by name.
+    fn measured_at_load(&self) -> Vec<String> {
+        vec!["cuda (a tensor-parallel group): what it measured is not tracked".to_string()]
+    }
+
     fn skips_measuring(&self) -> bool {
         false
     }
@@ -663,6 +669,30 @@ impl Engine for Group {
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         let evacuation = evacuation.clone();
         self.lead(move |rank| rank.evacuate(&evacuation))
+    }
+
+    /// Every rank's table, which every evacuation moves alike: one where
+    /// they agree, refused by name where a rank's differs.
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let mut tables = Vec::with_capacity(self.ranks.len());
+        for rank in &self.ranks {
+            let Ok(rank) = rank.try_lock() else {
+                return Err(Error::Program(
+                    "a rank is busy: its chunk table is read between frames".to_string(),
+                ));
+            };
+            tables.push(rank.chunk_table()?);
+        }
+        let first = tables
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::Program("an expert-parallel group of no ranks".to_string()))?;
+        if let Some(at) = tables.iter().position(|table| *table != first) {
+            return Err(Error::Program(format!(
+                "rank {at}'s chunk table differs from rank 0's: an evacuation moved them apart"
+            )));
+        }
+        Ok(first)
     }
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {

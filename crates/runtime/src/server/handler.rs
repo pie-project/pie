@@ -72,11 +72,10 @@ impl Session {
                         serde_json::Value::from(crate::engine::backend::eager_rungs()),
                     );
 
-                    // Fires whose geometry the host resolved though it is
-                    // not host-derivable: an engine limit or the program's
-                    // class, each named at bind.
-                    // Summed, and split by the engine the pass bound on, the
-                    // reason and the program.
+                    // Fires whose geometry the host evaluated though it is
+                    // not host-derivable: the program's class, named at bind.
+                    // Summed, and split by the engine the pass bound on and
+                    // the program.
                     let host_fires = crate::pipeline::fire::host_geometry::by();
                     stats.insert(
                         format!("{}.host_geometry_fires", model_name),
@@ -91,7 +90,6 @@ impl Session {
                                     serde_json::json!({
                                         "engine": key.engine,
                                         "kind": key.kind,
-                                        "reason": key.reason,
                                         "program": format!("{:016x}", key.program),
                                         "fires": fires,
                                     })
@@ -298,6 +296,14 @@ impl Session {
                     stats.insert(
                         format!("{}.fire.quorum.dispatch_blocked_holds", model_name),
                         serde_json::Value::from(inf.fire.quorum.dispatch_blocked_holds),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.frames_parked_on_lane", model_name),
+                        serde_json::Value::from(inf.fire.quorum.frames_parked_on_lane),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.frames_past_waiting_lane", model_name),
+                        serde_json::Value::from(inf.fire.quorum.frames_past_waiting_lane),
                     );
                     stats.insert(
                         format!("{}.fire.quorum.device_idle_us", model_name),
@@ -580,6 +586,7 @@ impl Session {
                 tenant: self.tenant.clone(),
                 session,
                 props,
+                keys_under: None,
             },
             executors,
         ) {

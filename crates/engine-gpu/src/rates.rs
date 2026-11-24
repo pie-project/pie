@@ -2023,6 +2023,8 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
          key or short of {top} rows: {}",
         wanted.iter().map(name).collect::<Vec<_>>().join(", ")
     );
+    let reference = tactics.gemm(tier, crate::submit::PROBE.0);
+    let clock_before = clock_read::<B>(device, reference)?;
     let curves = measure_shapes::<B, T>(
         device,
         tactics,
@@ -2049,16 +2051,37 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     }
     .over(stated.clone());
     let joined = fresh;
-    let saved_to = save
-        .map(|save| engine::rates::save_rates(&save, &joined))
-        .transpose()
-        .map_err(|why| Fault::Device {
-            call: "rates at load",
-            why,
-        })?;
+    // Curves timed on a device below its nominal clock serve this load
+    // alone, never stored (a hot or unramped device's curves would steer
+    // every later load's picks).
+    let throttle = throttled(clock_before, clock_read::<B>(device, reference)?);
+    let saved_to = match throttle {
+        None => save
+            .map(|save| engine::rates::save_rates(&save, &joined))
+            .transpose()
+            .map_err(|why| Fault::Device {
+                call: "rates at load",
+                why,
+            })?,
+        Some(ratio) => {
+            tracing::warn!(
+                ratio,
+                "rates: the dense curves were timed with the device {ratio:.2}x slower than its \
+                 nominal clock: served this load, not stored"
+            );
+            None
+        }
+    };
     let mut tuned = chip.tuned().clone();
     tuned.rates = measured;
     tuned.measured_this_load = true;
+    tuned.timed.push(match throttle {
+        None => format!("dense curves ({})", wanted.len()),
+        Some(ratio) => format!(
+            "dense curves ({}; device {ratio:.2}x below its nominal clock: not stored)",
+            wanted.len()
+        ),
+    });
     if saved_to.is_some() {
         tuned.saved_to = saved_to;
     }
@@ -2178,6 +2201,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // The keys a load asks for at this bound ([`keys_at`]), those `stated`
     // lacks.
     let want = Wanted::of(stated, &keys_at(max_submit));
+    // The device's clock before the step: read again after it, the step's
+    // rates are this load's alone where either read is below nominal.
+    let reference = tactics.gemm(tier, crate::submit::PROBE.0);
+    let clock_before = clock_read::<B>(device, reference)?;
     let mut rig = Rig::<B>::new(device, max_submit);
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
@@ -2310,6 +2337,47 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         ));
         attn.push((keys, rate));
     }
+    // Not one square point fit the bound: the narrowest square halved until
+    // one fire does (a rate a flop, which a smaller square of the same heads
+    // reads); a 16-key square past it refuses by name.
+    if want.attn && attn.is_empty() {
+        let mut keys = engine::rates::ATTN_KEYS[0];
+        loop {
+            keys /= 2;
+            let shape = engine::rates::ATTN_SHAPE.at(keys);
+            let rate = repeated(|| {
+                let rate = attention(
+                    &mut rig,
+                    tactics,
+                    tier,
+                    timer,
+                    shape,
+                    launch,
+                    Kind::Attention,
+                );
+                rig.release();
+                rate
+            });
+            if let Some(rate) = dropped(&rig, rate, say)? {
+                say(&format!(
+                    "[rates]: attention {keys} keys d 128: {:.1} TFLOP/s (the most keys whose \
+                     fire fits the bound)",
+                    rate / 1e3
+                ));
+                attn.push((keys, rate));
+                break;
+            }
+            if keys <= 16 {
+                return Err(Fault::Device {
+                    call: "rates",
+                    why: format!(
+                        "a {keys}-key attention is past the device's bound on one submission: \
+                         no attention can run under it"
+                    ),
+                });
+            }
+        }
+    }
     let longest = attn
         .last()
         .map_or(engine::rates::ATTN_KEYS[0], |&(keys, _)| keys);
@@ -2395,6 +2463,53 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
                 prefixed.push((rows, curve));
             }
         }
+        // Not one point fit the bound: the fewest keys past the narrowest
+        // rows, at fewer rows (halved) until one fire fits; a step of one
+        // row against them past the bound refuses by name (no prompt step
+        // could run under it).
+        if prefixed.is_empty() {
+            let keys = engine::rates::ATTN_KEYS[0];
+            let mut rows = PREFIX_ROWS[0];
+            loop {
+                rows = (rows / 2).max(1);
+                let shape = engine::rates::AttnShape {
+                    rows,
+                    keys,
+                    ..engine::rates::ATTN_SHAPE
+                };
+                let rate = repeated(|| {
+                    let rate = attention(
+                        &mut rig,
+                        tactics,
+                        tier,
+                        timer,
+                        shape,
+                        launch,
+                        Kind::Prefixed,
+                    );
+                    rig.release();
+                    rate
+                });
+                if let Some(rate) = dropped(&rig, rate, say)? {
+                    say(&format!(
+                        "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s (the \
+                         fewest rows whose fire fits the bound)",
+                        rate / 1e3
+                    ));
+                    prefixed.push((rows, vec![(keys, rate / 1e3)]));
+                    break;
+                }
+                if rows == 1 {
+                    return Err(Fault::Device {
+                        call: "rates",
+                        why: format!(
+                            "one row's attention against {keys} keys is past the device's bound \
+                             on one submission: no prompt step can run under it"
+                        ),
+                    });
+                }
+            }
+        }
     }
     let prefixed_fired = rig.take_fired();
     step_fired.extend(prefixed_fired.iter().copied());
@@ -2412,12 +2527,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     let elementwise_fired = rig.take_fired();
     step_fired.extend(elementwise_fired.iter().copied());
     let scan = if want.scan {
-        let gelems = repeated(|| {
-            let gelems = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, launch);
-            rig.release();
-            gelems
-        })?;
-        Some(gelems)
+        Some(scan_within(&mut rig, tactics, timer, launch, say)?)
     } else {
         None
     };
@@ -2493,6 +2603,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
     let mut rates = Rates {
+        landing: None,
+        load_width: None,
         launch_ns: want.launch.then_some(launch_ns),
         // A curve with no point measured is stated as none: the load is
         // refused by its key (`rates_at_load`), never weighed by nothing.
@@ -2556,6 +2668,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     Ok(engine::rates::Measured {
         rates,
         unsettled: rig.unsettled.get(),
+        throttled: {
+            drop(rig);
+            throttled(clock_before, clock_read::<B>(device, reference)?)
+        },
     })
 }
 
@@ -2980,7 +3096,8 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     let page_indptr = rig.words(&[0, pages], 2, 1, Dtype::U32)?;
     // Each fire reads the next of these q / k / v sets, past the last-level
     // cache, as a served fire reads each layer's kv cold.
-    let sets = (0..engine::rates::attn_sets_at(s, PAGE).min(ATTN_SETS_MOST))
+    let most = rig.planes_most.map_or(ATTN_SETS_MOST, |most| most.min(ATTN_SETS_MOST));
+    let sets = (0..engine::rates::attn_sets_at(s, PAGE).min(most))
         .map(|_| {
             let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
             let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
@@ -3148,6 +3265,46 @@ fn scan<B: Serve>(
     })
 }
 
+/// The scan's rate, timed at [`SCAN_SHAPE`] where one fire of it fits the
+/// device's bound on one submission, else at the most tokens that do (halved
+/// from it, refused unsubmitted by its estimate each time it does not): the
+/// rate is elements a ns, which a shorter sequence of the same heads measures
+/// alike, so a slow device's scan is sized to its bound, never refused.
+fn scan_within<B: Serve, T: Tactics + ?Sized>(
+    rig: &mut Rig<'_, B>,
+    tactics: &T,
+    timer: Timer<'_, B>,
+    launch: f64,
+    say: &mut dyn FnMut(&str),
+) -> Result<f64> {
+    let mut shape = SCAN_SHAPE;
+    loop {
+        let rate = repeated(|| {
+            let gelems = scan(rig, tactics.recurrent(), timer, shape, launch);
+            rig.release();
+            gelems
+        });
+        let past = rig.past_bound.borrow_mut().take().is_some();
+        match rate {
+            Err(_) if past && shape.tokens > 1 => {
+                let tokens = shape.tokens / 2;
+                say(&format!(
+                    "[rates]: scan of {} tokens is past the bound: timed at {tokens}",
+                    shape.tokens
+                ));
+                tracing::info!(
+                    tokens = shape.tokens,
+                    next = tokens,
+                    "rates: the scan's fire is past the device's bound on one submission: timed \
+                     at half its tokens (its rate a ns is the same work's)"
+                );
+                shape.tokens = tokens;
+            }
+            rate => return rate,
+        }
+    }
+}
+
 /// The version of [`copy_and_launch`]'s method (`[rates] launch_ns`' and
 /// `hbm_gbps`' stored key, `crate::stored`): bumped only when how it
 /// measures changes.
@@ -3182,9 +3339,18 @@ fn copy_and_launch<B: Serve>(
     // The launch: a chain of `n` dependent tiny matmuls in one frame (each
     // reads the one before's output) against one matmul of `n` times the
     // rows, at each chain length of the lattice.
+    // Each chain the device's bound admits (a chain is one submission): a
+    // chain past it is skipped by name, the shorter ones read; none at all
+    // refuses by name.
     let mut gaps = Vec::with_capacity(engine::rates::LAUNCH_CHAINS.len());
     for n in engine::rates::LAUNCH_CHAINS {
-        gaps.push((n, launch_gap(rig, tactic, timer, (act, w, y), n)?));
+        match launch_gap(rig, tactic, timer, (act, w, y), n) {
+            Ok(gap) => gaps.push((n, gap)),
+            Err(why) if rig.past_bound.borrow_mut().take().is_some() && !gaps.is_empty() => {
+                say(&format!("[rates]: launch chain of {n} past the bound, skipped ({why})"));
+            }
+            Err(why) => return Err(why),
+        }
     }
     say(&format!(
         "[rates]: launch: {}",
@@ -3476,6 +3642,12 @@ pub fn for_bound<B: Serve, T: Tactics + ?Sized>(
     let narrow = matmul(&mut rig, at.narrow, timer, (1, n, k), 0.0);
     rig.release();
     let read_bytes_per_ns = narrow?;
+    // The bound's estimate takes each dispatch's longer of its reads at the
+    // bandwidth (the one-row read above, cold) and its flops at the rates
+    // below: those need no cold read, so each rotates through two sets, not
+    // past the cache (most of the probe's time on a phone was laying and
+    // touching the cold rotation, 768 MiB a point).
+    rig.planes_most = Some(2);
     let matmul_flops_per_ns = if at.rows > 1 {
         let wide = matmul(&mut rig, at.wide, timer, (at.rows, n, k), 0.0);
         rig.release();
@@ -3498,7 +3670,7 @@ pub fn for_bound<B: Serve, T: Tactics + ?Sized>(
         None => None,
     };
     let scan_elements_per_ns = if at.recurrent {
-        let rate = scan(&mut rig, tactics.recurrent(), timer, SCAN_SHAPE, 0.0);
+        let rate = scan_within(&mut rig, tactics, timer, 0.0, &mut |_| {});
         rig.release();
         Some(rate?)
     } else {
@@ -3513,12 +3685,17 @@ pub fn for_bound<B: Serve, T: Tactics + ?Sized>(
     })
 }
 
-/// The rows and width of the matmul the device's resident workgroups are
-/// read against where a load skips measuring ([`resident_for_skip`]): a
-/// square of [`engine::rates::GEMM_WIDTHS`]' narrowest at that many rows,
-/// whose tiles fill any device served (a thousand 32 x 32 tiles), its
-/// kernel compute-bound there.
-pub const RESIDENT_SHAPE: u32 = engine::rates::GEMM_WIDTHS[0];
+/// The width (and depth) of the matmul the device's resident workgroups are
+/// read against where a load skips measuring ([`resident_for_skip`]): the
+/// rates step's widest ([`engine::rates::GEMM_WIDTH`]), whose one-workgroup
+/// fire is long enough that its launch is a small share of it (at 1024 a
+/// phone's one-workgroup fire was launch-bound, and the count read ~2x the
+/// rates step's), at [`RESIDENT_ROWS`] rows.
+pub const RESIDENT_SHAPE: u32 = engine::rates::GEMM_WIDTH;
+
+/// The rows of the full-width matmul [`resident_for_skip`] reads the kernel's
+/// rate at: a thousand rows fill every device served many times over.
+pub const RESIDENT_ROWS: u32 = 1024;
 
 /// `[rates] resident_workgroups` where a load skips measuring
 /// (`engine::rates::Measuring::Skip`) and no layer states it: a device fact
@@ -3561,12 +3738,73 @@ pub fn resident_for_skip<B: Serve, T: Tactics + ?Sized>(
         launch?.max(0.0)
     };
     let w = RESIDENT_SHAPE;
-    let peak = matmul(&mut rig, tactics.gemm(tier, w), timer, (w, w, w), launch);
+    let peak = matmul(
+        &mut rig,
+        tactics.gemm(tier, RESIDENT_ROWS),
+        timer,
+        (RESIDENT_ROWS, w, w),
+        launch,
+    );
     rig.release();
-    let curve = [(w, peak?)];
+    let curve = [(RESIDENT_ROWS, peak?)];
     let resident = resident_workgroups(&mut rig, tactics, tier, timer, &curve, w, launch);
     rig.release();
     Ok((resident?, started.elapsed().as_millis()))
+}
+
+/// The device's clock read off its reference kernel ([`crate::submit::Probe`],
+/// the smallest shape on the matmul curve): the fastest of [`ROUNDS`] single
+/// fires and their spread, `(slowest - fastest) / fastest`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockRead {
+    pub fastest_ns: f64,
+    pub spread: f64,
+}
+
+/// The reference kernel's fastest time this process has read on any device
+/// phase: the device at its nominal clock, as far as the process has seen
+/// it (f64 bits; 0 before any read).
+static NOMINAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `device`'s clock now ([`ClockRead`]), its reference kernel under `tactic`.
+pub fn clock_read<B: Serve>(
+    device: &B::Context,
+    tactic: kernels_slang::linear::gemm::Tactic,
+) -> Result<ClockRead> {
+    let probe = crate::submit::Probe::<B>::new(device, tactic)?;
+    let fires = (0..ROUNDS)
+        .map(|_| probe.fire(device))
+        .collect::<Result<Vec<f64>>>()?;
+    let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
+    let slowest = fires.iter().copied().fold(0.0, f64::max);
+    let read = ClockRead {
+        fastest_ns: fastest,
+        spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
+    };
+    let nominal = f64::from_bits(NOMINAL_NS.load(std::sync::atomic::Ordering::Relaxed));
+    if nominal == 0.0 || fastest < nominal {
+        NOMINAL_NS.store(fastest.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(read)
+}
+
+/// Whether a measuring phase ran below the device's nominal clock: its
+/// reference kernel read `before` and `after` it, against the fastest the
+/// process has read ([`NOMINAL_NS`]). Throttled where either read is slower
+/// than nominal by more than the reads' own spread (the reference's noise,
+/// no margin chosen): `Some(the slower read over nominal)`.
+#[must_use]
+pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
+    let nominal = f64::from_bits(NOMINAL_NS.load(std::sync::atomic::Ordering::Relaxed));
+    let nominal = if nominal > 0.0 {
+        nominal.min(before.fastest_ns).min(after.fastest_ns)
+    } else {
+        before.fastest_ns.min(after.fastest_ns)
+    };
+    let slower = before.fastest_ns.max(after.fastest_ns);
+    let noise = before.spread.max(after.spread);
+    let ratio = slower / nominal.max(f64::MIN_POSITIVE);
+    (ratio > 1.0 + noise).then_some(ratio)
 }
 
 /// The fires a warm-up rotation's next frame holds of `left`: as many as fit
@@ -3788,6 +4026,8 @@ mod wanted_tests {
     #[test]
     fn a_step_times_only_what_the_profile_lacks() {
         let all = Rates {
+            landing: None,
+            load_width: None,
             launch_ns: Some(3000),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 5.0)]),
@@ -4072,5 +4312,22 @@ mod bound_tests {
             "a 512-row step at 4096 keys is past 2 s whole: {:?}",
             held.step_ns(step(512, 4096))
         );
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// A phase is throttled where a reference read is slower than the
+    /// fastest the process has seen by more than the reads' own spread.
+    #[test]
+    fn a_phase_below_the_nominal_clock_is_throttled() {
+        let read = |fastest_ns, spread| ClockRead { fastest_ns, spread };
+        NOMINAL_NS.store(100.0_f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(throttled(read(101.0, 0.05), read(103.0, 0.05)), None, "inside the noise");
+        let hot = throttled(read(101.0, 0.02), read(160.0, 0.02)).expect("throttled");
+        assert!((hot - 1.6).abs() < 1e-9, "{hot}");
+        assert_eq!(throttled(read(90.0, 0.02), read(91.0, 0.02)), None, "a faster read is nominal");
     }
 }

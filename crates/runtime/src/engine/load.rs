@@ -270,10 +270,30 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
     }
     let source = open_source(checkpoint)?;
     let metadata = checkpoint_metadata(checkpoint)?;
-    let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
+    first_fit(&metadata, platform, catalog().fits(&source, platform)).map_err(|misses| {
+        anyhow!(
+            "{checkpoint:?} matches no deployment this build ships:\n  {}",
+            misses.join("\n  ")
+        )
+    })
+}
 
+/// The first of `fits` (each deployment, in catalog order, and how it reads
+/// the checkpoint `metadata` describes) that lands on this platform; else
+/// why each does not.
+fn first_fit(
+    metadata: &Metadata,
+    platform: Platform,
+    fits: impl Iterator<
+        Item = (
+            Deployment,
+            std::result::Result<ModelContract, poem::import::Error>,
+        ),
+    >,
+) -> std::result::Result<String, Vec<String>> {
+    let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
     let mut misses: Vec<String> = Vec::new();
-    for (deployment, read) in catalog().fits(&source, platform) {
+    for (deployment, read) in fits {
         // Metal multiplies activations as they are: a deployment that quantizes them is CUDA's.
         if platform == Platform::Metal && deployment.deploy.weights.iter().any(|w| w.act.is_some())
         {
@@ -290,15 +310,12 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
                 continue;
             }
         };
-        match checkpoint::plan::compile(&metadata, &contract, target.clone()) {
+        match checkpoint::plan::compile(metadata, &contract, target.clone()) {
             Ok(_) => return Ok(deployment.name.clone()),
             Err(why) => misses.push(format!("{}: {why}", deployment.name)),
         }
     }
-    Err(anyhow!(
-        "{checkpoint:?} matches no deployment this build ships:\n  {}",
-        misses.join("\n  ")
-    ))
+    Err(misses)
 }
 
 #[must_use]
@@ -576,6 +593,9 @@ pub fn request(
         residency,
         ordinal,
         frames_in_flight,
+        // The step builder's rules: the engine computes the set of step
+        // compositions it will be sent from them before its arm walk.
+        steps: ::engine::StepRules::runtime(),
     })
 }
 
@@ -632,6 +652,76 @@ mod tests {
             )
             .expect("write the stranger");
         writer.finish().expect("finish the checkpoint");
+    }
+
+    /// Every checkpoint at hand: a stranger no row reads, each directory
+    /// `PIE_IDENTIFY_CHECKPOINTS` lists (`:`-separated), and every snapshot
+    /// in the Hugging Face cache.
+    fn checkpoints_at_hand(scratch: &Path) -> Vec<std::path::PathBuf> {
+        let stranger = scratch.join("stranger.zt");
+        a_checkpoint_no_row_reads(&stranger);
+        let mut found = vec![stranger];
+        if let Some(listed) = std::env::var_os("PIE_IDENTIFY_CHECKPOINTS") {
+            found.extend(std::env::split_paths(&listed).filter(|p| p.exists()));
+        }
+        let hub = std::env::var_os("HF_HOME")
+            .map(|home| std::path::PathBuf::from(home).join("hub"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".cache/huggingface/hub"))
+            });
+        let listing = |dir: &Path| -> Vec<std::path::PathBuf> {
+            let mut paths: Vec<_> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            paths.sort();
+            paths
+        };
+        for model in hub.as_deref().map(listing).unwrap_or_default() {
+            found.extend(listing(&model.join("snapshots")));
+        }
+        found
+    }
+
+    /// The header pre-filter drops only deployments whose contract refuses,
+    /// so identification picks what contracting every candidate in catalog
+    /// order picks, on every checkpoint at hand.
+    #[test]
+    fn the_header_prefilter_keeps_every_pick() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let mut identified = 0;
+        for path in checkpoints_at_hand(dir.path()) {
+            let (Ok(source), Ok(metadata)) = (open_source(&path), checkpoint_metadata(&path))
+            else {
+                continue;
+            };
+            for platform in [Platform::Cuda, Platform::Metal] {
+                let candidates = catalog().candidates_of(&source, platform);
+                for d in &candidates {
+                    if !d.may_read(&source, platform) {
+                        assert!(
+                            d.contract(&source, platform).is_err(),
+                            "{path:?}: the pre-filter drops `{}` on {platform:?}, whose \
+                             contract reads it",
+                            d.name
+                        );
+                    }
+                }
+                let every = candidates.into_iter().map(|d| {
+                    let read = d.contract(&source, platform);
+                    (d, read)
+                });
+                let unfiltered = first_fit(&metadata, platform, every).ok();
+                let filtered =
+                    first_fit(&metadata, platform, catalog().fits(&source, platform)).ok();
+                assert_eq!(filtered, unfiltered, "{path:?} on {platform:?}");
+                identified += usize::from(filtered.is_some());
+            }
+        }
+        eprintln!("the pre-filter kept the pick on {identified} identifications");
     }
 
     #[test]

@@ -88,16 +88,36 @@ fn write_seeded(path: &std::path::Path, trace: &Trace) {
         .iter()
         .filter(|param| param.source == ParamSource::Checkpoint)
         .collect();
+    // A packed plane's scales are made with it when the artifact is
+    // imported from these floats (`common_llm`): none of their own here.
+    let made: std::collections::BTreeSet<String> = planes
+        .iter()
+        .filter(|param| {
+            !matches!(
+                param.dtype,
+                poem::Dtype::Bf16 | poem::Dtype::F32 | poem::Dtype::I64 | poem::Dtype::I32
+            )
+        })
+        .flat_map(|param| {
+            [
+                poem::scales_name(&param.name),
+                poem::biases_name(&param.name),
+                poem::global_scales_name(&param.name),
+            ]
+        })
+        .collect();
+    planes.retain(|param| !made.contains(&param.name));
     planes.sort_by(|a, b| a.name.cmp(&b.name));
     let mut writer = ztensor::Writer::create(path).expect("the fixture writes");
     for param in planes {
         let shape = poem::Weight::of_plane(param).shape;
         let count: usize = shape.iter().product::<u64>() as usize;
         let norm = param.name.ends_with("norm");
-        let mut seed = fnv(&param.name);
+        let bits = seeded_bits(&param.name, count, trace);
+        let mut at = 0usize;
         let mut next = || {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            seed >> 33
+            at += 1;
+            bits[at - 1]
         };
         let unit = |bits: u64| (bits as f32 / (1u64 << 31) as f32) - 0.5;
         let fixed = set.get(&param.name).copied();
@@ -113,13 +133,18 @@ fn write_seeded(path: &std::path::Path, trace: &Trace) {
         let (leaf, bytes): (ztensor::Leaf, Vec<u8>) = match param.dtype {
             poem::Dtype::F32 => (
                 ztensor::Leaf::F32,
-                (0..count).flat_map(|_| value(next()).to_le_bytes()).collect(),
+                (0..count)
+                    .flat_map(|_| value(next()).to_le_bytes())
+                    .collect(),
             ),
             poem::Dtype::I64 | poem::Dtype::I32 => {
                 let cols = param.shape.last().copied().unwrap_or(1).max(1);
                 let ids = (0..count as u64).map(|at| (at / cols + at % cols) % INDEX_SPAN);
                 if param.dtype == poem::Dtype::I64 {
-                    (ztensor::Leaf::I64, ids.flat_map(|id| id.to_le_bytes()).collect())
+                    (
+                        ztensor::Leaf::I64,
+                        ids.flat_map(|id| id.to_le_bytes()).collect(),
+                    )
                 } else {
                     (
                         ztensor::Leaf::I32,
@@ -142,11 +167,97 @@ fn write_seeded(path: &std::path::Path, trace: &Trace) {
     writer.finish().expect("the fixture is written");
 }
 
+/// The seed after `n` LCG steps from `seed` (jump-ahead by squaring).
+fn skip(seed: u64, n: u64) -> u64 {
+    let (mut a, mut c) = (6_364_136_223_846_793_005u64, 1u64);
+    let (mut ra, mut rc) = (1u64, 0u64);
+    let mut n = n;
+    while n > 0 {
+        if n & 1 == 1 {
+            ra = ra.wrapping_mul(a);
+            rc = rc.wrapping_mul(a).wrapping_add(c);
+        }
+        c = c.wrapping_mul(a).wrapping_add(c);
+        a = a.wrapping_mul(a);
+        n >>= 1;
+    }
+    seed.wrapping_mul(ra).wrapping_add(rc)
+}
+
+/// `len` draws of plane `name`'s sequence from draw `start` on.
+fn draws(name: &str, start: u64, len: usize) -> impl Iterator<Item = u64> {
+    let mut seed = skip(fnv(name), start);
+    (0..len).map(move |_| {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        seed >> 33
+    })
+}
+
+/// Plane `name`'s `count` seed draws: its own sequence; or, under
+/// `PIE_XLA_REF_JOINED=1`, where the CUDA plan joins planes this plan keeps
+/// apart (gpt-oss: `attn.qkv` rows q, k, v; `mlp.gate_up` each expert's
+/// gate rows then up rows; their biases alike), its slices of the joined
+/// plane's sequence, as golden_logits seeds the joined plane.
+fn seeded_bits(name: &str, count: usize, trace: &Trace) -> Vec<u64> {
+    let joined = std::env::var("PIE_XLA_REF_JOINED").is_ok_and(|v| v == "1");
+    let shape_of = |leg: &str| -> Option<Vec<u64>> {
+        trace
+            .params
+            .iter()
+            .find(|p| p.name == leg)
+            .map(|p| poem::Weight::of_plane(p).shape)
+    };
+    let rows_of = |leg: &str| shape_of(leg).and_then(|s| s.first().copied()).unwrap_or(0);
+    if joined && let Some((layer, leg)) = name.rsplit_once('.') {
+        let attn = |l: &str| format!("{layer}.{l}");
+        let (q, k) = (rows_of(&attn("q")), rows_of(&attn("k")));
+        let qkv_at = match leg {
+            "q" | "q_bias" => Some(0),
+            "k" | "k_bias" => Some(q),
+            "v" | "v_bias" => Some(q + k),
+            _ => None,
+        };
+        if layer.ends_with(".attn")
+            && let Some(row) = qkv_at
+        {
+            let bias = leg.ends_with("_bias");
+            let width = if bias {
+                1
+            } else {
+                count as u64 / rows_of(&attn(leg)).max(1)
+            };
+            let seed = attn(if bias { "qkv_bias" } else { "qkv" });
+            return draws(&seed, row * width, count).collect();
+        }
+        if layer.ends_with(".mlp") && matches!(leg, "gate" | "up" | "gate_bias" | "up_bias") {
+            let bias = leg.ends_with("_bias");
+            let shape = shape_of(name).unwrap_or_default();
+            let (experts, inter) = (shape[0] as usize, shape[1] as usize);
+            let width = if bias { 1 } else { shape[2] as usize };
+            let seed = attn(if bias { "gate_up_bias" } else { "gate_up" });
+            let half = if leg.starts_with("up") { inter } else { 0 };
+            return (0..experts)
+                .flat_map(|e| {
+                    draws(
+                        &seed,
+                        ((e * 2 * inter + half) * width) as u64,
+                        inter * width,
+                    )
+                })
+                .collect();
+        }
+    }
+    draws(name, 0, count).collect()
+}
+
 /// A row's top `TOP` tokens and logits, highest first.
 fn top(row: &[f32]) -> Vec<(u32, f32)> {
     let mut at: Vec<u32> = (0..row.len() as u32).collect();
     at.sort_by(|&a, &b| row[b as usize].total_cmp(&row[a as usize]));
-    at.into_iter().take(TOP).map(|i| (i, row[i as usize])).collect()
+    at.into_iter()
+        .take(TOP)
+        .map(|i| (i, row[i as usize]))
+        .collect()
 }
 
 /// The reference's top tokens a step, per model, from `PIE_XLA_REF`.
@@ -158,10 +269,13 @@ fn reference() -> BTreeMap<(String, usize), Vec<(u32, f32)>> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
         let mut parts = line.split_whitespace();
-        let (Some("cuda"), Some(model), Some(step)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some("cuda"), Some(model), Some(step)) = (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
-        let Ok(step) = step.parse::<usize>() else { continue };
+        let Ok(step) = step.parse::<usize>() else {
+            continue;
+        };
         let tops: Vec<(u32, f32)> = parts
             .filter_map(|p| {
                 let (id, logit) = p.split_once(':')?;
@@ -186,13 +300,18 @@ fn a_state_model_serves_the_cuda_reference() {
         crate::common_llm::set_knob("TOKENS", 256);
         // `PIE_XLA_REF_LAYERS=<n>`: the model cut to its first n layers,
         // compared against a reference labelled `<model>-l<n>`.
-        let layers: Option<u32> = std::env::var("PIE_XLA_REF_LAYERS").ok().and_then(|v| v.parse().ok());
+        let layers: Option<u32> = std::env::var("PIE_XLA_REF_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok());
         let label = layers.map_or_else(|| name.clone(), |n| format!("{name}-l{n}"));
         let mut model = Model::load_written(name, layers, CONTEXT, &write_seeded);
         let mut refs = Refs::of(&model);
         // `PIE_XLA_REF_SLOT=<n>`: the lane in slot n (a fresh slot answers
         // the same whichever it is).
-        let slot: u32 = std::env::var("PIE_XLA_REF_SLOT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let slot: u32 = std::env::var("PIE_XLA_REF_SLOT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let mut seq = Seq::new(slot);
         let mut fed = 0u32;
         let mut last = None;
@@ -250,7 +369,13 @@ fn a_state_model_serves_the_cuda_reference() {
                     "check {label} {at}: top {} vs {} (reference gap {gap:.4}) worst top-{TOP} logit diff {worst:.4}: {}",
                     mine[0].0,
                     want[0].0,
-                    if same { "same" } else if tie { "tie" } else { "PARTED" }
+                    if same {
+                        "same"
+                    } else if tie {
+                        "tie"
+                    } else {
+                        "PARTED"
+                    }
                 );
                 if !(same || tie) {
                     failed.push(format!("{label} step {at}"));

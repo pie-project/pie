@@ -217,6 +217,7 @@ impl Serve for Api {
         tuning.hold_decodes(
             tier,
             &engine_gpu::scratch::decodes(trace),
+            &engine_gpu::scratch::windowed_decodes(trace),
             device.storage_buffers(),
         )
     }
@@ -452,6 +453,19 @@ impl Serve for Api {
             &shell.shelf.mirror[arm],
             &hosted,
         )?;
+        // The fire's beam fault words land in its readback past its rows,
+        // from the store the head step wrote them in: read with the rows.
+        let beam_tail = prepared.beam_tail;
+        if let Some(tail) = beam_tail {
+            engine_gpu::backend::Frame::copy(
+                &mut frame,
+                shell.inputs_store(arm),
+                u64::from(tail.word) * 4,
+                &shell.shelf.mirror[arm],
+                tail.at,
+                u64::from(tail.words) * 4,
+            )?;
+        }
         // The fed lanes' token rows, for the landing to read with its rows.
         let fed = match fed_check.as_ref().map(engine_gpu::settle::FedCheck::rows) {
             Some(rows) if rows > 0 => {
@@ -478,6 +492,7 @@ impl Serve for Api {
                     )
                 }),
                 guests: prepared.guests.take(),
+                beam_tail,
                 fed,
             },
             std::sync::Arc::clone(&shell.shelf.mailbox),
@@ -523,7 +538,14 @@ impl Serve for Api {
     }
 }
 
-/// Takes every step the mailbox holds.
+/// Takes every step the mailbox holds, each out of the steps in flight
+/// wherever it stands among them. Steps land out of their order: each
+/// landing is its own chain of buffer maps (the seat, then the fed rows),
+/// and wgpu orders no map's callback against another's, so a narrow step
+/// fired behind a wide one may land first. Taken from the mailbox and left
+/// in flight, that step was waited on by the next harvest with nothing left
+/// to post it (eight lanes of one program, a frame of seven lanes landing
+/// behind the one-lane frame fired after it).
 fn collect(shell: &mut Shell<Api>) {
     let landed = std::mem::take(
         &mut shell
@@ -534,11 +556,11 @@ fn collect(shell: &mut Shell<Api>) {
             .landed,
     );
     for step in landed {
-        if shell
+        if let Some(at) = shell
             .inflight
-            .front()
-            .is_some_and(|flight| flight.seq == step.seq)
-            && let Some(flight) = shell.inflight.pop_front()
+            .iter()
+            .position(|flight| flight.seq == step.seq)
+            && let Some(flight) = shell.inflight.remove(at)
         {
             // Under a stated submit bound, the step's device time, read
             // without waiting once its backend filled it (`Shell::track`).

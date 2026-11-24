@@ -42,8 +42,8 @@ fn main() {
         "crates/client-api/src",
         "crates/inferlet-macros/src",
         "crates/eta-dsl/src",
-        "crates/policy/src",
-        "crates/policy/wit",
+        "crates/plex-sdk/src",
+        "crates/plex-host/wit",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(dep).display());
     }
@@ -77,16 +77,24 @@ fn main() {
         "crates/client-api/src",
         "crates/inferlet-macros/src",
         "crates/eta-dsl/src",
-        "crates/policy/src",
-        "crates/policy/wit",
+        "crates/plex-sdk/src",
+        "crates/plex-host/wit",
     ] {
         inputs.push(root.join(dep));
     }
     let source = source_fingerprint(&root, &inputs);
     let mut generated = format!("/// What the built-ins are built from, by content.\npub const SOURCE: &str = {source:?};\n");
-    for (name, workspace, set) in [
-        ("ALL", &inferlets, &builtins),
-        ("POLICIES", &policies, &policy_builtins),
+    // Inferlets are WASI 0.3 components as built. PLEX 1.1 policies are
+    // core modules carrying their component type, made components here: a
+    // policy imports only the contract, no WASI.
+    for (name, workspace, set, target) in [
+        ("ALL", &inferlets, &builtins, "wasm32-wasip3"),
+        (
+            "POLICIES",
+            &policies,
+            &policy_builtins,
+            "wasm32-unknown-unknown",
+        ),
     ] {
         let staged_dir = out_dir.join(name.to_lowercase());
         fs::create_dir_all(&staged_dir).expect("create staging directory");
@@ -95,14 +103,27 @@ fn main() {
             let target_dir = target_dir
                 .clone()
                 .unwrap_or_else(|| workspace.join("target"));
-            build(workspace, &target_dir, set);
+            build(workspace, &target_dir, set, target);
             for builtin in set {
                 let wasm = target_dir
-                    .join("wasm32-wasip3/release")
+                    .join(target)
+                    .join("release")
                     .join(format!("{}.wasm", builtin.name.replace('-', "_")));
                 let staged = staged_dir.join(format!("{}.wasm", builtin.name));
-                fs::copy(&wasm, &staged)
-                    .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
+                if target == "wasm32-unknown-unknown" {
+                    let module = fs::read(&wasm)
+                        .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
+                    let component = wit_component::ComponentEncoder::default()
+                        .module(&module)
+                        .and_then(|encoder| encoder.validate(true).encode())
+                        .unwrap_or_else(|e| {
+                            panic!("{} is not a PLEX component: {e:#}", wasm.display())
+                        });
+                    fs::write(&staged, component).expect("stage the policy");
+                } else {
+                    fs::copy(&wasm, &staged)
+                        .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
+                }
                 generated.push_str(&format!(
                     "    Builtin {{ name: {:?}, component: include_bytes!({:?}), source: SOURCE }},\n",
                     builtin.name,
@@ -194,7 +215,7 @@ fn find_builtins(workspace: &Path) -> Vec<Builtin> {
     builtins
 }
 
-fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
+fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin], target: &str) {
     // rustup's `cargo`, so the workspace's own rust-toolchain.toml (nightly,
     // for wasm32-wasip3) applies, not the host build's toolchain.
     let mut command = Command::new("cargo");
@@ -205,7 +226,7 @@ fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
         .arg(workspace.join("Cargo.toml"))
         .arg("--release")
         .arg("--target")
-        .arg("wasm32-wasip3");
+        .arg(target);
     for builtin in builtins {
         command.arg("-p").arg(&builtin.name);
     }
@@ -231,15 +252,13 @@ fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin]) {
         .unwrap_or_else(|e| panic!("running cargo for {}: {e}", workspace.display()));
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let hint = if stderr.contains("wasm32-wasip3")
-            && stderr.contains("target may not be installed")
-        {
-            "\n\nthe wasm32-wasip3 target is missing: `rustup toolchain install` in the workspace adds it"
+        let hint = if stderr.contains("target may not be installed") {
+            "\n\nthe wasm target is missing: `rustup toolchain install` in the workspace adds it"
         } else {
             ""
         };
         panic!(
-            "building the built-ins in {} for wasm32-wasip3 failed:\n{stderr}{hint}\n\n\
+            "building the built-ins in {} for {target} failed:\n{stderr}{hint}\n\n\
              PIE_BUILTINS=skip builds a pie with no built-in inferlets (every compat route then answers 404)",
             workspace.display()
         );

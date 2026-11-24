@@ -1,6 +1,8 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, Ctx, Fire, Launch, dtype_dispatch, flat_wide, kernel, nonzero, refuse, stated,
+};
 use crate::tensor::Tensor;
 
 const GLU: &str = "linear/glu.cu";
@@ -219,13 +221,9 @@ fn swiglu_clamp_lanes(
         }
     }
     let n = y.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the activation's element count", lanes)?;
+    if n == 0 {
+        return Err(refuse(op, "the activation's element count is 0"));
+    }
     let (packed, routed) = (up.is_none(), weights.is_some());
     let absent = crate::jit::ArgValue::ABSENT;
     ctx.fire(
@@ -234,13 +232,13 @@ fn swiglu_clamp_lanes(
             GLU,
             &format!("::pie::linear::swiglu_clamp_lanes<{t}, {packed}, {routed}>"),
         ))
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(flat_wide(op, n, BLOCK)?),
         &[
             gate.arg(),
             up.map_or(absent, |u| u.arg()),
             weights.map_or(absent, |w| w.arg()),
             y.arg(),
-            stated(op, lanes)?.arg(),
+            (n as i64).arg(),
             stated(op, y.width)?.arg(),
             limit.arg(),
             stated(op, fan)?.arg(),
@@ -319,20 +317,19 @@ pub fn swiglu_clamp_routed_e4m3(
     {
         return Ok(false);
     }
-    let lanes = u32::try_from(y.elements() / 8)
-        .map_err(|_| refuse(OP, "the rows' eights do not fit a 32-bit launch extent"))?;
+    let lanes = y.elements() / 8;
     if lanes == 0 {
         return Ok(true);
     }
     ctx.fire(
         OP,
         Fire::at(kernel(GLU, "::pie::linear::swiglu_clamp_routed_e4m3"))
-            .apply(Launch::flat(lanes, BLOCK)),
+            .apply(flat_wide(OP, lanes, BLOCK)?),
         &[
             packed.arg(),
             weights.arg(),
             y.arg(),
-            stated(OP, lanes)?.arg(),
+            (lanes as i64).arg(),
             stated(OP, y.width)?.arg(),
             limit.arg(),
             stated(OP, fan)?.arg(),
@@ -376,22 +373,18 @@ pub fn geglu_tanh(
     const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let n = y.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the activation's element count", lanes)?;
+    if n == 0 {
+        return Err(refuse(OP, "the activation's element count is 0"));
+    }
     ctx.fire(
         OP,
         Fire::at(kernel(GLU, &format!("::pie::linear::geglu_tanh<{t}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
+            .apply(flat_wide(OP, n, BLOCK)?),
         &[
             gate.arg(),
             up.arg(),
             y.arg(),
-            stated(OP, lanes)?.arg(),
+            (n as i64).arg(),
             stated(OP, y.width)?.arg(),
             stated(OP, fan)?.arg(),
             ctx.stage(),
@@ -421,21 +414,17 @@ fn act(
         { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" }
     );
     let n = y.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the activation's element count", lanes)?;
+    if n == 0 {
+        return Err(refuse(op, "the activation's element count is 0"));
+    }
     ctx.fire(
         op,
         Fire::at(kernel(GLU, &format!("::pie::linear::act<{t}, {relu2}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
+            .apply(flat_wide(op, n, BLOCK)?),
         &[
             x.arg(),
             y.arg(),
-            stated(op, lanes)?.arg(),
+            (n as i64).arg(),
             stated(op, y.width)?.arg(),
             stated(op, fan)?.arg(),
             ctx.stage(),

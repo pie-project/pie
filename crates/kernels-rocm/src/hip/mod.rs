@@ -135,7 +135,47 @@ pub fn warp_size(ordinal: u32) -> Result<u32, Error> {
     Ok(value as u32)
 }
 
+/// The compute units of device `ordinal` that this process's queues run
+/// on, as the engine stated them from the process's CU masks
+/// ([`hold_queue_units`]); every count of the device's units here answers
+/// these, never the device's whole.
+fn queue_units() -> &'static std::sync::Mutex<std::collections::HashMap<u32, u32>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// States that this process's queues on device `ordinal` run on `units` of
+/// its compute units (a CU mask), before anything is shaped by the count:
+/// [`multiprocessors`], the launchers' grids and occupancy math, read it
+/// from then on.
+pub fn hold_queue_units(ordinal: u32, units: u32) {
+    queue_units()
+        .lock()
+        .expect("queue units lock poisoned")
+        .insert(ordinal, units.max(1));
+}
+
+/// `units` of device `ordinal` as its queues hold them: the stated count
+/// where one was stated, at most the device's.
+pub(crate) fn held_units(ordinal: u32, units: u32) -> u32 {
+    queue_units()
+        .lock()
+        .expect("queue units lock poisoned")
+        .get(&ordinal)
+        .map_or(units, |&held| held.min(units))
+}
+
+/// The compute units this process's queues on device `ordinal` run on
+/// (the device's, less what a stated CU mask keeps them off:
+/// [`hold_queue_units`]).
 pub fn multiprocessors(ordinal: u32) -> Result<u32, Error> {
+    Ok(held_units(ordinal, all_multiprocessors(ordinal)?))
+}
+
+/// Every compute unit device `ordinal` has, whatever this process's queues
+/// are masked to: what a CU mask is read against.
+pub fn all_multiprocessors(ordinal: u32) -> Result<u32, Error> {
     let mut value: c_int = 0;
     check!(
         "hip.multiprocessors",

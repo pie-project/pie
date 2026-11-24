@@ -225,6 +225,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     let chunks = loaded.caps.chunks.clone();

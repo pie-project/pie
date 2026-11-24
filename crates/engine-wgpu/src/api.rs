@@ -83,9 +83,12 @@ impl Host for Api {
     }
 
     fn ports() -> PortMask {
-        PortMask::DECODE_ENVELOPE
+        PortMask::DEVICE_GEOMETRY
             .with(eta_ir::registry::Port::Fold)
             .with(eta_ir::registry::Port::AttnMask)
+            // Each beam's parent: the engine keeps the beams' page lists
+            // (`engine_gpu::beam`).
+            .with(eta_ir::registry::Port::Parents)
     }
 
     fn settles_asynchronously(_gpu: &Wgpu) -> bool {
@@ -128,6 +131,13 @@ impl Host for Api {
         faulted: &mut engine::StepOutcome,
     ) -> EngineResult<()> {
         'attachments: for attachment in &step.attachments {
+            // Device geometry resolves every port its lanes read, the
+            // shared engine's ([`engine_gpu::program::device_lanes`]).
+            if gpu.programs.geometry(attachment.instance)
+                == Some(eta_ir::registry::GeometryClass::DeviceGeometry)
+            {
+                continue;
+            }
             let lane_count = match gpu.programs.lane_count(attachment.instance) {
                 Ok(count) => count,
                 Err(refused) => {

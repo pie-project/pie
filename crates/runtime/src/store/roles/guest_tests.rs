@@ -227,6 +227,13 @@ impl Engine for GuestEngine {
         &[]
     }
 
+    fn measured_at_load(&self) -> Vec<String> {
+
+        Vec::new()
+
+    }
+
+
     fn skips_measuring(&self) -> bool {
         false
     }
@@ -249,6 +256,10 @@ impl Engine for GuestEngine {
 
     fn kind(&self) -> &'static str {
         "fake-guests"
+    }
+
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
     }
 
     fn prepare_program(
@@ -980,6 +991,7 @@ fn a_run_is_refused_by_name_where_only_scattered_chunks_are_free() {
                 free_runs: 0,
                 free_chunks: free,
                 committable: 0,
+                singles: 0,
             },
         }),
         "{named}"
@@ -1066,6 +1078,7 @@ fn mixed_runs_bound_and_closed_then_a_long_run_lands_or_is_refused_by_name() {
                     free_runs: 0,
                     free_chunks: free,
                     committable: 0,
+                    singles: 0,
                 }),
                 "{named}"
             );
@@ -1756,9 +1769,9 @@ async fn a_small_bind_takes_free_room_while_a_long_one_waits_and_a_dropped_wait_
                 let roles = roles.clone();
                 move || Some(roles.lock().unwrap().room_watch())
             },
-            |_, _| false,
-            |_, _| false,
-            |_, _| std::future::pending::<Result<crate::planner::BindRoomWait, String>>(),
+            |_, _, _| false,
+            |_, _, _| false,
+            |_, _, _| std::future::pending::<Result<crate::planner::BindRoomWait, String>>(),
             {
                 let roles = roles.clone();
                 move || roles.lock().unwrap().leave_guest_wait(holder(by))
@@ -1805,9 +1818,9 @@ fn waiting_bind<'a>(
         || std::future::pending::<Result<(), String>>(),
         move |prefix, run| super::grow_for_guest(device, engine_id, prefix, run),
         move || Some(roles.lock().unwrap().room_watch()),
-        move |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces,
-        |_, _| false,
-        move |_, _| {
+        move |run, pieces, singles| roles.lock().unwrap().room_free(run, pieces, singles),
+        |_, _, _| false,
+        move |_, _, _| {
             asked.set(asked.get() + 1);
             serve();
             std::future::ready(Ok::<_, String>(crate::planner::BindRoomWait::Served))
@@ -2649,17 +2662,17 @@ async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
         || std::future::ready(Ok::<(), String>(())),
         |_, _| std::future::ready(Ok::<(), String>(())),
         || None,
-        |_, _| false,
+        |_, _, _| false,
         {
             let suspends = suspends.clone();
-            move |_, _| {
+            move |_, _, _| {
                 suspends.set(suspends.get() + 1);
                 true
             }
         },
         {
             let waits = waits.clone();
-            move |_, _| {
+            move |_, _, _| {
                 waits.set(waits.get() + 1);
                 std::future::ready(Ok::<_, String>(crate::planner::BindRoomWait::Served))
             }
@@ -2989,7 +3002,7 @@ fn a_bind_short_of_room_asks_for_its_scratch_and_its_pair_together() {
     assert!(matches!(short, RolesError::BindShort(_)), "a wait: {short}");
     assert_eq!(
         short.room_runs(),
-        Some((1, 4)),
+        Some((1, 4, 0)),
         "its scratch's two chunks and its pair's two, together: {short}"
     );
 }
@@ -3192,14 +3205,14 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
         },
         {
             let roles = roles.clone();
-            move |run, pieces| roles.lock().unwrap().free_runs(run) >= pieces
+            move |run, pieces, singles| roles.lock().unwrap().room_free(run, pieces, singles)
         },
-        |_, _| false,
+        |_, _, _| false,
         {
             // The planner: asked beside the commit, it makes room only once
             // the bind is short of room it makes (its second ask).
             let (roles, asked) = (roles.clone(), asked.clone());
-            move |_, _| {
+            move |_, _, _| {
                 asked.set(asked.get() + 1);
                 let roles = roles.clone();
                 let second = asked.get() >= 2;
@@ -3394,7 +3407,7 @@ fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
     roles.lock().unwrap().commit(park);
     // Held for its restore: its unpark's pieces and a pending bind's run
     // of one chunk.
-    assert!(roles.lock().unwrap().reserve_restore(holder(1), Some((1, 1))));
+    assert!(roles.lock().unwrap().reserve_restore(holder(1), &[(1, 1)]));
     let held_for = roles.lock().unwrap().claimed(holder(1));
     assert!(!held_for.is_empty(), "its chunks are held");
     // Another holder binds meanwhile: none of the held chunks are its.
@@ -3446,7 +3459,7 @@ fn a_restore_whose_bind_runs_are_held_for_it_finds_them() {
     bind(&roles, &mut engine, 1).unwrap();
     let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
     roles.lock().unwrap().commit(park);
-    assert!(roles.lock().unwrap().reserve_restore(holder(1), Some((1, 1))));
+    assert!(roles.lock().unwrap().reserve_restore(holder(1), &[(1, 1)]));
     let unpark = roles.lock().unwrap().prepare_unpark(holder(1)).unwrap().expect("it unparks");
     roles.lock().unwrap().commit(unpark);
     // Every chunk free to others, and one more: only its own held chunk

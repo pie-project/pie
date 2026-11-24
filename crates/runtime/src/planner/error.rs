@@ -84,14 +84,25 @@ pub enum PlannerError {
         total: u32,
         runs: Option<(u32, u32)>,
     },
+    /// A waiter asking a run of `run` adjacent chunks longer than any
+    /// arrangement of the pool lays for state: a run lies inside one
+    /// segment, below the narrowest rung's activation and past the reserved
+    /// chunks, and no segment holds `run` such chunks (`longest` at most).
+    /// Refused by name at once; moving every holder never opens it.
+    RunPastPool {
+        run: u32,
+        longest: u32,
+    },
     /// An activation raise whose rung could never fit the pool, even with
-    /// all state moved off it: the reserved chunks and the rung's span
+    /// every other process moved off it: the reserved chunks, the rung's
+    /// span and the `own` chunks its owner's state takes at that rung
     /// (`need` chunks) past the pool's `total` chunks. Refused by name at
     /// once; every raise short of this waits, funded, while the planner
     /// makes room.
     PastRung {
         rung: u32,
         need: u32,
+        own: u32,
         total: u32,
     },
     Cancelled,
@@ -146,6 +157,13 @@ impl std::fmt::Display for PlannerError {
                 "recurrent pools exhausted by this process alone: it holds {held} and asks \
                  {need} more of {total}, and no move of others can cover it"
             ),
+            PlannerError::RunPastPool { run, longest } => write!(
+                f,
+                "device memory can never lay this need: a run of {run} adjacent chunks, past the \
+                 {longest} any segment of the pool holds for state — a run lies inside one \
+                 segment, so no move ever opens it; raise [engine.memory] budget_device or ask \
+                 for less"
+            ),
             PlannerError::PastDevice { need, total, runs } => {
                 write!(
                     f,
@@ -160,11 +178,17 @@ impl std::fmt::Display for PlannerError {
                      moved off it — raise [engine.memory] budget_device or ask for less"
                 )
             }
-            PlannerError::PastRung { rung, need, total } => write!(
+            PlannerError::PastRung {
+                rung,
+                need,
+                own,
+                total,
+            } => write!(
                 f,
                 "the activation rung of {rung} tokens can never fit: with the reserved \
-                 chunks it takes {need} chunks of a {total}-chunk pool, even with all \
-                 state moved off it"
+                 chunks and the {own} chunks the process's own state takes beside it, it \
+                 takes {need} chunks of a {total}-chunk pool, even with every other \
+                 process moved off it"
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }

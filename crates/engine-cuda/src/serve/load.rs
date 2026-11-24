@@ -88,11 +88,16 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.knobs.measuring,
     )
     .map_err(Fault::Card)?;
+    // What the rates step timed (none where every rate was stated).
+    let timed_at_open = chip.tuned().timed.clone();
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
     let products = chip.rates().product_ns.clone().unwrap_or_default();
+    // How the device's profile says this machine lands weights, under a
+    // matching key: a load that finds it measures nothing of it.
+    let landing = chip.rates().landing;
     device.set_routes(std::sync::Arc::new(
         kernels_cuda::linear::routes::Routes::of(&products),
     ));
@@ -625,9 +630,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         anchored,
         keys,
         products,
+        landing,
         asked,
         ceiling,
         weighed,
+        timed_at_open,
     })
 }
 
@@ -1007,6 +1014,7 @@ impl Shell {
     /// collectives.
     pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
+        crate::program::launch::state_queue_masks(&boot.knobs.queue_masks);
         let Baked {
             mut device,
             engine,
@@ -1017,9 +1025,11 @@ impl Shell {
             anchored,
             keys,
             products,
+            landing,
             asked,
             ceiling,
             weighed,
+            timed_at_open,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -1129,7 +1139,17 @@ impl Shell {
             // A load told its weights are held seats every bank before a
             // fire: its banks' host copy is pageable (`Tier::open`).
             boot.knobs.weights_held,
+            landing,
         )?;
+        if let Some(measured) = weights.landing() {
+            match crate::rates::save_landing(boot.knobs.profiles.as_deref(), device.name(), &keys, measured) {
+                Ok(Some(path)) => eprintln!(
+                    "engine-cuda: how this machine lands weights, measured, saved to {path}"
+                ),
+                Ok(None) => {}
+                Err(why) => eprintln!("engine-cuda: the landing's rates were not saved: {why}"),
+            }
+        }
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]
@@ -1358,6 +1378,8 @@ impl Shell {
             },
             !boot.knobs.dense_weights(),
             boot.knobs.diagnostics.one_window,
+            boot.knobs.diagnostics.windowed_state,
+            boot.budget.max_tokens,
         )?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
@@ -1441,6 +1463,10 @@ impl Shell {
         // The activation rungs a pool may drop to (SPEC decision 6), each a
         // bucket's carve laid at the reservation's end.
         let rungs = activation_rungs(&boot.trace, &budgets, &compiled)?;
+        // The own-row pages of a load that keeps rings lie at the span's
+        // top, above every carve (`store::OwnRows`).
+        let own_rows = pools.own_rows_bytes();
+        let arena_bytes = arena_bytes + own_rows;
         eprintln!(
             "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
             rungs
@@ -1448,7 +1474,9 @@ impl Shell {
                 .map(|(tokens, map)| (*tokens, map.bytes))
                 .collect::<Vec<_>>(),
         );
-        let mut arena = Arena::reserve(arena_bytes).with_rungs(rungs);
+        let mut arena = Arena::reserve(arena_bytes)
+            .keeping_top(own_rows)
+            .with_rungs(rungs);
         // The arena is backed here, at load, whole, out of the elastic pool
         // the allowance leaves past the weights: every carve a fire lays,
         // wherever in the span, and a fire reading out past one row a lane
@@ -1576,6 +1604,16 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
             pools.ids_a_lane(),
             buffers.as_ref().map(crate::store::rs::Buffers::page_tokens),
+            // A beam's fork copies a page's rows of every kv plane the pool
+            // holds (`Pools::page_planes`).
+            pools.page_planes().len(),
+            // A hybrid beam's fork copies a page's first rows of each
+            // buffered plane (`BEAM-PAGE-LISTS.md` §11).
+            buffers
+                .as_ref()
+                .map(crate::store::rs::Buffers::page_planes)
+                .transpose()?
+                .map_or(0, |planes| planes.len()),
             // A stretch a packing an attention stating a mask reads.
             stated_feeds.len(),
         )?;
@@ -1592,6 +1630,16 @@ impl Shell {
         if let Some(layout) = &capture {
             programs.set_score_bytes(layout.row_bytes());
         }
+        // A beam group's page lists count in kv pages to its bind's depth,
+        // and a page it frees waits out the frames in flight.
+        // A beam group's width is bound by the shared memory its step lays
+        // its tables in (`channel::beam_max_lanes`): a wider bind is refused
+        // by name.
+        programs.set_beam_bounds(
+            boot.page_size,
+            u32::from(boot.runahead.frames_in_flight),
+            kernels_cuda::runtime::channel::beam_max_lanes(&device.ctx()),
+        );
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
@@ -1646,6 +1694,8 @@ impl Shell {
             .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
             .flatten();
         let mut shell = Shell {
+            ring_runs: None,
+            ring_seen: crate::serve::RingSeen::default(),
             weighed,
             device,
             accounting,
@@ -1656,6 +1706,7 @@ impl Shell {
             keys,
             products,
             routes_measuring: boot.knobs.measuring,
+            measured: std::cell::RefCell::new(timed_at_open.clone()),
             forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
@@ -2340,6 +2391,9 @@ impl Shell {
             );
             return Ok(());
         }
+        self.measured
+            .borrow_mut()
+            .push(format!("decode products ({})", measured.len()));
         let saved = crate::rates::save_product_times(
             profiles,
             self.device.name(),
@@ -2895,12 +2949,16 @@ pub(super) struct Baked {
     /// The decode products' times the device's profile states under a
     /// matching key, which a measurement of more joins.
     pub(super) products: Vec<profile::fire::ProductTime>,
+    /// How the device's profile says this machine lands weights.
+    pub(super) landing: Option<profile::fire::Landing>,
     pub(super) asked: Budget,
     /// What the card may hold in all under the load's allowance, resolved
     /// before the load took anything (`elastic::ceiling_of`).
     pub(super) ceiling: u64,
     /// The rungs the top was weighed of, and the estimate that weighed them.
     pub(super) weighed: Option<crate::top::Weighed>,
+    /// What the rates step timed at open (none where every rate was stated).
+    pub(super) timed_at_open: Vec<String>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

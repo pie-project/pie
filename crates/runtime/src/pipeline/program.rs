@@ -69,6 +69,10 @@ pub struct RegisteredProgram {
     geometry_taint: std::sync::OnceLock<eta_compiler::eval::pareval::GeometryTaint>,
     shadow_plan: std::sync::OnceLock<Arc<crate::pipeline::fire::shadow::ShadowPlan>>,
     pub pricing: Pricing,
+    /// Whether it states each beam's parent (`Port::Parents`): its lanes
+    /// hold their own page lists of their set's reserve. Decided once, at
+    /// registration, never walked per fire.
+    pub binds_pages: bool,
 }
 
 #[derive(Debug)]
@@ -342,6 +346,11 @@ impl RegisteredProgram {
         let channel_accesses = Registry::channel_accesses(&bound.container);
         let reads = Registry::reads(&bound.container);
         let compiled_stages = eta_compiler::plan::compile_bound_with(&bound, plan_forms());
+        let binds_pages = bound
+            .container
+            .ports
+            .iter()
+            .any(|binding| binding.port == Port::Parents);
         Ok(Self {
             bytes,
             hash,
@@ -353,6 +362,7 @@ impl RegisteredProgram {
             geometry_taint: std::sync::OnceLock::new(),
             shadow_plan: std::sync::OnceLock::new(),
             pricing,
+            binds_pages,
             emitted: Mutex::new(HashMap::new()),
         })
     }

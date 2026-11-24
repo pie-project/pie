@@ -333,6 +333,56 @@ pub(super) fn load_ahead(
     chunk: Option<u64>,
     runahead: engine::runahead::Runahead,
 ) -> Shell {
+    load_boot(fixture, context, chunk, runahead, None)
+}
+
+/// [`load_near`] keeping what it measures in `profiles` and taking what an
+/// earlier load stored there. The loads a test compares to the bit share
+/// one: each load otherwise times its own kernel.dense curves and may fit
+/// another ladder (FOLLOWUPS F57: a 40-row prompt on mpp in one load and on
+/// tile in the other), so their logits agree within a tolerance, not to the
+/// bit.
+pub(super) fn load_stored(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    profiles: &Profiles,
+) -> Shell {
+    load_boot(
+        fixture,
+        context,
+        chunk,
+        engine::runahead::Runahead::F1,
+        Some(profiles.0.clone()),
+    )
+}
+
+/// A profile directory of one test's own, gone when dropped: the loads that
+/// test compares share it ([`load_stored`]), and no other test reads what
+/// they stored.
+pub(super) struct Profiles(PathBuf);
+
+impl Profiles {
+    pub(super) fn new(test: &str) -> Profiles {
+        let dir = std::env::temp_dir().join(format!("pie-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Profiles(dir)
+    }
+}
+
+impl Drop for Profiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn load_boot(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    runahead: engine::runahead::Runahead,
+    profiles: Option<PathBuf>,
+) -> Shell {
     let residency = engine_metal::ResidencyPlan::default();
     Shell::load(Boot {
         trace: fixture.trace.clone(),
@@ -352,7 +402,7 @@ pub(super) fn load_ahead(
             Some(bytes) => residency.with_chunk_bytes(bytes),
             None => residency,
         },
-        profiles: None,
+        profiles,
         top: engine_metal::Top::EveryRung,
         measure: engine::rates::Measuring::Time,
     })
@@ -533,6 +583,7 @@ fn serve(
         let seated: Vec<Seated<'_>> = lanes
             .iter()
             .map(|&(lane, tokens, have, (pages, windows))| Seated {
+                replay_stated: None,
                 pages,
                 windows,
                 held: Some(have),
@@ -580,6 +631,58 @@ fn serve(
     rows
 }
 
+/// The most a logit of one placement may differ from the same logit of
+/// another, `ulps` bf16 units in the last place of the larger magnitude:
+/// the lanes' rows meet the kernels in another order once their pages lie
+/// elsewhere, and bf16 operands round each partial sum to 8 significant
+/// bits, so the same row may land a few such units apart (no batch
+/// invariance is promised; an argmax apart, or a logit past this, is a bug).
+fn bf16_bound(a: f32, b: f32, ulps: f32) -> f32 {
+    let magnitude = a.abs().max(b.abs()).max(f32::MIN_POSITIVE);
+    // A bf16's unit in the last place: 2^(exponent - 7).
+    ulps * 2f32.powi(magnitude.log2().floor() as i32 - 7)
+}
+
+/// Panics at the first row whose argmax differs, or a logit of which lies
+/// past [`bf16_bound`] of two units from the other's.
+pub(super) fn close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    assert_eq!(got.len(), want.len(), "{what}: rows");
+    for (at, (got, want)) in got.iter().zip(want).enumerate() {
+        assert_eq!(got.len(), want.len(), "{what}: row {at}'s logits");
+        assert_eq!(argmax(got), argmax(want), "{what}: row {at}'s argmax");
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(&a, &b)| ((a - b).abs(), bf16_bound(a, b, 2.0), a, b))
+            .filter(|&(apart, bound, ..)| !(apart <= bound))
+            .collect::<Vec<_>>();
+        assert!(
+            worst.is_empty(),
+            "{what}: row {at}: {} of {} logits past two bf16 units, first {:?}",
+            worst.len(),
+            want.len(),
+            worst.first()
+        );
+    }
+}
+
+/// The bound passes two bf16 units of a logit and refuses three, and an
+/// argmax apart is refused at once whatever the logits' distance.
+#[test]
+fn close_holds_two_bf16_units_and_the_argmax() {
+    let unit = 2f32.powi(-7); // a bf16 unit at 1.0
+    let row = vec![1.0f32, 0.5, -3.0];
+    close("two units", &[vec![1.0 + 2.0 * unit, 0.5, -3.0]], &[row.clone()]);
+    let three = std::panic::catch_unwind(|| {
+        close("three units", &[vec![1.0 + 3.0 * unit, 0.5, -3.0]], &[vec![1.0f32, 0.5, -3.0]]);
+    });
+    assert!(three.is_err(), "three bf16 units apart is refused");
+    let swapped = std::panic::catch_unwind(|| {
+        close("argmax", &[vec![0.5f32, 0.5001, -3.0]], &[vec![0.5001f32, 0.5, -3.0]]);
+    });
+    assert!(swapped.is_err(), "an argmax apart is refused");
+}
+
 /// Panics at the first row whose logits differ in a bit.
 pub(super) fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
@@ -605,15 +708,18 @@ fn check(model: &str, hybrid: bool) {
         eprintln!("skipping: no Metal device");
         return;
     }
-    check_near(model, hybrid, None);
+    check_near(model, hybrid, None, &Profiles::new(&format!("scattered-{model}")));
 }
 
 /// [`check`] over a pool whose chunk aims near `chunk` bytes where stated:
 /// the seats' logits.
-fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
+/// The seats' run and the scattered one are two loads compared to the bit:
+/// both load in `profiles`, so they fire the same kernels (a caller that
+/// compares the result with another `check_near` passes the same one).
+fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles) -> Vec<Vec<f32>> {
     let fixture = fixture(model);
     const STEPS: usize = 12;
-    let load = |fixture: &Fixture| load_near(fixture, CONTEXT, chunk);
+    let load = |fixture: &Fixture| load_stored(fixture, CONTEXT, chunk, profiles);
 
     let mut shell = load(&fixture);
     let facts = shell.pool_chunk_facts();
@@ -707,7 +813,7 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
             }
         },
     );
-    same(
+    close(
         &format!("{model}: scattered and evacuated slots against the seats' runs"),
         &scattered,
         &seats,
@@ -730,11 +836,12 @@ fn a_refused_evacuation_moves_nothing() {
     for model in ["qwen3-micro-text", "qwen35-tiny"] {
         let fixture = fixture(model);
         const STEPS: usize = 8;
-        let mut shell = load_near(&fixture, CONTEXT, None);
+        let profiles = Profiles::new(&format!("refused-evacuation-{model}"));
+        let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
         let seats = serve(&mut shell, &fixture.trace, &Placement::Seats, STEPS, usize::MAX, &mut |_| {});
         drop(shell);
 
-        let mut shell = load_near(&fixture, CONTEXT, None);
+        let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
         let facts = shell.pool_chunk_facts();
         let layout = shell.pool_layout();
         let segment = facts.segment_chunks;
@@ -754,14 +861,14 @@ fn a_refused_evacuation_moves_nothing() {
             .commit_segments(kept + held.div_ceil(segment))
             .expect("the segments commit");
         let scattered = serve(&mut shell, &fixture.trace, &place(first), STEPS, STEPS / 2, &mut |shell| {
-            let before = shell.chunk_table();
+            let before = shell.chunk_table().clone();
             let moves = (0..held).map(|at| (first + at, low + at)).collect();
             engine_metal::serve::fail_next_repoint();
             let refused = shell.evacuate(&Evacuation { moves });
             assert!(refused.is_err(), "{model}: the injected refusal is answered");
-            assert_eq!(shell.chunk_table(), before, "{model}: a refused evacuation moves nothing");
+            assert_eq!(shell.chunk_table(), &before, "{model}: a refused evacuation moves nothing");
         });
-        same(
+        close(
             &format!("{model}: decoding on past a refused evacuation, against the seats' runs"),
             &scattered,
             &seats,
@@ -845,7 +952,7 @@ fn split_page_ids_over_buffers_serve_the_same_logits() {
             ids.shift.unwrap_or(0)
         );
         drop(shell);
-        check_near(model, hybrid, Some(chunk));
+        check_near(model, hybrid, Some(chunk), &Profiles::new(&format!("split-{model}")));
     }
 }
 
@@ -898,8 +1005,9 @@ fn a_record_in_pieces_serves_the_whole_records_logits() {
         "{model}'s record is whole in a {CHUNK}-byte chunk"
     );
     eprintln!("{model}: the record in {pieces} pieces");
-    let cut = check_near(model, true, Some(CHUNK));
-    let whole = check_near(model, true, None);
+    let profiles = Profiles::new("record-in-pieces");
+    let cut = check_near(model, true, Some(CHUNK), &profiles);
+    let whole = check_near(model, true, None, &profiles);
     same(
         &format!("{model}: the record in {pieces} pieces against whole"),
         &cut,
@@ -1134,6 +1242,7 @@ fn trimmed_windows(model: &str, fixture: &Fixture, context: u32, prompt: u32, li
                     _ => Vec::new(),
                 };
                 let seated = Seated {
+                    replay_stated: None,
                     held: Some(held),
                     refs: trimmed,
                     pages: &list_pages,

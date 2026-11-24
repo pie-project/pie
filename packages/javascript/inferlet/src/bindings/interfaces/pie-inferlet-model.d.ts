@@ -82,6 +82,14 @@ export function channelCapacity(): number;
  */
 export function runAheadWindow(): number;
 /**
+ * Frames the engine keeps in flight (`[runtime] frame_dispatch_depth`, the
+ * engine's `frames_in_flight`): a beam group's freed pages wait this many
+ * fires before they are handed out again (`new-memory/designs/
+ * BEAM-PAGE-LISTS.md` §3), so a guest sizing a beam pool reads it here.
+ * Static for the run.
+ */
+export function framesInFlight(): number;
+/**
  * Size in bytes of one folded recurrent state. 0 if the model keeps
  * none (attention only, windowed or not).
  */

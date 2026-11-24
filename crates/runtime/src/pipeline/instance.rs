@@ -122,6 +122,11 @@ pub struct StateBinding {
     pub slots: Option<u32>,
     pub kv_len: Option<u32>,
     pub fold: Option<u32>,
+    /// Per lane, the beam it continues (`forward.wit` `state-geometry.parents`).
+    pub parents: Option<u32>,
+    /// With `parents`, the slot past the search's last row: its depth, which
+    /// the bind lays its group's page lists for (`state-geometry.parents-end`).
+    pub parents_end: Option<u32>,
 }
 
 #[derive(Default)]
@@ -193,7 +198,7 @@ pub struct BoundForwardPass {
     pub decode_envelope: Option<eta_ir::registry::PortMask>,
     /// Bound with a [`crate::pipeline::fire::host_geometry::HostGeometry`]:
     /// each fire resolves its geometry on the host, and is counted here
-    /// (`host_geometry::counter`, under its engine, reason and program).
+    /// (`host_geometry::counter`, under its engine and program).
     pub host_geometry: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
     pub facts: Vec<LaneFacts>,

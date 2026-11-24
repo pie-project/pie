@@ -213,6 +213,9 @@ pub(crate) struct Core {
     /// the device shares the host's memory, so what the host can still give
     /// is read afresh while serving.
     pub(crate) shares_host: bool,
+    /// Whose memory the device's is ([`super::memory::whose`]): where it is
+    /// the host's, the load states no host tier.
+    pub(crate) whose_memory: engine::DeviceMemory,
     /// The most bytes one reservation takes on this device
     /// ([`super::memory::reservation_bound`]): every buffer made is no
     /// larger, and one past it is refused by name, never made invalid.
@@ -660,6 +663,7 @@ impl Context {
         } = handed;
         let info = adapter.get_info();
         let reading = super::memory::at_load(&adapter, allowance)?;
+        let whose_memory = super::memory::whose(&adapter)?;
         tracing::info!(device = %info.name, "{reading}");
         let budget = reading.bytes;
         let features = device.features();
@@ -723,6 +727,7 @@ impl Context {
             subgroup_min,
             budget,
             shares_host: reading.source == super::memory::Source::HostAvailable,
+            whose_memory,
             bound,
         });
         let dummy = Raw::new(
@@ -772,6 +777,11 @@ impl Context {
         self.core
             .shares_host
             .then(engine_gpu::host_memory::room_reader)
+    }
+
+    #[must_use]
+    pub fn whose_memory(&self) -> engine::DeviceMemory {
+        self.core.whose_memory
     }
 
     /// What the driver holds for this process beside every reservation:
@@ -1039,10 +1049,6 @@ pub(crate) struct UniformRegion {
 pub(crate) struct UniformRing {
     chunks: Vec<Held>,
     used: u64,
-    /// The end of the most the frame's encoder has staged through its
-    /// chunk: a copy gives its slot back once encoded, and a staging the
-    /// queue writes lies past this, where no command of the frame writes.
-    high: u64,
 }
 
 pub(crate) struct Inner {
@@ -1311,29 +1317,13 @@ impl Frame {
     /// `bytes` of this frame's scratch the frame's encoder writes: the
     /// chunk and the slot's first byte in it.
     pub(crate) fn scratch_slot(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
-        self.scratch_take(bytes, false)
-    }
-
-    /// `bytes` of this frame's scratch the queue writes, which lands before
-    /// any command of the frame runs: past every slot the encoder has
-    /// written, so no command of the frame writes over it.
-    pub(crate) fn scratch_slot_queued(&self, bytes: u64) -> Result<(wgpu::Buffer, u64)> {
-        self.scratch_take(bytes, true)
-    }
-
-    fn scratch_take(&self, bytes: u64, queued: bool) -> Result<(wgpu::Buffer, u64)> {
         let core = &self.inner.core;
         let align = u64::from(core.limits.min_storage_buffer_offset_alignment).max(256);
         let mut ring = self.inner.scratch.lock().expect("scratch lock poisoned");
         if ring.chunks.is_empty() {
             ring.chunks.push(core.scratch_chunk(bytes)?);
         }
-        let from = if queued {
-            ring.used.max(ring.high)
-        } else {
-            ring.used
-        };
-        let at = from.next_multiple_of(align);
+        let at = ring.used.next_multiple_of(align);
         let room = ring.chunks.last().map_or(0, |chunk| chunk.size());
         if at + bytes > room {
             return Err(Fault::Ceiling {
@@ -1343,7 +1333,6 @@ impl Frame {
             });
         }
         ring.used = at + bytes;
-        ring.high = ring.high.max(ring.used);
         Ok(((*ring.chunks.last().expect("non-empty")).clone(), at))
     }
 
@@ -1388,8 +1377,7 @@ impl Frame {
         // an overlapping source the pieces go from the end, so each reads its
         // source as it was.
         // The slot is given back once the copy is encoded: a later slot the
-        // encoder writes runs after the copy's pieces, and one the queue
-        // writes lies past it (`scratch_slot_queued`).
+        // encoder writes runs after the copy's pieces.
         let piece = len.min(self.scratch_room() & !3).max(4);
         let given = self
             .inner

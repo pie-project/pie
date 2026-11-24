@@ -261,6 +261,9 @@ fn args(
         tables.mask_words.arg(),
     ];
     args.extend_from_slice(extra);
+    if let Some(ring) = &pool.ring {
+        args.push(ring.lanes.arg());
+    }
     args.extend(pool.pool.args(false));
     args.extend([
         pool.pool.words.arg(),
@@ -276,6 +279,39 @@ fn args(
         shape.row0.arg(),
     ]);
     Ok(args)
+}
+
+/// The ring's scalars, after every other a form reads (`Params`' last).
+fn ring_params(op: &'static str, pool: &KvPool) -> Result<Vec<ArgValue>, Error> {
+    let Some(ring) = &pool.ring else {
+        return Ok(Vec::new());
+    };
+    if ring.lanes.dtype != Dtype::I32 {
+        return Err(refuse(op, "a ring's lane table is i32".to_string()));
+    }
+    if ring.pieces == 0 || ring.piece >= ring.pieces || ring.values_piece >= ring.pieces {
+        return Err(refuse(
+            op,
+            format!(
+                "the ring lies in piece {} of a record of {} pieces",
+                ring.piece, ring.pieces
+            ),
+        ));
+    }
+    Ok(vec![
+        nonzero(op, "the ring's rows", ring.rows)?.arg(),
+        ring.piece.arg(),
+        ring.values_piece.arg(),
+        ring.pieces.arg(),
+        ring.keys.arg(),
+        ring.values.arg(),
+        ring.slot_stride.arg(),
+    ])
+}
+
+/// `_ring` where the pool's windowed rows lie in a ring.
+fn ring_kind(pool: &KvPool) -> &'static str {
+    if pool.ring.is_some() { "_ring" } else { "" }
 }
 
 fn lse_plane(op: &'static str, lse: Tensor, shape: &Shape) -> Result<ArgValue, Error> {
@@ -313,20 +349,22 @@ pub fn decode_kernels(
     tactic: Tactic,
     head_dim: u32,
     lse: bool,
+    ring: bool,
 ) -> Result<[Fire; 2], Error> {
+    let ring = if ring { "_ring" } else { "" };
     Ok([
         decode_entry(
             target,
             "attn.decode",
             tactic,
-            walk_kind(false, lse),
+            &format!("{}{ring}", walk_kind(false, lse)),
             head_dim,
         )?,
         decode_entry(
             target,
             "attn.decode_split",
             tactic,
-            walk_kind(true, lse),
+            &format!("{}{ring}", walk_kind(true, lse)),
             head_dim,
         )?,
     ])
@@ -387,7 +425,13 @@ pub fn decode(
     if let Some(names) = ctx.naming() {
         // The rows and the keys a fire holds say whether it splits: where
         // the planes are there to split into, either walk, then the fold.
-        let [whole, ranges] = decode_kernels(ctx.target(), tactic, head_dim, lse.is_some())?;
+        let [whole, ranges] = decode_kernels(
+            ctx.target(),
+            tactic,
+            head_dim,
+            lse.is_some(),
+            pool.ring.is_some(),
+        )?;
         if split.is_none() {
             return names.either(&[whole]);
         }
@@ -415,10 +459,11 @@ pub fn decode(
         ctx.target(),
         OP,
         tactic,
-        walk_kind(false, lse.is_some()),
+        &format!("{}{}", walk_kind(false, lse.is_some()), ring_kind(pool)),
         head_dim,
     )?;
-    let args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
+    let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
+    args.extend(ring_params(OP, pool)?);
     ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
 }
 
@@ -476,7 +521,7 @@ fn decode_split(
         ctx.target(),
         OP,
         tactic,
-        walk_kind(true, lse.is_some()),
+        &format!("{}{}", walk_kind(true, lse.is_some()), ring_kind(pool)),
         head_dim,
     )?;
     let mut args = args(OP, q, pool, tables, shape, sm_scale, o, &extra)?;
@@ -485,6 +530,7 @@ fn decode_split(
         stated(OP, shape.rows)?.arg(),
         stated(OP, tactic.split_min_keys.max(1))?.arg(),
     ]);
+    args.extend(ring_params(OP, pool)?);
     ctx.fire(fire.groups([shape.q_heads, shape.rows, slices]), &args)?;
 
     let mut fold = vec![split.part_out.arg(), split.part_lse.arg(), o.arg_mut()];
@@ -534,6 +580,12 @@ pub fn selected(
     o: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.selected";
+    if pool.ring.is_some() {
+        return Err(refuse(
+            OP,
+            "a selection reads keys by score, and a ring is a window's".to_string(),
+        ));
+    }
     let shape = shape(OP, q, tables, pool, None, head_dim)?;
     if selection.dtype != Dtype::I32 {
         return Err(refuse(
@@ -593,8 +645,9 @@ pub fn prefill(
     let one_segment = ctx.target() == Target::Spirv
         && pool.pool.bufs[1..].iter().all(|&buf| buf == crate::ABSENT);
     let name = format!(
-        "attn_sdpa_{}{}{}{}_bf16_d_{head_dim}",
+        "attn_sdpa_{}{}{}{}{}_bf16_d_{head_dim}",
         if lse.is_some() { "tiled_lse" } else { "tiled" },
+        ring_kind(pool),
         if lanes == 32 { "" } else { "_l16" },
         if tile == 32 {
             String::new()
@@ -615,6 +668,7 @@ pub fn prefill(
     };
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
     args.push(stated(OP, shape.rows)?.arg());
+    let ring = ring_params(OP, pool)?;
     let keys = u64::from(pool.page_indices.rows) * pool.page_size.max(1) as u64;
     let keys = window
         .map_or(keys, |window| keys.min(u64::from(window)))
@@ -630,6 +684,7 @@ pub fn prefill(
     for first in (0..tiles).step_by(step as usize) {
         let mut args = args.clone();
         args.push(stated(OP, first)?.arg());
+        args.extend_from_slice(&ring);
         ctx.fire(
             Fire::at(SDPA, entry)
                 .tier(tier)
@@ -840,7 +895,7 @@ mod tests {
             prefill_work: 0,
         };
         let names = |tactic, head_dim, lse| {
-            decode_kernels(Target::Wgsl, tactic, head_dim, lse)
+            decode_kernels(Target::Wgsl, tactic, head_dim, lse, false)
                 .map(|fires| fires.map(|fire| (fire.file, fire.entrypoint, fire.tier)))
         };
         assert_eq!(

@@ -473,7 +473,13 @@ impl Stages {
                     .collect();
             }
             for reads in &combos {
-                for &lanes in &rungs {
+                // A fire of the load's top lanes carries at most `top /
+                // rows` guest lanes reading `rows` rows each, padded to its
+                // rung: no batch past that is compiled (a beam group of 17
+                // read 64 × 17 rows, a stage of more temp than the device).
+                let rows = lower::lane_rows(package, at, reads);
+                let carried_most = padded((top as usize / rows.max(1) as usize).max(1));
+                for &lanes in rungs.iter().filter(|&&lanes| lanes <= carried_most) {
                     wanted.push((at, Batch { lanes, reads: reads.clone() }, carried.to_vec()));
                 }
                 wanted.push((at, Batch { lanes: 1, reads: reads.clone() }, Vec::new()));

@@ -91,6 +91,19 @@ pub(crate) fn notify_owner_away(pid: ProcessId) {
     broadcast(|| SchedulerItem::OwnerAway(pid));
 }
 
+/// `lane`'s process on `engine` waits on the output of the fire
+/// `completion` settles, having submitted nothing since: no frame on
+/// `engine` waits on the lane until it submits again
+/// ([`super::frame::FramePolicy::on_lane_waits`]).
+pub(crate) fn notify_lane_waits(engine: usize, lane: ProcessId, completion: WorkItemCompletion) {
+    if completion.is_settled() {
+        return;
+    }
+    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
+        let _ = handle.send(SchedulerItem::LaneWaits { lane, completion });
+    }
+}
+
 pub(crate) fn notify_process_resume(pid: ProcessId) {
     broadcast(|| SchedulerItem::ProcessResume(pid));
 }
@@ -152,6 +165,10 @@ static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PendingRequest {
     pub(crate) logical_fire_id: u64,
+    /// When it was handed to the scheduler: a request's lanes name the
+    /// slots its stores held then (a debug check at the engine says how
+    /// long ago).
+    pub(crate) queued: std::time::Instant,
     pub(crate) request: crate::engine::FireRequest,
     pub(crate) instance_id: ::engine::InstanceId,
     pub(crate) completion: WorkItemCompletion,
@@ -185,6 +202,7 @@ impl PendingRequest {
         let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             logical_fire_id,
+            queued: std::time::Instant::now(),
             request,
             instance_id,
             completion,
@@ -321,6 +339,12 @@ enum SchedulerItem {
     /// frame until each submits again
     /// ([`super::frame::FramePolicy::on_owner_away`]).
     OwnerAway(ProcessId),
+    /// The lane's process waits on the output of the fire the completion
+    /// settles ([`super::frame::FramePolicy::on_lane_waits`]).
+    LaneWaits {
+        lane: ProcessId,
+        completion: WorkItemCompletion,
+    },
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -385,6 +409,11 @@ pub(crate) enum PoolOp {
     /// what an aborted move waits for before it gives back slots a copy may
     /// still be writing.
     SettleCopies,
+    /// The engine's chunk table (`Engine::chunk_table`) checked against the
+    /// runtime's logical to physical map, by logical chunk: refused naming
+    /// the first chunk they place apart. What a refused evacuation is
+    /// checked by, the engine's word that nothing moved not taken on trust.
+    CheckTable(Vec<u32>),
 }
 
 impl PoolOp {
@@ -399,6 +428,7 @@ impl PoolOp {
             Self::Evacuate(_) => "evacuate",
             Self::Rebind(_) => "rebind",
             Self::SettleCopies => "settle copies (waits every copy landed)",
+            Self::CheckTable(_) => "check chunk table",
         }
     }
 }
@@ -435,6 +465,9 @@ pub(crate) enum HostKvOp {
     /// The engine's weight use record since it last answered
     /// (`Engine::weight_uses`), as JSON.
     WeightUses,
+    /// A beam group's beam's page list (`Engine::beam_list`), little-endian
+    /// u32s: behind every fire queued before it.
+    BeamList(::engine::InstanceId, u32),
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
@@ -1404,36 +1437,39 @@ impl SchedulerHandle {
                 .and_then(|stores| stores.roles)
                 .map(|roles| roles.lock().unwrap().room_watch())
         };
-        // Whether `pieces` runs of `run` chunks stand free for its state,
-        // and the capacity gate lets them in.
-        let fits = |run: u32, pieces: u32| {
+        // Whether `pieces` runs of `run` chunks and `singles` chunks beside
+        // them stand free for its state, and the capacity gate lets them in.
+        let fits = |run: u32, pieces: u32, singles: u32| {
             crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
-                .is_some_and(|roles| roles.lock().unwrap().free_runs(run) >= pieces)
+                .is_some_and(|roles| roles.lock().unwrap().room_free(run, pieces, singles))
                 && crate::planner::planner_for(0, engine).is_none_or(|planner| {
-                    !planner.capacity_would_hold(pid, run.max(1).saturating_mul(pieces))
+                    !planner.capacity_would_hold(
+                        pid,
+                        run.max(1).saturating_mul(pieces).saturating_add(singles),
+                    )
                 })
         };
         // Holding guest state of its own, it is suspended instead: waiting,
         // it would hold room its own bind lacks.
-        let suspend = |run: u32, pieces: u32| {
+        let suspend = |run: u32, pieces: u32, singles: u32| {
             let holds = crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
                 .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
             holds
                 && crate::planner::planner_of(pid)
-                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces))
+                    .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces, singles))
         };
         // Waiting, it is a waiter in the planner's queue: idle cache goes
         // first, then a resident is parked for it, as for a restore short
         // of room for its roles.
-        let planned = |run: u32, pieces: u32| async move {
+        let planned = |run: u32, pieces: u32, singles: u32| async move {
             let planner = crate::planner::planner_of(pid)
                 .ok_or_else(|| "its process has no planner".to_string())?;
             crate::inferlet::process::said(
                 "bind: room for its guest state",
                 pid,
-                planner.wait_bind_room(pid, run, pieces),
+                planner.wait_bind_room(pid, run, pieces, singles),
             )
             .await
             .map_err(|why| why.to_string())
@@ -1752,6 +1788,14 @@ impl BatchScheduler {
                 &mut slot_buffer,
                 stopping,
             );
+            // A raise to held frames refused by name (it never fits beside
+            // its owner's own state): the frames held for it leave, their
+            // fires failed by that name, never held for good.
+            if let Some((owner, why)) = crate::store::shared::take_refused_owed(engine_id) {
+                let fires = frame_policy.refuse_held(owner);
+                Self::reject_fires_queued(&mut pending, &fires, &why);
+                progress |= !fires.is_empty();
+            }
             // Frames held out under the cap are owed a raise: the cap's
             // owner is told, its walk raising the rung to them (a hold with
             // nothing in flight waited on a raise nothing asked for).
@@ -2284,6 +2328,9 @@ impl BatchScheduler {
             SchedulerItem::OwnerAway(pid) => {
                 frame_policy.on_owner_away(pid);
             }
+            SchedulerItem::LaneWaits { lane, completion } => {
+                frame_policy.on_lane_waits(lane, completion);
+            }
             SchedulerItem::FrameTruncate {
                 lane,
                 seq,
@@ -2351,6 +2398,24 @@ impl BatchScheduler {
                 }
             }
         }
+    }
+
+    /// Fails the queued launches of `fires` by `why`, unsubmitted: a raise
+    /// to the frames they were held in was refused by name.
+    fn reject_fires_queued(pending: &mut PendingQueue, fires: &[u64], why: &str) {
+        if fires.is_empty() {
+            return;
+        }
+        let mut kept = VecDeque::with_capacity(pending.len());
+        while let Some(item) = pending.pop_front() {
+            match item {
+                QueuedItem::Launch(request) if fires.contains(&request.fire_id) => {
+                    request.completion.reject_unsubmitted(format!("scheduler: {why}"));
+                }
+                item => kept.push_back(item),
+            }
+        }
+        pending.replace(kept);
     }
 
     fn reject_pipeline_queued(
@@ -2866,7 +2931,6 @@ impl BatchScheduler {
                 }
                 vec![scan.untracked.clone()]
             } else {
-                frame_policy.bound_batch(crate::policy::batch::tokens());
                 match frame_policy.plan_dispatch(
                     &scan.queued_ids,
                     &scan.blocked_lanes,
@@ -3149,7 +3213,7 @@ impl BatchScheduler {
                 "scheduler: a refused chunk's move lacks free chunks below: the planner makes them"
             );
             crate::rt::spawn(async move {
-                if let Err(error) = planner.wait_bind_room(owner, 1, stuck).await {
+                if let Err(error) = planner.wait_bind_room(owner, 1, stuck, 0).await {
                     tracing::warn!(%owner, %error, "scheduler: the room for a refused chunk's move was refused");
                 }
                 crate::store::shared::ask_walk(engine_id);
@@ -3629,6 +3693,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -3651,6 +3722,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "panicking"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -3840,6 +3915,7 @@ mod tests {
     fn refused_request(fire: u64) -> Box<PendingRequest> {
         let slot = u32::try_from(fire).expect("a test fire id");
         Box::new(PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: fire,
             request: crate::engine::FireRequest::one(crate::engine::fire::lane_of(
@@ -3873,6 +3949,8 @@ mod tests {
             prefill_lanes: 0,
             max_readouts: 0,
             readout_store: 0,
+            max_replayed_rows: 0,
+            shapes: None,
         }
     }
 
@@ -4106,6 +4184,8 @@ mod tests {
         );
         let frame = |lanes: u32| crate::engine::FrameFire {
             steps: vec![crate::engine::StepFire {
+                fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -4155,6 +4235,7 @@ mod tests {
         });
         pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(
             PendingRequest {
+                queued: std::time::Instant::now(),
                 lora_program: false,
                 logical_fire_id: 9,
                 request: crate::engine::FireRequest::default(),
@@ -4191,6 +4272,8 @@ mod tests {
                 prefill_lanes: 0,
                 max_readouts: 0,
                 readout_store: 0,
+                max_replayed_rows: 0,
+                shapes: None,
             },
             &stats,
             &mut FramePolicy::new(1, 64, 4096, None),
@@ -4206,6 +4289,7 @@ mod tests {
     fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
         let pipeline = ProcessId::from_u128(5);
         let request = PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: 9,
             request: crate::engine::FireRequest::default(),
@@ -4237,6 +4321,7 @@ mod tests {
     fn an_unframed_piece_waits_for_its_pipelines_framed_fire_queued_ahead() {
         let (pipeline, other) = (ProcessId::from_u128(5), ProcessId::from_u128(6));
         let launch = |fire: u64, pipeline: ProcessId, framed: bool| PendingRequest {
+            queued: std::time::Instant::now(),
             lora_program: false,
             logical_fire_id: fire,
             request: crate::engine::FireRequest::default(),
@@ -4280,6 +4365,8 @@ mod tests {
             let answer_rx = lane.fire(
                 crate::engine::FrameFire {
                     steps: vec![crate::engine::StepFire {
+                        fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                         submission: ::engine::Step {
                             lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                             attachments: Vec::new(),
@@ -4327,6 +4414,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -4349,6 +4443,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "exhausted"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4399,6 +4497,8 @@ mod tests {
         let answer_rx = lane.fire(
             crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
+                    fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                         attachments: Vec::new(),
@@ -4449,6 +4549,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -4471,6 +4578,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "inline"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4548,6 +4659,8 @@ mod tests {
         let answer_rx = lane.fire(
             crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
+                    fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane {
                             reports: TAG,
@@ -4601,6 +4714,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -4623,6 +4743,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "lane-fault"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4709,6 +4833,8 @@ mod tests {
         let instance = |lane: u32| ::engine::InstanceId(instances[lane as usize]);
         let fire = crate::engine::FrameFire {
             steps: vec![crate::engine::StepFire {
+                fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -4873,6 +4999,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -4895,6 +5028,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "lane-refusal"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -5040,6 +5177,8 @@ mod tests {
                 .map(|_| crate::engine::WorkItemCompletion::deferred_with_guard(None))
                 .collect();
             fire.steps.push(crate::engine::StepFire {
+                fire_stamps: Vec::new(),
+            lane_sets: Vec::new(),
                 submission: ::engine::Step {
                     lanes: fires.iter().map(|(_, lane)| lane.clone()).collect(),
                     attachments: (0..lanes)
@@ -5340,6 +5479,13 @@ mod tests {
             &[]
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+
+            Vec::new()
+
+        }
+
+
         fn skips_measuring(&self) -> bool {
             false
         }
@@ -5362,6 +5508,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "holding"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(

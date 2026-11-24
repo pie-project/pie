@@ -1,7 +1,8 @@
 #![cfg(feature = "rocm")]
 //! A shell dropped leaves the queues where its load found them: load after load in one
-//! process leaves KFD's list of the process's queues where the first load's
-//! drop left it, HIP's rule (`kfd::save_areas`) flat and never under the
+//! process leaves KFD's list of the process's queues where the first single
+//! load's drop left it (at most one queue past the two-shell drop's: HIP
+//! opens one lazily and pools it), HIP's rule (`kfd::save_areas`) flat and never under the
 //! list, and the save areas the free figure holds back (`kfd::held`) flat
 //! with them. A reloading server keeps the device memory its first load
 //! found.
@@ -123,6 +124,32 @@ fn a_dropped_shell_takes_its_queues_with_it() {
     drop((one, two));
     let first = queues();
     at_least_listed("both dropped", first);
+    // One single-shell load first: HIP opens a hardware queue lazily, for a
+    // stream the two shells' never took, and pools it once its stream is
+    // destroyed, so the first single load may leave one queue (and its save
+    // area) past the two-shell drop's. Bounded here, at one; every reload
+    // after it must leave exactly what this one left.
+    let warm = {
+        drop(load(trace.clone(), &path));
+        queues()
+    };
+    eprintln!("after the two-shell drop {first:?}, after one warm reload {warm:?}");
+    at_least_listed("warm reload dropped", warm);
+    let area = kfd::save_areas(u32::MAX).expect("the rule's save areas read").area();
+    if let (Some(warm_listed), Some(first_listed)) = (warm.0, first.0) {
+        assert!(
+            warm_listed <= first_listed + 1,
+            "the warm reload's drop left {warm_listed} queues listed, past the two-shell drop's \
+             {first_listed} by more than HIP's one lazily opened queue"
+        );
+    }
+    assert!(
+        warm.2 <= first.2 + area,
+        "the warm reload's drop left {} save-area bytes held, past the two-shell drop's {} by more \
+         than one queue's {area}",
+        warm.2,
+        first.2
+    );
     for cycle in 0..CYCLES {
         let shell = load(trace.clone(), &path);
         at_least_listed(&format!("reload {cycle} live"), queues());
@@ -131,8 +158,8 @@ fn a_dropped_shell_takes_its_queues_with_it() {
         eprintln!("after reload {cycle}'s drop (listed, ruled, held bytes): {now:?}");
         at_least_listed(&format!("reload {cycle} dropped"), now);
         assert_eq!(
-            now, first,
-            "reload {cycle}'s drop left the queues or their save areas grown past the first drop's"
+            now, warm,
+            "reload {cycle}'s drop left the queues or their save areas grown past the warm reload's"
         );
     }
 }

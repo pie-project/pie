@@ -1,3 +1,0 @@
-plane = "worker"
-subscribe = ["arrived"]
-grants = ["schedule"]
