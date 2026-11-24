@@ -363,7 +363,14 @@ impl<B: Serve> Probe<B> {
     ) -> crate::error::Result<()> {
         let sink = B::sink(device, frame, pipelines, handles);
         for _ in 0..times.max(1) {
-            kernels_slang::linear::gemm::matmul(&sink, tactic, act, weight, out).map_err(|e| {
+            kernels_slang::linear::gemm::matmul(
+                &sink,
+                tactic,
+                act,
+                weight,
+                out,
+                kernels_slang::ssm::RowSpan::whole(act),
+            ).map_err(|e| {
                 Fault::Device {
                     call: "submit bound: probe",
                     why: e.to_string(),

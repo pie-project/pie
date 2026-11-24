@@ -81,6 +81,8 @@ pub fn latents_rope(
         ctx,
         k_pe,
         positions,
+        crate::ssm::RowSpan::whole(k_pe),
+        0,
         rope_dim,
         rope_dim,
         theta,

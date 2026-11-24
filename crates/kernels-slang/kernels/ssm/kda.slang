@@ -100,12 +100,12 @@ struct Params {
     int snap_lane0;
 #endif
 };
-PIE_PARAMS(PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PARAMS_AT, Params, params);
 
 #if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
 // The window's CSR boundary `i`.
 int csr(uint i) {
-    return indptr[uint(params.indptr_at) + i];
+    return indptr[uint(PIE_FIRE(indptr_at)) + i];
 }
 #endif
 PIE_POOL_READ(float, params.seg_words)
@@ -125,7 +125,7 @@ groupshared int kda_keep;
 
 // Token `t` of head `h`, its state at `state_base`.
 void token(uint tid, uint window_t, uint h, uint state_base) {
-    uint t = params.row0 + window_t;
+    uint t = PIE_FIRE(row0) + window_t;
     uint d = uint(params.head_dim);
     uint wide = uint(params.heads) * d;
     uint row = t * 3u * wide;
@@ -212,11 +212,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint cells = d * d;
     uint r = group.z;
 #if defined(PIE_COMMITTED)
-    uint lane = uint(params.lane0) + r;
+    uint lane = uint(PIE_FIRE(lane0)) + r;
     if (tid == 0u) {
         int begin = csr(r);
         for (uint j = 0; j < r; j++) {
-            begin += replay[uint(params.lane0) + j];
+            begin += replay[uint(PIE_FIRE(lane0)) + j];
         }
         int span = (csr(r + 1) - csr(r)) + replay[lane];
         kda_lo = begin;

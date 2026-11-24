@@ -55,12 +55,14 @@ impl<B: Backend> Run<'_, B> {
                         self.tensor(*y),
                     ),
                     None => self.gemm(*act, *w, |tactic| {
+                        let ([act, y], window) = self.windowed([*act, *y]);
                         kernels_slang::linear::gemm::matmul(
                             self.ctx,
                             tactic,
-                            self.tensor(*act),
+                            act,
                             self.tensor(*w),
-                            self.tensor(*y),
+                            y,
+                            window,
                         )
                     }),
                 },
@@ -89,12 +91,14 @@ impl<B: Backend> Run<'_, B> {
                         self.tensor(*y),
                     ),
                     None => self.gemm(*act, *w, |tactic| {
+                        let ([act, y], window) = self.windowed([*act, *y]);
                         kernels_slang::linear::gemm::lm_head(
                             self.ctx,
                             tactic,
-                            self.tensor(*act),
+                            act,
                             self.tensor(*w),
-                            self.tensor(*y),
+                            y,
+                            window,
                         )
                     }),
                 },

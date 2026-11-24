@@ -90,11 +90,11 @@ impl<B: Backend> Run<'_, B> {
         if self.window().gathered.is_some() {
             return sdpa::Tables { rows, ..plan };
         }
+        // The tables whole, from the window's first token row: the same
+        // views whatever window a fire cuts.
         sdpa::Tables {
-            positions: self.cut_rows(plan.positions),
-            request_of_token: self.cut_rows(plan.request_of_token),
-            mask_words: self.cut_rows(plan.mask_words),
             row0: 0,
+            table0: self.window().span.row_offset,
             rows,
             ..plan
         }
@@ -404,6 +404,7 @@ impl<B: Backend> Run<'_, B> {
                         mask: t.mask,
                         mask_words: self.attended_rows(t.mask_words),
                         row0: self.row0(),
+                        table0: self.row0(),
                         rows: self.window_rows(),
                     },
                 )?;
@@ -439,6 +440,7 @@ impl<B: Backend> Run<'_, B> {
                         mask: t.mask,
                         mask_words: self.attended_rows(t.mask_words),
                         row0: self.row0(),
+                        table0: self.row0(),
                         rows: self.window_rows(),
                     },
                 )?;
@@ -787,27 +789,45 @@ impl<B: Backend> Run<'_, B> {
                 cache,
                 write_page,
                 write_offset,
-            } => kernels_slang::attn::kv_append::kv_append(
-                self.ctx,
-                self.tensor(*k),
-                self.tensor(*v),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let ([k, v], window) = self.windowed([*k, *v]);
+                let ([write_page, write_offset], tables) =
+                    self.windowed([*write_page, *write_offset]);
+                kernels_slang::attn::kv_append::kv_append(
+                    self.ctx,
+                    k,
+                    v,
+                    self.pool(*cache),
+                    write_page,
+                    write_offset,
+                    kernels_slang::attn::kv_append::Rows {
+                        window,
+                        tables: tables.row0,
+                    },
+                )
+            }
             Attn::KvAppend {
                 k: plane,
                 v: None,
                 cache,
                 write_page,
                 write_offset,
-            } => kernels_slang::attn::kv_append::kv_append_shared(
-                self.ctx,
-                self.tensor(*plane),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let ([plane], window) = self.windowed([*plane]);
+                let ([write_page, write_offset], tables) =
+                    self.windowed([*write_page, *write_offset]);
+                kernels_slang::attn::kv_append::kv_append_shared(
+                    self.ctx,
+                    plane,
+                    self.pool(*cache),
+                    write_page,
+                    write_offset,
+                    kernels_slang::attn::kv_append::Rows {
+                        window,
+                        tables: tables.row0,
+                    },
+                )
+            }
 
             Attn::MlaPlan {
                 kv_indptr,

@@ -262,6 +262,13 @@ impl RowSpan {
         }
     }
 
+    /// The span's rows `t` (bound whole) holds, as a cut of it from the
+    /// span's first row would: a value's room may hold fewer than the
+    /// window. Refused where it holds none.
+    pub(crate) fn held(&self, op: &'static str, t: Tensor) -> Result<u32, Error> {
+        nonzero(op, "rows", self.rows.min(t.rows.saturating_sub(self.row0)))
+    }
+
     /// The span's rows, refused where they pass any of `held` (tensors
     /// whose rows it indexes) or are none.
     pub(crate) fn rows(&self, op: &'static str, held: &[Tensor]) -> Result<u32, Error> {

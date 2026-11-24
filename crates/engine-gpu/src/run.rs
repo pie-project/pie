@@ -673,23 +673,34 @@ impl<'c, B: Backend> Run<'c, B> {
         ) {
             return handle;
         }
+        match self.span_of(id) {
+            Some((skip, keep)) => self.slice(handle, skip, keep),
+            None => handle,
+        }
+    }
+
+    /// The rows of value `id` a window of the fire's own rows cuts, its
+    /// first and its count; `None` where it binds the value whole (no row
+    /// dimension, the capture's rows, the readouts).
+    fn span_of(&self, id: ValueId) -> Option<(u32, u32)> {
+        let at = id.0 as usize;
         let Ty::Tensor { shape, .. } = &self.values[at].ty else {
-            return handle;
+            return None;
         };
         let seated = self.window();
         let window = seated.span;
 
         let patch = seated.patch;
-        let (skip, keep) = match shape.first() {
+        Some(match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            Some(Dim::Readouts) => return handle,
+            Some(Dim::Readouts) => return None,
             // A capture's rows are the fire's capturing lanes, whatever the
             // window: its kernels walk them through the capture table.
-            Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return handle,
-            Some(Dim::Const(_)) | None => return handle,
+            Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return None,
+            Some(Dim::Const(_)) | None => return None,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
@@ -699,8 +710,57 @@ impl<'c, B: Backend> Run<'c, B> {
             }
             Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
             Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
-        };
-        self.slice(handle, skip, keep)
+        })
+    }
+
+    /// Value `id` as a kernel that adds a first row to its rows binds it
+    /// (that row the fire's data, not its commands'): whole, the row of it
+    /// the window's first is, and the rows of it the window holds (what a
+    /// cut of it holds). A value no window cuts (a readout row, the mask, a
+    /// weight) is whole from row 0; in a gathered window, its compacted
+    /// column, from row 0.
+    pub fn rowed(&self, id: ValueId) -> (Tensor, u32, u32) {
+        let uncut = matches!(
+            self.values[id.0 as usize].def,
+            Def::Input(RuntimeInput::Mask)
+                | Def::Input(RuntimeInput::Geometry {
+                    kind: GeomKind::Indices,
+                    ..
+                })
+        );
+        if self.window().gathered.is_some() {
+            let cut = self.tensor(id);
+            return (cut, 0, cut.rows);
+        }
+        let whole = self.whole(id);
+        match self.span_of(id) {
+            Some((skip, keep)) if !uncut => {
+                (whole, skip, keep.min(whole.rows.saturating_sub(skip)))
+            }
+            _ => (whole, 0, whole.rows),
+        }
+    }
+
+    /// Row-shaped values as a kernel that adds one first row to each of
+    /// their rows binds them ([`Self::rowed`]), and the window's rows of
+    /// them from it ([`kernels_slang::ssm::RowSpan`]), the first's. Where
+    /// their first rows part, each is cut as [`Self::tensor`] cuts it and
+    /// the span starts at 0.
+    pub fn windowed<const N: usize>(
+        &self,
+        ids: [ValueId; N],
+    ) -> ([Tensor; N], kernels_slang::ssm::RowSpan) {
+        let bound = ids.map(|id| self.rowed(id));
+        let (row0, rows) = bound.first().map_or((0, 0), |&(_, row0, rows)| (row0, rows));
+        if bound.iter().all(|&(_, at, _)| at == row0) {
+            return (
+                bound.map(|(t, _, _)| t),
+                kernels_slang::ssm::RowSpan { row0, rows },
+            );
+        }
+        let cut = ids.map(|id| self.tensor(id));
+        let rows = cut.first().map_or(0, |t| t.rows);
+        (cut, kernels_slang::ssm::RowSpan { row0: 0, rows })
     }
 
     fn compacted(&self, id: ValueId, handle: Tensor) -> Tensor {

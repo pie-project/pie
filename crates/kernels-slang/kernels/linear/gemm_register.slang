@@ -28,8 +28,11 @@ struct Params {
     int m;
     int n;
     int k;
+    // The window's first row in the bound rows of x and the landing (both
+    // the fire's whole): the fire's data, as M is.
+    uint row0;
 };
-PIE_PARAMS(3, Params, pc);
+PIE_PARAMS_FIRED(3, Params, pc);
 
 groupshared float4 xs[PIE_BK * (PIE_BM / 4)];
 groupshared float4 ws[PIE_BK * (PIE_BN / 4)];
@@ -40,7 +43,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint flat = local.x + PIE_TX * local.y;
     uint row0 = group.y * uint(PIE_BM);
     uint col0 = group.x * uint(PIE_BN);
-    uint m = uint(pc.m);
+    uint m = uint(PIE_FIRE(m));
+    uint first = PIE_FIRE(row0);
     uint n = uint(pc.n);
     uint words = uint(pc.k) / 2u;
 
@@ -56,7 +60,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint r = e / 2u;
             uint half_ = e % 2u;
             uint row = row0 + r;
-            uint base = row * words + k0 / 2u + half_ * 4u;
+            uint base = (first + row) * words + k0 / 2u + half_ * 4u;
             uint at = r / 4u;
             uint lane = r % 4u;
             [ForceUnroll] for (uint q = 0u; q < 4u; q++) {
@@ -111,7 +115,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         [ForceUnroll] for (uint c = 0u; c < uint(PIE_CN); c++) {
             uint col = col0 + local.x * uint(PIE_CN) + c;
             if (col >= n) continue;
-            slot_put(out_, row * n + col, acc[r][c / 4u][c % 4u]);
+            slot_put(out_, (first + row) * n + col, acc[r][c / 4u][c % 4u]);
         }
     }
 }

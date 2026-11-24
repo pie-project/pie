@@ -68,6 +68,7 @@ fn the_kv_append_answers_the_reference() {
                     &pool(o[0].0, o[1].0),
                     u(wp),
                     u(wo),
+                    kernels_slang::attn::kv_append::Rows::whole(kt),
                 )
             })
         },
@@ -90,6 +91,7 @@ fn the_kv_append_answers_the_reference() {
                     &pool(o[0].0, o[1].0),
                     u(wp),
                     u(wo),
+                    kernels_slang::attn::kv_append::Rows::whole(kt),
                 )
             })
         },

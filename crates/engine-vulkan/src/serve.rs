@@ -423,6 +423,7 @@ impl Serve for Api {
     /// and none made after: each arm's forward, the feed and the guest
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
+        crate::encode::profile_ready();
         shell.device().name_descriptor_sets();
         shell
             .device()
@@ -781,6 +782,7 @@ impl Serve for Api {
                     (!cuts.is_empty()).then_some(shape),
                 );
                 let groups = std::sync::Arc::new(kept.groups().to_vec());
+                let fresh = shell.shelf.recorder.family(family).is_none();
                 enum Act {
                     Fill,
                     Record(std::sync::Arc<Vec<bool>>),
@@ -808,7 +810,7 @@ impl Serve for Api {
                     _ if arming => {
                         // Under PIE_VK_BAKE_TRAIL, what parts a new family
                         // from the nearest held one.
-                        if matches!(act, Act::Record(_)) && crate::device::ctx::trailing() {
+                        if fresh && crate::device::ctx::trailing() {
                             nearest(shell, kept.trail(), prepared);
                         }
                         if let Act::Record(varying) = act {
@@ -1001,16 +1003,33 @@ fn nearest(shell: &Shell<Api>, trail: &[String], prepared: &Prepared<'_, Api>) {
     match best {
         Some((alike, held)) => eprintln!(
             "[vk-bake] arm {} rung {} rows {:?}: the fill walk parts from the nearest armed family \
-             after {alike} of {} commands ({} held)\n  walk: {}\n  held: {}",
+             after {alike} of {} commands ({} held)\n  before: {}\n  walk: {}\n  held: {}",
             prepared.arm,
             prepared.rung,
             prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
             trail.len(),
             held.len(),
+            alike.checked_sub(1).map_or_else(|| "<start>".into(), |i| at(trail, i)),
             at(trail, alike),
             at(held, alike),
         ),
         None => eprintln!("[vk-bake] no family is armed"),
+    }
+    // Where the nearest family is as long, every command past the parting
+    // that differs, by kernel: what else parts them.
+    if let Some((alike, held)) = best
+        && held.len() == trail.len()
+    {
+        let mut kinds: Vec<&str> = trail
+            .iter()
+            .zip(held)
+            .skip(alike)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a.rsplit(' ').next().unwrap_or(""))
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        eprintln!("  also: {kinds:?}");
     }
 }
 

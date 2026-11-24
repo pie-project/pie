@@ -24,8 +24,12 @@ struct Params {
     uint v_origin;
     uint k_page_stride;
     uint v_page_stride;
+    // The window's first row in the bound source rows, and in the bound
+    // write tables (each the fire's whole): the fire's data.
+    uint row0;
+    uint w0;
 };
-PIE_PARAMS(8, Params, params);
+PIE_PARAMS_FIRED(8, Params, params);
 PIE_POOL_READ(uint, params.seg_words)
 PIE_POOL_WRITE(uint, params.seg_words)
 PIE_POOL_VIEW(k_pages, uint, params.k_origin)
@@ -37,16 +41,17 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint head_dim = uint(params.head_dim);
     uint d = 2u * gid.x;
     uint h = gid.y;
-    uint i = gid.z;
+    uint i = PIE_FIRE(row0) + gid.z;
+    uint w = PIE_FIRE(w0) + gid.z;
     // A padding row's write entry is -1: it writes nothing.
-    if (d >= head_dim || w_page[i] == 0xFFFFFFFFu) {
+    if (d >= head_dim || w_page[w] == 0xFFFFFFFFu) {
         return;
     }
     uint row = uint(params.n_kv_heads) * head_dim;
-    uint dst = w_off[i] * row + h * head_dim + d;
+    uint dst = w_off[w] * row + h * head_dim + d;
     uint src = i * (params.src_row_stride > 0 ? uint(params.src_row_stride) : row) + h * head_dim + d;
-    k_pages[w_page[i] * params.k_page_stride + (dst >> 1)] = k_new[src >> 1];
-    v_pages[w_page[i] * params.v_page_stride + (dst >> 1)] = v_new[src >> 1];
+    k_pages[w_page[w] * params.k_page_stride + (dst >> 1)] = k_new[src >> 1];
+    v_pages[w_page[w] * params.v_page_stride + (dst >> 1)] = v_new[src >> 1];
 }
 
 // pie:instantiate attn_kv_append_bf16 PIE_GROUP_X=64

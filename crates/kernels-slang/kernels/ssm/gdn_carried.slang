@@ -70,7 +70,7 @@ struct Params {
     uint u_at;
     uint u_row;
 };
-PIE_PARAMS(11, Params, params);
+PIE_PARAMS_FIRED(11, Params, params);
 
 PIE_POOL_READ(uint4, params.seg_words / 4u)
 PIE_STATE_PIECES
@@ -230,8 +230,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (dk != uint(PIE_DK) || dv > uint(PIE_GROUP_X)) {
         return;
     }
-    uint lane = uint(params.lane0) + r;
-    uint row = params.row0 + r;
+    uint lane = uint(PIE_FIRE(lane0)) + r;
+    uint row = PIE_FIRE(row0) + r;
     // The lane's column of the committed state, found once (a state row
     // lies in one slot, so in one segment) and loaded first: its loads, the
     // step's largest, overlap all that follows. A lane naming no record

@@ -76,12 +76,57 @@ fn the_norms_answer_the_reference() {
             let y = gpu.zeros(n);
             let (xs, ys) = (st(x, rows, width), st(y, rows, width));
             gpu.run(|s| match i {
-                0 => slang::rmsnorm(s, xs, st(w, 1, width), eps, ys),
-                1 => slang::rmsnorm_plus_one(s, xs, st(w, 1, width), eps, ys),
-                2 => slang::rmsnorm_per_head(s, xs, st(hw, 1, head), head as u32, eps, ys),
-                3 => slang::rmsnorm_per_head_plus_one(s, xs, st(hw, 1, head), head as u32, eps, ys),
-                4 => slang::rmsnorm_grouped_plus_one(s, xs, st(w, 1, width), head as u32, eps, ys),
-                _ => slang::rmsnorm_no_scale(s, xs, head as u32, eps, ys),
+                0 => slang::rmsnorm(
+                    s,
+                    xs,
+                    st(w, 1, width),
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                1 => slang::rmsnorm_plus_one(
+                    s,
+                    xs,
+                    st(w, 1, width),
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                2 => slang::rmsnorm_per_head(
+                    s,
+                    xs,
+                    st(hw, 1, head),
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                3 => slang::rmsnorm_per_head_plus_one(
+                    s,
+                    xs,
+                    st(hw, 1, head),
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                4 => slang::rmsnorm_grouped_plus_one(
+                    s,
+                    xs,
+                    st(w, 1, width),
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                _ => slang::rmsnorm_no_scale(
+                    s,
+                    xs,
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
             });
             close(
                 &gpu.down(y, n),
@@ -339,13 +384,20 @@ fn the_layernorms_answer_the_reference() {
                 bt(b, 1),
                 eps,
                 bt(y, rows),
+                kernels_slang::ssm::RowSpan::whole(bt(x, rows)),
             )
         });
         close(&gpu.down(y, n), &want, &format!("layernorm {shape}"));
         let want = layernorm_reference(&xr, width, eps, None);
         let y = gpu.zeros(n);
         gpu.run(|s| {
-            kernels_slang::elemwise::norm::layernorm_no_scale(s, bt(x, rows), eps, bt(y, rows))
+            kernels_slang::elemwise::norm::layernorm_no_scale(
+                s,
+                bt(x, rows),
+                eps,
+                bt(y, rows),
+                kernels_slang::ssm::RowSpan::whole(bt(x, rows)),
+            )
         });
         close(
             &gpu.down(y, n),
@@ -362,7 +414,13 @@ fn the_layernorms_answer_the_reference() {
             .collect();
         let x = gpu.up_f32(&xv);
         let y = gpu.zeros(2 * n);
-        gpu.run(|s| kernels_slang::elemwise::norm::layernorm_no_scale(s, ft(x), eps, ft(y)));
+        gpu.run(|s| kernels_slang::elemwise::norm::layernorm_no_scale(
+            s,
+            ft(x),
+            eps,
+            ft(y),
+            kernels_slang::ssm::RowSpan::whole(ft(x)),
+        ));
         let want = layernorm_reference(&xv, width, eps, None);
         close(
             &gpu.down_f32(y, n),

@@ -344,6 +344,7 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize])
         mask: t(mb, 1, rows * MASK_STRIDE, Dtype::U8),
         mask_words: t(eb, rows, 2, Dtype::U32),
         row0: 0,
+        table0: 0,
         rows: rows as u32,
     };
     Staged {
@@ -941,6 +942,7 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
         mask: t(mb, 1, 2 * MASK_STRIDE, Dtype::U8),
         mask_words: t(eb, 2, 2, Dtype::U32),
         row0: 0,
+        table0: 0,
         rows: 2,
     };
     // The reference: lineage start 25 for both rows.

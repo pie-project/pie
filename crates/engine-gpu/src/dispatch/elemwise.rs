@@ -21,54 +21,70 @@ impl<B: Backend> Run<'_, B> {
                 eps,
                 y,
                 axis: NormAxis::Row,
-            } => kernels_slang::elemwise::norm::rmsnorm(
-                self.ctx,
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::rmsnorm(
+                    self.ctx,
+                    x,
+                    self.tensor(*weight),
+                    *eps,
+                    y,
+                    window,
+                )
+            }
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::Scale(weight),
                 axis: NormAxis::Head(head_dim),
                 eps,
                 y,
-            } => kernels_slang::elemwise::norm::rmsnorm_per_head(
-                self.ctx,
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::rmsnorm_per_head(
+                    self.ctx,
+                    x,
+                    self.tensor(*weight),
+                    *head_dim,
+                    *eps,
+                    y,
+                    window,
+                )
+            }
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),
                 eps,
                 y,
                 axis: NormAxis::Row,
-            } => kernels_slang::elemwise::norm::rmsnorm_plus_one(
-                self.ctx,
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::rmsnorm_plus_one(
+                    self.ctx,
+                    x,
+                    self.tensor(*weight),
+                    *eps,
+                    y,
+                    window,
+                )
+            }
             Elemwise::Rmsnorm {
                 x,
                 weight: NormWeight::PlusOne(weight),
                 axis: NormAxis::Head(head_dim),
                 eps,
                 y,
-            } => kernels_slang::elemwise::norm::rmsnorm_per_head_plus_one(
-                self.ctx,
-                self.tensor(*x),
-                self.tensor(*weight),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::rmsnorm_per_head_plus_one(
+                    self.ctx,
+                    x,
+                    self.tensor(*weight),
+                    *head_dim,
+                    *eps,
+                    y,
+                    window,
+                )
+            }
             // A row norm the tensor-parallel ranks split is served on CUDA.
             Elemwise::SumSquares { .. } | Elemwise::RmsnormBy { .. } => {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
@@ -88,13 +104,17 @@ impl<B: Backend> Run<'_, B> {
                 eps,
                 y,
                 weight: NormWeight::None,
-            } => kernels_slang::elemwise::norm::rmsnorm_no_scale(
-                self.ctx,
-                self.tensor(*x),
-                *head_dim,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::rmsnorm_no_scale(
+                    self.ctx,
+                    x,
+                    *head_dim,
+                    *eps,
+                    y,
+                    window,
+                )
+            }
 
             Elemwise::Layernorm {
                 x,
@@ -102,14 +122,18 @@ impl<B: Backend> Run<'_, B> {
                 bias: Some(bias),
                 eps,
                 y,
-            } => kernels_slang::elemwise::norm::layernorm(
-                self.ctx,
-                self.tensor(*x),
-                self.tensor(*weight),
-                self.tensor(*bias),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::layernorm(
+                    self.ctx,
+                    x,
+                    self.tensor(*weight),
+                    self.tensor(*bias),
+                    *eps,
+                    y,
+                    window,
+                )
+            }
 
             Elemwise::Clamp {
                 x,
@@ -142,12 +166,16 @@ impl<B: Backend> Run<'_, B> {
                 y,
                 weight: None,
                 bias: None,
-            } => kernels_slang::elemwise::norm::layernorm_no_scale(
-                self.ctx,
-                self.tensor(*x),
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::layernorm_no_scale(
+                    self.ctx,
+                    x,
+                    *eps,
+                    y,
+                    window,
+                )
+            }
             Elemwise::Modulate {
                 x,
                 m,
@@ -257,25 +285,31 @@ impl<B: Backend> Run<'_, B> {
                 rotary_dim,
                 head_dim,
                 x_out: _,
-            } => kernels_slang::elemwise::rope::axes(
-                self.ctx,
-                self.tensor(*x),
-                self.tensor(*positions),
-                *dims,
-                *thetas,
-                match form {
-                    poem_ir::RopeForm::Interleaved => {
-                        kernels_slang::elemwise::rope::RopeForm::Interleaved
-                    }
-                    poem_ir::RopeForm::Neox => kernels_slang::elemwise::rope::RopeForm::Neox,
-                    poem_ir::RopeForm::Split => kernels_slang::elemwise::rope::RopeForm::Split,
-                    poem_ir::RopeForm::SplitLadder => {
-                        kernels_slang::elemwise::rope::RopeForm::SplitLadder
-                    }
-                },
-                *rotary_dim,
-                *head_dim,
-            ),
+            } => {
+                let ([x], window) = self.windowed([*x]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::axes(
+                    self.ctx,
+                    x,
+                    positions,
+                    window,
+                    pos0,
+                    *dims,
+                    *thetas,
+                    match form {
+                        poem_ir::RopeForm::Interleaved => {
+                            kernels_slang::elemwise::rope::RopeForm::Interleaved
+                        }
+                        poem_ir::RopeForm::Neox => kernels_slang::elemwise::rope::RopeForm::Neox,
+                        poem_ir::RopeForm::Split => kernels_slang::elemwise::rope::RopeForm::Split,
+                        poem_ir::RopeForm::SplitLadder => {
+                            kernels_slang::elemwise::rope::RopeForm::SplitLadder
+                        }
+                    },
+                    *rotary_dim,
+                    *head_dim,
+                )
+            }
             Elemwise::Act {
                 x,
                 x_out: _,
@@ -307,14 +341,18 @@ impl<B: Backend> Run<'_, B> {
                 axis: NormAxis::Group(group),
                 eps,
                 y,
-            } => kernels_slang::elemwise::norm::rmsnorm_grouped_plus_one(
-                self.ctx,
-                self.tensor(*x),
-                self.tensor(*weight),
-                *group,
-                *eps,
-                self.tensor(*y),
-            ),
+            } => {
+                let ([x, y], window) = self.windowed([*x, *y]);
+                kernels_slang::elemwise::norm::rmsnorm_grouped_plus_one(
+                    self.ctx,
+                    x,
+                    self.tensor(*weight),
+                    *group,
+                    *eps,
+                    y,
+                    window,
+                )
+            }
             Elemwise::Act {
                 scale: Some(s),
                 x,
@@ -488,15 +526,21 @@ impl<B: Backend> Run<'_, B> {
                 k_out: _,
                 turn: poem_ir::Turn::Full { interleaved, .. },
                 ..
-            } => kernels_slang::elemwise::rope::full(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *head_dim,
-                *theta,
-                *interleaved,
-            ),
+            } => {
+                let ([q, k], window) = self.windowed([*q, *k]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::full(
+                    self.ctx,
+                    q,
+                    k,
+                    positions,
+                    window,
+                    pos0,
+                    *head_dim,
+                    *theta,
+                    *interleaved,
+                )
+            }
             Elemwise::Rope {
                 q,
                 k: Some(k),
@@ -511,16 +555,22 @@ impl<B: Backend> Run<'_, B> {
                         rotary_dim, span, ..
                     },
                 ..
-            } => kernels_slang::elemwise::rope::partial(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *rotary_dim,
-                *head_dim,
-                *theta,
-                *span,
-            ),
+            } => {
+                let ([q, k], window) = self.windowed([*q, *k]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::partial(
+                    self.ctx,
+                    q,
+                    k,
+                    positions,
+                    window,
+                    pos0,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                    *span,
+                )
+            }
             Elemwise::Rope {
                 q,
                 k: Some(k),
@@ -538,16 +588,22 @@ impl<B: Backend> Run<'_, B> {
                         ..
                     },
                 ..
-            } => kernels_slang::elemwise::rope::mrope_interleaved(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *sections,
-                *rotary_dim,
-                *head_dim,
-                *theta,
-            ),
+            } => {
+                let ([q, k], window) = self.windowed([*q, *k]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::mrope_interleaved(
+                    self.ctx,
+                    q,
+                    k,
+                    positions,
+                    window,
+                    pos0,
+                    *sections,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                )
+            }
 
             Elemwise::Rope {
                 q,
@@ -566,16 +622,22 @@ impl<B: Backend> Run<'_, B> {
                         ..
                     },
                 ..
-            } => kernels_slang::elemwise::rope::mrope_split(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *sections,
-                *rotary_dim,
-                *head_dim,
-                *theta,
-            ),
+            } => {
+                let ([q, k], window) = self.windowed([*q, *k]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::mrope_split(
+                    self.ctx,
+                    q,
+                    k,
+                    positions,
+                    window,
+                    pos0,
+                    *sections,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                )
+            }
 
             Elemwise::Rope {
                 q,
@@ -594,16 +656,22 @@ impl<B: Backend> Run<'_, B> {
                         ..
                     },
                 ..
-            } => kernels_slang::elemwise::rope::mrope_blocked(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *sections,
-                *rotary_dim,
-                *head_dim,
-                *theta,
-            ),
+            } => {
+                let ([q, k], window) = self.windowed([*q, *k]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::mrope_blocked(
+                    self.ctx,
+                    q,
+                    k,
+                    positions,
+                    window,
+                    pos0,
+                    *sections,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                )
+            }
             Elemwise::Rope {
                 q,
                 positions,
@@ -617,15 +685,21 @@ impl<B: Backend> Run<'_, B> {
                         rotary_dim, span, ..
                     },
                 ..
-            } => kernels_slang::elemwise::rope::partial_q(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*positions),
-                *rotary_dim,
-                *head_dim,
-                *theta,
-                *span,
-            ),
+            } => {
+                let ([q], window) = self.windowed([*q]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::partial_q(
+                    self.ctx,
+                    q,
+                    positions,
+                    window,
+                    pos0,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                    *span,
+                )
+            }
             Elemwise::Rope {
                 q,
                 positions,
@@ -642,22 +716,28 @@ impl<B: Backend> Run<'_, B> {
                         ..
                     },
                 ..
-            } => kernels_slang::elemwise::rope::partial_last(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*positions),
-                *rotary_dim,
-                *head_dim,
-                *theta,
-                *interleaved,
-                *inverse,
-                yarn.map(|y| kernels_slang::elemwise::rope::Yarn {
-                    factor: y.factor,
-                    beta_fast: y.beta_fast,
-                    beta_slow: y.beta_slow,
-                    original_max_position: y.original_max_position,
-                }),
-            ),
+            } => {
+                let ([q], window) = self.windowed([*q]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::partial_last(
+                    self.ctx,
+                    q,
+                    positions,
+                    window,
+                    pos0,
+                    *rotary_dim,
+                    *head_dim,
+                    *theta,
+                    *interleaved,
+                    *inverse,
+                    yarn.map(|y| kernels_slang::elemwise::rope::Yarn {
+                        factor: y.factor,
+                        beta_fast: y.beta_fast,
+                        beta_slow: y.beta_slow,
+                        original_max_position: y.original_max_position,
+                    }),
+                )
+            }
             Elemwise::Rope {
                 q,
                 k: Some(k),
@@ -681,20 +761,26 @@ impl<B: Backend> Run<'_, B> {
                         ..
                     },
                 ..
-            } => kernels_slang::elemwise::rope::yarn(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
-                *head_dim,
-                *theta,
-                *factor,
-                *beta_fast,
-                *beta_slow,
-                *attention_factor,
-                *original_max_position,
-                *interleaved,
-            ),
+            } => {
+                let ([q, k], window) = self.windowed([*q, *k]);
+                let (positions, pos0, _) = self.rowed(*positions);
+                kernels_slang::elemwise::rope::yarn(
+                    self.ctx,
+                    q,
+                    k,
+                    positions,
+                    window,
+                    pos0,
+                    *head_dim,
+                    *theta,
+                    *factor,
+                    *beta_fast,
+                    *beta_slow,
+                    *attention_factor,
+                    *original_max_position,
+                    *interleaved,
+                )
+            }
 
             // The pairs no builder makes.
             Elemwise::Rope { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),

@@ -17,13 +17,13 @@ struct Params {
     // whole, bound once whatever window a fire cuts.
     uint row0;
 };
-PIE_PARAMS(4, Params, params);
+PIE_PARAMS_FIRED(4, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint h = gid.x;
-    uint t = params.row0 + gid.y;
+    uint t = PIE_FIRE(row0) + gid.y;
     uint vh = uint(params.v_heads);
     if (h >= vh) {
         return;
