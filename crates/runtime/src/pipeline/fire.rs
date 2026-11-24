@@ -2651,6 +2651,22 @@ impl PendingOp {
         }
     }
 
+    /// Tells the scheduler that the process waits on this fire's output:
+    /// until it settles, its lane submits nothing, and no frame waits on it.
+    pub(crate) fn tell_awaited(&self) {
+        match self {
+            PendingOp::Fire(PendingFire {
+                completion,
+                engine,
+                lane: Some(lane),
+                ..
+            }) => crate::scheduler::worker::notify_lane_waits(*engine, *lane, completion.clone()),
+            PendingOp::Fire(_) => {}
+            #[cfg(test)]
+            PendingOp::TestStub => {}
+        }
+    }
+
     fn completion_signal(&self) -> OpSignal {
         match self {
             PendingOp::Fire(fire) => OpSignal::Fire(fire.completion.clone()),
@@ -3110,6 +3126,9 @@ pub struct PendingFire {
     failure: PipelineFailure,
     /// A dropped pass whose last fire this is; it closes when the fire settles.
     retired: Option<Box<crate::pipeline::instance::BoundForwardPass>>,
+    /// The scheduler lane it fired on: a process waiting on its output
+    /// tells that lane's frames not to wait for it.
+    lane: Option<crate::scheduler::ProcessId>,
 }
 
 /// Hands a dropped pass to its last pending fire, or back if none is pending.
@@ -3711,6 +3730,16 @@ fn trace_channel_wait(waiting_on_reader: bool, waiting_on_fire: bool) {
         waiting_on_fire,
         "guest parks on a channel"
     );
+}
+
+/// The process is about to wait on its pipeline's oldest fire: its lane
+/// tells the scheduler so ([`PendingOp::tell_awaited`]).
+pub(crate) fn tell_front_awaited(fires: Option<&PendingFires>) {
+    if let Some(fires) = fires
+        && let Some(front) = fires.lock().unwrap().front()
+    {
+        front.tell_awaited();
+    }
 }
 
 pub(crate) async fn await_channel_progress(
@@ -5531,6 +5560,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     cells: cells.clone(),
                     failure: pipeline_failure.clone(),
                     retired: None,
+                    lane: Some(quorum_pipeline_id),
                 },
             );
             // The next piece reads the KV this one writes: they run in
@@ -6355,6 +6385,7 @@ async fn finalize_fire_await(fire: PendingFire) -> FinalizeOutcome {
         cells,
         failure,
         retired,
+        lane: _,
     } = fire;
     let prior_failure = failure.lock().unwrap().clone();
     let result = completion.await;
@@ -7121,6 +7152,7 @@ async fn fire_device_geometry<C: FireContext>(
             cells,
             failure: pipeline_failure,
             retired: None,
+            lane: Some(quorum_pipeline_id),
         },
     );
     Ok(Ok(()))
@@ -7427,6 +7459,7 @@ pub(crate) mod lifecycle_tests {
                 cells,
                 failure: failure.clone(),
                 retired: None,
+                lane: None,
             }));
         (fires, completion, ws, stores, failure)
     }
@@ -10569,6 +10602,7 @@ pub(crate) mod fold_tests {
             cells: Vec::new(),
             failure: failure.clone(),
             retired: None,
+            lane: None,
         };
         // Its rows land where the device says: the cursor no longer knows
         // where they end.

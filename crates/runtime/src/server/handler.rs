@@ -298,6 +298,14 @@ impl Session {
                         serde_json::Value::from(inf.fire.quorum.dispatch_blocked_holds),
                     );
                     stats.insert(
+                        format!("{}.fire.quorum.frames_parked_on_lane", model_name),
+                        serde_json::Value::from(inf.fire.quorum.frames_parked_on_lane),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.frames_past_waiting_lane", model_name),
+                        serde_json::Value::from(inf.fire.quorum.frames_past_waiting_lane),
+                    );
+                    stats.insert(
                         format!("{}.fire.quorum.device_idle_us", model_name),
                         serde_json::Value::from(inf.fire.quorum.device_idle_us),
                     );
