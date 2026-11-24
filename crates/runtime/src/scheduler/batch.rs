@@ -164,6 +164,38 @@ fn check_step(lanes: &[::engine::Lane], limits: &SchedulerLimits) {
     }
 }
 
+/// The stated shape a step of `group` is of, as the fire carries it
+/// (CONTRACT-BC 24): what [`::engine::StepShapes::shape_of`] answers for the
+/// composition its members make, the one `StepGroup::accepts` held to the
+/// set. `Ok(None)` where the limits state no set. A step no stated shape
+/// holds is a runtime bug (the builder forms none): its gap, named.
+fn stated_shape(
+    group: &[Box<PendingRequest>],
+    limits: &SchedulerLimits,
+) -> Result<Option<::engine::FireShape>, ::engine::StepGap> {
+    let Some(shapes) = limits.shapes else {
+        return Ok(None);
+    };
+    let step = group
+        .iter()
+        .fold(::engine::StepComposition::default(), |step, request| {
+            step.with(composition(request))
+        });
+    shapes.fire_shape(&step).map(Some)
+}
+
+/// The stated shape a step of `lanes` is of in `shapes`, stated again once
+/// members are stripped from a formed step (`scheduler::lane`); `Ok(None)`
+/// where no set is stated.
+pub(crate) fn restated_shape(
+    shapes: Option<&::engine::StepShapes>,
+    lanes: &[::engine::Lane],
+) -> Result<Option<::engine::FireShape>, ::engine::StepGap> {
+    shapes.map_or(Ok(None), |shapes| {
+        shapes.fire_shape(&::engine::StepComposition::of(lanes)).map(Some)
+    })
+}
+
 /// The verify classes of `request`'s lanes ([`crate::model::Model::verify_class`]),
 /// sorted: a step holds requests of one such set, the empty one for every
 /// request that verifies nothing.
@@ -591,6 +623,24 @@ pub(crate) fn build_frame_submission(
     let mut flattened: Vec<Box<PendingRequest>> = Vec::new();
 
     for group in step_groups {
+        // The step's stated shape, carried by its fire. A step outside the
+        // set is a runtime bug: a debug build stops on it; a release build
+        // refuses its members by name, never posting an unstated shape.
+        let shape = match stated_shape(&group, &limits) {
+            Ok(shape) => shape,
+            Err(gap) => {
+                debug_assert!(false, "the step builder formed {gap}");
+                let reason = format!(
+                    "scheduler: the step builder formed {gap} (a runtime bug): its fires fail, \
+                     never posted"
+                );
+                tracing::error!("{reason}");
+                for request in &group {
+                    request.completion.reject_unsubmitted(reason.clone());
+                }
+                continue;
+            }
+        };
         let facts: Vec<fire_plan::MemberFacts> = group
             .iter()
             .enumerate()
@@ -671,11 +721,13 @@ pub(crate) fn build_frame_submission(
                 attachments,
                 media: build.media,
                 voxels: build.voxels,
+                shape,
             },
             terminal_cells: build.terminal_cells,
             completions: build.completions,
             member_lanes: build.member_lane_indptr,
             instances,
+            shapes: limits.shapes,
         });
         flattened.extend(group);
     }
@@ -1849,9 +1901,52 @@ mod tests {
                     for step in compositions(&frame) {
                         shapes.holds(&step).unwrap_or_else(|gap| panic!("{gap}"));
                     }
+                    for step in &frame.steps {
+                        let shape = step.submission.shape.expect("a formed step carries its shape");
+                        shapes
+                            .agrees(shape, &step.submission.lanes)
+                            .unwrap_or_else(|why| panic!("{why}"));
+                    }
                 }
             }
         }
+    }
+
+    /// A formed step carries the stated shape its composition is of
+    /// (CONTRACT-BC 24): folded decodes their folded decode shape; folded
+    /// decodes beside a buffered decode and a prompt the buffered mixed
+    /// shape, the step's treatment the buffered one any lane buffering makes.
+    #[test]
+    fn a_formed_step_carries_its_stated_shape() {
+        let base = limits();
+        let shapes = stated(base, &[4, 16, 64], true);
+        let limits = holding(base, shapes.clone());
+        let carried = |wave: Vec<Box<PendingRequest>>| {
+            let (frame, _) =
+                build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+            assert_eq!(frame.steps.len(), 1, "one step");
+            let step = &frame.steps[0];
+            let shape = step.submission.shape.expect("a formed step carries its shape");
+            let composition = ::engine::StepComposition::of(&step.submission.lanes);
+            assert_eq!(Some(shape.id as usize), shapes.shape_of(&composition), "{composition}");
+            assert_eq!(shape.treatment, shapes.shapes[shape.id as usize].treatment);
+            assert!(shapes.agrees(shape, &step.submission.lanes).is_ok());
+            (shape, shapes.shapes[shape.id as usize].clone())
+        };
+
+        let (shape, stated) =
+            carried((0..3).map(|i| pending(decode(1, 1), InstanceId(i))).collect());
+        assert_eq!(shape.treatment, ::engine::Treatment::Folds);
+        assert_eq!(stated.kind, ::engine::StepKind::Decode);
+
+        let mut wave: Vec<Box<PendingRequest>> =
+            (0..2).map(|i| pending(decode(1, 1), InstanceId(i))).collect();
+        wave.push(buffered_decode(5));
+        wave.push(prompt(6, 6));
+        let (shape, stated) = carried(wave);
+        assert_eq!(shape.treatment, ::engine::Treatment::Buffers, "{stated}");
+        assert_eq!(stated.kind, ::engine::StepKind::Mixed, "{stated}");
+        assert_eq!(stated.treatment, ::engine::Treatment::Buffers, "{stated}");
     }
 
     /// A load that states no mixed step: decodes and a prompt in one wave

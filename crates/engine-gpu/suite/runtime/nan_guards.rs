@@ -282,6 +282,7 @@ fn nan_guards_skip_real_nans_on_the_device() {
             }],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");

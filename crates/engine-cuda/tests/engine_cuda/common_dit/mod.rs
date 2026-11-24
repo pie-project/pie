@@ -674,6 +674,7 @@ pub fn frame(lanes: Vec<Lane>, attachments: Vec<Attachment>) -> FrameSubmission 
         attachments,
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     })
 }
 

@@ -91,6 +91,7 @@ impl Replay {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         };
         let mut tail = step.clone();
         for (lane, skipped) in tail.lanes.iter_mut().zip(cuts) {

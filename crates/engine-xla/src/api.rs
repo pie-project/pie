@@ -378,6 +378,11 @@ impl Xla {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;

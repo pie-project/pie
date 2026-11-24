@@ -362,6 +362,7 @@ fn four_ranks_land_what_one_rank_lands() {
             attachments,
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires on four ranks");
     group.settle_frame(&mut ticket).expect("the frame settles");

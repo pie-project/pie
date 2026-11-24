@@ -135,6 +135,7 @@ impl Bound {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .map_err(|e| e.to_string())?;
         self.engine

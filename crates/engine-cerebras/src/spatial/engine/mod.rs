@@ -659,6 +659,7 @@ mod tests {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }));
         assert!(refused.is_err());
         assert_eq!(live.tallied(Tally::Refused), 1);

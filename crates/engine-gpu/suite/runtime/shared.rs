@@ -294,6 +294,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");

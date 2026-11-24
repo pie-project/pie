@@ -786,6 +786,7 @@ impl Rig {
                 attachments,
                 media: Vec::new(),
                 voxels,
+                shape: None,
             }))
             .expect("the frame fires");
         self.engine

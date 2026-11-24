@@ -204,6 +204,7 @@ impl Rig {
                 attachments,
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         self.model
