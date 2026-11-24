@@ -189,6 +189,13 @@ fn out_of_range_tokens<B: Serve>(
         let Some(&id) = tokens.iter().find(|&&id| id >= vocab) else {
             continue;
         };
+        // A skip row (`engine::ports::SKIP_TOKEN`) is a contract id, not an
+        // out-of-range one; this engine does not carry skip rows yet.
+        let what = if id == engine::ports::SKIP_TOKEN {
+            "a skip row (token -1), which this engine does not carry yet".to_string()
+        } else {
+            format!("token {id}, out of range for a vocabulary of {vocab}")
+        };
         let lane_at = u32::try_from(at).unwrap_or(u32::MAX);
         match step
             .attachments
@@ -196,19 +203,12 @@ fn out_of_range_tokens<B: Serve>(
             .find(|attachment| attachment_lanes(attachment).contains(&lane_at))
         {
             Some(attachment) => {
-                let why = format!(
-                    "instance {}: token {id} is out of range for a vocabulary of {vocab}",
-                    attachment.instance
-                );
+                let why = format!("instance {}: {what}", attachment.instance);
                 envelope.refused(step, attachment, &why, faulted);
             }
             None => {
                 envelope.tokens[at] = Some(vec![0; lane.tokens.len()]);
-                faulted.fault_lanes(
-                    lane_at..lane_at + 1,
-                    None,
-                    &format!("token {id} is out of range for a vocabulary of {vocab}"),
-                );
+                faulted.fault_lanes(lane_at..lane_at + 1, None, &what);
             }
         }
     }
@@ -1123,7 +1123,7 @@ where
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
 
             ports: B::ports(),
-            geometry: GeometryClass::DecodeEnvelope,
+            geometry: GeometryClass::DeviceGeometry,
 
             kv_handle: None,
             media_encode: false,
@@ -1935,6 +1935,7 @@ impl<B: Host> Gpu<B> {
             feeds: vec![None; lanes],
         };
         B::envelope(self, submission, &mut envelope, &mut faulted)?;
+        let device = self.device_lanes(submission, &mut envelope, &mut faulted);
         if let Some(vocab) = self.vocab {
             out_of_range_tokens(submission, &mut envelope, vocab, &mut faulted);
         }
@@ -2155,14 +2156,18 @@ impl<B: Host> Gpu<B> {
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for (at, lane) in submission.lanes.iter().enumerate() {
-            // This load places every row itself (no `slots` port): a lane
-            // whose table is a working set's whole, for its program to
-            // place rows through, would land them in pages not its own.
-            if lane.list == engine::fire::ListKind::Translation {
+            // A lane whose table is a working set's whole, for its program
+            // to place rows through, is placed by its device-geometry ports
+            // ([`crate::program::device_lanes`], each row in
+            // `KvDelta::writable`), or refused already and sunk; any other
+            // would land rows in pages not its own.
+            let placed = device[at].as_ref().is_some_and(|placed| placed.have.is_some());
+            let refused = faulted.faulted.iter().any(|fault| fault.lane as usize == at);
+            if lane.list == engine::fire::ListKind::Translation && !placed && !refused {
                 return Err(Error::lane(
                     u32::try_from(at).unwrap_or(u32::MAX),
-                    "its kv table is a translation its program places rows through, and this \
-                     load resolves no `slots` port: it places no row a program states",
+                    "its kv table is a translation its program places rows through, and no \
+                     device-geometry port of an attached instance places its rows",
                 ));
             }
             pages_of.push(
@@ -2226,6 +2231,18 @@ impl<B: Host> Gpu<B> {
                 }
             }
         }
+        // A refused lane still fires (token 0) to keep the composition; one
+        // whose program places its rows has no run of its own the host may
+        // append to, so its rows land in the null chunk, never its table.
+        let sunk: Vec<bool> = submission
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(at, lane)| {
+                lane.list == engine::fire::ListKind::Translation
+                    && faulted.faulted.iter().any(|fault| fault.lane as usize == at)
+            })
+            .collect();
         let seated: Vec<Seated<'_, B>> = submission
             .lanes
             .iter()
@@ -2238,14 +2255,27 @@ impl<B: Host> Gpu<B> {
                     tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
                 },
                 pages: pages_of[at].as_deref().unwrap_or(&[]),
-                held: pages_of[at].is_some().then_some(lane.kv.held),
+                held: match device[at].as_ref().and_then(|placed| placed.have) {
+                    _ if sunk[at] => Some(0),
+                    Some(have) => Some(have),
+                    None => pages_of[at].is_some().then_some(lane.kv.held),
+                },
+                sunk: sunk[at],
                 folded: lane.kv.folded,
                 kv_less: lane.kv_less,
 
-                mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
+                mask: if sunk[at] {
+                    None
+                } else {
+                    resolved_masks[at].as_ref().or(lane.mask.as_ref())
+                },
 
                 adapter: lane_adapters[at].or(lane.adapter),
-                positions: &lane.positions,
+                positions: device[at]
+                    .as_ref()
+                    .and_then(|placed| placed.positions.as_deref())
+                    .unwrap_or(&lane.positions),
+                slots: device[at].as_ref().and_then(|placed| placed.slots.as_deref()),
 
                 readout: match &lane.readout {
                     Readout::Rows(rows) => Some(rows.as_slice()),
@@ -2368,6 +2398,72 @@ impl<B: Host> Gpu<B> {
                 fed,
             },
         ))
+    }
+}
+
+impl<B: Host> Gpu<B> {
+    /// Each lane's geometry as its instance's descriptor ports resolve it
+    /// ([`crate::program::device_lanes`]): device geometry's tokens,
+    /// positions, extent, slots and mask, and a decode envelope's positions
+    /// where its program computes them. The tokens and mask land in
+    /// `envelope`; an attachment whose ports refuse faults its own lanes.
+    fn device_lanes(
+        &self,
+        step: &Step,
+        envelope: &mut Envelope<B>,
+        faulted: &mut engine::StepOutcome,
+    ) -> Vec<Option<crate::program::DeviceLane>> {
+        let mut out: Vec<Option<crate::program::DeviceLane>> = vec![None; step.lanes.len()];
+        for attachment in program_attachments(step) {
+            let first = (attachment.lane as usize).min(step.lanes.len());
+            let end = attachment_lanes(attachment).end as usize;
+            let stated = &step.lanes[first..end.min(step.lanes.len())];
+            let resolved = self
+                .programs
+                .descriptor_ports(attachment.instance)
+                .and_then(|ports| match ports {
+                    Some(mut ports) => crate::program::device_lanes(
+                        &mut ports,
+                        stated,
+                        first,
+                        attachment.instance,
+                    )
+                    .map(Some),
+                    None => Ok(None),
+                });
+            match resolved {
+                Ok(None) => {}
+                Ok(Some(lanes)) => {
+                    for (at, placed) in lanes.into_iter().enumerate() {
+                        let at = first + at;
+                        if out[at].is_some() {
+                            envelope.refused(
+                                step,
+                                attachment,
+                                &format!(
+                                    "lane {at} is claimed by two attached instances; a lane's \
+                                     descriptor ports have one author"
+                                ),
+                                faulted,
+                            );
+                            break;
+                        }
+                        if let Some(tokens) = &placed.tokens {
+                            envelope.tokens[at] = Some(tokens.clone());
+                            envelope.feeds[at] = None;
+                        }
+                        if placed.mask.is_some() {
+                            envelope.masks[at].clone_from(&placed.mask);
+                        }
+                        out[at] = Some(placed);
+                    }
+                }
+                Err(refused) => {
+                    envelope.refused(step, attachment, &refused.to_string(), faulted);
+                }
+            }
+        }
+        out
     }
 }
 

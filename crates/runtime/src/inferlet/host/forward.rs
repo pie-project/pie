@@ -1268,9 +1268,10 @@ impl ProcessCtx {
                 Some(&rep) => super::working_set::kv_of(self, rep)?.engine,
                 None => crate::planner::engine_of(self.id()),
             };
-            // The class is chosen once, here; a pass whose geometry the host
-            // resolves while it is not host-derivable says why, by name
-            // (`pipeline::fire::host_geometry`), and its fires are counted.
+            // The class is chosen once, here; a pass whose program is
+            // host-evaluated says why, by name, and its fires are counted; one
+            // whose device class the engine cannot read is refused by name
+            // (`pipeline::fire::host_geometry`).
             let (devgeo, decode_envelope, geometry_class, host_geometry) = if float.is_none() {
                 use crate::pipeline::fire::{geometry as fire_geometry, host_geometry};
                 let spec = crate::engine::get_spec(engine)?;
@@ -1300,7 +1301,11 @@ impl ProcessCtx {
                     }),
                 };
                 let bound =
-                    host_geometry::classify(program, spec.device_geometry_port_mask, spec.kind);
+                    match host_geometry::classify(program, spec.device_geometry_port_mask, spec.kind)
+                    {
+                        Ok(bound) => bound,
+                        Err(lacks) => return Ok(Err(lacks.refusal(prog.hash))),
+                    };
                 if let Some(qo_indptr) = &bound.devgeo {
                     tracing::info!(
                         "device-carried decode ({} lane(s), {} row(s)) re-publishes \
@@ -1314,7 +1319,6 @@ impl ProcessCtx {
                     host_geometry::counter(host_geometry::FireKey {
                         engine,
                         kind: spec.kind,
-                        reason: host.reason(),
                         program: prog.hash,
                     })
                 });

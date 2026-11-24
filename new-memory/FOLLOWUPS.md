@@ -1456,3 +1456,13 @@ difference went away (5921 vs 5981, sd 132 / 216), so the profile's pick, not th
   across repeated rounds (re-time the near-ties, or widen the spread to the rounds' range), so a
   near-tie stays stated instead of a coin flip; or the export can mark near-ties so a reviewer sees
   which committed picks are noise-decided.
+
+## F75. Cerebras refuses device-geometry binds until it carries attn_mask / fold
+
+Since engine-gpu carries device geometry, an engine whose port mask lacks a
+port a program's device class needs refuses the bind by name
+(`runtime pipeline/fire/host_geometry.rs` `EngineLacks`) instead of serving
+it host-resolved. Cerebras advertises device geometry without `attn_mask` and
+`fold`, so beam search (a channel-fed mask) and any decode envelope with a
+device fold no longer bind there. It gets them back when its spatial engine
+reads those two ports from the device.
