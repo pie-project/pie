@@ -1649,3 +1649,15 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 **Idea.** A sweep per cap on MI300X over the shapes the served models fire (rocprofv3 on the kernel tests, the staging caps against the load's device-memory budget), each value then derived from what it bounds (the budget, the device's CUs, the pipeline's depth) or kept with its measurement stated.
 
 **Why later.** A value change re-measures what it fires; the cleanup PR changes no value.
+
+## F102. Split the large ETA emitter files
+
+**What.** `crates/eta-compiler/src/codegen/metal/streamed.rs` (2,175 lines; two functions under `allow(clippy::too_many_lines)` at :263 and :1157), `codegen/simt/stream.rs` (1,920) and `codegen/wgsl.rs` (1,641) each hold a whole emitter in one file. Split them along their schedule / step-kind seams, emitting byte-identical source (the `emitter_version` fingerprints pin it).
+
+**Why later.** It moves emitter code shared by every backend, so it needs a booted server on every backend; the cleanup pass changes no emitted code.
+
+## F99. engine-vulkan / engine-wgpu: one guest run, session and program in engine-gpu
+
+**What.** `crates/engine-{vulkan,wgpu}/src/guest/run.rs`, `guest/session.rs` and `program.rs` repeat each other (run bookkeeping, claims and pair runs, envelope tokens / mask, register / publish), but each backend holds its own pass / outbox and session types, so they move to engine-gpu behind shared traits (a generic `OnDevice<B>`, a session book, `Programs` default methods), not as plain moves.
+
+**Why later.** The shared traits are a design of their own; out of this PR's cleanup.

@@ -2087,17 +2087,6 @@ fn a_scattered_hybrid_pool_serves_the_same_logits() {
     scattered("qwen35-tiny");
 }
 
-/// A model with a compressed kv pool: its compressor state, rows of the list
-/// slots it describes, moves with the slots an evacuation moves.
-/// Ignored: dsv4-flash-mini does not serve here, before the pool as after
-/// (before it, its side planes overran a binding; now its index top-k
-/// refuses the index pool's pitch).
-#[test]
-#[ignore = "dsv4-flash-mini does not serve on this backend"]
-fn a_scattered_compressed_pool_serves_the_same_logits() {
-    scattered("dsv4-flash-mini");
-}
-
 /// A record cut over several slots (a chunk smaller than it, as
 /// `PIE_GOLDEN_CHUNK` forces on CUDA): the same logits, bit for bit, as the
 /// record in one slot, its pieces scattered and evacuated as above.

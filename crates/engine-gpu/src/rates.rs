@@ -216,6 +216,102 @@ pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
     keys
 }
 
+/// `chip` with every `[rates]` key a load at `max_submit` weighs by
+/// ([`keys_at`]) stated, by `engine::rates::resolve_at_load` (every
+/// engine's rule): as its layers state them where they state them all, else
+/// timed by `measure` and saved to `save`. Beside it, the workgroups the
+/// device holds at once: as the profile states them, or, where the load
+/// skips measuring and none does, timed by `time_resident` (milliseconds,
+/// stored nowhere, marked timed in the profile's `tuned`). A stale key's
+/// figure serves until the export round or `pie tune` measures it: its step
+/// needs device buffers of its own, which nothing lays after ready.
+///
+/// # Errors
+///
+/// The rates do not resolve, or the profile states no resident workgroups
+/// after the rates step.
+pub fn resolve_at_load(
+    chip: profile::Profile,
+    save: Option<engine::rates::SaveTo<'_>>,
+    room: u64,
+    max_submit: Option<std::time::Duration>,
+    measuring: engine::rates::Measuring,
+    measure: impl FnOnce(Option<std::time::Duration>, &Rates) -> Result<engine::rates::Measured>,
+    time_resident: impl FnOnce() -> Result<(f64, u128)>,
+) -> Result<(profile::Profile, u32)> {
+    let keys = keys_at(max_submit);
+    let lacked = chip.rates().missing(&keys);
+    if lacked.is_empty() {
+        tracing::info!(
+            "rates: every [rates] key the load weighs by is stated ({}); none measured",
+            keys.join(", ")
+        );
+    } else {
+        tracing::info!(
+            "rates: {} {}: no layer states them, or the user's file and the committed profile \
+             store them under no matching key (the stored measurements' lines say which)",
+            match measuring {
+                engine::rates::Measuring::Time => "measuring",
+                engine::rates::Measuring::Skip => "skipping (`[engine] measure = false`)",
+            },
+            lacked.join(", ")
+        );
+    }
+    let chip = engine::rates::resolve_at_load(
+        chip,
+        &keys,
+        save,
+        Some(room),
+        max_submit,
+        measuring,
+        engine::rates::StaleRates::Served,
+        |max_submit, stated| measure(max_submit, stated).map_err(|e| e.to_string()),
+    )
+    .map_err(|why| Fault::Device {
+        call: "rates at load",
+        why,
+    })?;
+    let stated = chip
+        .rates()
+        .resident_workgroups
+        .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32);
+    let resident = match (stated, measuring) {
+        (Some(resident), _) => {
+            tracing::info!(
+                resident,
+                "the workgroups the device holds at once, as its profile states them"
+            );
+            return Ok((chip, resident));
+        }
+        (None, engine::rates::Measuring::Skip) => {
+            // A device fact no driver states as such: timed, never defaulted.
+            let (resident, ms) = time_resident()?;
+            let resident = resident.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+            tracing::info!(
+                resident,
+                ms,
+                "rates: `[rates] {}` timed despite measure = false (no layer states it, and the \
+                 device states no count a guest step's grid can stride over): a {}-row matmul of \
+                 width {} against one workgroup of it, single fires; stored nowhere",
+                profile::rates::RESIDENT_WORKGROUPS,
+                RESIDENT_ROWS,
+                RESIDENT_SHAPE
+            );
+            resident
+        }
+        (None, engine::rates::Measuring::Time) => {
+            return Err(Fault::Device {
+                call: "rates at load",
+                why: "the profile states no [rates] resident_workgroups after the rates step"
+                    .into(),
+            });
+        }
+    };
+    let mut tuned = chip.tuned().clone();
+    tuned.timed.push(profile::rates::RESIDENT_WORKGROUPS.to_string());
+    Ok((chip.with_tuned(tuned), resident))
+}
+
 /// The rows of a prompt step the prefixed attention curve is timed at
 /// (`profile::rates::Rates::attn_tflops_by_rows_keys`): the prompt rungs a
 /// slang load on a bound-stating device lays its top at (wgpu's 512, native

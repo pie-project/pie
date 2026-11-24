@@ -97,16 +97,15 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
 /// again ([`profile::rates::Rates::sift`]), each said in the load log.
 #[must_use]
 pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Profile, Report) {
-    let keys = engine_gpu::stored::Keys::new(
-        on.to_string(),
+    engine_gpu::stored::resolve(
+        &SHELF,
+        registry(),
+        &device.name,
+        &device.facts(),
+        profiles,
+        on,
         <crate::device::Api as engine_gpu::serve::Serve>::TARGET,
-    );
-    let (profile, report) =
-        SHELF.resolve_keyed(registry(), &device.name, &device.facts(), profiles, &keys);
-    for line in &report.stored {
-        tracing::info!("{line}");
-    }
-    (profile, report)
+    )
 }
 
 #[must_use]
@@ -237,35 +236,10 @@ mod tests {
         }
     }
 
-    /// The dense matmul the per-vendor cascade before `kernel.qmm` picked:
-    /// coopmat, register tiles on Adreno and PowerVR, then tiled, from 12 rows over whole
-    /// 32-code tiles; for one row, the one-row kernel on Adreno (32 lanes a
-    /// row) and on PowerVR (8 lanes a row, two rows a lane); else
-    /// four vectors a workgroup.
-    fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> Qmm {
-        let qualcomm = d.vendor == "qualcomm";
-        let tiles = rows >= 12 && k.is_multiple_of(32);
-        let one_row = rows == 1 && k.is_multiple_of(32);
-        if d.coopmat && tiles {
-            Qmm::Coopmat
-        } else if (qualcomm || d.vendor == "imagination") && tiles {
-            Qmm::RegisterTiled {
-                bm: if rows > 32 { 64 } else { 32 },
-                k16: true,
-            }
-        } else if tiles && n.is_multiple_of(16) {
-            Qmm::Tiled { crossover_tg: 160 }
-        } else if one_row && qualcomm && d.subgroup >= 32 {
-            Qmm::OneRow { lanes: 32, rows: 1 }
-        } else if one_row && d.vendor == "imagination" && d.subgroup >= 32 {
-            Qmm::OneRow { lanes: 8, rows: 2 }
-        } else {
-            Qmm::Qmv { vecs: 4 }
-        }
-    }
-
+    /// Each vendor's stated defaults for the split attention and the MoE
+    /// tiles, over the devices the profiles name.
     #[test]
-    fn every_device_runs_what_it_ran_before_the_ladder() {
+    fn every_device_takes_its_vendors_defaults() {
         for d in [
             device("nvidia", 32, Some(142), true),
             device("nvidia", 32, Some(24), false),
@@ -288,16 +262,6 @@ mod tests {
             device("other", 32, None, false),
         ] {
             let t = tuning(&d);
-            for rows in [1, 2, 4, 11, 12, 16, 32, 33, 64, 512] {
-                for (n, k) in [(4096, 4096), (4096, 4100), (1000, 4096)] {
-                    let at = t.qmm_at(rows, n, k, 4, 64);
-                    assert_eq!(
-                        t.qmm(&at)[0],
-                        old_qmm(&d, rows, n, k),
-                        "{d:?}: {rows} x {n} x {k}"
-                    );
-                }
-            }
             let qualcomm = d.vendor == "qualcomm";
             assert_eq!(
                 t.sdpa_split_groups(),

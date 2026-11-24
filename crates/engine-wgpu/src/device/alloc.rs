@@ -12,6 +12,8 @@ use engine_gpu::error::{Fault, Result};
 use super::ctx::{Context, Core, note_reservation};
 use super::host::Signal;
 
+/// One `pread` a load's file read is cut into: far under the 2 GiB a Linux
+/// read moves at once, large enough that the calls cost nothing beside it.
 #[cfg(not(target_arch = "wasm32"))]
 const PREAD_CHUNK: u64 = 256 << 20;
 

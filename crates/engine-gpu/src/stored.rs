@@ -122,6 +122,29 @@ pub fn code_of_all(target: Target, kernels: &BTreeSet<Kernel>) -> Result<u32> {
     Ok(profile::rates::fingerprint(&bytes))
 }
 
+/// `shelf`'s profile for a load on the device `on` names (its vendor,
+/// device id and driver), its kernels built for `target`: the measurements
+/// the user's file stores kept where their keys match this build on this
+/// device, the rest dropped to be measured again
+/// ([`profile::rates::Rates::sift`]), each said in the load log.
+#[must_use]
+pub fn resolve(
+    shelf: &profile::Shelf,
+    registry: &profile::Registry,
+    device: &str,
+    facts: &profile::Facts,
+    profiles: Option<&std::path::Path>,
+    on: &str,
+    target: Target,
+) -> (profile::Profile, profile::Report) {
+    let keys = Keys::new(on.to_string(), target);
+    let (profile, report) = shelf.resolve_keyed(registry, device, facts, profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
+}
+
 /// The version of the method that measures `what` (a `[rates]` key), as
 /// the measuring code states it beside itself; `None` where no method of
 /// this build measures it.
