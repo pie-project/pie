@@ -19,16 +19,24 @@ pub const JOB_INTS: u32 = 4;
 /// pieces and words its ring's keys and values lie at, and its ring rows.
 pub const LAYER_INTS: u32 = 9;
 
-/// Moves the rows `jobs` names for every layer in `layers`, one dispatch:
-/// the table opens with the layers' entries ([`LAYER_INTS`] each, in
-/// `layers`' order), then the jobs' count, then [`JOB_INTS`] a job (source
-/// slot unit and row, destination slot unit or `-1 - lane` for that lane's
-/// ring, and the slot's row or the ring row's index), at most `most` jobs:
-/// a fire dispatches the same grid whatever its jobs, so a recording replays
-/// it. A ring row lands at its index modulo the layer's ring rows, those
-/// `rows` or more below the lane's folded index after the fire
-/// (`Ring::lanes`' fourth int) dropped.
-pub fn fold(ctx: &Ctx<'_>, layers: &[&KvPool], jobs: Tensor, most: u32) -> Result<(), Error> {
+/// Moves the rows of one phase of `jobs` for every layer in `layers`, one
+/// dispatch: the table opens with the layers' entries ([`LAYER_INTS`] each,
+/// in `layers`' order); the phase's jobs' count lies at int `jobs_at`, then
+/// [`JOB_INTS`] a job (source slot unit, or `-1 - lane` for that lane's
+/// ring, and its row; destination slot unit or `-1 - lane` for that lane's
+/// ring, and the slot's row or the ring row's index), at most `most` jobs,
+/// which `rows` rows of workgroups stride over: a fire dispatches the same
+/// grid whatever its jobs, so a recording replays it. A ring row lands at
+/// its index modulo the layer's ring rows, those `rows` or more below its
+/// lane's folded index after the fire (`Ring::lanes`' fourth int) dropped.
+pub fn fold(
+    ctx: &Ctx<'_>,
+    layers: &[&KvPool],
+    jobs: Tensor,
+    jobs_at: u32,
+    most: u32,
+    rows: u32,
+) -> Result<(), Error> {
     const OP: &str = "attn.ring_fold";
     let Some(first) = layers.first() else {
         return Ok(());
@@ -40,7 +48,12 @@ pub fn fold(ctx: &Ctx<'_>, layers: &[&KvPool], jobs: Tensor, most: u32) -> Resul
         return Err(refuse(OP, "the fold's job and record tables are i32"));
     }
     let count = u32::try_from(layers.len()).map_err(|_| refuse(OP, "too many layers"))?;
-    let need = u64::from(count) * u64::from(LAYER_INTS) + 1 + u64::from(most) * u64::from(JOB_INTS);
+    if u64::from(jobs_at) < u64::from(count) * u64::from(LAYER_INTS) {
+        return Err(refuse(OP, "a phase's jobs inside the table's layer entries"));
+    }
+    let need = u64::from(jobs_at).max(u64::from(count) * u64::from(LAYER_INTS))
+        + 1
+        + u64::from(most) * u64::from(JOB_INTS);
     if u64::from(jobs.rows) * u64::from(jobs.width) < need {
         return Err(refuse(
             OP,
@@ -77,11 +90,12 @@ pub fn fold(ctx: &Ctx<'_>, layers: &[&KvPool], jobs: Tensor, most: u32) -> Resul
         nonzero(OP, "the ring's rows", at.rows)?;
         widest = widest.max(row_words);
     }
-    if most == 0 {
+    let rows = rows.min(most);
+    if rows == 0 {
         return Ok(());
     }
     ctx.fire(
-        Fire::at(RING, "attn_ring_fold").apply(Grid::of([2 * widest, most, count], [64, 1, 1])),
+        Fire::at(RING, "attn_ring_fold").apply(Grid::of([2 * widest, rows, count], [64, 1, 1])),
         &[
             &[jobs.arg(), ring.lanes.arg()][..],
             &first.pool.args(true),
@@ -90,6 +104,8 @@ pub fn fold(ctx: &Ctx<'_>, layers: &[&KvPool], jobs: Tensor, most: u32) -> Resul
                 ring.pieces.arg(),
                 ring.slot_stride.arg(),
                 count.arg(),
+                jobs_at.arg(),
+                rows.arg(),
             ],
         ]
         .concat(),

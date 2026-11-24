@@ -18,8 +18,15 @@
 // lies `ring_rows` or more below the lane's folded index after the fire
 // (`lanes[(6 + pieces) lane + 3]`), so a layer of a narrower ring than the
 // jobs were laid for drops the rows past it. A job moves one row's keys and
-// values, a u32 word a lane. No two jobs of a fire land on one destination
-// row, and none reads a row another writes.
+// values, a u32 word a lane. A source unit below 0 is the ring of lane
+// `-1 - unit`, its row `r` at place `r % ring_rows` (a snapshot's rows
+// below the lane's folded index, read before the fold writes the ring). No
+// two jobs of a phase land on one destination row, and none reads a row
+// another writes.
+//
+// A dispatch runs one phase: the jobs whose count lies at `jobs_at` (the
+// snapshots' before the fold's), its workgroups striding over them by the
+// grid's rows, so a fire's grid is one whatever its jobs.
 
 [[vk::binding(0)]] StructuredBuffer<int> jobs;
 [[vk::binding(1)]] StructuredBuffer<int> lanes;
@@ -32,6 +39,9 @@ struct Params {
     uint pieces;
     uint slot_stride;
     uint layers;
+    // The phase's count, an int index of `jobs`; the grid's job rows.
+    uint jobs_at;
+    uint stride;
 };
 PIE_PARAMS(6, Params, params);
 PIE_POOL_READ(uint, params.seg_words)
@@ -41,10 +51,9 @@ PIE_POOL_WRITE(uint, params.seg_words)
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
     uint w = gid.x;
-    uint job = gid.y;
     uint layer = gid.z;
-    uint jobs_at = params.layers * LAYER_INTS;
-    if (layer >= params.layers || int(job) >= jobs[jobs_at]) {
+    uint jobs_at = params.jobs_at;
+    if (layer >= params.layers) {
         return;
     }
     uint l = layer * LAYER_INTS;
@@ -56,28 +65,38 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint ring_rows = uint(jobs[l + 8u]);
     bool values = w >= row_words;
     uint i = values ? w - row_words : w;
-    uint at = jobs_at + 1u + 4u * job;
-    uint src_unit = uint(jobs[at]);
-    uint src_row = uint(jobs[at + 1u]);
-    int dst = jobs[at + 2u];
-    uint dst_row = uint(jobs[at + 3u]);
     uint origin = uint(jobs[l + (values ? 1u : 0u)]);
-    uint src = origin + src_unit * page_stride + src_row * row_words + i;
-    uint to;
-    if (dst < 0) {
-        uint lane = uint(-1 - dst);
-        uint at_lane = (6u + params.pieces) * lane;
-        if (dst_row + ring_rows < uint(lanes[at_lane + 3u])) {
-            return;
+    uint piece = uint(jobs[l + (values ? 5u : 4u)]);
+    uint ring_at = uint(jobs[l + (values ? 7u : 6u)]);
+    int count = jobs[jobs_at];
+    for (uint job = gid.y; int(job) < count; job += params.stride) {
+        uint at = jobs_at + 1u + 4u * job;
+        int src_unit = jobs[at];
+        uint src_row = uint(jobs[at + 1u]);
+        int dst = jobs[at + 2u];
+        uint dst_row = uint(jobs[at + 3u]);
+        uint src;
+        if (src_unit < 0) {
+            uint from = (6u + params.pieces) * uint(-1 - src_unit);
+            uint rec = uint(lanes[from + 6u + piece]) * params.slot_stride;
+            src = rec + ring_at + (src_row % ring_rows) * row_words + i;
+        } else {
+            src = origin + uint(src_unit) * page_stride + src_row * row_words + i;
         }
-        dst_row = dst_row % ring_rows;
-        uint piece = uint(jobs[l + (values ? 5u : 4u)]);
-        uint rec = uint(lanes[at_lane + 6u + piece]) * params.slot_stride;
-        to = rec + uint(jobs[l + (values ? 7u : 6u)]) + dst_row * row_words + i;
-    } else {
-        to = origin + uint(dst) * page_stride + dst_row * row_words + i;
+        uint to;
+        if (dst < 0) {
+            uint lane = uint(-1 - dst);
+            uint at_lane = (6u + params.pieces) * lane;
+            if (dst_row + ring_rows < uint(lanes[at_lane + 3u])) {
+                continue;
+            }
+            uint rec = uint(lanes[at_lane + 6u + piece]) * params.slot_stride;
+            to = rec + ring_at + (dst_row % ring_rows) * row_words + i;
+        } else {
+            to = origin + uint(dst) * page_stride + dst_row * row_words + i;
+        }
+        pie_pool_set(to, pie_pool_get(src));
     }
-    pie_pool_set(to, pie_pool_get(src));
 }
 
 // pie:instantiate attn_ring_fold PIE_GROUP_X=64

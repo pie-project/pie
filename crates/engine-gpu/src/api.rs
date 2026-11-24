@@ -1131,8 +1131,14 @@ where
             // Windowed layers are ring + buffer (CONTRACT-BC 19, 21).
             windowed_state: shell.pools().rings().is_some(),
             // The prompt scans land the state as of rows inside a lane, a
-            // record a snapshot in pieces (CONTRACT-BC 16).
-            rs_snapshots: crate::rs::snapshots(shell.trace()),
+            // record a snapshot in pieces (CONTRACT-BC 16); a load of rings
+            // alone lands its rings' (`ring::stage`, before the fold), as
+            // one of recurrent state too does beside its state's.
+            rs_snapshots: if shell.pools().rings().is_some() && !shell.pools().has_recurrent() {
+                kernels_slang::ssm::RS_SNAPSHOTS
+            } else {
+                crate::rs::snapshots(shell.trace())
+            },
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),

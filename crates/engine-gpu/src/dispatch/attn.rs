@@ -32,13 +32,25 @@ impl<B: Backend> Run<'_, B> {
         if layers.is_empty() {
             return Ok(());
         }
-        let Some((jobs, most)) = self.bindings().ring_jobs else {
+        let Some((jobs, most, fold_at, snaps)) = self.bindings().ring_jobs else {
             return Err(kernels_slang::Error::Backend {
                 op: "attn.ring_fold",
                 detail: "a fire reading a ring staged no fold table".to_string(),
             });
         };
-        kernels_slang::attn::ring::fold(self.ctx, &layers, jobs, most)
+        // The snapshots first: they read the rings as the fire found them,
+        // which the fold then writes.
+        let layer_ints =
+            u32::try_from(layers.len()).unwrap_or(u32::MAX) * kernels_slang::attn::ring::LAYER_INTS;
+        kernels_slang::attn::ring::fold(
+            self.ctx,
+            &layers,
+            jobs,
+            layer_ints,
+            snaps,
+            crate::ring::SNAPSHOT_ROWS,
+        )?;
+        kernels_slang::attn::ring::fold(self.ctx, &layers, jobs, fold_at, most, most)
     }
 }
 
