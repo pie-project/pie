@@ -462,8 +462,11 @@ impl Core {
     fn descriptor_pool(&self, one_time: bool, mine: usize) -> Result<vk::DescriptorPool> {
         let mut spares = self.spares.lock().expect("spares lock poisoned");
         loop {
-            let pool = if spares.sealed && !one_time {
-                Some(self.new_descriptor_pool()?)
+            // A kept frame (a recording) holds its pools for its life: pools
+            // of its own, a few sets each, so a body holds about the sets its
+            // dispatches bind and no stock of a thousand.
+            let pool = if !one_time {
+                Some(self.new_descriptor_pool_of(KEPT_SETS_PER_POOL)?)
             } else {
                 match spares.free.pop() {
                     Some(pool) => Some(pool),
@@ -497,6 +500,18 @@ impl Core {
         if pools.is_empty() {
             return;
         }
+        if !one_time {
+            // A kept frame's own pools go with it.
+            for &pool in &pools {
+                // SAFETY: the kept frame holding the pool is gone, and a
+                // submission naming its sets waited its fence before then.
+                unsafe { self.device.destroy_descriptor_pool(pool, None) };
+            }
+            let mut spares = self.spares.lock().expect("spares lock poisoned");
+            spares.lent -= pools.len();
+            spares.kept -= pools.len();
+            return;
+        }
         for &pool in &pools {
             // SAFETY: the frame that held `pool` landed (its fence passed) or
             // was never submitted, so no command uses its sets; a pool is
@@ -516,14 +531,20 @@ impl Core {
     }
 
     fn new_descriptor_pool(&self) -> Result<vk::DescriptorPool> {
+        self.new_descriptor_pool_of(SETS_PER_POOL)
+    }
+
+    /// A descriptor pool of `sets` sets, each binding up to 8 storage
+    /// buffers and a uniform on average.
+    fn new_descriptor_pool_of(&self, sets: u32) -> Result<vk::DescriptorPool> {
         // A set binds its kernel's scalars as one uniform (the fire block's).
         let sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(BUFFERS_PER_POOL),
+                .descriptor_count(sets * 8),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(SETS_PER_POOL),
+                .descriptor_count(sets),
         ];
         // A recording's pool segments are written after it binds them: its
         // sets are allocated from pools that allow it.
@@ -537,7 +558,7 @@ impl Core {
             self.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(flags)
-                    .max_sets(SETS_PER_POOL)
+                    .max_sets(sets)
                     .pool_sizes(&sizes),
                 None,
             )
@@ -2007,6 +2028,7 @@ impl Context {
                 room_binds: Mutex::new(Vec::new()),
                 room_bound: Mutex::new(None),
                 room_fixed: std::sync::atomic::AtomicBool::new(false),
+                recording: std::sync::atomic::AtomicBool::new(true),
             }),
             open: true,
             room: self.room_next.lock().expect("room lock poisoned").take(),
@@ -2128,11 +2150,30 @@ pub(crate) struct Inner {
     /// A command of it names the room directly (a copy of its rows): it
     /// replays only at the room it was recorded at.
     pub(crate) room_fixed: std::sync::atomic::AtomicBool,
+    /// `cmd` is begun and not ended: the one state it may be ended in. Every
+    /// end clears it before anything that can fail, and every begin sets it
+    /// once it succeeded, so a frame dropped on an error between an end and
+    /// the next begin (a failed submit, wait or allocation of a flush or a
+    /// segment) leaves its buffer alone.
+    pub(crate) recording: std::sync::atomic::AtomicBool,
 }
 
 impl Inner {
     pub(crate) fn cmd(&self) -> vk::CommandBuffer {
         vk::Handle::from_raw(self.cmd.load(Ordering::Acquire))
+    }
+
+    /// Ends `cmd`, which must be recording, and marks it ended first.
+    fn end_cmd(&self) -> std::result::Result<(), vk::Result> {
+        self.recording.store(false, Ordering::Release);
+        // SAFETY: callers end only a buffer they began (`recording` was set),
+        // from the frame that records into it.
+        unsafe { self.core.device.end_command_buffer(self.cmd()) }
+    }
+
+    /// `cmd` was begun.
+    fn begun(&self) {
+        self.recording.store(true, Ordering::Release);
     }
 }
 
@@ -2261,8 +2302,10 @@ impl Inner {
 
 const SETS_PER_POOL: u32 = 1024;
 
+/// A kept frame's pools: a body's sets a few pools of these.
+const KEPT_SETS_PER_POOL: u32 = 64;
+
 const SETS_PER_BATCH: usize = 64;
-const BUFFERS_PER_POOL: u32 = SETS_PER_POOL * 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Span {
@@ -2381,6 +2424,13 @@ pub struct Frame {
     /// Each readout copy's mark (its most rows: its regions are the copier's
     /// table), in order.
     copies: std::cell::RefCell<Vec<[u32; 3]>>,
+}
+
+impl Frame {
+    /// A frame that records nothing ([`Context::frame_dry`]).
+    pub fn is_dry(&self) -> bool {
+        self.dry
+    }
 }
 
 impl Frame {
@@ -2678,7 +2728,11 @@ impl Frame {
                 return Ok(set);
             }
         }
-        let layouts = [layout; SETS_PER_BATCH];
+        // A frame run once takes its sets a batch at a time (it gives them
+        // back reset); a recording keeps every set it takes for its life, so
+        // takes one at a time: a body holds the sets its dispatches bind.
+        let batch = if self.kept { 1 } else { SETS_PER_BATCH };
+        let layouts = vec![layout; batch];
         let mut pools = self.inner.pools.lock().expect("pools lock poisoned");
         let mut got: Option<Vec<vk::DescriptorSet>> = None;
         if let Some(&pool) = pools.last() {
@@ -3131,7 +3185,7 @@ impl Frame {
         let head = self.staged_head()?;
         // SAFETY: as in `flush`: this frame's `cmd` is recording and only
         // `&self` records into it.
-        unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        self.inner.end_cmd().map_err(|e| core.fault("vkEndCommandBuffer", e))?;
         // The segment's head runs before it, submitted with it.
         if let Some(head) = head {
             self.inner.held.lock().expect("held lock poisoned").push(head);
@@ -3168,6 +3222,7 @@ impl Frame {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            self.inner.begun();
             let all = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -3204,7 +3259,7 @@ impl Frame {
         // every method that ends it consumes the frame.
         let head = self.staged_head()?;
         // SAFETY: `cmd` is recording, so it may be ended.
-        unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        self.inner.end_cmd().map_err(|e| core.fault("vkEndCommandBuffer", e))?;
         {
             let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
@@ -3259,6 +3314,7 @@ impl Frame {
             // SAFETY: `next` was just allocated, in the initial state.
             unsafe { d.begin_command_buffer(next, &vk::CommandBufferBeginInfo::default()) }
                 .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            self.inner.begun();
             self.hazards_settled();
             return Ok(());
         }
@@ -3275,6 +3331,7 @@ impl Frame {
             )
         }
         .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+        self.inner.begun();
         self.hazards_settled();
         Ok(())
     }
@@ -3284,11 +3341,11 @@ impl Frame {
             return Ok(());
         }
         self.open = false;
+        if !self.inner.recording.load(Ordering::Acquire) {
+            return Err(self.inner.core.fault("vkEndCommandBuffer", vk::Result::ERROR_UNKNOWN));
+        }
         let core = &self.inner.core;
-        // SAFETY: `open` was set, so `cmd` is recording; `&mut self` is its
-        // only user.
-        unsafe { core.device.end_command_buffer(self.inner.cmd()) }
-            .map_err(|e| core.fault("vkEndCommandBuffer", e))
+        self.inner.end_cmd().map_err(|e| core.fault("vkEndCommandBuffer", e))
     }
 
     fn submit(&mut self) -> Result<()> {
@@ -3420,13 +3477,18 @@ impl Frame {
 
 impl Drop for Frame {
     fn drop(&mut self) {
+        // A frame dropped open was never committed: an error unwound the
+        // walk that recorded it, and its buffer is freed with it (a buffer
+        // may be freed while recording). It is not ended: after an error the
+        // buffer may be in no state to end (a driver that failed an
+        // allocation inside it, or a flush that ended it and failed before
+        // the next began), and ending it there faults in the driver.
         if self.open {
             self.open = false;
-            // SAFETY: an open frame's `cmd` is recording and only this frame
-            // records into it.
-            unsafe {
-                let _ = self.inner.core.device.end_command_buffer(self.inner.cmd());
-            }
+            tracing::warn!(
+                recording = self.inner.recording.load(Ordering::Acquire),
+                "vulkan: an open frame dropped uncommitted; its buffer freed unended"
+            );
         }
     }
 }
