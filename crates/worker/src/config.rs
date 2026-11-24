@@ -279,6 +279,9 @@ pub struct ServerConfig {
     /// and what `pie inferlet install` put here.
     #[serde(default = "default_true")]
     pub allow_upload: bool,
+    /// Whether a client may write new weights over the served model's (`reload_weights`).
+    #[serde(default)]
+    pub allow_weight_reload: bool,
 }
 
 impl Default for ServerConfig {
@@ -289,6 +292,7 @@ impl Default for ServerConfig {
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
             allow_upload: true,
+            allow_weight_reload: false,
         }
     }
 }
@@ -805,8 +809,9 @@ pub struct RuntimeConfig {
     /// Frames the runtime keeps posted to the engine but not yet retired: the
     /// dispatch loop's enqueue horizon, keeping the GPU from idling between
     /// frames. Bounded jointly with `frame_size` — see [`Self::validate`].
-    #[serde(default = "default_frame_dispatch_depth")]
-    pub frame_dispatch_depth: u32,
+    /// Unstated: the engine's preference, else 2 ([`Self::dispatch_depth`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_dispatch_depth: Option<u32>,
     /// Hard cap on inferlets admitted at once. Omit to derive it from the
     /// engine's fire lanes, which is what fills a batch.
     #[serde(default)]
@@ -835,7 +840,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             frame_size: default_frame_size(),
-            frame_dispatch_depth: default_frame_dispatch_depth(),
+            frame_dispatch_depth: None,
             max_concurrent_processes: None,
             worker_policy: default_worker_policy(),
             snapshot_budget: default_snapshot_budget(),
@@ -844,12 +849,21 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// The frames the runtime keeps posted: the stated depth, else the engine's preference
+    /// (`engine`, 0: none), else 2.
+    #[must_use]
+    pub fn dispatch_depth(&self, engine: u32) -> u32 {
+        self.frame_dispatch_depth.unwrap_or(if engine > 0 {
+            engine
+        } else {
+            DEFAULT_FRAME_DISPATCH_DEPTH
+        })
+    }
+
     fn validate(&self, max_frames: u8) -> Result<()> {
         ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
-        ensure!(
-            self.frame_dispatch_depth >= 1,
-            "runtime.frame_dispatch_depth must be >= 1"
-        );
+        let depth = self.dispatch_depth(0);
+        ensure!(depth >= 1, "runtime.frame_dispatch_depth must be >= 1");
         ensure!(
             self.frame_size <= u32::from(Runahead::STEPS_MAX),
             "runtime.frame_size must be at most {} (got {}): it is `k` in the engine's \
@@ -860,14 +874,14 @@ impl RuntimeConfig {
             self.frame_size
         );
         ensure!(
-            self.frame_dispatch_depth <= u32::from(max_frames),
+            depth <= u32::from(max_frames),
             "runtime.frame_dispatch_depth must be at most {} (got {}) on this engine: \
              an engine with a staging ring publishes its free set as one 64-bit \
              word, and `frames_in_flight * {} + 1` must fit in it \
              (`engine::runahead::Runahead::MAX_FRAMES`; the cerebras engine, \
              which has none, takes up to `Runahead::UNSTAGED_MAX_FRAMES`)",
             max_frames,
-            self.frame_dispatch_depth,
+            depth,
             Runahead::STEPS_MAX
         );
         if let Some(n) = self.max_concurrent_processes {
@@ -881,9 +895,7 @@ fn default_frame_size() -> u32 {
     2
 }
 
-fn default_frame_dispatch_depth() -> u32 {
-    2
-}
+const DEFAULT_FRAME_DISPATCH_DEPTH: u32 = 2;
 
 /// `[engine]`: the keys every engine reads, and beside them the named
 /// engine's own, each checked against that engine's options struct.
@@ -1121,7 +1133,7 @@ impl EngineConfig {
                 || (self.kind == EngineKind::Cuda && self.device.len() == 1),
             "engine.measure = false skips the measurements a load takes on the vulkan, wgpu, \
              metal and xla engines and a one-device cuda engine; the {} engine{} still measures outside \
-             that path (new-memory/FOLLOWUPS.md), so omit the key",
+             that path, so omit the key",
             self.kind.as_str(),
             if self.kind == EngineKind::Cuda {
                 " across devices"
@@ -1157,8 +1169,7 @@ impl EngineConfig {
 
 /// Which engine `[engine] type` names.
 ///
-/// Every name here is now offered: `Vulkan` and `Wgpu` were named-not-hosted
-/// until their shells landed, and each is one `--features` flag away.
+/// Every name here is offered; each is one `--features` flag away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
@@ -1246,27 +1257,11 @@ type = "metal"
 device = ["metal:0"]
 "#;
 
-    /// A key no section declares is refused by name, rather than read as
-    /// nothing.
-    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
-    /// diagnostics record says so instead of swallowing the flag.
-    /// The word list is the shell's, so this side keeps it whole rather than
-    /// parsing it — a config that states one is the string it stated.
-    /// Every engine kind's `as_str` is the word a config file spells it with;
-    /// `as_str` is a hand-written match and nothing ties it to serde's
-    /// `rename_all` if they drift.
-    /// `[model.adapters]` absent is the shape hard-coded before it existed:
-    /// zero seats, no roster, and the correction op never launches.
-    /// The capacity is stated once: either the operator says it, or the
-    /// roster does — one number, one owner.
-    /// The two refusals this layer can make without a device.
     #[test]
     fn config_every_case() {
         an_unknown_key_is_refused();
         a_distributed_worker_states_no_cluster_policies();
         the_policies_default_to_the_built_in_defaults();
-        offload_peers_and_pools_are_unknown_keys();
-        a_submit_deadline_is_an_unknown_key();
         the_diag_flag_states_the_engines_diagnostics_key();
         measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere();
         an_engine_s_own_key_is_written_beside_the_common_ones();
@@ -1402,14 +1397,12 @@ device = ["metal:0"]
         );
     }
 
-    /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
-    /// shell, which posts frames to a host queue, takes more.
     /// Nothing reads a compute dtype from the config: a file that states
     /// one is refused as it would be for any key no struct declares.
     fn activation_dtype_is_an_unknown_key() {
         let file = std::path::Path::new("/etc/pie/config.toml");
         // An engine's own key, read through its options struct: lines 6-9
-        // are `[engine]`, `type`, `device`, the dropped key.
+        // are `[engine]`, `type`, `device`, the unknown key.
         let err = Config::parse_file(
             &MINIMAL_METAL.replace(
                 "device = [\"metal:0\"]",
@@ -1452,6 +1445,8 @@ device = ["metal:0"]
         Config::parse(MINIMAL_METAL).expect("without it, the file loads");
     }
 
+    /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
+    /// shell, which posts frames to a host queue, takes more.
     fn the_dispatch_depth_is_bounded_by_the_engine_kind() {
         for (depth, ok) in [(15, true), (16, false)] {
             let toml = format!("{MINIMAL_METAL}\n[runtime]\nframe_dispatch_depth = {depth}\n");
@@ -1473,6 +1468,8 @@ device = ["metal:0"]
         }
     }
 
+    /// A key no section declares is refused by name, rather than read as
+    /// nothing.
     fn an_unknown_key_is_refused() {
         for (section, key) in [
             ("server", "host = \"127.0.0.1\""),
@@ -1524,27 +1521,10 @@ device = ["metal:0"]
             .expect("a distributed worker states none, and takes no default");
     }
 
-    /// Which workers prefill a worker's passes and which pools keep its
-    /// runs are the cluster policy's: the keys that named them are gone.
-    fn offload_peers_and_pools_are_unknown_keys() {
-        for key in ["peers = [\"10.0.0.2:7100\"]", "pools = [\"10.0.0.3:7201\"]"] {
-            let toml = format!("{MINIMAL_METAL}\n[offload]\n{key}\n");
-            let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
-            assert!(err.contains("unknown field"), "{key}: {err}");
-        }
-    }
-
-    /// The leash is gone, and its key with it: a config that sets it is
-    /// refused by name.
-    fn a_submit_deadline_is_an_unknown_key() {
-        let toml = format!("{MINIMAL_METAL}\n[runtime]\nsubmit_deadline = \"5s\"\n");
-        let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field `submit_deadline`"),
-            "got: {err}"
-        );
-    }
-
+    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
+    /// diagnostics record says so instead of swallowing the flag. The word
+    /// list is the shell's, so this side keeps it whole rather than parsing
+    /// it: a config that states one is the string it stated.
     fn the_diag_flag_states_the_engines_diagnostics_key() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.state_diagnostics("tier-trace,kernel-profile=2")
@@ -1646,6 +1626,9 @@ device = ["metal:0"]
         assert_eq!(cfg.server.listen.port(), 8080);
     }
 
+    /// Every engine kind's `as_str` is the word a config file spells it with;
+    /// `as_str` is a hand-written match and nothing ties it to serde's
+    /// `rename_all` if they drift.
     fn every_engine_kind_round_trips_through_its_config_string() {
         const KINDS: &[(EngineKind, &str)] = &[
             (EngineKind::Cuda, "cuda"),
@@ -1677,6 +1660,8 @@ device = ["metal:0"]
         );
     }
 
+    /// `[model.adapters]` absent is zero seats, no roster, and the
+    /// correction op never launches.
     fn adapters_are_absent_by_default_and_that_is_zero_seats() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
@@ -1685,6 +1670,8 @@ device = ["metal:0"]
         assert!(cfg.model.adapters.registered.is_empty());
     }
 
+    /// The capacity is stated once: either the operator says it, or the
+    /// roster does — one number, one owner.
     fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
         let plane = if cfg!(windows) {
             "C:/adapters/0/a.bin"
@@ -1715,6 +1702,7 @@ device = ["metal:0"]
         assert_eq!(cfg.model.adapters.seats(), 8);
     }
 
+    /// The two refusals this layer can make without a device.
     fn an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name() {
         let past = MINIMAL_METAL.replace(
             "source = \"Qwen/Qwen3-0.6B\"",

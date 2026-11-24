@@ -43,7 +43,8 @@ pub fn build_without_engine(
         tokenizer_path: artifact.to_path_buf(),
         metadata,
         engines: Vec::new(),
-        scheduler: scheduler(&user.runtime),
+        scheduler: scheduler(&user.runtime, 0),
+        media_device: media_device(&user.engine),
     };
     runtime_config(user, home, builtins, model)
 }
@@ -104,6 +105,7 @@ fn runtime_config(
             network_allowed_hosts: user.sandbox.network_allowed_hosts.clone(),
             max_upload_mb: user.server.max_upload.as_mib() as usize,
             allow_upload: user.server.allow_upload,
+            allow_weight_reload: user.server.allow_weight_reload,
             languages_dir: home.join("languages"),
             compile_cache_dir: Some(home.join("cache").join("wasmtime")),
         },
@@ -114,11 +116,21 @@ fn runtime_config(
     })
 }
 
-fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerConfig {
-    runtime::bootstrap::SchedulerConfig {
+/// The runtime's scheduler knobs; `engine_depth`: the engine's preferred dispatch depth (0: none).
+fn scheduler(
+    runtime: &config::RuntimeConfig,
+    engine_depth: u32,
+) -> runtime::bootstrap::SchedulerConfig {
+    let c = runtime::bootstrap::SchedulerConfig {
         frame_size: runtime.frame_size,
-        frame_dispatch_depth: runtime.frame_dispatch_depth,
-    }
+        frame_dispatch_depth: runtime.dispatch_depth(engine_depth),
+    };
+    tracing::info!(
+        frame_size = c.frame_size,
+        frame_dispatch_depth = c.frame_dispatch_depth,
+        "runtime frames"
+    );
+    c
 }
 
 fn build_model(
@@ -193,8 +205,23 @@ fn build_model(
         tokenizer_path,
         metadata,
         engines,
-        scheduler: scheduler(runtime),
+        scheduler: scheduler(runtime, group0_caps.limits.dispatch_depth),
+        media_device: media_device(&user.engine),
     })
+}
+
+/// The CUDA device a media encode runs on: the cuda engine's first device
+/// (`cuda:<n>`), else device 0.
+fn media_device(engine: &config::EngineConfig) -> u32 {
+    if engine.kind != config::EngineKind::Cuda {
+        return 0;
+    }
+    engine
+        .device
+        .first()
+        .and_then(|device| device.strip_prefix("cuda:"))
+        .and_then(|index| index.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The disk tier `g` keeps for the next run, its journal beside its slot

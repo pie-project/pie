@@ -6,7 +6,6 @@
 
 use std::time::Instant;
 
-use engine::Engine;
 use engine::chunk::{ShapeId, SlotCopy, SlotKind, SlotRole};
 use engine::transfer::MemoryDomain;
 use engine_xla::store::layout::CHANNEL;
@@ -42,9 +41,7 @@ fn a_maintenance_write_is_timed() {
         .shapes(|s| matches!(s.kind, SlotKind::List { window: None, .. }) && s.role == SlotRole::State)[0]
         .id;
     let copy = |model: &mut Model, shape: ShapeId, src, dst, slots: Vec<(u32, u32)>| {
-        model
-            .engine
-            .copy_slots(&SlotCopy {
+        engine::Tiers::copy(&mut model.engine, &SlotCopy {
                 shape,
                 src,
                 dst,

@@ -86,7 +86,6 @@ async fn main(input: Input) -> Result<String> {
         prompt_tokens.push(0);
     }
     let n = prompt_tokens.len() as u32;
-    let stop = chat::stop_tokens();
 
     // A conversation's turns reuse its earlier ones within its session.
     let ws = WorkingSet::shared(ShareScope::Session)?;
@@ -118,8 +117,8 @@ async fn main(input: Input) -> Result<String> {
 
     let chat_dec = chat::Decoder::new();
     let mut text = String::new();
-    let mut done = stop.contains(&(g0 as u32));
-    if !stop.contains(&(g0 as u32)) {
+    let mut done = chat::is_stop(g0 as u32);
+    if !chat::is_stop(g0 as u32) {
         match chat_dec.feed(&[g0 as u32])? {
             chat::Event::Delta(s) => {
                 print!("{s}");
@@ -163,7 +162,7 @@ async fn main(input: Input) -> Result<String> {
     run_ahead(&pipe, &fwd, budget, async || {
         let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
-        if stop.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         match chat_dec.feed(&[token])? {

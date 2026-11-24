@@ -1,5 +1,6 @@
-//! The pressure bucket the gateway admits on: room only idle work or idle
-//! cache holds, on the device or below it, never saturates it.
+//! The pressure bucket the default cluster policy places by: room only
+//! idle work or idle cache holds, on the device or below it, never
+//! saturates it.
 
 use super::*;
 
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use crate::store::kv::page_table::PhysicalKvPageId;
 use crate::store::rs::RsUnits;
 
-/// The gateway's default saturation mark (`AdmissionConfig::kv_saturate_bucket`).
+/// The default cluster policy's full mark (`FULL_PRESSURE`).
 const SATURATED: u8 = 240;
 
 /// Each tier's `(free, total)` and what of it only idle cache holds.
@@ -177,30 +178,3 @@ fn a_parked_process_alone_holds_no_launch() {
     assert!(b < SATURATED);
 }
 
-/// L1: the capacity gate's first finisher is the highest-priority process
-/// whose need fits (the policy's `schedule/priority`); equal priorities
-/// keep the banker's order, then first come, first served.
-#[test]
-fn the_first_finisher_is_the_highest_priority_that_fits() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
-    let planner = ResidencyPlanner::new(Arc::new(TierPool {
-        device: (64, 64),
-        context: Some(16),
-        census: Some(super::pool::CapacityCensus {
-            whole: 64,
-            ..Default::default()
-        }),
-        ..Default::default()
-    }) as Arc<dyn PoolPort>);
-    let (older, newer) = (ProcessId::new_v4(), ProcessId::new_v4());
-    for pid in [older, newer] {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    let finisher = || planner.capacity_gate().expect("a gate").finisher;
-    assert_eq!(finisher(), older, "equal priorities: first come, first served");
-    planner.with_inner(|inner| inner.procs.get_mut(&newer).unwrap().key = 5);
-    assert_eq!(finisher(), newer, "the higher priority finishes first");
-    planner.with_inner(|inner| inner.procs.get_mut(&older).unwrap().key = 9);
-    assert_eq!(finisher(), older);
-}

@@ -61,8 +61,6 @@ fn an_exported_kv_stays_mapped() {
         None,
         &[],
         true,
-        false,
-        false,
         0,
     )
     .expect("the pool reserves");
@@ -89,7 +87,13 @@ fn an_exported_kv_stays_mapped() {
             region.len >= pages * region.page_stride,
             "every declared page"
         );
-        assert_eq!(region.domain, engine::MemoryDomain::CudaDevice(0));
+        assert_eq!(
+            region.domain,
+            engine::MemoryDomain::Device {
+                ordinal: 0,
+                reach: engine::DeviceReach::Peer,
+            }
+        );
     }
     let offsets: std::collections::BTreeSet<u64> =
         exported.regions.iter().map(|region| region.base).collect();

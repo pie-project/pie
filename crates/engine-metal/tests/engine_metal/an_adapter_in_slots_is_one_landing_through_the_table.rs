@@ -74,7 +74,6 @@ fn the_adapter_key_is_cudas_digest_of_the_sink() {
     let b: Vec<u8> = (100u8..124).collect();
     let key =
         engine_metal::api::adapter_digest(5, [("lora_a", &a[..]), ("lora_b", &b[..])].into_iter());
-    eprintln!("adapter key {key:#034x}");
     assert_eq!(key, PINNED, "the digest CUDA's adapter_key_of states");
     assert_ne!(
         engine_metal::api::adapter_digest(5, [("lora_a", &a[..]), ("lora_b", &a[..])].into_iter()),
@@ -176,8 +175,8 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
     shell
         .copy_slots(&SlotCopy {
             shape: ADAPTER,
-            src: MemoryDomain::MetalShared,
-            dst: MemoryDomain::MetalShared,
+            src: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+            dst: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
             slots: refs.iter().copied().zip(moved.iter().copied()).collect(),
             runs: Vec::new(),
         })
@@ -185,8 +184,8 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
     shell
         .copy_slots(&SlotCopy {
             shape: ADAPTER,
-            src: MemoryDomain::MetalShared,
-            dst: MemoryDomain::MetalShared,
+            src: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+            dst: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
             slots: refs.iter().map(|&r| (moved[0] + banks, r)).collect(),
             runs: Vec::new(),
         })
@@ -213,5 +212,4 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
         landed,
         "a fresh landing writes its planes"
     );
-    eprintln!("an adapter in slots is one landing through the table (id {id})");
 }

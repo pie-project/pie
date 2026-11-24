@@ -65,13 +65,13 @@ class StateGeometry:
       `parents[b]` of the fire before. Every lane names the same working
       set, whose reserve past its frozen full pages is a pool each lane
       holds its own pages of; the engine keeps the lanes' page lists and
-      reorders them by the parents before each fire reads or appends
-      (`new-memory/designs/BEAM-PAGE-LISTS.md`). Computed on the device by
+      reorders them by the parents before each fire reads or appends.
+      Computed on the device by
       the epilogue before; the first fire ignores it. A parent past the
       lanes faults its lane. Default: none.
       A search owns its set's state: the rows every live beam shares
       (below the group's common ancestor) fold into the set as the search
-      runs (`BEAM-PAGE-LISTS.md` §11.3), so a search left without adopting
+      runs, so a search left without adopting
       a beam leaves the set folded past its prompt. A guest that wants the
       prompt state back forks the set before the search.
     """
@@ -117,8 +117,8 @@ class ForwardPass:
         States that this pass's sampled rows are final: once a fire of it
         samples a row, the program never retracts, truncates, rolls back
         or rewinds the working sets it writes below that row. Its lanes
-        then fold every row at fire and carry none into the next
-        (CONTRACT-BC 25). Unstated a pass is not final: on a set with a
+        then fold every row at fire and carry none into the next.
+        Unstated a pass is not final: on a set with a
         recurrent state or windows its run-ahead fires fold only what the
         program has accepted, so a stop can take the rest back. The
         runtime never infers this; only the statement counts. The SDKs
@@ -168,7 +168,7 @@ class ForwardPass:
         raise NotImplementedError
     def adopt_beam(self, beam: int, end: int) -> None:
         """
-        A beam search's finish (`BEAM-PAGE-LISTS.md` §6.6): once the
+        A beam search's finish: once the
         pass's last fire has landed, its working set holds beam `beam`'s
         hypothesis at its slots `[folded, end)` in its own order, as its
         page list names them (its recurrent rows too, on a hybrid); the

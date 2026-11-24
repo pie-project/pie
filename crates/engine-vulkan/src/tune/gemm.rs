@@ -81,6 +81,9 @@ pub struct Point {
     pub times: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     pub baseline: Option<usize>,
+    /// The timed candidates' median errors pooled, relative
+    /// ([`profile::tune::Sample::spread`]).
+    pub spread: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -110,14 +113,15 @@ impl Measured {
                 .collect();
             let _ = writeln!(
                 out,
-                "point {} {} {} {} {} {}",
+                "point {} {} {} {} {} {} {:e}",
                 p.rows,
                 p.n,
                 p.k,
                 p.weight,
                 p.baseline
                     .map_or_else(|| "-".to_string(), |b| b.to_string()),
-                times.join(",")
+                times.join(","),
+                p.spread
             );
         }
         out
@@ -165,6 +169,9 @@ impl Measured {
                         .split(',')
                         .map(|t| t.parse().ok())
                         .collect(),
+                    spread: f.get(6).and_then(|v| v.parse().ok()).ok_or(format!(
+                        "`{line}` states no spread (measured by an older pie); measure again"
+                    ))?,
                 });
             }
         }
@@ -195,6 +202,7 @@ pub fn fit(measured: &Measured) -> Result<(Entries, Vec<Line>), String> {
             at: vec![i64::from(p.rows)],
             weight: p.weight,
             times: p.times.clone(),
+            spread: p.spread,
         })
         .collect();
     let baseline: Vec<Option<usize>> = measured.points.iter().map(|p| p.baseline).collect();
@@ -354,10 +362,11 @@ mod device {
                 })?;
                 let all = candidates();
                 let mut row = vec![None; all.len()];
-                for (c, t) in live.iter().zip(times) {
+                for (c, (t, _)) in live.iter().zip(&times) {
                     let i = all.iter().position(|p| *p == kept[*c]).expect("a path");
-                    row[i] = Some(t);
+                    row[i] = Some(*t);
                 }
+                let spread = profile::tune::pooled(times.iter().map(|&(_, e)| e));
                 let picked = if today.gemm_coopmat(m) {
                     crate::tuning::GemmPath::Coopmat
                 } else {
@@ -370,6 +379,7 @@ mod device {
                     weight: share / grid.rows.len() as f64,
                     baseline: all.iter().position(|p| *p == picked),
                     times: row,
+                    spread,
                 });
             }
             say(&format!(
@@ -466,6 +476,7 @@ mod tests {
                     weight: share / grid.rows.len() as f64,
                     times: vec![Some(tiled), Some(coopmat)],
                     baseline: Some(1),
+                    spread: 0.005,
                 });
             }
         }

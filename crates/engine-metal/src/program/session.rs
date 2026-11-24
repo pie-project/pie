@@ -71,7 +71,7 @@ pub(crate) fn launches(compiled: &Compiled, index: usize) -> bool {
         .is_some_and(|stage| !stage.regions.is_empty())
 }
 
-/// The pool slots the runtime took for an instance (REDESIGN step 4).
+/// The pool slots the runtime took for an instance.
 #[derive(Clone, Copy)]
 pub struct Pooled<'a> {
     pub pools: &'a Pools,
@@ -119,7 +119,7 @@ pub struct Session {
     /// The score rows its capturing lanes write (a key row and its page
     /// row), where its program reads them out.
     capture: Option<held::Held>,
-    /// A beam group's resident state (BEAM-PAGE-LISTS §4), where its
+    /// A beam group's resident state, where its
     /// program states parents.
     beam: Option<super::held::Held>,
     /// The outputs bound, by name and lane.
@@ -190,8 +190,7 @@ impl Session {
 
     /// The tables an instance lays, in order: every launching stage's, a
     /// set after a set (`sets` of them, at least [`MIN_SETS`]), then its
-    /// score rows, then a beam group's resident state (`beam` bytes,
-    /// BEAM-PAGE-LISTS §4).
+    /// score rows, then a beam group's resident state (`beam` bytes).
     pub fn table_sizes(
         compiled: &Compiled,
         channels: usize,
@@ -439,7 +438,7 @@ impl Session {
             .then(|| tables.take(capture + CAPTURE_ALIGN))
             .transpose()?;
         // A beam group's lists, zeroed with the tables: its first fire
-        // primes them (BEAM-PAGE-LISTS §5). State of the instance, parked
+        // primes them. State of the instance, parked
         // and unparked with it.
         let beam = (beam > 0)
             .then(|| tables.take(beam + CAPTURE_ALIGN))
@@ -539,7 +538,7 @@ impl Session {
         {
             capture.retarget(pools, to(slot)?)?;
         }
-        // A beam group's lists lie in the tables too (BEAM-PAGE-LISTS §4):
+        // A beam group's lists lie in the tables too:
         // the runtime copied them with the tables, so the group's state
         // follows its slot, as the score rows do; left behind, the next
         // step read the slot's next owner's bytes as its map.

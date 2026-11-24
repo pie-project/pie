@@ -14,7 +14,7 @@
 
 use engine::chunk::{ShapeId, SlotCopy, SlotKind};
 use engine::fire::{FoldLen, Lineage, WindowFold};
-use engine::transfer::MemoryDomain;
+use engine::transfer::{DeviceReach, MemoryDomain};
 use engine_metal::serve::Seated;
 use engine_metal::store::layout::{FIXED, LIST, RING, WINDOWS};
 use engine_metal::{Lane, Shell};
@@ -79,7 +79,10 @@ fn park(
     shell
         .copy_slots(&SlotCopy {
             shape,
-            src: MemoryDomain::MetalShared,
+            src: MemoryDomain::Device {
+                ordinal: 0,
+                reach: DeviceReach::HostShared,
+            },
             dst: tier,
             slots: out.clone(),
             runs: Vec::new(),
@@ -143,7 +146,10 @@ fn park(
         .copy_slots(&SlotCopy {
             shape,
             src: tier,
-            dst: MemoryDomain::MetalShared,
+            dst: MemoryDomain::Device {
+                ordinal: 0,
+                reach: DeviceReach::HostShared,
+            },
             slots: back,
             runs: Vec::new(),
         })
@@ -395,14 +401,12 @@ fn check(model: &str) {
     let kept = serve(&fixture, Offload::Never);
     let parked = serve(&fixture, Offload::Parked);
     same(&format!("{model}: parked against kept"), &parked, &kept);
-    eprintln!("{model}: parked = kept over {} rows", kept.len());
     let bytes = serve(&fixture, Offload::Bytes);
     same(
         &format!("{model}: parked through bytes against kept"),
         &bytes,
         &kept,
     );
-    eprintln!("{model}: parked through tier bytes = kept");
     let windowed = fixture.trace.caches.iter().any(|row| match row {
         poem_ir::CacheRow::Kv { window, .. } => window.is_some(),
         _ => false,
@@ -419,7 +423,6 @@ fn check(model: &str) {
             swapped, kept,
             "{model}: another lane's record and ring brought back move the logits"
         );
-        eprintln!("{model}: a swapped record and ring move the logits (the control)");
     }
 }
 

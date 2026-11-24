@@ -493,7 +493,11 @@ class ForwardPassStub:
     def checkpoints(self, slots) -> None:
         self.checkpoint_slots = list(slots)
 
+    final_refusal: str | None = None
+
     def final_rows(self) -> None:
+        if self.final_refusal:
+            raise WitErr(self.final_refusal)
         self.final_stated += 1
 
     def media(self, lane: int, spans) -> None:

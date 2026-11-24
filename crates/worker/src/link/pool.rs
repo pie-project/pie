@@ -155,7 +155,7 @@ const REDIAL_AFTER: Duration = Duration::from_secs(1);
 async fn link(pool: &engine_cpu::Pool, listen: &str, gateway: &str, id: WorkerId) -> Result<()> {
     let addr = gateway.strip_prefix("tcp://").unwrap_or(gateway);
     let mut conn = tcp::connect(addr, dispatch_codec);
-    conn.config_mut().max_frame_length(64 << 20);
+    conn.config_mut().max_frame_length(worker_api::LINK_MAX_FRAME_BYTES);
     let transport = conn
         .await
         .with_context(|| format!("dialing the gateway at {gateway}"))?;

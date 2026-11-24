@@ -1,11 +1,13 @@
 //! A beam group's head step (`channel::beam_step`) against the host replay
-//! of `new-memory/designs/BEAM-PAGE-LISTS.md` (`engine::beam::step`), fire
-//! by fire: widths 2, 4 and 8, a prompt ending mid-page and one ending on a
-//! page, parents with forks and retirements; and the state moved to another
+//! of the same step (`engine::beam::step`), fire by fire: widths 2, 4 and
+//! 8, a prompt ending mid-page and one ending on a page, parents with
+//! forks and retirements; and the state moved to another
 //! allocation mid-search (a suspend and restore of the instance's bytes),
 //! after which the search goes on identically. On a hybrid each beam's rs
 //! row lands, through its group's list as the step left it
-//! (`channel::RsRows`), on the set's row of the slot §11.1 names.
+//! (`channel::RsRows`), on the set's row of the slot that list resolves:
+//! a slot below the frozen pages the set's own, else the pool page the
+//! beam's list names at the slot's column.
 #![allow(unsafe_code)]
 #![cfg(feature = "rocm")]
 
@@ -32,13 +34,13 @@ impl Lcg {
     /// Each beam's parent: none moved, or sorted draws (forks where one
     /// repeats, retirements where one is skipped).
     fn parents(&mut self, lanes: u32) -> Vec<u32> {
-        if self.next() % 4 == 0 {
+        if self.next().is_multiple_of(4) {
             return (0..lanes).collect();
         }
         let mut parents: Vec<u32> = (0..lanes).map(|_| self.next() % lanes).collect();
         // Most fires take their parents in order, as a top-k by score need
         // not: every third keeps the draw's order.
-        if self.next() % 3 != 0 {
+        if !self.next().is_multiple_of(3) {
             parents.sort_unstable();
         }
         parents
@@ -67,7 +69,8 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
     let ctx = gpu.ctx();
     let f0 = folded / PAGE;
     let columns = (folded + steps - 1) / PAGE - f0 + 1;
-    let reserve = lanes * columns + lanes + lanes * FRAMES + u32::from(folded % PAGE > 0);
+    let reserve =
+        lanes * columns + lanes + lanes * FRAMES + u32::from(!folded.is_multiple_of(PAGE));
     let cap = reserve + 8;
     let words = channel::beam_state_words(lanes, cap, FRAMES) as usize;
     let mut state_at = gpu.up(&vec![0u32; words]);
@@ -101,7 +104,8 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
         let c = slot / PAGE - f0;
         let o = slot % PAGE;
         // The pool grows a column at a time: what this fire's column needs.
-        let pool = (lanes * (c + 2) + lanes * FRAMES + u32::from(folded % PAGE > 0)).min(reserve);
+        let pool = (lanes * (c + 2) + lanes * FRAMES + u32::from(!folded.is_multiple_of(PAGE)))
+            .min(reserve);
         let parents = rng.parents(lanes);
         let parents_at = gpu.up(&parents);
         let offset_at = gpu.up(&vec![o as i32; lanes as usize]);
@@ -118,7 +122,7 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
             })
             .collect();
         let lists_at = gpu.up(&lists);
-        // A hybrid's beams' rs rows (§11.1): the step points each at its list.
+        // A hybrid's beams' rs rows: the step points each at its list.
         let beams: Vec<RsRows> = (0..lanes)
             .map(|b| RsRows {
                 list: state_at + u64::from(channel::BEAM_HEADER + b * cap) * 4,
@@ -174,7 +178,7 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
             let row = &held[map + b * cap as usize..map + b * cap as usize + c as usize + 1];
             assert_eq!(row, &want.lists[b][..], "{at}: beam {b}'s list");
         }
-        // The common slot (§11.3, §11.4): the live beams' longest common
+        // The common slot: the live beams' longest common
         // history past the prompt, by brute force over their histories,
         // capped at the slot past the fire's row.
         histories = (0..lanes)
@@ -218,7 +222,7 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
             assert_eq!(entries, &list[..], "{at}: beam {b}'s resolved entries");
             assert_eq!(writes[b], device_id(want.lists[b][c as usize]), "{at}: beam {b}'s write page");
         }
-        // A hybrid's rows (§11.1): each beam lands its row at this fire's
+        // A hybrid's rows: each beam lands its row at this fire's
         // slot through the list the step pointed it at, on the set's row of
         // slot (f0 + list[j]) S + slot mod S.
         let rs_lanes: Vec<RsLane> = (0..lanes)
@@ -314,7 +318,7 @@ fn a_parent_past_the_group_faults_its_lane() {
     assert_eq!(replay.fired, 2);
 }
 
-/// A fork's rs copy on a hybrid (`BEAM-PAGE-LISTS.md` §6.4, §11): rows of
+/// A fork's rs copy on a hybrid (its rs rows move with its kv slots): rows of
 /// 2 a page from slot 38, kv pages of 16 (the live Qwen3.5 frozen slot),
 /// two planes of other row bytes. A copy of 5 slots from pool page 1 to 3
 /// ends mid rs page; one from the prompt's own page 0 skips its tail's

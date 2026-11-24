@@ -229,7 +229,7 @@ pub(crate) async fn read_device_kv(
 }
 
 /// Pages on `tier` copied into host slots `slots`, and those slots' bytes.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn read_tier_kv(
     engine_id: usize,
     tier: ::engine::MemoryDomain,
@@ -249,39 +249,15 @@ pub(crate) async fn read_tier_kv(
         .await
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn read_host_kv(engine_id: usize, slots: Vec<u32>) -> Result<Vec<u8>> {
     scheduler_handle(engine_id)?
         .host_kv(worker::HostKvOp::Read(slots))
         .await
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) async fn read_host_state(
-    engine_id: usize,
-    slots: Vec<u32>,
-    pages: Vec<u32>,
-) -> Result<Vec<u8>> {
-    scheduler_handle(engine_id)?
-        .host_kv(worker::HostKvOp::ReadState(slots, pages))
-        .await
-}
-
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) async fn write_host_state(
-    engine_id: usize,
-    slots: Vec<u32>,
-    pages: Vec<u32>,
-    bytes: Vec<u8>,
-) -> Result<()> {
-    scheduler_handle(engine_id)?
-        .host_kv(worker::HostKvOp::WriteState(slots, pages, bytes))
-        .await
-        .map(drop)
-}
-
 /// The bytes of host tier slots, shape by shape, in order (CONTRACT-BC 22).
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
 pub(crate) async fn read_tier_slots(
     engine_id: usize,
     slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
@@ -291,7 +267,7 @@ pub(crate) async fn read_tier_slots(
         .await
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
 pub(crate) async fn write_tier_slots(
     engine_id: usize,
     slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
@@ -308,6 +284,26 @@ pub(crate) async fn write_host_kv(engine_id: usize, slots: Vec<u32>, bytes: Vec<
         .host_kv(worker::HostKvOp::Write(slots, bytes))
         .await
         .map(drop)
+}
+
+pub(crate) fn schedulers() -> Vec<SchedulerHandle> {
+    handle_registry()
+        .read()
+        .unwrap()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+pub(crate) async fn reload_weights(
+    scheduler: &SchedulerHandle,
+    path: &std::path::Path,
+) -> Result<::engine::Reloaded> {
+    let answer = scheduler
+        .host_kv(worker::HostKvOp::ReloadWeights(path.to_path_buf()))
+        .await?;
+    Ok(serde_json::from_slice(&answer)?)
 }
 
 pub(crate) async fn pool(engine_id: usize, op: worker::PoolOp) -> Result<()> {
@@ -344,10 +340,11 @@ pub(crate) async fn rebind_slots(engine_id: usize, rebind: ::engine::Rebind) -> 
     pool(engine_id, worker::PoolOp::Rebind(rebind)).await
 }
 
+static LAYOUTS: std::sync::Mutex<Vec<Option<Option<state::PageLayout>>>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// The engine's host-tier layout, once asked.
 pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout> {
-    static LAYOUTS: std::sync::Mutex<Vec<Option<Option<state::PageLayout>>>> =
-        std::sync::Mutex::new(Vec::new());
     if let Some(Some(known)) = LAYOUTS.lock().unwrap().get(engine_id) {
         return known.clone();
     }
@@ -365,11 +362,12 @@ pub(crate) async fn host_kv_layout(engine_id: usize) -> Option<state::PageLayout
     layout
 }
 
+type Known = Option<Option<::engine::TapGroups>>;
+static GROUPS: std::sync::Mutex<Vec<Known>> = std::sync::Mutex::new(Vec::new());
+
 /// The groups the engine reads a tapped page's planes out in, as spans of a
 /// host slot; `None` where it taps nothing. Once asked, known.
 pub(crate) async fn tap_groups(engine_id: usize) -> Result<Option<::engine::TapGroups>> {
-    type Known = Option<Option<::engine::TapGroups>>;
-    static GROUPS: std::sync::Mutex<Vec<Known>> = std::sync::Mutex::new(Vec::new());
     if let Some(Some(known)) = GROUPS.lock().unwrap().get(engine_id) {
         return Ok(known.clone());
     }
@@ -385,6 +383,21 @@ pub(crate) async fn tap_groups(engine_id: usize) -> Result<Option<::engine::TapG
     }
     known[engine_id] = Some(groups.clone());
     Ok(groups)
+}
+
+/// Forgets the boot's schedulers and what their engines answered, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    handle_registry().write().unwrap().clear();
+    LAYOUTS.lock().unwrap().clear();
+    GROUPS.lock().unwrap().clear();
+    FRAME_SIZE.store(0, Ordering::Relaxed);
+    HOST_COVER.store(0, Ordering::Relaxed);
+    FRAME_CEILING.store(0, Ordering::Relaxed);
+    frame::reset();
+    probe::host_submit().reset();
+    lane::reset();
+    worker::BACKSTOP_RETIREMENTS.store(0, Ordering::Relaxed);
 }
 
 pub fn configured_frame_size() -> usize {
@@ -627,10 +640,7 @@ pub async fn get_stats() -> AggregateStats {
     stats::aggregate(&scheduler_stats)
 }
 
-#[cfg_attr(
-    target_arch = "wasm32",
-    allow(dead_code, reason = "no policy runs in the browser")
-)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn last_batch_us() -> Option<u64> {
     handle_registry()
         .read()
@@ -648,10 +658,7 @@ pub(crate) fn last_batch_us() -> Option<u64> {
 }
 
 /// The processes in each engine's last fire, summed over engines.
-#[cfg_attr(
-    target_arch = "wasm32",
-    allow(dead_code, reason = "no policy runs in the browser")
-)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn last_batch_size() -> u64 {
     handle_registry()
         .read()
@@ -673,10 +680,7 @@ mod tests {
     fn an_unregistered_engine_names_no_devices_memory() {
         let domain = super::device_domain(usize::MAX);
         assert_eq!(domain, ::engine::MemoryDomain::HostPinned);
-        assert_ne!(domain, ::engine::MemoryDomain::CudaDevice(0));
-        assert_ne!(domain, ::engine::MemoryDomain::VulkanDevice(0));
-        assert_ne!(domain, ::engine::MemoryDomain::WgpuDevice(0));
-        assert_ne!(domain, ::engine::MemoryDomain::MetalPrivate);
+        assert!(!matches!(domain, ::engine::MemoryDomain::Device { .. }));
     }
 }
 

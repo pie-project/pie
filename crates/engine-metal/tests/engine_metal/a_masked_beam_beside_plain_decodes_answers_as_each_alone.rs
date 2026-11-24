@@ -7,12 +7,12 @@
 
 use engine::fire::{Mask, Masking};
 use engine_metal::serve::Seated;
-use engine_metal::{Boot, Lane, Shell};
+use engine_metal::{Lane, Shell};
 use eta_compiler::contract::{Drift, near_tie};
 use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, ops, trace_hybrid};
 use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, argmax, fixture_from};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, argmax, fixture_from};
 
 const VOCAB: u32 = 64;
 const WIDTH: u64 = 128;
@@ -70,25 +70,14 @@ impl ForwardHybrid for Micro {
 }
 
 fn load(fixture: &Fixture) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
+    Load {
         budget: Budget::new(LANES + 1, 64),
-        patches: None,
-        voxels: None,
-        profile: None,
         page_size: PAGE,
         context: CONTEXT,
         slots: SLOTS,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }
@@ -159,7 +148,6 @@ fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
     }
     let first_beam_token = last[beam as usize][1];
     let mut first_beam_alone = Vec::new();
-    let (mut same, mut ties) = (0u32, 0u32);
     let mut parted = [false; LANES as usize];
     for step in 0..STEPS {
         let held = PROMPT + step;
@@ -184,21 +172,16 @@ fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
             let (ta, tb) = (argmax(a) as usize, argmax(b) as usize);
             if !parted[lane] && ta != tb {
                 let parting = near_tie(gap(a), &[ta, tb], Drift::Rows { a, b }, None);
-                eprintln!("lane {lane} parts at step {step}: {parting:?}");
                 assert!(
                     parting.tie,
                     "lane {lane} (beam: {}) parts at step {step} on no near-tie",
                     lane as u32 == beam
                 );
                 parted[lane] = true;
-                ties += 1;
-            } else if !parted[lane] {
-                same += 1;
             }
             last[lane] = [tb as u32, ta as u32];
         }
     }
-    eprintln!("{same} lane steps the same token, {ties} parted on a near-tie");
 
     // A mixed fire: a prompt between the plain decodes and the beam, so the
     // decoding class is out of order and its window is copied or split. The
@@ -217,8 +200,6 @@ fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
         let alone = fire(&mut shell, &trace, &[(LANES + beam, &token, held, Some(&mask))]).swap_remove(0);
         let got = &mixed[rows.len() - 1];
         let (ta, tb) = (argmax(&alone) as usize, argmax(got) as usize);
-        let worst = alone.iter().zip(got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        eprintln!("the beam in a mixed fire: {worst} from alone");
         assert!(
             ta == tb || near_tie(gap(&alone), &[ta, tb], Drift::Rows { a: &alone, b: got }, None).tie,
             "the beam in a mixed fire answers otherwise than alone, on no near-tie"
@@ -241,7 +222,6 @@ fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
     // fired alone answers the same bits every time, so any move is the mask.
     let span = first_beam_alone.iter().copied().fold(f32::MIN, f32::max)
         - first_beam_alone.iter().copied().fold(f32::MAX, f32::min);
-    eprintln!("stating no mask moves the beam's first step {moved} of a span {span}");
     assert!(
         moved > span * 0.05,
         "the beam's first step reads its mask: stating none moves its logits ({moved} of {span})"
@@ -274,7 +254,6 @@ fn a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
     for (step, (a, b)) in masked.iter().zip(&plain).enumerate() {
         let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         let span = b.iter().copied().fold(f32::MIN, f32::max) - b.iter().copied().fold(f32::MAX, f32::min);
-        eprintln!("step {step}: worst {worst} of a span {span}");
         assert!(worst <= span * 1e-2, "step {step}: the masked arms answer otherwise ({worst})");
     }
 }

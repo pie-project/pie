@@ -404,48 +404,31 @@ pub fn conversion_contract(
     platform: Platform,
 ) -> Option<(String, ModelContract)> {
     let target = convert_target();
-    let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
-    let pinned = std::env::var("PIE_IMPORT_DEPLOYMENT").ok();
     for deployment in catalog().candidates_of(source, platform) {
-        let read = deployment.contract(source, platform);
-        if pinned
-            .as_deref()
-            .is_some_and(|name| name != deployment.name)
-        {
-            continue;
-        }
-        let contract = match read {
+        let contract = match deployment.contract(source, platform) {
             Ok(contract) => contract,
             Err(why) => {
-                if trace {
-                    eprintln!(
-                        "identify: {} does not read this source: {why}",
-                        deployment.name
-                    );
-                }
+                tracing::debug!(
+                    deployment = %deployment.name,
+                    "identify: does not read this source: {why}"
+                );
                 continue;
             }
         };
-        if pinned.is_none()
-            && let Some(plane) = poem_compiler::catalog::requantizes(&contract)
-        {
-            if trace {
-                eprintln!(
-                    "identify: {} reads it only by re-quantizing `{plane}`; not by identification",
-                    deployment.name
-                );
-            }
+        if let Some(plane) = poem_compiler::catalog::requantizes(&contract) {
+            tracing::debug!(
+                deployment = %deployment.name,
+                "identify: reads it only by re-quantizing `{plane}`; not by identification"
+            );
             continue;
         }
         match checkpoint::plan::compile(metadata, &contract, target.clone()) {
             Ok(_) => return Some((deployment.name, contract)),
             Err(why) => {
-                if trace {
-                    eprintln!(
-                        "identify: {} reads it but does not compile: {why}",
-                        deployment.name
-                    );
-                }
+                tracing::debug!(
+                    deployment = %deployment.name,
+                    "identify: reads it but does not compile: {why}"
+                );
             }
         }
     }
@@ -486,55 +469,18 @@ pub fn checkpoint_metadata(checkpoint: &Path) -> Result<Metadata> {
     }
 }
 
+/// The contract `trace`'s params land from `checkpoint` by, as this build's
+/// catalog reads it (`Catalog::contract_for`).
 pub fn contract_for(
     trace: &Trace,
     checkpoint: &Path,
 ) -> std::result::Result<ModelContract, String> {
-    let said = |error: &dyn std::fmt::Display| format!("{error:#}");
-    let source = open_source(checkpoint).map_err(|e| said(&e))?;
-    if stamp_of(checkpoint).map_err(|e| said(&e))?.is_some() {
-        let package = carried(checkpoint).map_err(|e| said(&e))?;
-        let (_, deploy) = package.manifest().parse(&trace.name).ok_or_else(|| {
-            format!(
-                "{:?} names no deployment of the package `{}` {checkpoint:?} carries",
-                trace.name,
-                package.name()
-            )
-        })?;
-        let tp = deploy.tp;
-        return poem::import::own_contract(&source, &trace.params, tp, trace.platform).map_err(
-            |error| {
-                format!(
-                    "{checkpoint:?} does not hold every plane of {:?}: {error}",
-                    trace.name
-                )
-            },
-        );
+    // an artifact whose package the catalog lacks: refused here, naming the
+    // models directory the catalog reads
+    if matches!(stamp_of(checkpoint), Ok(Some(_))) {
+        carried(checkpoint).map_err(|error| format!("{error:#}"))?;
     }
-    let deployment = catalog().parse(&trace.name).ok_or_else(|| {
-        format!(
-            "{:?} names no deployment of a model this build ships, so a checkpoint's tensors \
-             cannot be mapped onto its params",
-            trace.name
-        )
-    })?;
-    let ranks = deployment.deploy.tp.max(deployment.deploy.ep);
-    if ranks > 1 {
-        return Err(format!(
-            "{:?} is a {ranks}-rank deployment and {checkpoint:?} is an unconverted checkpoint: \
-             the ranks band their shares out of a stamped artifact, so convert it first (`pie \
-             model import`) and serve the artifact",
-            trace.name
-        ));
-    }
-    deployment
-        .contract(&source, trace.platform)
-        .map_err(|error| {
-            format!(
-                "the import contract for {:?} does not fit {checkpoint:?}: {error}",
-                trace.name
-            )
-        })
+    catalog().contract_for(trace, checkpoint)
 }
 
 /// The load of the deployment `checkpoint` states, under the config's

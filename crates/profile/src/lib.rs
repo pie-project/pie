@@ -3,13 +3,14 @@
 //! file, the user's file) against a [`Registry`], each layer checked against
 //! the probed facts and applied whole or not at all.
 
-pub mod routes;
-pub mod fire;
+pub mod curves;
 pub mod ladder;
 pub mod profile;
+pub mod rates;
 pub mod region;
 pub mod registry;
 pub mod render;
+pub mod routes;
 pub mod search;
 pub mod shelf;
 pub mod spec;
@@ -28,13 +29,6 @@ pub use shelf::{
 };
 pub use spec::{Alternative, Constant, Domain, Kind, Shape, Sort, Spec, Tune, Value, Var};
 pub use when::When;
-
-/// The tolerance two measurements of one thing agree within: two runs of a
-/// rates step, a check's estimate against the measured best, and two
-/// candidates of a search (the lowest of those within it of the fastest is
-/// taken, so two tunes write the same profile). One definition, which
-/// `engine::rates` re-exports.
-pub const AGREEMENT: f64 = 0.05;
 
 /// The backends `pie tune` can measure.
 const TUNABLE: &[&str] = &["metal", "cuda", "vulkan"];

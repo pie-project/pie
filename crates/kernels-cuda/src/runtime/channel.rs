@@ -484,7 +484,7 @@ pub struct CopyRun {
 }
 
 /// Copies each of the `count` runs at `runs` (a block a run): a windowed
-/// fire's rows folded onto their ring pages (CONTRACT-BC 19).
+/// fire's rows folded onto their ring pages.
 pub fn copy_runs(ctx: &Ctx, runs: DevicePtr, count: u32) -> Result<(), Error> {
     const OP: &str = "channel.copy_runs";
     if count == 0 {
@@ -768,7 +768,7 @@ const _: () = assert!(size_of::<BeamListRun>() == 40);
 /// carry: buffer token `tok` (slot `base + tok`) is the row of slot `σ` on
 /// entry `(σ - base) / tokens` of `bases` (`bases_len` of them), row
 /// `(σ - base) mod tokens`. A lane alone on its set reads its own pages
-/// (`list` 0, `σ` the slot). A beam on a hybrid (`BEAM-PAGE-LISTS.md` §11.1)
+/// (`list` 0, `σ` the slot). A beam on a hybrid
 /// reads its set's through its row of its group's list, which [`beam_step`]
 /// points `list` at (`cap` columns): `σ = (f0 + list[slot / page - f0]) page
 /// + slot mod page`, a slot below `f0 page` the set's own.
@@ -787,7 +787,7 @@ pub struct RsRows {
 
 const _: () = assert!(size_of::<RsRows>() == 40);
 
-/// A beam's rs copy (`BEAM-PAGE-LISTS.md` §6.4 on a hybrid, `channel.hip`'s
+/// A beam's rs copy (a fork's rows on a hybrid, `channel.hip`'s
 /// `RsCopyRun`): the `[src, dst, tokens]` its group's step left at `copy`,
 /// moved row by row of each plane through the set's rs entries (`bases`,
 /// as [`RsRows`]'s); slots below the buffer have no row.
@@ -836,8 +836,7 @@ pub fn copy_rs_rows(
     )
 }
 
-/// One beam group's step (`new-memory/designs/BEAM-PAGE-LISTS.md`,
-/// `channel.cu`'s `BeamStepRun`): its resident state, the parents its
+/// One beam group's step (`channel.cu`'s `BeamStepRun`): its resident state, the parents its
 /// last epilogue wrote, its pool's device ids, its lanes' list runs and
 /// fault words, and its numbers.
 #[repr(C)]

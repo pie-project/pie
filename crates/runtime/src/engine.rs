@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 pub mod backend;
 pub mod channel;
 pub mod completion;
@@ -36,7 +35,7 @@ pub type EngineId = usize;
 pub mod verbs {
     use anyhow::Result;
 
-    use ::engine::ChannelRegistration;
+    use ::engine::{ChannelRegistration, Engine};
 
     use super::{EngineBox, EngineId, RegisteredChannel, SubmissionCompletion};
 
@@ -47,12 +46,50 @@ pub mod verbs {
             .and_then(|facts| facts.codegen_backend.as_deref())
     }
 
+    /// An engine as the runtime holds it: boxed on its lane, or borrowed.
+    pub trait EngineMut {
+        fn engine_mut(&mut self) -> &mut dyn Engine;
+    }
+
+    impl EngineMut for EngineBox {
+        fn engine_mut(&mut self) -> &mut dyn Engine {
+            self.as_mut()
+        }
+    }
+
+    impl<'x> EngineMut for dyn Engine + 'x {
+        fn engine_mut(&mut self) -> &mut dyn Engine {
+            self
+        }
+    }
+
+    /// `engine`'s family `family`, or `Unsupported` naming `verb` where
+    /// the engine serves none.
+    pub fn serve<'a, E: EngineMut + ?Sized, F: ?Sized>(
+        engine: &'a mut E,
+        family: fn(&'a mut dyn Engine) -> Option<&'a mut F>,
+        verb: &'static str,
+    ) -> engine::Result<&'a mut F> {
+        let engine = engine.engine_mut();
+        let kind = engine.kind();
+        family(engine).ok_or(engine::Error::unsupported(kind, verb))
+    }
+
+    /// Whether `engine` lands its steps after `submit` returns
+    /// ([`::engine::Completion::asynchronous`]); one that tells no sink
+    /// settles inside `submit`.
+    pub fn settles_asynchronously(engine: &mut dyn Engine) -> bool {
+        engine
+            .completion()
+            .is_some_and(|completion| completion.asynchronous())
+    }
+
     pub fn register_adapter(
         engine: &mut EngineBox,
         registration: &engine::adapter::AdapterRegistration,
     ) -> Result<()> {
-        engine
-            .register_adapter(registration)
+        serve(engine, Engine::programs, "register_adapter")
+            .and_then(|programs| programs.adapter(registration))
             .map_err(anyhow::Error::from)
     }
 
@@ -69,12 +106,18 @@ pub mod verbs {
     ) -> Result<RegisteredChannel> {
         let table = waker::WakerTable::global();
         // What the engine stated it holds is what the bind took rings by
-        // (`Engine::holds_channel`): an answer past it would leave a ring
-        // with no slots, or slots taken twice.
-        let holds = engine.holds_channel(registration);
-        let answered = match engine.register_channel(registration) {
+        // (`Channels::holds`): an answer past it would leave a ring with no
+        // slots, or slots taken twice.
+        let holds = engine
+            .channels()
+            .is_some_and(|channels| channels.holds(registration));
+        let answered = match serve(engine, Engine::channels, "register_channel")
+            .and_then(|channels| channels.open(registration))
+        {
             Ok(answer) if !holds => {
-                let _ = engine.close_channel(registration.id);
+                if let Some(channels) = engine.channels() {
+                    let _ = channels.close(registration.id);
+                }
                 return Err(anyhow::anyhow!(
                     "channel {}: the engine states it leaves the registration to the runtime \
                      and took it",
@@ -121,21 +164,16 @@ pub mod verbs {
                         published.capacity
                     ));
                 }
-                // SAFETY: the engine published these addresses for this
-                // registration and holds them until `close_channel`, which
-                // the runtime calls only after dropping the record below.
-                let ring = std::sync::Arc::new(unsafe {
-                    super::channel::HostRing::adopt(
-                        published.mirror,
-                        published.words,
-                        published.cell_bytes,
-                        published.capacity,
+                let ring = super::channel::HostRing::adopt(published).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "channel {}'s engine mirror is shorter than its ring",
+                        registration.id
                     )
-                });
+                })?;
                 Ok(RegisteredChannel::over(
                     engine_id,
                     registration.id,
-                    ring,
+                    std::sync::Arc::new(ring),
                     reader_wait_id,
                     writer_wait_id,
                 ))

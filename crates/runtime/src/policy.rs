@@ -4,7 +4,10 @@
 //! A process's PLEX id is the id its client knows: one restarted after a KV
 //! reclaim keeps it. The browser build runs no policy: the runtime still
 //! reports here, and nothing listens.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#![cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser: its reports are formed and dropped")
+)]
 
 pub mod pressure;
 pub mod retention;
@@ -19,6 +22,21 @@ mod seat_to_end_tests;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use port::{LoadError, reload, start};
+
+/// Ends the policy thread and forgets what the boot's policy set, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    #[cfg(not(target_arch = "wasm32"))]
+    port::reset();
+    pressure::reset();
+    schedule::reset();
+    for count in ROWS_ENACTED.iter().chain(&ROWS_PASSED_OVER) {
+        count.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    withdraw_published();
+    *STARTS.lock().unwrap() = Starts::default();
+    STOPS.lock().unwrap().clear();
+}
 
 use client_api::Props;
 

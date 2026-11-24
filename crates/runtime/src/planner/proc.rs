@@ -41,9 +41,7 @@ pub(super) struct Proc {
     /// stall dump. It moves no state and runs no fire meanwhile: nothing in
     /// flight on its account ([`super::inner::Inner::nothing_in_flight`]),
     /// or the restore that brings what it waits on, or the room, is never
-    /// planned (Mac Pro at 2 GiB on 1e87ab171: a restore waiting on
-    /// InstanceId(5) for good, the queue's head held behind it as a move
-    /// in flight).
+    /// planned (the queue's head held behind it as a move in flight).
     pub(super) rebind_waiting: Option<String>,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     pub(super) parked: Option<Demand>,
@@ -102,9 +100,8 @@ pub(super) struct Proc {
     /// The length its last unpark refusal named, and the free runs of that
     /// length (within the state budget) then: it goes again on runs only
     /// once more of them stand. A count of room given back moved with every refused
-    /// restore's own return, and refused restores sent each other again,
-    /// round after round (Mac Pro's 2 GiB spin: 139,315 refusals, the free
-    /// room no different).
+    /// restore's own return, and refused restores would send each other
+    /// again, round after round, the free room no different.
     pub(super) roles_short_runs: Option<(u32, u32)>,
     /// The free chunks a guest's take reads (within the state budget) as
     /// its last unpark refusal left them: it goes again only once more
@@ -128,23 +125,22 @@ pub(super) struct Proc {
     /// its serve's state laid first) stood its need as its last unpark
     /// refusal left the pool. Refused where it did not stand, it goes again
     /// once it does: the placement decides, not a count of free chunks
-    /// beside it (Mac Pro at 5 GiB on 1e87ab171: 4 chunks free, the
-    /// refused restore held on "no more chunks free than it left", 18,973
-    /// no-step lines). Refused while it stood it, the placement read a
+    /// beside it (a count can hold a refused restore for good on "no more
+    /// chunks free than it left"). Refused while it stood it, the placement read a
     /// room the unpark did not, and it goes again only once more chunks
     /// stand free than the refusal left ([`Self::roles_short_free`]): a
     /// decoding fleet's takes and gives sent it again ~350 times a second.
     pub(super) roles_short_stood: Option<bool>,
     /// The run its last unpark was refused, `(run, pieces)`, kept across a
     /// re-send until a restore serves it: its need always holds what the
-    /// unpark asked. Cleared with the refusal at a re-send, the need fell
-    /// back to its bind's runs and its own, and the run of nine its unpark
-    /// was refused was never asked of the map (Mac Pro on 22b0a3e83).
+    /// unpark asked. Cleared with the refusal at a re-send, the need would
+    /// fall back to its bind's runs and its own, and the run its unpark
+    /// was refused never be asked of the map.
     pub(super) roles_refused: Option<(u32, u32)>,
     /// Evicted while it waited in the queue: its restore goes only once no
     /// process ahead of it (older) has an entry in the queue. Restored for
-    /// its own queued bind while the binds ahead of it still waited, it was
-    /// evicted for them again, 1,730 times (the L40S on 46296784b).
+    /// its own queued bind while the binds ahead of it still wait, it would
+    /// be evicted for them again, round after round.
     pub(super) evicted_queued: bool,
     /// Refused while the map showed runs of its need standing that its
     /// unpark did not see: `(map's free runs, the refusal's)`, for the
@@ -159,22 +155,27 @@ pub(super) struct Proc {
     pub(super) bind_room: Option<PendingBind>,
     /// Restored, or its bind served, for a waiting head, and not fired
     /// since: no eviction candidate until it fires once (the anti-thrash
-    /// rule's first half). Evicted back before it ran, a process was moved
-    /// 443 times with the head it was moved for never served.
+    /// rule's first half). Evicted back before it ran, a process would be
+    /// moved again and again with the head it was moved for never served.
     pub(super) unfired: bool,
     /// The head (its process) this one was evicted for: its restore is not
     /// served while that head waits unserved (the rule's second half),
     /// whatever key the head waits under now.
     pub(super) evicted_for: Option<ProcessId>,
-    /// The head this one was evicted for, its restore served ahead of it
-    /// while that head stood passed over with no move to make
-    /// ([`super::ResidencyPlanner::stuck_head`]): no victim for that
-    /// head until the head arrives ([`super::inner::Inner::arrived`]).
-    /// Moved back first, it went round with the
+    /// Binds served it so far ([`super::ResidencyPlanner::serve_bind_room`]).
+    pub(super) binds_served: u64,
+    /// The heads this one was evicted for, its restore served ahead of
+    /// each while that head stood passed over with no move to make
+    /// ([`super::ResidencyPlanner::stuck_head`]): no victim for any of
+    /// them until that head arrives ([`super::inner::Inner::arrived`]).
+    /// Each is kept until its own head arrives: restored past a second
+    /// head, a mark for the first alone would be overwritten, and the
+    /// first head move it again with no arrival between.
+    /// Moved back first, it would go round with the
     /// head, restored past it and evicted for it again, its waits never
-    /// served (seed 3392: queued for a page behind the head, so the mark
-    /// alone did not hold it).
-    pub(super) restored_past: Option<ProcessId>,
+    /// served (queued for a page behind the head, so the mark alone does
+    /// not hold it).
+    pub(super) restored_past: Vec<ProcessId>,
     /// The head the last resort last moved it for, until that head arrives
     /// ([`super::inner::Inner::arrived`]): it moves no victim twice for one
     /// head ([`super::ResidencyPlanner::last_resort_evict`]).
@@ -286,7 +287,8 @@ impl Proc {
             bind_room: None,
             unfired: false,
             evicted_for: None,
-            restored_past: None,
+            binds_served: 0,
+            restored_past: Vec::new(),
             last_resort_for: None,
         }
     }

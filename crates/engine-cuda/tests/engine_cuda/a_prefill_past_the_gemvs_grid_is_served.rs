@@ -8,6 +8,7 @@ use engine_cuda::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
+use crate::common::fnv;
 
 const TOP_K: u32 = 4;
 const WIDE: u32 = 16_400;
@@ -57,15 +58,6 @@ fn scratch(tag: &str) -> Scratch {
 
 fn bf16_bits(value: f32) -> u16 {
     (value.to_bits() >> 16) as u16
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn write_checkpoint(path: &Path, trace: &Trace) {

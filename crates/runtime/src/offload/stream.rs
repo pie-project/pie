@@ -65,23 +65,34 @@ static STREAMS: LazyLock<Mutex<Streams>> = LazyLock::new(Mutex::default);
 /// What the engine told of its taps, for [`route`] to take in order: the
 /// receiving half until the first run starts it.
 struct Told {
-    tx: mpsc::UnboundedSender<engine::Tapped>,
+    tx: Mutex<mpsc::UnboundedSender<engine::Tapped>>,
     rx: Mutex<Option<mpsc::UnboundedReceiver<engine::Tapped>>>,
 }
 
 static TOLD: LazyLock<Told> = LazyLock::new(|| {
     let (tx, rx) = mpsc::unbounded_channel();
     Told {
-        tx,
+        tx: Mutex::new(tx),
         rx: Mutex::new(Some(rx)),
     }
 });
 
+/// Forgets the boot's runs, and opens a new tap channel: the router of the
+/// last one ended with its runtime.
+pub(crate) fn reset() {
+    *STREAMS.lock().unwrap() = Streams::default();
+    UNSTREAMED.store(0, std::sync::atomic::Ordering::Relaxed);
+    let (tx, rx) = mpsc::unbounded_channel();
+    *TOLD.tx.lock().unwrap() = tx;
+    *TOLD.rx.lock().unwrap() = Some(rx);
+}
+
 /// The engine's tap sink. It is called on the device's own thread, so it
 /// only passes each told layer on.
 pub(crate) fn sink() -> engine::TapSink {
-    Arc::new(|tapped| {
-        let _ = TOLD.tx.send(tapped);
+    let tx = TOLD.tx.lock().unwrap().clone();
+    Arc::new(move |tapped| {
+        let _ = tx.send(tapped);
     })
 }
 

@@ -83,7 +83,7 @@ type Runs = SmallVec<[Range<u32>; 2]>;
 
 /// A page as a snapshot keeps it.
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ExportedPage {
     pub backing: KvPageBacking,
     pub key: Option<Hash256>,
@@ -91,7 +91,7 @@ pub struct ExportedPage {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ExportedSet {
     pub pages: Vec<ExportedPage>,
     pub page_len: u64,
@@ -268,6 +268,10 @@ impl KvPageTable {
     pub fn create_working_set(&mut self) -> WorkingSetId {
         self.rev += 1;
         self.working_sets.insert(WorkingSetEntry::new(None, 0, 0))
+    }
+
+    pub fn live_working_sets(&self) -> usize {
+        self.working_sets.iter().count()
     }
 
     /// Not while a fire on its way folds `ws` by a count placed when it
@@ -622,26 +626,37 @@ impl KvPageTable {
         Ok(())
     }
 
-    /// Node by node: the copy of a node start that runs furthest, then the node
-    /// its last key ends or branches at.
+    /// The furthest one trie path holds `keys` from token 0: a copy of a node
+    /// start whose path agrees with every key before it, as far as it runs.
+    /// Copies of a prefix sealed apart each carry their own children, so a run
+    /// stitched from one copy's start and another's child is no path to map.
     pub fn sealed_run(&self, keys: &[Hash256], resident: bool) -> Vec<TriePageLocation> {
-        let mut run = Vec::new();
-        while let Some(copies) = keys
-            .get(run.len())
-            .and_then(|key| self.node_starts.get(key))
-        {
-            let from = run.len();
-            let Some((node, matched)) = copies
-                .iter()
-                .map(|&node| (node, self.node_run(node, &keys[from..], resident)))
-                .max_by_key(|&(_, matched)| matched)
-                .filter(|&(_, matched)| matched > 0)
-            else {
-                break;
-            };
-            run.extend((0..matched as u64).map(|local| TriePageLocation { node, local }));
-        }
-        run
+        let mut starts: Vec<(usize, NodeId, usize)> = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(at, key)| Some((at, self.node_starts.get(key)?)))
+            .flat_map(|(at, copies)| copies.iter().map(move |&node| (at, node)))
+            .map(|(at, node)| (at, node, self.node_run(node, &keys[at..], resident)))
+            .filter(|&(.., matched)| matched > 0)
+            .collect();
+        starts.sort_by_key(|&(at, _, matched)| std::cmp::Reverse(at + matched));
+        starts
+            .into_iter()
+            .find_map(|(at, node, matched)| {
+                let path = self.path_locations(node, matched as u64 - 1);
+                (path.len() == at + matched
+                    && path[..at].iter().zip(keys).all(|(location, key)| {
+                        self.page_key_at(location) == Some(*key)
+                            && !self.swap_locations.contains(location)
+                            && (!resident
+                                || matches!(
+                                    self.backing_at(location),
+                                    Ok(KvPageBacking::Resident(_))
+                                ))
+                    }))
+                .then_some(path)
+            })
+            .unwrap_or_default()
     }
 
     fn node_run(&self, node: NodeId, keys: &[Hash256], resident: bool) -> usize {
@@ -965,6 +980,7 @@ impl KvPageTable {
     }
 
     /// The owners of the live working sets.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn working_set_owners(&self) -> impl Iterator<Item = ProcessId> + '_ {
         self.working_sets.iter().filter_map(|(_, entry)| entry.owner)
     }
@@ -2154,7 +2170,7 @@ impl KvPageTable {
     }
 
     /// Every page of `ws`, first to last, and what the table knows of it.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn exported(&self, ws: WorkingSetId) -> Result<ExportedSet, KvTableError> {
         let entry = self.entry(ws)?;
         if entry.unsettled > 0 {
@@ -2185,7 +2201,7 @@ impl KvPageTable {
 
     /// A working set of `pages`' own, as [`Self::exported`] said one stood,
     /// with every page at `backings`.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn imported(
         &mut self,
         set: ExportedSet,

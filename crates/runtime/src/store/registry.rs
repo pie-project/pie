@@ -53,12 +53,6 @@ pub struct Stores {
     /// The instance and channel slots, where the shared pool states their
     /// shapes ([`super::roles`]).
     pub roles: Option<super::roles::RolesHandle>,
-    /// The kv pages' pinned run, where the engine pins its pools (the
-    /// degenerate mode): lanes name their pages by its slot refs.
-    pub pinned_kv: Option<super::chunks::ShapeRun>,
-    /// The state records' pinned run, where the engine pins its pools and
-    /// the model holds recurrent state: lanes name their record by its refs.
-    pub pinned_state: Option<super::chunks::ShapeRun>,
 }
 
 fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
@@ -93,7 +87,7 @@ pub struct StatePool {
     pub pages: u32,
 }
 
-/// Today's pool counts as the pinned shapes the degenerate mode states.
+/// Stores of pinned pools, no shared pool: the counts each engine's pools hold.
 #[cfg(test)]
 pub fn register_model_with_swap(
     kv_page_size: u32,
@@ -189,11 +183,19 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
                 shared: None,
                 host: None,
                 roles: None,
-                pinned_kv: (pools.kv.device > 0).then_some(pools.kv),
-                pinned_state: (pools.state.device > 0).then_some(pools.state),
             })
         })
         .collect();
+    // An index a reset freed is taken again, the lowest first, so the next
+    // boot's model is 0.
+    let freed = {
+        let mut freed = FREED.lock().unwrap();
+        freed.pop_first()
+    };
+    if let Some(idx) = freed {
+        *REGISTRY[idx].write().unwrap() = stores;
+        return idx;
+    }
     REGISTRY.push(RwLock::new(stores))
 }
 
@@ -218,6 +220,20 @@ fn kv_seed() -> [u8; 32] {
         return seed;
     }
     rand::random::<[u8; 32]>()
+}
+
+/// The indices [`reset`] emptied.
+static FREED: Mutex<std::collections::BTreeSet<usize>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Empties every model's stores, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    KV_TAINTED.store(false, std::sync::atomic::Ordering::Release);
+    let mut freed = FREED.lock().unwrap();
+    for (idx, model) in REGISTRY.iter() {
+        model.write().unwrap().clear();
+        freed.insert(idx);
+    }
 }
 
 /// The stores of an engine whose pool is `shared`: kv pages are the list
@@ -283,8 +299,6 @@ pub fn shared_stores(
             }
             Arc::new(Mutex::new(roles))
         }),
-        pinned_kv: None,
-        pinned_state: None,
     }
 }
 
@@ -380,8 +394,6 @@ mod tests {
             shared: None,
             host: None,
             roles: None,
-            pinned_kv: None,
-            pinned_state: None,
         });
         Ok(())
     }

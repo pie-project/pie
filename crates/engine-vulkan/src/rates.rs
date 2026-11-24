@@ -37,95 +37,23 @@ pub fn at_load(
     max_submit: Option<std::time::Duration>,
     measuring: engine::rates::Measuring,
 ) -> Result<crate::tuning::Tuning> {
-    let chip = tuning.profile().clone();
     // What the profile states stands; a load times only what it lacks.
-    let stated = chip.rates();
     let measured = device.chip();
     let save = profiles.map(|profiles| engine::rates::SaveTo {
         path: crate::chip::SHELF.user_path(profiles, &measured.name),
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     });
-    let keys = engine_gpu::rates::keys_at(max_submit);
-    let lacked = stated.missing(&keys);
-    if lacked.is_empty() {
-        tracing::info!(
-            "rates: every [rates] key the load weighs by is stated ({}); none measured",
-            keys.join(", ")
-        );
-    } else {
-        tracing::info!(
-            "rates: {} {}: no layer states them, or the user's file and the committed profile \
-             store them under no matching key (the stored measurements' lines say which)",
-            match measuring {
-                engine::rates::Measuring::Time => "measuring",
-                engine::rates::Measuring::Skip => "skipping (`[engine] measure = false`)",
-            },
-            lacked.join(", ")
-        );
-    }
-    let chip = engine::rates::resolve_at_load(
-        chip,
-        &keys,
+    let (chip, resident) = engine_gpu::rates::resolve_at_load(
+        tuning.profile().clone(),
         save,
-        Some(device.left()),
+        device.left(),
         max_submit,
         measuring,
-        // A stale key's figure serves until the export round or `pie tune`
-        // measures it: its step needs device buffers of its own, which
-        // nothing lays after ready, so it is not timed behind serving.
-        engine::rates::StaleRates::Served,
-        |max_submit, stated| measure(device, &tuning, max_submit, stated).map_err(|e| e.to_string()),
-    )
-    .map_err(|why| engine_gpu::error::Fault::Device {
-        call: "rates at load",
-        why,
-    })?;
-    let stated_resident = chip
-        .rates()
-        .resident_workgroups
-        .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32);
-    let resident = match (stated_resident, measuring) {
-        (Some(resident), _) => {
-            tracing::info!(
-                resident,
-                "the workgroups the device holds at once, as its profile states them"
-            );
-            resident
-        }
-        (None, engine::rates::Measuring::Skip) => {
-            // A device fact no driver states as such: timed (milliseconds,
-            // stored nowhere), never defaulted.
-            let (resident, ms) = resident_for_skip(device, &tuning, max_submit)?;
-            let resident = resident.round().clamp(1.0, f64::from(u32::MAX)) as u32;
-            tracing::info!(
-                resident,
-                ms,
-                "rates: `[rates] {}` timed despite measure = false (no layer states it, and the \
-                 device states no count a guest step's grid can stride over): a {}-row matmul of \
-                 width {} against one workgroup of it, single fires; stored nowhere",
-                profile::fire::RESIDENT_WORKGROUPS,
-                engine_gpu::rates::RESIDENT_ROWS,
-                engine_gpu::rates::RESIDENT_SHAPE
-            );
-            resident
-        }
-        (None, engine::rates::Measuring::Time) => {
-            return Err(engine_gpu::error::Fault::Device {
-                call: "rates at load",
-                why: "the profile states no [rates] resident_workgroups after the rates step"
-                    .into(),
-            });
-        }
-    };
+        |max_submit, stated| measure(device, &tuning, max_submit, stated),
+        || resident_for_skip(device, &tuning, max_submit),
+    )?;
     device.hold_resident(resident);
-    let chip = if stated_resident.is_none() && measuring == engine::rates::Measuring::Skip {
-        let mut tuned = chip.tuned().clone();
-        tuned.timed.push(profile::fire::RESIDENT_WORKGROUPS.to_string());
-        chip.with_tuned(tuned)
-    } else {
-        chip
-    };
     Ok(crate::tuning::Tuning::new(chip, device.limits()))
 }
 
@@ -148,7 +76,7 @@ pub fn measure(
     device: &Context,
     tuning: &crate::tuning::Tuning,
     max_submit: Option<std::time::Duration>,
-    stated: &profile::fire::Rates,
+    stated: &profile::rates::Rates,
 ) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = |frame: Frame| Ok((None, (frame.commit_timed()? * 1e9) as u64));
@@ -172,7 +100,7 @@ fn on(device: &Context, mut measured: engine::rates::Measured) -> engine::rates:
 pub fn save_rates(
     device: &Context,
     profiles: Option<&std::path::Path>,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
 ) -> Result<()> {
     let Some(profiles) = profiles else {
         return Ok(());
@@ -183,7 +111,7 @@ pub fn save_rates(
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     };
-    let rates = profile::fire::Rates {
+    let rates = profile::rates::Rates {
         measured_on: Some(device.measured_on()),
         ..rates.clone()
     };
@@ -262,7 +190,7 @@ pub fn measure_saying(
         tier,
         &timer,
         stated_submit_bound(),
-        &profile::fire::Rates::default(),
+        &profile::rates::Rates::default(),
         say,
     )
     .map(|measured| on(device, measured))

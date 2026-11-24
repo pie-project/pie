@@ -3,7 +3,8 @@
 //! bank rotated through copies past the last-level cache. Each leg's line
 //! states its median and spread in us and its price on the tests' roofline
 //! (the RTX Spark's rates: `common::roof`); `*` marks the leg priced
-//! cheapest, the one `matmul_select` takes on a device of those rates.
+//! cheapest, the one `matmul_select` takes on a device of those rates. A
+//! probe run by hand (`--ignored --nocapture`).
 
 use crate::common::linear_ref::t;
 use crate::common::{Gpu, Lcg, captured, forget, replay};
@@ -85,6 +86,7 @@ fn times(gpu: &Gpu, ctx: &Ctx, launch: &dyn Fn(&Ctx, usize)) -> Vec<f64> {
 }
 
 #[test]
+#[ignore = "a probe run by hand"]
 fn each_legs_time_by_band() {
     let mut gpu = Gpu::open();
     let ctx = gpu.ctx();

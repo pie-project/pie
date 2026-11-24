@@ -12,6 +12,7 @@ use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
 use checkpoint::file::read::parse_metadata;
 use checkpoint::file::zt;
+use checkpoint::overwrite::{Held, Overwrite};
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
@@ -41,7 +42,8 @@ pub struct Weights {
     decoded: Vec<Buffer>,
     /// How this load landed its weights, where it measured it: for the
     /// device's profile, so a later load measures nothing.
-    landing: Option<profile::fire::Landing>,
+    landing: Option<profile::rates::Landing>,
+    places: Vec<Place>,
 }
 
 pub(crate) fn decodes_at_load(param: &poem_ir::Param) -> bool {
@@ -309,8 +311,8 @@ fn restore_from_checkpoint(
         Err(_) => return Err(Rotten::Machine("a digest worker panicked".to_string())),
         Ok(Ok(())) => {}
     }
-    eprintln!(
-        "engine-cuda: this boot read its whole image out of {:?} — {} device image(s) \
+    tracing::info!(
+        "this boot read its whole image out of {:?} — {} device image(s) \
          pumped and {} T1 plane(s) {}, so the executor never ran",
         serving.path(),
         pumped,
@@ -526,7 +528,7 @@ impl Weights {
         target: StorageTarget,
         decode_dense: bool,
         held: bool,
-        known: Option<profile::fire::Landing>,
+        known: Option<profile::rates::Landing>,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -633,8 +635,8 @@ impl Weights {
                     }),
                 ) {
                     Ok(ring) => {
-                        eprintln!(
-                            "engine-cuda: the weights cross by a pinned ring of 2 x {} KiB: the \
+                        tracing::info!(
+                            "the weights cross by a pinned ring of 2 x {} KiB: the \
                              link moves {:.1} GB/s from {} KiB copies past a {:.1} us latency; \
                              a slot fills at {:.1} GB/s ({} in {} ms)",
                             ring.slot_bytes() >> 10,
@@ -648,8 +650,8 @@ impl Weights {
                         Some(ring)
                     }
                     Err(why) => {
-                        eprintln!(
-                            "engine-cuda: no pinned ring for the weights ({why}); each is copied \
+                        tracing::info!(
+                            "no pinned ring for the weights ({why}); each is copied \
                              as it lands"
                         );
                         None
@@ -687,8 +689,8 @@ impl Weights {
             if let Some(ring) = &sink.ring {
                 ring.drain()?;
             }
-            eprintln!(
-                "engine-cuda: the weights landed in {} ms",
+            tracing::info!(
+                "the weights landed in {} ms",
                 landing_started.elapsed().as_millis()
             );
             // What this machine's landing measured, where it measured it
@@ -696,7 +698,7 @@ impl Weights {
             let all = [reads.spawn_s, reads.thread_bytes_per_s, reads.whole_bytes_per_s];
             measured_landing = match (&sink.ring, known) {
                 (Some(ring), None) if all.iter().all(|v| *v > 0.0) => {
-                    Some(profile::fire::Landing {
+                    Some(profile::rates::Landing {
                         copy_latency_ns: ring.rates.latency * 1e9,
                         copy_gbps: ring.rates.copy / 1e9,
                         copy_full_bytes: ring.rates.saturated as f64,
@@ -826,6 +828,7 @@ impl Weights {
             from_cache,
             decoded,
             landing: measured_landing,
+            places,
         })
     }
 
@@ -1413,7 +1416,7 @@ impl Weights {
     }
 
     #[must_use]
-    pub fn landing(&self) -> Option<profile::fire::Landing> {
+    pub fn landing(&self) -> Option<profile::rates::Landing> {
         self.landing
     }
 
@@ -1490,6 +1493,94 @@ impl Weights {
             self.store.write(at, plane.bytes)?;
         }
         Ok(())
+    }
+
+    pub fn unreloadable(&self, trace: &Trace) -> Option<&'static str> {
+        let table = &self.table;
+        if self.experts.is_some() {
+            return Some(
+                "streams planes from a host copy (routed experts or embedding rows the \
+                 weight cache takes)",
+            );
+        }
+        if !self.decoded.is_empty()
+            || !table.1.is_empty()
+            || !table.2.is_empty()
+            || !table.3.is_empty()
+            || !table.4.is_empty()
+        {
+            return Some(
+                "derives planes from the checkpoint's at load (decoded or requantized copies)",
+            );
+        }
+        let laid = table.0.iter().any(|row| {
+            !matches!(
+                row,
+                None | Some(WeightRow::Dense(_))
+                    | Some(WeightRow::Planes {
+                        atoms: false,
+                        lanes: false,
+                        ..
+                    })
+            )
+        });
+        if laid {
+            return Some("lays quantized scales in its products' own order at load");
+        }
+        if cfg!(feature = "rocm")
+            && trace.params.iter().any(|param| {
+                param.source == ParamSource::Checkpoint
+                    && !matches!(param.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32)
+            })
+        {
+            return Some("serves quantized planes, which the HIP build reorders at load");
+        }
+        None
+    }
+
+    pub fn reload(
+        &mut self,
+        trace: &Trace,
+        contract: &ModelContract,
+        path: &Path,
+        target: StorageTarget,
+        stream: *mut core::ffi::c_void,
+        torn: &mut bool,
+    ) -> Result<(u32, u64)> {
+        if let Some(why) = self.unreloadable(trace) {
+            return Err(Fault::Load(LoadError::Unsupported(format!(
+                "this load {why}, which a reload does not redo: restart the server on the \
+                 new checkpoint instead"
+            ))));
+        }
+        let held: Vec<Option<Held<'_>>> = trace
+            .params
+            .iter()
+            .zip(&self.places)
+            .map(|(param, place)| {
+                (param.source == ParamSource::Checkpoint && place.reserved > 0).then_some(Held {
+                    name: &param.name,
+                    shape: &param.shape,
+                    bytes: place.bytes,
+                })
+            })
+            .collect();
+        // Walked as the load walks its checkpoint: each plane written over
+        // its held one as it lands, no host image of the whole.
+        let overwrite = Overwrite::streaming(path, contract, target, &held)?;
+        let (store, places) = (&mut self.store, &self.places);
+        *torn = true;
+        let written = overwrite.run(None, |at, plane| {
+            store
+                .write(places[at].offset, plane)
+                .map_err(|fault| LoadError::Internal(fault.to_string()))
+        })?;
+        #[cfg(feature = "cuda")]
+        share_input_scales(trace, &self.table.0, stream)?;
+        #[cfg(not(feature = "cuda"))]
+        let _ = stream;
+        *torn = false;
+        Ok(written)
     }
 
     #[must_use]
@@ -1933,9 +2024,9 @@ pub(crate) fn laid_planes(trace: &Trace) -> Vec<Laid> {
             Dtype::E4m3g128 => 1,
             _ => continue,
         };
-        let (rows, k, leads) = match param.shape.as_slice() {
-            &[n, k] => (n, k, 1),
-            &[e, n, k] => (n, k, e),
+        let (rows, k, leads) = match *param.shape.as_slice() {
+            [n, k] => (n, k, 1),
+            [e, n, k] => (n, k, e),
             _ => continue,
         };
         if rows == 0 || k == 0 || !rows.is_multiple_of(128) || !k.is_multiple_of(128) {

@@ -1,0 +1,295 @@
+// wafer/ops/satt.csl: an attention PE's side of attention over a step's own rows (the stream
+// regime: non-causal, no cache across steps). A column holds one kv head: row r keeps rows
+// p = r (mod PYA) as entry p / PYA, keys 16-bit dim-major [d][e], values entry-major [e][d | 1]
+// with a ones column (so the values matvec also gives the softmax sum).
+//
+// store(p) lands the root's [k | v] multicast on the row that keeps p; the root streams no query
+// before its last store. query(): scores, exp against the head's reference mref, clamped to PMAX,
+// the values matvec into [o | l] up the column chain; the root's [redo, step] pair a head says
+// whether to redo the pass (ops/cy_satt.csl decides).
+// QH: queries held on the column (store_q / query_q). CAUSAL (QH only): row p attends rows <= p.
+// PAGED: a decode step of lanes over Pie's pages: `ptab` each lane slot's pages (LANES x MAXP),
+// `rowp` each row's (lane slot, state slot, position); pages of EP x PYA positions; WIN > 0 adds
+// a sliding window.
+//
+// ADVANCE (PAGED): after the step's last row reads `rowp`, every row's position += 1 (before its
+// query sends), so the host writes `rowp` only where its rows differ.
+//
+// Params: fab, math, red (the column chain), YM (the root's multicast queue), Qh, Dc, NE (entries
+// a row), PYA (the column's rows), SC (the scores' scale), PMAX (the 16-bit probabilities'
+// ceiling), QH, CAUSAL, PAGED, EP, LANES, MAXP, ROWS.
+param fab: imported_module;
+param math: imported_module;
+param red: imported_module;
+param YM: input_queue;
+param Qh: u16;
+param Dc: u16;
+param NE: u16;
+param PYA: u16;
+param SC: f32;
+param PMAX: f32 = 65504.0;
+param QH: bool = false;
+param CAUSAL: bool = false;
+param WIN: u16 = 0;
+param PAGED: bool = false;
+param EP: u16 = 1;
+param LANES: u16 = 1;
+param MAXP: u16 = 1;
+param ROWS: u16 = 1;
+param ADVANCE: bool = false;
+
+const matvec = @import_module("ops/mv.csl");
+
+fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
+const KCW: u16 = Dc * NE;
+const VCW: u16 = NE * (Dc + 1);
+const XW: u16 = mx(Qh * Dc, Qh * NE);
+const YW: u16 = mx(Qh * NE, Qh * (Dc + 1));
+var kc = @zeros([KCW]u16);
+var vc = @zeros([VCW]u16);
+var xh = @zeros([XW]@fp16());
+var y: [YW]f32 align(16) = @zeros([YW]f32);
+const SXW: u16 = if (QH) (Qh + 2) * Dc else 2 * Dc;
+var sx: [SXW]f32 align(16) = @zeros([SXW]f32);
+const QCW: u16 = if (PAGED) ROWS * Qh * Dc else if (QH) NE * Qh * Dc else 1;
+var ptab = @zeros([if (PAGED) LANES * MAXP else 1]u32);
+var rowp = @zeros([if (PAGED) 3 * ROWS else 1]u32);
+var mk = @zeros([if (PAGED) NE else 1]f32);
+const mk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (PAGED) NE else 1} -> mk[i] });
+var qc = @zeros([QCW]u16);
+const QFW: u16 = if (QH) Qh * Dc else 1;
+var qf: [QFW]f32 align(16) = @zeros([QFW]f32);
+const qf_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QFW} -> qf[i] });
+var pp = @zeros([Qh * NE]f32);
+var kk = @zeros([Qh * NE]u16);
+var mref = @zeros([Qh]f32);
+var myrow: u16 = 0;
+var qpos: u16 = 0;
+const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XW} -> xh[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{YW} -> y[i] });
+const sx_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * Dc} -> sx[i] });
+const kc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kc[i] });
+const vc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc + 1} -> vc[i] });
+const sc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> y[i] });
+const p_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> pp[i] });
+// the stores' 16-bit views: a key down its entry's column of kc (stride NE), a value row of vc, a
+// held q row of qc (each offset to the entry at run time)
+const kcol_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> kc[i * @as(i16, NE)] });
+const vrow_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> vc[i] });
+const qrow_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QFW} -> qc[i] });
+const sxk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Dc} -> sx[i] });
+const k_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Qh * NE} -> kk[i] });
+var pl_d = k_d;
+
+// The PE's row in the column, and the exp's view of its probabilities' low halves (pl_d: unset,
+// it is kk's own and the add overlaps its source). First call: the cache carries over (PAGED:
+// init() clears it).
+fn bind(row: u16) void {
+  myrow = row;
+  pl_d = @set_dsd_stride(@set_dsd_base_addr(k_d, @ptrcast([*]u16, &pp)), 2);
+}
+
+fn init(row: u16) void {
+  bind(row);
+  var e: u16 = 0;
+  while (e < VCW) : (e += 1) { vc[e] = 0; }
+  e = 0;
+  while (e < KCW) : (e += 1) { kc[e] = 0; }
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) { mref[h] = 0.0; }
+}
+
+// Entry e's key and value (and its ones column) from sx's words from `at`: two narrowing DSD
+// moves (the key strided down kc's column e).
+fn keep(e: u16, at: u16) void {
+  @fs2h(@increment_dsd_offset(kcol_d, @as(i16, e), u16),
+        @increment_dsd_offset(sxk_d, @as(i16, at), f32));
+  @fs2h(@increment_dsd_offset(vrow_d, @as(i16, e * (Dc + 1)), u16),
+        @increment_dsd_offset(sxk_d, @as(i16, at + Dc), f32));
+  vc[e * (Dc + 1) + Dc] = @bitcast(u16, @as(@fp16(), 1.0));
+}
+
+// Row p's [k | v] from the root's multicast; kept by row p % PYA as entry p / PYA.
+fn store(p: u16) void {
+  @fmovs(sx_d, fab.fin(YM, 2 * Dc));
+  if (p % PYA != myrow) { return; }
+  keep(p / PYA, 0);
+}
+
+// Row p's [q | k | v] from the root's multicast; kept (q too) by row p % PYA as entry p / PYA.
+fn store_q(p: u16) void {
+  const QD: u16 = Qh * Dc;
+  @fmovs(@set_dsd_length(sx_d, QD + 2 * Dc), fab.fin(YM, QD + 2 * Dc));
+  if (p % PYA != myrow) { return; }
+  const e = p / PYA;
+  keep(e, QD);
+  @fs2h(@increment_dsd_offset(qrow_d, @as(i16, e * QD), u16), @set_dsd_length(sxk_d, QD));
+}
+
+// Row p's query: its q up the chain from the PE that keeps it, then query().
+fn query_q(p: u16) void {
+  const QD: u16 = Qh * Dc;
+  if (p % PYA == myrow) {
+    @fh2s(qf_d, @increment_dsd_offset(qrow_d, @as(i16, (p / PYA) * QD), u16));
+  } else {
+    @fmovs(qf_d, @as(f32, 0.0));
+  }
+  red.send(qf_d, QD);
+  qpos = p;
+  query();
+}
+
+// A page's positions, and the pages a PE's entries hold (a page id the host writes is held below
+// it, a lane below LANES, a page index below MAXP: fab.below).
+const PG: u16 = EP * PYA;
+const NPG: u32 = NE / EP;
+
+// Row t's slot (PAGED): its PE row `srow` and entry `sent`.
+var srow: u16 = 0;
+var sent: u16 = 0;
+fn slot(t: u16) void {
+  const P: u32 = @as(u32, EP) * @as(u32, PYA);
+  const lane = fab.below(rowp[3 * t], LANES);
+  const q = rowp[3 * t + 2];
+  const page = fab.below(ptab[lane * @as(u32, MAXP) + fab.below(q / P, MAXP)], NPG);
+  const off = q % @as(u32, PG);
+  srow = @as(u16, off % @as(u32, PYA));
+  sent = @as(u16, page * @as(u32, EP) + off / @as(u32, PYA));
+}
+
+// Row t's [q | k | v] from the root's multicast; kept (its q a row) by the PE its slot is on.
+fn store_t(t: u16) void {
+  const QD: u16 = Qh * Dc;
+  @fmovs(@set_dsd_length(sx_d, QD + 2 * Dc), fab.fin(YM, QD + 2 * Dc));
+  slot(t);
+  if (srow != myrow) { return; }
+  keep(sent, QD);
+  @fs2h(@increment_dsd_offset(qrow_d, @as(i16, t * QD), u16), @set_dsd_length(sxk_d, QD));
+}
+
+// Row t's query: its q up the chain from the PE that keeps it, its lane's mask, then query().
+fn query_t(t: u16) void {
+  const QD: u16 = Qh * Dc;
+  slot(t);
+  if (srow == myrow) {
+    @fh2s(qf_d, @increment_dsd_offset(qrow_d, @as(i16, t * QD), u16));
+  } else {
+    @fmovs(qf_d, @as(f32, 0.0));
+  }
+  red.send(qf_d, QD);
+  lane_mask(t);
+  if (ADVANCE and t + 1 == ROWS) { advance(); }
+  query();
+}
+
+fn advance() void {
+  var r: u16 = 0;
+  while (r < ROWS) : (r += 1) { rowp[3 * r + 2] += 1; }
+}
+
+// Entries [a, b) of page `page` attended.
+fn unmask(page: u32, a: u32, b: u32) void {
+  if (b <= a) { return; }
+  const at = @as(u16, page * @as(u32, EP) + a);
+  @fmovs(@set_dsd_length(@increment_dsd_offset(mk_d, @as(i16, at), f32), @as(u16, b - a)), @as(f32, 1.0));
+}
+
+// Row t's mask (mk, 1 an entry attended): its lane's pages up to its position (and from its
+// window's first).
+fn lane_mask(t: u16) void {
+  const P: u32 = @as(u32, EP) * @as(u32, PYA);
+  const Y: u32 = @as(u32, PYA);
+  const lane = fab.below(rowp[3 * t], LANES);
+  const q = rowp[3 * t + 2];
+  @fmovs(mk_d, @as(f32, 0.0));
+  // the first position attended
+  var lo: u32 = 0;
+  if (WIN > 0 and q + 1 > @as(u32, WIN)) { lo = q + 1 - @as(u32, WIN); }
+  const row = @as(u32, myrow);
+  var j: u32 = lo / P;
+  while (j <= q / P and j < @as(u32, MAXP)) : (j += 1) {
+    const page = fab.below(ptab[lane * @as(u32, MAXP) + j], NPG);
+    // offsets o = e x PYA + row in [from, to]
+    var from: u32 = 0;
+    var to: u32 = P - 1;
+    if (j == lo / P) { from = lo % @as(u32, PG); }
+    if (j == q / P) { to = q % @as(u32, PG); }
+    var a: u32 = 0;
+    if (from > row) { a = (from - row + Y - 1) / Y; }
+    var b: u32 = 0;
+    if (to >= row) { b = (to - row) / Y + 1; }
+    unmask(page, a, b);
+  }
+}
+
+// The paged mask on the probabilities.
+fn page_mask() void {
+  var h: u16 = 0;
+  while (h < Qh) : (h += 1) {
+    const sh = @set_dsd_length(@increment_dsd_offset(sc_d, @as(i16, h * NE), f32), NE);
+    @fmuls(sh, sh, mk_d);
+  }
+}
+
+// The causal mask: of the entries kept here (rows e * PYA + myrow), those after row qpos score
+// no probability (WIN > 0: nor those WIN or more rows before it, a sliding window's).
+fn mask() void {
+  var n: u16 = 0;
+  if (qpos >= myrow) { n = (qpos - myrow) / PYA + 1; }
+  var h: u16 = 0;
+  if (WIN > 0 and qpos + 1 > WIN) {
+    // the first row kept, qpos + 1 - WIN: entries below it out
+    const lo = qpos + 1 - WIN;
+    var m: u16 = 0;
+    if (lo > myrow) { m = (lo - myrow + PYA - 1) / PYA; }
+    if (m > NE) { m = NE; }
+    while (h < Qh) : (h += 1) {
+      var e: u16 = 0;
+      while (e < m) : (e += 1) { y[h * NE + e] = 0.0; }
+    }
+    h = 0;
+  }
+  if (n >= NE) { return; }
+  while (h < Qh) : (h += 1) {
+    var e: u16 = n;
+    while (e < NE) : (e += 1) { y[h * NE + e] = 0.0; }
+  }
+}
+
+// One query: q in, passes until no head's sum left the window.
+fn query() void {
+  const QD: u16 = Qh * Dc;
+  @fs2h(@set_dsd_length(xh_d, QD), fab.fin(YM, QD));
+  // (until the root's word says done: ops/cy_satt.csl's PASSES its own bound)
+  while (true) {
+    var h: u16 = 0;
+    while (h < Qh) : (h += 1) {
+      matvec.tile32(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NE), kc_d,
+                    @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h * Dc), @fp16()), Dc));
+    }
+    @fmuls(sc_d, sc_d, SC);
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      const sh = @set_dsd_length(@increment_dsd_offset(sc_d, @as(i16, h * NE), f32), NE);
+      @fsubs(sh, sh, mref[h]);
+    }
+    math.vexp(sc_d, p_d, k_d, pl_d, 88.0, true);
+    @fnegs(sc_d, sc_d);
+    @fmaxs(sc_d, sc_d, -PMAX);
+    @fnegs(sc_d, sc_d);
+    if (PAGED) { page_mask(); } else if (CAUSAL) { mask(); }
+    // (q is spent: the probabilities take xh; a redo pass gets q again from the root)
+    @fs2h(@set_dsd_length(xh_d, Qh * NE), sc_d);
+    h = 0;
+    while (h < Qh) : (h += 1) {
+      matvec.tile32(@set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * (Dc + 1)), f32), Dc + 1), vc_d,
+                    @set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h * NE), @fp16()), NE));
+    }
+    red.send(@set_dsd_length(y_d, Qh * (Dc + 1)), Qh * (Dc + 1));
+    @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(YM, 1 + Qh));
+    h = 0;
+    while (h < Qh) : (h += 1) { mref[h] += sx[1 + h]; }
+    if (sx[0] == 0.0) { return; }
+    @fs2h(@set_dsd_length(xh_d, QD), fab.fin(YM, QD));
+  }
+}

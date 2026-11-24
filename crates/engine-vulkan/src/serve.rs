@@ -45,6 +45,46 @@ pub struct Shelf {
     derived_mismatches: u64,
     /// The first arm's fills' image bytes, and how many.
     image_bytes: (u64, u64),
+
+    /// Each walked family by its picks on its arm and rung (the kernels it
+    /// runs and its other commands, apart from what they bind): what a
+    /// lay-only pass's fill is a fill of; `None` where two families pick
+    /// alike, which no pass then fills.
+    by_picks: std::collections::HashMap<u64, Option<crate::record::Key>>,
+
+    /// A fill a lay-only pass laid, which the fire's own fill walk is held
+    /// to (`PIE_VK_VERIFY_DERIVED`).
+    pending_check: Option<(crate::record::Key, crate::record::Fill)>,
+}
+
+/// A walk's picks on its arm and rung: what names its family to a
+/// lay-only pass.
+fn picked(arm: usize, rung: usize, picks: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (arm, rung, picks).hash(&mut h);
+    h.finish()
+}
+
+/// Notes `family` as the one walked fires picking `picks` fill.
+fn note_picks(shell: &mut Shell<Api>, picks: u64, family: crate::record::Key) {
+    shell
+        .shelf
+        .by_picks
+        .entry(picks)
+        .and_modify(|held| {
+            if *held != Some(family) {
+                *held = None;
+            }
+        })
+        .or_insert(Some(family));
+}
+
+/// Whether a lay-only pass's fill is held to the fire's own fill walk,
+/// which then lays it (`PIE_VK_VERIFY_DERIVED`).
+fn verifying_derived() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_VK_VERIFY_DERIVED").is_some())
 }
 
 /// A first-arm fill, as an arm past it lays it.
@@ -288,7 +328,7 @@ impl Serve for Api {
     fn save_rates(
         device: &Context,
         boot: &crate::api::DeviceBoot,
-        rates: &profile::fire::Rates,
+        rates: &profile::rates::Rates,
     ) -> Result<()> {
         crate::rates::save_rates(device, boot.profiles.as_deref(), rates)
     }
@@ -510,6 +550,8 @@ impl Serve for Api {
             derived_checked: 0,
             derived_mismatches: 0,
             image_bytes: (0, 0),
+            by_picks: std::collections::HashMap::new(),
+            pending_check: None,
         })
     }
 
@@ -532,9 +574,11 @@ impl Serve for Api {
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
         crate::encode::profile_ready();
-        if shell.shelf.derived_fills > 0 || verifying_arms() {
+        if shell.shelf.derived_fills > 0 || shell.laid_walk > 0 || verifying_arms() {
             tracing::info!(
                 derived = shell.shelf.derived_fills,
+                laid = shell.laid_walk,
+                lay_ms = shell.lay_walk_ns / 1_000_000,
                 checked = shell.shelf.derived_checked,
                 image_bytes = ?shell.shelf.image_bytes,
                 mismatches = shell.shelf.derived_mismatches,
@@ -786,6 +830,61 @@ impl Serve for Api {
         true
     }
 
+    fn lay_frame(device: &Context, _arm: usize) -> Result<Option<Frame>> {
+        device.frame_lay().map(Some)
+    }
+
+    /// The fill a lay-only pass laid, of the family walked fires that pick
+    /// alike fill (on its arm and rung), where that family's recording
+    /// serves its group counts.
+    fn lay_fill(
+        shell: &mut Shell<Api>,
+        frame: Frame,
+        prepared: &mut Prepared<'_, Api>,
+        layout: &[ReadSpan],
+        launches: u32,
+    ) -> Result<bool> {
+        let fill = frame.into_fill();
+        if fill.cuts > 0 {
+            return Ok(false);
+        }
+        let picks = picked(prepared.arm, prepared.rung, fill.picks);
+        let Some(Some(family)) = shell.shelf.by_picks.get(&picks).copied() else {
+            return Ok(false);
+        };
+        let Some(held) = shell.shelf.recorder.family(family) else {
+            return Ok(false);
+        };
+        if !held.recording.cuts.is_empty() || !held.recording.serves(&fill.groups) {
+            return Ok(false);
+        }
+        let shape = record_key(shell, prepared);
+        let (groups, image, room_pasts) = (
+            std::sync::Arc::new(fill.groups),
+            std::sync::Arc::new(fill.image),
+            std::sync::Arc::new(fill.room_pasts),
+        );
+        // The arm walk's first-arm fill, laid: an arm past it derives its own.
+        if !verifying_derived() {
+            note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+        }
+        let laid = crate::record::Fill::new(
+            family,
+            groups,
+            image,
+            layout.to_vec(),
+            launches,
+            room_pasts,
+        );
+        // Verifying, the fire walks for its fill all the same, held to this.
+        if verifying_derived() {
+            shell.shelf.pending_check = Some((shape, laid));
+            return Ok(false);
+        }
+        shell.shelf.recorder.insert_fill(shape, laid);
+        Ok(true)
+    }
+
     fn fill_frame(device: &Context, _arm: usize) -> Result<Frame> {
         device.frame_dry()
     }
@@ -802,9 +901,7 @@ impl Serve for Api {
         layout: &[ReadSpan],
         launches: u32,
     ) -> Result<bool> {
-        let t = std::time::Instant::now();
         let fill = frame.into_fill();
-        engine_gpu::kernel_profile::phase(2, t);
         let shape = record_key(shell, prepared);
         let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
         if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
@@ -863,11 +960,41 @@ impl Serve for Api {
             }
             return Ok(false);
         }
+        if fill.cuts == 0 {
+            note_picks(shell, picked(prepared.arm, prepared.rung, fill.picks), family);
+        }
         let (groups, image, room_pasts) = (
             std::sync::Arc::new(fill.groups),
             std::sync::Arc::new(fill.image),
             std::sync::Arc::new(fill.room_pasts),
         );
+        if let Some((held, laid)) = shell.shelf.pending_check.take()
+            && held == shape
+        {
+            let mut parts = Vec::new();
+            if laid.family != family {
+                parts.push("family");
+            }
+            if laid.groups != groups {
+                parts.push("groups");
+            }
+            if !laid.image.same(&image) {
+                parts.push("image");
+            }
+            if format!("{:?}", laid.layout) != format!("{layout:?}") {
+                parts.push("layout");
+            }
+            if laid.launches != launches {
+                parts.push("launches");
+            }
+            if laid.room_pasts.as_ref() != room_pasts.as_ref() {
+                parts.push("room_pasts");
+            }
+            tracing::warn!(
+                differs = ?parts,
+                "verifying: a lay-only pass's fill against the fire's own fill walk"
+            );
+        }
         if fill.cuts == 0 {
             note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
         }
@@ -941,7 +1068,7 @@ impl Serve for Api {
             // run.
             drop(frame);
             shell.kept_none();
-            return shell.device.frame()?.commit_async(Some(on_done));
+            return shell.device.landed(Some(on_done));
         }
         match keep {
             Some(shape) => {
@@ -951,6 +1078,7 @@ impl Serve for Api {
                 // step to replay after it; a flush of anything else would
                 // not repeat, so such a fire is not kept.
                 let image = std::sync::Arc::new(kept.image().sealed());
+                let picks = picked(prepared.arm, prepared.rung, kept.picks());
                 if kept.cuts() != cuts.len() {
                     kept.stage(&image)?;
                     return kept.replay(Some(on_done));
@@ -1021,7 +1149,7 @@ impl Serve for Api {
                         } else {
                             shell.kept_none();
                         }
-                        shell.device.frame()?.commit_async(Some(on_done))?
+                        shell.device.landed(Some(on_done))?
                     }
                     Act::Fill => {
                         shell.kept_none();
@@ -1067,6 +1195,7 @@ impl Serve for Api {
                 };
                 let room_pasts = std::sync::Arc::new(room_pasts);
                 if uncut && !alone {
+                    note_picks(shell, picks, family);
                     note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
                 }
                 let recorder = &mut shell.shelf.recorder;
@@ -1255,7 +1384,7 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
     let t = std::time::Instant::now();
     let key = keyed_inner(shell, p, reads);
-    engine_gpu::kernel_profile::phase(7, t);
+    engine_gpu::kernel_profile::phase_if(7, t);
     key
 }
 

@@ -106,10 +106,15 @@ pub enum Tally {
     /// replay reads, which the load laid for none of its shape: arming
     /// after ready, so 0 on a load whose arm walk laid every fill.
     FilledInFire,
+    /// A serving fire of an armed family whose fill the walk laid for none
+    /// of its shape (a row count it enumerates no composition of): a
+    /// lay-only pass laid it on the host, its dispatch arguments and group
+    /// counts, once a length, as fire data.
+    LaidAtFirstFire,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 15] = [
+    pub const ALL: [Tally; 16] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -125,6 +130,7 @@ impl Tally {
         Tally::FiresFolds,
         Tally::FiresBuffers,
         Tally::FilledInFire,
+        Tally::LaidAtFirstFire,
     ];
 
     /// Its name in the model status.
@@ -146,6 +152,7 @@ impl Tally {
             Tally::FiresFolds => "fires_folds",
             Tally::FiresBuffers => "fires_buffers",
             Tally::FilledInFire => "filled_in_fire",
+            Tally::LaidAtFirstFire => "laid_at_first_fire",
         }
     }
 }

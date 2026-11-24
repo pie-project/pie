@@ -13,8 +13,8 @@ impl engine_gpu::Backend for Api {
 
     const COPY_GRAIN: u64 = 4;
 
-    /// The pool is laid whole at load and never resized, as XLA's (user
-    /// ruling, 2026-11-15): no `yield` applies.
+    /// The pool is laid whole at load and never resized, as XLA's: no
+    /// `yield` applies.
     const RESIZES_POOL: bool = false;
 
     const STORAGE: checkpoint::types::BackendKind = checkpoint::types::BackendKind::Wgpu;
@@ -30,7 +30,13 @@ impl engine_gpu::Backend for Api {
     type Tuning = crate::tuning::Tuning;
 
     fn is_device(domain: engine::transfer::MemoryDomain) -> bool {
-        matches!(domain, engine::transfer::MemoryDomain::WgpuDevice(_))
+        matches!(
+            domain,
+            engine::transfer::MemoryDomain::Device {
+                reach: engine::transfer::DeviceReach::Private,
+                ..
+            }
+        )
     }
 
     fn stage_rows(

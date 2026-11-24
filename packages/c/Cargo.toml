@@ -1,6 +1,7 @@
 [package]
 name = "pie-c"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "pie's C library (include/pie.h): a worker::Server in the caller's process, for any language with a C FFI. The Swift package links it."

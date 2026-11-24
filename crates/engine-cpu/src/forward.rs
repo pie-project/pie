@@ -6,6 +6,9 @@
 //! own lane, routed experts, an expert-parallel dispatch and combine, a
 //! tensor-parallel sum and gather) and refuses the rest.
 //!
+//! A stream step ([`Forward::stream`]) runs several lanes at once, each its own
+//! request word: a diffusion transformer's denoise, its lanes attending each other.
+//!
 //! Each value is f32 on the host, rounded to bf16 where the trace types it
 //! so. A row's result depends only on that row (and, in attention, on its
 //! lane's earlier rows), never on which other rows a step or a rank holds:
@@ -29,11 +32,14 @@ use std::sync::Arc;
 use engine::placement::Placement;
 use poem_ir::{
     Attn, Collective, Def, Dim, Dtype, Elemwise, Gather, GluAct, Guard, Linear, NormAxis,
-    NormWeight, Operands, Operation, ParamSource, RouteScore, RuntimeInput, Shard, Trace, Turn, Ty,
-    ValueId,
+    NormWeight, Operands, Operation, ParamSource, RouteScore, RuntimeInput, Shard, Ssm, Trace,
+    Turn, Ty, ValueId,
 };
 
 pub use crate::exchange::{Exchange, Post};
+pub use stream::{Captured, StreamLane, StreamStep};
+
+mod stream;
 
 /// A value as the forward holds it: rows of `width` elements.
 #[derive(Clone, Debug)]
@@ -41,7 +47,8 @@ enum Held {
     Floats {
         rows: usize,
         width: usize,
-        v: Vec<f32>,
+        /// Shared: a run's values start as the weights' (a clone is a pointer, not a copy).
+        v: std::sync::Arc<Vec<f32>>,
     },
     Ints {
         rows: usize,
@@ -77,6 +84,8 @@ struct Ints<'a> {
 struct Lane {
     k: Vec<Option<Vec<f32>>>,
     v: Vec<Option<Vec<f32>>>,
+    /// A short conv's state (`ssm.short_conv`): its last rows, oldest first.
+    hist: Vec<f32>,
 }
 
 /// A layer's placement: the dispatch's table (`stride` i32 an expert) and
@@ -159,6 +168,28 @@ fn bf16(x: f32) -> f32 {
     let bits = x.to_bits();
     let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
     f32::from_bits(rounded & 0xffff_0000)
+}
+
+/// A plane as the ops read it: a convolution kernel's `[C_out, c_in, taps]` relabelled taps
+/// major, as every engine lays it at load.
+pub(crate) fn laid(layout: poem_ir::ParamLayout, v: Vec<f32>) -> Vec<f32> {
+    let poem_ir::ParamLayout::ConvTapsMajor { c_in, taps } = layout else {
+        return v;
+    };
+    let (c_in, taps) = (c_in as usize, taps as usize);
+    let pitch = c_in * taps;
+    if pitch == 0 || !v.len().is_multiple_of(pitch) {
+        return v;
+    }
+    let mut out = vec![0.0; v.len()];
+    for (row, o) in v.chunks(pitch).zip(out.chunks_mut(pitch)) {
+        for c in 0..c_in {
+            for t in 0..taps {
+                o[t * c_in + c] = row[c * taps + t];
+            }
+        }
+    }
+    out
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -266,7 +297,7 @@ impl Forward {
             weights[id] = Some(Held::Floats {
                 rows,
                 width: each,
-                v: v.into_iter().map(bf16).collect(),
+                v: std::sync::Arc::new(laid(param.layout, v.into_iter().map(bf16).collect())),
             });
         }
         let lanes = (0..trace.caches.len()).map(|_| Lane::default()).collect();
@@ -287,6 +318,22 @@ impl Forward {
     pub fn at_context(mut self, context: u32, page_size: u32) -> Forward {
         self.context = Some((context, page_size));
         self
+    }
+
+    /// A forward of `trace` holding no weights, for the host's part of a step a device runs
+    /// ([`Forward::stream_values`]). A node that reads a weight errs.
+    #[must_use]
+    pub fn host(trace: Trace) -> Forward {
+        let weights = vec![None; trace.values.len()];
+        let lanes = (0..trace.caches.len()).map(|_| Lane::default()).collect();
+        Forward {
+            trace,
+            group: None,
+            weights,
+            lanes,
+            placed: std::collections::BTreeMap::new(),
+            context: None,
+        }
     }
 
     /// The engine's uniform placement of `experts` over `ranks` ranks of
@@ -335,8 +382,9 @@ impl Forward {
                         Vec::new()
                     },
                 },
-                Def::Input(RuntimeInput::Mask | RuntimeInput::Geometry { .. })
-                | Def::Cache(_) => Held::Opaque,
+                Def::Input(RuntimeInput::Mask | RuntimeInput::Geometry { .. }) | Def::Cache(_) => {
+                    Held::Opaque
+                }
                 Def::Input(other) => return Err(format!("no input {other:?} here")),
                 _ => continue,
             };
@@ -351,6 +399,7 @@ impl Forward {
             group: self.group.as_ref(),
             placed: &self.placed,
             context: self.context,
+            rows: None,
         };
         let mut aliases = Vec::new();
         for (at, node) in self.trace.nodes.iter().enumerate() {
@@ -379,7 +428,7 @@ impl Forward {
                 continue;
             }
             let (rows, width, values) = match run.held(output.value)? {
-                Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.clone())),
+                Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.as_ref().clone())),
                 Held::Ints { rows, width, v } => (*rows, *width, Values::I32(v.clone())),
                 Held::Opaque => return Err(format!("output `{}` holds no rows", output.name)),
             };
@@ -450,11 +499,17 @@ struct Run<'a> {
     group: Option<&'a Group>,
     placed: &'a std::collections::BTreeMap<u32, Placed>,
     context: Option<(u32, u32)>,
+    /// A stream step's lanes ([`Forward::stream`]): each row's lane, the merges made ahead.
+    rows: Option<&'a stream::RowLanes>,
 }
 
 impl Run<'_> {
     /// The value `id` reads as: a merge's arm the word takes.
     fn resolve(&self, mut id: ValueId) -> Result<ValueId, String> {
+        if self.rows.is_some() {
+            // a stream step's merges are made row by row ahead of their readers
+            return Ok(id);
+        }
         while let Def::Merge(arms) = &self.trace.values[id.0 as usize].def {
             id = (arms.iter())
                 .find(|(_, g): &&(ValueId, Guard)| g.holds(self.word))
@@ -476,7 +531,7 @@ impl Run<'_> {
             Held::Floats { rows, width, v } => Ok(Rows {
                 rows: *rows,
                 width: *width,
-                v,
+                v: v.as_slice(),
             }),
             _ => Err(format!("value {} is not floats", id.0)),
         }
@@ -515,7 +570,11 @@ impl Run<'_> {
             } => v.into_iter().map(bf16).collect(),
             _ => v,
         };
-        self.vals[id.0 as usize] = Some(Held::Floats { rows, width, v });
+        self.vals[id.0 as usize] = Some(Held::Floats {
+            rows,
+            width,
+            v: std::sync::Arc::new(v),
+        });
         Ok(())
     }
 
@@ -530,7 +589,63 @@ impl Run<'_> {
             Operation::Gather(op) => self.gather(op),
             Operation::Linear(op) => self.linear(op),
             Operation::Collective(op) => self.collective(op),
+            Operation::Conv(op) => self.conv(op),
+            Operation::Ssm(op) => self.ssm(op),
             other => Err(format!("`{}` has no host forward", Operands::name(other))),
+        }
+    }
+
+    /// A recurrent mixer: a short causal conv (`ssm.short_conv`), each channel over its last
+    /// `conv_width` rows, no activation; a row at position 0 starts from a cleared state.
+    fn ssm(&mut self, op: &Ssm) -> Result<(), String> {
+        match *op {
+            Ssm::ShortConv {
+                x,
+                weight,
+                state,
+                conv_width,
+                y,
+            }
+            | Ssm::ShortConvChunked {
+                x,
+                weight,
+                state,
+                conv_width,
+                y,
+            } => {
+                let Def::Cache(c) = self.trace.values[state.0 as usize].def else {
+                    return Err("a short conv over no state".into());
+                };
+                let (xs, w) = (self.floats(x)?, self.floats(weight)?);
+                let (taps, ch) = (conv_width as usize, xs.width);
+                if w.v.len() != ch * taps {
+                    return Err(format!(
+                        "a short conv's taps: {} values for {ch} x {taps}",
+                        w.v.len()
+                    ));
+                }
+                let (rows, xv, wv) = (xs.rows, xs.v.to_vec(), w.v.to_vec());
+                let lane = &mut self.lanes[c as usize];
+                let held = (taps - 1) * ch;
+                let mut out = Vec::with_capacity(rows * ch);
+                for r in 0..rows {
+                    if self.positions[r] == 0 || lane.hist.len() != held {
+                        lane.hist = vec![0.0; held];
+                    }
+                    let xr = &xv[r * ch..(r + 1) * ch];
+                    for i in 0..ch {
+                        let mut acc = wv[i * taps + taps - 1] * xr[i];
+                        for j in 0..taps - 1 {
+                            acc += wv[i * taps + j] * lane.hist[j * ch + i];
+                        }
+                        out.push(acc);
+                    }
+                    lane.hist.drain(..ch.min(held));
+                    lane.hist.extend_from_slice(&xr[..ch.min(held)]);
+                }
+                self.put(y, rows, out)
+            }
+            ref other => Err(format!("`{}` has no host forward", Operands::name(other))),
         }
     }
 
@@ -611,7 +726,10 @@ impl Run<'_> {
                 ..
             } => self.capture(q, cache, head_dim as usize, q_heads, sm_scale, observe, into, scores),
             Attn::ScorePages { keys, pages } => self.score_pages(keys, pages),
-            _ => Err(format!("`{}` has no host forward", Operands::name(op))),
+            Attn::Prefill { mask: Some(_), .. } => {
+                Err("a custom mask, which this forward does not read".into())
+            }
+            _ => self.attn_more(op),
         }
     }
 
@@ -806,8 +924,8 @@ impl Run<'_> {
                     NormWeight::PlusOne(w) => (Some(self.floats(w)?), 1.0),
                 };
                 let mut out = Vec::with_capacity(xs.v.len());
-                for t in 0..xs.rows {
-                    let inv = 1.0 / (sums.v[t] / width as f32 + eps).sqrt();
+                for (t, sum) in sums.v[..xs.rows].iter().enumerate() {
+                    let inv = 1.0 / (sum / width as f32 + eps).sqrt();
                     for (i, v) in xs.row(t).iter().enumerate() {
                         let g = w.as_ref().map_or(1.0, |w| w.v[i] + plus);
                         out.push(v * inv * g);
@@ -880,7 +998,7 @@ impl Run<'_> {
                 let rows = xs.rows;
                 self.put(y_out, rows, out)
             }
-            _ => Err(format!("`{}` has no host forward", Operands::name(op))),
+            _ => self.elemwise_more(op),
         }
     }
 
@@ -970,7 +1088,7 @@ impl Run<'_> {
                 let rows = picks.rows;
                 self.put(y, rows, out)
             }
-            _ => Err(format!("`{}` has no host forward", Operands::name(op))),
+            _ => self.gather_more(op),
         }
     }
 

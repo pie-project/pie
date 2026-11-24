@@ -173,8 +173,7 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
         .expect("the program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut engine, &ProgramRegistration {
             program_hash: 0xb001,
             launch,
             ..Default::default()
@@ -235,20 +234,17 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     assert!(
-        engine
-            .publish_channel(instance, 2, &0.375f32.to_le_bytes())
+        engine::Channels::publish(&mut engine, instance, 2, &0.375f32.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
     let mask_rows: Vec<bool> = OTHER_ROW.iter().chain(&PARENT_ROW).copied().collect();
     assert!(
-        engine
-            .publish_channel(instance, 0, &bits(&mask_rows))
+        engine::Channels::publish(&mut engine, instance, 0, &bits(&mask_rows))
             .expect("the mask publishes"),
         "the ring had room"
     );
@@ -280,8 +276,7 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");
-    let cell = engine
-        .take_channel(instance, 1)
+    let cell = engine::Channels::take(&mut engine, instance, 1)
         .expect("the channel reads")
         .expect("the channel holds a cell");
     let got: Vec<bool> = cell
@@ -296,8 +291,7 @@ fn a_gathered_bool_row_keeps_its_parents_cells() {
     eprintln!("or(gather(mask, parent), eq(col, slot)): {got:?}");
 
     let mut words = |dense: u32| -> Vec<bool> {
-        engine
-            .take_channel(instance, dense)
+        engine::Channels::take(&mut engine, instance, dense)
             .expect("the channel reads")
             .expect("the channel holds a cell")
             .as_chunks::<4>()

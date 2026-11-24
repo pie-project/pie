@@ -396,35 +396,6 @@ pub fn causal_conv1d_carried(
     )
 }
 
-/// [`short_conv`] over each lane's carried rows then its own, as
-/// [`causal_conv1d_carried`].
-#[allow(clippy::too_many_arguments)]
-pub fn short_conv_carried(
-    ctx: &Ctx,
-    x: Tensor,
-    weight: Tensor,
-    state: &RecurrentPool,
-    conv_width: u32,
-    y: &mut Tensor,
-    carry: &Carry,
-) -> Result<(), Error> {
-    const OP: &str = "ssm.short_conv";
-    conv1d_carried(
-        ctx,
-        OP,
-        x,
-        weight,
-        None,
-        state,
-        conv_width,
-        1,
-        y,
-        ConvOut::Residual,
-        carry,
-        None,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn conv1d_carried(
     ctx: &Ctx,
@@ -506,7 +477,7 @@ fn conv1d_carried(
     )
 }
 
-/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, plane 0 of
+/// Folds each beam group's fold rows (plane 0 of
 /// `carry`: the rows' conv inputs, through the group's representative lane's
 /// pages) into its conv window: the window stored as it stands after them.
 /// The groups that fold lead `folds` (`groups` entries at most, the first of

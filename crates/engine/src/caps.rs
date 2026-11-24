@@ -52,6 +52,10 @@ pub struct FireLimits {
     /// going in the steps after.
     #[serde(default)]
     pub replayed_rows: u32,
+    /// The frames the engine would have the runtime keep posted where
+    /// `[runtime] frame_dispatch_depth` is not stated (0: the runtime's own).
+    #[serde(default)]
+    pub dispatch_depth: u32,
 }
 
 /// What a load states beside its chunk pool ([`ChunkFacts`], which holds
@@ -318,6 +322,7 @@ mod mixed_lanes {
                 prefill_lanes: 0,
                 max_readouts: 0,
                 replayed_rows: 0,
+                dispatch_depth: 0,
             },
         )
     }

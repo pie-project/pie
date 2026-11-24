@@ -1,6 +1,7 @@
 [package]
 name = "units"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "The unit-carrying config values every pie role reads: durations (`50ms`) and byte sizes (`4GiB`), written with their unit."

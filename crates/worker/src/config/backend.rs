@@ -116,6 +116,8 @@ pub struct CerebrasEngineOptions {
     pub target: String,
     /// The CS system's `host:port`. Omit to run the fabric simulator.
     pub cmaddr: Option<String>,
+    /// Host threads the simulator uses; omit for the host's available parallelism.
+    pub num_threads: Option<u32>,
     /// Steps a greedy lane's token loop runs past its row in one wafer launch (0: off); omit
     /// for the engine's default.
     pub lookahead: Option<u32>,
@@ -130,8 +132,8 @@ pub struct CerebrasEngineOptions {
     /// `[engine.toolchain]`: where the SDK image's toolchain is when off its default layout
     /// (`cslc`, `cslang_root`, `python`, `sdk_lib`, `compile_timeout`).
     pub toolchain: Option<toml::Table>,
-    /// `[engine.debug]`: bench and experiment settings (`program`, `weights`, `set`, `levers`);
-    /// a load with any logs them.
+    /// `[engine.debug]`: bench and experiment settings (`program`, `link`, `stream_fabric`,
+    /// `weights`, `set`, `levers`); a load with any logs them.
     pub debug: Option<toml::Table>,
 }
 
@@ -140,6 +142,7 @@ impl Default for CerebrasEngineOptions {
         Self {
             target: "wse3".to_string(),
             cmaddr: None,
+            num_threads: None,
             lookahead: None,
             asynchronous: None,
             wafer: None,
@@ -155,6 +158,10 @@ impl CerebrasEngineOptions {
             matches!(self.target.as_str(), "wse2" | "wse3"),
             "engine.target must be one of \"wse2\", \"wse3\"; got {:?}",
             self.target
+        );
+        ensure!(
+            self.num_threads != Some(0),
+            "engine.num_threads must be > 0 (omit it for the host's available parallelism)"
         );
         Ok(())
     }

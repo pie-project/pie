@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use eta_ir::container::HostRole;
 
@@ -155,7 +155,7 @@ impl Endpoint {
     pub fn detach(&self) {
         let _ = self
             .attachments
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(1))
             });
     }
@@ -269,7 +269,7 @@ impl Endpoint {
     pub fn unpredict_head(&self, by: u64) {
         let _ = self
             .predicted_head
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |at| {
                 Some(at.saturating_sub(by))
             });
     }
@@ -277,7 +277,7 @@ impl Endpoint {
     pub fn unpredict_tail(&self, by: u64) {
         let _ = self
             .predicted_tail
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |at| {
                 Some(at.saturating_sub(by))
             });
     }
@@ -302,6 +302,38 @@ impl Endpoint {
         unsafe {
             (*AtomicU64::from_ptr(host.cast::<u64>().add(index))).store(value, Ordering::Release);
         }
+    }
+}
+
+/// The host side of the words and the mirror, as the runtime adopts them.
+impl engine::channel::MirrorMemory for Endpoint {
+    fn words(&self) -> &[AtomicU64] {
+        let host = self.words.host();
+        if host.is_null() {
+            return &[];
+        }
+        // SAFETY: as `word`, for as long as `self` lives.
+        unsafe { std::slice::from_raw_parts(host.cast::<AtomicU64>(), WORDS) }
+    }
+
+    fn cells(&self) -> &[AtomicU8] {
+        let host = self.mirror.host();
+        if host.is_null() {
+            return &[];
+        }
+        // SAFETY: `mirror` is `mirror_bytes` of live mapped memory that lives
+        // as long as `self`, and an `AtomicU8` is laid out as a `u8`.
+        unsafe { std::slice::from_raw_parts(host.cast::<AtomicU8>(), self.mirror.bytes()) }
+    }
+
+    fn cell_words(&self) -> &[AtomicU64] {
+        let host = self.mirror.host().cast::<AtomicU64>();
+        if host.is_null() || !host.is_aligned() {
+            return &[];
+        }
+        // SAFETY: as `cells`, and the words start on a word boundary and end
+        // within the mapping.
+        unsafe { std::slice::from_raw_parts(host, self.mirror.bytes() / 8) }
     }
 }
 

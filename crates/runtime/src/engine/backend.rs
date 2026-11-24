@@ -326,6 +326,12 @@ pub fn take_engine_backend(engine_id: usize) -> Result<EngineBox> {
         .ok_or_else(|| anyhow!("engine {engine_id} has no backend installed"))
 }
 
+/// Forgets the boot's engines, so the next boot's first is 0 again.
+pub(crate) fn reset() {
+    registry().lock().unwrap().clear();
+    crate::engine::completion::reset();
+}
+
 pub fn unregister_engine(engine_id: usize) -> Result<()> {
     let mut engines = registry().lock().unwrap();
     let Some(slot) = engines.get_mut(engine_id) else {

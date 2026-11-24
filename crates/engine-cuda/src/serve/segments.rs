@@ -76,8 +76,8 @@ impl Shell {
         let verdict = match script {
             Ok(_) => true,
             Err(uncut) => {
-                eprintln!(
-                    "engine-cuda: body {key} holds nothing a graph can keep — {uncut}. \
+                tracing::info!(
+                    "body {key} holds nothing a graph can keep — {uncut}. \
                      This composition walks eagerly for the life of the load; \
                      `record::widen` grew its islands to the nearest legal boundary \
                      first, and `record::Uncut` names what was left."

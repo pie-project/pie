@@ -78,7 +78,7 @@ struct BeamAt {
     lists_cap: u64,
     planes_cap: u64,
     pages_cap: u64,
-    /// A hybrid's (BEAM-PAGE-LISTS §11): its beams' rs page tables, the
+    /// A hybrid's: its beams' rs page tables, the
     /// sets' rs entries and its beams' rs copies.
     rs_runs: u64,
     rs_bases: u64,
@@ -98,7 +98,7 @@ pub struct BeamRecords {
     pub bases: Vec<u64>,
     pub lanes: u32,
     /// A hybrid's beams' rs page tables, its sets' rs entries (slab
-    /// slots) and its beams' rs copies (BEAM-PAGE-LISTS §11).
+    /// slots) and its beams' rs copies.
     pub rs: Vec<kernels_metal::runtime::beam::BeamRsRun>,
     pub rs_bases: Vec<i32>,
     pub rs_copies: Vec<kernels_metal::runtime::beam::RsCopyRun>,
@@ -209,8 +209,8 @@ pub struct Handles {
     /// Each band's snapshot table, `[lanes, RS_SNAPSHOTS * (1 + width)]`.
     pub rs_snap_bands: Vec<Tensor>,
     pub rs_pages: Option<Tensor>,
-    /// The fire's beam groups' folds, `[seat, rows]` a group
-    /// (BEAM-PAGE-LISTS §11.3), and how many.
+    /// The fire's beam groups' folds, `[seat, rows]` a group,
+    /// and how many.
     pub rs_folds: Option<(Tensor, u32)>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
@@ -509,7 +509,7 @@ pub struct Inputs {
     /// The group masks' room in the store, sized for the widest fire where
     /// the model packs attention groups ([`group_mask_bytes`]).
     group_masks: (u64, u64),
-    /// A fire's beam groups' head step (BEAM-PAGE-LISTS): its records and
+    /// A fire's beam groups' head step: its records and
     /// arrays, and its fault words read at settle.
     beam: BeamAt,
 }
@@ -800,7 +800,7 @@ impl Inputs {
         let group_masks = (take(mask_bytes), mask_bytes);
         // The beam head step: a group, a copy and a fault word at most a
         // lane; a list a lane a table; a page a lane's table holds plus
-        // the pages a fire hands out and holds pending (BEAM-PAGE-LISTS §3).
+        // the pages a fire hands out and holds pending.
         let beam = {
             use kernels_metal::runtime::beam::{
                 BeamListRun, BeamRsRun, BeamStepRun, PageCopyRun, PagePlane, RsCopyRun,
@@ -1072,11 +1072,16 @@ impl Inputs {
             _ => false,
         };
         if let Some(snaps) = fire.rs_snaps {
-            if snaps.len() != lanes as usize * SNAP_INTS as usize {
+            let per_lane: u32 = self
+                .bands
+                .iter()
+                .map(|&w| kernels_metal::ssm::RS_SNAPSHOTS * (1 + w))
+                .sum();
+            if snaps.len() != lanes as usize * per_lane as usize {
                 return Err(Fault::Ceiling {
                     what: "recurrent snapshot tables, one row per lane",
                     need: snaps.len() as u64,
-                    have: u64::from(lanes) * u64::from(SNAP_INTS),
+                    have: u64::from(lanes) * u64::from(per_lane),
                 });
             }
             self.store.write(self.rs_snaps, bytes_of(snaps))?;

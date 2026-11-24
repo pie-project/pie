@@ -88,8 +88,7 @@ fn a_frame_of_two_readout_widens_serves() {
     let bound = eta_ir::validate::bind(epilogue(), vec![decls], EngineCaps::default())
         .expect("the epilogue binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut engine, &ProgramRegistration {
             program_hash: 0x2e1d,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
@@ -144,8 +143,7 @@ fn a_frame_of_two_readout_widens_serves() {
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     let mut ticket = engine
@@ -173,8 +171,7 @@ fn a_frame_of_two_readout_widens_serves() {
     engine.settle_frame(&mut ticket).expect("the frame settles");
     let row = &planes["embed"].1[(tokens[2] * WIDTH) as usize..][..WIDTH as usize];
     for dense in 0..2u32 {
-        let got: Vec<f32> = engine
-            .take_channel(instance, dense)
+        let got: Vec<f32> = engine::Channels::take(&mut engine, instance, dense)
             .expect("the channel reads")
             .expect("the channel holds a cell")
             .as_chunks::<4>()

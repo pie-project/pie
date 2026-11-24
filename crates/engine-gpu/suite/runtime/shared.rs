@@ -195,8 +195,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
     let bound = eta_ir::validate::bind(program(), vec![decls], EngineCaps::default())
         .expect("the chain binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut engine, &ProgramRegistration {
             program_hash: 0x5a4e,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
@@ -256,16 +255,14 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
 
     // The timestep's one cell feeds every pass: a fire reads it where it
     // lies and leaves it there.
     assert!(
-        engine
-            .publish_channel(instance, 2, &0.375f32.to_le_bytes())
+        engine::Channels::publish(&mut engine, instance, 2, &0.375f32.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
@@ -301,8 +298,7 @@ fn a_chain_of_rows_answers_the_host_cell_for_cell() {
 
         let id = argmax[token as usize];
         for (dense, want) in [0u32, 1, 3].into_iter().zip(wanted(id)) {
-            let cell = engine
-                .take_channel(instance, dense)
+            let cell = engine::Channels::take(&mut engine, instance, dense)
                 .expect("the channel reads")
                 .expect("the channel holds a cell");
             assert_eq!(cell.len(), WIDE as usize * 4, "channel {dense}'s row");

@@ -89,26 +89,29 @@ impl ResidencyPlanner {
     /// any of it (a placement it will not copy: the runtime's own doing,
     /// never the process's): the move is taken back, the process stays
     /// resident, and it is no victim again until the pool moves past the
-    /// refusal, said as the runtime's bug. Failed for it, a beam lost its
-    /// process (Mac Pro at 5 GiB on 5aa45805b: "state chunk 1936 ... lies
-    /// inside the activation span's backed carve").
+    /// refusal, said as the runtime's bug: no process is failed for it.
     /// An eviction whose copy down failed because the tier below is full
     /// (the disk tier's slot file, `StorageFull`): nothing on the device
     /// changed, so the move is taken back and the process stays resident,
     /// said by name, and it is no victim again until the pool moves past
     /// it (its block lapses, [`Self::lapse_blocks`]): moved again at once,
-    /// it would find the tier as full.
+    /// it would find the tier as full. With the fleet stalled on it, every
+    /// tier full, it fails by name instead ([`Self::fail_tiers_full`]).
     pub(super) fn eviction_tier_full(self: &Arc<Self>, pid: ProcessId, error: &str) {
         tracing::warn!(
             pid = %pid,
             %error,
-            "planner: the tier below is full: the eviction is taken back, the process kept \
-             resident, no victim until the pool moves"
+            "planner: the tier below is full: the eviction is taken back"
         );
         self.stats.eviction_tier_full.fetch_add(1, Ordering::Relaxed);
         // Blocked as room below short, which a stall with nothing in flight
         // lifts ([`Self::dump_stall`]).
         self.eviction_failed_inner(pid, true, false);
+        // Every tier full and the fleet stalled: the victim fails by name
+        // and its room frees for the others ([`Self::fail_tiers_full`]).
+        if self.with_inner(|inner| inner.truly_wedged()) && !self.waits_on_policy() {
+            self.fail_tiers_full(Some(pid));
+        }
     }
 
     pub(super) fn eviction_copy_refused(self: &Arc<Self>, pid: ProcessId, error: &str) {
@@ -172,9 +175,9 @@ impl ResidencyPlanner {
                 // Never parked: its bind goes again as it stands. The room
                 // a bind withdrawn by this eviction waited for is kept
                 // until that bind asks again ([`Self::wait_room`]): moved
-                // again before it did, its restore came back without the
-                // room, short, and its process went down a second time for
-                // one bind (the simulation's seed 276).
+                // again before it did, its restore would come back without
+                // the room, short, and its process go down a second time for
+                // one bind.
             }
             Some(proc.signal.clone())
         });
@@ -329,8 +332,8 @@ impl ResidencyPlanner {
     /// The head's need becomes the refusal's own, never less than what was
     /// recorded for it: the longest run and the most pieces of the refused
     /// need, the bind that suspended it and its last refusal, kept as both
-    /// (mx-7: recorded (3,1) beside a refused (4,1), the plan funding the
-    /// smaller while the restore waited on the larger, nothing moved). A
+    /// (else, recorded (3,1) beside a refused (4,1), the plan funds the
+    /// smaller while the restore waits on the larger). A
     /// refusal that came while runs of that need stood (in its own view or
     /// the map's) understates what the unpark takes: its need becomes one
     /// run more than stood, which the planner funds by moving the occupants
@@ -353,8 +356,7 @@ impl ResidencyPlanner {
         });
         // Of what was recorded, only a need of the refusal's own length:
         // folded over a bind's run of seven, a refusal of a run of four
-        // read as runs of seven (Mac Pro's mx-3: need (7, 4) while its unpark
-        // was refused a run of four).
+        // would read as runs of seven.
         let run = need.0;
         let pieces = recorded
             .iter()
@@ -372,8 +374,8 @@ impl ResidencyPlanner {
         // The runs of the length its refusal named, standing now: what it
         // goes again on. Read at its need's length (a run of seven, the
         // bind's, folded over the unpark's run of four), runs of seven
-        // freed sent it again while the run of four it was refused never
-        // stood (Mac Pro's mx-3).
+        // freed would send it again while the run of four it was refused
+        // never stands.
         let refused_room = self.port.guest_free_runs(need.0);
         // The free chunks a guest's take reads (within the state budget),
         // as the refusal leaves them: what it goes again on too.
@@ -397,9 +399,8 @@ impl ResidencyPlanner {
         // Only a refusal that saw runs of its need standing understates the
         // need. One the map shows runs for while the refusal saw none names
         // a room the map does not read (the unpark's own takes, chunks its
-        // serve opened first): grown on it, the need ballooned a run a
-        // refusal ((7, 6) to (7, 22), Mac Pro's 2 GiB and mx-2 on
-        // 3b45462d4) with nothing issued.
+        // serve opened first): grown on it, the need would grow a run a
+        // refusal with nothing issued.
         let understated = refused_saw && stood < max_runs;
         let pieces = if understated { pieces.max(stood.saturating_add(1)) } else { pieces };
         let updated = super::proc::PendingBind {
@@ -411,10 +412,10 @@ impl ResidencyPlanner {
         self.stats
             .restore_roles_short
             .fetch_add(1, Ordering::Relaxed);
-        // The same refusal again on the same room: each send re-ran the
-        // pass (the head's own re-send moved the generation), so no pass
-        // ever settled and the invariant never saw it (Mac Pro g2 on
-        // bd4f4ffe7: 394k passes). A repeat is a settled stall: counted, a
+        // The same refusal again on the same room: each send re-runs the
+        // pass (the head's own re-send moves the generation), so no pass
+        // would ever settle and the invariant never see it. A repeat is a
+        // settled stall: counted, a
         // strict test fails, and it is read as the placement's mismatch
         // (no race refused it twice on one room): held from a send until
         // the room moves, its need planned on chunks only moves empty.
@@ -513,11 +514,9 @@ impl ResidencyPlanner {
         self.port.release_restore(pid);
         // Queued at what it has off the device, read now: its kv pages and
         // its state. Queued at nothing, the planner's need and placement
-        // read no state for it until its next serve re-quoted it, stood a
-        // need its serve's state then broke, and sent it again, refused,
-        // round after round (Mac Pro at 2 GiB on 5aa45805b: 151k no-step
-        // lines, the refusal's room 0 free chunks beside 28 runs the
-        // planner read).
+        // would read no state for it until its next serve re-quoted it,
+        // stand a need its serve's state then breaks, and send it again,
+        // refused, round after round.
         let (model, engine) = self.port.locus();
         let demand = Demand {
             kv_pages: super::holdings::swapped_page_count(pid, model, engine),
@@ -542,8 +541,7 @@ impl ResidencyPlanner {
     fn fail_restore_loud(self: &Arc<Self>, pid: ProcessId, reason: &str) {
         let reason = format!("KV restore failed: {reason}");
         // The engine's scheduler gone: the worker is shutting down, and the
-        // restore was cut by it, no failure of the process's (logs after
-        // SIGTERM: "engine 0 has no scheduler").
+        // restore was cut by it, no failure of the process's.
         let (_, engine) = self.port.locus();
         if crate::scheduler::scheduler_handle(engine).is_err() {
             tracing::debug!(pid = %pid, %reason, "planner: a restore cut by shutdown");

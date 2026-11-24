@@ -33,7 +33,11 @@ struct Input {
 /// The token a row's logits pick: the most likely one when `greedy`, else
 /// a Gumbel draw keyed by `r`.
 fn pick(logits: Tensor, r: &Tensor, greedy: bool) -> Tensor {
-    if greedy { reduce_argmax(logits) } else { gumbel_max(logits, r) }
+    if greedy {
+        reduce_argmax(logits)
+    } else {
+        gumbel_max(logits, r)
+    }
 }
 
 #[derive(Serialize)]
@@ -81,13 +85,17 @@ async fn draw(
 }
 
 /// Writes `tokens` to `ws`, then draws up to `max_tokens` ahead of reading
-/// them, stopping after `stop_after`.
+/// them, stopping after `stop_after`. Drawing none fires nothing, as the
+/// one-at-a-time path does.
 async fn draw_ahead(
     ws: &WorkingSet,
     pipe: &Pipeline,
     input: &Input,
     stop_after: usize,
 ) -> Result<Vec<u32>> {
+    if input.max_tokens == 0 || stop_after == 0 {
+        return Ok(Vec::new());
+    }
     let tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
     let (first, _) = draw(ws, pipe, &tokens, input.seed, input.drawn, input.greedy).await?;
     let mut drawn = vec![first as u32];
@@ -115,7 +123,8 @@ async fn draw_ahead(
     });
     run_ahead(pipe, &fwd, input.max_tokens - 1, async || {
         let t = out.take_host::<Vec<i32>>().await?;
-        drawn.push(*t.first().unwrap_or(&0) as u32);
+        let next = t.first().ok_or("a draw-ahead fire returned no token")?;
+        drawn.push(*next as u32);
         Ok(if drawn.len() >= stop_after {
             ControlFlow::Break(())
         } else {
@@ -144,8 +153,15 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated = Vec::with_capacity(input.max_tokens);
     let mut gaps = Vec::with_capacity(input.max_tokens);
     for i in 0..input.max_tokens as u32 {
-        let (next, gap) =
-            draw(&ws, &pipe, &tokens, input.seed, input.drawn + i, input.greedy).await?;
+        let (next, gap) = draw(
+            &ws,
+            &pipe,
+            &tokens,
+            input.seed,
+            input.drawn + i,
+            input.greedy,
+        )
+        .await?;
         generated.push(next as u32);
         gaps.push(gap);
         tokens = vec![next];

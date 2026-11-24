@@ -47,9 +47,12 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(3)]] StructuredBuffer<int> ids;
 [[vk::binding(4)]] RWStructuredBuffer<uint> y;
 
+// The bank may hold a run of a table's rows, its rows `first ..`: an id
+// outside it lands zeros from the first run alone, which a later run leaves.
 struct Params {
     int hidden;
     int vocab;
+    int first;
 };
 PIE_PARAMS(5, Params, params);
 
@@ -62,10 +65,12 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (k >= hidden) {
         return;
     }
-    int id = ids[m];
+    int id = ids[m] - params.first;
     uint at = (m * hidden + k) >> 1;
     if (id < 0 || id >= params.vocab) {
-        y[at] = 0u;
+        if (params.first == 0) {
+            y[at] = 0u;
+        }
         return;
     }
     uint row = uint(id);

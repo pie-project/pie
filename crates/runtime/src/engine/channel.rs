@@ -1,11 +1,29 @@
-#![allow(unsafe_code)]
 use std::sync::Arc;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use engine::{ChannelId, InstanceId};
 
-type OwnedRing = (Box<[u8]>, Box<[AtomicU64]>);
+/// A ring the runtime allocates for an engine that maps none.
+#[derive(Debug)]
+struct OwnedRing {
+    words: Box<[AtomicU64]>,
+    cells: Box<[AtomicU64]>,
+}
+
+impl engine::channel::MirrorMemory for OwnedRing {
+    fn words(&self) -> &[AtomicU64] {
+        &self.words
+    }
+
+    fn cells(&self) -> &[AtomicU8] {
+        &[]
+    }
+
+    fn cell_words(&self) -> &[AtomicU64] {
+        &self.cells
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelValue {
@@ -15,9 +33,8 @@ pub struct ChannelValue {
 
 #[derive(Debug)]
 pub struct HostRing {
-    owned: Option<OwnedRing>,
-    mirror_base: u64,
-    word_base: u64,
+    adopted: bool,
+    memory: Arc<dyn engine::channel::MirrorMemory>,
     mirror_bytes: u64,
     cell_bytes: u32,
     capacity: u32,
@@ -33,41 +50,42 @@ impl HostRing {
     pub fn new(cell_bytes: u32, capacity: u32) -> HostRing {
         let slots = u64::from(capacity).saturating_add(1);
         let bytes = usize::try_from(slots * u64::from(cell_bytes)).unwrap_or(usize::MAX);
-        let mirror = vec![0u8; bytes].into_boxed_slice();
+        let cells = (0..bytes.div_ceil(8)).map(|_| AtomicU64::new(0)).collect();
         let words: Box<[AtomicU64]> = (0..4)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         HostRing {
-            mirror_base: mirror.as_ptr() as u64,
-            word_base: words.as_ptr() as u64,
-            mirror_bytes: mirror.len() as u64,
-            owned: Some((mirror, words)),
+            mirror_bytes: bytes as u64,
+            memory: Arc::new(OwnedRing { words, cells }),
+            adopted: false,
             cell_bytes,
             capacity,
         }
     }
 
-    /// # Safety
-    ///
-    /// `mirror` and `words` must point at a live mapping of at least
-    /// `capacity + 1` cells of `cell_bytes` that outlives the returned ring.
+    /// A ring over the engine's mapping, which it holds alive; `None` if the
+    /// mapping is short of four words or of `capacity + 1` cells.
     #[must_use]
-    pub unsafe fn adopt(mirror: u64, words: u64, cell_bytes: u32, capacity: u32) -> HostRing {
-        let slots = u64::from(capacity).saturating_add(1);
-        HostRing {
-            owned: None,
-            mirror_base: mirror,
-            word_base: words,
-            mirror_bytes: slots * u64::from(cell_bytes),
-            cell_bytes,
-            capacity,
+    pub fn adopt(mirror: engine::HostMirror) -> Option<HostRing> {
+        let slots = u64::from(mirror.capacity).saturating_add(1);
+        let mirror_bytes = slots * u64::from(mirror.cell_bytes);
+        let (words, cells) = (mirror.memory.words(), Cells::of(&*mirror.memory));
+        if words.len() < 4 || (cells.len() as u64) < mirror_bytes {
+            return None;
         }
+        Some(HostRing {
+            adopted: true,
+            mirror_bytes,
+            cell_bytes: mirror.cell_bytes,
+            capacity: mirror.capacity,
+            memory: mirror.memory,
+        })
     }
 
     #[must_use]
     pub const fn adopted(&self) -> bool {
-        self.owned.is_none()
+        self.adopted
     }
 
     #[must_use]
@@ -83,8 +101,7 @@ impl HostRing {
     pub fn binding(&self, channel_id: ChannelId) -> ChannelBinding {
         ChannelBinding {
             channel_id,
-            mirror_base: self.mirror_base,
-            word_base: self.word_base,
+            memory: Arc::clone(&self.memory),
             mirror_bytes: self.mirror_bytes,
             word_bytes: (4 * size_of::<AtomicU64>()) as u64,
             cell_bytes: self.cell_bytes,
@@ -97,11 +114,10 @@ impl HostRing {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ChannelBinding {
     pub channel_id: ChannelId,
-    pub mirror_base: u64,
-    pub word_base: u64,
+    pub memory: Arc<dyn engine::channel::MirrorMemory>,
     pub mirror_bytes: u64,
     pub word_bytes: u64,
     pub cell_bytes: u32,
@@ -177,7 +193,8 @@ impl RegisteredChannel {
 impl PartialEq for RegisteredChannel {
     fn eq(&self, other: &RegisteredChannel) -> bool {
         self.engine_id == other.engine_id
-            && self.binding == other.binding
+            && self.id() == other.id()
+            && Arc::ptr_eq(&self.ring, &other.ring)
             && self.reader_wait_id == other.reader_wait_id
             && self.writer_wait_id == other.writer_wait_id
     }
@@ -281,29 +298,27 @@ impl ChannelJoin {
                 waker::WakerTable::global().wake(joined.registered.writer_wait_id);
                 continue;
             }
-            let binding = joined.registered.binding;
+            let binding = &joined.registered.binding;
+            let (words, cells) = (binding.memory.words(), Cells::of(&*binding.memory));
             let cap1 = u64::from(binding.capacity).saturating_add(1);
             let cell_bytes = binding.cell_bytes as usize;
-            let mut head = load_word(binding.word_base, binding.head_word_index);
-            let tail = load_word(binding.word_base, binding.tail_word_index);
+            let mut head = load_word(words, binding.head_word_index);
+            let tail = load_word(words, binding.tail_word_index);
             let mut moved = false;
+            let mut cell = Vec::new();
             while head < tail {
-                let offset = (head % cap1) * cell_bytes as u64;
-                // SAFETY: the ring is alive for as long as the
-                // `RegisteredChannel` this table holds is, and `head < tail`
-                // with the guest owning the tail means this cell is published
-                // and ours to read.
-                let cell = unsafe {
-                    std::slice::from_raw_parts(
-                        (binding.mirror_base + offset) as *const u8,
-                        cell_bytes,
-                    )
+                let offset = ((head % cap1) * cell_bytes as u64) as usize;
+                cell.resize(cell_bytes, 0);
+                cells.load(offset, &mut cell);
+                let kind = engine.kind();
+                let Some(channels) = engine.channels() else {
+                    return Err(engine::Error::unsupported(kind, "publish_channel"));
                 };
-                if !engine.publish_channel(instance, dense as u32, cell)? {
+                if !channels.publish(instance, dense as u32, &cell)? {
                     break;
                 }
                 head += 1;
-                store_word(binding.word_base, binding.head_word_index, head);
+                store_word(words, binding.head_word_index, head);
                 moved = true;
             }
             if moved {
@@ -346,14 +361,19 @@ impl ChannelJoin {
                 }
                 continue;
             }
-            let binding = joined.registered.binding;
+            let binding = &joined.registered.binding;
+            let (words, cells) = (binding.memory.words(), Cells::of(&*binding.memory));
             let cap1 = u64::from(binding.capacity).saturating_add(1);
             let cell_bytes = binding.cell_bytes as usize;
-            let head = load_word(binding.word_base, binding.head_word_index);
-            let mut tail = load_word(binding.word_base, binding.tail_word_index);
+            let head = load_word(words, binding.head_word_index);
+            let mut tail = load_word(words, binding.tail_word_index);
             let mut moved = false;
             while tail.saturating_sub(head) < u64::from(binding.capacity) {
-                let Some(bytes) = engine.take_channel(instance, dense as u32)? else {
+                let kind = engine.kind();
+                let Some(channels) = engine.channels() else {
+                    return Err(engine::Error::unsupported(kind, "take_channel"));
+                };
+                let Some(bytes) = channels.take(instance, dense as u32)? else {
                     break;
                 };
                 if bytes.len() != cell_bytes {
@@ -363,19 +383,10 @@ impl ChannelJoin {
                         bytes.len()
                     )));
                 }
-                let offset = (tail % cap1) * cell_bytes as u64;
-                // SAFETY: as `pump_in`, and the slot at `tail` is the one the
-                // guest has not read and will not until the tail word below
-                // says it may.
-                unsafe {
-                    std::slice::from_raw_parts_mut(
-                        (binding.mirror_base + offset) as *mut u8,
-                        cell_bytes,
-                    )
-                }
-                .copy_from_slice(&bytes);
+                let offset = ((tail % cap1) * cell_bytes as u64) as usize;
+                cells.store(offset, &bytes);
                 tail += 1;
-                store_word(binding.word_base, binding.tail_word_index, tail);
+                store_word(words, binding.tail_word_index, tail);
                 moved = true;
             }
             if moved {
@@ -386,16 +397,103 @@ impl ChannelJoin {
     }
 }
 
-fn load_word(word_base: u64, index: u32) -> u64 {
-    // SAFETY: `index` is one of the four words `HostRing` allocates and the
-    // ring outlives every reader of this binding.
-    unsafe { (*(word_base as *const AtomicU64).add(index as usize)).load(Ordering::Acquire) }
+fn load_word(words: &[AtomicU64], index: u32) -> u64 {
+    words[index as usize].load(Ordering::Acquire)
 }
 
-fn store_word(word_base: u64, index: u32, value: u64) {
-    // SAFETY: as `load_word`; the SPSC discipline makes this word ours.
-    unsafe {
-        (*(word_base as *const AtomicU64).add(index as usize)).store(value, Ordering::Release);
+fn store_word(words: &[AtomicU64], index: u32, value: u64) {
+    words[index as usize].store(value, Ordering::Release);
+}
+
+/// A ring's cells, a word at a time where its memory offers words: the word
+/// that publishes a cell orders the accesses to it.
+#[derive(Clone, Copy)]
+pub(crate) struct Cells<'a> {
+    bytes: &'a [AtomicU8],
+    words: &'a [AtomicU64],
+}
+
+impl<'a> Cells<'a> {
+    pub(crate) fn of(memory: &'a dyn engine::channel::MirrorMemory) -> Cells<'a> {
+        Cells {
+            bytes: memory.cells(),
+            words: memory.cell_words(),
+        }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.bytes.len().max(self.words.len() * 8)
+    }
+
+    /// The words wholly within `len` bytes at `offset`, if any.
+    fn whole(self, offset: usize, len: usize) -> Option<std::ops::Range<usize>> {
+        let (first, last) = (
+            offset.div_ceil(8),
+            ((offset + len) / 8).min(self.words.len()),
+        );
+        (first < last).then_some(first..last)
+    }
+
+    pub(crate) fn load(self, offset: usize, out: &mut [u8]) {
+        let Some(whole) = self.whole(offset, out.len()) else {
+            return self.load_bytes(offset, out);
+        };
+        let (head, rest) = out.split_at_mut(whole.start * 8 - offset);
+        let (body, tail) = rest.split_at_mut(whole.len() * 8);
+        self.load_bytes(offset, head);
+        for (chunk, word) in body
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(&self.words[whole.clone()])
+        {
+            *chunk = word.load(Ordering::Relaxed).to_ne_bytes();
+        }
+        self.load_bytes(whole.end * 8, tail);
+    }
+
+    pub(crate) fn store(self, offset: usize, bytes: &[u8]) {
+        let Some(whole) = self.whole(offset, bytes.len()) else {
+            return self.store_bytes(offset, bytes);
+        };
+        let (head, rest) = bytes.split_at(whole.start * 8 - offset);
+        let (body, tail) = rest.split_at(whole.len() * 8);
+        self.store_bytes(offset, head);
+        for (chunk, word) in body
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(&self.words[whole.clone()])
+        {
+            word.store(u64::from_ne_bytes(*chunk), Ordering::Relaxed);
+        }
+        self.store_bytes(whole.end * 8, tail);
+    }
+
+    fn load_bytes(self, at: usize, out: &mut [u8]) {
+        for (at, byte) in (at..).zip(out) {
+            *byte = match self.bytes.get(at) {
+                Some(cell) => cell.load(Ordering::Relaxed),
+                None => self.words[at / 8].load(Ordering::Relaxed).to_ne_bytes()[at % 8],
+            };
+        }
+    }
+
+    /// Bytes short of a word. Memory that offers words alone only the host
+    /// touches, and a compare-and-swap keeps the word's other bytes.
+    fn store_bytes(self, at: usize, bytes: &[u8]) {
+        for (at, &byte) in (at..).zip(bytes) {
+            match self.bytes.get(at) {
+                Some(cell) => cell.store(byte, Ordering::Relaxed),
+                None => {
+                    self.words[at / 8].update(Ordering::Relaxed, Ordering::Relaxed, |word| {
+                        let mut word = word.to_ne_bytes();
+                        word[at % 8] = byte;
+                        u64::from_ne_bytes(word)
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -434,13 +532,6 @@ impl std::fmt::Display for ChannelWaitError {
 }
 
 impl std::error::Error for ChannelWaitError {}
-
-fn load_channel_word(word_base: u64, index: u32) -> u64 {
-    // SAFETY: as `load_word` — the binding is the one its engine minted over
-    // `registered.ring`, which the endpoint keeps alive while it waits, and
-    // `index` is one of that ring's four words.
-    unsafe { (&*((word_base as *const AtomicU64).add(index as usize))).load(Ordering::Acquire) }
-}
 
 impl ChannelEndpoint {
     pub fn new(registered: RegisteredChannel) -> Self {
@@ -485,16 +576,17 @@ impl ChannelEndpoint {
         word_index: u32,
         observed: u64,
     ) -> Result<(), ChannelWaitError> {
-        let binding = self.registered.binding;
+        let binding = &self.registered.binding;
+        let words = binding.memory.words();
         waker::WaitFuture::new(waker::WakerTable::global(), wait_id, move || {
-            let poison = load_channel_word(binding.word_base, binding.poison_word_index);
+            let poison = load_word(words, binding.poison_word_index);
             if poison != 0 {
                 return waker::Readiness::Ready(Err(ChannelWaitError::Poisoned(poison)));
             }
-            if load_channel_word(binding.word_base, binding.closed_word_index) != 0 {
+            if load_word(words, binding.closed_word_index) != 0 {
                 return waker::Readiness::Ready(Err(ChannelWaitError::Closed));
             }
-            let current = load_channel_word(binding.word_base, word_index);
+            let current = load_word(words, word_index);
             if current > observed {
                 waker::Readiness::Ready(Ok(()))
             } else {
@@ -546,5 +638,29 @@ impl ChannelEndpoint {
 impl Drop for ChannelEndpoint {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_reads_back_at_any_offset_and_leaves_its_neighbours() {
+        let ring = HostRing::new(1, 63);
+        let cells = Cells::of(&*ring.memory);
+        for (offset, len) in [(0, 64), (3, 21), (8, 16), (13, 2), (60, 4)] {
+            cells.store(0, &[0xff; 64]);
+            let bytes: Vec<u8> = (1..=len as u8).collect();
+            cells.store(offset, &bytes);
+            let mut want = [0xff; 64];
+            want[offset..offset + len].copy_from_slice(&bytes);
+            let mut got = [0; 64];
+            cells.load(0, &mut got);
+            assert_eq!(got, want);
+            let mut cell = vec![0; len];
+            cells.load(offset, &mut cell);
+            assert_eq!(cell, bytes);
+        }
     }
 }

@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub use ids::{GatewayId, NodeId, WorkerId};
 
+#[cfg(feature = "client")]
+mod client;
+#[cfg(feature = "client")]
+pub use client::{ControllerLink, HEARTBEAT_INTERVAL};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -281,7 +286,7 @@ pub enum ProcessEvent {
 pub struct PlacementView {
     /// The workers it may run on, best first: the router sends a pending
     /// process to the first that takes it. Empty holds it at the gateway;
-    /// `None` (no row) leaves the choice to the router. A running process
+    /// `None` (no row): the routing table's order. A running process
     /// stays while the list names its worker, and moves when it does not.
     pub workers: Option<Vec<WorkerId>>,
     /// Passed on with the process: the worker plane reads `cluster/<name>`.

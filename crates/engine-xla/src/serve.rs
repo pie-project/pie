@@ -1743,7 +1743,7 @@ impl Shell {
         Ok(spans)
     }
 
-    /// See `Engine::read_tier_slots`: host tier slots' bytes, shape by
+    /// See `Tiers::read`: host tier slots' bytes, shape by
     /// shape, each as `copy_tier` lays it (the device slot's bytes). Copies
     /// into the host tier land before `copy_tier` returns.
     pub fn read_tier_slots(&self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
@@ -1756,7 +1756,7 @@ impl Shell {
         Ok(out)
     }
 
-    /// See `Engine::write_tier_slots`: `bytes`, laid out as
+    /// See `Tiers::write`: `bytes`, laid out as
     /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
     /// whole when the byte count differs.
     pub fn write_tier_slots(

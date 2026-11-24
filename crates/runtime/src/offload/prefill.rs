@@ -483,7 +483,7 @@ async fn read_in_place(
     let crate::planner::Acquired::Granted(mut grant) = planner
         .acquire(pid, pid, demand)
         .await
-        .map_err(|error| anyhow!("reserving pages to read a peer's into: {error}"))?
+        .map_err(|error| anyhow::Error::new(error).context("reserving pages to read a peer's into"))?
     else {
         bail!("the planner asked the pass to yield before its pages were read");
     };
@@ -669,6 +669,10 @@ struct Lease {
 /// Pages this executor holds for askers to read in place, by lease.
 static LEASES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Lease>>> =
     std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn reset() {
+    LEASES.lock().unwrap().clear();
+}
 
 static NEXT_LEASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 

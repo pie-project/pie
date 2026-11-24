@@ -171,11 +171,17 @@ async fn main(input: Input) -> Result<Output> {
         tok_out_p.put(&token);
         rng_p.put(&(&r + iota(2)));
 
-        let folded = gather(&reshape(intrinsics::output(0, "attn.scores"), [score_kv]), iota(kv_max));
+        let folded = gather(
+            &reshape(intrinsics::output(0, "attn.scores"), [score_kv]),
+            iota(kv_max),
+        );
         scores_out.put(&folded);
 
         // Exact: `kv_max = p_max * page_size`.
-        page_mass_out.put(gather(&reshape(intrinsics::output(0, "attn.scores.pages"), [score_pages]), iota(p_max)));
+        page_mass_out.put(gather(
+            &reshape(intrinsics::output(0, "attn.scores.pages"), [score_pages]),
+            iota(p_max),
+        ));
     });
 
     fwd_p.submit(&pipe).context("prefill submit")?;

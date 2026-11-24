@@ -15,7 +15,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,7 +45,7 @@ const SUPPORTED: &[&str] = &[
     plex_host::tables::RETENTION_TIERS,
 ];
 
-static EVENTS: OnceLock<Sender<Event>> = OnceLock::new();
+static EVENTS: crate::slot::Slot<Sender<Event>> = crate::slot::Slot::new();
 
 /// Errors starting the port.
 #[derive(Debug)]
@@ -116,6 +115,16 @@ pub fn reload(name: &str, component: &[u8]) -> Result<(), String> {
     answered
         .recv()
         .map_err(|_| "the worker's PLEX port has ended".to_string())?
+}
+
+/// Ends the port (its thread stops once its events' sender goes) and
+/// withdraws what the policy set, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    EVENTS.clear();
+    super::schedule::install(None);
+    super::retention::reset();
+    super::grants::withdraw();
+    super::withdraw_published();
 }
 
 pub(super) fn report(event: Event) {

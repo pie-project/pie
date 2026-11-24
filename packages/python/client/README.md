@@ -22,3 +22,10 @@ event, value = await process.recv()
 
 `pie-client config init` writes `~/.pie/cli_config.toml` (host, port,
 username); `--host`, `--port` and `--username` on any command override it.
+
+A server with `[server] allow_weight_reload = true` takes a fine-tune of its
+model in place, between batches:
+
+```python
+await client.reload_weights("/ckpts/step-12", version=12)  # or: pie model reload /ckpts/step-12
+```

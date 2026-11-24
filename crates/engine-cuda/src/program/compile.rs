@@ -1125,7 +1125,7 @@ impl Cache {
             persistent_hits: 0,
             compilations: 0,
         };
-        let built = build.build_region(&mut region, &mut std::collections::HashMap::new());
+        let built = build.build_regions(vec![&mut region]);
         self.stats.persistent_hits += build.persistent_hits;
         self.stats.compilations += build.compilations;
         built?;
@@ -1259,56 +1259,141 @@ impl Build {
     /// Compiles, or reads from disk, every region's code the plan found
     /// none for. It holds nothing of the engine's and needs no context, so
     /// it runs on any thread while the engine fires on. Regions the same
-    /// but for their names build once.
+    /// but for their names build once; those the disk holds none for
+    /// compile side by side, a thread a core the process may run on.
     pub fn build(&mut self) -> std::result::Result<(), Failure> {
         let mut stages = std::mem::take(&mut self.stages);
-        let mut made = std::collections::HashMap::new();
-        let built = stages.iter_mut().try_for_each(|stage| match stage {
-            StageBuild::Held(_) => Ok(()),
-            StageBuild::Regions { regions, .. } => regions
+        let built = self.build_regions(
+            stages
                 .iter_mut()
-                .try_for_each(|region| self.build_region(region, &mut made)),
-        });
+                .filter_map(|stage| match stage {
+                    StageBuild::Held(_) => None,
+                    StageBuild::Regions { regions, .. } => Some(regions.iter_mut()),
+                })
+                .flatten()
+                .filter(|region| region.module.is_none() && region.code.is_none())
+                .collect(),
+        );
         self.stages = stages;
         built
     }
 
-    fn build_region(
+    fn build_regions(
         &mut self,
-        region: &mut RegionBuild,
-        made: &mut std::collections::HashMap<String, Arc<[u8]>>,
+        mut regions: Vec<&mut RegionBuild>,
     ) -> std::result::Result<(), Failure> {
-        if region.module.is_some() || region.code.is_some() {
-            return Ok(());
-        }
-        if let Some(code) = made.get(&region.key) {
-            region.code = Some((Arc::clone(code), Origin::Memory));
-            return Ok(());
-        }
-        let code = match self.disk.load(&region.key, REGION_SYMBOL) {
-            // One that asks for late memory was compiled before that was
-            // refused: compiled again, and refused below if it still asks.
-            Some(code) if late_memory(&code).is_ok() => {
-                self.persistent_hits += 1;
-                (Arc::<[u8]>::from(code), Origin::Disk)
+        // Each text once: the disk's code where it holds code that loads
+        // late memory nowhere, else a compile.
+        let mut made: HashMap<String, (Arc<[u8]>, Origin)> = HashMap::new();
+        let mut compiles: Vec<(String, String, u32, String)> = Vec::new();
+        for region in &regions {
+            if made.contains_key(&region.key) || compiles.iter().any(|(key, ..)| *key == region.key)
+            {
+                continue;
             }
-            stale => {
-                if stale.is_some() {
-                    self.disk.invalidate(&region.key);
+            match self.disk.load(&region.key, REGION_SYMBOL) {
+                // One that asks for late memory was compiled before that was
+                // refused: compiled again, and refused below if it still asks.
+                Some(code) if late_memory(&code).is_ok() => {
+                    self.persistent_hits += 1;
+                    made.insert(region.key.clone(), (Arc::from(code), Origin::Disk));
                 }
-                let code = compile(&region.source, &self.architecture)?;
-                self.compilations += 1;
-                late_memory(&code).map_err(|why| Failure::Deterministic {
-                    reason: format!("region {} (`{}`): {why}", region.region_index, region.entry),
-                })?;
-                self.disk.store(&region.key, REGION_SYMBOL, &code);
-                (Arc::<[u8]>::from(code), Origin::Compiled)
+                stale => {
+                    if stale.is_some() {
+                        self.disk.invalidate(&region.key);
+                    }
+                    compiles.push((
+                        region.key.clone(),
+                        region.source.clone(),
+                        region.region_index,
+                        region.entry.clone(),
+                    ));
+                }
             }
-        };
-        made.insert(region.key.clone(), Arc::clone(&code.0));
-        region.code = Some(code);
+        }
+        let compiled = side_by_side(&compiles, &self.architecture);
+        for ((key, _, region_index, entry), code) in compiles.iter().zip(compiled) {
+            let code = code?;
+            self.compilations += 1;
+            late_memory(&code).map_err(|why| Failure::Deterministic {
+                reason: format!("region {region_index} (`{entry}`): {why}"),
+            })?;
+            self.disk.store(key, REGION_SYMBOL, &code);
+            made.insert(key.clone(), (Arc::from(code), Origin::Compiled));
+        }
+        let mut first = std::collections::HashSet::new();
+        for region in &mut regions {
+            let (code, origin) = &made[&region.key];
+            // A text's later regions take the code the first one made.
+            let origin = if first.insert(region.key.clone()) {
+                *origin
+            } else {
+                Origin::Memory
+            };
+            region.code = Some((Arc::clone(code), origin));
+        }
         Ok(())
     }
+}
+
+/// HIP's runtime compiler runs one compile at a time; elsewhere a build
+/// takes every core the process may run on (its CPU quota, which
+/// `available_parallelism` reads).
+#[cfg(feature = "rocm")]
+const SERIAL_COMPILER: bool = true;
+#[cfg(not(feature = "rocm"))]
+const SERIAL_COMPILER: bool = false;
+
+/// Each of `compiles`' sources `(key, source, ..)` compiled, in their
+/// order, side by side, a thread a core the process may run on.
+fn side_by_side(
+    compiles: &[(String, String, u32, String)],
+    architecture: &str,
+) -> Vec<std::result::Result<Vec<u8>, Failure>> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let width = if SERIAL_COMPILER { 1 } else { cores }.min(compiles.len());
+    if width < 2 {
+        return compiles
+            .iter()
+            .map(|(_, source, ..)| compile(source, architecture))
+            .collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<std::result::Result<Vec<u8>, Failure>>>> = compiles
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    let work = || {
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            let Some((_, source, ..)) = compiles.get(at) else {
+                break;
+            };
+            let built = compile(source, architecture);
+            *out[at]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built);
+        }
+    };
+    // Each worker joined here: one that panics leaves its region unbuilt,
+    // refused below, and takes nothing else down.
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..width).map(|_| scope.spawn(work)).collect();
+        for worker in workers {
+            let _ = worker.join();
+        }
+    });
+    out.into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|| {
+                    Err(Failure::Retryable {
+                        reason: "a region's compile panicked".into(),
+                    })
+                })
+        })
+        .collect()
 }
 
 /// The dynamic shared memory a region's text asks: CUDA keeps the exact

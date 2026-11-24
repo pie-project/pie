@@ -233,8 +233,8 @@ fn session(fixture: &Fixture, park: bool) -> Decodes {
             );
             let copy = |pairs: Vec<(u32, u32)>| engine::chunk::SlotCopy {
                 shape: engine_metal::store::layout::INSTANCE,
-                src: engine::MemoryDomain::MetalShared,
-                dst: engine::MemoryDomain::MetalShared,
+                src: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+                dst: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                 slots: pairs,
                 runs: Vec::new(),
             };
@@ -354,7 +354,6 @@ fn a_score_reader_holds_its_rows_through_a_park() {
         parked.iter().zip(&walked).enumerate()
     {
         let mass: f32 = keys.iter().sum();
-        eprintln!("decode {step}: mass {mass}, {} pages", pages.len());
         assert!(
             mass > 0.5,
             "decode {step}'s key row holds the layers' mass: {mass}"

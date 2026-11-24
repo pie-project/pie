@@ -289,29 +289,9 @@ mod tests {
 
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
-        // A committed measured profile holds measurements, no decision
-        // (`the_checked_in_profiles_hold_together` reads it as one).
-        for (name, text) in SEEDED
-            .iter()
-            .filter(|(name, _)| !name.ends_with(profile::MEASURED_SUFFIX))
-        {
-            let p = registry()
-                .load(text, name)
-                .unwrap_or_else(|e| panic!("{e}"));
-            let dumped = profile::render::dump(&p);
-            let again = registry()
-                .parse(&dumped, "dump", profile::Strict::CheckedIn)
-                .unwrap_or_else(|e| panic!("{name}: {e}\n---\n{dumped}"));
-            for (spec, rungs, _) in p.entries() {
-                assert_eq!(
-                    again.entries.get(spec.id).map(Vec::as_slice),
-                    Some(rungs),
-                    "{name}: {}",
-                    spec.id
-                );
-            }
-            assert_eq!(again.target.assumes, p.target().assumes, "{name}");
-        }
+        SHELF
+            .check_dumps(registry())
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[cfg(target_vendor = "apple")]

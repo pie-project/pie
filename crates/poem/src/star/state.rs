@@ -722,6 +722,10 @@ pub(crate) fn lowered(states: &[StateDecl], first: &Trace) -> anyhow::Result<Sta
         });
         match like {
             Some(j) => read[i] = read[j].clone(),
+            // a deployment cut to a depth reads none of the layers past it
+            None if crate::star::forward::DEPTH
+                .with(std::cell::Cell::get)
+                .is_some() => {}
             None => anyhow::bail!(
                 "no attention reads the per-token state `{}`, nor one of its shape, so the \
                  width of its heads is unknown",

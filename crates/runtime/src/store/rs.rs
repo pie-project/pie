@@ -50,8 +50,8 @@ pub const MAX_WINDOW_LISTS: usize = 4;
 /// `tokens` (`T_w`) of them, slot `i` of a set's table rows
 /// `[i * T_w, (i + 1) * T_w)`.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub window: u32,
@@ -62,8 +62,8 @@ pub struct WindowGeometry {
 /// `head` the position written up to, in tokens; `retired[l]` counts the
 /// leading slots of list `l`'s table already given back.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowState {
     retired: [u32; MAX_WINDOW_LISTS],
@@ -81,8 +81,8 @@ pub struct WindowState {
 /// device-positioned fire retires behind `reach`, the first token it may
 /// write, as no row's window reaches back past it.
 ///
-/// Window-list path: removed by the windowed-state change (the integration
-/// commit deletes it once every engine states `Capabilities::windowed_state`).
+/// Window-list path: what an engine that does not state
+/// `Capabilities::windowed_state` is served by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowAdvance {
     pub(crate) positioned: bool,
@@ -152,8 +152,7 @@ pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
 
 /// A count in each recurrent pool: state slots and buffer pages, or, of a
 /// windowed store, its window lists' slots: `pages` their sum and
-/// `windows[l]` list `l`'s (each its own shape's slots). In the degenerate
-/// mode a slot is a chunk, so this is the chunks the shapes ask for.
+/// `windows[l]` list `l`'s (each its own shape's slots).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RsUnits {
     pub slots: u32,
@@ -393,7 +392,7 @@ impl RsDisk {
 
 /// What a set holds, in its own numbering: see [`RsEntry`].
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct RsExport {
     pub folded: Option<RsSlotId>,
     pub buffer: Vec<Option<RsSlotId>>,
@@ -569,9 +568,8 @@ impl RsStore {
     /// set does; the lanes name the pages in `Lane::tables` and the fold in
     /// `Lane::window` ([`crate::pipeline::fire::rs::apply_shared`]).
     ///
-    /// The window-list store (the first kind, `windows` non-empty) is
-    /// removed by the windowed-state change: the integration commit deletes
-    /// it, once every engine states `Capabilities::windowed_state`.
+    /// The window-list store (the first kind, `windows` non-empty) serves
+    /// an engine that does not state `Capabilities::windowed_state`.
     ///
     /// `host`, the engine's host tier (CONTRACT-BC 22), backs the host rows
     /// a suspend parks state in: records, rs list slots and every window
@@ -936,6 +934,7 @@ impl RsStore {
 
     /// Whether `id` is a disk row: its state lies in the disk tier.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn on_disk(&self, id: RsSlotId) -> bool {
         self.is_disk(id)
     }
@@ -1333,7 +1332,7 @@ impl RsStore {
     /// What a snapshot keeps of `ws`, on the rows it stands on now: not
     /// while its frozen length is behind its record
     /// ([`Self::device_fold_gate`]), which an export leaves the engine with.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn export(&self, ws: RsWorkingSetId) -> Result<RsExport, RsError> {
         self.device_fold_gate(ws)?;
         let entry = self.entry(ws)?;
@@ -1350,7 +1349,7 @@ impl RsStore {
     }
 
     /// Whether `id` is a host row already.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn on_host(&self, id: RsSlotId) -> bool {
         self.is_host(id) && !self.is_disk(id)
     }
@@ -1361,15 +1360,15 @@ impl RsStore {
     /// A shared pool's host rows are slot refs of its host tier: records
     /// (a slot of each fixed shape a piece) and rs list or window slots,
     /// whose bytes the engine reads and writes by those refs
-    /// ([`Self::tier_refs`], `Engine::read_tier_slots`).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    /// ([`Self::tier_refs`], `Tiers::read`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
         self.take_host_of(slots, pages, 0)
     }
 
     /// [`Self::take_host`], and `wpages` of a hybrid's window-buffer rows
     /// after the pages.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn take_host_of(
         &mut self,
         slots: usize,
@@ -1391,7 +1390,7 @@ impl RsStore {
         Some(rows)
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn give_host(&mut self, rows: Vec<RsSlotId>) {
         self.release_host(rows);
     }
@@ -1399,8 +1398,8 @@ impl RsStore {
     /// A shared pool's host rows `rows` as the engine names them: for each
     /// row in order, the refs of each shape it spans (a record's pieces, a
     /// list slot), runs of one shape merged. The order the bytes of
-    /// `Engine::read_tier_slots` lie in.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    /// `Tiers::read` lie in.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn tier_refs(&self, rows: &[RsSlotId]) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
         let mut out: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = Vec::new();
         for &row in rows {
@@ -1416,7 +1415,7 @@ impl RsStore {
 
     /// A shared pool's copy of device rows to host rows, `(device, host)`
     /// pairs, shape by shape: what `copy_slots` moves.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn tier_copies(
         &self,
         moves: &[(RsSlotId, RsSlotId)],
@@ -1441,7 +1440,7 @@ impl RsStore {
     }
 
     /// A set of its own on host rows, as `export` said one stood.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn import(&mut self, geom: RsGeometry, set: RsExport) -> RsWorkingSetId {
         self.working_sets.insert(RsEntry {
             geom,
@@ -1742,8 +1741,8 @@ impl RsStore {
     /// needs has retired, or as [`Self::checkpoint`]; at the windows' own
     /// position, [`Self::checkpoint`]. Another state checkpoints only there.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn checkpoint_at(
         &mut self,
         ws: RsWorkingSetId,
@@ -1910,6 +1909,13 @@ impl RsStore {
         )
     }
 
+    /// Drops every checkpoint, its rows on the device or parked on the
+    /// host tier alike: what the weights a reload replaces computed, which
+    /// no later set may resume from. How many went.
+    pub fn drop_cache(&mut self) -> usize {
+        self.drop_checkpoints(|_, _| true)
+    }
+
     /// Whether any checkpoint is kept: cache a policy could let go.
     pub fn holds_checkpoints(&self) -> bool {
         !self.checkpoints.is_empty()
@@ -2040,8 +2046,8 @@ impl RsStore {
 
     /// The window slots a fire landing rows `rows` of `ws` takes.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn window_demand(
         &self,
         ws: RsWorkingSetId,
@@ -2057,8 +2063,8 @@ impl RsStore {
     /// from `granted` or the pools; [`Self::window_advance`] moves the
     /// windows once the fire's tables have been read.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn prepare_window(
         &mut self,
         ws: RsWorkingSetId,
@@ -2136,8 +2142,8 @@ impl RsStore {
     /// reads it, in the engine's numbering: slot `i` its rows
     /// `[i * T_w, (i + 1) * T_w)`, 0 where trimmed or not written.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn window_tables(&self, ws: RsWorkingSetId, end: u32) -> Result<Vec<Vec<u32>>, RsError> {
         let entry = self.entry(ws)?;
         if self.live_window(entry).is_none() {
@@ -2174,8 +2180,8 @@ impl RsStore {
     /// slots whose last row lies below the committed position less the
     /// list's own window retire, once no fire still reads them.
     ///
-    /// Window-list path: removed by the windowed-state change (the integration
-    /// commit deletes it once every engine states `Capabilities::windowed_state`).
+    /// Window-list path: what an engine that does not state
+    /// `Capabilities::windowed_state` is served by.
     pub fn window_advance(&mut self, ws: RsWorkingSetId, advance: WindowAdvance) {
         let lists = self.window.clone();
         let entry = self.entry_mut(ws).expect("batch prevalidated");

@@ -3,45 +3,11 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
-
-/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
-fn mask_words(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
-
-fn bf(x: f32) -> f32 {
-    let b = x.to_bits();
-    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000)
-}
-fn vals(n: usize, s: u64) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let mut x = (i as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ s;
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
-            bf(((x >> 40) as f32 / 16777216. - 0.5) * 4.)
-        })
-        .collect()
-}
-fn bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-        .collect()
-}
-fn u32s(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-fn f32s(v: &[u8]) -> Vec<f32> {
-    v.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
-        .collect()
-}
+use crate::common::{bytes, f32s, mask_words, u32s, vals};
 
 /// Head width 128 (Qwen3, Mistral, Phi-3) through the simdgroup-matrix kernel
 /// (`sdpa_paged_mma_wide_bfloat16_d_128`: bf16 tiles, f32 scores and output)
-/// against the tiled kernel it replaces and an fp64 host reference: 35 to
+/// against the tiled kernel and an fp64 host reference: 35 to
 /// 8190 rows, interleaved requests, rows appended to a long cached prefix,
 /// plain causal, windowed and masked, and a mask that admits later keys. The
 /// reference is computed on every row up to 2048 and on a sample of rows
@@ -195,16 +161,8 @@ fn mma_attention_at_128_matches_the_tiled_kernel_and_fp64() {
                 }
                 ((err / norm.max(1e-30)).sqrt(), abs)
             };
-            let ((rms, abs), (old_rms, old_abs)) = (against(&got), against(&old));
-            let apart = got
-                .iter()
-                .zip(&old)
-                .map(|(a, b)| (*a - *b).abs() as f64)
-                .fold(0f64, f64::max);
+            let ((rms, abs), (old_rms, _)) = (against(&got), against(&old));
             let label = format!("rows={m} heads={qh}/{kh} requests={requests} base={base} window={window:?} mode={mode}");
-            eprintln!(
-                "d=128 {label}: mma rms {rms:.5} max {abs:.4}; tiled rms {old_rms:.5} max {old_abs:.4}; mma-tiled max {apart:.4}"
-            );
             assert!(rms < 0.008, "d=128 {label}: the mma kernel parts from fp64 by relative rms {rms}");
             assert!(abs < 0.03, "d=128 {label}: the mma kernel's worst element parts from fp64 by {abs}");
             assert!(
@@ -216,5 +174,4 @@ fn mma_attention_at_128_matches_the_tiled_kernel_and_fp64() {
             }
         }
     }
-    eprintln!("d=128 worst element against fp64: {:.4} (relative rms {:.5}) at {}", worst.0, worst.1, worst.2);
 }

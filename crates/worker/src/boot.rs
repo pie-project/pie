@@ -18,21 +18,22 @@ pub(crate) struct LoadedModelEngines {
 }
 
 /// The wafer's token loops answer each lane as far as its guest has posted,
-/// so a cerebras engine serves at the runtime's most (`frame_size` 4,
-/// `frame_dispatch_depth` 15: `pie config init` writes them): below it fewer
-/// lanes ride each loop (the 8B ring's 12 streams took turns, 6 a launch, at
-/// frame_size 2). Advice only; the configuration stands.
+/// so a cerebras engine serves at the runtime's most `frame_size` (4: `pie
+/// config init` writes it) and, unstated, the engine's `frame_dispatch_depth`
+/// (127 with a posted loop): below them fewer lanes ride each loop (the
+/// 8B ring's 12 streams took turns, 6 a launch, at frame_size 2). Advice only;
+/// the configuration stands.
 fn advise_cerebras_frames(runtime: &config::RuntimeConfig) {
     let (size, depth) = (
         u32::from(engine::runahead::Runahead::STEPS_MAX),
         u32::from(engine::runahead::Runahead::MAX_FRAMES),
     );
-    if runtime.frame_size < size || runtime.frame_dispatch_depth < depth {
+    if runtime.frame_size < size || runtime.frame_dispatch_depth.is_some_and(|d| d < depth) {
         tracing::warn!(
             frame_size = runtime.frame_size,
-            frame_dispatch_depth = runtime.frame_dispatch_depth,
-            "cerebras serves at [runtime] frame_size = {size}, frame_dispatch_depth = {depth}: \
-             below them fewer lanes ride each wafer loop"
+            frame_dispatch_depth = runtime.dispatch_depth(0),
+            "cerebras serves at [runtime] frame_size = {size}, frame_dispatch_depth unstated \
+             (the engine's) or at least {depth}: below them fewer lanes ride each wafer loop"
         );
     }
 }
@@ -44,7 +45,7 @@ pub(crate) fn load_model_engines(
 ) -> Result<LoadedModelEngines> {
     #[cfg(feature = "net")]
     engine::memory::on_return_freed_heap(crate::return_freed_heap);
-    let (engine_groups, metadata) = {
+    let (mut engine_groups, metadata) = {
         let m = &user_cfg.model;
         let e = &user_cfg.engine;
         let flavor = crate::backend::flavor::resolve(e.kind, &m.name)?;
@@ -125,7 +126,7 @@ pub(crate) fn load_model_engines(
                 &snapshot_dir,
                 home,
                 m.adapter_mount().as_deref(),
-                u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
+                u8::try_from(user_cfg.runtime.dispatch_depth(0)).unwrap_or(u8::MAX),
                 &m.adapters,
                 residency,
                 e.max_context,
@@ -161,7 +162,7 @@ pub(crate) fn load_model_engines(
                 &snapshot_dir,
                 home,
                 tp_degree,
-                u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
+                u8::try_from(user_cfg.runtime.dispatch_depth(0)).unwrap_or(u8::MAX),
                 opened.take(),
             )?);
         }
@@ -180,8 +181,9 @@ pub(crate) fn load_model_engines(
         .context("no engine capabilities available for control-plane registration")?;
     let kv_handle = engine_groups
         .groups
-        .first()
-        .and_then(|group| group.backend.export_kv_handle());
+        .first_mut()
+        .and_then(|group| group.backend.peers())
+        .and_then(|peers| peers.export());
     Ok(LoadedModelEngines {
         metadata,
         model: user_cfg.model.name.clone(),
@@ -242,10 +244,16 @@ impl Embedded {
 
 /// A model on its engine, the runtime not yet booted over it.
 pub struct Loaded {
-    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "net"),
+        allow(dead_code, reason = "only the networked worker names its model to peers")
+    )]
     pub(crate) model: String,
     /// The kv the engine exported, for peers to read in place.
-    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "net"),
+        allow(dead_code, reason = "only the networked worker offers its kv to peers")
+    )]
     pub(crate) kv_handle: Option<engine::KvHandle>,
     summary: Summary,
     config: runtime::bootstrap::Config,

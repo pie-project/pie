@@ -281,9 +281,7 @@ pub struct KvStore {
     /// Per trie node, the epoch through which a fire may still read its
     /// pages: the last a working set holding it was let go at (or a copy
     /// into it was handed out at). An idle entry's pages go back after the
-    /// latest of its path's nodes, not after every fire in flight: a waiter
-    /// short of a prompt's pages waited behind ~1600 handed-out epochs (a
-    /// second) for cache last read long before ([`Self::fence_of`]).
+    /// latest of its path's nodes and every fire in flight ([`Self::fence_of`]).
     node_epochs: HashMap<NodeId, u64>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
@@ -499,7 +497,7 @@ struct SetScope {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CachedWorkingSet {
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "an idle cache is demoted on native targets alone"))]
     pub owner: ProcessId,
     pub entries: usize,
     pub pages: u64,
@@ -953,7 +951,7 @@ impl KvStore {
     }
 
     /// The epoch after which the pages an idle entry ending at `terminal`
-    /// holds alone may go back: the latest stamp on its path, at most
+    /// holds alone may go back: the latest stamp on its path, at least
     /// `epoch` (now). Stamps every fire has retired through are dropped.
     fn fence_of(&mut self, terminal: NodeId, epoch: u64) -> u64 {
         let retired = self.retired_through();
@@ -964,7 +962,7 @@ impl KvStore {
             .filter_map(|node| self.node_epochs.get(node).copied())
             .max()
             .unwrap_or(0)
-            .min(epoch)
+            .max(epoch)
     }
 
     fn release_entry(&mut self, entry: KeptEntry, epoch: u64) -> usize {
@@ -1039,7 +1037,18 @@ impl KvStore {
         sets.into_values().collect()
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn live_working_sets(&self) -> usize {
+        self.table.live_working_sets()
+    }
+
+    pub fn rekey(&mut self, domain: Hash256) -> usize {
+        let keys: Vec<u64> = self.cache.keys().copied().collect();
+        let freed = self.drop_entries(keys, By::Client, self.current_epoch());
+        self.domain = domain;
+        freed
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn owns_cache(&self, owner: ProcessId) -> bool {
         self.owners.contains_key(&owner)
     }
@@ -1048,7 +1057,7 @@ impl KvStore {
     /// not yet released. A process's last fire settles after it exits, and
     /// only then is what it leaves cached: until then its working set is
     /// still here, not gone.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn holds_kv_of(&self, owner: ProcessId) -> bool {
         self.owns_cache(owner)
             || self
@@ -2406,9 +2415,9 @@ impl KvStore {
 
     /// A shared pool's host slots for a read or a write none of the
     /// planner's: kv list slots of its host tier, whose bytes the engine
-    /// reads and writes by those refs (`Engine::read_tier_slots`), not by
+    /// reads and writes by those refs (`Tiers::read`), not by
     /// `read_host_kv`. `None` off a shared pool, or if the host lacks them.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     pub fn alloc_tier_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {
         self.shape?;
         self.host_pool.try_alloc_n(n)
@@ -2547,7 +2556,7 @@ impl KvStore {
 
     /// `ws` as a snapshot reads it, pinned where it stands until the pin is
     /// released.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn export(
         &mut self,
         ws: WorkingSetId,
@@ -2558,7 +2567,7 @@ impl KvStore {
     }
 
     /// A working set of its own from what `slots` hold.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn import(
         &mut self,
         set: page_table::ExportedSet,
@@ -3514,17 +3523,12 @@ impl KvStore {
     }
 
     /// Device pages given back must be in no live set's table: one still
-    /// named reads or writes a page another may take (the M1's runs 11 and
-    /// 12: a set's own table named a page whose segment was released). Said
-    /// at ERROR naming the set and the page, in a debug build or with
-    /// PIE_CHECK_SLOT_REFS (a walk of every set's table a give-back).
+    /// named reads or writes a page another may take (a set's own table
+    /// naming a page whose segment was released). Said at ERROR naming the
+    /// set and the page, in a debug build (a walk of every set's table a
+    /// give-back).
     fn check_given_back(&self, ids: &[PhysicalKvPageId], what: &str) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if ids.is_empty()
-            || !*ON.get_or_init(|| {
-                cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
-            })
-        {
+        if ids.is_empty() || !cfg!(debug_assertions) {
             return;
         }
         let given: std::collections::HashSet<u32> = ids.iter().map(|id| id.0).collect();
@@ -3569,9 +3573,9 @@ impl KvStore {
     /// reads moves, nothing copied; one something else reads too (a cache
     /// entry or another set's path through the old tail) is named by its
     /// copy in `copies`, `(page, copy)`, made on the device before this:
-    /// moved, both would name it, and it went back twice (the M1's beam
-    /// line: a suspend committed under a relist gave back the chosen pages
-    /// the new tail still named). `false`, nothing done, where the set is
+    /// moved, both would name it, and it would go back twice (a suspend
+    /// committed under a relist giving back the chosen pages the new tail
+    /// still names). `false`, nothing done, where the set is
     /// in a move or `copies` no longer covers what is shared: the caller
     /// asks [`Self::relist_beam_needs`] again.
     pub fn relist_beam_with(

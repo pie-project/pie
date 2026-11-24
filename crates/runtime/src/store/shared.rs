@@ -40,7 +40,7 @@
 //! Position (CONTRACT-BC item 2): state lies below `total - act_chunks(rung)`;
 //! raising the rung first moves state out of the new activation span
 //! ([`RungWalk`], [`SharedPool::plan_raise`]), the engine copying it by
-//! [`::engine::Engine::evacuate`] before the next fire
+//! [`::engine::Pool::evacuate`] before the next fire
 //! ([`SharedPool::apply_rung`] once it has). The top
 //! `act_chunks_max` span is committed from the load and counts as held from
 //! then on. Segments commit as a prefix (`commit_segments(n)`) ahead of need,
@@ -404,6 +404,23 @@ impl Drop for RungWant {
 /// (an inferlet feeding a prompt in several passes) lower nothing.
 static PROCESS_WANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, RungWant>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Forgets the boot's asks and caps: the next boot's engines start at their
+/// largest rung.
+pub(crate) fn reset() {
+    PROCESS_WANTS.lock().unwrap().clear();
+    RUNG_WANTS.lock().unwrap().clear();
+    use std::sync::atomic::Ordering::Release;
+    for gate in RUNG_GATES.read().unwrap().values() {
+        gate.cap.store(u32::MAX, Release);
+        gate.grant.store(u32::MAX, Release);
+        gate.held.store(u32::MAX, Release);
+        gate.owed.store(0, Release);
+        *gate.owed_by.lock().unwrap() = None;
+        *gate.refused.lock().unwrap() = None;
+        *gate.walk_waiting.lock().unwrap() = None;
+    }
+}
 
 /// Process `pid`'s pass on `engine` asks fires of `rows` (`None`: a pass of
 /// a few rows, a decode, asks nothing): what its process holds the rung
@@ -954,7 +971,7 @@ pub struct SharedPool {
     /// engine's to take: what a refused raise goes back to.
     raise_from: Option<u32>,
     /// The rung the engine holds: the one it was last told
-    /// (`Engine::set_rung`), set in the hold of the pool that decides the
+    /// (`Pool::set_rung`), set in the hold of the pool that decides the
     /// move, so whatever is decided next reads it, and put back where the
     /// engine refuses a raise. A notice goes only where a move leaves it
     /// another rung ([`Self::raise_applied`], [`Self::lower_rung`]).
@@ -1151,7 +1168,7 @@ impl SharedPool {
             let kind = match shape.kind {
                 SlotKind::List { tokens, window, .. } => {
                     let found = match window {
-                        // Window lists: removed by the windowed-state change.
+                        // Window lists: the window-list path.
                         Some(_) => &mut windows,
                         None if shape.role == SlotRole::RsBuffer => &mut rs_lists,
                         None if shape.role == SlotRole::WindowBuffer => &mut window_buffers,
@@ -1242,7 +1259,7 @@ impl SharedPool {
         });
         // The span backed from the load: the pool starts at the largest
         // rung. Backed on demand: at the smallest, the one the engine backs
-        // at load; passes raise it through `Engine::set_rung` as fires need.
+        // at load; passes raise it through `Pool::set_rung` as fires need.
         if !facts.span_backed_on_demand
             && let Some(&(rung, _)) = facts.act_chunks.last()
         {
@@ -1369,9 +1386,8 @@ impl SharedPool {
         self.rs_list.or(self.window_buffer)
     }
 
-    /// The window lists, narrowest window first. Removed by the
-    /// windowed-state change (the integration commit deletes the window
-    /// lists everywhere); do not use in new code.
+    /// The window lists, narrowest window first: an engine that does not
+    /// state `Capabilities::windowed_state`.
     #[must_use]
     pub fn windows(&self) -> &[TokenShape] {
         &self.windows
@@ -2025,7 +2041,7 @@ impl SharedPool {
     ///
     /// The engine may refuse the copy ([`Self::raise_refused`]).
     ///
-    /// The notice the engine is sent first (`Engine::set_rung(from, to)`),
+    /// The notice the engine is sent first (`Pool::set_rung(from, to)`),
     /// where the raise leaves it another rung than it holds and it is told
     /// rungs ([`Self::tells_rungs`]): decided here, in the hold that takes
     /// the raise. A raise at the rung the engine holds (a guest term grew
@@ -2052,7 +2068,7 @@ impl SharedPool {
     /// take it: it moves state, which the engine copies first, or it
     /// leaves an engine that is told rungs (the span backed on demand)
     /// another rung than it holds, where the engine backs its carve for
-    /// the wider rung first (`Engine::set_rung`). A move-free raise makes
+    /// the wider rung first (`Pool::set_rung`). A move-free raise makes
     /// no lane trip with the span backed from the load, nor at the rung
     /// the engine holds: a guest term that grew under it is covered by the
     /// engine inside the bind that grew it.
@@ -2117,7 +2133,7 @@ impl SharedPool {
     }
 
     /// The engine holds the rung of `rung` from here; the notice it is
-    /// owed (`Engine::set_rung(from, to)`) where that is another rung than
+    /// owed (`Pool::set_rung(from, to)`) where that is another rung than
     /// it held and it is told rungs.
     fn tell(&mut self, rung: u32) -> Option<(u32, u32)> {
         let to = self.pool.rung_of(rung);
@@ -2170,7 +2186,7 @@ impl SharedPool {
         self.lifted(self.rung())
     }
 
-    /// Whether every rung change is told the engine (`Engine::set_rung`):
+    /// Whether every rung change is told the engine (`Pool::set_rung`):
     /// the span is backed on demand. A change is a move to another rung
     /// than the engine holds ([`Self::told`]).
     #[must_use]
@@ -2234,7 +2250,7 @@ impl SharedPool {
         self.pool.plan_rung(rung).map_err(RungError::Pool)
     }
 
-    /// `evacuation`'s moves as the engine takes them (`Engine::evacuate`).
+    /// `evacuation`'s moves as the engine takes them (`Pool::evacuate`).
     #[must_use]
     pub fn rung_moves(evacuation: &RungEvacuation) -> EngineEvacuation {
         engine_moves(&evacuation.moves)
@@ -2439,7 +2455,7 @@ impl SharedPool {
 
     /// Lets state take the span above `rung`'s activation again. Where the
     /// span is backed on demand and the engine holds another rung, the
-    /// notice it is sent (`Engine::set_rung(from, to)`), after the walk's
+    /// notice it is sent (`Pool::set_rung(from, to)`), after the walk's
     /// retire fence: every fire wider than `rung` has retired, so it may
     /// give back the carve above it. A lower that only gives back what a
     /// dropped guest term took, the rung standing, sends none.
@@ -2449,7 +2465,7 @@ impl SharedPool {
     /// grew past the rung it holds, [`Self::told_unfit`]): what is set
     /// aside stays, and a raise at `rung` follows.
     /// The first half of a lower that brings the engine down: the notice it
-    /// is sent (`Engine::set_rung(from, to)`), with nothing given back yet.
+    /// is sent (`Pool::set_rung(from, to)`), with nothing given back yet.
     /// The engine holds [`Self::told`] until that notice lands, laying its
     /// guests' tables and covering a bind's term at that rung, so what is
     /// set aside for it stays until [`Self::lower_landed`] (a bind funded
@@ -2595,9 +2611,8 @@ impl SharedPool {
                     return Some(SegmentMove::NoRoom);
                 };
                 // Refused by the pool's own check (stale, or a run it
-                // would split): said and not moved, never a panic (the M1
-                // on f623134fc: "an evacuation planned under the lock
-                // applies: Stale(11)", then a poisoned lock everywhere).
+                // would split): said and not moved, never a panic (which
+                // would poison the lock everywhere).
                 if let Err(error) = self.pool.apply_evacuation(&evacuation, epoch) {
                     tracing::warn!(%error, segment = last, "store: a segment's evacuation refused by the pool's check");
                     return Some(SegmentMove::NoRoom);
@@ -2624,9 +2639,9 @@ impl SharedPool {
                 }
                 let Some(moves) = self.pool.plan_compaction_for(run, pieces) else {
                     // Asked and no window clears now: the ask is answered,
-                    // never left pending (the M1's run 10: a restore's plan
-                    // ended "compaction asked" every pass for ten minutes,
-                    // the walk sending none). The head's next pass reads the
+                    // never left pending (else a restore's plan ends
+                    // "compaction asked" every pass, the walk sending none).
+                    // The head's next pass reads the
                     // pool as it stands and goes to its eviction.
                     tracing::debug!(
                         run,
@@ -2862,7 +2877,7 @@ impl SharedPool {
     /// 17) handed out by then. Any of those may still read the old
     /// location; every fire after reads the new one. The copy itself the
     /// engine waits out before it gives the segment back
-    /// (`Engine::release_segments`), so the segment drains once the fires
+    /// (`Pool::release`), so the segment drains once the fires
     /// through `current` retire, with no fire to wait for after them: on
     /// an idle pool, at once.
     pub fn evacuated(&mut self, current: u64) {
@@ -2908,8 +2923,8 @@ impl SharedPool {
         self.walk_target = Some(target);
     }
 
-    /// Whether the walk would commit a segment now: its goal (a pinned
-    /// count, else the governor's target) is past what is mapped. At the
+    /// Whether the walk would commit a segment now: its goal (the
+    /// governor's target) is past what is mapped. At the
     /// target nothing commits, however many segments the pool's own
     /// limits leave uncommitted. Without a walk (a pool none steers), as
     /// the pool's limits say.
@@ -2918,9 +2933,7 @@ impl SharedPool {
         let Some(target) = &self.walk_target else {
             return true;
         };
-        let goal = target::pinned_segments()
-            .unwrap_or_else(|| target.load(std::sync::atomic::Ordering::Acquire));
-        goal > self.mapped_segments()
+        target.load(std::sync::atomic::Ordering::Acquire) > self.mapped_segments()
     }
 
     /// The chunks the governor's target holds back from state: segments

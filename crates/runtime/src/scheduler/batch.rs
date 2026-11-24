@@ -683,7 +683,7 @@ pub(crate) fn build_frame_submission(
             .collect();
 
         // Counted before the build moves the lanes out.
-        let traced = super::worker::wave_trace().then(|| {
+        let traced = tracing::enabled!(tracing::Level::DEBUG).then(|| {
             let (mut tokens, mut page_refs) = (0usize, 0usize);
             for req in &group {
                 let usage = request_capacity_usage(req, page_size);
@@ -702,14 +702,14 @@ pub(crate) fn build_frame_submission(
             .collect();
         let build = build_batch_request(&mut group, page_size, stats);
         if let Some((tokens, page_refs, prefill_lanes, kv_len_max)) = traced {
-            super::worker::wave_trace_emit(format!(
-                "[step-lanes] t={}us members={} prefill_lanes={prefill_lanes} lanes={} tokens={tokens}/{} page_refs={page_refs}/{} kv_len_max={kv_len_max}",
-                super::worker::wave_trace_us(),
+            tracing::debug!(
+                "step lanes: members={} prefill_lanes={prefill_lanes} lanes={} tokens={tokens}/{} \
+                 page_refs={page_refs}/{} kv_len_max={kv_len_max}",
                 group.len(),
                 build.lanes.len(),
                 limits.max_forward_tokens,
                 limits.max_page_refs,
-            ));
+            );
         }
         let mut instances = Vec::with_capacity(build.lanes.len());
         for (member, &instance) in build.instance_ids.iter().enumerate() {
@@ -1830,7 +1830,11 @@ mod tests {
         let cells: Vec<_> = frame.terminal_cells().collect();
         assert_eq!(cells.len(), flattened.len());
         assert_eq!(
-            cells.iter().collect::<std::collections::HashSet<_>>().len(),
+            cells
+                .iter()
+                .map(|cell| std::sync::Arc::as_ptr(&cell.0))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
             cells.len(),
             "no cell is owned by two members"
         );

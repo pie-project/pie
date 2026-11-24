@@ -479,13 +479,14 @@ pub(crate) mod naive {
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::{Arg, kernel};
 
+    /// The walk's block (`mla_naive::kBlock`).
     pub const NAIVE_BLOCK: u32 = 256;
 
+    /// Latent and rope elements a lane holds in registers
+    /// (`mla_naive::kMaxPer` / `kMaxPe`): latent rows up to 1024, rope up to
+    /// 256.
     pub const NAIVE_MAX_PER: i32 = 16;
-
     pub const NAIVE_MAX_PE_PER: i32 = 4;
-
-    pub const WAVE_TARGET: i64 = 296;
 
     /// Wavefronts in the MLA walk's block.
     const WAVES: i32 = NAIVE_BLOCK as i32 / 64;
@@ -502,17 +503,18 @@ pub(crate) mod naive {
     }
 
     /// Query heads a block of the MLA walk takes: as many as its wavefronts
-    /// while the grid still fills the device.
+    /// while the grid still holds a block for each of the device's `cus`
+    /// compute units.
     #[must_use]
-    pub fn wave_group(num_heads: i32, total_tokens: i32) -> i32 {
-        group_of(WAVES, num_heads, total_tokens)
+    pub fn wave_group(num_heads: i32, total_tokens: i32, cus: u32) -> i32 {
+        group_of(WAVES, num_heads, total_tokens, cus)
     }
 
-    fn group_of(most: i32, num_heads: i32, total_tokens: i32) -> i32 {
+    fn group_of(most: i32, num_heads: i32, total_tokens: i32, cus: u32) -> i32 {
         let mut g = most;
         while g > 1
             && (num_heads % g != 0
-                || i64::from(total_tokens) * i64::from(num_heads / g) < WAVE_TARGET)
+                || i64::from(total_tokens) * i64::from(num_heads / g) < i64::from(cus))
         {
             g >>= 1;
         }
@@ -577,7 +579,11 @@ pub(crate) mod naive {
                 format!("the rope width {kpe} is not one this walk holds (0..={MAX_ROPE})"),
             ));
         }
-        let g = wave_group(shape.num_heads, shape.total_tokens);
+        let g = wave_group(
+            shape.num_heads,
+            shape.total_tokens,
+            ctx.multiprocessors(op)?,
+        );
         #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
             [
@@ -1295,8 +1301,8 @@ mod tests {
 
     #[test]
     fn a_head_group_divides_the_heads_and_fits_the_block() {
-        assert_eq!(wave_group(64, 1), 1);
-        assert_eq!(wave_group(64, 4096), 4);
-        assert_eq!(wave_group(6, 4096), 2);
+        assert_eq!(wave_group(64, 1, 304), 1);
+        assert_eq!(wave_group(64, 4096, 304), 4);
+        assert_eq!(wave_group(6, 4096, 304), 2);
     }
 }

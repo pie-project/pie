@@ -31,7 +31,7 @@ pub const FIXED: ShapeId = ShapeId(1);
 /// The first window list's shape.
 pub const WINDOW: ShapeId = ShapeId(2);
 pub const RS: ShapeId = ShapeId(3);
-/// A windowed lane's ring (`SlotRole::Ring`, CONTRACT-BC 21): its own fixed
+/// A windowed lane's ring (`SlotRole::Ring`): its own fixed
 /// shape of one slot a chunk, each piece a whole chunk tiled by window-slot
 /// pages from its start (`chunks::MetalRing`). A windowed recipe pages one
 /// window table, so the second window list's id is free for it.
@@ -46,13 +46,13 @@ pub const CHANNEL: ShapeId = ShapeId(8);
 /// slot, shared by every instance that lands the same adapter.
 pub const ADAPTER: ShapeId = ShapeId(9);
 
-/// An `Instance` slot's bytes: every measured instance's tables in one
-/// (`new-memory/STATE-ROLES.md` section 3). Structural, not config.
+/// An `Instance` slot's bytes: every measured instance's tables in one.
+/// Structural, not config.
 pub const INSTANCE_SLOT: u64 = 4 << 10;
 /// A `Channel` slot's bytes: every measured ring in one.
 pub const CHANNEL_SLOT: u64 = 1 << 10;
 
-/// The most window lists a load pages (CONTRACT-BC 21).
+/// The most window lists a load pages.
 pub const MAX_WINDOWS: usize = 4;
 
 /// Each window list's shape, in the recipe's order: the first is
@@ -132,11 +132,11 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
-    /// The window lists (CONTRACT-BC 19, 21), one a distinct window: each
+    /// The window lists, one a distinct window: each
     /// `T_w` tokens a slot of the rows it windows, a table in its own token
     /// order a lane; slots trimmed behind the window are the null chunk.
     pub windows: [Option<WindowList>; MAX_WINDOWS],
-    /// The rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of every
+    /// The rs list: `rs_tokens` unfolded rows of every
     /// recurrent layer's rs planes a slot.
     pub rs: Option<Slots>,
     pub rs_tokens: u32,
@@ -147,14 +147,14 @@ pub struct Layout {
     pub ring_pieces: u32,
     /// The seats seat-addressed lanes take.
     pub seats: u32,
-    /// Guest instances' tables and rings (REDESIGN step 4): shapes no
+    /// Guest instances' tables and rings: shapes no
     /// working set holds, taken per instance and channel.
     pub instance: Option<Slots>,
     pub channel: Option<Slots>,
     /// Landed adapters' planes, one a slot ([`Layout::with_adapter`]);
     /// none for a model with no registered banks.
     pub adapter: Option<Slots>,
-    /// The activation span (REDESIGN 3c): `(rung tokens, chunks)` a fire of
+    /// The activation span: `(rung tokens, chunks)` a fire of
     /// up to that many tokens takes out of the range's top, ascending, the
     /// first `act_rungs`; the last is the span. None where activation lives
     /// apart.
@@ -492,8 +492,7 @@ impl Layout {
                 &rows[0],
             ));
         }
-        // The window lists: lists of their own slots, each with its window
-        // (CONTRACT-BC 19, 21).
+        // The window lists: lists of their own slots, each with its window.
         // A windowed load's one window table is its window buffer: a list of
         // `T` unfolded rows of every windowed layer, no window of its own.
         let buffered = self.ring.is_some();

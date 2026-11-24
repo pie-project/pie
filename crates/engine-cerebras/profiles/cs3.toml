@@ -1,0 +1,130 @@
+api = 1
+
+[target]
+assumes = { system = "cs3" }
+
+# The CS-3's calibration: the cost model's per-unit cycles and rates (kernels-cerebras
+# `tuning`). The decode rates are fitted to the chip's `TSTAMP:1` phase stamps and bare decode
+# steps (each layer kind's own cost by least squares over them); the stream, GEMM and tiled
+# regimes' to the chip's and the fabric simulator's runs.
+[kernel]
+cost.decode.matvec_cycles = 0.4579326923076923
+cost.decode.kv_ms = 6.436e-6
+cost.decode.chain_ms = 1.093e-6
+cost.decode.span_row_ms = 1.267e-5
+cost.decode.span_col_ms = 0.0
+cost.decode.head_cycles = 0.537
+cost.decode.loop_reduce_cycles = 1.0
+cost.decode.layer_gdn_ms = 8.018e-3
+cost.decode.layer_global_ms = 5.707e-3
+cost.decode.layer_sliding_ms = 10.653e-3
+cost.decode.layer_shared_kv_ms = 19.700e-3
+cost.chain.loop_merge = 75.0
+cost.chain.loop_wire = 0.5
+cost.chain.add = 7.0
+cost.chain.merge = 7.0
+cost.chain.wire = 3.0
+cost.gemm.turn = 150.0
+cost.gemm.piece = 280.0
+cost.gemm.mac_call = 61.75
+cost.gemm.mac_elem = 0.543
+cost.gemm.hop = 12.0
+cost.gemm.call = 8.0
+cost.gemm.exp = 30.0
+cost.gemm.key_block = 11770.0
+cost.gemm.op = 200.0
+cost.gemm.measured = 1.0
+cost.tiled.word = 1.0
+cost.tiled.stream_word = 1.17
+cost.tiled.key = 1350.0
+cost.tiled.key_hop = 8.3
+cost.tiled.call = 40.0
+cost.tiled.hop = 2.0
+cost.tiled.scalar = 12.0
+cost.tiled.op = 5100.0
+cost.grid.row = 1150.0
+cost.grid.final = 400.0
+cost.stream.p1 = 0.55
+cost.stream.dsd_op = 0.0
+cost.stream.dsd_elem = 0.69
+cost.stream.exp_elem = 16.2
+cost.stream.recip_elem = 16.2
+cost.stream.sum_elem = 0.69
+cost.stream.sum_level = 20.0
+cost.stream.scalar_math = 60.0
+cost.stream.all_reduce = 210.0
+cost.stream.rot_call = 170.0
+cost.stream.rot_change = 429.0
+cost.stream.rot_level = 152.0
+cost.stream.rot_direct_op = 30.0
+cost.stream.store_word = 1.0
+cost.stream.chain_hop = 2.0
+cost.stream.store = 508.0
+cost.stream.query = 1100.0
+cost.stream.query_entry = 151.0
+cost.stream.fabric_word = 1.0
+cost.stream.forward_word = 1.0
+cost.stream.measured = 1.41
+cost.place.kv_hop = 2.08
+
+[provenance]
+measured = [
+  "kernel.cost.decode.matvec_cycles",
+  "kernel.cost.decode.kv_ms",
+  "kernel.cost.decode.chain_ms",
+  "kernel.cost.decode.span_row_ms",
+  "kernel.cost.decode.span_col_ms",
+  "kernel.cost.decode.head_cycles",
+  "kernel.cost.decode.loop_reduce_cycles",
+  "kernel.cost.decode.layer_gdn_ms",
+  "kernel.cost.decode.layer_global_ms",
+  "kernel.cost.decode.layer_sliding_ms",
+  "kernel.cost.decode.layer_shared_kv_ms",
+  "kernel.cost.chain.loop_merge",
+  "kernel.cost.chain.loop_wire",
+  "kernel.cost.chain.add",
+  "kernel.cost.chain.merge",
+  "kernel.cost.chain.wire",
+  "kernel.cost.gemm.turn",
+  "kernel.cost.gemm.piece",
+  "kernel.cost.gemm.mac_call",
+  "kernel.cost.gemm.mac_elem",
+  "kernel.cost.gemm.hop",
+  "kernel.cost.gemm.call",
+  "kernel.cost.gemm.exp",
+  "kernel.cost.gemm.key_block",
+  "kernel.cost.gemm.op",
+  "kernel.cost.gemm.measured",
+  "kernel.cost.tiled.word",
+  "kernel.cost.tiled.stream_word",
+  "kernel.cost.tiled.key",
+  "kernel.cost.tiled.key_hop",
+  "kernel.cost.tiled.call",
+  "kernel.cost.tiled.hop",
+  "kernel.cost.tiled.scalar",
+  "kernel.cost.tiled.op",
+  "kernel.cost.grid.row",
+  "kernel.cost.grid.final",
+  "kernel.cost.stream.p1",
+  "kernel.cost.stream.dsd_op",
+  "kernel.cost.stream.dsd_elem",
+  "kernel.cost.stream.exp_elem",
+  "kernel.cost.stream.recip_elem",
+  "kernel.cost.stream.sum_elem",
+  "kernel.cost.stream.sum_level",
+  "kernel.cost.stream.scalar_math",
+  "kernel.cost.stream.all_reduce",
+  "kernel.cost.stream.rot_call",
+  "kernel.cost.stream.rot_change",
+  "kernel.cost.stream.rot_level",
+  "kernel.cost.stream.rot_direct_op",
+  "kernel.cost.stream.store_word",
+  "kernel.cost.stream.chain_hop",
+  "kernel.cost.stream.store",
+  "kernel.cost.stream.query",
+  "kernel.cost.stream.query_entry",
+  "kernel.cost.stream.fabric_word",
+  "kernel.cost.stream.forward_word",
+  "kernel.cost.stream.measured",
+  "kernel.cost.place.kv_hop",
+]

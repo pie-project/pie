@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use client_api::{ClientMessage, ServerMessage};
@@ -14,13 +13,11 @@ use tarpc::serde_transport::unix;
 use tarpc::server::{BaseChannel, Channel};
 use tokio::sync::{Mutex, Notify, mpsc};
 use worker_api::{
-    Accepted, Control, GatewayInboundClient, Priority, Request, Tokens, WorkerControl,
-    connect_gateway_link, dispatch_codec,
+    Accepted, Control, GatewayInboundClient, LINK_MAX_FRAME_BYTES, Priority, Request, Tokens,
+    WorkerControl, connect_gateway_link, dispatch_codec,
 };
 
-const LINK_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-
-const PUSH_DEADLINE: Duration = Duration::from_secs(300);
+const LINK_HEADROOM_BYTES: usize = 64 * 1024;
 
 const TURN_QUEUE_DEPTH: usize = 64;
 
@@ -675,7 +672,7 @@ async fn run_turn(
             fired = async { start.as_mut().expect("armed").await }, if start.is_some() => {
                 start = None;
                 if fired.is_ok() {
-                    let _ = gateway.started(push_ctx(), req_id).await;
+                    let _ = gateway.started(worker_api::until_link_lost(), req_id).await;
                 }
             }
             _ = cancel.notified() => {
@@ -693,12 +690,13 @@ async fn run_turn(
                 let Some(msg) = msg else {
                     return TurnEnd::Aborted;
                 };
+                let msg = within_link(msg, LINK_MAX_FRAME_BYTES - LINK_HEADROOM_BYTES);
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
                 if !armed && let Some(rx) = arm(&process_id) {
                     start = Some(rx);
                     armed = true;
                 }
-                match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
+                match gateway.push_tokens(worker_api::until_link_lost(), req_id, Tokens::Chunk(msg)).await {
                     Ok(Control::Continue) => {}
                     Ok(Control::Abort) => {
                         tracing::debug!(%req_id, "gateway piggybacked abort");
@@ -721,7 +719,7 @@ async fn run_turn(
 }
 
 async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {
-    match gateway.push_tokens(push_ctx(), req_id, Tokens::Eos).await {
+    match gateway.push_tokens(worker_api::until_link_lost(), req_id, Tokens::Eos).await {
         Ok(_) => TurnEnd::Done,
         Err(e) => {
             tracing::warn!(%req_id, error = %e, "push Eos transport error");
@@ -730,10 +728,32 @@ async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {
     }
 }
 
-fn push_ctx() -> tarpc::context::Context {
-    let mut ctx = tarpc::context::current();
-    ctx.deadline = std::time::Instant::now() + PUSH_DEADLINE;
-    ctx
+fn within_link(msg: ServerMessage, budget: usize) -> ServerMessage {
+    match msg {
+        ServerMessage::ProcessEvent {
+            process_id,
+            event,
+            value,
+        } if value.len() > budget => ServerMessage::ProcessEvent {
+            value: format!(
+                "`{event}` of {} bytes exceeds the {budget}-byte message limit; send large results with session.send-file",
+                value.len()
+            ),
+            process_id,
+            event: "error".to_string(),
+        },
+        ServerMessage::Response {
+            corr_id, result, ..
+        } if result.len() > budget => ServerMessage::Response {
+            corr_id,
+            ok: false,
+            result: format!(
+                "response of {} bytes exceeds the {budget}-byte message limit",
+                result.len()
+            ),
+        },
+        other => other,
+    }
 }
 
 fn turn_terminal(
@@ -789,7 +809,8 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
         | AttachProcess { corr_id, .. }
         | TerminateProcess { corr_id, .. }
         | ListProcesses { corr_id }
-        | Ping { corr_id } => Some(*corr_id),
+        | Ping { corr_id }
+        | ReloadWeights { corr_id, .. } => Some(*corr_id),
         SignalProcess { .. } | TransferFile { .. } => None,
     }
 }
@@ -836,6 +857,45 @@ fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod handle_turn_tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_message_becomes_an_error_for_its_owner() {
+        let event = |value: String| ServerMessage::ProcessEvent {
+            process_id: "p".to_string(),
+            event: "return".to_string(),
+            value,
+        };
+        let ServerMessage::ProcessEvent { event: kind, .. } =
+            within_link(event("x".repeat(16)), 16)
+        else {
+            unreachable!()
+        };
+        assert_eq!(kind, "return");
+        let failed = within_link(event("x".repeat(17)), 16);
+        assert!(turn_terminal(
+            &failed,
+            None,
+            true,
+            &mut Some("p".to_string())
+        ));
+        let ServerMessage::ProcessEvent {
+            event: kind, value, ..
+        } = failed
+        else {
+            unreachable!()
+        };
+        assert_eq!(kind, "error");
+        assert!(value.contains("17 bytes"), "{value}");
+        let response = ServerMessage::Response {
+            corr_id: 1,
+            ok: true,
+            result: "y".repeat(17),
+        };
+        let ServerMessage::Response { ok, .. } = within_link(response, 16) else {
+            unreachable!()
+        };
+        assert!(!ok);
+    }
 
     fn reply(ok: bool) -> ServerMessage {
         ServerMessage::Response {

@@ -183,8 +183,7 @@ fn nan_guards_skip_real_nans_on_the_device() {
         .position(|input| input.name == "t")
         .expect("the plan reads `t`") as u32;
     let decls = output_decls(&loaded);
-    let program = engine
-        .register_program(&registration_of(&decls, program(), 0x7fc0))
+    let program = engine::Programs::register(&mut engine, &registration_of(&decls, program(), 0x7fc0))
         .expect("the NaN program registers");
     let chunks = &loaded.caps.chunks;
     let mut slots = Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
@@ -246,16 +245,14 @@ fn nan_guards_skip_real_nans_on_the_device() {
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     let x = values();
     let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
-    assert!(engine.publish_channel(instance, 0, &bytes).expect("the values publish"));
+    assert!(engine::Channels::publish(&mut engine, instance, 0, &bytes).expect("the values publish"));
     assert!(
-        engine
-            .publish_channel(instance, 1, &0.375f32.to_le_bytes())
+        engine::Channels::publish(&mut engine, instance, 1, &0.375f32.to_le_bytes())
             .expect("the timestep publishes")
     );
     let lane = Lane {
@@ -290,8 +287,7 @@ fn nan_guards_skip_real_nans_on_the_device() {
     // The guards are what is under test: the interpreter skips every NaN.
     assert!(!want[0][0].is_nan() && !want[1][0].is_nan(), "the reference skips NaNs");
     for (at, &(what, len, dtype)) in READERS.iter().enumerate() {
-        let raw = engine
-            .take_channel(instance, 2 + at as u32)
+        let raw = engine::Channels::take(&mut engine, instance, 2 + at as u32)
             .expect("the channel reads")
             .expect("the channel holds a cell");
         let got = cells(&raw, dtype);

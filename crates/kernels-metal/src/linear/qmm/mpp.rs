@@ -98,10 +98,9 @@ pub(super) fn fire(
                     [32 * groups_per_tg, 1, 1],
                 )),
                 &[
-                    if packed {
-                        w.mpp_codes.unwrap().arg()
-                    } else {
-                        w.codes.arg()
+                    match &w.mpp_codes {
+                        Some(codes) => codes.arg(),
+                        None => w.codes.arg(),
                     },
                     w.scales.arg(),
                     biases.arg(),

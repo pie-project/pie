@@ -62,6 +62,33 @@ fn token_text(token: u32) -> String {
     }
 }
 
+fn token_label(token: u32, as_ids: bool) -> String {
+    if as_ids {
+        format!("token_id:{token}")
+    } else {
+        token_text(token)
+    }
+}
+
+#[derive(Default)]
+struct PendingIds {
+    prompt: Option<Vec<u32>>,
+    tokens: Vec<u32>,
+}
+
+impl PendingIds {
+    fn attach(&mut self, chunk: &mut Value, prompt_on_choice: bool) {
+        if let Some(prompt) = self.prompt.take() {
+            if prompt_on_choice {
+                chunk["choices"][0]["prompt_token_ids"] = json!(prompt);
+            } else {
+                chunk["prompt_token_ids"] = json!(prompt);
+            }
+        }
+        chunk["choices"][0]["token_ids"] = json!(std::mem::take(&mut self.tokens));
+    }
+}
+
 /// A sampled token's alternatives as vLLM lists them: the sampled token
 /// first, then the likeliest others, as many as were asked.
 fn alternatives(token: u32, logprob: &compat::Logprob) -> impl Iterator<Item = (u32, f32)> + '_ {
@@ -77,12 +104,10 @@ fn alternatives(token: u32, logprob: &compat::Logprob) -> impl Iterator<Item = (
 }
 
 /// One chat-completions logprob entry: the sampled token and its
-/// [`alternatives`], each with its text's UTF-8 bytes.
-fn chat_logprob(token: u32, logprob: &compat::Logprob) -> Value {
+fn chat_logprob(token: u32, logprob: &compat::Logprob, as_ids: bool) -> Value {
     let entry = |token: u32, logprob: f32| {
-        let text = token_text(token);
-        let bytes: Vec<u8> = text.as_bytes().to_vec();
-        json!({"token": text, "logprob": logprob.max(-9999.0), "bytes": bytes})
+        let bytes: Vec<u8> = token_text(token).into_bytes();
+        json!({"token": token_label(token, as_ids), "logprob": logprob.max(-9999.0), "bytes": bytes})
     };
     let mut out = entry(token, logprob.logprob);
     out["top_logprobs"] = Value::Array(
@@ -111,6 +136,20 @@ fn vllm_prompt_logprobs(prompt: &[(u32, Option<compat::Logprob>)], top: usize) -
         Value::Object(row)
     });
     Value::Array(rows.collect())
+}
+
+fn logprobs_mode(mode: Option<String>) -> Result<compat::LogprobsMode, ApiError> {
+    let Some(name) = mode else {
+        return Ok(compat::LogprobsMode::default());
+    };
+    compat::LogprobsMode::from_name(&name).ok_or_else(|| {
+        invalid(
+            format!(
+                "unknown logprobs_mode `{name}`: one of raw_logprobs, raw_logits, processed_logprobs, processed_logits"
+            ),
+            Some("logprobs_mode"),
+        )
+    })
 }
 
 /// The `prompt_logprobs` field (vLLM's): how many alternatives each prompt
@@ -283,6 +322,18 @@ where
         .await
         .into_iter()
         .collect()
+}
+
+fn stop_reason(outcome: &compat::Outcome) -> Value {
+    // Stopped by the host: why, in vLLM's field for what stopped it.
+    if let Some(reason) = &outcome.stop_reason {
+        return json!(reason);
+    }
+    match (&outcome.stop_sequence, outcome.stop_token) {
+        (Some(sequence), _) => json!(sequence),
+        (None, Some(token)) => json!(token),
+        (None, None) => Value::Null,
+    }
 }
 
 /// The `stop` field: absent, one string, or an array of them.

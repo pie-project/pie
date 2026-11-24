@@ -188,6 +188,11 @@ pub struct FireKey {
 
 static FIRES: Mutex<BTreeMap<FireKey, Arc<AtomicU64>>> = Mutex::new(BTreeMap::new());
 
+/// Forgets the boot's fire counts.
+pub(crate) fn reset() {
+    FIRES.lock().unwrap().clear();
+}
+
 /// The count a pass bound with a [`HostGeometry`] adds each fire to, one a
 /// key: passes of one program on one engine share it.
 #[must_use]

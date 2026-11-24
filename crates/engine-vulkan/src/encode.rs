@@ -203,10 +203,12 @@ struct Scratch {
 /// What stands for a pool segment's buffer in a frame's hash: its place,
 /// never the buffer, which a commit or a release changes under a recording
 /// that is rebound ([`crate::device::Context::rebind_segments`]).
+#[cfg(feature = "vulkan")]
 const SEGMENT_TAG: u64 = 0xffff_ffff_0000_0000;
 
 /// What stands for a score room's buffer in a frame's hash: the room's place
 /// is the fire's ([`crate::device::Kept::bind_room`]).
+#[cfg(feature = "vulkan")]
 const ROOM_TAG: u64 = 0xffff_fffe_0000_0000;
 
 #[cfg(feature = "vulkan")]
@@ -367,12 +369,15 @@ impl Sink<'_> {
                 format!("not instantiated at the {} tier", fire.tier.name()),
             )
         })?;
-        let groups = engine_gpu::workgroups(
-            key,
-            fire.groups,
-            self.device.core.limits.max_compute_work_group_count,
-        )
-        .map_err(|fault| Sink::refuse(fire, fault))?;
+        let groups = match fire.launched() {
+            Some(none) => none,
+            None => engine_gpu::workgroups(
+                key,
+                fire.groups,
+                self.device.core.limits.max_compute_work_group_count,
+            )
+            .map_err(|fault| Sink::refuse(fire, fault))?,
+        };
         let pipeline = self
             .pipelines
             .get(self.device, fire.file, key)
@@ -390,6 +395,8 @@ impl Sink<'_> {
         scratch.writes.clear();
         scratch.segments.clear();
         scratch.rooms.clear();
+        // Where a fired table's zero rows start in the scalars, if any.
+        let mut zeros_from: Option<usize> = None;
         let (infos, writes_at, extents, push, segments, rooms) = (
             &mut scratch.infos,
             &mut scratch.writes_at,
@@ -412,7 +419,38 @@ impl Sink<'_> {
                         writes_at.push(false);
                         extents.push(0);
                         segments.push(None);
-                        rooms.push(None);
+                        // A score room's binding with no room (a fire none of
+                        // whose lanes capture, its kernels launching none) is
+                        // the room's all the same, at its first byte: the
+                        // commands of a fire whose lanes capture.
+                        let at = infos.len() - 1;
+                        rooms.push((at < 64 && pipeline.rooms & (1 << at) != 0).then_some(0));
+                        continue;
+                    }
+                    // A lay-only walk binds nothing: what a buffer argument
+                    // is matters to the commands, not to the block.
+                    // A score room's binding is the fire's data all the same:
+                    // where in the room its rows lie.
+                    if self.frame.lay_only() {
+                        let at = infos.len();
+                        let room = (at < 64 && pipeline.rooms & (1 << at) != 0)
+                            .then_some(self.frame.room)
+                            .flatten()
+                            .and_then(|(room, base)| {
+                                let binding = self.handles.get(handle)?;
+                                (binding.buffer().slab().buffer == room)
+                                    .then(|| binding.offset().saturating_sub(base))
+                            });
+                        infos.push(
+                            vk::DescriptorBufferInfo::default()
+                                .buffer(dummy.buffer)
+                                .offset(0)
+                                .range(dummy.size),
+                        );
+                        writes_at.push(false);
+                        extents.push(0);
+                        segments.push(None);
+                        rooms.push(room);
                         continue;
                     }
                     let binding = self.handles.get(handle).ok_or_else(|| {
@@ -470,9 +508,25 @@ impl Sink<'_> {
                         self.frame.retain(slab);
                     }
                 }
-                ArgValue::I32(v) => push.extend_from_slice(&v.to_le_bytes()),
-                ArgValue::U32(v) => push.extend_from_slice(&v.to_le_bytes()),
-                ArgValue::F32(v) => push.extend_from_slice(&v.to_le_bytes()),
+                // A scalar after zeros: the zeros lie inside what is kept.
+                ArgValue::I32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::U32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::F32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::Zeros(words) => {
+                    // What a lay keeps runs through the last non-zero byte:
+                    // the zeros are laid, not scanned.
+                    zeros_from.get_or_insert(push.len());
+                    push.resize(push.len() + words as usize * 4, 0);
+                }
             }
         }
 
@@ -533,7 +587,11 @@ impl Sink<'_> {
                 }
                 let (buffer, place) = self
                     .frame
-                    .lay(push, limits.min_uniform_buffer_offset_alignment)
+                    .lay_kept(
+                        push,
+                        limits.min_uniform_buffer_offset_alignment,
+                        zeros_from.unwrap_or(push.len()),
+                    )
                     .map_err(|fault| Sink::refuse(fire, fault))?;
                 fired_buffer = Some(buffer);
                 infos.resize(
@@ -578,6 +636,16 @@ impl Sink<'_> {
             ));
         }
 
+        // The kernel, in the frame's picks; a lay-only walk lays no more.
+        self.frame.pick(&key);
+        if self.frame.lay_only() {
+            // Where in the room each room binding lies, the fire's data.
+            for past in scratch.rooms.iter().take(declared).flatten() {
+                self.frame.room_past(*past);
+            }
+            self.frame.dispatches.set(self.frame.dispatches.get() + 1);
+            return Ok(());
+        }
         let (reads, writes) = (&mut scratch.reads, &mut scratch.writes);
         for (at, info) in infos.iter().enumerate().take(declared) {
             if !pipeline.used[at] || info.buffer == dummy.buffer || Some(at) == params_at {

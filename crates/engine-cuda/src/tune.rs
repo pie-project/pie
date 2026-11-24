@@ -236,6 +236,7 @@ fn serve(
         readout,
         read: chip.read(),
         refused: None,
+        layers: trace.decoder_layers(),
     })
 }
 
@@ -247,10 +248,11 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     let engine = crate::chip::Engine::of(chip);
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
     let profile = poem_compiler::DeviceProfile::of(chip, sms, &crate::EXCLUSIVE, grouped);
-    let trace = poem_compiler::fuse::fuse(
-        row.trace(poem::Platform::Cuda),
-        poem_compiler::fuse::flags::on(chip, &crate::FUSIONS),
-    );
+    #[cfg(not(feature = "rocm"))]
+    let rules = crate::fusions(chip);
+    #[cfg(feature = "rocm")]
+    let rules = poem_compiler::fuse::flags::on(chip, &crate::FUSIONS);
+    let trace = poem_compiler::fuse::fuse(row.trace(poem::Platform::Cuda), rules);
     #[cfg(not(feature = "rocm"))]
     let trace = {
         let tuning = kernels_cuda::tuning::Tuning::of(chip);
@@ -265,6 +267,9 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
             || tuning.ssm_gdn_out_bf16(),
         )
     };
+    #[cfg(not(feature = "rocm"))]
+    let trace =
+        poem_compiler::fuse::fuse(trace, crate::residual_norms(chip, profile.synth_regions));
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budget = poem_compiler::Budget::new(slots, CONTEXT);
     budget.buckets = crate::api::lattice(
@@ -302,6 +307,7 @@ struct Cuda<'a> {
     facts: &'a Facts,
     sms: u32,
     profiles: Option<&'a Path>,
+    mix: search::Mix,
 }
 
 impl Cuda<'_> {
@@ -313,6 +319,14 @@ impl Cuda<'_> {
 }
 
 impl Bench for Cuda<'_> {
+    fn mix(&self) -> search::Mix {
+        self.mix
+    }
+
+    fn agreement(&self) -> f64 {
+        engine::rates::AGREEMENT
+    }
+
     fn models(&self) -> Vec<String> {
         self.models.iter().map(|(_, d)| d.clone()).collect()
     }
@@ -348,6 +362,7 @@ impl Bench for Cuda<'_> {
 pub fn run(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
+    mix: search::Mix,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -366,6 +381,7 @@ pub fn run(
         facts: &facts,
         sms,
         profiles,
+        mix,
     };
     let mut lines = Vec::new();
     let mut chosen = Vec::new();

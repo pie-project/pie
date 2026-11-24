@@ -12,11 +12,6 @@ fn the_resident_probe_counts_the_cores() {
         return;
     };
     let groups = device.resident_groups().expect("the probe runs");
-    eprintln!(
-        "{groups} full workgroups resident at once; the device states {:?} cores ({:?})",
-        device.cores(),
-        device.cores_from()
-    );
     assert!(groups >= RESIDENT_PER_CORE, "the probe counts at least a core's groups");
     if let Some(cores) = device.cores() {
         assert_eq!(

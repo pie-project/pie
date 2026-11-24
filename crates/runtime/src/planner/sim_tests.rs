@@ -943,7 +943,7 @@ impl SimEngine {
     }
 }
 
-impl Engine for SimEngine {
+impl ::engine::Engine for SimEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -954,48 +954,12 @@ impl Engine for SimEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "sim"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
@@ -1006,7 +970,47 @@ impl Engine for SimEngine {
         unreachable!("the simulation's fires never reach the engine")
     }
 
-    fn program_facts(&self, _program: ProgramId) -> ::engine::Result<ProgramFacts> {
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for SimEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn facts(&self, _program: ProgramId) -> ::engine::Result<ProgramFacts> {
         let footprint = |bytes: u64, slots: u32| ::engine::program::Footprint {
             bytes,
             slots,
@@ -1049,7 +1053,7 @@ impl Engine for SimEngine {
         })
     }
 
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
         self.next += 1;
         let id = self.next;
         let places = Places {
@@ -1079,7 +1083,7 @@ impl Engine for SimEngine {
         })
     }
 
-    fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
+    fn rebind(&mut self, rebind: Rebind) -> ::engine::Result<()> {
         match rebind {
             Rebind::Instance {
                 id,
@@ -1124,7 +1128,69 @@ impl Engine for SimEngine {
         }
         Ok(())
     }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
 }
+
+impl ::engine::Pool for SimEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for SimEngine {
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 const PART_TABLE: u8 = 0;
 const PART_RING: u8 = 1;
@@ -1226,9 +1292,12 @@ struct Workload {
     /// its sources left as they were. `None`: every copy lands.
     landing_fails: Option<u64>,
     /// The built-in `default` worker policy's seat-to-end holds are
-    /// enacted ([`SeatHolds`]); `false` runs as `noop`, no rows. Set for
-    /// every seed by `PIE_SIM_DEFAULT`.
+    /// enacted ([`SeatHolds`]); `false` runs as `noop`, no rows.
     default_policy: bool,
+    /// The engine refuses an evacuation after its table took the moves, one
+    /// time in four, and puts its table back: the runtime takes the move
+    /// back too.
+    late_refuse: bool,
 }
 
 impl Workload {
@@ -1393,7 +1462,8 @@ impl Workload {
             target,
             ring,
             landing_fails,
-            default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+            default_policy: false,
+            late_refuse: false,
         }
     }
 
@@ -1526,7 +1596,8 @@ impl Workload {
             target,
             ring: None,
             landing_fails: None,
-            default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+            default_policy: false,
+            late_refuse: false,
         }
     }
 
@@ -1940,19 +2011,11 @@ struct Log {
     bind_suspends: u64,
     idles: u64,
     rescores: u64,
-    /// The safe order stood short at the last settled step.
-    /// The first admission that turned the safe order short: the gate let
-    /// a newcomer in that left someone unable to finish in turn.
-    admitted_short: Option<String>,
-    short: bool,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
     checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
-    /// The capacity gate's figures as the last step with nothing moving
-    /// between tiers read them.
-    capacity: Option<super::inner::CapacityRead>,
     /// Processes that ended their work.
     finished: u64,
     /// Processes back from their client with a new request, in order.
@@ -1964,6 +2027,17 @@ struct Log {
     /// Binds suspended for their own room more than once: (process,
     /// program, suspensions).
     bind_thrash: Vec<(ProcessId, u32, u32)>,
+    /// Processes ended (finished or failed by name): what a process
+    /// refused at admission waits on to come back ([`run_process`]).
+    departures: u64,
+    /// Admission refusals retried.
+    retries: u64,
+    /// Processes failed by name with every tier full.
+    wedged: u64,
+    /// Each process the planner failed ([`super::ResidencyPlanner::fail_tiers_full`])
+    /// and the step it was first seen failed: it departs within the next
+    /// step, or its failure reached no wait of its own.
+    failed_at: BTreeMap<ProcessId, u32>,
     /// Each process's evictions landed.
     evicted_of: std::collections::HashMap<ProcessId, u32>,
 }
@@ -2402,7 +2476,6 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     |_| false,
                     Some(pid),
                     |pid| ctx.planner.is_resident(pid),
-                    |pid, chunks| ctx.planner.capacity_holds_chunks(pid, chunks),
                 )
             })();
             let (roles, engine, binding) = (roles.clone(), engine.clone(), binding.clone());
@@ -2439,10 +2512,6 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
         || Some(roles.lock().unwrap().room_watch()),
         |run, pieces, singles| {
             roles.lock().unwrap().room_free(run, pieces, singles)
-                && !planner.capacity_would_hold(
-                    pid,
-                    run.max(1).saturating_mul(pieces).saturating_add(singles),
-                )
         },
         |run, pieces, singles| {
             roles.lock().unwrap().holds_guest_state(pid)
@@ -2509,7 +2578,7 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true, |_, _| false) {
+    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -2635,23 +2704,27 @@ async fn seat_to_end(ctx: &Ctx, pid: ProcessId) {
     }
 }
 
+/// A process's life by `script`; refused at admission (its first ask fit
+/// nowhere, [`super::ADMISSION_REFUSED`]) it is the client's to retry: it
+/// leaves, and comes back after the next departure, as a client retries
+/// such a refusal, never counted a failure.
 async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
+    while run_once(ctx.clone(), pid, script.clone()).await {
+        let ended = ctx.log.lock().unwrap().departures;
+        while ctx.log.lock().unwrap().departures == ended {
+            ctx.next_step().await;
+        }
+        ctx.planner.register(pid);
+    }
+}
+
+/// One run of [`run_process`]: whether it was refused at admission.
+async fn run_once(ctx: Arc<Ctx>, pid: ProcessId, script: Script) -> bool {
     let planner = ctx.planner.clone();
     ctx.at(pid, "admit");
     seat_to_end(&ctx, pid).await;
     planner.admit(pid).await;
-    // As the runtime's gates hold a newcomer
-    // (`inferlet::process::wait_for_room`): until the capacity gate's last
-    // place has room for its first ask.
-    planner.admitted_to_ask(pid).await;
-    let before = planner.order_least();
     planner.note_admitted(pid);
-    let after = planner.order_least();
-    if before.is_none_or(|least| least >= 0) && after.is_some_and(|least| least < 0) {
-        ctx.log.lock().unwrap().admitted_short.get_or_insert_with(|| {
-            format!("admitting {} turned the safe order short: least {before:?} -> {after:?}", &pid.to_string()[..8])
-        });
-    }
     let residency = Arc::new(Mutex::new(ProcessResidency::default()));
     register_residency(pid, Arc::downgrade(&residency));
     let departure = planner.departure(pid);
@@ -2722,7 +2795,22 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
         Ok::<(), String>(())
     }
     .await;
-    if let Err(why) = &lived {
+    let retry = lived
+        .as_ref()
+        .is_err_and(|why| why.contains(&format!("[{}]", super::ADMISSION_REFUSED)));
+    // Failed by name with every tier full ([`super::TIERS_FULL`]): an
+    // allowed end where the fleet was truly wedged, counted apart; the
+    // run goes on, and every other process must still end.
+    let wedged = lived
+        .as_ref()
+        .is_err_and(|why| why.contains(&format!("[{}]", super::TIERS_FULL)));
+    if wedged {
+        ctx.log.lock().unwrap().wedged += 1;
+    }
+    if let Err(why) = &lived
+        && !retry
+        && !wedged
+    {
         ctx.refused(pid, why.clone());
     }
     // Its end, as the runtime's: its instances close (the engine's close
@@ -2747,8 +2835,14 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     }
     let mut log = ctx.log.lock().unwrap();
     log.stages.remove(&pid);
-    log.ended += 1;
+    if retry {
+        log.retries += 1;
+    } else {
+        log.ended += 1;
+        log.departures += 1;
+    }
     log.acts += 1;
+    retry
 }
 
 /// Closes instance `id` as the runtime's lane does: the engine's close,
@@ -2773,9 +2867,6 @@ fn close(ctx: &Ctx, id: InstanceId) {
 /// table, so a slot ref (a logical chunk's) reads what it read, and the
 /// bytes stand as they lie. Whether it moved chunks.
 fn walk(ctx: &Ctx) -> bool {
-    if std::env::var_os("PIE_SIM_NOWALK").is_some() {
-        return false;
-    }
     let Some(shared) = &ctx.stores.shared else {
         return false;
     };
@@ -2855,23 +2946,7 @@ const LOST_WAKES_FAIL: bool = false;
 
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
-fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
-    if std::env::var_os("PIE_SIM_CAP").is_some() {
-        eprintln!(
-            "SIMCAP step {step} held {:?} pending {:?} kv {:?} read {:?} census {:?} device {:?} disk {:?} roles {:?}",
-            ctx.stores.roles.as_ref().map(|roles| roles.lock().unwrap().audit_held()),
-            ctx.stores.shared.as_ref().map(|shared| { let shared = shared.lock().unwrap(); (shared.pool().pending_slots(), shared.pool().budget_line(), shared.pool().census(1), shared.pool().held_census()) }),
-            with_kv_lock(&ctx.stores.kv, "sim-cap", |kv| kv.census()),
-            ctx.planner.capacity_read(),
-            ctx.planner.port.capacity_census(),
-            ctx.planner.port.device_stats(),
-            ctx.planner.port.disk_stats(),
-            ctx.stores.roles.as_ref().map(|roles| {
-                let roles = roles.lock().unwrap();
-                (roles.footprint(), roles.footprint_on_disk(), roles.slack())
-            }),
-        );
-    }
+fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -2898,21 +2973,6 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         // scratch (a parked one's kept tables and rings). A slot named past
         // its release is read and written as another's (the M1's fires on
         // free logical chunks swapped onto a released segment).
-        // `PIE_SIM_SHORT`: each step the safe order turns short, said with
-        // the gate's read and what the last step granted.
-        if std::env::var_os("PIE_SIM_SHORT").is_some() {
-            let least = ctx.planner.order_least();
-            let was = ctx.log.lock().unwrap().short;
-            let now = least.is_some_and(|least| least < 0);
-            if now && !was {
-                eprintln!(
-                    "SIMSHORT step {step}: least {least:?} read {:?} gate {:?}",
-                    ctx.planner.capacity_read(),
-                    ctx.planner.capacity_gate()
-                );
-            }
-            ctx.log.lock().unwrap().short = now;
-        }
         if let Some(why) = stray_holders(ctx, shared) {
             return Err(fail("stale ref", why));
         }
@@ -2972,42 +3032,23 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     {
         return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
     }
-    // The capacity gate's invariant: every path that adds state goes
-    // through it, so every tier together keeps the finisher's headroom.
-    // The capacity gate's invariant: every path that adds state goes
-    // through it, so between two steps with nothing moving between tiers
-    // (a move holds its slots on both while its copies land), the same
-    // finisher and the same capacity, the tiers' free pages never fall
-    // further short of the finisher's headroom. A breach is named at the
-    // step it happens.
-    let moving = moving
-        || ctx.planner.with_inner(|inner| {
-            !inner.evicting.is_empty()
-                || inner.procs.values().any(|proc| {
-                    matches!(
-                        proc.state,
-                        super::proc::Residency::Evicting | super::proc::Residency::Restoring
-                    )
-                })
+    // A failed process departs within a step: a failure no wait of its own
+    // reads leaves its kill in flight for good and the fleet quiet (the
+    // Metal mix's seed 42), failed loudly here instead.
+    {
+        let failed: Vec<ProcessId> = ctx.planner.with_inner(|inner| {
+            inner.failed.keys().copied().filter(|pid| inner.procs.contains_key(pid)).collect()
         });
-    if !moving && let Some(read) = ctx.planner.capacity_read() {
-        let before = ctx.log.lock().unwrap().capacity.replace(read);
-        let short = read.others_short();
-        if let Some(before) = before
-            && before.finisher == read.finisher
-            && before.whole == read.whole
-            && short > before.others_short()
-        {
-            return Err(fail(
-                "capacity",
-                format!(
-                    "every tier together holds {} pages free, {short} short of the finisher \
-                     {}'s headroom, {} short the step before: {read:?}; before {before:?}",
-                    read.gate().free,
-                    read.finisher,
-                    before.others_short()
-                ),
-            ));
+        let mut log = ctx.log.lock().unwrap();
+        log.failed_at.retain(|pid, _| failed.contains(pid));
+        for pid in failed {
+            let since = *log.failed_at.entry(pid).or_insert(step);
+            if step > since + 1 {
+                return Err(fail(
+                    "undelivered",
+                    format!("process {pid} failed at step {since} and has not departed"),
+                ));
+            }
         }
     }
     if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
@@ -3211,6 +3252,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         let ops = lane_ops.clone();
         let view = engine_view.clone();
         let lane_shared = stores.shared.clone();
+        let late_refuse = workload.late_refuse;
         crate::store::shared::SharedGrow::new(model, 0, shared)
             .with_lane(move |op| {
                 if let Some(view) = &view {
@@ -3230,18 +3272,19 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                         anyhow::bail!(fault);
                     }
                     if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op {
+                        let before = view.table.clone();
                         if let Err(error) = view.table.apply(evacuation) {
                             let fault =
                                 format!("the engine's table refused {:?}: {error}", evacuation.moves);
                             view.faults.push(fault.clone());
                             anyhow::bail!(fault);
                         }
-                        // `PIE_SIM_LATE_REFUSE`: the engine refuses an
-                        // evacuation after its table took the moves, one
-                        // time in a few (Metal before 6b69c5978's next: a
-                        // rebind failing past the swap). The runtime takes
-                        // the move back; the tables part.
-                        if std::env::var_os("PIE_SIM_LATE_REFUSE").is_some() && view.rng.chance(1, 4) {
+                        // The engine refuses an evacuation after its table
+                        // took the moves ([`Workload::late_refuse`]) and
+                        // puts its table back: the runtime takes the move
+                        // back too, and the two tables agree.
+                        if late_refuse && view.rng.chance(1, 4) {
+                            view.table = before;
                             anyhow::bail!("an evacuation refused past its table swap (simulated)");
                         }
                     }
@@ -3451,7 +3494,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
         progress.moved(&ctx, step);
         coverage.live_steps += u64::from(tasks.len() > ctx.log.lock().unwrap().ended);
-        match check(&ctx, step, !pending.is_empty()) {
+        match check(&ctx, step) {
             Ok(refused) => {
                 for failed in refused {
                     if !failures
@@ -3499,18 +3542,10 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 kind: "liveness".to_string(),
                 line: format!(
                     "{} of {total} processes still running {} steps after the last arrival; \
-                     stuck {stuck:?}; capacity gate {:?}; queue {}; evicting/in flight {}; copies \
+                     stuck {stuck:?}; queue {}; evicting/in flight {}; copies \
                      pending {}; free chunks {}",
                     total - ended,
                     step - last_arrival,
-                    planner.capacity_gate().map(|gate| {
-                        let state = planner.with_inner(|inner| {
-                            inner.procs.get(&gate.finisher).map(|proc| {
-                                format!("{:?} unfired={} bind_waiting={}", proc.state, proc.unfired, proc.bind_waiting)
-                            })
-                        });
-                        (gate, state)
-                    }),
                     planner.debug_queue(),
                     planner.with_inner(|inner| inner.evicting.len()),
                     pending.len(),
@@ -3540,6 +3575,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.bind_waits = log.bind_waits;
         coverage.bind_suspends = log.bind_suspends;
         coverage.raises_owed = log.raises_owed;
+        eprintln!("SIM outcome: finished {} refused_at_admission_retried {} failed_wedged {} other_failures {}", log.finished, log.retries, log.wedged, log.refusals.len());
         coverage.rung_raises = lane_ops[0].load(Ordering::Relaxed);
         coverage.rung_lowers = lane_ops[2].load(Ordering::Relaxed);
         coverage.evacuations = lane_ops[1].load(Ordering::Relaxed);
@@ -3556,13 +3592,6 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
         // some suspended 58 to 68 times, unfinished in 45 minutes).
         coverage.most_suspended = u64::from(log.most_suspended);
-        if let Some(line) = log.admitted_short.clone() {
-            failures.push(Failure {
-                step,
-                kind: "admission".to_string(),
-                line,
-            });
-        }
         for &(pid, program, suspended) in &log.bind_thrash {
             progress.again += u64::from(suspended - 1);
             progress.first.get_or_insert_with(|| {
@@ -3661,10 +3690,19 @@ fn shrink(workload: &Workload, shape: &str) -> (Vec<usize>, Failure) {
 
 /// Runs seeds `seeds`: the failures (seed, failure) and the coverage.
 fn sweep(seeds: std::ops::Range<u64>) -> (Vec<(u64, Failure)>, Coverage) {
+    sweep_with(seeds, |_| {})
+}
+
+/// [`sweep`] with each seed's workload changed by `tweak`.
+fn sweep_with(
+    seeds: std::ops::Range<u64>,
+    tweak: impl Fn(&mut Workload),
+) -> (Vec<(u64, Failure)>, Coverage) {
     let mut failures = Vec::new();
     let mut coverage = Coverage::default();
     for seed in seeds {
-        let workload = Workload::of(seed);
+        let mut workload = Workload::of(seed);
+        tweak(&mut workload);
         let (found, covered) = run(&workload, None);
         coverage.add(&covered);
         for failure in found {
@@ -3729,13 +3767,6 @@ fn report(failures: &[(u64, Failure)], coverage: &Coverage, shrinking: bool) -> 
 fn replay_seed(seed: u64) -> Vec<Failure> {
     run(&Workload::of(seed), None).0
 }
-
-/// The failure shapes the simulation has found and the planner has not yet
-/// fixed, each with a seed that showed it (its regression test below,
-/// ignored until fixed). The fast sweep fails on any other shape; once a
-/// shape is fixed its entry goes and its test is no longer ignored. None
-/// now.
-const KNOWN: [(&str, u64); 0] = [];
 
 /// Shapes the simulation found and the runtime fixed, each seed's
 /// regression test run in the suite; the fast sweep fails on them again.
@@ -3860,31 +3891,40 @@ const FIXED: [(&str, u64); 35] = [
     ("liveness", 431),
 ];
 
-fn known(shape: &str) -> bool {
-    KNOWN.iter().any(|(prefix, _)| shape.starts_with(prefix))
-}
-
-/// The fast sweep: 200 seeds, none failing in a shape not [`KNOWN`].
+/// The fast sweep: 200 seeds, none failing. It covers the [`FIXED`] seeds
+/// below 200, so only those past it have a regression test of their own.
 #[test]
 fn the_simulated_fleet_settles_every_step_on_200_seeds() {
     let (failures, coverage) = sweep(0..200);
     let report = report(&failures, &coverage, false);
     eprintln!("{report}");
-    let new: Vec<_> = failures
-        .iter()
-        .filter(|(_, failure)| !known(&shape_of(failure)))
-        .collect();
-    assert!(
-        new.is_empty(),
-        "failures in a shape not known: {new:?}\n{report}"
-    );
+    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
     assert!(
         coverage.evictions > 0 && coverage.restores > 0,
         "{coverage:?}"
     );
 }
 
-/// Seed `seed` runs clean of the shape `prefix` ([`KNOWN`], [`FIXED`]).
+/// The fast sweep's seeds under the built-in `default` policy's seat-to-end
+/// holds ([`Workload::default_policy`]).
+#[test]
+fn the_simulated_fleet_settles_every_step_under_the_default_policy() {
+    let (failures, coverage) = sweep_with(0..48, |workload| workload.default_policy = true);
+    let report = report(&failures, &coverage, false);
+    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
+}
+
+/// The fast sweep's seeds with the engine refusing evacuations past its
+/// table swap and putting its table back ([`Workload::late_refuse`]): the
+/// runtime takes each move back, and the tables agree.
+#[test]
+fn the_simulated_fleet_settles_every_step_with_evacuations_refused_late() {
+    let (failures, coverage) = sweep_with(0..48, |workload| workload.late_refuse = true);
+    let report = report(&failures, &coverage, false);
+    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
+}
+
+/// Seed `seed` runs clean of the shape `prefix` ([`FIXED`]).
 fn regression((prefix, seed): (&str, u64)) {
     let failures = replay_seed(seed);
     for failure in &failures {
@@ -3904,36 +3944,6 @@ fn regression((prefix, seed): (&str, u64)) {
 }
 
 #[test]
-fn sim_seed_1_a_bind_s_parts_opening_fresh_chunks_do_not_spin() {
-    regression(FIXED[0]);
-}
-
-#[test]
-fn sim_seed_13_a_bind_suspended_restore_s_need_does_not_ratchet() {
-    regression(FIXED[1]);
-}
-
-#[test]
-fn sim_seed_111_a_bind_suspended_restore_whose_placement_stands_is_sent() {
-    regression(FIXED[2]);
-}
-
-#[test]
-fn sim_seed_188_a_bind_short_of_a_run_is_funded() {
-    regression(FIXED[3]);
-}
-
-#[test]
-fn sim_seed_1_no_guest_state_a_later_fire_reads_is_lost_at_a_park() {
-    regression(FIXED[4]);
-}
-
-#[test]
-fn sim_seed_19_a_pair_taken_anew_is_laid_at_its_new_generation() {
-    regression(FIXED[5]);
-}
-
-#[test]
 fn sim_seed_3364_a_bound_pair_s_slots_are_its_own() {
     regression(FIXED[6]);
 }
@@ -3946,16 +3956,6 @@ fn sim_seed_3999_a_bound_pair_s_slots_are_its_own() {
 #[test]
 fn sim_seed_1711_every_process_ends() {
     regression(FIXED[8]);
-}
-
-#[test]
-fn sim_seed_111_a_restore_short_of_runs_its_unpark_takes_is_compacted_for() {
-    regression(FIXED[9]);
-}
-
-#[test]
-fn sim_seed_134_a_head_no_move_serves_is_passed_over() {
-    regression(FIXED[10]);
 }
 
 #[test]
@@ -4106,27 +4106,35 @@ fn sim_field_seeds_863_and_178_end() {
     field_regression(178);
 }
 
-/// The Metal w17 mix's seeds 2 and 6: newcomers arrive while the safe
-/// order has no room at its last place, wait there holding nothing
-/// (`ResidencyPlanner::admitted_to_ask`), and are let in as admitted
-/// processes finish; no admission turns the order short (the run's
-/// `admission` check), and every process ends: admitting never starves one
-/// admitted.
+/// The Metal w17 mix's seeds 2 and 6: newcomers arrive with the device
+/// full of admitted work. Over-demand waits and is served: each newcomer
+/// waits for room as admitted processes move or finish (refused by name
+/// at admission only with the fleet wedged but for it), and every process
+/// ends, finished or failed by name with every tier full.
 #[test]
-fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_ends() {
-    // Seated lanes grow before a waiting prompt on every engine now (PLEX
-    // 1.1's no displacement): seed 6's newcomers no longer reach the gate's
-    // last place, seed 2's still do. Both must end clean.
-    let mut waits = 0;
+fn sim_metal_seeds_2_and_6_every_process_ends() {
     for seed in [2, 6] {
-        let (failures, coverage) = run(&Workload::metal(seed), None);
+        let (failures, _) = run(&Workload::metal(seed), None);
         for failure in &failures {
             eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
         }
         assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
-        waits += coverage.admission_waits;
     }
-    assert!(waits > 0, "no newcomer waited at the gate");
+}
+
+/// The Metal mix's seeds 30, 44 and 131: a restore carrying the bind that
+/// suspended its process lays that bind's fresh chunks, new state (seed
+/// 44: a chunk taken with nothing spare, 14 pages short). Every process
+/// ends, finished or failed by name with every tier full.
+#[test]
+fn sim_metal_seeds_30_44_131_a_restores_bind_waits_on_the_gate() {
+    for seed in [30, 44, 131] {
+        let (failures, _) = run(&Workload::metal(seed), None);
+        for failure in &failures {
+            eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
+        }
+        assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
+    }
 }
 
 /// What a run did, as a string two runs of one seed must agree on.
@@ -4252,6 +4260,24 @@ fn replay_one_simulated_seed() {
     );
 }
 
+/// [`replay_one_simulated_seed`] under the built-in `default` policy's
+/// seat-to-end holds ([`Workload::default_policy`]).
+#[test]
+#[ignore]
+fn replay_one_simulated_seed_under_the_default_policy() {
+    let seed = std::env::var("PIE_SIM_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut workload = Workload::of(seed);
+    workload.default_policy = true;
+    let failures = run(&workload, None).0;
+    for failure in &failures {
+        eprintln!("SIM seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
+    }
+    assert!(failures.is_empty(), "seed {seed}: {} failures", failures.len());
+}
+
 /// A pool of `total` chunks in segments of `segment`, a bind of `run`
 /// adjacent chunks arriving once the decoders around it have scattered
 /// their pages over the pool ([`a_run_the_pool_can_open_is_opened`]).
@@ -4337,7 +4363,8 @@ fn run_pieces_workload(
         target: Vec::new(),
         ring: None,
         landing_fails: None,
-        default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+        default_policy: false,
+        late_refuse: false,
     }
 }
 
@@ -4486,7 +4513,8 @@ fn raise_beside_own_workload(scripts: Vec<Script>) -> Workload {
         target: Vec::new(),
         ring: None,
         landing_fails: None,
-        default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+        default_policy: false,
+        late_refuse: false,
     }
 }
 

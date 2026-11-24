@@ -2450,7 +2450,6 @@ fn a_fire_then_a_guest_pass_is_timed() {
 #[test]
 fn a_sampler_registers_on_a_served_model() {
     use crate::common_llm::{Model, set_knob};
-    use engine::Engine as _;
     if std::env::var_os("PIE_XLA_GUEST_BENCH").is_none() {
         return;
     }
@@ -2471,9 +2470,7 @@ fn a_sampler_registers_on_a_served_model() {
     let (container, _) = carrying(model.vocab);
     let plan = plan_of(container, model.vocab);
     let t = std::time::Instant::now();
-    model
-        .engine
-        .register_program(&engine::program::ProgramRegistration {
+    engine::Programs::register(&mut model.engine, &engine::program::ProgramRegistration {
             launch: plan.package.clone(),
             ..Default::default()
         })

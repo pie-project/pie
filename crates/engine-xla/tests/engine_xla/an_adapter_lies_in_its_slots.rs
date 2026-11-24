@@ -77,9 +77,7 @@ fn register(model: &mut Model, layers: u32, rank: u32, hidden: u32) -> ProgramId
     .expect("the program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
-    model
-        .engine
-        .register_program(&ProgramRegistration {
+    engine::Programs::register(&mut model.engine, &ProgramRegistration {
             launch,
             ..Default::default()
         })
@@ -142,9 +140,7 @@ impl Rig {
             .map(|shape| {
                 let id = ChannelId(u64::from(self.next_channel));
                 self.next_channel += 1;
-                self.model
-                    .engine
-                    .register_channel(&ChannelRegistration {
+                engine::Channels::open(&mut self.model.engine, &ChannelRegistration {
                         id,
                         shape,
                         dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -159,9 +155,7 @@ impl Rig {
                 id
             })
             .collect();
-        self.model
-            .engine
-            .bind_instance(&InstanceBinding {
+        engine::Programs::bind(&mut self.model.engine, &InstanceBinding {
                 program: self.program,
                 channels,
                 seeds,
@@ -240,9 +234,7 @@ fn an_adapter_lies_in_its_slots() {
     let (rank, hidden) = (lora_a[0].rows as u32, lora_a[0].cols as u32);
     assert!(layers > 0, "the model text corrects through LoRA banks");
     let program = register(&mut model, layers, rank, hidden);
-    let facts = model
-        .engine
-        .program_facts(program)
+    let facts = engine::Programs::facts(&model.engine, program)
         .expect("the program states its facts");
     assert_eq!(
         facts.adapter.slots,
@@ -311,9 +303,7 @@ fn an_adapter_lies_in_its_slots() {
     );
     let device = rig.model.loaded.caps.device.domain;
     let host: Vec<u32> = (0..want.len() as u32).collect();
-    rig.model
-        .engine
-        .copy_slots(&SlotCopy {
+    engine::Tiers::copy(&mut rig.model.engine, &SlotCopy {
             shape: ADAPTER,
             src: device,
             dst: MemoryDomain::HostPinned,
@@ -325,10 +315,7 @@ fn an_adapter_lies_in_its_slots() {
             runs: Vec::new(),
         })
         .expect("the slots park");
-    let back = rig
-        .model
-        .engine
-        .read_tier_slots(&[(ADAPTER, host)])
+    let back = engine::Tiers::read(&mut rig.model.engine, &[(ADAPTER, host)])
         .expect("the host slots read");
     let slot = back.len() / want.len();
     for (at, (bank, bytes)) in want.iter().enumerate() {
@@ -374,9 +361,7 @@ fn an_adapter_lies_in_its_slots() {
     // The adapter's slots move and both holders are rebound there.
     let moved = rig.slots();
     let device = rig.model.loaded.caps.device.domain;
-    rig.model
-        .engine
-        .copy_slots(&SlotCopy {
+    engine::Tiers::copy(&mut rig.model.engine, &SlotCopy {
             shape: ADAPTER,
             src: device,
             dst: device,
@@ -388,9 +373,7 @@ fn an_adapter_lies_in_its_slots() {
             runs: Vec::new(),
         })
         .expect("the adapter's slots move");
-    rig.model
-        .engine
-        .copy_slots(&SlotCopy {
+    engine::Tiers::copy(&mut rig.model.engine, &SlotCopy {
             shape: ADAPTER,
             src: device,
             dst: device,
@@ -403,9 +386,7 @@ fn an_adapter_lies_in_its_slots() {
         })
         .expect("the old slots are overwritten");
     for holder in [one, joined] {
-        rig.model
-            .engine
-            .rebind_slots(Rebind::Instance {
+        engine::Programs::rebind(&mut rig.model.engine, Rebind::Instance {
                 id: holder,
                 instance: Vec::new(),
                 rings: Vec::new(),
@@ -422,10 +403,7 @@ fn an_adapter_lies_in_its_slots() {
         "after the move its lanes read the planes where they lie now"
     );
 
-    let refused = rig
-        .model
-        .engine
-        .register_adapter(&engine::adapter::AdapterRegistration {
+    let refused = engine::Programs::adapter(&mut rig.model.engine, &engine::adapter::AdapterRegistration {
             id: 0,
             planes: Vec::new(),
         })

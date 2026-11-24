@@ -177,22 +177,15 @@ static CURRENT: RwLock<Option<Table>> = RwLock::new(None);
 static REVISION: AtomicU64 = AtomicU64::new(0);
 
 /// The tiers column's own default: every tier the worker has.
-#[cfg(not(test))]
 const fn own_tiers() -> u8 {
     ALL_TIERS
 }
 
-/// Under test, `PIE_TEST_POLICY=default-like` stands in for the shipped
-/// default policy's retention (`tiers = [device]` on idle cache, which keeps
-/// today's drop), so the planner's suites run under it as well as under no
-/// policy at all.
-#[cfg(test)]
-fn own_tiers() -> u8 {
-    static OWN: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *OWN.get_or_init(|| match std::env::var("PIE_TEST_POLICY").as_deref() {
-        Ok("default-like") => DEVICE,
-        _ => ALL_TIERS,
-    })
+/// Forgets the policy's table, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    IDLE_CACHE_NEW.store(false, std::sync::atomic::Ordering::Release);
+    *CURRENT.write() = None;
+    REVISION.fetch_add(1, Ordering::AcqRel);
 }
 
 #[cfg(test)]
@@ -341,6 +334,24 @@ mod tests {
             None,
         )));
         assert_eq!(Installed.key_at(Some(owner), 10), 0, "past every entry");
+        install(None);
+    }
+
+    /// A table whose tiers default is the device alone (the shipped
+    /// default policy's idle cache) holds every owner no row names there.
+    #[test]
+    fn a_device_only_tiers_default_holds_unnamed_owners_on_the_device() {
+        let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();
+        let (named, unnamed) = (ProcessId::from_u128(0xd1), ProcessId::from_u128(0xd2));
+        install(None);
+        assert_eq!(Installed.tiers_at(Some(unnamed), 0), ALL_TIERS, "no policy: every tier");
+        install(Some(
+            Table::new(HashMap::new(), None)
+                .with_tiers(HashMap::from([(named, vec![(None, ALL_TIERS)])]), Some(DEVICE)),
+        ));
+        assert_eq!(Installed.tiers_at(Some(unnamed), 0), DEVICE);
+        assert_eq!(Installed.tiers_at(None, 0), DEVICE);
+        assert_eq!(Installed.tiers_at(Some(named), 0), ALL_TIERS, "its row");
         install(None);
     }
 

@@ -13,7 +13,7 @@ pub(crate) use residency::ProcessResidency;
 use crate::rt::Instant;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::rt::JoinHandle;
@@ -26,6 +26,7 @@ type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>
 use crate::policy::{Arrival, By, Outcome};
 use crate::server::{self, ClientId};
 use crate::service::{ServiceHandler, ServiceMap};
+use crate::slot::Slot;
 
 use self::ordered::{OrderedPermit, OrderedSemaphore};
 use super::linker;
@@ -110,10 +111,10 @@ pub type ProcessId = Uuid;
 
 static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(ServiceMap::new);
 
-static ADMISSION: OnceLock<Option<Arc<OrderedSemaphore>>> = OnceLock::new();
-static BIND_ADMISSION: OnceLock<Option<Arc<OrderedSemaphore>>> = OnceLock::new();
-static PREWARM_ADMISSION: OnceLock<Option<Arc<OrderedSemaphore>>> = OnceLock::new();
-static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
+static ADMISSION: Slot<Option<Arc<OrderedSemaphore>>> = Slot::new();
+static BIND_ADMISSION: Slot<Option<Arc<OrderedSemaphore>>> = Slot::new();
+static PREWARM_ADMISSION: Slot<Option<Arc<OrderedSemaphore>>> = Slot::new();
+static EXECUTION_SLOT_CAPACITY: Slot<Option<usize>> = Slot::new();
 /// A process's bind permit, then its execution seat; a process the schedule
 /// pauses gives both back.
 #[derive(Default)]
@@ -135,8 +136,7 @@ fn seats_held() -> std::sync::MutexGuard<'static, HashMap<ProcessId, Seat>> {
 }
 
 pub(crate) fn seats_capped() -> bool {
-    ADMISSION.get().is_some_and(Option::is_some)
-        || BIND_ADMISSION.get().is_some_and(Option::is_some)
+    ADMISSION.get().flatten().is_some() || BIND_ADMISSION.get().flatten().is_some()
 }
 
 fn take_permits(pid: ProcessId) -> Option<Seat> {
@@ -155,11 +155,11 @@ pub(crate) fn vacate_seat(pid: ProcessId) -> bool {
 
 pub(crate) async fn take_seat(pid: ProcessId) -> Seat {
     let mut seat = Seat::default();
-    if let Some(semaphore) = BIND_ADMISSION.get().and_then(Option::as_ref) {
-        seat.bind = Some(Arc::clone(semaphore).acquire_owned(pid).await);
+    if let Some(semaphore) = BIND_ADMISSION.get().flatten() {
+        seat.bind = Some(semaphore.acquire_owned(pid).await);
     }
-    if let Some(semaphore) = ADMISSION.get().and_then(Option::as_ref) {
-        seat.exec = Some(Arc::clone(semaphore).acquire_owned(pid).await);
+    if let Some(semaphore) = ADMISSION.get().flatten() {
+        seat.exec = Some(semaphore.acquire_owned(pid).await);
     }
     seat
 }
@@ -174,7 +174,7 @@ pub(crate) fn reseat(pid: ProcessId, seat: Seat) {
 }
 
 pub(crate) fn execution_slot_capacity() -> Option<usize> {
-    EXECUTION_SLOT_CAPACITY.get().copied().flatten()
+    EXECUTION_SLOT_CAPACITY.get().flatten()
 }
 
 /// How long a process waits at one step of a fire's path before it says
@@ -367,10 +367,7 @@ pub fn live_count() -> usize {
 
 pub fn seats() -> (usize, usize) {
     let live = live_count();
-    let running = match (
-        ADMISSION.get().and_then(Option::as_ref),
-        execution_slot_capacity(),
-    ) {
+    let running = match (ADMISSION.get().flatten(), execution_slot_capacity()) {
         (Some(semaphore), Some(capacity)) => capacity.saturating_sub(semaphore.available_permits()),
         _ => live,
     }
@@ -454,8 +451,8 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
     // Passed in this order: none passes a gate ahead of a higher key
     // waiting at an earlier one. Only the first gate, prewarm, holds below
-    // the floor. With no count stated it counts nothing: what a newcomer may
-    // take is the capacity gate's, read at each gate ([`wait_for_room`]).
+    // the floor. With no count stated it counts nothing: over-demand is the
+    // planner's contention to settle.
     let prewarm = Some(OrderedSemaphore::new("prewarm", limit.unwrap_or(usize::MAX / 2), true));
     const STAGED_COHORTS: usize = 1;
     let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
@@ -477,18 +474,22 @@ pub fn init_admission(max_concurrent: Option<usize>) {
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
         Relaxed,
     );
-    EXECUTION_SLOT_CAPACITY
-        .set(limit)
-        .expect("execution slot capacity already initialized");
-    ADMISSION
-        .set(sem)
-        .expect("admission controller already initialized");
-    BIND_ADMISSION
-        .set(bind_ahead)
-        .expect("bind admission controller already initialized");
-    PREWARM_ADMISSION
-        .set(prewarm)
-        .expect("prewarm admission controller already initialized");
+    assert!(
+        EXECUTION_SLOT_CAPACITY.set(limit).is_ok(),
+        "execution slot capacity already initialized"
+    );
+    assert!(
+        ADMISSION.set(sem).is_ok(),
+        "admission controller already initialized"
+    );
+    assert!(
+        BIND_ADMISSION.set(bind_ahead).is_ok(),
+        "bind admission controller already initialized"
+    );
+    assert!(
+        PREWARM_ADMISSION.set(prewarm).is_ok(),
+        "prewarm admission controller already initialized"
+    );
 }
 
 struct AdmissionQueued(ProcessId);
@@ -550,10 +551,7 @@ pub(crate) fn set_bind_release_hold(hold: bool) {
     drop(drained);
 }
 
-#[cfg_attr(
-    target_arch = "wasm32",
-    allow(dead_code, reason = "no policy runs in the browser")
-)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "no policy runs in the browser"))]
 pub(crate) fn regrant_admission() {
     for gate in [&PREWARM_ADMISSION, &BIND_ADMISSION, &ADMISSION] {
         if let Some(Some(semaphore)) = gate.get() {
@@ -562,23 +560,49 @@ pub(crate) fn regrant_admission() {
     }
 }
 
-/// Holds a newcomer before a gate while the capacity gate's last place has
-/// no room for any first ask ([`crate::planner::ResidencyPlanner::admits`]):
-/// it waits there holding nothing it took for that ask, and the read that
-/// raises the room wakes it.
-async fn wait_for_room(pid: ProcessId) {
-    if let Some(planner) = crate::planner::planner_of(pid) {
-        planner.admitted_to_ask(pid).await;
+/// Forgets the boot's gates, seats and processes, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    BIND_RELEASE_HOLD.store(false, Relaxed);
+    HELD_BIND_PERMITS
+        .lock()
+        .expect("held bind permits lock poisoned")
+        .clear();
+    seats_held().clear();
+    for gate in [&PREWARM_ADMISSION, &BIND_ADMISSION, &ADMISSION] {
+        gate.clear();
     }
+    EXECUTION_SLOT_CAPACITY.clear();
+    BIND_STAGED_RESERVE.store(0, Relaxed);
+    SERVICES.clear();
+    RESTARTABLE.write().unwrap().clear();
+    RESTART_REQUESTED.write().unwrap().clear();
+    RESTART_ALIAS.write().unwrap().clear();
+    RESTART_TOTAL.store(0, Relaxed);
+    PARKED.lock().unwrap().clear();
+    for count in [
+        &PROCESS_COMPLETED,
+        &PROCESS_ADMISSION_WAIT_US,
+        &PROCESS_INSTANTIATE_US,
+        &PROCESS_CONTEXT_REGISTER_US,
+        &PROCESS_WASM_RUN_US,
+        &PROCESS_LAST_ADMISSION_WAIT_US,
+        &PROCESS_LAST_INSTANTIATE_US,
+        &PROCESS_LAST_CONTEXT_REGISTER_US,
+        &PROCESS_LAST_WASM_RUN_US,
+    ] {
+        count.store(0, Relaxed);
+    }
+    crate::inferlet::host::frames::reset();
+    residency::reset();
 }
 
 pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
     }
-    wait_for_room(ctx.id()).await;
-    let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
-        Some(semaphore) => Some(Arc::clone(semaphore).acquire_owned(ctx.id()).await),
+    let permit = match BIND_ADMISSION.get().flatten() {
+        Some(semaphore) => Some(semaphore.acquire_owned(ctx.id()).await),
         None => None,
     };
     ctx.release_prewarm_permit();
@@ -594,11 +618,10 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         return;
     }
     let started = Instant::now();
-    wait_for_room(ctx.id()).await;
-    let seated = match ADMISSION.get().and_then(|value| value.as_ref()) {
+    let seated = match ADMISSION.get().flatten() {
         Some(semaphore) => {
             let _queued = AdmissionQueued::enter(ctx.id());
-            let permit = Arc::clone(semaphore).acquire_owned(ctx.id()).await;
+            let permit = Arc::clone(&semaphore).acquire_owned(ctx.id()).await;
             if semaphore.available_permits() == 0 {
                 open_staged_bind_pool();
             }
@@ -706,6 +729,7 @@ fn spawn_inner(
     executors: Vec<String>,
     watch_departure: bool,
 ) -> Result<(ProcessId, Option<crate::planner::DepartureWatch>)> {
+    let _weights = crate::model::reload::launching()?;
     let id = Uuid::new_v4();
     // Before anything is held under the id, so no departure is missed.
     let watch = watch_departure.then(|| crate::planner::DepartureWatch::new(id));
@@ -1046,9 +1070,8 @@ impl Process {
         if let Some(planner) = crate::planner::planner_of(process_id) {
             planner.admit(process_id).await;
         }
-        wait_for_room(process_id).await;
-        let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
-            Some(sem) => Some(Arc::clone(sem).acquire_owned(process_id).await),
+        let prewarm_permit = match PREWARM_ADMISSION.get().flatten() {
+            Some(sem) => Some(sem.acquire_owned(process_id).await),
             None => None,
         };
         let mut admission_wait_us = 0u64;
@@ -1115,7 +1138,16 @@ impl Process {
                 }
                 Err(call_err) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
-                    Err(trapped(&call_err, store.data().stderr_said()))
+                    let text = trapped(&call_err, store.data().stderr_said());
+                    // A planner error in the trap's chain leads the text
+                    // with its code, found by type.
+                    Err(match call_err
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<crate::planner::PlannerError>())
+                    {
+                        Some(error) => error.lead(text),
+                        None => text,
+                    })
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
@@ -1128,6 +1160,9 @@ impl Process {
             result
         }
         .await;
+        // However the guest or the pipeline wrapped it, a failure the
+        // planner coded leads with its code.
+        let result = result.map_err(|text| crate::planner::lead_result(process_id, text));
         record_process_timing(
             admission_wait_us,
             instantiate_us,

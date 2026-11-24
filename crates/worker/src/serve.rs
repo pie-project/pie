@@ -55,7 +55,7 @@ pub struct RuntimeHandle {
 enum ClusterControl {
     None,
     Distributed {
-        _client: control::Controller,
+        _client: controller_api::ControllerLink,
         worker_id: WorkerId,
     },
     Embedded {
@@ -292,7 +292,7 @@ async fn assemble_control_and_edge(
             controller,
             gateways,
         } => {
-            let client = control::Controller::dial(&controller)
+            let client = controller_api::ControllerLink::dial(&controller)
                 .await
                 .with_context(|| format!("dialing controller at {controller}"))?;
             let (edge, control_tasks, worker_id) = assemble_distributed(

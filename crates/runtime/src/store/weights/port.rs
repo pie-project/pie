@@ -78,7 +78,7 @@ impl EnginePort {
 
     /// Reads an answer [`Self::take_queued`] handed out: the bytes the
     /// engine holds back of the chunks it stated, now that it took the set
-    /// (`Engine::weight_residency`); `None` from an engine that does not
+    /// (`WeightCache::set_residency`); `None` from an engine that does not
     /// stream.
     ///
     /// # Errors

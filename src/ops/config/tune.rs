@@ -349,7 +349,7 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
         worker::standalone::derive_standalone(&content, Some(&cfg_path))?;
     let baseline = Knobs {
         frame_size: worker.runtime.frame_size as usize,
-        dispatch_depth: worker.runtime.frame_dispatch_depth as usize,
+        dispatch_depth: worker.runtime.dispatch_depth(0) as usize,
     };
     let (plan, skipped) = plan(baseline, args.budget);
     let workload = args.workload(objective);
@@ -390,7 +390,7 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
             .collect();
         let mut worker = worker.clone();
         worker.runtime.frame_dispatch_depth =
-            u32::try_from(depth).context("a dispatch depth past a u32")?;
+            Some(u32::try_from(depth).context("a dispatch depth past a u32")?);
         // the load's frame size is the largest this depth tries: its window
         // is laid for it, and the smaller ones sweep within the load
         let largest = at_depth

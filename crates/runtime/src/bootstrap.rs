@@ -1,4 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 use anyhow::{Result, ensure};
 
@@ -63,22 +62,20 @@ impl RuntimeShutdown {
             let map = planner.map_census();
             let edge = planner.edge_census();
             let stuck = planner.stuck_census();
-            println!(
-                "[planner-census] at shutdown: passes={} pass_ms={} pass_mean_us={} \
-                 map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
-                 stuck_settles={} forced_passes={} oldest_wait_ms={} refusal_repeats={}",
-                pass.0,
-                pass.1 / 1000,
-                pass.2,
-                map.0,
-                map.1 / 1000,
-                map.2,
-                edge.0,
-                edge.1,
-                stuck.0,
-                stuck.1,
-                stuck.2,
-                planner.refusal_repeats(),
+            tracing::info!(
+                passes = pass.0,
+                pass_ms = pass.1 / 1000,
+                pass_mean_us = pass.2,
+                map_passes = map.0,
+                map_pass_ms = map.1 / 1000,
+                quiet_waits = map.2,
+                skipped_wakes = edge.0,
+                map_cache_hits = edge.1,
+                stuck_settles = stuck.0,
+                forced_passes = stuck.1,
+                oldest_wait_ms = stuck.2,
+                refusal_repeats = planner.refusal_repeats(),
+                "planner census at shutdown"
             );
         }
         let scheduler_result = self.scheduler.shutdown().await;
@@ -87,6 +84,27 @@ impl RuntimeShutdown {
         }
         scheduler_result
     }
+}
+
+/// Clears what a boot set process-wide, and frees bootstrap for the next
+/// boot in this process, which may serve another model. Call it once the
+/// boot's [`BootstrapHandle::shutdown`] returned and the tokio runtime it
+/// ran on is dropped, so no task of the boot is left to see the state go.
+pub fn reset() {
+    server::reset();
+    process::reset();
+    linker::stop();
+    program::stop();
+    crate::policy::reset();
+    crate::pipeline::reset();
+    crate::offload::reset();
+    crate::handle::snapshot::reset();
+    crate::scheduler::reset();
+    crate::planner::reset();
+    crate::store::reset();
+    model::reset();
+    engine::backend::reset();
+    RUNTIME_ACTIVE.store(false, Ordering::Release);
 }
 
 pub struct Config {
@@ -140,6 +158,7 @@ pub struct RuntimeConfig {
     /// Whether a client may install its own programs; without, the
     /// system's alone run.
     pub allow_upload: bool,
+    pub allow_weight_reload: bool,
     /// Where the `<language>.wasm` language components live.
     pub languages_dir: PathBuf,
     /// Where wasmtime caches compiled code across boots; `None` compiles
@@ -160,14 +179,16 @@ pub struct ModelConfig {
     pub metadata: ModelMetadata,
     pub engines: Vec<EngineConfig>,
     pub scheduler: SchedulerConfig,
+    /// The CUDA device a media encode (NVENC) runs on: the engine's own.
+    pub media_device: u32,
 }
 
 pub struct EngineConfig {
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
-    /// The model's window (`PoolFacts::window_tokens`). The window-list
-    /// path: removed by the windowed-state change.
+    /// The model's window (`PoolFacts::window_tokens`): the window-list
+    /// path's.
     pub window_tokens: u32,
     /// The engine serves windowed layers as ring + buffer
     /// (`Capabilities::windowed_state`, CONTRACT-BC 19, 21).
@@ -257,9 +278,6 @@ fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
     Ok(budget)
 }
 
-/// The admission cap: `cap`, held to the `seats` a seated-first kv pool
-/// seats where the model holds no recurrent state (whose processes its
-/// planner admits against the state pool instead).
 /// The frames the model's engines keep in flight
 /// ([`::engine::Capabilities::frames_in_flight`]): one number, so engines
 /// stating different ones are refused by name.
@@ -321,7 +339,17 @@ impl BootstrapHandle {
 /// its engines load: what the sandbox pool leaves the rest of the process
 /// to grow by. Call
 /// it before the engines load; [`bootstrap`] comes after them.
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 pub use crate::sandbox_pool::note_maps_before_engines;
+/// No sandbox pool sizes itself by the process's maps on this target.
+#[cfg(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+))]
+pub fn note_maps_before_engines() {}
 
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
     bootstrap_inner(config).await
@@ -372,7 +400,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         rx
     };
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
-    server::init(max_upload_bytes, config.runtime.allow_upload);
+    server::init(
+        max_upload_bytes,
+        config.runtime.allow_upload,
+        config.runtime.allow_weight_reload,
+    );
     let bound_port = config.port;
 
     let ModelConfig {
@@ -384,7 +416,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         metadata,
         engines: mut engine_configs,
         scheduler,
+        media_device,
     } = config.model;
+    crate::inferlet::host::frames::set_media_device(media_device);
 
     // The library forms programs are planned with: what every engine served
     // here states (`pipeline::program::serve_forms`), before any program
@@ -615,9 +649,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         let backend =
             crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
         let registrations = crate::pipeline::standard::registrations(backend.as_deref(), rows)?;
-        engine
-            .engine_backend
-            .prewarm_programs(&registrations)
+        let Some(programs) = engine.engine_backend.programs() else {
+            continue;
+        };
+        programs
+            .prewarm(&registrations)
             .map_err(|error| {
                 anyhow::anyhow!("engine {at}: the standard samplers' guest code: {error}")
             })?;
@@ -639,8 +675,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         engine_configs.iter().map(|d| d.chunks.clone()).collect();
     let arena_disk_kept: Vec<Option<KeptDisk>> =
         engine_configs.iter().map(|d| d.disk_kept.clone()).collect();
-    // Each engine's pools as chunks: what it states, else today's pools as
-    // the degenerate mode's pinned shapes.
+    // Each engine's pools as chunks: the shared pool it states.
     let arena_stores = engine_configs
         .iter()
         .zip(&readouts)
@@ -648,8 +683,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
             // A window the engine holds no pages for is still a window (the
-            // window-list path: removed by the windowed-state change; a
-            // ring + buffer load holds no window list).
+            // window-list path; a ring + buffer load holds no window list).
             if pools.window_tokens == 0 && !rs_caps.window_state {
                 pools.window_tokens = d.window_tokens;
             }
@@ -706,14 +740,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect::<Result<Vec<_>>>()?;
     // Test builds: a slot the shared pool gives back is poisoned by its
-    // engine before the engine's next verb (`Engine::poison_queue`), so a
+    // engine before the engine's next verb (`Pool::poison_queue`), so a
     // fire that reads a cell its owner never wrote reads NaN.
     #[cfg(feature = "test-slot-fill")]
     for (engine, stores) in engine_configs.iter_mut().zip(&arena_stores) {
         if let Some(shared) = &stores.shared {
             let queue = ::engine::chunk::PoisonQueue::default();
             shared.lock().unwrap().pool_mut().poison_into(queue.clone());
-            engine.engine_backend.poison_queue(queue);
+            if let Some(pool) = engine.engine_backend.pool() {
+                pool.poison_queue(queue);
+            }
         }
     }
     // A shared pool's tiers are its host chunks and disk slots; today's
@@ -1671,6 +1707,7 @@ fn init_tracing(
 /// gateway heartbeat. A filter that names either target keeps its own say,
 /// and one whose base level is already as quiet gets nothing added: a quiet
 /// target is never made louder than the operator's level.
+#[cfg(not(target_arch = "wasm32"))]
 const QUIET: [(&str, tracing_subscriber::filter::LevelFilter); 2] = [
     ("naga", tracing_subscriber::filter::LevelFilter::WARN),
     ("tarpc", tracing_subscriber::filter::LevelFilter::INFO),
@@ -1690,6 +1727,7 @@ pub fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
 /// the last directive with no target (`off` where there is none, as an
 /// `EnvFilter` reads it); a directive's target is what precedes its `[`
 /// span or its `=`.
+#[cfg(not(target_arch = "wasm32"))]
 fn quieted(filter: &str) -> String {
     use tracing_subscriber::filter::LevelFilter;
 
@@ -1828,23 +1866,12 @@ mod tests {
         )
     }
 
-    /// A pool that lays a state shape for a dense model (records of some
-    /// size beside its kv) still says the model holds no state: its RsCaps
-    /// state nothing (no rs working set, no rs count a fire is held to). A
-    /// hybrid's record bytes are its RsCaps' state size, a record's and not
-    /// a slot's.
+    /// A load whose records take no bytes says the model holds no state:
+    /// its RsCaps state nothing (no rs working set, no rs count a fire is
+    /// held to). A hybrid's record bytes are its RsCaps' state size.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
-        let mut facts =
-            ::engine::chunk::ChunkFacts::degenerate(&::engine::chunk::DegeneratePools {
-                kv_pages: 8,
-                kv_page_size: 16,
-                kv_page_bytes: 4096,
-                state_slots: 4,
-                state_slot_bytes: 1 << 20,
-                ..::engine::chunk::DegeneratePools::default()
-            });
-        facts.record_bytes = 0;
+        let mut facts = ::engine::chunk::ChunkFacts::default();
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");
 

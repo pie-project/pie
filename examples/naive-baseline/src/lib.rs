@@ -116,7 +116,6 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    // The runtime cuts every program's prompt at the same rows (`PIE_FIRE_ROWS` pins them).
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pipe = Pipeline::new();
 

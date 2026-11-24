@@ -102,14 +102,10 @@ fn register(nonce: u32) -> u64 {
     let live = model.engine.live();
     let before = live.tallied(Tally::BuiltAtRegister);
     let cold = registration(&model, nonce);
-    let compile = model
-        .engine
-        .prepare_program(&cold)
+    let compile = engine::Programs::prepare(&mut model.engine, &cold)
         .expect("the program prepares");
     let prepared = compile();
-    model
-        .engine
-        .finish_program(prepared)
+    engine::Programs::finish(&mut model.engine, prepared)
         .expect("the program registers");
     for other in [Tally::Compiled, Tally::BuiltInFire] {
         assert_eq!(

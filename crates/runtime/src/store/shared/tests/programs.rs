@@ -1204,7 +1204,7 @@ fn on_demand_at(rung: u32) -> (SharedPool, FakeEngine) {
     (pool, engine)
 }
 
-/// Every `Engine::set_rung(from, to)` `engine` was sent.
+/// Every `Pool::set_rung(from, to)` `engine` was sent.
 fn notices(engine: &FakeEngine) -> Vec<(u32, u32)> {
     engine
         .calls
@@ -1225,7 +1225,7 @@ impl Funder for Grants {
     }
 }
 
-/// `Engine::set_rung(from, to)` is sent only where the rung the engine
+/// `Pool::set_rung(from, to)` is sent only where the rung the engine
 /// holds differs. Each of 64 binds at a standing rung grows the guest
 /// term (twice by a chunk); the room is set aside before the bind is sent,
 /// where the engine covers it inside the bind, with no notice, no trip
@@ -1552,7 +1552,7 @@ fn a_steady_one_row_decode_moves_no_rung_and_no_cap() {
     assert!(notices(&engine).is_empty());
 }
 
-/// Mac Pro's serving case (M3): a wave of 256 lanes over 14 pairs of
+/// A Metal serving case: a wave of 256 lanes over 14 pairs of
 /// 9 312 512 bytes a lane and 4 718 592 a fire wanted 1911 chunks at the
 /// 256 rung, of a span of 1758 (3.3 GB): Metal's `Pool::cover` refused it
 /// inside the bind. Held against the span the engine states, the 256 rung
@@ -1717,8 +1717,8 @@ const SET: u64 = 2 * CHUNK;
 
 /// An engine that keeps one set of tables standing a program, shared by
 /// every live instance of it (Metal's batch tables), and states the total
-/// as `Engine::standing_after`, `BoundInstance::standing_guest_bytes` and
-/// `Engine::close_instance` do.
+/// as `Programs::standing_after`, `BoundInstance::standing_guest_bytes` and
+/// `Programs::close` do.
 #[derive(Default)]
 struct SetEngine {
     /// The bytes of each program's set.
@@ -1756,51 +1756,12 @@ impl ::engine::Engine for SetEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "fake-sets"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: ::engine::LoadRequest) -> ::engine::Result<::engine::Loaded> {
@@ -1814,6 +1775,46 @@ impl ::engine::Engine for SetEngine {
         unreachable!("nothing fires here")
     }
 
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for SetEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "close_program"))
+    }
+
     fn standing_after(&self, binding: &::engine::InstanceBinding) -> ::engine::Result<u64> {
         Ok(self.total(
             self.live
@@ -1823,7 +1824,7 @@ impl ::engine::Engine for SetEngine {
         ))
     }
 
-    fn bind_instance(
+    fn bind(
         &mut self,
         binding: &::engine::InstanceBinding,
     ) -> ::engine::Result<::engine::BoundInstance> {
@@ -1839,11 +1840,72 @@ impl ::engine::Engine for SetEngine {
         })
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> ::engine::Result<u64> {
+    fn close(&mut self, id: InstanceId) -> ::engine::Result<u64> {
         self.live.remove(&id);
         Ok(self.total(self.live.values().copied()))
     }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_program"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_adapter"))
+    }
 }
+
+impl ::engine::Pool for SetEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for SetEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_kv"))
+    }
+}
+
 
 fn binding(program: ProgramId) -> ::engine::InstanceBinding {
     ::engine::InstanceBinding {
@@ -1862,14 +1924,11 @@ fn bind_through(
     engine: &mut SetEngine,
     program: ProgramId,
 ) -> Result<InstanceId, String> {
-    use ::engine::Engine as _;
-    let total = engine
-        .standing_after(&binding(program))
+    let total = <SetEngine as ::engine::Programs>::standing_after(&engine, &binding(program))
         .map_err(|error| error.to_string())?;
     let added = shared.lock().unwrap().standing_added(total);
     let open = ProgramOpen::new(shared, key(program), added)?;
-    let bound = engine
-        .bind_instance(&binding(program))
+    let bound = <SetEngine as ::engine::Programs>::bind(engine, &binding(program))
         .map_err(|error| error.to_string())?;
     {
         let mut pool = shared.lock().unwrap();
@@ -1883,8 +1942,7 @@ fn bind_through(
 /// A close as the lane books it: the engine's total after it, then the
 /// term built at the close's commit.
 fn close_through(shared: &Shared, engine: &mut SetEngine, id: InstanceId) {
-    use ::engine::Engine as _;
-    let total = engine.close_instance(id).unwrap();
+    let total = <SetEngine as ::engine::Programs>::close(engine, id).unwrap();
     {
         let mut pool = shared.lock().unwrap();
         pool.instance_closed(id);
@@ -1982,13 +2040,12 @@ fn the_span_backs_the_standing_total_and_the_fire_term_at_every_rung() {
 /// before the engine's bind is entered, the pool as it was.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_s_standing_bytes_are_backed_before_its_bind_and_a_total_past_the_span_is_refused() {
-    use ::engine::Engine as _;
     let (pool, fake) = pool_at_256();
     let shared: Shared = Arc::new(Mutex::new(pool));
     let mut engine = SetEngine::with(&[(PROGRAM, SET), (ProgramId(9), 63 * CHUNK)]);
 
     // Backed first: the span widens by the set while the bind is held.
-    let total = engine.standing_after(&binding(PROGRAM)).unwrap();
+    let total = <SetEngine as ::engine::Programs>::standing_after(&engine, &binding(PROGRAM)).unwrap();
     let added = shared.lock().unwrap().standing_added(total);
     assert_eq!(added, SET);
     let open = ProgramOpen::new(&shared, key(PROGRAM), added).unwrap();
@@ -2002,7 +2059,7 @@ async fn a_bind_s_standing_bytes_are_backed_before_its_bind_and_a_total_past_the
     .unwrap();
     assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4 + 2);
     assert_eq!(engine.binds, 0, "backed before the engine binds");
-    let bound = engine.bind_instance(&binding(PROGRAM)).unwrap();
+    let bound = <SetEngine as ::engine::Programs>::bind(&mut engine, &binding(PROGRAM)).unwrap();
     {
         let mut pool = shared.lock().unwrap();
         pool.instance_bound(bound.id, key(PROGRAM));

@@ -56,13 +56,19 @@ pub fn present() -> bool {
     wgpu::Instance::enabled_backend_features().contains(wgpu::Backends::BROWSER_WEBGPU)
 }
 
+/// The buffer bound where a binding has nothing: one binding's alignment.
 pub(crate) const DUMMY_BYTES: u64 = 256;
 
+/// One frame's dispatch uniforms: 4096 dispatches at the 256-byte
+/// uniform-offset alignment; a frame past it is refused by name.
 const UNIFORM_CHUNK: u64 = 1 << 20;
 
+/// The scratch chunk the ring keeps between frames: a fire's transient
+/// buffers in one, beside the pool, at most a reservation's bound.
 const SCRATCH_CHUNK: u64 = 8 << 20;
 
-const TIMING_QUERIES: u32 = 4096;
+/// The timestamps a frame's query set holds: the most wgpu allows a set.
+const TIMING_QUERIES: u32 = wgpu::QUERY_SET_MAX_QUERIES;
 
 const SPAN_AT: u64 = (TIMING_QUERIES as u64) * 8;
 
@@ -673,7 +679,7 @@ impl Context {
             let sink = Arc::clone(&last_error);
             device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
                 let text = error.to_string();
-                eprintln!("wgpu: {text}");
+                tracing::error!("wgpu: {text}");
                 *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }
@@ -805,7 +811,7 @@ impl Context {
     /// The workgroups the device holds at once, which what sizes a fire's
     /// work to the device reads: WebGPU reports no count of an adapter's
     /// compute units, so the load's rates step measures this
-    /// (`profile::fire::RESIDENT_WORKGROUPS`) and lays it here. `None`
+    /// (`profile::rates::RESIDENT_WORKGROUPS`) and lays it here. `None`
     /// before the load has.
     #[must_use]
     pub fn resident(&self) -> Option<u32> {

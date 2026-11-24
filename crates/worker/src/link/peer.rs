@@ -19,14 +19,11 @@ use tarpc::server::{BaseChannel, Channel};
 use worker_api::dispatch_codec;
 use worker_api::peer::{Hello, PEER_MAX_FRAME_BYTES, Pages, Peer, PeerClient, Prefill};
 
-/// A prefill may run long; the link waits this long for it.
-const PREFILL_DEADLINE: Duration = Duration::from_secs(300);
-
 /// What this worker says of itself. Its class is the engine and the
 /// deployment, which names the served variant; the page size rides in the
 /// format.
 pub fn hello(worker: WorkerId, engine: &str) -> Hello {
-    let identity = runtime::model::identity().cloned();
+    let identity = runtime::model::identity();
     let page_tokens = runtime::offload::prefill::page_tokens();
     Hello {
         worker,
@@ -359,8 +356,9 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
         let home = self.home.clone();
         let broken = self.broken.clone();
         Box::pin(async move {
-            let mut ctx = tarpc::context::current();
-            ctx.deadline = Instant::now() + PREFILL_DEADLINE;
+            // A prefill may wait on the peer's capacity: it fails only when
+            // the link goes.
+            let ctx = worker_api::until_link_lost();
             let t0 = Instant::now();
             let pages = client
                 .prefill(

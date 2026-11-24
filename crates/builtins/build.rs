@@ -1,8 +1,9 @@
 //!
 //! The inferlets are a separate cargo workspace (they target wasm), so this
 //! runs cargo for it, into that workspace's own target directory, on the
-//! toolchain that workspace's `rust-toolchain.toml` pins (nightly, for
-//! `wasm32-wasip3`); without it the build fails here with how to add it.
+//! toolchain the repository's `rust-toolchain.toml` pins, which carries
+//! `wasm32-wasip3`; without the target the build fails here with how to add
+//! it.
 //!
 //! `PIE_BUILTINS=skip` embeds nothing — for a host that cannot build wasm
 //! at all. A pie built that way answers 404 on every compat route and
@@ -216,8 +217,8 @@ fn find_builtins(workspace: &Path) -> Vec<Builtin> {
 }
 
 fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin], target: &str) {
-    // rustup's `cargo`, so the workspace's own rust-toolchain.toml (nightly,
-    // for wasm32-wasip3) applies, not the host build's toolchain.
+    // rustup's `cargo`, so the pinned toolchain applies rather than one a
+    // `cargo +toolchain` of the host build named.
     let mut command = Command::new("cargo");
     command.current_dir(workspace);
     command
@@ -253,7 +254,7 @@ fn build(workspace: &Path, target_dir: &Path, builtins: &[Builtin], target: &str
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let hint = if stderr.contains("target may not be installed") {
-            "\n\nthe wasm target is missing: `rustup toolchain install` in the workspace adds it"
+            "\n\nthe wasm target is missing: `rustup toolchain install` at the repository root adds it"
         } else {
             ""
         };

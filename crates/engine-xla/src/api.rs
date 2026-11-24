@@ -23,7 +23,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -33,7 +32,8 @@ use engine::fire::{
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, MemoryDomain};
+use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
+use engine::Engine;
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -441,7 +441,7 @@ impl Xla {
         let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, settles));
         tracing::debug!(frame = id.0, "xla submitted");
-        if !self.settles_asynchronously() {
+        if synchronous() {
             self.settle_frame(&mut ticket)?;
         }
         Ok(ticket)
@@ -617,7 +617,10 @@ impl Engine for Xla {
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "xla".to_string(),
-                domain: MemoryDomain::XlaDevice(boot.ordinal),
+                domain: MemoryDomain::Device {
+                    ordinal: boot.ordinal,
+                    reach: DeviceReach::Private,
+                },
                 sms: 1,
                 unified_memory: false,
                 fp8_native: shell.tpu().fp8_native(),
@@ -647,6 +650,7 @@ impl Engine for Xla {
                 .unwrap_or(u32::MAX),
                 // Each lane's rung bounds what it replays.
                 replayed_rows: 0,
+                dispatch_depth: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -744,10 +748,6 @@ impl Engine for Xla {
         self.refused(submitted)
     }
 
-    fn settles_asynchronously(&self) -> bool {
-        !synchronous()
-    }
-
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
         let Some((id, _)) = self.pending.as_ref() else {
             return Err(Error::Invalid(format!(
@@ -785,7 +785,64 @@ impl Engine for Xla {
         Ok(())
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+    /// XLA's readouts ([`engine::Engine::readout_facts`]): every output
+    /// lands in a ring laid at load (`Pools::lay_readouts`), inside the
+    /// bytes the load reserved, so no term beside the rungs; a sequence
+    /// readout's ring holds the lane rung's rows a fire, the store the
+    /// runtime cuts a fire's sequence lanes to. Float lanes' rows land in a
+    /// ring of the top row rung's rows and are not bounded here.
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(engine::ReadoutFacts {
+            landing: engine::ReadoutLanding::InSpan,
+            store_rows: self.shell.as_ref().and_then(Shell::readout_store_rows),
+        })
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn engine::Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn engine::Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn engine::Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn engine::WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl engine::Completion for Xla {
+    fn asynchronous(&self) -> bool {
+        !synchronous()
+    }
+
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+}
+
+impl engine::Programs for Xla {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let device = self.shell.as_ref().map(|shell| shell.device());
         let registered = self
             .programs
@@ -806,7 +863,7 @@ impl Engine for Xla {
     /// compile ledger (`guest::run`), so a cold boot is bounded by host
     /// memory, not run in turn. A program that does not lower or compile
     /// fails the load by name.
-    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+    fn prewarm(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
         let device = self
             .shell
             .as_ref()
@@ -859,7 +916,7 @@ impl Engine for Xla {
         Ok(())
     }
 
-    fn prepare_program(
+    fn prepare(
         &mut self,
         registration: &ProgramRegistration,
     ) -> EngineResult<engine::ProgramCompile> {
@@ -877,7 +934,7 @@ impl Engine for Xla {
 
     /// The stages a prepared program's compile made held, and the program
     /// registered (`Plane::finish`).
-    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
         let Ok(compiled) = prepared.0.downcast::<Compiled>() else {
             return Err(Error::Program(
                 "a prepared program XLA did not prepare".to_string(),
@@ -893,23 +950,10 @@ impl Engine for Xla {
         self.programs.close_program(program).map_err(refusal)
     }
 
-    /// XLA's readouts ([`engine::Engine::readout_facts`]): every output
-    /// lands in a ring laid at load (`Pools::lay_readouts`), inside the
-    /// bytes the load reserved, so no term beside the rungs; a sequence
-    /// readout's ring holds the lane rung's rows a fire, the store the
-    /// runtime cuts a fire's sequence lanes to. Float lanes' rows land in a
-    /// ring of the top row rung's rows and are not bounded here.
-    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
-        Ok(engine::ReadoutFacts {
-            landing: engine::ReadoutLanding::InSpan,
-            store_rows: self.shell.as_ref().and_then(Shell::readout_store_rows),
-        })
-    }
-
     /// The rings an instance keeps in the pool's `Channel` slots: its
     /// program's carried channels on the device; every other ring lives on
     /// the host. No `Instance` slots: the bind-time tables stay host-side.
-    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+    fn facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
         // The adapter its `lora` sink lands: one plane a bank row, an
         // `Adapter` slot each, taken once a content key and shared by
         // every holder.
@@ -957,35 +1001,6 @@ impl Engine for Xla {
                 (role.bank(), wire)
             }),
         )))
-    }
-
-    /// A registered channel an instance may carry or feed on the device
-    /// keeps its ring in the pool's `Channel` slots, the rows every instance
-    /// bound to it reads; one only the host reads or writes takes none.
-    /// Every registration: its ring on the host, mirrored where the host
-    /// reads or writes it.
-    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
-        let _ = registration;
-        true
-    }
-
-    fn ring_facts(
-        &self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<Option<engine::program::RingFacts>> {
-        if self.shell.is_none() {
-            return Ok(None);
-        }
-        Ok(crate::program::Plane::ring_facts(registration))
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        self.programs
-            .register_channel(registration)
-            .map_err(refusal)
     }
 
     /// What a fire holding lanes of `program` takes beside the model's own:
@@ -1037,7 +1052,7 @@ impl Engine for Xla {
     /// An instance's carried rings, or a registered channel's ring, moved to
     /// fresh `Channel` slots (a park and its return): the cells are read and
     /// written there from now on, by every instance bound to them.
-    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+    fn rebind(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
         match rebind {
             engine::program::Rebind::Instance {
                 id,
@@ -1087,7 +1102,7 @@ impl Engine for Xla {
         }
     }
 
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         let caps = self
             .caps
             .as_ref()
@@ -1185,7 +1200,7 @@ impl Engine for Xla {
         Ok(bound)
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
         if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
             shell.release_adapter(id, held);
         }
@@ -1201,28 +1216,13 @@ impl Engine for Xla {
 
     /// Refused: an adapter is an instance's, landed at its bind in the
     /// pool's `Adapter` slots, never one the operator seats by id.
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
         Err(Error::Invalid(format!(
             "adapter {} registered by id: an adapter lands at the bind of the program \
              instance that carries it, in the pool's Adapter slots, keyed by its \
              content; this engine seats none by id",
             registration.id
         )))
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.programs.close_channel(id).map_err(refusal)
-    }
-
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        self.programs
-            .publish(instance, channel, cell)
-            .map_err(refusal)
     }
 
     /// Beam `beam`'s page list as the group's last fire left it
@@ -1259,19 +1259,120 @@ impl Engine for Xla {
             .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             .collect())
     }
+}
 
-    fn take_channel(
+impl engine::Channels for Xla {
+    /// A registered channel an instance may carry or feed on the device
+    /// keeps its ring in the pool's `Channel` slots, the rows every instance
+    /// bound to it reads; one only the host reads or writes takes none.
+    /// Every registration: its ring on the host, mirrored where the host
+    /// reads or writes it.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        if self.shell.is_none() {
+            return Ok(None);
+        }
+        Ok(crate::program::Plane::ring_facts(registration))
+    }
+
+    fn open(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<RegisteredChannel> {
+        self.programs
+            .register_channel(registration)
+            .map_err(refusal)
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.programs.close_channel(id).map_err(refusal)
+    }
+
+    fn publish(
+        &mut self,
+        instance: InstanceId,
+        channel: u32,
+        cell: &[u8],
+    ) -> EngineResult<bool> {
+        self.programs
+            .publish(instance, channel, cell)
+            .map_err(refusal)
+    }
+
+    fn take(
         &mut self,
         instance: InstanceId,
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
         self.programs.take(instance, channel).map_err(refusal)
     }
+}
 
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
+impl engine::Pool for Xla {
+    /// The pool is fixed at load: one segment, committed whole.
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        if segments <= 1 {
+            return Ok(());
+        }
+        Err(Error::Invalid(format!(
+            "this pool is one segment fixed at load; {segments} cannot be committed"
+        )))
     }
 
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        if segments >= 1 {
+            return Ok(());
+        }
+        Err(Error::Invalid(
+            "this pool is one segment fixed at load and is never released".into(),
+        ))
+    }
+
+    /// Moves chunks within the fixed pool (the runtime does not ask it of a
+    /// `Growth::Fixed` pool; served for a defragmenting caller).
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let shell = self
+            .shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?;
+        Ok(shell.pools().chunk_table().clone())
+    }
+}
+
+impl engine::WeightCache for Xla {
+    /// Whole-slot copies on the device. HOST/DISK TIERS HOOK: a copy whose
+    /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
+    /// from sc/tier-shared's contract) lands here; until that contract is
+    /// merged only device-to-device copies are served.
+    fn set_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
+        // This engine holds back none of the chunks it states
+        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map(|()| 0)
+            .map_err(fault)
+    }
+
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        Ok(self.loaded_mut()?.weight_uses())
+    }
+}
+
+impl engine::Tiers for Xla {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let served = self
@@ -1302,47 +1403,14 @@ impl Engine for Xla {
         Ok(())
     }
 
-    /// The pool is fixed at load: one segment, committed whole.
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        if segments <= 1 {
-            return Ok(());
-        }
-        Err(Error::Invalid(format!(
-            "this pool is one segment fixed at load; {segments} cannot be committed"
-        )))
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        if segments >= 1 {
-            return Ok(());
-        }
-        Err(Error::Invalid(
-            "this pool is one segment fixed at load and is never released".into(),
-        ))
-    }
-
-    /// Moves chunks within the fixed pool (the runtime does not ask it of a
-    /// `Growth::Fixed` pool; served for a defragmenting caller).
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
-    }
-
-    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
-        let shell = self
-            .shell
-            .as_ref()
-            .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?;
-        Ok(shell.pools().chunk_table().clone())
-    }
-
-    fn read_tier_slots(
+    fn read(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
     ) -> EngineResult<Vec<u8>> {
         self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
     }
 
-    fn write_tier_slots(
+    fn write(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
@@ -1352,29 +1420,9 @@ impl Engine for Xla {
             .map_err(fault)
     }
 
-    /// Whole-slot copies on the device. HOST/DISK TIERS HOOK: a copy whose
-    /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
-    /// from sc/tier-shared's contract) lands here; until that contract is
-    /// merged only device-to-device copies are served.
-    fn weight_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
-        // This engine holds back none of the chunks it states
-        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
-        self.loaded_mut()?
-            .weight_residency(residency)
-            .map(|()| 0)
-            .map_err(fault)
-    }
-
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        Ok(self.loaded_mut()?.weight_uses())
-    }
-
     /// Its copies land inside the call (see [`Engine::copy_slots_landing`]):
     /// nothing to wait for.
-    fn settle_copies(&mut self) -> EngineResult<()> {
+    fn settle(&mut self) -> EngineResult<()> {
         Ok(())
     }
 
@@ -1382,16 +1430,16 @@ impl Engine for Xla {
     /// into host memory before it writes anywhere, and a move within the
     /// device runs as a pool program, ordered ahead of every program (a
     /// fire, a bind's seeds, a channel's cells) enqueued after it.
-    fn copy_slots_landing(
+    fn copy_landing(
         &mut self,
         copy: &engine::chunk::SlotCopy,
         _token: u64,
     ) -> EngineResult<bool> {
-        self.copy_slots(copy)?;
+        engine::Tiers::copy(self, copy)?;
         Ok(true)
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         let tier = |domain| match domain {
@@ -2427,7 +2475,7 @@ impl Xla {
                     for (b, &code) in words.iter().take(live as usize).enumerate() {
                         if code != 0 {
                             let lane = first + b as u32;
-                            hold.fault_lane(lane, instance, &crate::beam::fault_reason(code, lane));
+                            hold.fault_lane(lane, instance, &engine::beam::fault_reason(code, lane as usize, "engine-xla"));
                         }
                     }
                     // the group's common slot, after the lanes' faults (§11.3)

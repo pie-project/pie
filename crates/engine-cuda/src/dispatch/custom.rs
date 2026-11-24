@@ -6,10 +6,10 @@ use poem_ir::{NormAxis, NormWeight};
 use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
-/// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
-/// norms, a scaled embedding's chain, a DiT block's norm and modulation and
-/// a head's norm and the turn of its first dims run as generated regions
-/// here, a product's bias, soft cap and GEGLU and an attention prologue's
+/// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): a residual
+/// norm ahead of a scale or a post norm, a scaled embedding's chain, a DiT
+/// block's norm and modulation and a head's norm and the turn of its first
+/// dims run as generated regions here, a product's bias, soft cap and GEGLU and an attention prologue's
 /// turn and cache write as anchored ones (`fused.anchored`), their fused ops
 /// ROCm's and Metal's where any backend forms them.
 pub(crate) fn refuses(op: &Fused) -> bool {
@@ -22,7 +22,6 @@ pub(crate) fn refuses(op: &Fused) -> bool {
         | Fused::MatmulBias { .. }
         | Fused::MatmulSoftcap { .. }
         | Fused::MatmulGlu { .. }
-        | Fused::ResidualAddRmsnorm { .. }
         | Fused::ResidualAddRmsnormMatmul { .. }
         | Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. }
         | Fused::RmsnormResidualAdd { .. }
@@ -61,13 +60,19 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulBias { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulGlu { .. }
-            | Fused::ResidualAddRmsnorm { .. }
             | Fused::ResidualAddRmsnormMatmul { .. }
             | Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend { .. }
             | Fused::RopeYarnAppend { .. }
             | Fused::SplitRopeYarnAppend { .. } => unreachable!("`refuses` names it"),
+            Fused::ResidualAddRmsnorm { out, .. } => {
+                if self.lane_shaped(*out) {
+                    self.unseated(|| self.residual_rmsnorm(op))
+                } else {
+                    self.residual_rmsnorm(op)
+                }
+            }
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
             Fused::NormRopeLastAppend { .. } => self.norm_rope_last_append(op),
             Fused::PoolCompress { .. } => self.pool_compress(op),
@@ -355,6 +360,49 @@ impl Run<'_> {
         self.elemwise(project)?;
         self.elemwise(gates)?;
         self.elemwise(rmsnorm)
+    }
+
+    fn residual_rmsnorm(&self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::ResidualAddRmsnorm {
+            x,
+            y,
+            y_out,
+            weight,
+            plus_one,
+            eps,
+            out,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        if kernels_cuda::elemwise::norm::residual_rmsnorm(
+            self.ctx(),
+            self.tensor(*x),
+            &mut self.tensor(*y),
+            self.tensor(*weight),
+            *plus_one,
+            *eps,
+            &mut self.tensor(*out),
+        )? {
+            return Ok(());
+        }
+        self.elemwise(&poem_ir::Elemwise::ResidualAdd {
+            x: *x,
+            gate: None,
+            y: *y,
+            y_out: *y_out,
+        })?;
+        self.elemwise(&poem_ir::Elemwise::Rmsnorm {
+            x: *y_out,
+            weight: if *plus_one {
+                NormWeight::PlusOne(*weight)
+            } else {
+                NormWeight::Scale(*weight)
+            },
+            axis: NormAxis::Row,
+            eps: *eps,
+            y: *out,
+        })
     }
 
     /// AttnRes's blend and the norm of its row: in one pass where the

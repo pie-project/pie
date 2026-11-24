@@ -1,5 +1,5 @@
 //! The operating system's own memory-pressure reading, and the one rule
-//! every tier's target takes from it (user ruling, 2026-11-15):
+//! every tier's target takes from it:
 //!
 //! ```text
 //! target = floor + (ceiling - floor) * (1 - yield * pressure)

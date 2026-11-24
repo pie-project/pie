@@ -1,5 +1,4 @@
-//! Beam search's per-beam page lists (`state-geometry.parents`,
-//! `new-memory/designs/BEAM-PAGE-LISTS.md`).
+//! Beam search's per-beam page lists (`state-geometry.parents`).
 //!
 //! The beams share one working set: the prompt is folded into it, and the
 //! pages of its reserve past its frozen full ones are a pool each beam holds
@@ -32,7 +31,7 @@ pub struct BeamGroup {
 
 impl BeamGroup {
     /// Starts `beams` beams decoding `steps` fires from `folded` frozen
-    /// slots, the first writing slot `folded` (`BEAM-PAGE-LISTS.md` §3): `ws`
+    /// slots, the first writing slot `folded`: `ws`
     /// reserves what the first column needs (each beam's page, the pages a
     /// fire hands out, those freed in the frames in flight, and the prompt's
     /// own page where it ends mid-page); the runtime grows the reservation a
@@ -100,7 +99,7 @@ impl BeamGroup {
     /// the working set then holds that beam's hypothesis at slots
     /// `[folded, folded + fires)` in its own order, its recurrent rows too
     /// on a hybrid, and later passes bind it as any set; the other beams'
-    /// pages are let go (`BEAM-PAGE-LISTS.md` §6.6). On a hybrid its rows
+    /// pages are let go. On a hybrid its rows
     /// are folded into the state by an ordinary pass that folds them.
     pub fn finish(&self, pass: &ForwardPass, beam: u32, fires: u32) -> Result<(), String> {
         if beam >= self.beams {

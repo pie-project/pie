@@ -48,7 +48,7 @@ pub fn device_boot() -> DeviceBoot {
 
 /// `boot` for a load whose test fires the lanes and rows its budgets state
 /// straight at the engine, as no runtime does: the load lays its fires to
-/// those rows (`DeviceBoot::fires_stated`) in place of the ruling's fire
+/// those rows (`DeviceBoot::fires_stated`) in place of the fire-top rule's fire
 /// top, which for a model with no weight to read is its narrowest rung (one
 /// row, one lane), since every rung is then wholly efficient.
 pub fn fires_stated(boot: DeviceBoot) -> DeviceBoot {
@@ -577,7 +577,7 @@ pub fn tiers() -> &'static [kernels_slang::Tier] {
 /// Whether an output of `columns` lands: on WGSL every output pair is one
 /// bf16 word, so an odd count does not.
 pub fn lands(columns: usize) -> bool {
-    crate::backend::SPIRV || columns % 2 == 0
+    crate::backend::SPIRV || columns.is_multiple_of(2)
 }
 
 pub fn close(got: &[f32], want: &[f64], what: &str) {

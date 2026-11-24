@@ -14,6 +14,10 @@ fn full_demand(trace: &Trace) -> u64 {
 
 #[test]
 fn routed_experts_stream_every_case() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
     a_plan_opens_no_tier_at_all();
     a_plan_whose_cache_takes_the_banks_seats_no_expert();
     a_bank_the_cache_does_not_take_stays_whole_on_the_device();

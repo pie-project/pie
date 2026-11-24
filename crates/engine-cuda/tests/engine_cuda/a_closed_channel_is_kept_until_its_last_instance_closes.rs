@@ -1,13 +1,13 @@
 #![cfg(feature = "device")]
 
 //! A channel closed while an instance is still bound on it stays
-//! registered until that instance closes (`Engine::close_channel`): a
+//! registered until that instance closes (`Channels::close`): a
 //! process closes a channel while it is parked, with its instance still
 //! live, and the restore's rebind of the channel's ring must still be
 //! served, else the instance would read its ring where it no longer lies.
 
 use crate::common_two_axis::{Rig, WIDTH, Weights, assert_close, frame, trace};
-use engine::Engine;
+use engine::{Channels, Engine, Programs};
 use engine::chunk::SlotRole;
 use engine::fire::Attachment;
 use engine::program::Rebind;
@@ -115,7 +115,7 @@ fn a_closed_channel_is_kept_until_its_last_instance_closes() {
     // A channel no instance is bound on is released by its close.
     let alone = rig.channel(vec![ROWS, WIDTH], HostRole::None);
     assert!(rig.engine.has_channel(alone));
-    rig.engine.close_channel(alone).expect("the channel closes");
+    Channels::close(&mut rig.engine, alone).expect("the channel closes");
     assert!(
         !rig.engine.has_channel(alone),
         "a channel no instance is bound on is released at its close"
@@ -165,7 +165,7 @@ fn a_closed_channel_is_kept_until_its_last_instance_closes() {
     let old = endpoint.slots();
     assert!(!old.is_empty(), "a device-only ring lies in Channel slots");
     let (old_at, parked) = ring_bytes(&rig, &old, &endpoint);
-    rig.engine.close_channel(ring).expect("the channel closes");
+    Channels::close(&mut rig.engine, ring).expect("the channel closes");
     assert!(
         rig.engine.has_channel(ring),
         "a channel closed with its instance still bound stays registered"
@@ -187,7 +187,7 @@ fn a_closed_channel_is_kept_until_its_last_instance_closes() {
             .expect("the old slots are overwritten");
     }
     rig.engine
-        .rebind_slots(Rebind::Channel {
+        .rebind(Rebind::Channel {
             id: ring,
             slots: fresh.clone(),
         })
@@ -199,7 +199,7 @@ fn a_closed_channel_is_kept_until_its_last_instance_closes() {
     // No new instance binds on a closed channel.
     let refused = rig
         .engine
-        .bind_instance(&engine::program::InstanceBinding {
+        .bind(&engine::program::InstanceBinding {
             program,
             channels: vec![ring, timestep, position, landed],
             ..engine::program::InstanceBinding::default()
@@ -217,9 +217,7 @@ fn a_closed_channel_is_kept_until_its_last_instance_closes() {
     );
 
     // Its last instance's close releases the channel.
-    rig.engine
-        .close_instance(instance)
-        .expect("the instance closes");
+    Programs::close(&mut rig.engine, instance).expect("the instance closes");
     assert!(
         !rig.engine.has_channel(ring),
         "the last instance's close releases the closed channel"

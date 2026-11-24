@@ -95,8 +95,7 @@ fn fired(
     let fire = FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rows = case.rows;
     let stages = eta_compiler::plan::compile_bound(&case.bound);
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(engine, &ProgramRegistration {
             program_hash: 0xbea0_0000 + fire,
             launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
             ..Default::default()
@@ -158,8 +157,7 @@ fn fired(
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(engine, &binding)
         .expect("the instance binds")
         .id;
 
@@ -204,15 +202,13 @@ fn fired(
         case.readers
             .iter()
             .map(|&channel| {
-                engine
-                    .take_channel(instance, channel)
+                engine::Channels::take(engine, instance, channel)
                     .expect("the channel reads")
                     .expect("the channel holds a cell")
             })
             .collect()
     });
-    engine
-        .close_instance(instance)
+    engine::Programs::close(engine, instance)
         .expect("the instance closes");
     got
 }

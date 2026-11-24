@@ -1,5 +1,4 @@
-//! Beam groups' page lists (`state-geometry.parents`,
-//! `new-memory/designs/BEAM-PAGE-LISTS.md`): planned on the host from what
+//! Beam groups' page lists (`state-geometry.parents`): planned on the host from what
 //! the host knows (each group's working set's reserve and frozen slots, the
 //! slot its beams write, its lanes' staged tables), run on the device from
 //! the group's resident state and the parents its last epilogue wrote
@@ -70,7 +69,7 @@ pub struct GroupPlan {
 }
 
 /// The pool pages a group of `lanes` beams can name at the fire whose
-/// beams write `slot` (`BEAM-PAGE-LISTS.md` §3): the step hands out the
+/// beams write `slot`: the step hands out the
 /// lowest free pages, so every page named or pending lies below
 /// `B (c + 2) + B F + 1`. Only those are seated and staged.
 #[must_use]
@@ -97,7 +96,7 @@ pub struct ListPlan {
 }
 
 /// A beam's copy over the planes a page holds: the kv planes over its
-/// pool's kv pages, or on a hybrid the rs planes over its rs pages (§11).
+/// pool's kv pages, or on a hybrid the rs planes over its rs pages.
 #[derive(Clone, Copy, Debug)]
 pub struct CopyPlan {
     pub fault: u32,
@@ -114,7 +113,7 @@ pub struct CopyPlan {
 }
 
 /// Where a lane's rs rows lie (`channel::RsRows`): its entry of the fire's
-/// lane rows; a beam's (a hybrid's, `BEAM-PAGE-LISTS.md` §11.1) list's row of
+/// lane rows; a beam's (a hybrid's) list's row of
 /// its group's state before the step points it (the state's first list:
 /// valid memory; 0 for a lane alone on its set) and the list's columns, the group's first pool page `f0`
 /// and kv page, the buffer's first slot and its rows a page, and where the
@@ -133,7 +132,7 @@ pub struct RsRowsPlan {
     pub bases_len: u32,
 }
 
-/// A beam's rs copy (§6.4 on a hybrid): its group's copy, row by row of
+/// A beam's rs copy (a fork's rows on a hybrid): its group's copy, row by row of
 /// each rs plane through the set's rs entries (`copy_rs_rows`).
 #[derive(Clone, Copy, Debug)]
 pub struct RsCopyPlan {
@@ -186,7 +185,7 @@ pub struct PageWork {
     pub planes: Vec<PagePlane>,
     /// Per fault word, the lane it faults.
     pub faults: Vec<(usize, engine::InstanceId)>,
-    /// Each group's common slot word (its state's `header[3]`, §11.3) and its
+    /// Each group's common slot word (its state's `header[3]`) and its
     /// instance: read with the fault words when the fire lands.
     pub commons: Vec<(u64, engine::InstanceId)>,
 }
@@ -208,38 +207,6 @@ impl PageWork {
             ..PageWork::default()
         }
     }
-}
-
-/// Why a lane's fault word faults it (`BEAM-PAGE-LISTS.md` §7).
-#[must_use]
-pub fn fault_reason(code: u32, lane: usize) -> String {
-    use kernels_cuda::runtime::channel::{
-        PAGES_BELOW_FLOOR, PAGES_COPY_BOUNDS, PAGES_EXHAUSTED, PAGES_PARENT, PAGES_PAST_RESERVE,
-        PAGES_SHORT, PAGES_TOO_WIDE,
-    };
-    let why = match code {
-        PAGES_PAST_RESERVE => "names a page past its working set's pool",
-        PAGES_SHORT => "is shorter than the pages the lane reads",
-        PAGES_BELOW_FLOOR => "would land a row below its working set's frozen slots or past its reserve",
-        PAGES_COPY_BOUNDS => {
-            "states a page copy past its working set's pool, longer than a page, or into frozen \
-             slots"
-        }
-        PAGES_PARENT => "continues a parent past its beams",
-        PAGES_TOO_WIDE => "belongs to a group wider than its step was laid for",
-        PAGES_EXHAUSTED => {
-            eprintln!(
-                "engine-cuda: BUG: lane {lane}'s beam group found fewer free pages than it hands \
-                 out; its pool is sized exactly (BEAM-PAGE-LISTS.md §3)"
-            );
-            "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
-        }
-        _ => "faulted",
-    };
-    format!(
-        "Overreach: lane {lane}'s page list {why}; nothing was written outside its own working \
-         set, and the lane is failed"
-    )
 }
 
 /// Plans `groups` over the fire's staged `geometries` (`indptr` a seat each):
@@ -351,7 +318,7 @@ pub fn plan(
             }
         }
         let list_count = work.lists.len() as u32 - lists_at;
-        // A hybrid's beams (§11.1): each beam's rs rows, resolved row by row
+        // A hybrid's beams: each beam's rs rows, resolved row by row
         // through the same list; the group's rs pool pages are the set's.
         let mut rs_bases_at = None;
         if let Some(rs) = rs {
@@ -359,7 +326,7 @@ pub fn plan(
         }
         let rows_at = rs_bases_at.map(|_| group.rows_at);
         // The head step leaves the group's common slot in its header's fourth
-        // word (§11.3).
+        // word.
         work.commons.push((group.state + 12, group.instance));
         work.groups.push(GroupPlan {
             state: group.state,
@@ -419,7 +386,7 @@ pub fn plan(
     Ok(work)
 }
 
-/// A hybrid group's beams' rs rows (`BEAM-PAGE-LISTS.md` §11.1): where each
+/// A hybrid group's beams' rs rows: where each
 /// beam's rows resolve, slot by slot through its list to the set's entry
 /// holding the same rows, and the set's rs entries' slot addresses in
 /// [`PageWork::bases`]; their run, its length and the buffer's base, or
@@ -452,8 +419,7 @@ fn rs_lists(
             format!(
                 "instance {}'s beams buffer recurrent rows {tokens} a page from slot {base}, \
                  and their page lists page kv slots {page} a page: a hybrid's beams need the \
-                 rs page's rows to divide the kv page's and its buffer to start on a row page \
-                 (BEAM-PAGE-LISTS.md §11)",
+                 rs page's rows to divide the kv page's and its buffer to start on a row page",
                 group.instance
             ),
         ));

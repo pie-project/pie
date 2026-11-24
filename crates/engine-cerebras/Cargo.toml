@@ -1,6 +1,7 @@
 [package]
 name = "engine-cerebras"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The Cerebras engine: PIE's engine over a wafer program. A load plans the model's trace, builds and links the program (kernels-cerebras) and cuts the checkpoint for it, both cached, then drives it through a pure-Rust binding of the Cerebras SDK runtime (libsdkruntime, dlopened at runtime) on a CS system or the fabric simulator; guest programs run in the host interpreter."
@@ -14,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
 kernels-cerebras = { path = "../kernels-cerebras" }
+profile = { package = "pie-profile", path = "../profile" }
 libloading = "0.9"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
@@ -22,18 +24,21 @@ tempfile = "3"
 toml = "1.1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 engine = { path = "../engine" }
+engine-cpu = { path = "../engine-cpu" }
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-exec = { path = "../eta-exec" }
 eta-compiler = { path = "../eta-compiler" }
 checkpoint = { path = "../checkpoint" }
+ztensor = { workspace = true }
 tracing = "0.1"
 blake3 = "1"
 
 [dev-dependencies]
 poem = { package = "pie-poem", path = "../poem" }
 sha2 = "0.11"
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 
 [lints]
 workspace = true

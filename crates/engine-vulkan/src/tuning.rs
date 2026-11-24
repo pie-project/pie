@@ -53,7 +53,7 @@ pub enum Qmm {
     #[requires("coopmat")]
     #[partial]
     Coopmat,
-    /// The register-tiled kernel: a 4x4 output block an invocation, which
+    /// The register-tiled kernel: an 8x4 output block an invocation, which
     /// suits GPUs whose workgroup memory is slow next to their ALUs
     /// (Adreno, PowerVR).
     #[partial]

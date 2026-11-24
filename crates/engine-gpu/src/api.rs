@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -16,6 +15,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain};
+use engine::{Completion, Engine};
 use eta_ir::registry::{GeometryClass, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -473,6 +473,10 @@ impl<B: Host> Gpu<B> {
         if bound > 0 {
             self.live.tally(engine::live::Tally::BoundInFire, bound);
             self.warn_in_fire("what a dispatch binds (a bind group the load's walk did not build)");
+        }
+        let laid = self.shell.as_mut().map_or(0, Shell::laid_serving);
+        if laid > 0 {
+            self.live.tally(engine::live::Tally::LaidAtFirstFire, laid);
         }
         let filled = self.shell.as_mut().map_or(0, Shell::filled_serving);
         if filled > 0 {
@@ -1144,6 +1148,7 @@ where
                 // its widest bucket's rows, every lane's summed, a decode
                 // lane's included (`inputs::rs_carry_ints`).
                 replayed_rows: if shell.pools().rs_rows().is_some() { max_tokens } else { 0 },
+                dispatch_depth: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -1203,8 +1208,8 @@ where
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the walk's own branch
-        // (sc/gpu-arm-before-ready) consumes it before ready.
+        // facts, computed once the caps are: the arm walk keys on them before
+        // ready.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
@@ -1237,7 +1242,7 @@ where
                 "stated eager at load, each fire walked and never recorded: a fire past the \
                  bodies' allowance (named above where one is), one with a group mask, one \
                  landing a recurrent snapshot, one whose token table streams with no ring, one \
-                 whose lanes capture scores, a split step"
+                 of a class whose lanes carry an attachment (named above), a split step"
             );
         } else {
             tracing::info!(
@@ -1287,179 +1292,6 @@ where
         })
     }
 
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_segments(segments).map_err(fault)
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_segments(segments).map_err(fault)
-    }
-
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        let Gpu {
-            shell, programs, ..
-        } = self;
-        let shell = shell.as_mut().ok_or_else(unloaded::<B>)?;
-        programs.quiesce().map_err(refusal)?;
-        // All or nothing (`Engine::evacuate`): the copies recorded and the
-        // table moved, nothing committed; guest tables and cells, which
-        // bind their slots' chunks by place, resolved against the moved
-        // table and their runs claimed; only then is a copy committed.
-        let Some(staged) = shell.stage_evacuation(evacuation).map_err(fault)? else {
-            return Ok(());
-        };
-        let rebound = match programs.resolve_rebind(shell.pools()) {
-            Ok(rebound) => rebound,
-            Err(refused) => {
-                shell.abort_evacuation(staged);
-                return Err(refusal(refused));
-            }
-        };
-        shell.commit_evacuation(staged).map_err(fault)?;
-        programs.install_rebind(rebound).map_err(refusal)
-    }
-
-    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
-        let shell = self.shell.as_ref().ok_or_else(unloaded::<B>)?;
-        Ok(shell.pools().chunk_table().clone())
-    }
-
-    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
-        let Some(shell) = self.shell.as_ref() else {
-            return Ok(engine::program::ProgramFacts::default());
-        };
-        self.programs.facts(program, &place(shell)).map_err(refusal)
-    }
-
-    /// What an instance of `program` bound at `extents` and its pair keep
-    /// as their state ([`crate::guest::state`]): its stages' heaps, the
-    /// instance's own, and, where it reads captured attention scores, the
-    /// pair's lane-indexed room a fire lays its capturing lanes' rows in.
-    /// Nothing of a guest lies in a fire's span: this engine states no
-    /// fire term.
-    fn guest_state(
-        &self,
-        program: ProgramId,
-        extents: &engine::BindExtents,
-        // The class bound: the engine half states per-class arms.
-        _class: engine::ports::GeometryClass,
-    ) -> EngineResult<engine::GuestState> {
-        let Some(shell) = self.shell.as_ref() else {
-            return Ok(engine::GuestState::default());
-        };
-        let Some(layout) = self.pair_layout(program, extents)? else {
-            return Ok(engine::GuestState::default());
-        };
-        let facts = crate::guest::state::Facts::of(shell.pools()).map_err(fault)?;
-        layout
-            .state(&facts)
-            .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))
-    }
-
-    /// Every registration: a ring the device keeps in its `Channel` slots
-    /// or on the host.
-    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
-        let _ = registration;
-        true
-    }
-
-    fn ring_facts(
-        &self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<Option<engine::program::RingFacts>> {
-        let Some(shell) = self.shell.as_ref() else {
-            return Ok(None);
-        };
-        self.programs
-            .ring_facts(registration, &place(shell))
-            .map_err(refusal)
-    }
-
-    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
-        let shell = self.shell.as_ref().ok_or_else(unloaded::<B>)?;
-        self.programs
-            .rebind_slots(shell.pools(), &rebind)
-            .map_err(refusal)
-    }
-
-    /// Returns once every copy submitted so far has landed: every frame
-    /// and device copy in flight, and a slot file read's copy onto the
-    /// device (`Shell::settle_copies`). Off the hot path: an aborted move
-    /// waits on it.
-    fn settle_copies(&mut self) -> EngineResult<()> {
-        self.loaded_mut()?.settle_copies().map_err(fault)
-    }
-
-    /// `false` only for a move off the device into mapped host chunks: it
-    /// rides the queue past the call, and its device slots, once back, may
-    /// be written by anything; told landed from its frame's fence. Every
-    /// other copy's sources may go back at once (`Shell::copy_slots_landing`
-    /// states why for each kind).
-    fn copy_slots_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
-        let landed = self
-            .landed
-            .clone()
-            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token, engine::Landing::Landed)) });
-        let copied = self
-            .loaded_mut()?
-            .copy_slots_landing(copy, landed)
-            .map_err(fault);
-        self.count_drained();
-        copied
-    }
-
-    fn on_landed(&mut self, sink: engine::LandingSink) {
-        self.landed = Some(sink);
-    }
-
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        let copied = self.loaded_mut()?.copy_slots(copy).map_err(fault);
-        self.count_drained();
-        copied
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        let read = self.loaded_mut()?.read_tier_slots(slots).map_err(fault);
-        self.count_drained();
-        read
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        let written = self
-            .loaded_mut()?
-            .write_tier_slots(slots, bytes)
-            .map_err(fault);
-        self.count_drained();
-        written
-    }
-
-    fn weight_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
-        // This engine holds back none of the chunks it states
-        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
-        self.loaded_mut()?
-            .weight_residency(residency)
-            .map(|()| 0)
-            .map_err(fault)
-    }
-
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
-    }
-
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         let submitted = self.submit_frame(frame);
         // A frame whose step refused its lanes by name fired the steps
@@ -1471,221 +1303,6 @@ where
             self.live.tally(engine::live::Tally::Refused, 1);
         }
         self.refused(submitted)
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        let registered = self.programs.register(registration).map_err(refusal);
-        self.count_registered();
-        self.refused(registered)
-    }
-
-    /// The runtime's standard samplers, before ready: each adopted and its
-    /// stages lowered as its registration does them, and every step call
-    /// their stages dispatch held to a pipeline the load built
-    /// (`Programs::load`), so a request that registers one, or binds it,
-    /// builds nothing. A program that does not adopt, or that dispatches a
-    /// call the load could not build, fails the load by name. No stage holds
-    /// code of its own (`guest::Compiled`): nothing here is keyed on a
-    /// program's hash, which its channels' capacities enter.
-    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
-        if self.shell.is_none() {
-            return Err(Error::Program(
-                "the standard samplers prewarmed before load".to_owned(),
-            ));
-        }
-        let started = std::time::Instant::now();
-        let prewarmed = crate::program::prewarm(registrations).map_err(refusal)?;
-        for &call in &prewarmed.calls {
-            if let Some(why) = self.programs.unbuilt(call) {
-                return Err(Error::Load(format!(
-                    "a standard sampler dispatches guest step call {call}, which the load did \
-                     not build: {why}"
-                )));
-            }
-        }
-        tracing::info!(
-            engine = B::KIND,
-            programs = prewarmed.programs,
-            stages = prewarmed.stages,
-            calls = prewarmed.calls.len(),
-            built_serving = self.programs.built_serving(),
-            slowest_ms = prewarmed.slowest.as_secs_f64() * 1e3,
-            ms = started.elapsed().as_secs_f64() * 1e3,
-            hashes = format_args!("{:016x}", prewarmed.hashes),
-            forms = format_args!("{:016x}", prewarmed.forms),
-            "the standard samplers adopted before ready; every step call they dispatch has its \
-             pipeline from the load"
-        );
-        Ok(())
-    }
-
-    /// The program adopted and its stages lowered in the returned compile,
-    /// off the engine's thread (`program::adopt`); nothing of the plane's
-    /// is touched until the finish.
-    fn prepare_program(
-        &mut self,
-        registration: &ProgramRegistration,
-    ) -> EngineResult<engine::ProgramCompile> {
-        let registration = registration.clone();
-        Ok(Box::new(move || {
-            engine::Prepared(Box::new(crate::program::adopt(&registration)))
-        }))
-    }
-
-    /// The adopted program's id and form held (`Programs::finish`); a
-    /// compile that refused refuses here.
-    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
-        let Ok(prepared) = prepared.0.downcast::<crate::program::Prepared>() else {
-            return self.refused(Err(Error::Program(format!(
-                "a prepared program the {} engine did not prepare",
-                B::KIND
-            ))));
-        };
-        let finished = self.programs.finish(*prepared).map_err(refusal);
-        self.count_registered();
-        self.refused(finished)
-    }
-
-    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
-        self.programs.close_program(program).map_err(refusal)
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        let place = self.shell.as_ref().map(place);
-        self.programs
-            .register_channel(registration, place.as_ref())
-            .map_err(refusal)
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        let caps = self
-            .caps
-            .as_ref()
-            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
-        if !caps.admits(binding.geometry) {
-            return Err(Error::Program(format!(
-                "this load resolves {:?} on the device, so it binds at most {:?} and not {:?}",
-                caps.ports, caps.geometry, binding.geometry
-            )));
-        }
-
-        let layout = self
-            .pair_layout(binding.program, &binding.extents)?
-            .unwrap_or_default();
-        let place = self.shell.as_ref().map(place);
-        let bound = self
-            .programs
-            .bind(binding, place.as_ref(), &layout)
-            .map_err(refusal);
-        // What the bind built, counted where it lands, before its first
-        // fire: the program's own registration's builds.
-        self.count_registered();
-        let bound = bound?;
-
-        // A lane that only classes the kernels refuse serve is refused
-        // here, where its first fire would be.
-        let unserved = self.shell.as_ref().and_then(|shell| {
-            let unservable = &shell.named().unservable;
-            if unservable.is_empty() {
-                return None;
-            }
-            crate::naming::refuses(unservable, &shell.classes(), &self.programs.reads(bound.id))
-        });
-        if let Some(why) = unserved {
-            let _ = self.programs.close_instance(bound.id);
-            return Err(Error::Program(why));
-        }
-
-        let seeds: Vec<(u32, Vec<u8>)> = binding
-            .seeds
-            .iter()
-            .map(|seed| (seed.channel, seed.bytes.clone()))
-            .collect();
-        let package = self.programs.package(binding.program).cloned();
-        let landed = match (package, self.shell.as_mut()) {
-            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
-            _ => Ok(None),
-        };
-        match landed {
-            Ok(Some(binding)) => {
-                self.adapters.insert(bound.id, binding);
-            }
-            Ok(None) => {}
-            Err(why) => {
-                let _ = self.programs.close_instance(bound.id);
-                return Err(why);
-            }
-        }
-        Ok(bound)
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
-        if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
-            shell.release_adapter(&held);
-        }
-        // A guest's tables lie in its slots and its scratch in a buffer of
-        // its own: nothing standing in the span.
-        self.programs.close_instance(id).map_err(refusal)?;
-        if let Some(shell) = self.shell.as_ref() {
-            shell.beam_forget(id);
-        }
-        Ok(0)
-    }
-
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<crate::weights::AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| crate::weights::AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.programs.close_channel(id).map_err(refusal)
-    }
-
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        self.programs
-            .publish(instance, channel, cell)
-            .map_err(refusal)
-    }
-
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
-        self.programs.take(instance, channel).map_err(refusal)
-    }
-
-    /// Beam `beam`'s page list of `instance`'s group as its last fire left
-    /// it (`BEAM-PAGE-LISTS.md` §6.6): every fire in flight lands first,
-    /// then the state's last list is read from the pool.
-    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
-        let shell = self.shell.as_mut().ok_or_else(unloaded::<B>)?;
-        shell.drain().map_err(fault)?;
-        let resident = self.programs.beam_state(instance).ok_or_else(|| {
-            Error::Program(format!("instance {instance} binds no beam group (parents)"))
-        })?;
-        resident.list(shell.pools(), beam).map_err(fault)
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        B::settles_asynchronously(self)
     }
 
     fn measures_behind(&self) -> bool {
@@ -1747,19 +1364,15 @@ where
         // What the settle decided so far, kept in the user's profile for
         // the next load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {
-            let rates = profile::fire::Rates {
+            let rates = profile::rates::Rates {
                 dense_settled: vec![settled],
-                ..profile::fire::Rates::default()
+                ..profile::rates::Rates::default()
             };
             if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
                 tracing::warn!(%why, "the dense settle was not kept in the profile");
             }
         }
         Ok(fired)
-    }
-
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -1814,11 +1427,467 @@ where
         Ok(())
     }
 
+    fn completion(&mut self) -> Option<&mut dyn engine::Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn engine::Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn engine::Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn engine::WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl<B: Host> engine::Completion for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn asynchronous(&self) -> bool {
+        B::settles_asynchronously(self)
+    }
+
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
-        if let Some(shell) = self.shell.as_mut() {
-            let _ = shell.reap();
+        if let Some(shell) = self.shell.as_mut()
+            && let Err(fault) = shell.reap()
+        {
+            tracing::warn!(%fault, "reaping landed frames before a fire");
         }
+    }
+}
+
+impl<B: Host> engine::Programs for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(engine::program::ProgramFacts::default());
+        };
+        self.programs.facts(program, &place(shell)).map_err(refusal)
+    }
+
+    /// What an instance of `program` bound at `extents` and its pair keep
+    /// as their state ([`crate::guest::state`]): its stages' heaps, the
+    /// instance's own, and, where it reads captured attention scores, the
+    /// pair's lane-indexed room a fire lays its capturing lanes' rows in.
+    /// Nothing of a guest lies in a fire's span: this engine states no
+    /// fire term.
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        extents: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
+    ) -> EngineResult<engine::GuestState> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(engine::GuestState::default());
+        };
+        let Some(layout) = self.pair_layout(program, extents)? else {
+            return Ok(engine::GuestState::default());
+        };
+        let facts = crate::guest::state::Facts::of(shell.pools()).map_err(fault)?;
+        layout
+            .state(&facts)
+            .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))
+    }
+
+    fn rebind(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        let shell = self.shell.as_ref().ok_or_else(unloaded::<B>)?;
+        self.programs
+            .rebind_slots(shell.pools(), &rebind)
+            .map_err(refusal)
+    }
+
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        let registered = self.programs.register(registration).map_err(refusal);
+        self.count_registered();
+        self.refused(registered)
+    }
+
+    /// The runtime's standard samplers, before ready: each adopted and its
+    /// stages lowered as its registration does them, and every step call
+    /// their stages dispatch held to a pipeline the load built
+    /// (`Programs::load`), so a request that registers one, or binds it,
+    /// builds nothing. A program that does not adopt, or that dispatches a
+    /// call the load could not build, fails the load by name. No stage holds
+    /// code of its own (`guest::Compiled`): nothing here is keyed on a
+    /// program's hash, which its channels' capacities enter.
+    fn prewarm(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        if self.shell.is_none() {
+            return Err(Error::Program(
+                "the standard samplers prewarmed before load".to_owned(),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let prewarmed = crate::program::prewarm(registrations).map_err(refusal)?;
+        for &call in &prewarmed.calls {
+            if let Some(why) = self.programs.unbuilt(call) {
+                return Err(Error::Load(format!(
+                    "a standard sampler dispatches guest step call {call}, which the load did \
+                     not build: {why}"
+                )));
+            }
+        }
+        tracing::info!(
+            engine = B::KIND,
+            programs = prewarmed.programs,
+            stages = prewarmed.stages,
+            calls = prewarmed.calls.len(),
+            built_serving = self.programs.built_serving(),
+            slowest_ms = prewarmed.slowest.as_secs_f64() * 1e3,
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            hashes = format_args!("{:016x}", prewarmed.hashes),
+            forms = format_args!("{:016x}", prewarmed.forms),
+            "the standard samplers adopted before ready; every step call they dispatch has its \
+             pipeline from the load"
+        );
+        Ok(())
+    }
+
+    /// The program adopted and its stages lowered in the returned compile,
+    /// off the engine's thread (`program::adopt`); nothing of the plane's
+    /// is touched until the finish.
+    fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let registration = registration.clone();
+        Ok(Box::new(move || {
+            engine::Prepared(Box::new(crate::program::adopt(&registration)))
+        }))
+    }
+
+    /// The adopted program's id and form held (`Programs::finish`); a
+    /// compile that refused refuses here.
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(prepared) = prepared.0.downcast::<crate::program::Prepared>() else {
+            return self.refused(Err(Error::Program(format!(
+                "a prepared program the {} engine did not prepare",
+                B::KIND
+            ))));
+        };
+        let finished = self.programs.finish(*prepared).map_err(refusal);
+        self.count_registered();
+        self.refused(finished)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+        let caps = self
+            .caps
+            .as_ref()
+            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
+        if !caps.admits(binding.geometry) {
+            return Err(Error::Program(format!(
+                "this load resolves {:?} on the device, so it binds at most {:?} and not {:?}",
+                caps.ports, caps.geometry, binding.geometry
+            )));
+        }
+
+        let layout = self
+            .pair_layout(binding.program, &binding.extents)?
+            .unwrap_or_default();
+        let place = self.shell.as_ref().map(place);
+        let bound = self
+            .programs
+            .bind(binding, place.as_ref(), &layout)
+            .map_err(refusal);
+        // What the bind built, counted where it lands, before its first
+        // fire: the program's own registration's builds.
+        self.count_registered();
+        let bound = bound?;
+
+        // A lane that only classes the kernels refuse serve is refused
+        // here, where its first fire would be.
+        let unserved = self.shell.as_ref().and_then(|shell| {
+            let unservable = &shell.named().unservable;
+            if unservable.is_empty() {
+                return None;
+            }
+            crate::naming::refuses(unservable, &shell.classes(), &self.programs.reads(bound.id))
+        });
+        if let Some(why) = unserved {
+            let _ = self.programs.close_instance(bound.id);
+            return Err(Error::Program(why));
+        }
+
+        let seeds: Vec<(u32, Vec<u8>)> = binding
+            .seeds
+            .iter()
+            .map(|seed| (seed.channel, seed.bytes.clone()))
+            .collect();
+        let package = self.programs.package(binding.program).cloned();
+        let landed = match (package, self.shell.as_mut()) {
+            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
+            _ => Ok(None),
+        };
+        match landed {
+            Ok(Some(binding)) => {
+                self.adapters.insert(bound.id, binding);
+            }
+            Ok(None) => {}
+            Err(why) => {
+                let _ = self.programs.close_instance(bound.id);
+                return Err(why);
+            }
+        }
+        Ok(bound)
+    }
+
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
+        if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
+            shell.release_adapter(&held);
+        }
+        // A guest's tables lie in its slots and its scratch in a buffer of
+        // its own: nothing standing in the span.
+        self.programs.close_instance(id).map_err(refusal)?;
+        if let Some(shell) = self.shell.as_ref() {
+            shell.beam_forget(id);
+        }
+        Ok(0)
+    }
+
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        let planes: Vec<crate::weights::AdapterPlane<'_>> = registration
+            .planes
+            .iter()
+            .map(|plane| crate::weights::AdapterPlane {
+                bank: plane.bank.as_str(),
+                bytes: &plane.bytes,
+            })
+            .collect();
+        self.loaded_mut()?
+            .register_adapter(registration.id, &planes)
+            .map_err(fault)
+    }
+
+    /// Beam `beam`'s page list of `instance`'s group as its last fire left
+    /// it (`BEAM-PAGE-LISTS.md` §6.6): every fire in flight lands first,
+    /// then the state's last list is read from the pool.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        let shell = self.shell.as_mut().ok_or_else(unloaded::<B>)?;
+        shell.drain().map_err(fault)?;
+        let resident = self.programs.beam_state(instance).ok_or_else(|| {
+            Error::Program(format!("instance {instance} binds no beam group (parents)"))
+        })?;
+        resident.list(shell.pools(), beam).map_err(fault)
+    }
+}
+
+impl<B: Host> engine::Channels for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    /// Every registration: a ring the device keeps in its `Channel` slots
+    /// or on the host.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(None);
+        };
+        self.programs
+            .ring_facts(registration, &place(shell))
+            .map_err(refusal)
+    }
+
+    fn open(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<RegisteredChannel> {
+        let place = self.shell.as_ref().map(place);
+        self.programs
+            .register_channel(registration, place.as_ref())
+            .map_err(refusal)
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.programs.close_channel(id).map_err(refusal)
+    }
+
+    fn publish(
+        &mut self,
+        instance: InstanceId,
+        channel: u32,
+        cell: &[u8],
+    ) -> EngineResult<bool> {
+        self.programs
+            .publish(instance, channel, cell)
+            .map_err(refusal)
+    }
+
+    fn take(
+        &mut self,
+        instance: InstanceId,
+        channel: u32,
+    ) -> EngineResult<Option<Vec<u8>>> {
+        self.programs.take(instance, channel).map_err(refusal)
+    }
+}
+
+impl<B: Host> engine::Pool for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        let Gpu {
+            shell, programs, ..
+        } = self;
+        let shell = shell.as_mut().ok_or_else(unloaded::<B>)?;
+        programs.quiesce().map_err(refusal)?;
+        // All or nothing (`Engine::evacuate`): the copies recorded and the
+        // table moved, nothing committed; guest tables and cells, which
+        // bind their slots' chunks by place, resolved against the moved
+        // table and their runs claimed; only then is a copy committed.
+        let Some(staged) = shell.stage_evacuation(evacuation).map_err(fault)? else {
+            return Ok(());
+        };
+        let rebound = match programs.resolve_rebind(shell.pools()) {
+            Ok(rebound) => rebound,
+            Err(refused) => {
+                shell.abort_evacuation(staged);
+                return Err(refusal(refused));
+            }
+        };
+        shell.commit_evacuation(staged).map_err(fault)?;
+        programs.install_rebind(rebound).map_err(refusal)
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let shell = self.shell.as_ref().ok_or_else(unloaded::<B>)?;
+        Ok(shell.pools().chunk_table().clone())
+    }
+}
+
+impl<B: Host> engine::WeightCache for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn set_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
+        // This engine holds back none of the chunks it states
+        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map(|()| 0)
+            .map_err(fault)
+    }
+
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
+    }
+}
+
+impl<B: Host> engine::Tiers for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    /// Returns once every copy submitted so far has landed: every frame
+    /// and device copy in flight, and a slot file read's copy onto the
+    /// device (`Shell::settle_copies`). Off the hot path: an aborted move
+    /// waits on it.
+    fn settle(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_copies().map_err(fault)
+    }
+
+    /// `false` only for a move off the device into mapped host chunks: it
+    /// rides the queue past the call, and its device slots, once back, may
+    /// be written by anything; told landed from its frame's fence. Every
+    /// other copy's sources may go back at once (`Shell::copy_slots_landing`
+    /// states why for each kind).
+    fn copy_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        let landed = self
+            .landed
+            .clone()
+            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token, engine::Landing::Landed)) });
+        let copied = self
+            .loaded_mut()?
+            .copy_slots_landing(copy, landed)
+            .map_err(fault);
+        self.count_drained();
+        copied
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        let copied = self.loaded_mut()?.copy_slots(copy).map_err(fault);
+        self.count_drained();
+        copied
+    }
+
+    fn read(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        let read = self.loaded_mut()?.read_tier_slots(slots).map_err(fault);
+        self.count_drained();
+        read
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        let written = self
+            .loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault);
+        self.count_drained();
+        written
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
@@ -1988,7 +2057,7 @@ where
         let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
 
-        if !self.settles_asynchronously() {
+        if !B::settles_asynchronously(self) {
             self.settle_frame(&mut ticket)?;
             self.tell_wrote();
         }

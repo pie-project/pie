@@ -165,6 +165,7 @@ fn label(name: &'static str, fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<
             ArgValue::I32(v) => v.to_string(),
             ArgValue::U32(v) => v.to_string(),
             ArgValue::F32(v) => format!("{v}"),
+            ArgValue::Zeros(words) => format!("0x{words}"),
             ArgValue::Buffer(_) | ArgValue::BufferMut(_) => continue,
         };
         let _ = write!(key, "{}{scalar}", if first { " s=" } else { "," });
@@ -290,12 +291,15 @@ impl Sink<'_> {
             .map_err(|fault| Sink::refuse(fire, fault))?;
         let core = self.device.core();
         let limits = &core.limits;
-        let groups = engine_gpu::workgroups(
-            name,
-            fire.groups,
-            [limits.max_compute_workgroups_per_dimension; 3],
-        )
-        .map_err(|fault| Sink::refuse(fire, fault))?;
+        let groups = match fire.launched() {
+            Some(none) => none,
+            None => engine_gpu::workgroups(
+                name,
+                fire.groups,
+                [limits.max_compute_workgroups_per_dimension; 3],
+            )
+            .map_err(|fault| Sink::refuse(fire, fault))?,
+        };
         let storage_align = u64::from(limits.min_storage_buffer_offset_alignment);
         let max_binding = limits.max_storage_buffer_binding_size;
 
@@ -432,20 +436,19 @@ impl Sink<'_> {
                 ArgValue::I32(v) => words.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::U32(v) => words.extend_from_slice(&v.to_le_bytes()),
                 ArgValue::F32(v) => words.extend_from_slice(&v.to_le_bytes()),
+                ArgValue::Zeros(count) => words.resize(words.len() + count as usize * 4, 0),
             }
         }
 
         let declared = pipeline.bindings as usize;
-        for at in views.len()..declared {
-            if pipeline.used[at] {
-                return Err(Sink::backend(
-                    fire,
-                    format!(
-                        "the module declares binding {at} but the entry passed only {} buffers",
-                        views.len()
-                    ),
-                ));
-            }
+        if let Some(at) = (views.len()..declared).find(|&at| pipeline.used[at]) {
+            return Err(Sink::backend(
+                fire,
+                format!(
+                    "the module declares binding {at} but the entry passed only {} buffers",
+                    views.len()
+                ),
+            ));
         }
         for (at, view) in views.iter().enumerate() {
             if at >= declared {

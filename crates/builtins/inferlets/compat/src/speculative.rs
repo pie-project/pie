@@ -30,6 +30,14 @@ struct Pick {
     noise: Channel,
 }
 
+struct Released(Vec<Channel>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        self.0.drain(..).for_each(Channel::release);
+    }
+}
+
 /// What a pass landed: a token a row (the target's argmax, a draw past
 /// the row's proposal, or the draft's picks), and under a `Pick` each
 /// row's chance of its proposal.
@@ -63,8 +71,8 @@ async fn pass(
         Round::Draft => Some(0),
         Round::Verify(survivors) => Some(survivors),
     };
-    let fold = fold.map(|n| Channel::from([n]));
-    let fold = match &fold {
+    let fold_count = fold.map(|n| Channel::from([n]));
+    let fold = match &fold_count {
         Some(count) => Fold::Count(count),
         None => Fold::All,
     };
@@ -85,9 +93,20 @@ async fn pass(
         )
     });
     let chances = sampled.as_ref().map(|(_, _, chances)| *chances);
+    let _released = Released(
+        [toks, indptr, slots, readout, out]
+            .into_iter()
+            .chain(fold_count)
+            .chain(
+                sampled
+                    .iter()
+                    .flat_map(|(_, proposals, chances)| [*proposals, *chances]),
+            )
+            .collect(),
+    );
     let fwd = ForwardPass::new();
     // A verify's rejected draft rows are written again by the next round:
-    // the rows are taken back, so the pass is not final (CONTRACT-BC 25).
+    // the rows are taken back, so the pass is not final.
     fwd.retractable()?;
     if drafting {
         fwd.switch(0, "block_draft", "on").context("draft block")?;
@@ -154,6 +173,7 @@ struct Prices {
 }
 
 impl Prices {
+    /// An odd count, so the median is a fire's own price past one stall.
     const KEEP: usize = 5;
 
     fn keep(bucket: &mut Vec<u64>, ns: u64) {
@@ -200,6 +220,7 @@ struct Yield {
 }
 
 impl Yield {
+    /// A round's weight halves in about seven rounds (0.9^7 = 0.48).
     const DECAY: f64 = 0.9;
 
     /// A round verified `width - 1` proposals and kept the first `kept`.
@@ -266,6 +287,7 @@ pub async fn generate(
         vocab: model::output_vocab_size(),
         noise: Channel::from([seed, 0u32]),
     });
+    let _released = Released(pick.iter().map(|pick| pick.noise).collect());
     // The acceptance draws, a stream apart from the device's noise.
     let mut uniform = SplitMix64::new(u64::from(sampled.map_or(0, |(_, seed)| seed)) ^ 0x5bec);
     let pick = pick.as_ref();

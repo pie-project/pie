@@ -2,7 +2,6 @@
 //! and `Channel` slots taken where the engine's facts say, so a test binds
 //! instances and registers channels as a served one is.
 
-use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::chunk::{ChunkFacts, ShapeId, SlotRole};
 use engine::program::{Footprint, InstanceBinding, RingSlots, ScratchPlace};
@@ -106,9 +105,12 @@ impl Slots {
     }
 
     /// Registers `registration` over the channel slots its ring facts state.
-    pub fn register(&mut self, engine: &mut dyn Engine, registration: ChannelRegistration) {
-        let slots = match engine
-            .ring_facts(&registration)
+    pub fn register(
+        &mut self,
+        engine: &mut (impl engine::Channels + ?Sized),
+        registration: ChannelRegistration,
+    ) {
+        let slots = match engine::Channels::ring_facts(engine, &registration)
             .expect("the channel's ring facts")
         {
             Some(facts) => self
@@ -118,8 +120,7 @@ impl Slots {
                 .take(&facts.footprint),
             None => Vec::new(),
         };
-        engine
-            .register_channel(&ChannelRegistration {
+        engine::Channels::open(engine, &ChannelRegistration {
                 slots,
                 ..registration
             })
@@ -130,12 +131,11 @@ impl Slots {
     /// each ring's no registered channel (`registered`) covers.
     pub fn binding(
         &mut self,
-        engine: &dyn Engine,
+        engine: &(impl engine::Programs + ?Sized),
         binding: InstanceBinding,
         registered: &[ChannelId],
     ) -> InstanceBinding {
-        let facts = engine
-            .program_facts(binding.program)
+        let facts = engine::Programs::facts(engine, binding.program)
             .expect("the program's facts");
         let instance_slots = match self.instance.as_mut() {
             Some(shape) if facts.instance.slots > 0 => shape.take(&facts.instance),
@@ -155,8 +155,7 @@ impl Slots {
             })
             .collect();
         // Its state and its pair's, the pair's taken once.
-        let state = engine
-            .guest_state(binding.program, &binding.extents, binding.geometry)
+        let state = engine::Programs::guest_state(engine, binding.program, &binding.extents, binding.geometry)
             .expect("the program's guest state");
         let scratch = self.state(state.instance_bytes(), state.run);
         let key = (binding.program, binding.extents);

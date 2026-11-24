@@ -11,17 +11,22 @@ use tarpc::server::{BaseChannel, Channel};
 use tokio::net::ToSocketAddrs;
 use tokio::sync::watch;
 use worker_api::{
-    Accepted, Control, GatewayInbound, Request, Tokens, WorkerControlClient, accept_gateway_link,
-    dispatch_codec,
+    Accepted, Control, GatewayInbound, LINK_MAX_FRAME_BYTES, Request, Tokens, WorkerControlClient,
+    accept_gateway_link, dispatch_codec,
 };
 
 use crate::session::Sessions;
 
-pub(crate) const WORKER_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// A client request's inline limit; a larger input goes as a blob
+/// reference.
+pub const MAX_CLIENT_FRAME_BYTES: usize = 7 * 1024 * 1024;
 
-pub const MAX_CLIENT_FRAME_BYTES: usize = WORKER_MAX_FRAME_BYTES - (1024 * 1024);
+/// What the client socket reads: past the request limit, so an oversized
+/// request is refused by name rather than cut off by the socket.
+pub const MAX_CLIENT_FRAME_RECV_BYTES: usize = MAX_CLIENT_FRAME_BYTES + 768 * 1024;
 
-pub const MAX_CLIENT_FRAME_RECV_BYTES: usize = WORKER_MAX_FRAME_BYTES - (256 * 1024);
+// A request the socket reads fits, with its envelope, in one link frame.
+const _: () = assert!(MAX_CLIENT_FRAME_RECV_BYTES + 1024 * 1024 <= LINK_MAX_FRAME_BYTES);
 
 #[derive(Debug)]
 pub enum DispatchErr {
@@ -180,9 +185,7 @@ pub async fn serve(
     let mut incoming = tcp::listen(bind, dispatch_codec)
         .await
         .context("bind worker-facing listener")?;
-    incoming
-        .config_mut()
-        .max_frame_length(WORKER_MAX_FRAME_BYTES);
+    incoming.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
     let bound = incoming.local_addr();
 
     let task = tokio::spawn(async move {

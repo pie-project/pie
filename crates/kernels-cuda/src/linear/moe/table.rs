@@ -1,5 +1,5 @@
-//! Where a routed bank's experts, and a gathered table's row blocks, lie:
-//! the weight cache's location tables (`linear/moe/table.cuh`).
+//! Host-only: where a routed bank's experts, and a gathered table's row
+//! blocks, lie: the weight cache's location tables (`linear/moe/table.cuh`).
 //!
 //! A routed bank is one or more planes, each `[experts, ...]` when
 //! contiguous. An [`ExpertTable`] names, for every expert, the device address

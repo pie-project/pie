@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
-use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
 use engine::{ChannelId, InstanceId, ProgramId};
+use engine::{Channels, Engine, Programs};
 use engine_cuda::Graphs;
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
@@ -435,7 +435,7 @@ impl Rig {
         };
         let id = self
             .engine
-            .register_program(&registration)
+            .register(&registration)
             .expect("the program registers");
         self.programs.insert(rows, id);
         id
@@ -499,7 +499,7 @@ impl Rig {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let accepted = self
             .engine
-            .publish_channel(instance, dense, &bytes)
+            .publish(instance, dense, &bytes)
             .expect("the cell publishes");
         assert!(accepted, "the ring had room");
     }

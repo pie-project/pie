@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
-use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
 use engine::{ChannelId, InstanceId, ProgramId};
+use engine::{Channels, Engine, Programs};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -541,7 +541,7 @@ impl Rig {
             ..Default::default()
         };
         self.engine
-            .register_program(&registration)
+            .register(&registration)
             .expect("the program registers")
     }
 
@@ -611,7 +611,7 @@ impl Rig {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let accepted = self
             .engine
-            .publish_channel(instance, dense, &bytes)
+            .publish(instance, dense, &bytes)
             .expect("the cell publishes");
         assert!(accepted, "the ring had room");
     }
@@ -619,7 +619,7 @@ impl Rig {
     pub fn take(&mut self, instance: InstanceId, dense: u32) -> Vec<f32> {
         let bytes = self
             .engine
-            .take_channel(instance, dense)
+            .take(instance, dense)
             .expect("the channel reads")
             .expect("the channel holds a cell");
         bytes

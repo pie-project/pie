@@ -7,8 +7,8 @@ use crate::hip::sys;
 use crate::jit::{Fault, Root, hiprtc};
 
 pub struct Resolved {
-    #[allow(dead_code)]
-    module: sys::Module,
+    /// The module `function` lives in, held beside it and never unloaded.
+    _module: sys::Module,
     pub function: sys::Function,
 }
 
@@ -97,7 +97,10 @@ pub(crate) fn load(root: &Root, instantiation: &str, ordinal: i32) -> Result<Res
         ms = started.elapsed().as_secs_f64() * 1e3,
         "resolved a device instantiation"
     );
-    Ok(Resolved { module, function })
+    Ok(Resolved {
+        _module: module,
+        function,
+    })
 }
 
 fn api(call: &'static str) -> Result<&'static sys::Api, Fault> {

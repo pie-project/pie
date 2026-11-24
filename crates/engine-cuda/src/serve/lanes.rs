@@ -32,9 +32,6 @@ pub struct Seated<'a> {
     /// fire folds them (`Lane::window`); `None` where the runtime states
     /// none (a runtimeless lane folds every row it writes).
     pub window_fold: Option<engine::fire::WindowFold>,
-    /// The lane's slot refs of the window lists past the first, narrowest
-    /// first: a list each, where lanes name slot refs.
-    pub more_windows: &'a [&'a [u32]],
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
     pub rs: RsVerb,
@@ -73,7 +70,6 @@ impl<'a> Seated<'a> {
             write_end: 0,
             window: &[],
             window_fold: None,
-            more_windows: &[],
             mask: None,
             adapter: None,
             rs: RsVerb::Fold,

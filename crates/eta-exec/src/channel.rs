@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eta_ir::container::{ChanDType, HostRole};
@@ -196,6 +196,31 @@ impl ChannelState {
         let value = self.decode_sequence(h);
         self.store_word(0, h + 1);
         Some(value)
+    }
+}
+
+impl engine::channel::MirrorMemory for ChannelState {
+    fn words(&self) -> &[AtomicU64] {
+        &self.words
+    }
+
+    #[allow(unsafe_code)]
+    fn cells(&self) -> &[AtomicU8] {
+        // SAFETY: the cells are never resized, so they live as long as
+        // `self`; an `AtomicU8` is laid out as a `u8`, and the ring's words
+        // order the host's access to a cell against the interpreter's.
+        unsafe { std::slice::from_raw_parts(self.cells_ptr().cast(), self.cells_len()) }
+    }
+
+    #[allow(unsafe_code)]
+    fn cell_words(&self) -> &[AtomicU64] {
+        let cells = self.cells_ptr().cast::<AtomicU64>();
+        if !cells.is_aligned() {
+            return &[];
+        }
+        // SAFETY: as `cells`, and the words start on a word boundary and end
+        // within the cells.
+        unsafe { std::slice::from_raw_parts(cells, self.cells_len() / 8) }
     }
 }
 

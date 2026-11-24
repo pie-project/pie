@@ -74,8 +74,7 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
         return;
     };
     let table = planes["embed"].1.clone();
-    let program = engine
-        .register_program(&registration_of(&output_decls(&caps), reader(), 0x4057))
+    let program = engine::Programs::register(&mut engine, &registration_of(&output_decls(&caps), reader(), 0x4057))
         .expect("the reader registers");
     let chunks = &caps.caps.chunks;
     let mut slots =
@@ -120,8 +119,7 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
         },
         &[channel],
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the reader binds")
         .id;
     let word = trace.facts.word(&Request::new(ROWS, false));
@@ -193,8 +191,7 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
             );
 
             // The program read its lane's own row, wherever it lay.
-            let read = engine
-                .take_channel(instance, 0)
+            let read = engine::Channels::take(&mut engine, instance, 0)
                 .expect("the channel reads")
                 .expect("the reader put its row");
             let read: Vec<u32> = read

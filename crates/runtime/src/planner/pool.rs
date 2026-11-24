@@ -45,9 +45,9 @@ pub struct ChunkStats {
 /// ([`PoolPort::chunk_occupants`]).
 /// The runs of adjacent chunks a head's step lays, one entry per run
 /// length, the longest first: `(run, pieces)`. Read as one length, a
-/// restore whose unpark lays a run of two and fourteen single chunks was
-/// asked sixteen single chunks, the map stood them, and the unpark was
-/// refused the run of two (the L40S).
+/// restore whose unpark lays a run of two and fourteen single chunks would
+/// be asked sixteen single chunks, the map stand them, and the unpark be
+/// refused the run of two.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunNeed(Vec<(u32, u32)>);
 
@@ -113,6 +113,12 @@ impl RunNeed {
             .iter()
             .find(|(at, _)| *at == run.max(1))
             .map_or(0, |&(_, pieces)| pieces)
+    }
+
+    /// Itself where it asks any chunk, else none.
+    #[must_use]
+    pub fn filter_chunks(self) -> Option<Self> {
+        (self.chunks() > 0).then_some(self)
     }
 
     /// The chunks it asks in all.
@@ -200,8 +206,14 @@ impl RestorePlacement {
         // chunks: the runs of each length stand where both do.
         let bind_free_runs = bind.first().map(|&(run, _)| placement.free_runs(run));
         let bind_chunks: u32 = bind.iter().map(|&(run, pieces)| run.saturating_mul(pieces)).sum();
+        // Laid by the takes themselves in what its own left, within the
+        // budget's headroom, as its reservation lays them: counts of free
+        // runs beside it read room past the headroom, and a restore went
+        // whose reservation then failed (field seed 934: a restore served
+        // in the same pass took its runs, its bind came back short).
         let bind_short = bind.first().is_some_and(|&(run, pieces)| placement.free_runs(run) < pieces)
-            || (!bind.is_empty() && placement.free_runs(1) < bind_chunks);
+            || (!bind.is_empty() && placement.free_runs(1) < bind_chunks)
+            || (!bind.is_empty() && !placement.places_runs(bind));
         if !bind.is_empty() && (!rest.is_empty() || bind_short) {
             for &(run, pieces) in bind {
                 short.add(run, pieces);
@@ -762,9 +774,8 @@ pub trait PoolPort: Send + Sync + 'static {
     /// one placement a restore is sent on ([`Self::restore_stands`]), its
     /// moves are planned by (the map lays [`RestorePlacement::short`] in
     /// the room its own takes leave) and the stall line reads: a check
-    /// that mirrored the takes stood runs the restore's own takes then
-    /// broke (Mac Pro at 2 GiB: PendingBindShort, free runs (3, 2) before
-    /// and one after, need_moves 0). Where the pool keeps no roles, `need`
+    /// that mirrored the takes would stand runs the restore's own takes
+    /// then break. Where the pool keeps no roles, `need`
     /// (the runs the planner reads its step as) is placed beside `state`.
     fn restore_placement(
         &self,
@@ -809,10 +820,10 @@ pub trait PoolPort: Send + Sync + 'static {
     /// ([`crate::store::roles::Roles::reserve_restore`]), closed to every
     /// other take until its unpark and bind take them or
     /// [`Self::release_restore`]. Whether it was held (its placement
-    /// stands). Where the pool keeps no roles, nothing is held.
-    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
+    /// stands); `None` where the pool keeps no roles and holds nothing.
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> Option<bool> {
         let _ = (pid, bind);
-        false
+        None
     }
     /// `pid`'s reservation goes back: its restore failed, was queued again,
     /// was withdrawn, landed with no bind pending, or its process is gone.
@@ -858,15 +869,15 @@ pub trait PoolPort: Send + Sync + 'static {
     /// Whether `pieces` free runs of `run` adjacent chunks stand beside
     /// the guest state `pid`'s restore retakes first (its parked dead
     /// parts, [`crate::store::roles::Roles::fits_beside_unpark`]): room for
-    /// the bind that suspended it, past its own (the M1 freeze: restored
-    /// straight back into the room its park gave, short again, 750 times
-    /// a second). Where the pool keeps no guest state, the runs alone.
+    /// the bind that suspended it, past its own (else it is restored
+    /// straight back into the room its park gave, short again). Where the
+    /// pool keeps no guest state, the runs alone.
     fn room_beside_own(&self, pid: ProcessId, run: u32, pieces: u32) -> bool {
         let _ = pid;
         self.guest_room_free(run, pieces)
     }
     /// Whether moving chunks will stand `pieces` free runs of `run`
-    /// adjacent chunks where free chunks are enough but scattered (F21): a
+    /// adjacent chunks where free chunks are enough but scattered: a
     /// compaction planned, the pool's walk asked to carry it out, or one on
     /// its way. Where it is, no resident is moved for the bind; where no
     /// moves could stand the runs, `false`. None where the pool keeps no
@@ -968,6 +979,16 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = pid;
         RunNeed::default()
     }
+    /// The physical chunks the kv `pages` lie in: each chunk, the slots it
+    /// holds in all, and how many of `pages` lie there. Empty where the
+    /// pool keeps no chunks.
+    fn kv_pages_by_chunk(
+        &self,
+        pages: &[crate::store::kv::page_table::PhysicalKvPageId],
+    ) -> Vec<(u32, u32, u32)> {
+        let _ = pages;
+        Vec::new()
+    }
     /// The chunks the device pool holds for kv and state at most (its
     /// chunks past the reserved and the activation's): the most runs of
     /// any length a need can ask. `u32::MAX` where the pool keeps no
@@ -1011,6 +1032,11 @@ pub trait PoolPort: Send + Sync + 'static {
     fn guest_pages_of(&self, pid: ProcessId) -> u64 {
         let _ = pid;
         0
+    }
+    /// [`Self::guest_pages_of`]'s share still on the device: what a park
+    /// of `pid` moves below (or leaves where it lies, no tier taking it).
+    fn guest_device_pages_of(&self, pid: ProcessId) -> u64 {
+        self.guest_pages_of(pid)
     }
     /// The kv pages one process may hold at most: the declared context
     /// served ([`crate::store::registry::Stores::context_pages`]), the
@@ -1123,6 +1149,23 @@ pub struct RegistryPool {
 const RECLAIMABLE_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RegistryPool {
+    /// Guest bytes `of` reads from the roles, as pages counted as
+    /// [`CapacityCensus::held`] counts them; 0 where the pool keeps none.
+    fn guest_bytes_as_pages(&self, of: impl FnOnce(&crate::store::roles::Roles) -> u64) -> u64 {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return 0;
+        };
+        let Some(roles) = stores.roles.as_ref() else {
+            return 0;
+        };
+        let bytes = of(&roles.lock().unwrap());
+        let chunk_bytes = stores
+            .shared
+            .as_ref()
+            .map_or(1, |shared| shared.lock().unwrap().pool().chunk_bytes().max(1));
+        (bytes * u64::from(self.chunks_as_pages(1))).div_ceil(chunk_bytes)
+    }
+
     /// The fewest chunks `pid`'s own state takes on the device, wherever
     /// it lies: per shape, the slots of its kv pages that leave with it,
     /// its state's (records, lists, windows) and its guest state's, packed
@@ -1344,10 +1387,10 @@ impl PoolPort for RegistryPool {
         RestorePlacement::of(&own, &placement, bind, pool_alone)
     }
 
-    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> Option<bool> {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.roles)
-            .is_some_and(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
+            .map(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
     }
 
     fn release_restore(&self, pid: ProcessId) {
@@ -1548,6 +1591,7 @@ impl PoolPort for RegistryPool {
         });
     }
 
+
     fn unpark_need(&self, pid: ProcessId) -> RunNeed {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.roles)
@@ -1622,18 +1666,11 @@ impl PoolPort for RegistryPool {
     }
 
     fn guest_pages_of(&self, pid: ProcessId) -> u64 {
-        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
-            return 0;
-        };
-        let Some(roles) = stores.roles.as_ref() else {
-            return 0;
-        };
-        let bytes = roles.lock().unwrap().footprint_of(pid);
-        let chunk_bytes = stores
-            .shared
-            .as_ref()
-            .map_or(1, |shared| shared.lock().unwrap().pool().chunk_bytes().max(1));
-        (bytes * u64::from(self.chunks_as_pages(1))).div_ceil(chunk_bytes)
+        self.guest_bytes_as_pages(|roles| roles.footprint_of(pid))
+    }
+
+    fn guest_device_pages_of(&self, pid: ProcessId) -> u64 {
+        self.guest_bytes_as_pages(|roles| roles.device_footprint_of(pid))
     }
 
     fn context_pages(&self) -> Option<u32> {
@@ -1844,9 +1881,8 @@ impl PoolPort for RegistryPool {
         // eviction by another reader or a key) is theirs together, counted
         // in the map as theirs (`chunk_occupants` of the evicted), and goes
         // down a tier once with their sets, every reader's refs pointing
-        // there. Passed over, it held its chunk for good, no process its
-        // holder (the L40S at 3 GiB disk-only: chunk 4, one slot, seven
-        // evicted forks' refs, a head short of it unserved).
+        // there. Passed over, it would hold its chunk for good, no process
+        // its holder, a head short of it unserved.
         let kv_sets: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = pids
             .iter()
             .flat_map(|&pid| {
@@ -1891,9 +1927,8 @@ impl PoolPort for RegistryPool {
         // An evicted process's state left on the device at its eviction
         // (records and rs list slots its suspend found no row for, or still
         // settling then) goes down with its parked role slots: left there,
-        // queued processes waiting to be restored held chunks no move
-        // freed (Mac Pro on 22b0a3e83: 85 chunks of one live slot each, all
-        // queued processes').
+        // queued processes waiting to be restored would hold chunks no move
+        // frees.
         let sets: HashSet<crate::store::rs::RsWorkingSetId> = pids
             .iter()
             .flat_map(|&pid| {

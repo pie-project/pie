@@ -837,7 +837,9 @@ impl<B: Backend> Inputs<B> {
             .write(self.laid.request_of_token, bytes_of(fire.request_of_token))?;
         self.store
             .write(self.laid.slot_of_row, bytes_of(fire.slot_of_row))?;
-        let capture = if fire.capture.is_empty() {
+        // A load that captures binds its table in every fire (none capturing:
+        // its rows none), the same view whatever lanes capture.
+        let capture = if fire.capture.is_empty() && self.laid.capture.is_none() {
             None
         } else {
             let Some((at, ints)) = self.laid.capture else {
@@ -854,7 +856,9 @@ impl<B: Backend> Inputs<B> {
                     have: ints,
                 });
             }
-            self.store.write(at, bytes_of(fire.capture))?;
+            if !fire.capture.is_empty() {
+                self.store.write(at, bytes_of(fire.capture))?;
+            }
             Some(i32s(
                 handles,
                 &self.store,

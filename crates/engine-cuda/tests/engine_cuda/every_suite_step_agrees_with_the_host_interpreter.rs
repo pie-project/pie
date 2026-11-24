@@ -1093,7 +1093,7 @@ fn every_suite_step_agrees_with_the_host_interpreter() {
 }
 
 /// A program's registration compiles off the thread that fires
-/// (`Engine::prepare_program`): a lane of the sampling primitives fires on
+/// (`Programs::prepare`): a lane of the sampling primitives fires on
 /// while the beam step's regions compile cold on another thread, and the
 /// beam step registers once they have.
 #[test]

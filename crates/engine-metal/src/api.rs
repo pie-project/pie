@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -15,7 +14,8 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain};
+use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
+use engine::Engine;
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -34,6 +34,10 @@ pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<std::path::PathBuf>,
+    /// `[metal] cache`: pie's engine cache directory, where the Neural
+    /// Engine's compiled programs are kept between runs. `None` (a test or
+    /// a tool stating no home): a directory of the system's temporary one.
+    pub cache: Option<std::path::PathBuf>,
     /// `[metal] measure`: whether a load times what no stored or committed
     /// profile states under a matching key.
     pub measure: engine::rates::Measuring,
@@ -83,6 +87,8 @@ pub struct Metal {
     /// next verb (`Engine::poison_queue`).
     #[cfg(feature = "test-slot-fill")]
     poison: Option<engine::chunk::PoisonQueue>,
+    /// A reload that failed part way: the weights are torn until one lands.
+    torn: bool,
 }
 
 impl Metal {
@@ -117,6 +123,7 @@ impl Metal {
             landed: None,
             #[cfg(feature = "test-slot-fill")]
             poison: None,
+            torn: false,
         }
     }
 
@@ -181,7 +188,20 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
             "`copy_kv` into host-pinned memory, which needs a swap pool this load does not \
              reserve"
         }
-        (MemoryDomain::MetalPrivate, _) | (_, MemoryDomain::MetalPrivate) => {
+        (
+            MemoryDomain::Device {
+                reach: DeviceReach::Private,
+                ..
+            },
+            _,
+        )
+        | (
+            _,
+            MemoryDomain::Device {
+                reach: DeviceReach::Private,
+                ..
+            },
+        ) => {
             "`copy_kv` with a Metal PRIVATE end, and every reservation this load made is \
              Shared — there are no private pages here to read or write"
         }
@@ -660,7 +680,7 @@ impl Engine for Metal {
                 {
                     break prepared;
                 }
-                eprintln!(
+                tracing::warn!(
                     "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
                  resident weights on this device: fires narrowed to {narrower} tokens",
                     budgets.max_tokens,
@@ -675,6 +695,7 @@ impl Engine for Metal {
 
             prepared
                 .set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
+            prepared.set_ane_cache(self.boot.cache.clone());
             match prepared.load() {
                 Ok(shell) => break shell,
                 Err(Fault::FitShort(short)) => {
@@ -690,7 +711,7 @@ impl Engine for Metal {
             }
         };
         if let Some(short) = cut {
-            eprintln!(
+            tracing::warn!(
                 "the widest fire narrowed from {asked} to {} forward tokens at load: at the \
                  wider fire, {short}",
                 budgets.max_tokens
@@ -730,7 +751,10 @@ impl Engine for Metal {
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "metal".to_string(),
-                domain: MemoryDomain::MetalShared,
+                domain: MemoryDomain::Device {
+                    ordinal: 0,
+                    reach: DeviceReach::HostShared,
+                },
                 sms: 0,
                 unified_memory: true,
                 fp8_native: false,
@@ -757,6 +781,7 @@ impl Engine for Metal {
                 .unwrap_or(u32::MAX),
                 // Each lane's rung bounds what it replays.
                 replayed_rows: 0,
+                dispatch_depth: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -771,7 +796,7 @@ impl Engine for Metal {
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
-            // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): a load
+            // Windowed layers as ring + buffer: a load
             // with any states the rings and the window buffer in its facts.
             windowed_state: shell.pool_ring().is_some(),
             rs_snapshots: crate::rs::snapshots(shell.trace()),
@@ -791,7 +816,7 @@ impl Engine for Metal {
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24), computed before the walk, which fires each.
+        // facts, computed before the walk, which fires each.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
@@ -863,117 +888,21 @@ impl Engine for Metal {
         })
     }
 
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        Err(Error::Invalid(format!(
-            "adapter {} is operator-declared, and no backend hosts operator-declared \
-             adapters: an adapter arrives through a program's `lora` sink at bind, its \
-             planes the bind's seeds, and lands in `Adapter` slots shared by every \
-             instance that carries the same planes",
-            registration.id
-        )))
-    }
-
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_segments(segments).map_err(fault)
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_segments(segments).map_err(fault)
-    }
-
-    fn set_rung(&mut self, from: u32, to: u32) -> EngineResult<()> {
-        self.loaded_mut()?.set_rung(from, to).map_err(fault)
-    }
-
-    fn commit_span(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_span(segments).map_err(fault)
-    }
-
-    fn release_span(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_span(segments).map_err(fault)
-    }
-
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
-    }
-
-    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
-        Ok(self.loaded()?.chunk_table().clone())
-    }
-
-    /// Waits on the last copy's command buffer: every copy submitted so far
-    /// has read its sources and written its destinations.
-    fn settle_copies(&mut self) -> EngineResult<()> {
-        match self.shell.as_mut() {
-            Some(shell) => shell.settle_copies().map_err(fault),
-            None => Ok(()),
-        }
-    }
-
-    /// A copy on the device rides a command buffer that may still be
-    /// reading its sources when the call returns: told landed from that
-    /// buffer's completion. A move to or from the host tier or the slot
-    /// files is a host copy done inside the call: its sources are read.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
-        let landed = self.landed.clone();
-        self.loaded_mut()?
-            .copy_slots_landing(copy, landed.map(|sink| (sink, token)))
-            .map_err(fault)
-    }
-
-    fn on_landed(&mut self, sink: engine::LandingSink) {
-        self.landed = Some(sink);
-    }
-
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.loaded_mut()?.copy_slots(copy).map_err(fault)
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_tier_slots(slots, bytes)
-            .map_err(fault)
-    }
-
-    fn weight_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
-        // This engine holds back none of the chunks it states
-        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
-        self.loaded_mut()?
-            .weight_residency(residency)
-            .map(|()| 0)
-            .map_err(fault)
-    }
-
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
-    }
-
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        if self.torn {
+            return Err(Error::Load(
+                "a weight reload failed partway, so this engine's weights are part old and \
+                 part new; reload them again before anything runs"
+                    .into(),
+            ));
+        }
         frame.validate_for(
             self.caps
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -1005,7 +934,7 @@ impl Engine for Metal {
         let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
-                self.expect_fire(next);
+                engine::Completion::expect_fire(self, next);
             }
             let at = engine::StepDone {
                 frame: id,
@@ -1039,24 +968,14 @@ impl Engine for Metal {
         self.tally_unbuilt();
         let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
-        if !self.settles_asynchronously() {
+        if !engine::Completion::asynchronous(self) {
             self.settle_frame(&mut ticket)?;
         }
         Ok(ticket)
     }
 
-    fn settles_asynchronously(&self) -> bool {
-        self.shell
-            .as_ref()
-            .is_some_and(|shell| shell.frames_in_flight() > 1)
-    }
-
     fn live(&self) -> engine::live::Live {
         self.live.clone()
-    }
-
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -1108,6 +1027,50 @@ impl Engine for Metal {
         Ok(())
     }
 
+    fn completion(&mut self) -> Option<&mut dyn engine::Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn engine::Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn engine::Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn engine::WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl engine::Completion for Metal {
+    fn asynchronous(&self) -> bool {
+        self.shell
+            .as_ref()
+            .is_some_and(|shell| shell.frames_in_flight() > 1)
+    }
+
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
     /// Commits the epilogues of every landed step (their sink was told from
     /// the completion handler) before the runtime takes their channels.
     fn publish_landed(&mut self) -> EngineResult<()> {
@@ -1123,8 +1086,20 @@ impl Engine for Metal {
             let _ = shell.reap();
         }
     }
+}
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+impl engine::Programs for Metal {
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        Err(Error::Invalid(format!(
+            "adapter {} is operator-declared, and no backend hosts operator-declared \
+             adapters: an adapter arrives through a program's `lora` sink at bind, its \
+             planes the bind's seeds, and lands in `Adapter` slots shared by every \
+             instance that carries the same planes",
+            registration.id
+        )))
+    }
+
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let shell = self.loaded_mut()?;
         let before = (shell.program_compilations(), shell.program_compile_nanos());
         let id = shell.register_program(registration).map_err(fault)?;
@@ -1147,7 +1122,7 @@ impl Engine for Metal {
         Ok(id)
     }
 
-    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+    fn prewarm(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
         self.loaded_mut()?
             .prewarm_programs(registrations)
             .map_err(fault)
@@ -1155,7 +1130,7 @@ impl Engine for Metal {
 
     /// The plan here; the libraries and pipelines in the compile, off this
     /// thread (cold, a sampler's take 0.1-0.4 s on an M1 Max).
-    fn prepare_program(
+    fn prepare(
         &mut self,
         registration: &ProgramRegistration,
     ) -> EngineResult<engine::ProgramCompile> {
@@ -1168,7 +1143,7 @@ impl Engine for Metal {
         }))
     }
 
-    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
         let registered = prepared
             .0
             .downcast::<crate::program::Registered>()
@@ -1206,7 +1181,7 @@ impl Engine for Metal {
         adapter_key_of(self.loaded()?, binding.program, &binding.seeds)
     }
 
-    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::ProgramFacts> {
+    fn facts(&self, program: ProgramId) -> EngineResult<engine::ProgramFacts> {
         self.loaded()?.program_facts(program).map_err(fault)
     }
 
@@ -1226,52 +1201,11 @@ impl Engine for Metal {
             .map_err(fault)
     }
 
-    #[cfg(feature = "test-slot-fill")]
-    fn poison_queue(&mut self, queue: engine::chunk::PoisonQueue) {
-        self.poison = Some(queue);
-    }
-
-    fn rebind_slots(&mut self, rebind: engine::Rebind) -> EngineResult<()> {
+    fn rebind(&mut self, rebind: engine::Rebind) -> EngineResult<()> {
         self.loaded_mut()?.rebind_slots(&rebind).map_err(fault)
     }
 
-    /// A device channel's ring is a shared ring in its `Channel` slots; a
-    /// channel the host reads or writes is the runtime's, each instance
-    /// holding its own ring of it.
-    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
-        registration.host_role == eta_ir::container::HostRole::None
-    }
-
-    fn ring_facts(
-        &self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<Option<engine::RingFacts>> {
-        if registration.host_role != eta_ir::container::HostRole::None {
-            return Ok(None);
-        }
-        Ok(self.loaded()?.ring_facts(channel_shape(registration)))
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        if registration.host_role != eta_ir::container::HostRole::None {
-            return Err(self.unsupported("register_channel"));
-        }
-        let shape = channel_shape(registration);
-        self.loaded_mut()?
-            .register_shared_channel(registration.id, shape, &registration.slots)
-            .map_err(fault)?;
-        Ok(RegisteredChannel {
-            id: registration.id,
-            reader_wait_id: 0,
-            writer_wait_id: 0,
-            mirror: None,
-        })
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         let caps = self
             .caps
             .as_ref()
@@ -1323,7 +1257,7 @@ impl Engine for Metal {
         })
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
         shell.detach_adapter(id);
@@ -1331,29 +1265,62 @@ impl Engine for Metal {
         Ok(0)
     }
 
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
+    }
+}
+
+impl engine::Channels for Metal {
+    /// A device channel's ring is a shared ring in its `Channel` slots; a
+    /// channel the host reads or writes is the runtime's, each instance
+    /// holding its own ring of it.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        registration.host_role == eta_ir::container::HostRole::None
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::RingFacts>> {
+        if registration.host_role != eta_ir::container::HostRole::None {
+            return Ok(None);
+        }
+        Ok(self.loaded()?.ring_facts(channel_shape(registration)))
+    }
+
+    fn open(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<RegisteredChannel> {
+        if registration.host_role != eta_ir::container::HostRole::None {
+            return Err(Error::unsupported(self.kind(), "register_channel"));
+        }
+        let shape = channel_shape(registration);
+        self.loaded_mut()?
+            .register_shared_channel(registration.id, shape, &registration.slots)
+            .map_err(fault)?;
+        Ok(RegisteredChannel {
+            id: registration.id,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+            mirror: None,
+        })
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
         if self.loaded_mut()?.close_shared_channel(id) {
             return Ok(());
         }
-        Err(self.unsupported("close_channel"))
+        Err(Error::unsupported(self.kind(), "close_channel"))
     }
 
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         self.instance(instance)?
             .publish(channel, cell)
             .map_err(fault)
     }
 
-    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
-        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
-    }
-
-    fn take_channel(
+    fn take(
         &mut self,
         instance: InstanceId,
         channel: u32,
@@ -1366,6 +1333,123 @@ impl Engine for Metal {
                 id: instance.0,
             })?
             .take(channel)
+            .map_err(fault)
+    }
+}
+
+impl engine::Pool for Metal {
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn set_rung(&mut self, from: u32, to: u32) -> EngineResult<()> {
+        self.loaded_mut()?.set_rung(from, to).map_err(fault)
+    }
+
+    fn commit_span(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_span(segments).map_err(fault)
+    }
+
+    fn release_span(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_span(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        Ok(self.loaded()?.chunk_table().clone())
+    }
+
+    #[cfg(feature = "test-slot-fill")]
+    fn poison_queue(&mut self, queue: engine::chunk::PoisonQueue) {
+        self.poison = Some(queue);
+    }
+}
+
+impl engine::WeightCache for Metal {
+    fn set_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
+        // This engine holds back none of the chunks it states
+        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map(|()| 0)
+            .map_err(fault)
+    }
+
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
+    }
+
+    fn reload(&mut self, reload: &engine::load::Reload) -> EngineResult<engine::load::Reloaded> {
+        let path = reload.checkpoint.as_path();
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))?;
+        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
+        let (planes, bytes) = shell
+            .reload_weights(&contract, path, &mut self.torn)
+            .map_err(fault)?;
+        Ok(engine::load::Reloaded { planes, bytes })
+    }
+}
+
+impl engine::Tiers for Metal {
+    /// Waits on the last copy's command buffer: every copy submitted so far
+    /// has read its sources and written its destinations.
+    fn settle(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.settle_copies().map_err(fault),
+            None => Ok(()),
+        }
+    }
+
+    /// A copy on the device rides a command buffer that may still be
+    /// reading its sources when the call returns: told landed from that
+    /// buffer's completion. A move to or from the host tier or the slot
+    /// files is a host copy done inside the call: its sources are read.
+    fn copy_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        let landed = self.landed.clone();
+        self.loaded_mut()?
+            .copy_slots_landing(copy, landed.map(|sink| (sink, token)))
+            .map_err(fault)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
+    }
+
+    fn read(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+    ) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
             .map_err(fault)
     }
 
@@ -1510,7 +1594,7 @@ impl Metal {
             })?;
         }
         // A lane names its kv pages, its window pages and its state record
-        // in its slot tables (CONTRACT-BC 4): this engine states one shared
+        // in its slot tables: this engine states one shared
         // pool, so the runtime states them. A device-geometry lane's list
         // table is its working set's whole mapped table, which its ports'
         // page indexes translate through.
@@ -1592,27 +1676,16 @@ impl Metal {
                 }
             }
         }
-        if !ring_forks.is_empty() {
-            eprintln!("ringfork {} pair(s), first {:?}", ring_forks.len(), ring_forks.first());
-        }
         if !forks.is_empty() || !ring_forks.is_empty() {
             shell.copy_records(&forks, &ring_forks).map_err(fault)?;
         }
         // Tail copies (an rs-list or kv slot a fork shares) land before any
-        // lane of the fire reads or writes (CONTRACT-BC 20).
+        // lane of the fire reads or writes.
         let slot_copies: Vec<_> = submission
             .lanes
             .iter()
             .flat_map(|lane| lane.slot_copies.iter().cloned())
             .collect();
-        if !slot_copies.is_empty() || !forks.is_empty() {
-            eprintln!(
-                "wanomaly submit slot_copies {} forks {} first copy {:?}",
-                slot_copies.len(),
-                forks.len(),
-                slot_copies.first()
-            );
-        }
         shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
@@ -1642,8 +1715,8 @@ impl Metal {
                         Readout::Last | Readout::None => None,
                     },
                     // A beam group's lane resolves through its working set's
-                    // whole reserve (the pool its list's entries name,
-                    // BEAM-PAGE-LISTS §6.5); any other lane through its own
+                    // whole reserve (the pool its list's entries name);
+                    // any other lane through its own
                     // table.
                     translation: if lane.reserve.is_empty() {
                         match lane.list {

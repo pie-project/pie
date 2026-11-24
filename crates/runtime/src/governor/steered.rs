@@ -186,7 +186,7 @@ impl Shared<Steered> {
     /// reads from the host a row the cache holds.
     ///
     /// The engine answers what it holds back of its range from then on
-    /// (`Engine::weight_residency`): one that armed there settled its fit
+    /// (`WeightCache::set_residency`): one that armed there settled its fit
     /// and holds less than its load stated. The pool's hold-back takes the
     /// answer, and the segments that opens are backed here, so the load
     /// returns with the pool a load that armed before its last fit has.

@@ -944,7 +944,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
     assert_eq!(p.get::<PrefillChunk>().0, 128, "the derived profile's");
     assert_eq!(
         p.rates(),
-        profile::fire::Rates {
+        profile::rates::Rates {
             stale: None,
             landing: None,
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0), (4096, 50.0)])]),
@@ -961,7 +961,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
-            kernel_tflops_by_shape: None,
+            kernel_curves: None,
             dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
@@ -1189,7 +1189,7 @@ fn a_stale_inline_table_takes_only_itself() {
 /// measured shapes join the saved ones, its own replacing a shape both state.
 #[test]
 fn product_times_read_back_and_accumulate() {
-    use profile::fire::{ProductTime, Rates};
+    use profile::rates::{ProductTime, Rates};
     let t = |kind, m, kernel, ns| ProductTime {
         kind,
         rows: 6144,
@@ -1223,21 +1223,36 @@ fn product_times_read_back_and_accumulate() {
 
 /// How a machine lands weights (`[rates] landing`) is written and read
 /// back as stored, and a list of the wrong length, or a value not past
-/// nothing, is refused by name.
+/// nothing, is skipped by name in a user file and refused in a checked-in
+/// one.
 #[test]
 fn a_landing_reads_back_as_written() {
     let r = registry();
-    let landing = profile::fire::Landing::of([7411.0, 24.25, 2097152.0, 56.25, 217133.0, 1.81, 53.5]);
-    let rates = profile::fire::Rates {
+    let landing =
+        profile::rates::Landing::of([7411.0, 24.25, 2097152.0, 56.25, 217133.0, 1.81, 53.5]);
+    let rates = profile::rates::Rates {
         landing: Some(landing),
-        ..profile::fire::Rates::default()
+        ..profile::rates::Rates::default()
     };
     let text = format!("api = 1\n{}", rates.toml());
     let file = r.parse(&text, "landing.toml", Strict::User).unwrap();
     assert_eq!(file.tuned.rates.landing, Some(landing), "{text}");
-    for bad in ["landing = [1.0, 2.0]\n", "landing = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0]\n"] {
+    for bad in [
+        "landing = [1.0, 2.0]\n",
+        "landing = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0]\n",
+    ] {
+        let text = format!("api = 1\n[rates]\n{bad}");
+        let file = r.parse(&text, "bad.toml", Strict::User).unwrap();
+        assert_eq!(file.tuned.rates.landing, None);
+        assert!(
+            file.skipped_rates
+                .iter()
+                .any(|s| s.contains("rates.landing")),
+            "{:?}",
+            file.skipped_rates
+        );
         let why = r
-            .parse(&format!("api = 1\n[rates]\n{bad}"), "bad.toml", Strict::User)
+            .parse(&text, "bad.toml", Strict::CheckedIn)
             .expect_err("refused")
             .to_string();
         assert!(why.contains("rates.landing"), "{why}");

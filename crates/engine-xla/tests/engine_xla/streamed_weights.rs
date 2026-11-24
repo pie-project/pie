@@ -9,7 +9,6 @@
 //! `a_pool_answers_what_the_base_build_answered`) it says which cases also
 //! equal the base build at its own pool size. Skipped without a PJRT plugin.
 
-use engine::Engine;
 use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency, WeightShape};
 
 use crate::common_llm::{Model, scenario};
@@ -106,9 +105,7 @@ fn served(
         facts.weights
     );
     if held != Held::Seated {
-        model
-            .engine
-            .weight_residency(&residency(&facts.weights, held))
+        engine::WeightCache::set_residency(&mut model.engine, &residency(&facts.weights, held))
             .expect("the residency lands");
     }
     let started = std::time::Instant::now();
@@ -117,11 +114,11 @@ fn served(
         "{name}: {held:?}: the scenario took {:?}",
         started.elapsed()
     );
-    let uses = model.engine.weight_uses().expect("the uses read");
+    let uses = engine::WeightCache::uses(&mut model.engine).expect("the uses read");
     if held == Held::Whole {
         // The host copy is gone: a residency that moves an atom is refused.
         let moved = residency(&facts.weights, Held::Moved);
-        let refused = model.engine.weight_residency(&WeightResidency {
+        let refused = engine::WeightCache::set_residency(&mut model.engine, &WeightResidency {
             held: true,
             ..moved
         });

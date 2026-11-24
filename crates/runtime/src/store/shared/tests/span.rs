@@ -690,10 +690,10 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
     assert_eq!(cases, 48);
 }
 
-/// Mac Pro at 2 GiB on 5120cbc3c (Metal, the span backed on demand): the
+/// Metal at 2 GiB, the span backed on demand: the
 /// prefix whole, a rung of 32 chunks under a top span of 165, and the 126
 /// chunks it lends unbacked (committable_one_chunk=0), a live waiter short
-/// of room waited on evictions. Span lending: the walk backs the lent span
+/// of room waits on evictions. Span lending: the walk backs the lent span
 /// for it, the goal past the prefix, and the waiter's room opens there.
 /// The commit is within the range reserved at load: the span's own
 /// segments, the pool's total unchanged. Once every lent segment is
@@ -915,7 +915,7 @@ async fn no_fire_wider_than_the_rung_the_engine_was_told_reaches_it() {
     assert_eq!(queued, [1024], "held until the engine holds its rung");
 }
 
-/// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy of state in a lent
+/// An eviction's copy of state in a lent
 /// span chunk. State lent the span (the engine told the lower) is evicted:
 /// while the eviction's copy reads its chunks, a raise wanting them waits
 /// (never lays its activation over state a copy reads); once the copy has
@@ -948,11 +948,10 @@ fn a_raise_waits_for_a_copy_reading_a_lent_chunk_then_takes_it_back() {
     pool.pool().check();
 }
 
-/// Mac Pro at 2 GiB on 6c21ebca3: a forward refused "state chunk 231
-/// (physical 433) lies inside the activation span's backed carve" and
-/// three beams were lost: a raise told the engine its wider carve before
-/// it moved the state lying there, and a fire in between read it inside
-/// the carve. State in a lent chunk, then a raise covering it: the state
+/// A forward must not be refused "state chunk ... lies inside the
+/// activation span's backed carve": a raise telling the engine its wider
+/// carve before it moves the state lying there lets a fire in between
+/// read it inside the carve. State in a lent chunk, then a raise covering it: the state
 /// moves down first, and only then does the engine back the carve.
 #[tokio::test(flavor = "current_thread")]
 async fn a_raise_moves_the_state_down_before_the_engine_backs_its_carve() {

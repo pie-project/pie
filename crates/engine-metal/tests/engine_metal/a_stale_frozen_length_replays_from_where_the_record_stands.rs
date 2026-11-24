@@ -90,5 +90,4 @@ fn a_stale_frozen_length_replays_from_where_the_record_stands() {
         stale_state, exact_state,
         "the record after the stale statement is the record after the exact one"
     );
-    eprintln!("a fire told a stale frozen length replays from where its record stands, bit for bit");
 }

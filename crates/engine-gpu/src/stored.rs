@@ -1,5 +1,5 @@
 //! What a measurement a load stores in the user's profile is keyed by on
-//! these backends ([`profile::fire::Now`]): the device (its vendor, device
+//! these backends ([`profile::rates::Now`]): the device (its vendor, device
 //! id and driver, as the backend states them), the version of the method
 //! that measured it (a constant beside the measuring code, bumped only when
 //! the method changes) and the code of each kernel it fired (its SPIR-V or
@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use kernels_slang::Target;
-use profile::fire::{MeasuredBy, Now};
+use profile::rates::{MeasuredBy, Now};
 
 use crate::error::{Fault, Result};
 use crate::naming::Kernel;
@@ -96,7 +96,7 @@ pub fn code(target: Target, kernel: &str) -> Option<u32> {
         Target::Spirv => kernels_slang::spirv(kernel)?,
         Target::Wgsl => kernels_slang::wgsl(kernel)?.as_bytes(),
     };
-    Some(profile::fire::fingerprint(bytes))
+    Some(profile::rates::fingerprint(bytes))
 }
 
 /// The fingerprint of every kernel of `kernels` for `target`, each by its
@@ -119,7 +119,30 @@ pub fn code_of_all(target: Target, kernels: &BTreeSet<Kernel>) -> Result<u32> {
         bytes.push(0);
         bytes.extend_from_slice(&code.to_le_bytes());
     }
-    Ok(profile::fire::fingerprint(&bytes))
+    Ok(profile::rates::fingerprint(&bytes))
+}
+
+/// `shelf`'s profile for a load on the device `on` names (its vendor,
+/// device id and driver), its kernels built for `target`: the measurements
+/// the user's file stores kept where their keys match this build on this
+/// device, the rest dropped to be measured again
+/// ([`profile::rates::Rates::sift`]), each said in the load log.
+#[must_use]
+pub fn resolve(
+    shelf: &profile::Shelf,
+    registry: &profile::Registry,
+    device: &str,
+    facts: &profile::Facts,
+    profiles: Option<&std::path::Path>,
+    on: &str,
+    target: Target,
+) -> (profile::Profile, profile::Report) {
+    let keys = Keys::new(on.to_string(), target);
+    let (profile, report) = shelf.resolve_keyed(registry, device, facts, profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
 }
 
 /// The version of the method that measures `what` (a `[rates]` key), as
@@ -131,13 +154,13 @@ pub fn method(what: &str) -> Option<u32> {
     Some(match what {
         "launch_ns" | "hbm_gbps" => rates::LAUNCH_METHOD,
         "gemm_tflops_by_rows" => rates::GEMM_METHOD,
-        "attn_tflops_by_keys" | profile::fire::ATTN_BY_ROWS_KEYS => rates::ATTN_METHOD,
+        "attn_tflops_by_keys" | profile::rates::ATTN_BY_ROWS_KEYS => rates::ATTN_METHOD,
         "elementwise_gbps" => rates::ELEMENTWISE_METHOD,
         "scan_gelems" => rates::SCAN_METHOD,
-        profile::fire::RESIDENT_WORKGROUPS => rates::RESIDENT_METHOD,
-        profile::fire::SUBMIT_WORST_RATIO => rates::SUBMIT_METHOD,
-        profile::fire::KERNEL_CURVES => rates::CURVE_METHOD,
-        profile::fire::DENSE_SETTLED => crate::serve::SETTLE_METHOD,
+        profile::rates::RESIDENT_WORKGROUPS => rates::RESIDENT_METHOD,
+        profile::rates::SUBMIT_WORST_RATIO => rates::SUBMIT_METHOD,
+        profile::rates::KERNEL_CURVES => rates::CURVE_METHOD,
+        profile::rates::DENSE_SETTLED => crate::serve::SETTLE_METHOD,
         _ => return None,
     })
 }
@@ -153,8 +176,8 @@ mod tests {
         for key in crate::rates::keys_at(Some(std::time::Duration::from_millis(1))) {
             assert!(method(key).is_some(), "{key}");
         }
-        assert!(method(profile::fire::KERNEL_CURVES).is_some());
-        assert!(method(profile::fire::DENSE_SETTLED).is_some());
+        assert!(method(profile::rates::KERNEL_CURVES).is_some());
+        assert!(method(profile::rates::DENSE_SETTLED).is_some());
         assert_eq!(method("product_ns"), None);
     }
 
@@ -176,7 +199,7 @@ mod tests {
                 Target::Spirv => kernels_slang::spirv(key).unwrap(),
                 Target::Wgsl => kernels_slang::wgsl(key).unwrap().as_bytes(),
             };
-            assert_eq!(code(target, key), Some(profile::fire::fingerprint(bytes)));
+            assert_eq!(code(target, key), Some(profile::rates::fingerprint(bytes)));
         }
         assert_eq!(code(Target::Spirv, "no_such_kernel"), None);
         let absent = Kernel {

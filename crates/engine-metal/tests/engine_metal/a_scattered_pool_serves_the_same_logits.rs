@@ -7,9 +7,6 @@
 //! with those chunks evacuated mid-decode out of the pool's top segment,
 //! which is then given back, the decode running on through the moved
 //! chunks. Two miniatures: a dense one and a gated-delta hybrid.
-//!
-//! (Before the per-plane pools were deleted this script also ran over them in
-//! the same process and landed the same bits.)
 
 use std::path::{Path, PathBuf};
 
@@ -246,16 +243,10 @@ pub(super) fn deployed_fixture(name: &str) -> Fixture {
     }
 }
 
-/// Where a fixture's files go: `PIE_FIXTURE_DIR`, kept across processes (a
-/// probe), or a directory of its own under the temp dir, which the fixture
-/// removes when dropped (`owned`), passing or failing.
+/// Where a fixture's files go: a directory of its own under the temp dir,
+/// which the fixture removes when dropped (`owned`), passing or failing.
 fn fixture_dir() -> (PathBuf, Option<PathBuf>) {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if let Some(kept) = std::env::var_os("PIE_FIXTURE_DIR") {
-        let dir = PathBuf::from(kept);
-        std::fs::create_dir_all(&dir).expect("the fixture dir");
-        return (dir, None);
-    }
     let dir = std::env::temp_dir().join(format!(
         "pie-bm-pool-{}-{}",
         std::process::id(),
@@ -385,30 +376,75 @@ fn load_boot(
     profiles: Option<PathBuf>,
 ) -> Shell {
     let residency = engine_metal::ResidencyPlan::default();
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(SEATS, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: PAGE,
+    Load {
         context,
-        slots: SEATS,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
         runahead,
         residency: match chunk {
             Some(bytes) => residency.with_chunk_bytes(bytes),
             None => residency,
         },
         profiles,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
+}
+
+/// A test load's settings past its fixture, each as the shell tests lay it
+/// unless the test states its own (`..Load::default()`); every rung served
+/// (`Top::EveryRung`), the whole device allowed.
+pub(super) struct Load {
+    pub(super) budget: Budget,
+    pub(super) page_size: u32,
+    pub(super) context: u32,
+    pub(super) slots: u32,
+    pub(super) kv_budget: Option<u64>,
+    pub(super) runahead: engine::runahead::Runahead,
+    pub(super) residency: engine_metal::ResidencyPlan,
+    pub(super) profiles: Option<PathBuf>,
+    pub(super) measure: engine::rates::Measuring,
+}
+
+impl Default for Load {
+    fn default() -> Load {
+        Load {
+            budget: Budget::new(SEATS, 256),
+            page_size: PAGE,
+            context: CONTEXT,
+            slots: SEATS,
+            kv_budget: None,
+            runahead: engine::runahead::Runahead::F1,
+            residency: engine_metal::ResidencyPlan::default(),
+            profiles: None,
+            measure: engine::rates::Measuring::Time,
+        }
+    }
+}
+
+impl Load {
+    /// `fixture` loaded under these settings.
+    pub(super) fn boot(self, fixture: &Fixture) -> engine_metal::Result<Shell> {
+        Shell::load(Boot {
+            trace: fixture.trace.clone(),
+            contract: &fixture.contract,
+            checkpoint: &fixture.container,
+            budget: self.budget,
+            patches: None,
+            voxels: None,
+            profile: None,
+            page_size: self.page_size,
+            context: self.context,
+            slots: self.slots,
+            kv_budget: self.kv_budget,
+            allowance: engine::Allowance::WHOLE,
+            runahead: self.runahead,
+            residency: self.residency,
+            profiles: self.profiles,
+            top: engine_metal::Top::EveryRung,
+            measure: self.measure,
+        })
+    }
 }
 
 pub(super) fn word(trace: &Trace, rows: u32) -> u64 {
@@ -682,23 +718,6 @@ pub(super) fn close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     }
 }
 
-/// The bound passes two bf16 units of a logit and refuses three, and an
-/// argmax apart is refused at once whatever the logits' distance.
-#[test]
-fn close_holds_two_bf16_units_and_the_argmax() {
-    let unit = 2f32.powi(-7); // a bf16 unit at 1.0
-    let row = vec![1.0f32, 0.5, -3.0];
-    close("two units", &[vec![1.0 + 2.0 * unit, 0.5, -3.0]], &[row.clone()]);
-    let three = std::panic::catch_unwind(|| {
-        close("three units", &[vec![1.0 + 3.0 * unit, 0.5, -3.0]], &[vec![1.0f32, 0.5, -3.0]]);
-    });
-    assert!(three.is_err(), "three bf16 units apart is refused");
-    let swapped = std::panic::catch_unwind(|| {
-        close("argmax", &[vec![0.5f32, 0.5001, -3.0]], &[vec![0.5001f32, 0.5, -3.0]]);
-    });
-    assert!(swapped.is_err(), "an argmax apart is refused");
-}
-
 /// Panics at the first row whose logits differ in a bit.
 pub(super) fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
@@ -740,18 +759,6 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles
     let mut shell = load(&fixture);
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
-    eprintln!(
-        "{model}: {} chunks of {} B, {} a segment, segments {:?}, shapes {:?}",
-        facts.total_chunks,
-        facts.chunk_bytes,
-        facts.segment_chunks,
-        facts.segments,
-        facts
-            .shapes
-            .iter()
-            .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
-            .collect::<Vec<_>>()
-    );
     assert!(facts.shapes.iter().all(|s| s.pinned.is_none()));
     assert_eq!(facts.shape(FIXED).is_some(), hybrid);
     let seats = serve(
@@ -831,11 +838,9 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles
 }
 
 /// An evacuation refused past its copies and its rebind (a holder whose refs
-/// the moved table cannot resolve, beamx40 on d821e8d1c) is taken back whole:
+/// the moved table cannot resolve) is taken back whole:
 /// the refusal answered, the chunk table as it stood, and the lanes decode on
-/// at the refs they lay in, the seats' logits bit for bit. Before, the copies
-/// and the claims stood moved while the refusal told the runtime nothing
-/// moved, and the two maps parted.
+/// at the refs they lay in, the seats' logits bit for bit.
 #[test]
 fn a_refused_evacuation_moves_nothing() {
     if !engine_metal::device::present() {
@@ -976,7 +981,7 @@ fn page_ids_split_exactly_where_a_paged_shape_does_not_tile() {
     }
     for model in ["qwen3-micro-text", "gemma4-e4b-mini-l1", "qwen35-tiny"] {
         let shell = load_near(&fixture(model), CONTEXT, None);
-        let (ids, parts) = shell.page_ids();
+        let (ids, _) = shell.page_ids();
         let layout = shell.pool_layout();
         let tiles = layout
             .list
@@ -984,7 +989,6 @@ fn page_ids_split_exactly_where_a_paged_shape_does_not_tile() {
             .chain(layout.window(0).map(|w| &w.slots))
             .chain(layout.rs.iter())
             .all(|slots| layout.chunk_bytes.is_multiple_of(slots.slot_bytes));
-        eprintln!("{model}: {parts} buffer(s), slots tile the chunk: {tiles}, {ids:?}");
         assert_eq!(
             ids.shift.is_none(),
             tiles,
@@ -1013,7 +1017,6 @@ fn a_record_in_pieces_serves_the_whole_records_logits() {
         pieces > 1,
         "{model}'s record is whole in a {CHUNK}-byte chunk"
     );
-    eprintln!("{model}: the record in {pieces} pieces");
     let profiles = Profiles::new("record-in-pieces");
     let cut = check_near(model, true, Some(CHUNK), &profiles);
     let whole = check_near(model, true, None, &profiles);

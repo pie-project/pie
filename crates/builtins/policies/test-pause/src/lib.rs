@@ -2,7 +2,7 @@
 //! after its arrival for `pause-for-ms` (1000 without one), then lifts it:
 //! the host pauses it (its state parked on the tiers below the device) and
 //! resumes it. What a host's test of state that must survive the move uses
-//! (a beam group's page lists, BEAM-PAGE-LISTS §9). Named by `[runtime]
+//! (a beam group's page lists). Named by `[runtime]
 //! worker_policy`; the client states the hints as the process's props at
 //! launch.
 //!

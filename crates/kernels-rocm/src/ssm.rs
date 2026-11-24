@@ -1,9 +1,12 @@
 mod dyn_conv;
 pub use dyn_conv::dyn_conv;
 
-/// The kernel of a beam group's fold (`BEAM-PAGE-LISTS.md` §11.3) by the step it folds
-/// for: launched eagerly ahead of a fire's body, so no arming fire reaches
-/// it, and a load makes its kernel beforehand ([`FoldKernel::load`]).
+/// The kernel of a beam group's fold by the step it folds for. A group's rows
+/// below its beams' most recent common ancestor are the same in every live
+/// beam, so they fold into the set's state once and each beam carries only
+/// the rows after it. The kernel is launched eagerly ahead of a fire's body,
+/// so no arming fire reaches it, and a load makes it beforehand
+/// ([`FoldKernel::load`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldKernel {
     Conv1d,
@@ -16,15 +19,19 @@ impl FoldKernel {
     /// Compiles (or reads from the disk cache) and loads this fold's kernel
     /// on the current device, so that no serving fire does.
     pub fn load(self) -> Result<(), Error> {
-        let name = match self {
-            FoldKernel::Conv1d => "::pie::attn::ssm_conv1d_fold<::pie::bf16>".to_string(),
-            FoldKernel::GatedDelta => "::pie::attn::ssm_gdn_fold<16>".to_string(),
-            FoldKernel::Mamba2 => "::pie::attn::ssm_mamba2_fold".to_string(),
-            FoldKernel::Kda { head_dim } => {
-                format!("::pie::attn::ssm_kda_fold<{head_dim}, {KDA_TILE_ROWS}>")
-            }
+        let (file, name) = match self {
+            FoldKernel::Conv1d => (
+                CONV_FILE,
+                "::pie::attn::ssm_conv1d_fold<::pie::bf16>".to_string(),
+            ),
+            FoldKernel::GatedDelta => (GDN_FILE, "::pie::attn::ssm_gdn_fold<16>".to_string()),
+            FoldKernel::Mamba2 => (MAMBA2_FILE, "::pie::attn::ssm_mamba2_fold".to_string()),
+            FoldKernel::Kda { head_dim } => (
+                KDA_FILE,
+                format!("::pie::attn::ssm_kda_fold<{head_dim}, {KDA_TILE_ROWS}>"),
+            ),
         };
-        kernel(FILE, &name).load()
+        kernel(file, &name).load()
     }
 }
 
@@ -36,7 +43,11 @@ use crate::jit::{
 };
 use crate::tensor::{RaggedTensor, RecurrentPool, StateRows, Tensor};
 
-const FILE: &str = "ssm/mixers.hip";
+/// The mixers' units, a family each (`kernels/ssm/`).
+const CONV_FILE: &str = "ssm/conv.hip";
+const GDN_FILE: &str = "ssm/gdn.hip";
+const KDA_FILE: &str = "ssm/kda.hip";
+const MAMBA2_FILE: &str = "ssm/mamba2.hip";
 
 /// A decode step's carried rows (`ssm/carry.hip`'s `Carry`), passed by
 /// value: the staged rs tables a lane's buffered rows are read through
@@ -91,10 +102,10 @@ impl Carry {
     }
 }
 
-/// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3, `ssm/carry.hip`'s
-/// `GroupFold`): its representative lane (any of its lanes; they share the
-/// set's state), where its fold rows start in the replay table, and how
-/// many. The fold kernels read a device table of them: the groups that fold
+/// A beam group's fold of its rows below its common ancestor ([`FoldKernel`],
+/// `ssm/carry.hip`'s `GroupFold`): its representative lane (any of its
+/// lanes; they share the set's state), where its fold rows start in the
+/// replay table, and how many. The fold kernels read a device table of them: the groups that fold
 /// lead it, and the first entry of no rows ends it (a block folds each group
 /// in turn, so an empty table costs a read, not a block a group).
 #[repr(C)]
@@ -110,9 +121,9 @@ const _: () = assert!(size_of::<GroupFold>() == 12);
 /// A thread a channel for the group folds of the conv window.
 const FOLD_CONV_BLOCK: u32 = 256;
 
-/// Folds each group's rows into its conv window (§11.3): the window stored as
-/// it stands after them, from the committed cells and the rows' inputs
-/// (`carry`'s plane 0) (`ssm_conv1d_fold`).
+/// Folds each group's common rows into its conv window ([`FoldKernel`]):
+/// the window stored as it stands after them, from the committed cells and
+/// the rows' inputs (`carry`'s plane 0) (`ssm_conv1d_fold`).
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_fold(
     ctx: &Ctx,
@@ -131,7 +142,7 @@ pub fn conv1d_fold(
     let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_conv1d_fold<::pie::bf16>"))
+        Fire::at(kernel(CONV_FILE, "::pie::attn::ssm_conv1d_fold<::pie::bf16>"))
             .apply(Launch::grid([channels.div_ceil(FOLD_CONV_BLOCK), 1, 1], [FOLD_CONV_BLOCK, 1, 1])),
         &[
             rows.arg(),
@@ -146,9 +157,9 @@ pub fn conv1d_fold(
     )
 }
 
-/// Folds each group's rows into its gated-delta state (§11.3), from the kept
-/// planes (`carry`: `[b | a]`, keys, corrected values), rounded as a token's
-/// step stores them (`ssm_gdn_fold`).
+/// Folds each group's common rows into its gated-delta state ([`FoldKernel`]),
+/// from the kept planes (`carry`: `[b | a]`, keys, corrected values),
+/// rounded as a token's step stores them (`ssm_gdn_fold`).
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_fold(
     ctx: &Ctx,
@@ -176,7 +187,7 @@ pub fn gated_delta_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_fold<16>"))
+        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_fold<16>"))
             .apply(Launch::grid([v_dim / CARRIED_BV, v_heads, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
@@ -448,7 +459,11 @@ fn conv1d_update(
         state.write_state_mask.arg(),
         ctx.stage(),
     ];
-    ctx.fire(op, Fire::at(kernel(FILE, &entrypoint)).apply(launch), &args)
+    ctx.fire(
+        op,
+        Fire::at(kernel(CONV_FILE, &entrypoint)).apply(launch),
+        &args,
+    )
 }
 
 /// The causal conv's decode step over each lane's carried rows then its own
@@ -485,35 +500,6 @@ pub fn causal_conv1d_carried(
         ConvOut::Silu,
         carry,
         keys,
-    )
-}
-
-/// [`short_conv`] over each lane's carried rows then its own, as
-/// [`causal_conv1d_carried`].
-#[allow(clippy::too_many_arguments)]
-pub fn short_conv_carried(
-    ctx: &Ctx,
-    x: Tensor,
-    weight: Tensor,
-    state: &RecurrentPool,
-    conv_width: u32,
-    y: &mut Tensor,
-    carry: &Carry,
-) -> Result<(), Error> {
-    const OP: &str = "ssm.short_conv";
-    conv1d_carried(
-        ctx,
-        OP,
-        x,
-        weight,
-        None,
-        state,
-        conv_width,
-        1,
-        y,
-        ConvOut::Residual,
-        carry,
-        None,
     )
 }
 
@@ -569,7 +555,11 @@ fn conv1d_carried(
         stated(op, keys.map_or(0, |(_, len)| len))?.arg(),
         ctx.stage(),
     ];
-    ctx.fire(op, Fire::at(kernel(FILE, &entrypoint)).apply(launch), &args)
+    ctx.fire(
+        op,
+        Fire::at(kernel(CONV_FILE, &entrypoint)).apply(launch),
+        &args,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -675,7 +665,7 @@ fn conv1d_chunked(
         );
         ctx.fire(
             op,
-            Fire::at(kernel(FILE, &entrypoint)).apply(launch),
+            Fire::at(kernel(CONV_FILE, &entrypoint)).apply(launch),
             &[
                 x.data.arg(),
                 weight.arg(),
@@ -702,7 +692,7 @@ fn conv1d_chunked(
         );
         ctx.fire(
             op,
-            Fire::at(kernel(FILE, &entrypoint)).apply(launch),
+            Fire::at(kernel(CONV_FILE, &entrypoint)).apply(launch),
             &[
                 x.data.arg(),
                 weight.arg(),
@@ -728,7 +718,7 @@ fn conv1d_chunked(
     let [snap, snap_rows, snap_slots] = state.snapshots.args();
     ctx.fire(
         op,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_conv1d_state_commit")).apply(Launch::grid(
+        Fire::at(kernel(CONV_FILE, "::pie::attn::ssm_conv1d_state_commit")).apply(Launch::grid(
             [channels.div_ceil(TILE_BLOCK), lanes, 1],
             [TILE_BLOCK, 1, 1],
         )),
@@ -779,7 +769,7 @@ pub fn gdn_gates(
     let rows = nonzero(OP, "rows", ba.rows)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_prep_ba_gates")).apply(Launch::grid(
+        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_prep_ba_gates")).apply(Launch::grid(
             [rows, v_heads.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -894,7 +884,7 @@ impl Delta {
         let q_scale = (self.k_dim as f32).sqrt().recip();
         ctx.fire(
             op,
-            Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_prep_qk_norm<128>"))
+            Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_prep_qk_norm<128>"))
                 .apply(Launch::grid([self.n, self.k_heads, 1], [PREP_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
@@ -909,7 +899,7 @@ impl Delta {
         )?;
         ctx.fire(
             op,
-            Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_prep_v_gates<128>"))
+            Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_prep_v_gates<128>"))
                 .apply(Launch::grid([self.n, self.v_heads, 1], [PREP_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
@@ -1039,7 +1029,7 @@ pub fn gated_delta_carried(
     if shape.k_dim == CHUNK_HEAD && shape.v_dim == CHUNK_HEAD {
         return ctx.fire(
             OP,
-            Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_rows_carried<128, 128, 256>"))
+            Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_rows_carried<128, 128, 256>"))
                 .apply(Launch::grid([v_heads, n, 1], [FUSED_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
@@ -1062,7 +1052,7 @@ pub fn gated_delta_carried(
     }
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_step_carried<16>")).apply(Launch::grid(
+        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_step_carried<16>")).apply(Launch::grid(
             [v_dim / CARRIED_BV, n, v_heads],
             [BLOCK, 1, 1],
         )),
@@ -1132,7 +1122,7 @@ pub fn gated_delta_tail(
     let conv_dim = 2 * k_heads * k_dim + v_heads * v_dim;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_tail_corrected<16>")).apply(Launch::grid(
+        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_tail_corrected<16>")).apply(Launch::grid(
             [v_dim / CARRIED_BV, lanes, v_heads],
             [BLOCK, 1, 1],
         )),
@@ -1234,7 +1224,7 @@ pub fn gdn_step_fused(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            FILE,
+            GDN_FILE,
             "::pie::attn::ssm_gdn_step_fused<128, 128, 256, 4>",
         ))
         .apply(Launch::grid([v_heads, n, 1], [FUSED_BLOCK, 1, 1])),
@@ -1336,7 +1326,7 @@ pub fn gdn_step_fused_carried(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            FILE,
+            GDN_FILE,
             "::pie::attn::ssm_gdn_step_fused_carried<128, 128, 256, 4>",
         ))
         .apply(Launch::grid([v_heads, n, 1], [FUSED_BLOCK, 1, 1])),
@@ -1403,7 +1393,7 @@ impl Delta {
         ctx.fire(
             op,
             Fire::at(kernel(
-                FILE,
+                GDN_FILE,
                 "::pie::attn::ssm_gdn_decode_rows<128, 128, 256>",
             ))
             .apply(Launch::grid([self.v_heads, self.n, 1], [FUSED_BLOCK, 1, 1])),
@@ -1438,7 +1428,7 @@ impl Delta {
         let q_scale = (self.k_dim as f32).sqrt().recip();
         ctx.fire(
             op,
-            Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_decode_step<16>")).apply(Launch::grid(
+            Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_decode_step<16>")).apply(Launch::grid(
                 [self.v_dim / FUSED_BV, self.n, self.v_heads],
                 [FUSED_BLOCK, 1, 1],
             )),
@@ -1461,6 +1451,7 @@ impl Delta {
     }
 }
 
+#[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_chunked_serial(
     ctx: &Ctx,
@@ -1531,7 +1522,7 @@ pub fn gated_delta_chunked(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            FILE,
+            GDN_FILE,
             &format!("::pie::attn::ssm_gdn_scan<{bk}, {bv}>"),
         ))
         .apply(Launch::grid(
@@ -1681,7 +1672,7 @@ fn chunk_parallel(
     ];
     ctx.fire(
         op,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_chunk_wu<128, 128>"))
+        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_chunk_wu<128, 128>"))
             .apply(Launch::grid([slots, v_heads, 1], [2 * BLOCK, 1, 1])),
         &args,
     )?;
@@ -1711,7 +1702,7 @@ fn chunk_parallel(
     ctx.fire(
         op,
         Fire::at(kernel(
-            FILE,
+            GDN_FILE,
             &format!("::pie::attn::ssm_gdn_chunk_h<128, 128, {bvt}>"),
         ))
         .apply(Launch::grid(
@@ -1736,7 +1727,7 @@ fn chunk_parallel(
     common(&mut args)?;
     ctx.fire(
         op,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_chunk_o<128, 128>"))
+        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_chunk_o<128, 128>"))
             .apply(Launch::grid([slots, v_heads, 1], [BLOCK, 1, 1])),
         &args,
     )
@@ -1841,7 +1832,7 @@ impl Kda {
 
         ctx.fire(
             op,
-            Fire::at(kernel(FILE, "::pie::attn::ssm_kda_qkv_prep<128>")).apply(Launch::grid(
+            Fire::at(kernel(KDA_FILE, "::pie::attn::ssm_kda_qkv_prep<128>")).apply(Launch::grid(
                 [
                     self.n,
                     PLANES,
@@ -1862,7 +1853,7 @@ impl Kda {
         )?;
         ctx.fire(
             op,
-            Fire::at(kernel(FILE, "::pie::attn::ssm_kda_gate_beta")).apply(Launch::grid(
+            Fire::at(kernel(KDA_FILE, "::pie::attn::ssm_kda_gate_beta")).apply(Launch::grid(
                 [self.n, self.width.div_ceil(4 * PREP_BLOCK), 1],
                 [PREP_BLOCK, 1, 1],
             )),
@@ -1957,7 +1948,7 @@ pub fn kda(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            FILE,
+            KDA_FILE,
             &format!("::pie::attn::ssm_kda_step_batched<{head_dim}, {rows}>"),
         ))
         .apply(Launch::grid(
@@ -2026,7 +2017,7 @@ pub fn kda_carried(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            FILE,
+            KDA_FILE,
             &format!("::pie::attn::ssm_kda_step_carried<{head_dim}, {rows}>"),
         ))
         .apply(Launch::grid(
@@ -2092,7 +2083,7 @@ pub fn kda_tail(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            FILE,
+            KDA_FILE,
             &format!("::pie::attn::ssm_kda_tail_corrected<{head_dim}, {rows}>"),
         ))
         .apply(Launch::grid([heads, lanes, head_dim / rows], [STEP_BLOCK, 1, 1])),
@@ -2117,8 +2108,9 @@ pub fn kda_tail(
     )
 }
 
-/// Folds each group's rows into its KDA state (§11.3), from the kept planes
-/// (`carry`: forget rows, beta, keys, corrected values) (`ssm_kda_fold`).
+/// Folds each group's common rows into its KDA state ([`FoldKernel`]), from
+/// the kept planes (`carry`: forget rows, beta, keys, corrected values)
+/// (`ssm_kda_fold`).
 #[allow(clippy::too_many_arguments)]
 pub fn kda_fold(
     ctx: &Ctx,
@@ -2144,7 +2136,7 @@ pub fn kda_fold(
     let rows = KDA_TILE_ROWS;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, &format!("::pie::attn::ssm_kda_fold<{head_dim}, {rows}>")))
+        Fire::at(kernel(KDA_FILE, &format!("::pie::attn::ssm_kda_fold<{head_dim}, {rows}>")))
             .apply(Launch::grid([heads, head_dim / rows, 1], [STEP_BLOCK, 1, 1])),
         &[
             state_rows.arg(),
@@ -2163,6 +2155,7 @@ pub fn kda_fold(
 
 /// `kda_chunked` through the token-by-token scan whatever the head: the
 /// reference the chunk-parallel passes answer to.
+#[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn kda_chunked_serial(
     ctx: &Ctx,
@@ -2235,7 +2228,7 @@ pub fn kda_chunked(
     ctx.fire(
         OP,
         Fire::at(kernel(
-            FILE,
+            KDA_FILE,
             &format!("::pie::attn::ssm_kda_chunked_batched<{head_dim}>"),
         ))
         .apply(Launch::grid([lanes, shape.heads, 1], [8 * head_dim, 1, 1])),
@@ -2322,7 +2315,7 @@ fn kda_chunk_parallel(
     ];
     ctx.fire(
         op,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_kda_chunk_wu<128>"))
+        Fire::at(kernel(KDA_FILE, "::pie::attn::ssm_kda_chunk_wu<128>"))
             .apply(Launch::grid([slots, heads, 1], [2 * BLOCK, 1, 1])),
         &args,
     )?;
@@ -2347,7 +2340,7 @@ fn kda_chunk_parallel(
     tail(&mut args)?;
     ctx.fire(
         op,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_kda_chunk_ho<128>")).apply(Launch::grid(
+        Fire::at(kernel(KDA_FILE, "::pie::attn::ssm_kda_chunk_ho<128>")).apply(Launch::grid(
             [lanes * heads * (d / CHUNK_SLICE), 1, 1],
             [BLOCK, 1, 1],
         )),
@@ -2441,7 +2434,7 @@ pub fn mamba2(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_step"))
+        Fire::at(kernel(MAMBA2_FILE, "::pie::attn::ssm_mamba2_step"))
             .apply(Launch::grid([n, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.arg(),
@@ -2487,7 +2480,7 @@ pub fn mamba2_carried(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_step_carried"))
+        Fire::at(kernel(MAMBA2_FILE, "::pie::attn::ssm_mamba2_step_carried"))
             .apply(Launch::grid([n, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.arg(),
@@ -2539,7 +2532,7 @@ pub fn mamba2_tail(
     let xb = inner + m.groups * state_dim;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_tail_rows"))
+        Fire::at(kernel(MAMBA2_FILE, "::pie::attn::ssm_mamba2_tail_rows"))
             .apply(Launch::grid([lanes, 1, 1], [TAIL_BLOCK, 1, 1])),
         &[
             xbc.arg(),
@@ -2556,7 +2549,8 @@ pub fn mamba2_tail(
     )
 }
 
-/// Folds each group's rows into its Mamba-2 state (§11.3), from the kept
+/// Folds each group's common rows into its Mamba-2 state ([`FoldKernel`]),
+/// from the kept
 /// planes (`carry`: step sizes, convolved `x | B`) (`ssm_mamba2_fold`).
 pub fn mamba2_fold(
     ctx: &Ctx,
@@ -2574,7 +2568,7 @@ pub fn mamba2_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_fold"))
+        Fire::at(kernel(MAMBA2_FILE, "::pie::attn::ssm_mamba2_fold"))
             .apply(Launch::grid([m.heads, 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
@@ -2634,7 +2628,7 @@ fn mamba2_scan(
     let [snap, snap_rows, snap_slots] = state.snapshots.args();
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::attn::ssm_mamba2_scan"))
+        Fire::at(kernel(MAMBA2_FILE, "::pie::attn::ssm_mamba2_scan"))
             .apply(Launch::grid([lanes, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.data.arg(),

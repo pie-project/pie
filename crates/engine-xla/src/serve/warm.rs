@@ -1458,14 +1458,14 @@ fn keep_width(width: &super::LoadWidth, knee: usize) {
         ),
         registry: crate::chip::registry(),
     };
-    let measured = profile::fire::Rates {
+    let measured = profile::rates::Rates {
         load_width: u32::try_from(knee).ok(),
         measured_on: Some(on.clone()),
         measured_by: Some(vec![(
-            profile::fire::LOAD_WIDTH.to_string(),
+            profile::rates::LOAD_WIDTH.to_string(),
             crate::stored::load_width_by(),
         )]),
-        ..profile::fire::Rates::default()
+        ..profile::rates::Rates::default()
     };
     match engine::rates::save_rates(&save, &measured) {
         Ok(saved) => tracing::info!(profile = %saved, width = knee, "xla loader width kept"),

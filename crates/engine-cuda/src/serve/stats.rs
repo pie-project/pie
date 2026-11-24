@@ -64,7 +64,7 @@ impl Shell {
             .map_or(0, |routes| routes.fingerprint());
         format!(
             "cuda|{}|kernels {}|emitter {}|routes {routes:#010x}|lanes {} tokens {}",
-            profile::fire::Now::on(&self.keys),
+            profile::rates::Now::on(&self.keys),
             self.keys.codes_said(),
             eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION,
             self.budget.max_lanes,
@@ -177,12 +177,12 @@ impl Shell {
         self.accounting
     }
 
-    /// See `Engine::commit_segments`: off a fire's path.
+    /// See `Pool::commit`: off a fire's path.
     pub fn commit_segments(&mut self, segments: u32) -> crate::Result<()> {
         self.pools.commit_segments(segments)
     }
 
-    /// See `Engine::release_segments`. The runtime has waited out every
+    /// See `Pool::release`. The runtime has waited out every
     /// frame that named the segments' chunks; what the stream still holds
     /// (an evacuation's copy out of them) lands first.
     pub fn release_segments(&mut self, segments: u32) -> crate::Result<()> {
@@ -190,7 +190,7 @@ impl Shell {
         self.pools.release_segments(segments)
     }
 
-    /// See `Engine::evacuate`: the copy and the table change are ordered on
+    /// See `Pool::evacuate`: the copy and the table change are ordered on
     /// the stream behind every fire enqueued so far and before the next.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {
         self.evacuate_with(evacuation, &[]).map(drop)
@@ -233,7 +233,7 @@ impl Shell {
         Ok(at)
     }
 
-    /// The state pool's chunk table as it stands (`Engine::chunk_table`).
+    /// The state pool's chunk table as it stands (`Pool::chunk_table`).
     #[must_use]
     pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
         self.pools.chunk_table()
@@ -310,7 +310,7 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::weight_residency`: stream-ordered before the next fire.
+    /// See `WeightCache::set_residency`: stream-ordered before the next fire.
     /// Answers what the fit holds back of the chunks stated
     /// ([`Self::held_and_outside`]) once the set is taken.
     pub fn weight_residency(
@@ -367,8 +367,8 @@ impl Shell {
                 if self.pools.weights_located() {
                     // The recorded bodies keep the plain-load select they
                     // chose, which reads a located table as well.
-                    eprintln!(
-                        "engine-cuda: a held weight set arrived after lanes named slot refs; \
+                    tracing::info!(
+                        "a held weight set arrived after lanes named slot refs; \
                          the recorded bodies keep the per-route select (send the set before \
                          the first fire)"
                     );
@@ -404,8 +404,8 @@ impl Shell {
             let freed = tier.release_host(&held);
             if freed > 0 {
                 self.pools.drop_weight_hosts();
-                eprintln!(
-                    "engine-cuda: the weights the pool holds whole are read from it alone; \
+                tracing::info!(
+                    "the weights the pool holds whole are read from it alone; \
                      {} MiB of their host copy freed",
                     freed >> 20
                 );
@@ -421,7 +421,7 @@ impl Shell {
         self.pools.row_blocks()
     }
 
-    /// See `Engine::weight_uses`.
+    /// See `WeightCache::uses`.
     pub fn weight_uses(&mut self) -> crate::Result<engine::chunk::WeightUses> {
         self.pools.weight_uses(self.device.stream())
     }
@@ -459,7 +459,7 @@ impl Shell {
             .copy_whole_slots(self.device.stream(), shape, pairs)
     }
 
-    /// Copies whole slots of `shape` between tiers (CONTRACT-BC 22), on
+    /// Copies whole slots of `shape` between tiers, on
     /// the stream behind the fires enqueued and ahead of the next.
     pub fn copy_tier_slots(
         &mut self,

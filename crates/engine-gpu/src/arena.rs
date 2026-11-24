@@ -142,6 +142,7 @@ pub fn grain(map: &ArenaMap, value: ValueId) -> Option<Grain> {
 }
 
 impl Rung {
+    #[allow(clippy::too_many_arguments)]
     fn lay<T: Tactics + ?Sized>(
         trace: &Trace,
         compiled: &CompiledModel,
@@ -150,6 +151,8 @@ impl Rung {
         paging: Paging,
         tuning: &T,
         routers: &[u32],
+        planes: &[u64],
+        max_buffer: u64,
     ) -> Result<Rung> {
         let map = if tokens >= budgets.tokens.max_tokens {
             compiled.arena.clone()
@@ -162,7 +165,7 @@ impl Rung {
             })?
         };
         let rooms = Rooms::lay(
-            trace, compiled, &map, budgets, tokens, paging, tuning, routers,
+            trace, compiled, &map, budgets, tokens, paging, tuning, routers, planes, max_buffer,
         );
         let rooms_at = map.bytes.next_multiple_of(ALIGN);
         let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
@@ -241,12 +244,20 @@ impl<B: Backend> Span<B> {
         tokens: &[u32],
         paging: Paging,
         tuning: &B::Tuning,
+        max_buffer: u64,
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
+        // A projection whose bank outgrows one binding lands its logits in
+        // a room of the rung's, a run of rows at a time.
+        let planes = crate::weights::plane_bytes(trace)?;
         let capture = CaptureRows::of(trace, paging.context(), paging.page_size)?;
         let rungs = tokens
             .iter()
-            .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
+            .map(|&tokens| {
+                Rung::lay(
+                    trace, compiled, budgets, tokens, paging, tuning, &routers, &planes, max_buffer,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Span {
             widest: (0..rungs.len()).collect(),
@@ -464,13 +475,17 @@ impl<B: Backend> Span<B> {
         for value in 0..at.map.placements.len() {
             let value = ValueId(value as u32);
             // A fire that captures nothing lays no row: a capture's value
-            // has no rectangle, so it binds none.
-            let grain = captured.and_then(|_| grain(&at.map, value));
-            slots.push(match (grain, captured) {
-                (Some(Grain::Keys), Some((keys, _))) => Some(keys),
-                (Some(Grain::Pages), Some((_, pages))) => pages,
-                (Some(_), None) => None,
-                (None, _) => match rect(&at.map, value, rows) {
+            // binds no rows (its kernels launch none), the absent buffer
+            // in their place.
+            let grain = self.capture.and_then(|_| grain(&at.map, value));
+            let none = |width: u32| Some(Tensor::new(crate::NIL, 0, width, Dtype::F32));
+            slots.push(match (grain, captured, self.capture) {
+                (Some(Grain::Keys), Some((keys, _)), _) => Some(keys),
+                (Some(Grain::Pages), Some((_, Some(pages))), _) => Some(pages),
+                (Some(Grain::Keys), _, Some(capture)) => none(capture.keys),
+                (Some(Grain::Pages), _, Some(capture)) => none(capture.pages),
+                (Some(_), _, None) => None,
+                (None, _, _) => match rect(&at.map, value, rows) {
                     // Bound at its room, what the rung's map lays for it, not
                     // at the rows this fire brings: a view then depends on
                     // where the value lies, so what a dispatch binds over it

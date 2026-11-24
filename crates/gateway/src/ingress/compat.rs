@@ -51,7 +51,7 @@ use worker_api::{Priority, Tokens};
 
 use crate::GatewayState;
 use crate::ingress::identity::REQUEST_ID_HEADER;
-use crate::session::{Affinity, Identity, Resume, SessionError, SessionHandle, TokenRx, TurnInput};
+use crate::session::{Identity, Resume, SessionError, SessionHandle, TokenRx, TurnInput};
 
 /// Route → the built-in inferlet that serves it.
 pub const ROUTES: &[(&str, &str)] = &[
@@ -252,6 +252,31 @@ fn overflow(message: &str) -> Option<Response> {
     })
 }
 
+/// The runtime's stable error codes, carried at the head of a failed
+/// process's result as `[code] ...` (`runtime::planner::PlannerError::code`)
+/// through the worker's reply unchanged: the client reads `code` by machine.
+/// An admission refusal is retried (503); every tier full fails the process
+/// for good (503 too, its own code).
+const CODED: &[(&str, &str)] = &[
+    ("[admission_refused]", "admission_refused"),
+    ("[tiers_full]", "tiers_full"),
+];
+
+/// A failure the runtime coded, with its code in the error body.
+fn coded(message: &str) -> Option<Response> {
+    CODED.iter().find(|(tag, _)| message.contains(tag)).map(|&(_, code)| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {
+                "message": message,
+                "type": "server_error",
+                "code": code,
+            }})),
+        )
+            .into_response()
+    })
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -315,7 +340,7 @@ impl Launch {
         };
         self.state
             .sessions
-            .create(self.identity.clone(), turn, Affinity::Ephemeral)
+            .create(self.identity.clone(), turn)
             .await
     }
 }
@@ -419,7 +444,7 @@ async fn relay(
         match rx.recv().await {
             Some(Tokens::Chunk(ServerMessage::Response { ok, result, .. })) => {
                 if !ok {
-                    if let Some(response) = overflow(&result) {
+                    if let Some(response) = coded(&result).or_else(|| overflow(&result)) {
                         return response;
                     }
                     let status = if result.contains("not installed")
@@ -498,7 +523,7 @@ fn error_response(value: &str) -> Response {
     {
         return (status, Json(body.clone())).into_response();
     }
-    if let Some(response) = overflow(value) {
+    if let Some(response) = coded(value).or_else(|| overflow(value)) {
         return response;
     }
     error_body(StatusCode::INTERNAL_SERVER_ERROR, value)
@@ -639,7 +664,7 @@ pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Re
     };
     let (_handle, mut rx) = match state
         .sessions
-        .create(identity(&headers), turn, Affinity::Ephemeral)
+        .create(identity(&headers), turn)
         .await
     {
         Ok(pair) => pair,
@@ -679,6 +704,36 @@ pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure the runtime coded keeps its code to the client: the
+    /// worker's reply carries the process's result unchanged, and the
+    /// gateway's body names the code by machine.
+    #[tokio::test]
+    async fn a_coded_runtime_failure_reaches_the_client_with_its_code() {
+        for (message, code) in [
+            (
+                "fire: acquire 9 pages: [admission_refused] refused at admission: the first ask of 9 kv pages fits nowhere",
+                "admission_refused",
+            ),
+            ("acquire 1 pages: [tiers_full] every tier is full", "tiers_full"),
+            // As the runtime leads a wrapped failure: the code first, the
+            // chain after it.
+            (
+                "[tiers_full] Call error: fire: acquire 1 pages\n\nCaused by:\n    [tiers_full] every tier is full",
+                "tiers_full",
+            ),
+            (
+                "[admission_refused] fire: acquire 9 pages: [admission_refused] refused at admission",
+                "admission_refused",
+            ),
+        ] {
+            let response = error_response(message);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], code, "{body}");
+        }
+    }
 
     #[test]
     fn a_reply_keeps_what_its_frames_covered_and_the_client_never_sees_it() {

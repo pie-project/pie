@@ -39,10 +39,6 @@ pub struct ResidencyPlanner {
     /// the head and the pages gathered: the step, the map, the wants and
     /// the stall line read it once a pass, not once each.
     pub(super) need_cache: parking_lot::Mutex<Option<(u64, EntryKey, u32, Option<RunNeed>)>>,
-    /// The capacity gate's last place gained room: a newcomer held at a
-    /// gate before its first ask looks again ([`Self::admits`]). Fired on
-    /// every read that raises it and on every departure, never on a clock.
-    pub(super) allowance_rose: Notify,
     /// Events that can change a pass's answer the pool's own counts do not
     /// show: an arrival, a departure, a landing, a policy answer, each a
     /// poke ([`Self::poke`]). Part of [`Self::generation`].
@@ -120,21 +116,6 @@ pub struct ResidencyPlanner {
     weight_shed: Option<WeightShed>,
 }
 
-// How far short the safe order stood at its last read (for tests,
-// `ResidencyPlanner::order_least`).
-#[cfg(test)]
-thread_local! {
-    static ORDER_LEAST: std::cell::Cell<Option<i128>> = const { std::cell::Cell::new(None) };
-}
-
-/// The first's room in the order: what it has free less its need.
-#[cfg(test)]
-fn free_first(order: &[(u64, u64, super::inner::CapacityRead)]) -> i128 {
-    order
-        .first()
-        .map_or(i128::MAX, |&(need, _, read)| read.free() as i128 - need as i128)
-}
-
 /// How long a process waits at admission before it says why, and again
 /// after each such span: what a stall at the gates is read from.
 pub(super) const ADMIT_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
@@ -168,7 +149,6 @@ impl ResidencyPlanner {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             need_cache: parking_lot::Mutex::new(None),
-            allowance_rose: Notify::new(),
             events: AtomicU64::new(0),
             force_moves: AtomicBool::new(false),
             pass_landed: AtomicU64::new(0),
@@ -263,11 +243,13 @@ impl ResidencyPlanner {
         if !self.short.lock().is_short(head.1) {
             return false;
         }
-        // The host is what is short: the policy frees it by letting a set at
-        // rest go, and the head waits until one does.
-        if self.short.lock().host_short(head.1) {
-            return true;
-        }
+        // The host short or the device: the policy frees it by letting a
+        // set at rest go, idle cache or a checkpoint, and the head waits
+        // until one does, where there is one to let go. With none, no
+        // answer of the policy's frees anything: no wait on it (every tier
+        // full and nothing runnable is then a named failure,
+        // [`Self::fail_tiers_full`], never a wait on an answer that
+        // cannot come).
         let (model, engine) = self.port.locus();
         resting
             || self.port.reclaimable_idle() > 0
@@ -323,322 +305,6 @@ impl ResidencyPlanner {
         }
     }
 
-    /// The capacity gate as it stands ([`super::inner::CapacityGate`]): the
-    /// finisher, the oldest admitted process not idle, and what every tier's
-    /// room leaves past what is held (idle cache counted free: the policy
-    /// lets it go) and the finisher's headroom, its end less the kv pages
-    /// it holds on every tier. `None` where the pool states no end or keeps
-    /// no chunks, or nothing is admitted.
-    #[cfg(test)]
-    pub(super) fn capacity_gate(&self) -> Option<super::inner::CapacityGate> {
-        self.capacity_order().map(|(gate, _)| gate)
-    }
-
-    /// The gate and each process's place in its order
-    /// ([`super::inner::CapacityGate`]).
-    pub(super) fn capacity_order(
-        &self,
-    ) -> Option<(super::inner::CapacityGate, std::collections::HashMap<ProcessId, u64>)> {
-        self.capacity_reads().map(|(read, places, last)| {
-            let mut gate = read.gate();
-            // What one not in the order (a new process's first ask) may
-            // take: the place after the last.
-            gate.spare = last;
-            (gate, places.into_iter().collect())
-        })
-    }
-
-    /// The gate and its order as a pass reads them, set for the pass's
-    /// asks; a read that gives the last place more than the one before
-    /// wakes the newcomers held for it ([`Self::admits`]).
-    pub(super) fn read_capacity(&self) {
-        let order = self.capacity_order();
-        let rose = self.with_inner(|inner| {
-            let was = inner.capacity.map(|gate| gate.allowance(None));
-            inner.set_capacity(order);
-            let now = inner.capacity.map(|gate| gate.allowance(None));
-            match (was, now) {
-                (Some(was), Some(now)) => now > was,
-                (_, None) => true,
-                (None, Some(_)) => false,
-            }
-        });
-        if rose {
-            self.allowance_rose.notify_waiters();
-        }
-    }
-
-    /// Whether a newcomer may go on to its first ask: what it holds at its
-    /// first step is priced there, by the capacity gate at the order's last
-    /// place with the finisher's headroom and margin
-    /// ([`Self::capacity_holds`]), never at the declared context. Held here
-    /// while the last place has no room for any ask, it takes nothing it
-    /// would hold against the order while it waits. One already in the
-    /// order, or with no gate to read (nothing admitted: it alone may
-    /// finish), goes on.
-    pub fn admits(&self, pid: ProcessId) -> bool {
-        if self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| proc.admitted)) {
-            return true;
-        }
-        self.capacity_order()
-            .is_none_or(|(gate, places)| places.contains_key(&pid) || gate.allowance(None) > 0)
-    }
-
-    /// Waits until [`Self::admits`] lets `pid` on: woken by a read that
-    /// raises the last place (a retire, a grant given back, a move landed,
-    /// a segment committed: each plans a pass) or a departure.
-    pub async fn admitted_to_ask(&self, pid: ProcessId) {
-        let mut counted = false;
-        loop {
-            let rose = self.allowance_rose.notified();
-            tokio::pin!(rose);
-            rose.as_mut().enable();
-            if self.admits(pid) {
-                return;
-            }
-            if !std::mem::replace(&mut counted, true) {
-                self.stats.admission_waits.fetch_add(1, Ordering::Relaxed);
-                // Said once a newcomer: how many the gate held, and when.
-                tracing::info!(%pid, "planner: a newcomer waits for room at the capacity gate's last place");
-            }
-            rose.await;
-        }
-    }
-
-    /// The figures the capacity gate is read from ([`Self::capacity_gate`]).
-    #[cfg(test)]
-    pub(super) fn capacity_read(&self) -> Option<super::inner::CapacityRead> {
-        self.capacity_reads().map(|(read, ..)| read)
-    }
-
-    /// [`Self::capacity_read`] and each process's allowance in the gate's
-    /// order: past the first, the least room any process ahead of it would
-    /// be left with to finish in turn.
-    #[allow(clippy::type_complexity)]
-    fn capacity_reads(&self) -> Option<(super::inner::CapacityRead, Vec<(ProcessId, u64)>, u64)> {
-        let end = self.port.context_pages()?;
-        // Pages the planner gathered and holds for its heads are free too:
-        // counted taken, gathering for a head held it at the gate, given
-        // back it went again, a pass that never ended.
-        let (candidates, gathered, residents, priority) = self.with_inner(|inner| {
-            let mut candidates: Vec<(u64, ProcessId, bool, u64)> = inner
-                .procs
-                .iter()
-                .filter(|(_, proc)| proc.admitted && !proc.idle && !proc.held)
-                .map(|(pid, proc)| {
-                    // The room its binds wait for: queued, or the bind that
-                    // suspended it.
-                    let queued: u64 = inner
-                        .queue
-                        .values()
-                        .filter(|waiter| {
-                            waiter.pid == *pid
-                                && matches!(waiter.kind, WaitKind::BindRoom { rise: None, .. })
-                        })
-                        .map(|waiter| u64::from(waiter.room_pages()))
-                        .sum();
-                    let pending = proc.bind_room.map_or(0, |bind| u64::from(bind.pages));
-                    (proc.seq, *pid, proc.state == Residency::Resident, queued.max(pending))
-                })
-                .collect();
-            candidates.sort_unstable_by_key(|&(seq, ..)| seq);
-            let priority: std::collections::HashMap<ProcessId, (i64, i64)> = candidates
-                .iter()
-                .filter_map(|&(_, pid, ..)| Some((pid, inner.procs.get(&pid)?.rank().priority())))
-                .collect();
-            let residents: Vec<ProcessId> = inner
-                .procs
-                .iter()
-                .filter(|(_, proc)| proc.state == Residency::Resident)
-                .map(|(pid, _)| *pid)
-                .collect();
-            (candidates, inner.accum.len() as u64, residents, priority)
-        });
-        if candidates.is_empty() {
-            return None;
-        }
-        let census = self.port.capacity_census()?;
-        let (model, engine) = self.port.locus();
-        // What one eviction of each resident moves below whole: its kv
-        // pages on the device, its recurrent state and its guest state and
-        // tables, as the census counts them. The largest two, read once.
-        let mut moves: Vec<(u64, ProcessId)> = residents
-            .iter()
-            .map(|&pid| {
-                let kv = super::holdings::held_page_count(pid, model, engine)
-                    .saturating_sub(super::holdings::swapped_page_count(pid, model, engine));
-                let rs = self
-                    .port
-                    .rs_as_pages(super::holdings::held_rs_units(pid, model, engine));
-                (u64::from(kv) + u64::from(rs) + self.port.guest_pages_of(pid), pid)
-            })
-            .collect();
-        moves.sort_unstable_by(|a, b| b.cmp(a));
-        // The largest and the second largest move of anyone but `finisher`.
-        let unit = |finisher: ProcessId| {
-            let mut others = moves.iter().filter(|&&(_, pid)| pid != finisher);
-            let largest = others.next().copied();
-            let second = others.next().map_or(0, |&(pages, _)| pages);
-            (largest.map_or(0, |(pages, _)| pages), largest.map(|(_, pid)| pid), second)
-        };
-        let read = |&(_, finisher, resident, binding): &(u64, ProcessId, bool, u64)| {
-            let guest = self.port.guest_pages_of(finisher);
-            let below = u64::from(super::holdings::swapped_page_count(finisher, model, engine))
-                + if resident { 0 } else { guest };
-            super::inner::CapacityRead {
-                finisher,
-                end: u64::from(end),
-                // Every page of its working sets, on every tier.
-                kv: u64::from(super::holdings::held_page_count(finisher, model, engine)),
-                below,
-                binding,
-                guest,
-                whole: census.whole,
-                held: census.held,
-                slack: census.slack,
-                idle: census.idle,
-                moving: census.moving,
-                gathered,
-                unit: unit(finisher),
-            }
-        };
-        // An order every admitted process can finish in, one after another
-        // (a banker's order, one resource: every tier's free pages): each in
-        // turn needs its growth to its end, its restore's state, its binds'
-        // room and the margin a whole move takes, and gives back all it
-        // holds as it ends. Fewest needed first: if any order finishes them
-        // all, that one does. The first is the finisher. An ask of any
-        // other waits while it would leave someone ahead of it unable to
-        // finish in turn; one in the finisher's place never waits. Held to
-        // the first alone, every ask past it was let in while the next
-        // process in line no longer fit (the simulation's field mix: the
-        // finisher ended, the oldest then needed 74 pages with 19 free, and
-        // every other ask was held while nothing could move).
-        let mut order: Vec<(u64, u64, super::inner::CapacityRead)> = candidates
-            .iter()
-            .map(|candidate| {
-                let read = read(candidate);
-                let rs = self.port.rs_as_pages(super::holdings::held_rs_units(
-                    read.finisher,
-                    model,
-                    engine,
-                ));
-                (read.need(), read.kv + read.guest + u64::from(rs), read)
-            })
-            .collect();
-        // Fewest needed first, the oldest first among equals (candidates
-        // come by admission, and the sort is stable).
-        order.sort_by_key(|&(need, ..)| need);
-        let fits = |&(need, _, read): &(u64, u64, super::inner::CapacityRead)| need <= read.free();
-        // The first finisher is the highest-priority candidate whose need
-        // fits now (the policy's `schedule/priority`): finishing it only
-        // raises what is free, so the rest, still in need order, stay
-        // feasible. Ties keep the banker's own order (fewest needed), then
-        // first come, first served. Equal priorities leave it as it was.
-        let priority_of = |read: &super::inner::CapacityRead| {
-            priority.get(&read.finisher).copied().unwrap_or_default()
-        };
-        if let Some(head) = order.first().map(|(_, _, read)| priority_of(read))
-            && let Some(best) = order.iter().filter(|c| fits(c)).map(|(_, _, read)| priority_of(read)).max()
-            && best > head
-            && let Some(at) = order.iter().position(|c| fits(c) && priority_of(&c.2) == best)
-        {
-            let first = order.remove(at);
-            order.insert(0, first);
-        }
-        // The finisher stays first while it still fits, or while no one
-        // else does: it runs to its end. Read afresh each pass, the first
-        // flipped between two processes as a restore moved one's need:
-        // restored as the finisher, the other's next ask evicted it, which
-        // made it the finisher again, 914 times over one head in the field
-        // mix's wide shape (seed 7: many beam searches at once). A move
-        // under way opens chunks below for a step (the slack): read then,
-        // no one fitted, and the finisher passed to whoever needed least
-        // for that step, its own restore's victim among the rest.
-        let kept = self.with_inner(|inner| inner.capacity.map(|gate| gate.finisher));
-        if let Some(at) = order.iter().position(|&(_, _, read)| Some(read.finisher) == kept)
-            && (fits(&order[at]) || !order.iter().any(fits))
-        {
-            let first = order.remove(at);
-            order.insert(0, first);
-        }
-        let (_, _, first) = *order.first()?;
-        let mut free = first.free() as i128;
-        let mut least = i128::MAX;
-        let mut places = Vec::with_capacity(order.len());
-        for &(need, held, read) in &order {
-            places.push((read.finisher, u64::try_from(least.max(0)).unwrap_or(u64::MAX)));
-            least = least.min(free - need as i128);
-            free += held as i128;
-        }
-        // The first's place is the finisher's: it never waits. One not in
-        // the order goes after the last.
-        places.remove(0);
-        #[cfg(test)]
-        ORDER_LEAST.with(|cell| cell.set(Some(least.min(free_first(&order)))));
-        Some((first, places, u64::try_from(least.max(0)).unwrap_or(u64::MAX)))
-    }
-
-    /// How far short the safe order stood when last read: negative where
-    /// some process in it (the first included) cannot finish in turn
-    /// (for tests).
-    #[cfg(test)]
-    pub(super) fn order_least(&self) -> Option<i128> {
-        let _ = self.capacity_reads();
-        ORDER_LEAST.with(std::cell::Cell::get)
-    }
-
-    /// Whether an allocation of `pages` for `pid` waits on the capacity
-    /// gate now, said at debug with the finisher and the bound its end came
-    /// from, and counted.
-    /// Read off the gate the last pass left ([`super::inner::Inner::capacity`]),
-    /// each grant taken past it out of its spare: a fire's grant pays one
-    /// lock, never a read of every tier.
-    pub(super) fn capacity_holds(&self, pid: ProcessId, pages: u32) -> bool {
-        // No pass has read it yet: read now, before the first grant.
-        if self.with_counts(|inner| inner.capacity.is_none()) {
-            self.read_capacity();
-        }
-        let Some((gate, holds)) = self.with_counts(|inner| {
-            let place = inner.capacity_allow.get(&pid).copied();
-            let gate = inner.capacity.as_mut()?;
-            let holds = gate.holds(pid, pages, place);
-            if !holds && pid != gate.finisher {
-                gate.used = gate.used.saturating_add(gate.cost(pid, pages));
-            }
-            Some((*gate, holds))
-        }) else {
-            return false;
-        };
-        if holds {
-            self.stats.capacity_waits.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                %pid,
-                pages,
-                finisher = %gate.finisher,
-                allowance = gate.allowance(None),
-                free = gate.free,
-                end = "the declared context",
-                "planner: an allocation waits for the finisher's headroom on all tiers"
-            );
-        }
-        holds
-    }
-
-    /// [`Self::capacity_holds`] for a bind's `chunks` of fresh guest state.
-    pub fn capacity_holds_chunks(&self, pid: ProcessId, chunks: u32) -> bool {
-        self.capacity_holds(pid, self.port.chunks_as_pages(chunks))
-    }
-
-    /// Whether the gate would hold `chunks` of fresh state for `pid` now,
-    /// read without taking them out of its spare.
-    pub fn capacity_would_hold(&self, pid: ProcessId, chunks: u32) -> bool {
-        let pages = self.port.chunks_as_pages(chunks);
-        self.with_inner(|inner| {
-            let place = inner.capacity_allow.get(&pid).copied();
-            inner.capacity.is_some_and(|gate| gate.holds(pid, pages, place))
-        })
-    }
 
     /// The error waiter `key` is refused with where its need could never
     /// fit the device pool, even with nothing else resident: its kv pages
@@ -674,9 +340,8 @@ impl ResidencyPlanner {
         }
         // One map a generation, over every process the planner knows and
         // those asked: each candidate list (the eviction plan's, the stall
-        // line's, the parked map's) reads its own restriction of it. Built
-        // per list, a pass built it up to three times (the L40S's 14 s of
-        // map passes in a 334 s run).
+        // line's, the parked map's) reads its own restriction of it, so a
+        // pass builds it once, not once per list.
         let generation = self.generation();
         if let Some((at, of, map)) = self.restricted_cache.lock().as_ref()
             && *at == generation
@@ -730,15 +395,14 @@ impl ResidencyPlanner {
 
     pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
         // One device figure on every path: the state room at the narrowest
-        // rung, lent span included (Mac Pro on ba229ff25 read 365 pages on
-        // one path and 428 on the other, the 63 lent chunks apart).
+        // rung, lent span included, so no two paths read figures the lent
+        // chunks apart.
         let most = self.port.state_chunks_most();
         let total = self.device_pages_most();
         // Its runs, its unpark's and its state's chunks together past every
         // chunk state may take: with every other process evicted and all
         // parked state moved down it still would not fit, and it is refused
-        // by name, never waited on (the L40S on 3b45462d4: a restore's 1,058
-        // slots of guest state against what the state limit leaves).
+        // by name, never waited on.
         if most != u32::MAX
             && let Some(room) = self.head_room_within(key, false)
             && room.chunks() > u64::from(most)
@@ -754,9 +418,8 @@ impl ResidencyPlanner {
             });
         }
         // A run longer than any segment lays for state is never laid,
-        // whatever moves: refused by name, never waited on (the M5 at beam
-        // w32: a restore of runs of 57 chunks, the planner finding no step
-        // 0.5 M times).
+        // whatever moves: refused by name, never waited on (waited on, the
+        // planner finds no step for it without end).
         let longest = self.port.longest_run_most();
         if longest != u32::MAX
             && let Some(room) = self.head_room_within(key, false)
@@ -813,10 +476,9 @@ impl ResidencyPlanner {
                     continue;
                 }
                 // Not on the policy's answer of nothing freed: nothing
-                // changed, and a pass taken on it said the shortfall again,
-                // drew the next such answer and planned again, sixty times a
-                // second with nothing to issue (the L40S: a stuck head, 98
-                // passes between two stall reports). What the policy does
+                // changed, and a pass taken on it would say the shortfall
+                // again, draw the next such answer and plan again, with
+                // nothing to issue. What the policy does
                 // free comes back through the pool's room signal.
                 tokio::select! {
                     () = notify.notified() => planner.plan(),
@@ -885,9 +547,8 @@ impl ResidencyPlanner {
     /// room no pass has planned it on since the fleet went quiet: the fleet
     /// going quiet is an event no store tells (the last fire landing, an
     /// eviction settling), and with no pass after it a restore head left
-    /// unfunded while fires were in flight waited for good (Mac Pro's
-    /// 2 GiB: one stall line in three minutes, 0 chunks free, 308
-    /// emptiable, no eviction issued). Once per head and room: the same
+    /// unfunded while fires were in flight would wait for good. Once per
+    /// head and room: the same
     /// room plans nothing again. Records the room it reads.
     fn quiet_unplanned(&self) -> bool {
         let room = [
@@ -911,8 +572,8 @@ impl ResidencyPlanner {
 
     /// A head unserved past [`super::plan::STALL_SAYS_AGAIN`], spinning or
     /// quiet: what is in flight and whose slots hold the opened chunks are
-    /// said, once per head each such span. Mac Pro's 2 GiB mix went silent
-    /// after one stall line, a head waiting on something no line named.
+    /// said, once per head each such span, so a head waiting on something
+    /// is never left unnamed after its first stall line.
     fn say_held_in_flight(&self) {
         let gives = self.port.room_gives();
         let held = self.with_inner(|inner| {
@@ -921,7 +582,7 @@ impl ResidencyPlanner {
                 .map(|(key, waiter)| (key, waiter.pid, waiter.kind_name()))?;
             // Once per head each STALL_SAYS_AGAIN, spinning or quiet: a
             // head re-planned continuously never goes quiet, and its line
-            // was never said (Mac Pro on 22b0a3e83).
+            // would never be said otherwise.
             let now = crate::rt::Instant::now();
             match inner.held_in_flight {
                 Some((at, _, since, _)) if at == key => {
@@ -969,7 +630,7 @@ impl ResidencyPlanner {
             let store = self.store_holders();
             // What the pool's walker awaits and for how long: a walk stuck
             // on a lane op's reply steps nothing, the head's asked
-            // compaction or grow never sent (the M1's run 10).
+            // compaction or grow never sent.
             let walk = crate::store::shared::walk_waiting(self.port.locus().1)
                 .map_or_else(|| "nothing".to_string(), |(what, since)| format!("{what} since {since:?} ago"));
             tracing::warn!(
@@ -1054,18 +715,17 @@ impl ResidencyPlanner {
         // there): a count that room already meets moves nothing, so its
         // want is past what stands. Its chunk count met by the free chunks
         // (a restore short of a run of four, 231 chunks free), every chunk
-        // given back anywhere, the pass's own among them, woke a pass that
-        // found no step (Mac Pro's mx-3: ~470 a second, nothing in flight).
+        // given back anywhere, the pass's own among them, would wake a pass
+        // that finds no step.
         // A head never refused is tried against the room standing, its
         // want its need.
         let past = |count: u32| if refused { u64::from(count).saturating_add(1) } else { 0 };
         // Refused, it goes again on any chunk more than its refusal left
         // where its placement stands, which reads its own parked parts
         // retaken first: fewer chunks free than its whole need's count can
-        // stand it. A floor of that count left a chunk given back that
-        // stood it unwoken, the head waiting on a pass some other event
-        // ran (the simulation's lost wakes: "restore short of runs:
-        // something in flight, not funded", then sent at once).
+        // stand it. A floor of that count would leave a chunk given back
+        // that stands it unwoken, the head waiting on a pass some other
+        // event runs.
         let mut want_chunks = self.head_room(key).map_or(u64::MAX, |need| {
             if refused {
                 past(self.port.free_chunks())
@@ -1087,14 +747,11 @@ impl ResidencyPlanner {
         // refused: slots of those shapes given back fill no chunk and move
         // no kv slot, so no count the signal carries measures them; any
         // room given back wakes it. Left to the free chunks' count, a
-        // restore short of its state waited for a fire landing's poke, up
-        // to 15 s (the L40S at 6 GiB on 22b0a3e83: restores served almost
-        // all by pokes, about one a run by the room signal).
+        // restore short of its state would wait for a fire landing's poke.
         // Refused before in its unpark or not: its step is state slots
         // (read ahead of its runs), and the refusal's want of more chunks
         // than stood was a count state given back inside open chunks never
-        // moves (the L40S at 6 GiB on 5120cbc3c: restore waits served by
-        // pokes, up to 16.5 s, a few by the room signal).
+        // moves.
         if rs_short && (!refused || kv_missing == 0) {
             want_chunks = 0;
         }
@@ -1150,7 +807,7 @@ impl ResidencyPlanner {
     /// change the generation already reads (the pool's counts, the grant
     /// returns). A wake whose generation the last no-step pass ended on
     /// plans nothing ([`Self::settled_at`]): waking each parked KV-short
-    /// restore on every poke cost the L40S ~280 s of waits a run.
+    /// restore on every poke costs passes that plan nothing.
     pub(super) fn wake_planner(self: &Arc<Self>) {
         self.returns
             .wake_cause
@@ -1435,22 +1092,18 @@ impl ResidencyPlanner {
         // chunks the pages still need are asked in runs of its longest
         // length, laid after the runs (they need not be adjacent; asked so,
         // no page gathered first breaks a run the need counts on). Read as
-        // the runs alone, fitting runs stood (Mac Pro: a restore of (3, 3)
-        // and 41 kv pages, 8 runs open), the pages broke them as they were
-        // gathered, and the unpark came up short.
-        // Its state the serve takes first (Mac Pro's 2 GiB on 3b45462d4: a
-        // restore's records opened chunks between the map's read and its
-        // unpark, which came up short of a run of four with no chunk free,
-        // the map showing its need standing, round after round) is asked
-        // the same way.
+        // the runs alone, fitting runs stand, the pages break them as they
+        // are gathered, and the unpark comes up short.
+        // Its state the serve takes first (a restore's records open chunks
+        // between the map's read and its unpark, which would come up short
+        // with the map showing its need standing) is asked the same way.
         let (kv_missing, rs) = kv_missing;
         let pages = kv_missing.saturating_add(self.port.rs_as_pages(rs));
         let per_chunk = self.port.chunks_as_pages(1);
         // As single chunks beside its runs, never runs of their own: asked
         // as runs of the longest length, a restore with many pages to
-        // gather asked runs no pool of this size held (Mac Pro at 2 GiB on
-        // c10d7de5d: (7, 1) grew to (7, 31), 217 chunks against 30 free runs
-        // of 7, on a device 310 of 365 pages free, and nothing was moved).
+        // gather would ask runs no pool of this size holds, and nothing is
+        // moved.
         // Where its gathered pages break runs the map stood, the store's
         // placement (its kv taken first) places them first, and the map
         // lays its runs in what they leave ([`Self::head_placement`]).
@@ -1494,7 +1147,7 @@ impl ResidencyPlanner {
     /// list slots, [`PoolPort::chunk_occupants`] of them), the head's own
     /// once it is evicted. A move down a tier frees either
     /// ([`Self::park_down`]); counted as no one's, queued processes waiting
-    /// to be restored held chunks no move freed (Mac Pro on 22b0a3e83).
+    /// to be restored would hold chunks no move frees.
     pub(super) fn parked_map(&self, head: ProcessId) -> super::pool::ChunkMap {
         let except = self.parked_except(head);
         let evicted: Vec<ProcessId> = self.with_inner(|inner| {
@@ -1520,8 +1173,8 @@ impl ResidencyPlanner {
     /// resident (its state is live, whatever of it lies parked), nobody's
     /// once it is evicted. Nothing runs on an evicted head's state parked in
     /// place; moved down a tier, its restore lays it back compactly. Left
-    /// out, an evicted head's own tables and rings (126 instances on the
-    /// M1) held the chunks its bind's runs needed, and nothing moved them.
+    /// out, an evicted head's own tables and rings would hold the chunks
+    /// its bind's runs need, and nothing would move them.
     pub(super) fn parked_except(&self, head: ProcessId) -> ProcessId {
         let evicted = self.with_inner(|inner| {
             inner
@@ -1653,8 +1306,8 @@ impl ResidencyPlanner {
         });
         if pids.is_empty() || !self.port.move_parked_down(self, &pids, &order) {
             // Refused here as at its landing: not tried again on this room
-            // (its take and give-back of the slots below counted room freed,
-            // and the pass ran again on it, for good: seed 3392).
+            // (its take and give-back of the slots below count as room
+            // freed, and the pass would run again on it for good).
             if !pids.is_empty() {
                 self.park_down_failed
                     .store(self.park_down_room(), Ordering::Release);
@@ -2194,10 +1847,8 @@ impl ResidencyPlanner {
             });
             // The suspended bind it was restored for waits for room again:
             // its restore is over, and the next bind-suspended restore may
-            // go. Held for it, every other one waited on a bind that waits
-            // behind them (Mac Pro's beam mix: a restored process short at
-            // its bind again, the queue's head a bind-suspended restore,
-            // flat with every thread parked).
+            // go. Held for it, every other one would wait on a bind that
+            // waits behind them, every thread parked.
             let released = waiting && inner.bind_restoring == Some(pid);
             if released {
                 inner.bind_restoring = None;
@@ -2361,12 +2012,6 @@ impl ResidencyPlanner {
             pages: self.port.chunks_as_pages(chunks),
         };
 
-        // A bind the capacity gate holds waits for the gate in the planner:
-        // suspended, it parked its process for room that was there, and
-        // came back to the same hold.
-        if self.capacity_would_hold(pid, chunks) {
-            return false;
-        }
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
         ptrace!(
             "suspend-for-room pid={} run={} pieces={}",
@@ -2392,9 +2037,7 @@ impl ResidencyPlanner {
         let suspended = self.stats.evictions_started.load(Ordering::Relaxed) > before;
         // Its suspension begun changes who heads the queue (a restore ahead
         // of new work goes first only while the fleet runs): the waiters
-        // plan on it now, not on its landing (the simulation's lost wakes:
-        // allocations served at once by a pass forced after a bind's
-        // suspend, none planned since).
+        // plan on it now, not on its landing, or a wake is lost.
         if suspended && self.returns.waiters.load(Ordering::Acquire) != 0 {
             self.poke();
         }
@@ -2426,7 +2069,6 @@ impl ResidencyPlanner {
                     let proc = inner.procs.get(pid)?;
                     (proc.admitted
                         && proc.state == Residency::Resident
-                        && !inner.is_finisher(*pid)
                         && !inner.host_swap_blocked.contains(pid)
                         && !inner.prepare_blocked.contains(pid))
                     .then(|| (*pid, proc.rank()))
@@ -2522,8 +2164,6 @@ impl ResidencyPlanner {
             self.re_arm_idle_reclaim();
             self.poke();
         }
-        // What it held is back: the last place may hold a newcomer's ask.
-        self.allowance_rose.notify_waiters();
     }
 
     /// `pid` leaves: its client has heard, its seat and asks go now. What
@@ -2533,8 +2173,6 @@ impl ResidencyPlanner {
     /// wedged for pages no one registered holds.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         crate::store::shared::forget_process(pid);
-        // Out of the order: the newcomers held at its last place look again.
-        let _woken = ScopeNotify(&self.allowance_rose);
         // What was held for its restore goes back with it.
         self.port.release_restore(pid);
         let (model, engine) = self.port.locus();
@@ -2543,6 +2181,8 @@ impl ResidencyPlanner {
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
+            inner.failed.remove(&pid);
+            inner.handed.remove(&pid);
             let departed = inner.procs.remove(&pid);
             inner.arrived(pid);
             if inner.bind_restoring == Some(pid) {
@@ -2722,15 +2362,6 @@ fn holder_head(pid: ProcessId) -> u64 {
         .unwrap_or(0)
 }
 
-/// Wakes every waiter of a [`Notify`] as it drops: at the end of the scope
-/// it guards, whichever way that ends.
-struct ScopeNotify<'a>(&'a Notify);
-
-impl Drop for ScopeNotify<'_> {
-    fn drop(&mut self) {
-        self.0.notify_waiters();
-    }
-}
 
 /// What one idle reclaim came to ([`ResidencyPlanner::reclaim_idle_once`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

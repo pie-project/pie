@@ -10,6 +10,12 @@ import msgpack from 'msgpack-lite';
 import { blake3 } from '@noble/hashes/blake3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
+function closedBecause(event) {
+    const why = 'WebSocket connection closed.';
+    if (!event || !event.code || event.code === 1000) return why;
+    return `${why} (${event.code}${event.reason ? `: ${event.reason}` : ''})`;
+}
+
 /**
  * A simple asynchronous queue.
  */
@@ -440,8 +446,8 @@ export class PieClient {
                     this.connectionPromise = null;
                 };
 
-                this.ws.onclose = () => {
-                    this._rejectPendingRequests(new Error("WebSocket connection closed."));
+                this.ws.onclose = (event) => {
+                    this._failConnectionWaiters(new Error(closedBecause(event)));
                     this.ws = null;
                     this.connectionPromise = null;
                 };
@@ -457,16 +463,48 @@ export class PieClient {
     /** @private */
     async _listen() {
         this.ws.onmessage = async (event) => {
-            if (event.data instanceof Blob) {
-                try {
-                    const arrayBuffer = await event.data.arrayBuffer();
-                    const message = msgpack.decode(new Uint8Array(arrayBuffer));
-                    await this._processServerMessage(message);
-                } catch (e) {
-                    console.error("[PieClient] Failed to decode messagepack:", e);
-                }
+            if (!(event.data instanceof Blob)) return;
+            let message;
+            try {
+                const arrayBuffer = await event.data.arrayBuffer();
+                message = msgpack.decode(new Uint8Array(arrayBuffer));
+            } catch (e) {
+                console.error("[PieClient] Failed to decode messagepack:", e);
+                return;
+            }
+            try {
+                await this._processServerMessage(message);
+            } catch (e) {
+                this._failMessageOwner(message, e);
             }
         };
+    }
+
+    /** @private */
+    _failMessageOwner(message, error) {
+        if (message === null || typeof message !== 'object') return;
+        const why = `the client could not process a \`${message.type}\` message: ${error}`;
+        const queue = this.processEventQueues.get(message.process_id);
+        if (queue) {
+            this.processEventQueues.delete(message.process_id);
+            queue.put(['error', why]);
+        }
+        this.pendingDownloads.delete(message.file_hash);
+        const pending = this.pendingRequests.get(message.corr_id);
+        if (pending) {
+            this.pendingRequests.delete(message.corr_id);
+            pending.reject(new Error(why));
+        }
+    }
+
+    /** @private */
+    _failConnectionWaiters(error) {
+        this._rejectPendingRequests(error);
+        const queues = [...this.processEventQueues.values()];
+        this.processEventQueues.clear();
+        for (const queue of queues) {
+            queue.put(['error', error.message]);
+        }
     }
 
     /**
@@ -546,7 +584,7 @@ export class PieClient {
     async close() {
         return new Promise((resolve) => {
             if (!this.ws || this.ws.readyState !== this.Socket.OPEN) {
-                this._rejectPendingRequests(new Error("WebSocket connection closed."));
+                this._failConnectionWaiters(new Error("WebSocket connection closed."));
                 resolve();
                 return;
             }

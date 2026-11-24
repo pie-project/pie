@@ -28,15 +28,10 @@ runs:
         targets: ${{ inputs.triple }}
 
     # rust-toolchain.toml pins the toolchain; install it here, serially, so
-    # concurrent cargo calls (maturin, napi) do not race to.
-    - if: inputs.manylinux != 'true'
-      shell: bash
-      run: rustup toolchain install
-
-    # The wasm workspaces (built-ins, examples) pin nightly with
-    # `wasm32-wasip3`; every host build compiles the built-ins on it.
+    # concurrent cargo calls (maturin, napi) do not race to. It carries
+    # `wasm32-wasip3`, which every host build compiles the built-ins on.
     - shell: bash
-      run: cd crates/builtins/policies && rustup toolchain install
+      run: rustup toolchain install
 
     - if: runner.os == 'macOS'
       shell: bash

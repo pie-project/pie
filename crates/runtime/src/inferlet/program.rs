@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -42,6 +41,10 @@ pub fn spawn(
         .spawn(|| ProgramService::new(wasm_engine, repository, languages_dir))
         .expect("Program manager already spawned");
     Ok(())
+}
+
+pub fn stop() {
+    SERVICE.stop();
 }
 
 /// Install `binary`, which came as `file`, under its name in `namespace`.
@@ -433,19 +436,10 @@ impl ServiceHandler for ProgramService {
     }
 }
 
-/// A component serialized by `precompile_component`. Wasmtime checks the
-/// artifact's header against this engine's version and settings and refuses
-/// a mismatch.
+/// A component serialized by `precompile_component`, loaded through
+/// `runtime_sys`, with its memory images made.
 fn deserialize_component(engine: &WasmEngine, precompiled: &[u8]) -> Result<Component> {
-    if WasmEngine::detect_precompiled(precompiled) != Some(wasmtime::Precompiled::Component) {
-        anyhow::bail!("not a component precompiled by wasmtime");
-    }
-    // SAFETY: deserializing trusts the bytes to be wasmtime's own output, as
-    // wasmtime cannot verify the code inside. They come from the host that
-    // embeds this runtime (the page, in a browser), which is trusted as much
-    // as the runtime itself: it supplies the language component's source too.
-    let component =
-        unsafe { Component::deserialize(engine, precompiled) }.map_err(|e| anyhow!("{e}"))?;
+    let component = runtime_sys::deserialize_component(engine, precompiled)?;
     initialize_images(&component)?;
     Ok(component)
 }

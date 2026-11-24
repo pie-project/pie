@@ -50,20 +50,20 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses, WindowedLayer,
 };
 pub use engine::{
-    BehindNeed, BehindSeat, BehindServing, CompletionSink, Engine, HostRoom, KvWrites, Landing, LandingSink, LaneFault, Prepared, ProgramCompile,
-    StepDone,
-    StepOutcome, TapGroups, TapSink, Tapped,
+    BehindNeed, BehindSeat, BehindServing, Channels, Completion, CompletionSink, Engine, HostRoom,
+    KvWrites, Landing, LandingSink, LaneFault, Peers, Pool, Prepared, ProgramCompile, Programs,
+    StepDone, StepOutcome, TapGroups, TapSink, Tapped, Taps, Tiers, WeightCache,
 };
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
-    LaneReadout, LaneRecord, LaneReplay, ListKind, Mask, Masking, MediaEncode, Readout, ReplayBound,
+    LaneReadout, LaneRecord, LaneReplay, ListKind, Mask, Masking, Readout, ReplayBound,
     ReplayPast, ReplayRows, RsReset, RsSnapshot, RsVerb, RungReplay, ScratchBytes, Serves, Step,
     WindowFold,
 };
 pub use load::{
     Allowance, Budgets, Checkpoint, DeviceMemory, HostTier, LoadFacts, LoadRequest, Loaded,
-    Residency,
+    Reload, Reloaded, Residency,
 };
 pub use memory::SAFETY_FLOOR_BYTES;
 pub use shapes::{
@@ -76,5 +76,6 @@ pub use program::{
     ReadoutFacts, ReadoutLanding, Rebind, RingFacts, RingSlots, ScratchPlace,
 };
 pub use transfer::{
-    KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy, StateMove,
+    DeviceReach, KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain,
+    StateCopy, StateMove,
 };

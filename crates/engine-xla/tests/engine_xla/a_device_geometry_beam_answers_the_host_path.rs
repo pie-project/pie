@@ -10,7 +10,7 @@
 use crate::common_dit;
 
 use common_dit::{Rig, Weights, assert_close, attach, attach_over};
-use engine::Engine;
+use engine::{Channels, Engine, Programs};
 use engine::fire::{Lane, Readout};
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
@@ -229,7 +229,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
     ];
     let instance = rig
         .engine
-        .bind_instance(&engine::program::InstanceBinding {
+        .bind(&engine::program::InstanceBinding {
             program,
             channels,
             seeds: Vec::new(),
@@ -278,7 +278,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         ] {
             assert!(
                 rig.engine
-                    .publish_channel(instance, chan, &cell)
+                    .publish(instance, chan, &cell)
                     .expect("the cell publishes"),
                 "the ring had room"
             );
@@ -328,8 +328,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         (3, words(&[held + 1, held + 1])),
     ] {
         assert!(
-            rig.engine
-                .publish_channel(instance, chan, &cell)
+            engine::Channels::publish(&mut rig.engine, instance, chan, &cell)
                 .expect("the cell publishes"),
             "the ring had room"
         );
@@ -432,7 +431,7 @@ fn device_fed_tokens_reach_the_next_fire() {
     });
     // The rings the instance keeps itself: one contiguous run of Channel
     // slots each, as the runtime takes them.
-    let facts = rig.engine.program_facts(program).expect("the program's facts");
+    let facts = engine::Programs::facts(&rig.engine, program).expect("the program's facts");
     assert!(
         facts.rings.iter().any(|r| r.channel == 0),
         "the fed ring is kept in the pool"
@@ -460,9 +459,7 @@ fn device_fed_tokens_reach_the_next_fire() {
         rig.channel_of(vec![1, VOCAB], EtaDtype::F32, HostRole::Reader),
     ];
     let first = 11u32;
-    let instance = rig
-        .engine
-        .bind_instance(&engine::program::InstanceBinding {
+    let instance = engine::Programs::bind(&mut rig.engine, &engine::program::InstanceBinding {
             program,
             channels,
             seeds: vec![engine::channel::ChannelSeed {

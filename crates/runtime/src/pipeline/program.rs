@@ -277,7 +277,7 @@ impl Registry {
         rows: Option<u32>,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
         let (bytes, row_extents) = identity(bytes, rows)?;
-        let hash = program_hash(&bytes);
+        let hash = container_hash(&bytes);
         if let Some(hit) = self.hit(hash, &bytes, &lanes)? {
             return Ok(hit);
         }
@@ -392,17 +392,6 @@ impl Registry {
     pub fn lookup(&mut self, hash: u64) -> Option<Arc<RegisteredProgram>> {
         self.inner.get(&hash).cloned()
     }
-}
-
-fn program_hash(bytes: &[u8]) -> u64 {
-    let mut hash = container_hash(bytes);
-    if std::env::var_os("PIE_ETA_NO_IDIOM").is_some() {
-        hash ^= 0x9e37_79b9_7f4a_7c15;
-    }
-    if std::env::var_os("PIE_ETA_NO_FUSION").is_some() {
-        hash ^= 0xbf58_476d_1ce4_e5b9;
-    }
-    hash
 }
 
 impl RegisteredProgram {
@@ -525,6 +514,12 @@ fn global() -> MutexGuard<'static, Registry> {
     GLOBAL.lock().expect("global lock poisoned")
 }
 
+/// Forgets the programs registered against the boot's model.
+pub(crate) fn reset() {
+    *PLAN_FORMS.lock().unwrap() = LibraryForms::ALL;
+    *global() = Registry::new(NonZeroUsize::new(DEFAULT_CAPACITY).expect("nonzero capacity"));
+}
+
 /// Registers `bytes` for the served model. `rows` is the most rows one of
 /// its fires binds (`model.max-pass-rows()`), which a row-extent channel is
 /// declared at ([`identity`]); `None` for a float pass.
@@ -560,7 +555,7 @@ fn register_with(
     rows: Option<u32>,
 ) -> Result<Arc<RegisteredProgram>, RegisterError> {
     let (bytes, row_extents) = identity(bytes, rows)?;
-    let hash = program_hash(&bytes);
+    let hash = container_hash(&bytes);
     if let Some(hit) = global().hit(hash, &bytes, &lanes)? {
         return Ok(hit);
     }

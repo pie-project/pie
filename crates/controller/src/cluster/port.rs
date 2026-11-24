@@ -737,6 +737,19 @@ impl Port {
                 "pie/model",
                 Some(Value::Text(worker.model.clone())),
             );
+            // Its load as it reports it, for a policy that places by it: the
+            // kv pressure (0-255, idle work and idle cache counted as room)
+            // and the processes it holds.
+            self.host.attr(
+                Subject::Worker(id.clone()),
+                "pie/kv-pressure",
+                Some(Value::Int(i64::from(load.kv_pressure_bucket))),
+            );
+            self.host.attr(
+                Subject::Worker(id.clone()),
+                "pie/inflight",
+                Some(Value::Int(i64::from(load.inflight))),
+            );
             // It serves other workers' passes: a helper the default cluster
             // policy names.
             let listen = view
@@ -959,23 +972,22 @@ mod tests {
             .imports
     }
 
-    /// `default-cluster` writes only defaults: by its imports it can neither
-    /// place nor end a process, so it decides no arrival before dispatch and
-    /// a launch under it does not wait at the gate. A policy that places
-    /// (`test-route`) still gates.
+    /// A policy gates launches by its imports: `default-cluster` places
+    /// pending processes (`placement/workers`), so a launch under it waits
+    /// at the gate, as under `test-route`; `noop` decides nothing and gates
+    /// nothing.
     #[test]
     fn only_a_policy_that_decides_pending_processes_gates_launches() {
         let imports = imports_of("default-cluster");
         assert!(
-            imports.iter().any(|i| i == tables::PLACEMENT_HELPERS)
+            imports.iter().any(|i| i == tables::PLACEMENT_WORKERS)
+                && imports.iter().any(|i| i == tables::PLACEMENT_HELPERS)
                 && imports.iter().any(|i| i == tables::REPLICATION_WORKERS),
-            "it writes its defaults: {imports:?}"
+            "it places and writes its defaults: {imports:?}"
         );
-        assert!(
-            !gates(&imports),
-            "it states no arrival decision: {imports:?}"
-        );
+        assert!(gates(&imports), "it decides arrivals: {imports:?}");
         assert!(gates(&imports_of("test-route")));
+        assert!(!gates(&imports_of("noop")));
 
         let config = Config::default();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1003,9 +1015,9 @@ mod tests {
             .unwrap();
             host.decisions(GatewayId(0)).borrow().gate_ms
         };
-        assert_eq!(gate(&["default-cluster"]), 0);
-        assert_eq!(gate(&["test-route"]), config.deadline_ms);
-        assert_eq!(gate(&["default-cluster", "test-route"]), config.deadline_ms);
+        assert_eq!(gate(&["noop"]), 0);
+        assert_eq!(gate(&["default-cluster"]), config.deadline_ms);
+        assert_eq!(gate(&["default-cluster", "noop"]), config.deadline_ms);
     }
 
     #[test]

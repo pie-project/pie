@@ -10,7 +10,6 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,7 +40,7 @@ const STATE: &str = "state.bin";
 const KV: &str = "kv";
 const SHARED: &str = "pages";
 
-static STORE: OnceLock<(PathBuf, u64)> = OnceLock::new();
+static STORE: crate::slot::Slot<(PathBuf, u64)> = crate::slot::Slot::new();
 /// One save, load or delete at a time: a page's link count is what says
 /// whether it is still read.
 static BUSY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -51,6 +50,11 @@ pub(crate) fn configure(dir: PathBuf, budget: u64) {
         tracing::warn!(%error, "snapshots: leftovers of a crash stay on disk");
     }
     let _ = STORE.set((dir, budget));
+}
+
+/// The next boot states its own store, or none.
+pub(crate) fn reset() {
+    STORE.clear();
 }
 
 /// What a crash left: saves that never landed, deletes that never finished,
@@ -75,7 +79,7 @@ fn sweep(root: &Path) -> std::io::Result<()> {
         for domain in shared {
             for page in std::fs::read_dir(domain?.path())? {
                 let page = page?;
-                if link_count(&page.path())? == 1 {
+                if links::count(&page.path(), &page.metadata()?)? == 1 {
                     std::fs::remove_file(page.path())?;
                 }
             }
@@ -84,49 +88,42 @@ fn sweep(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// How many directory entries name the file at `path` (its hard links).
-#[cfg(unix)]
-fn link_count(path: &Path) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(std::fs::symlink_metadata(path)?.nlink())
-}
+/// A page file's hard link count and its identity on its volume: what
+/// `nlink` and `ino` give on Unix, and the file information Windows keeps.
+mod links {
+    use std::fs::Metadata;
+    use std::io;
+    use std::path::Path;
 
-/// The file's identity on its volume: one value for all its hard links.
-#[cfg(unix)]
-fn file_id(path: &Path) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(std::fs::symlink_metadata(path)?.ino())
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn file_info(
-    path: &Path,
-) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
-    let file = std::fs::File::open(path)?;
-    // SAFETY: a plain-old-data struct the call fills, on success, whole.
-    let mut info = unsafe { std::mem::zeroed() };
-    // SAFETY: `file` is open for the call's duration; `info` is ours.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error());
+    #[cfg(unix)]
+    pub fn count(_: &Path, meta: &Metadata) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(meta.nlink())
     }
-    Ok(info)
+
+    #[cfg(unix)]
+    pub fn id(_: &Path, meta: &Metadata) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(meta.ino())
+    }
+
+    #[cfg(windows)]
+    fn info(path: &Path) -> io::Result<winapi_util::file::Information> {
+        winapi_util::file::information(std::fs::File::open(path)?)
+    }
+
+    #[cfg(windows)]
+    pub fn count(path: &Path, _: &Metadata) -> io::Result<u64> {
+        Ok(info(path)?.number_of_links())
+    }
+
+    #[cfg(windows)]
+    pub fn id(path: &Path, _: &Metadata) -> io::Result<u64> {
+        Ok(info(path)?.file_index())
+    }
 }
 
-#[cfg(windows)]
-fn link_count(path: &Path) -> std::io::Result<u64> {
-    Ok(u64::from(file_info(path)?.nNumberOfLinks))
-}
-
-#[cfg(windows)]
-fn file_id(path: &Path) -> std::io::Result<u64> {
-    let info = file_info(path)?;
-    Ok(u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow))
-}
-
-fn store() -> Result<&'static (PathBuf, u64), HandleError> {
+fn store() -> Result<(PathBuf, u64), HandleError> {
     STORE
         .get()
         .ok_or_else(|| HandleError::invalid("this server keeps no snapshots"))
@@ -185,8 +182,8 @@ struct SavedState {
     frozen: u32,
     bytes: u64,
     /// The windows' position, for a model whose state is one window list:
-    /// `buffer` is then its table, and `window_tokens` the window. The
-    /// window-list path: removed by the windowed-state change.
+    /// `buffer` is then its table, and `window_tokens` the window (the
+    /// window-list path).
     window: Option<WindowState>,
     window_tokens: u32,
     /// The model's windowed layers are ring + buffer (CONTRACT-BC 19, 21):
@@ -267,7 +264,7 @@ fn used(root: &Path) -> std::io::Result<u64> {
             let meta = entry.metadata()?;
             if meta.is_dir() {
                 dirs.push(entry.path());
-            } else if seen.insert(file_id(&entry.path())?) {
+            } else if seen.insert(links::id(&entry.path(), &meta)?) {
                 bytes += meta.len();
             }
         }
@@ -448,8 +445,8 @@ async fn read_state(
             "a state of several window lists is not saved to the host",
         ));
     }
-    // A window list's table rides as the buffer (the window-list path:
-    // removed by the windowed-state change). A ring + buffer set's buffer is
+    // A window list's table rides as the buffer (the window-list path). A
+    // ring + buffer set's buffer is
     // its window buffer's unfolded slots, its rings in its record.
     let table = set.windows.first().unwrap_or(&set.buffer);
     let pages: Vec<RsSlotId> = table
@@ -458,30 +455,12 @@ async fn read_state(
         .flatten()
         .copied()
         .collect();
-    let shared = stores.rs.lock().unwrap().is_shared();
-    let bytes = if shared {
-        read_tier_state(engine, &stores, &held, &pages).await?
-    } else {
-        // Without a host tier, rows are read where they rest on the host: a
-        // read parks nothing.
-        let (row_slots, row_pages) = {
-            let store = stores.rs.lock().unwrap();
-            if held.iter().chain(&pages).any(|&id| !store.on_host(id)) {
-                return Err(HandleError::quota(
-                    "the host has no room to read this recurrent state out",
-                ));
-            }
-            let ids = |ids: &[RsSlotId]| {
-                ids.iter()
-                    .map(|&id| store.engine_id(id))
-                    .collect::<Vec<_>>()
-            };
-            (ids(&held), ids(&pages))
-        };
-        scheduler::read_host_state(engine, row_slots, row_pages)
-            .await
-            .map_err(|error| failed("reading recurrent state", error))?
-    };
+    if !stores.rs.lock().unwrap().is_shared() {
+        return Err(HandleError::invalid(
+            "a state outside a shared pool is not saved to the host",
+        ));
+    }
+    let bytes = read_tier_state(engine, &stores, &held, &pages).await?;
     Ok((
         SavedState {
             state_size: rs.geom.state_size,
@@ -617,7 +596,7 @@ fn token_hashes(mut bytes: &[u8], pages: usize) -> Option<Vec<Vec<Option<Hash256
 /// Keeps `held` under `name`. It stays as it was.
 pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value, HandleError> {
     let dir = dir_of(tenant, name)?;
-    let (root, budget) = store()?.clone();
+    let (root, budget) = store()?;
     let tenant_root = tenant_dir(tenant)?;
     let _busy = BUSY.lock().await;
     if dir.exists() {
@@ -724,8 +703,8 @@ fn store_domain(stores: &store_registry::Stores) -> Hash256 {
 fn unlink_unread(shared: &Path, names: &[String]) -> std::io::Result<()> {
     for name in names {
         for path in [shared.join(name), shared.join(format!("part-{name}"))] {
-            match link_count(&path) {
-                Ok(1) => std::fs::remove_file(&path)?,
+            match std::fs::metadata(&path) {
+                Ok(meta) if links::count(&path, &meta)? == 1 => std::fs::remove_file(&path)?,
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -1092,13 +1071,11 @@ async fn load_state(
     let slots = usize::from(saved.folded);
     let pages = saved.buffer.iter().filter(|&&page| page).count();
     let wpages = saved.window_buffer.iter().filter(|&&page| page).count();
-    let (rows, ids) = {
+    let rows = {
         let mut store = stores.rs.lock().unwrap();
-        let rows = store
+        store
             .take_host_of(slots, pages, wpages)
-            .ok_or_else(|| HandleError::quota("the host has no room for this recurrent state"))?;
-        let ids: Vec<u32> = rows.iter().map(|&id| store.engine_id(id)).collect();
-        (rows, ids)
+            .ok_or_else(|| HandleError::quota("the host has no room for this recurrent state"))?
     };
     let tier = {
         let store = stores.rs.lock().unwrap();
@@ -1107,16 +1084,9 @@ async fn load_state(
     let written = match tier {
         // A shared pool's host rows are host tier slots (CONTRACT-BC 22).
         Some(refs) => scheduler::write_tier_slots(engine, refs, bytes.to_vec()).await,
-        None => {
-            let (row_slots, row_pages) = ids.split_at(slots);
-            scheduler::write_host_state(
-                engine,
-                row_slots.to_vec(),
-                row_pages.to_vec(),
-                bytes.to_vec(),
-            )
-            .await
-        }
+        None => Err(anyhow::anyhow!(
+            "a state outside a shared pool is not saved to the host"
+        )),
     };
     let mut store = stores.rs.lock().unwrap();
     if let Err(error) = written {
@@ -1168,7 +1138,7 @@ pub(super) async fn delete(tenant: &str, name: &str) -> Result<Value, HandleErro
         let domain = manifest.as_ref().map_or(domain, |m| m.domain.clone());
         for file in manifest.iter().flat_map(|m| m.files.iter()) {
             let page = root.join(SHARED).join(&domain).join(file);
-            if link_count(&page).is_ok_and(|links| links == 1) {
+            if std::fs::metadata(&page).is_ok_and(|meta| links::count(&page, &meta).unwrap() == 1) {
                 std::fs::remove_file(page)?;
             }
         }

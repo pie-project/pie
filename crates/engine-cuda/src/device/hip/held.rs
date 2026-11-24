@@ -44,7 +44,11 @@ static RINGS: std::sync::Mutex<Option<std::collections::HashMap<core::ffi::c_int
 /// event of a destroyed stream.
 pub(crate) fn forget_stream(stream: usize) {
     use kernels_cuda::hip::rt;
-    let mut rings = RINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A poisoned ring's slots are not to be trusted: their events stay as
+    // they are rather than read (a teardown never panics).
+    let Ok(mut rings) = RINGS.lock() else {
+        return;
+    };
     let Some(rings) = rings.as_mut() else {
         return;
     };

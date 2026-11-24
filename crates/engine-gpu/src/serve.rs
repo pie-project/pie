@@ -156,12 +156,12 @@ pub trait Serve: Backend {
     fn save_rates(
         device: &Self::Context,
         boot: &Self::DeviceBoot,
-        rates: &profile::fire::Rates,
+        rates: &profile::rates::Rates,
     ) -> Result<()>;
 
     /// `tuning` with each dense kernel's rate curve at each of the model's
     /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
-    /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
+    /// fire of the load may bring (`profile::rates::Rates::kernel_curves`):
     /// those its profile lacks measured now, on `device`, and saved with the
     /// device's rates (`crate::rates::measure_shapes`); what the dense
     /// matmul's kernel at each rung is chosen by (`crate::dense`).
@@ -217,7 +217,7 @@ pub trait Serve: Backend {
     fn submit_bound(boot: &Self::DeviceBoot) -> Option<std::time::Duration>;
 
     /// Whether a load of `boot` lays its fires to the rows its budgets state
-    /// ([`CheckRungs::To`] at `max_tokens`) in place of the ruling's fire
+    /// ([`CheckRungs::To`] at `max_tokens`) in place of the fire-top rule's
     /// top: a test's load whose harness states what the test fires, which
     /// a runtime fitting its steps to the load's caps never needs
     /// (`test-limits`). No config or profile reaches it.
@@ -340,6 +340,27 @@ pub trait Serve: Backend {
     /// [`Serve::plan`] replays. Whether one was: a fire whose walk matches
     /// no armed body is one the load neither armed nor stated eager.
     fn fill(
+        _shell: &mut Shell<Self>,
+        _frame: Self::Frame,
+        _prepared: &mut Prepared<'_, Self>,
+        _layout: &[ReadSpan],
+        _launches: u32,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The frame a lay-only pass walks into ([`Shell::lay_once`]): one that
+    /// lays the fire's block (its dispatches' scalars and group counts) and
+    /// names the kernels it runs, and binds, hashes and records nothing.
+    /// `None` where the backend lays none.
+    fn lay_frame(_device: &Self::Context, _arm: usize) -> Result<Option<Self::Frame>> {
+        Ok(None)
+    }
+
+    /// Takes what a lay-only pass of `prepared` laid in `frame`: where the
+    /// kernels it names are an armed family's, the fire's fill of it, which
+    /// the next [`Serve::plan`] replays. Whether one was.
+    fn lay_fill(
         _shell: &mut Shell<Self>,
         _frame: Self::Frame,
         _prepared: &mut Prepared<'_, Self>,
@@ -740,7 +761,7 @@ pub struct Settled {
 /// The version of the dense settle's method ([`Shell::settle_dense`]: how
 /// it weighs each range in whole served steps, or on its widest plane
 /// alone), its stored settle's key beside what it weighed and the kernels'
-/// code (`profile::fire::DenseSettled`): bumped only when how it weighs
+/// code (`profile::curves::DenseSettled`): bumped only when how it weighs
 /// changes.
 pub const SETTLE_METHOD: u32 = 1;
 
@@ -764,7 +785,7 @@ fn tier_of(number: u32) -> kernels_slang::Tier {
     }
 }
 
-/// A row of a stored settle (`profile::fire::DenseSettled::ranges`) as the
+/// A row of a stored settle (`profile::curves::DenseSettled::ranges`) as the
 /// kernel it takes over its range where it replaced the curves' one.
 fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
     let [_, _, replaced, vector, wide, tier] = row;
@@ -1189,16 +1210,16 @@ pub struct Shell<B: Serve> {
     /// The dense planes and the rates the dense kernel was chosen by: what
     /// the settle prices an option's step by under a stated submit bound.
     dense_planes: Vec<(u32, u32, u32, f64)>,
-    dense_rates: profile::fire::Rates,
+    dense_rates: profile::rates::Rates,
     /// The dense settle a committed measured profile states, taken where
     /// the user's stored one's key does not match and its own does
-    /// (`profile::fire::Tuned::committed_settle`).
-    committed_settle: Vec<profile::fire::DenseSettled>,
+    /// (`profile::rates::Tuned::committed_settle`).
+    committed_settle: Vec<profile::curves::DenseSettled>,
     /// The key the settle looked its stored entries up by, once it ran:
     /// `(of, code)` ([`Shell::settle_key`]).
     settle_keyed: Option<(u32, u32)>,
     /// What the shell timed at load beside its profile's
-    /// (`profile::fire::Tuned::timed`): the bound probe, the settle.
+    /// (`profile::rates::Tuned::timed`): the bound probe, the settle.
     timed: Vec<String>,
     /// Whether the load times what no stored or committed profile states
     /// (`[engine] measure`): skipped, the settle fires nothing.
@@ -1206,7 +1227,7 @@ pub struct Shell<B: Serve> {
     /// What the dense settle did at each range ([`Shell::settled`]).
     settled: Vec<Settled>,
     /// The settle this load ran, for the engine to keep in the profile.
-    to_store: Option<profile::fire::DenseSettled>,
+    to_store: Option<profile::curves::DenseSettled>,
     /// The dense settle left to weigh behind serving, where no stored or
     /// committed settle of the load's key decided every range.
     behind: Option<Behind>,
@@ -1259,8 +1280,21 @@ pub struct Shell<B: Serve> {
     /// ([`Shell::fill_once`] before its plan): its walk lays into a frame
     /// that records nothing, and nothing runs.
     pub arm_filled: bool,
+    /// Whether a lane's score capture is its data, not its class: every lane
+    /// of a load that captures fires its class's capturing program, and the
+    /// capture kernels walk the fire's capturing lanes (none: no workgroup).
+    /// Set where the backend records bodies, so the capture splits none.
+    pub folds_scores: bool,
     /// Serving fires that walked for their fill, since the last count.
     filled_in_fire: u64,
+    /// Serving fires whose fill a lay-only pass laid, since the last count,
+    /// and the host time those passes took, all told.
+    laid_at_first_fire: u64,
+    pub lay_ns: u64,
+    /// The arm walk's compositions a lay-only pass laid, not walked, and
+    /// the host time its passes took.
+    pub laid_walk: u64,
+    pub lay_walk_ns: u64,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
@@ -1526,7 +1560,7 @@ impl<B: Serve> Shell<B> {
             .into_iter()
             .map(|(n, k, ..)| (n, k))
             .collect();
-        let before = fitted.tuning.profile().rates().kernel_tflops_by_shape;
+        let before = fitted.tuning.profile().rates().kernel_curves;
         fitted.tuning = B::rate_shapes(
             &fitted.device,
             boot.device,
@@ -1535,7 +1569,7 @@ impl<B: Serve> Shell<B> {
             counts.weight_bytes,
             top.max(1),
         )?;
-        Ok(fitted.tuning.profile().rates().kernel_tflops_by_shape != before)
+        Ok(fitted.tuning.profile().rates().kernel_curves != before)
     }
 
     /// Opens the device `boot` names and fits the load to it: the trace
@@ -1718,7 +1752,8 @@ impl<B: Serve> Shell<B> {
         let rs_bytes = rows.rs.as_ref().map_or(0, |rs| rs.bytes);
         let rs_tokens = rows.rs.as_ref().map_or(0, |rs| rs.tokens);
         // One working set: its pages, its record and one written
-        // copy-on-write, and its rs-list pages, beside the null chunk.
+        // copy-on-write, and a chunk of the rs list for the rows a fire
+        // leaves unfolded (as the runtime counts one), beside the null chunk.
         let least_chunks = crate::store::layout::Layout::least_chunks(
             chunk,
             [rows.list_bytes, rows.fixed_bytes],
@@ -1900,7 +1935,7 @@ impl<B: Serve> Shell<B> {
             (None, false) => None,
         };
         let device_profile = tuning.profile().clone();
-        // The live range the ruling weighs a span against: the pool the room
+        // The live range the fire-top rule weighs a span against: the pool the room
         // leaves past one working set at the declared context, bound in the
         // segments the kernels bind.
         let live = {
@@ -2073,6 +2108,7 @@ impl<B: Serve> Shell<B> {
                 &rung_tokens,
                 least,
                 &tuning,
+                device.max_buffer(),
             )?;
             // A fire's own windowed rows lie in slots of its activation
             // span, laid as the window buffer's (CONTRACT-BC 19).
@@ -2554,7 +2590,7 @@ impl<B: Serve> Shell<B> {
                             "skipped: `[rates] {}`, served by the estimate: a step is held at \
                              the ratio 1 of its estimate until a served step's measured ratio \
                              passes it",
-                            profile::fire::SUBMIT_WORST_RATIO
+                            profile::rates::SUBMIT_WORST_RATIO
                         );
                         Some(1.0)
                     }
@@ -2568,7 +2604,7 @@ impl<B: Serve> Shell<B> {
                          measures it",
                         bound.as_millis(),
                         device.name(),
-                        profile::fire::SUBMIT_WORST_RATIO
+                        profile::rates::SUBMIT_WORST_RATIO
                     )));
                 };
                 // A prompt step's attention against a longer prefix,
@@ -2587,7 +2623,7 @@ impl<B: Serve> Shell<B> {
                             "skipped: `[rates] {}`, served by the estimate: a prompt step's \
                              attention against a longer prefix is read off the square attention \
                              curve",
-                            profile::fire::ATTN_BY_ROWS_KEYS
+                            profile::rates::ATTN_BY_ROWS_KEYS
                         );
                         Some(Vec::new())
                     }
@@ -2601,7 +2637,7 @@ impl<B: Serve> Shell<B> {
                          measures it",
                         bound.as_millis(),
                         device.name(),
-                        profile::fire::ATTN_BY_ROWS_KEYS
+                        profile::rates::ATTN_BY_ROWS_KEYS
                     )));
                 };
                 let held = crate::submit::SubmitBound {
@@ -3148,7 +3184,12 @@ impl<B: Serve> Shell<B> {
             arming: false,
             walk_at: None,
             arm_filled: false,
+            folds_scores: false,
             filled_in_fire: 0,
+            laid_at_first_fire: 0,
+            lay_ns: 0,
+            laid_walk: 0,
+            lay_walk_ns: 0,
             eager: 0,
             eager_next: false,
             armed: false,
@@ -3280,7 +3321,7 @@ impl<B: Serve> Shell<B> {
         self.settle_keyed = Some((of, code));
         // The user's stored settle first, then a committed profile's: the
         // first whose key matches is taken, each other said and why.
-        let why_not = |stored: &profile::fire::DenseSettled| {
+        let why_not = |stored: &profile::curves::DenseSettled| {
             if stored.method != SETTLE_METHOD {
                 Some(format!(
                     "its method is version {SETTLE_METHOD} now, {} when stored",
@@ -3297,7 +3338,7 @@ impl<B: Serve> Shell<B> {
                 None
             }
         };
-        let mut taken: Option<(&str, profile::fire::DenseSettled)> = None;
+        let mut taken: Option<(&str, profile::curves::DenseSettled)> = None;
         for (whence, settled) in [
             ("stored", self.dense_rates.dense_settled.clone()),
             ("committed", self.committed_settle.clone()),
@@ -3467,8 +3508,8 @@ impl<B: Serve> Shell<B> {
     /// committed one; else the settle whose model shares the most planes
     /// with this one's (the stored first on a tie). `(whence, settle, how
     /// near)`; `None` where no settle shares a plane.
-    fn nearest_settle(&self, of: u32) -> Option<(&'static str, profile::fire::DenseSettled, String)> {
-        let all: Vec<(&'static str, &profile::fire::DenseSettled)> = self
+    fn nearest_settle(&self, of: u32) -> Option<(&'static str, profile::curves::DenseSettled, String)> {
+        let all: Vec<(&'static str, &profile::curves::DenseSettled)> = self
             .dense_rates
             .dense_settled
             .iter()
@@ -3479,7 +3520,7 @@ impl<B: Serve> Shell<B> {
             return Some((whence, same.clone(), "the same model's".to_string()));
         }
         let mine: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
-        let mut best: Option<(usize, &'static str, &profile::fire::DenseSettled)> = None;
+        let mut best: Option<(usize, &'static str, &profile::curves::DenseSettled)> = None;
         for &(whence, settle) in &all {
             let shared = settle.planes.iter().filter(|p| mine.contains(p)).count();
             if shared > 0 && best.is_none_or(|(most, ..)| shared > most) {
@@ -3843,12 +3884,12 @@ impl<B: Serve> Shell<B> {
 
     /// The settle entry for the profile as `behind` stands: the rows stored
     /// before and every range weighed since whose clock held.
-    fn behind_entry(&self, behind: &Behind) -> profile::fire::DenseSettled {
+    fn behind_entry(&self, behind: &Behind) -> profile::curves::DenseSettled {
         let mut planes: Vec<(u32, u32)> =
             self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
         planes.sort_unstable();
         planes.dedup();
-        profile::fire::DenseSettled {
+        profile::curves::DenseSettled {
             method: SETTLE_METHOD,
             of: behind.of,
             code: behind.code,
@@ -4369,7 +4410,7 @@ impl<B: Serve> Shell<B> {
         // stored entry, a committed one, a measurement, the estimate under
         // skip): the dense kernel each rung takes after the settle, and the
         // workgroups a guest step strides over; never which file stated them.
-        let tuning = profile::fire::fingerprint(
+        let tuning = profile::rates::fingerprint(
             format!(
                 "{decisions:?}|{:?}|{:?}|{}|{}|cores {} resident {:?}",
                 self.dense,
@@ -4464,7 +4505,7 @@ impl<B: Serve> Shell<B> {
     }
 
     /// The stored settle's row of a range `bottom..=top` that replaced the
-    /// curves' kernel with `tactic` (`profile::fire::DenseSettled::ranges`).
+    /// curves' kernel with `tactic` (`profile::curves::DenseSettled::ranges`).
     #[must_use]
     pub fn settled_row(
         bottom: u32,
@@ -4482,7 +4523,7 @@ impl<B: Serve> Shell<B> {
     }
 
     /// The settle the load ran and the profile should keep, taken once.
-    pub fn take_settled(&mut self) -> Option<profile::fire::DenseSettled> {
+    pub fn take_settled(&mut self) -> Option<profile::curves::DenseSettled> {
         self.to_store.take()
     }
 
@@ -4571,15 +4612,21 @@ impl<B: Serve> Shell<B> {
                 engine::disk::derived_need(0, 0, pages.div_ceil(per_list) + state, chunk, guest);
             let bytes = need.min(room.for_us());
             // Its inputs, stated at load: what the field rules on.
-            eprintln!(
-                "engine-gpu: the unstated disk tier: {bytes} bytes of a derived need of {need} \
-                 bytes ({seats} seats x {context} tokens: {pages} kv pages in {} chunks and \
-                 {state} chunks of state ({} B a seat), and {guest} B of guest state the device \
-                 holds live, chunks of {chunk} B), within {} under {}: {room}",
-                pages.div_ceil(per_list),
-                self.state_slot_bytes(),
-                room.for_us(),
-                dir.display(),
+            tracing::info!(
+                bytes,
+                need,
+                seats,
+                context,
+                kv_pages = pages,
+                page_chunks = pages.div_ceil(per_list),
+                state_chunks = state,
+                seat_state_bytes = self.state_slot_bytes(),
+                guest_bytes = guest,
+                chunk_bytes = chunk,
+                for_us = room.for_us(),
+                dir = %dir.display(),
+                %room,
+                "engine-gpu: the unstated disk tier"
             );
             bytes
         });
@@ -4636,7 +4683,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`: landed when this returns. A move off the
+    /// See `Tiers::copy`: landed when this returns. A move off the
     /// device, which rides the queue past `copy_slots_landing`, is waited
     /// out here.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
@@ -4646,7 +4693,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots_landing`: whether the copy's sources may go
+    /// See `Tiers::copy_landing`: whether the copy's sources may go
     /// back when this returns.
     /// - Within the device, and between the device and mapped host chunks:
     ///   in queue order, behind every frame submitted before, with no
@@ -4678,7 +4725,7 @@ impl<B: Serve> Shell<B> {
             None if queued && parks => {
                 return Err(Fault::Unbound {
                     what: "a copy on the device with no landing sink installed \
-                           (Engine::on_landed comes before any copy_slots_landing)"
+                           (Tiers::on_landed comes before any copy_landing)"
                         .to_string(),
                 });
             }
@@ -4708,14 +4755,14 @@ impl<B: Serve> Shell<B> {
         }
     }
 
-    /// See `Engine::settle_copies`: every frame and copy in flight lands,
+    /// See `Tiers::settle`: every frame and copy in flight lands,
     /// a slot file read's copy onto the device too.
     pub fn settle_copies(&mut self) -> Result<()> {
         self.drain()?;
         self.pools.settle_spill()
     }
 
-    /// See `Engine::read_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::read`: every frame and copy lands first.
     pub fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -4724,7 +4771,7 @@ impl<B: Serve> Shell<B> {
         self.pools.read_tier_slots(slots)
     }
 
-    /// See `Engine::write_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::write`: every frame and copy lands first.
     pub fn write_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -4807,7 +4854,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::weight_residency`: every slot newly named filled from
+    /// See `WeightCache::set_residency`: every slot newly named filled from
     /// the host before the next fire, every block's entry rewritten. The
     /// first after a load that seated its weights says how many atoms it
     /// names elsewhere (each filled again there).
@@ -4897,7 +4944,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::weight_uses`.
+    /// See `WeightCache::uses`.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         self.drain()?;
         let (mut uses, mut held) = self.row_caches.uses()?;
@@ -5202,6 +5249,12 @@ impl<B: Serve> Shell<B> {
         std::mem::take(&mut self.filled_in_fire)
     }
 
+    /// The serving fires since the last count whose fill a lay-only pass
+    /// laid ([`engine::live::Tally::LaidAtFirstFire`]).
+    pub fn laid_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.laid_at_first_fire)
+    }
+
     /// A step walked to be kept made no recording: its commands were a held
     /// recording's, which it filled (the backend keeps what a fire changes
     /// apart from its commands).
@@ -5301,6 +5354,16 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.voxel_seat.map(|seat| seat.dtype)
+    }
+
+    /// The word a lane is classed by: its own, its score capture set where
+    /// the capture is the lane's data ([`Shell::folds_scores`]).
+    fn class_word(&self, word: u64) -> u64 {
+        if self.folds_scores {
+            self.trace.facts.with(word, poem_ir::Builtin::Scores, true)
+        } else {
+            word
+        }
     }
 
     /// Whether lanes of `class` capture: the class writes a score row.
@@ -5441,10 +5504,23 @@ impl<B: Serve> Shell<B> {
             let mut layers = Vec::with_capacity(plane.values.len());
             let mut buffer = None;
             for value in &plane.values {
+                // A capture's value in a fire none of whose lanes capture
+                // binds the absent buffer: its rows none, copied from the
+                // fire's room all the same (a copy of no region), where it
+                // has one.
                 let Some(rect) = prepared.slots.0[value.0 as usize] else {
                     buffer = None;
                     break;
                 };
+                if rect.buf == crate::NIL {
+                    let Some((room, at)) = prepared.score_room.as_ref() else {
+                        buffer = None;
+                        break;
+                    };
+                    layers.push(*at);
+                    buffer.get_or_insert_with(|| room.clone());
+                    continue;
+                }
                 if rect.width != plane.width {
                     return Err(Fault::Ceiling {
                         what: "elements in one readout row",
@@ -5586,16 +5662,16 @@ impl<B: Serve> Shell<B> {
             },
             None,
         )?;
-        crate::kernel_profile::phase(0, t);
+        crate::kernel_profile::phase_if(0, t);
         let t = std::time::Instant::now();
         let enqueued = FrameShell::enqueue(self, prepared)?;
-        crate::kernel_profile::phase(1, t);
+        crate::kernel_profile::phase_if(1, t);
         let t = std::time::Instant::now();
         let landed = FrameShell::settle(self, enqueued)?;
-        crate::kernel_profile::phase(2, t);
+        crate::kernel_profile::phase_if(2, t);
         let t = std::time::Instant::now();
         let rows = self.rows_of(&landed);
-        crate::kernel_profile::phase(3, t);
+        crate::kernel_profile::phase_if(3, t);
         rows
     }
 
@@ -7021,15 +7097,15 @@ impl<B: Serve> Shell<B> {
             .zip(&lane_rows)
             .enumerate()
             .map(|(at, (seated, &rows))| match (media_of[at], clips_of[at]) {
-                (None, None) => FireLane::new(seated.lane.word, rows),
+                (None, None) => FireLane::new(self.class_word(seated.lane.word), rows),
                 (Some(shot), _) => FireLane::with_images(
-                    seated.lane.word,
+                    self.class_word(seated.lane.word),
                     rows,
                     shot.rows.len() as u32,
                     shot.rows.iter().copied().fold(0u32, u32::saturating_add),
                 ),
                 (None, Some(tile)) => FireLane::with_clips(
-                    seated.lane.word,
+                    self.class_word(seated.lane.word),
                     rows,
                     tile.boxes.len() as u32,
                     tile.boxes
@@ -7655,7 +7731,12 @@ impl<B: Serve> Shell<B> {
         // The lanes whose class captures, compacted in lane order: a key row
         // each, and a page row each of those whose program reads pages.
         let scored = Scored::of(composition.lanes().iter().map(|row| {
-            let captures = self.captures(row.class as usize);
+            let captures = self.captures(row.class as usize)
+                && (!self.folds_scores
+                    || self
+                        .trace
+                        .facts
+                        .holds(lanes[row.source as usize].lane.word, poem_ir::Builtin::Scores));
             let pages = captures
                 && lanes[row.source as usize]
                     .reads
@@ -8250,7 +8331,20 @@ impl<B: Serve> Shell<B> {
         }
 
         // A fire's capturing lanes' rows lie in the score room of its first
-        // capturing lane's pair, laid for the most lanes a fire carries.
+        // capturing lane's pair, laid for the most lanes a fire carries. A
+        // fire of a load whose capture is its lanes' data, none of whose
+        // lanes captures, binds the load's standing room (its kernels launch
+        // none and its copy moves none): the commands of a fire whose lanes
+        // capture.
+        let idle_room = if self.folds_scores
+            && !composition.lanes().iter().enumerate().any(|(lane, row)| {
+                scored.row(u32::try_from(lane).unwrap_or(u32::MAX)).is_some()
+                    && lanes[row.source as usize].scores.is_some()
+            }) {
+            self.arming_room()?
+        } else {
+            None
+        };
         let room = composition
             .lanes()
             .iter()
@@ -8261,6 +8355,7 @@ impl<B: Serve> Shell<B> {
                     .is_some()
             })
             .find_map(|(_, row)| lanes[row.source as usize].scores)
+            .or(idle_room.as_ref())
             .map(|cell| (&cell.buffer, cell.at, cell.bytes));
         let score_room = room.map(|(buffer, at, _)| (buffer.clone(), at));
         // A naming walk fires nothing: its capturing classes' rows bind the
@@ -8553,6 +8648,59 @@ impl<B: Serve> Shell<B> {
         self.walk_into(frame, p, false, false, &place, &mut Cursor::new(&place))
     }
 
+    /// Lays `prepared`'s fill of the armed family whose kernels it runs
+    /// from a lay-only pass ([`Serve::lay_frame`]): the fire's dispatch
+    /// arguments and group counts, and its readout copies, computed on the
+    /// host from its own rows and reads, with nothing bound, hashed,
+    /// recorded or built. Whether a family took it.
+    fn lay_once(&mut self, prepared: &mut Prepared<'_, B>) -> Result<bool> {
+        let Some(frame) = B::lay_frame(&self.device, prepared.arm)? else {
+            return Ok(false);
+        };
+        let at = std::time::Instant::now();
+        // What the pass mints goes again after it; the fire's own staged
+        // rows stand, for a walk of it the pass fills no family for.
+        let mark = self.handles.len();
+        let place = At::new();
+        let walked = self.walk_into(frame, prepared, false, false, &place, &mut Cursor::new(&place));
+        let walked = match walked {
+            Ok(walked) => walked,
+            Err(fault) => {
+                self.handles.rewind_to(mark);
+                return Err(fault);
+            }
+        };
+        let mut frame = walked.frame.expect("the walk opened a frame");
+        let laid = self.readout_copies(prepared).and_then(|(layout, regions)| {
+            for (from, list, most) in &regions {
+                frame.copy_rows(from, &self.readout[prepared.arm], list, *most)?;
+            }
+            self.copy_pixels(&mut frame, prepared)?;
+            Ok(layout)
+        });
+        self.handles.rewind_to(mark);
+        let layout = laid?;
+        let filled = B::lay_fill(self, frame, prepared, &layout, walked.launches)?;
+        if self.arming {
+            self.lay_walk_ns = self.lay_walk_ns.saturating_add(at.elapsed().as_nanos() as u64);
+        }
+        if filled && self.arming {
+            self.laid_walk += 1;
+        } else if filled {
+            let ns = at.elapsed().as_nanos() as u64;
+            self.lay_ns = self.lay_ns.saturating_add(ns);
+            self.laid_at_first_fire += 1;
+            tracing::info!(
+                rung = prepared.rung,
+                rows = ?prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
+                us = ns / 1000,
+                "a lay-only pass laid a fire's fill of its armed family (counted \
+                 laid_at_first_fire)"
+            );
+        }
+        Ok(filled)
+    }
+
     /// Fills an armed body for `prepared`'s shape from a walk that records
     /// nothing ([`Plan::Fill`]): the walk, the fire's readout copies and its
     /// pixels laid in a fill frame, and the backend's fill from what they
@@ -8567,7 +8715,7 @@ impl<B: Serve> Shell<B> {
         };
         let t = std::time::Instant::now();
         let walked = self.walk_fill(prepared);
-        crate::kernel_profile::phase(4, t);
+        crate::kernel_profile::phase_if(4, t);
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
@@ -8587,7 +8735,7 @@ impl<B: Serve> Shell<B> {
         let layout = laid?;
         let t = std::time::Instant::now();
         let filled = B::fill(self, frame, prepared, &layout, walked.launches);
-        crate::kernel_profile::phase(5, t);
+        crate::kernel_profile::phase_if(5, t);
         filled
     }
 
@@ -9277,10 +9425,17 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             // its shape) and records nothing: a body is recorded once, each
             // composition of it a table of data.
             B::ready_fill(self, &prepared);
-            self.arm_filled = B::derive_fill(self, &prepared) || self.fill_once(&mut prepared)?;
+            // A composition whose kernels name a family already recorded is
+            // laid, not walked: a lay-only pass, its picks the family's.
+            self.arm_filled = B::derive_fill(self, &prepared) || self.lay_once(&mut prepared)? || {
+                // A pass that laid none took what the plan laid for the next
+                // frame: laid again for the fill walk's.
+                B::ready_fill(self, &prepared);
+                self.fill_once(&mut prepared)?
+            };
             let t = std::time::Instant::now();
             let plan = B::plan(self, &mut prepared)?;
-            crate::kernel_profile::phase(6, t);
+            crate::kernel_profile::phase_if(6, t);
             plan
         } else {
             B::plan(self, &mut prepared)?
@@ -9288,7 +9443,21 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // An armed body with no fill for the step's shape fills from a walk
         // that records nothing, then replays.
         let plan = match plan {
+            // A fire of an armed family whose fill the walk did not lay
+            // (a row count it enumerates no composition of) lays it on the
+            // host, once a length.
+            Plan::Fill if self.serving && self.lay_once(&mut prepared)? => {
+                match B::plan(self, &mut prepared)? {
+                    Plan::Fill => self.unarmed(&prepared, "its laid fill replays no body")?,
+                    plan => plan,
+                }
+            }
             Plan::Fill => {
+                // A lay-only pass that laid no fill took what the plan laid
+                // for the next frame: laid again for the fill walk's.
+                if self.serving {
+                    B::ready_fill(self, &prepared);
+                }
                 self.filled_in_fire += 1;
                 if self.serving {
                     let kind = format!(
@@ -9377,7 +9546,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 picks: Vec::new(),
             })
         } else {
-            self.walk_once(&prepared, keep.is_some(), split)
+            let t = std::time::Instant::now();
+            let walked = self.walk_once(&prepared, keep.is_some(), split);
+            crate::kernel_profile::phase_if(8, t);
+            walked
         };
         self.split_layers = 1;
         let walked = walked?;
@@ -10413,26 +10585,36 @@ impl<B: Serve> Shell<B> {
         // A body binds the pool's segments by place: their places stated
         // before the first is recorded.
         B::rebind(self)?;
+        let classes = self.compiled.classes.classes.len();
+        let mut decoding = vec![false; classes];
+        let mut prefilling = vec![false; classes];
+        // A load that captures scores fires every lane on its class's
+        // capturing program: the capture is the lane's data (a capture table
+        // its kernels walk, none: no workgroup), so it splits no class.
+        self.folds_scores = (0..classes).any(|class| self.captures(class));
         let facts = &self.trace.facts;
         let table = &self.compiled.classes;
-        let mut decoding = vec![false; table.classes.len()];
-        let mut prefilling = vec![false; table.classes.len()];
-        // Interim: the walk arms classes without a score capture, an adapter
-        // or a guest input. A class whose lanes carry one binds commands of
-        // its own per attachment, which multiplies
-        // the bodies past what a device holds; it is stated eager at load
-        // until its commands read the attachment as data.
-        // (A mask is armed: every class of a load that masks carries one.)
+        // The walk arms every class but those whose lanes carry an adapter
+        // or a guest input: such a class binds commands of its own per
+        // attachment, which multiplies the bodies past what a device holds;
+        // it is stated eager at load, by name, until its commands read the
+        // attachment as data. (A mask is armed: every class of a load that
+        // masks carries one.)
         let attached: Vec<bool> = (0..table.classes.len())
             .map(|class| {
                 let lane = self.naming_lane(class, 1).ok();
-                self.captures(class)
-                    || lane.as_ref().is_some_and(|lane| lane.adapter.is_some())
+                lane.as_ref().is_some_and(|lane| lane.adapter.is_some())
                     || lane.as_ref().is_some_and(|lane| !lane.inputs.is_empty())
             })
             .collect();
         for request in facts.requests() {
-            if let Some(class) = table.class_of(facts.word(&request) & table.mask) {
+            let word = facts.word(&request);
+            let word = if self.folds_scores {
+                facts.with(word, poem_ir::Builtin::Scores, true)
+            } else {
+                word
+            };
+            if let Some(class) = table.class_of(word & table.mask) {
                 if attached[class] {
                     continue;
                 }
@@ -10572,12 +10754,22 @@ impl<B: Serve> Shell<B> {
         // Each shape carrying decode lanes is recorded so too.
         let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
         let capturing: Vec<bool> = (0..decoding.len()).map(|class| self.captures(class)).collect();
+        // Each class's outputs a lane of it may read out, captures apart.
+        let readable: Vec<Vec<String>> = (0..decoding.len())
+            .map(|class| {
+                self.readouts
+                    .iter()
+                    .filter(|plane| plane.captured.is_none() && plane.classes.contains(class))
+                    .map(|plane| plane.output.clone())
+                    .collect()
+            })
+            .collect();
         // Where the trace buffers a recurrence, a decode lane carries the
         // rows it has not folded (the lagged fold): its scans are the
         // carried forms, another body. Each shape carrying decode lanes is
         // recorded so too.
         let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
-        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, bool)> = shapes
+        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, u8)> = shapes
             .into_iter()
             .flat_map(|lanes| {
                 let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
@@ -10598,22 +10790,36 @@ impl<B: Serve> Shell<B> {
                         forms.push(Buffering::Tail);
                     }
                 }
-                // A capturing class's lanes read their page rows, or their key
-                // rows alone: a fire laying no page row sums none (another
-                // form of commands).
-                let pageless = [false, true];
+                // A capturing class's lanes capturing (reading their page
+                // rows, or their key rows alone: a fire laying no page row
+                // sums none), or not capturing at all: the capture is the
+                // lanes' data, the fills of one body.
+                let pageless = [0u8, 1, 4];
                 let captures = lanes.iter().any(|&(class, _)| capturing[class]);
+                // Its lanes reading out nothing, or every output their class
+                // reads out (a sampler on the host reads its logits): what a
+                // lane reads lays its fire's readout data, so a serving fire
+                // finds a fill laid for its reads.
+                let reading = lanes.iter().any(|&(class, _)| !readable[class].is_empty());
                 forms
                     .into_iter()
                     .flat_map(move |form| {
                         let lanes = lanes.clone();
                         pageless
                             .into_iter()
-                            .filter(move |&keys_only| !keys_only || captures)
-                            .flat_map(move |keys_only| {
+                            .filter(move |&capture| capture == 0 || captures)
+                            .flat_map(move |capture| {
                                 let lanes = lanes.clone();
-                                std::iter::once((lanes.clone(), false, form, keys_only))
-                                    .chain(fed.then_some((lanes, true, form, keys_only)))
+                                [false, true]
+                                    .into_iter()
+                                    .filter(move |&reads| !reads || reading)
+                                    .flat_map(move |reads| {
+                                        let lanes = lanes.clone();
+                                        let flags = capture | u8::from(reads) << 1;
+                                        std::iter::once((lanes.clone(), false, form, flags))
+                                            .chain(fed.then_some((lanes, true, form, flags)))
+                                    })
+                                    .collect::<Vec<_>>()
                             })
                             .collect::<Vec<_>>()
                     })
@@ -10637,21 +10843,21 @@ impl<B: Serve> Shell<B> {
                 };
                 let attachments: Vec<engine::Attachments> =
                     (0..decoding.len()).map(carries).collect();
-                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, bool), usize)> = shapes
+                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, u8), usize)> = shapes
                     .into_iter()
                     .filter_map(|entry| {
                         let step = step_of(&entry.0, entry.2 != Buffering::None, &attachments);
                         steps.shape_of(&step).map(|at| (entry, at))
                     })
                     .collect();
-                tagged.sort_by_key(|((lanes, fed, carried, keys_only), at)| {
+                tagged.sort_by_key(|((lanes, fed, carried, flags), at)| {
                     (
                         *at,
                         lanes.iter().map(|&(_, rows)| rows).sum::<u32>(),
                         std::cmp::Reverse(lanes.len()),
                         *fed,
                         *carried as u8,
-                        *keys_only,
+                        *flags,
                     )
                 });
                 let mut covered = vec![false; steps.len()];
@@ -10806,6 +11012,11 @@ impl<B: Serve> Shell<B> {
             .or_else(|| B::max_maps(self));
         let maps_before = map_count().unwrap_or(0);
         let mut dearest_maps = 0u64;
+        // The process's maps as last read: the file lists every map, so a
+        // read costs as many as the process holds (a kgsl map each driver
+        // allocation, on Android). A recording makes them; a shape that
+        // records none reads the count it left, re-read each 64 shapes.
+        let mut maps_seen = map_count();
         let before = rss();
         let mut dearest = 0u64;
         let mut dearest_device = 0u64;
@@ -10819,7 +11030,27 @@ impl<B: Serve> Shell<B> {
                 None => self.eager_rows = known.eager,
             }
         }
-        for (at, (lanes, fed, carried, keys_only)) in shapes.iter().enumerate() {
+        // `flags`: 1 a capturing lane of the pageless form (its key rows
+        // alone), 2 every lane reading out its class's outputs, 4 no lane
+        // capturing (a class that captures, fired with none).
+        let mut stride = (std::time::Instant::now(), [0u64; 10]);
+        for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
+            // Under the kernel profile, each 64 shapes' time and its phases:
+            // whether the walk slows as it goes.
+            if crate::kernel_profile::phases_timed() && at % 64 == 0 && at > 0 {
+                let now: [u64; 10] = std::array::from_fn(|phase| {
+                    crate::kernel_profile::WALK_PHASES[phase].load(std::sync::atomic::Ordering::Relaxed)
+                });
+                let ms: Vec<u64> = now.iter().zip(&stride.1).map(|(n, b)| (n - b) / 1_000_000).collect();
+                tracing::info!(
+                    at,
+                    of = shapes.len(),
+                    ms = stride.0.elapsed().as_millis() as u64,
+                    phases_ms = ?ms,
+                    "arm walk stride"
+                );
+                stride = (std::time::Instant::now(), now);
+            }
             // A known lattice states eager what its allowance did; every shape
             // short of it is walked, the ones whose family an earlier shape
             // recorded filling it (their fills kept before ready).
@@ -10830,6 +11061,7 @@ impl<B: Serve> Shell<B> {
             }) {
                 break;
             }
+            let probed = std::time::Instant::now();
             let used = rss().saturating_sub(before);
             // The next shape's bodies cost what the dearest so far did, on
             // each arm: on the host (its resident bytes) and on the device
@@ -10844,12 +11076,16 @@ impl<B: Serve> Shell<B> {
             let cmds_short = most_cmds.is_some_and(|most| {
                 live_cmds.saturating_add(dearest_cmds.saturating_mul(depth as u64)) >= most
             });
-            let maps_now = map_count();
+            if at % 64 == 0 {
+                maps_seen = map_count();
+            }
+            let maps_now = maps_seen;
             let maps_short = max_maps.zip(maps_now).is_some_and(|(most, now)| {
                 now.saturating_add(dearest_maps.saturating_mul(depth as u64))
                     .saturating_add(maps_before)
                     >= most
             });
+            crate::kernel_profile::phase_if(9, probed);
             if device_short || host_short || cmds_short || maps_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
@@ -10906,18 +11142,29 @@ impl<B: Serve> Shell<B> {
             }
             let families = self.recorded;
             for arm in 0..depth {
+                let probed = std::time::Instant::now();
                 let ahead = rss();
                 let cmds_ahead = B::command_buffers(self).0;
-                let maps_ahead = map_count();
+                let maps_ahead = maps_seen;
                 let left_ahead = self.device.left();
+                let bodies_ahead = self.recorded;
+                crate::kernel_profile::phase_if(9, probed);
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
                         let mut lane = self.naming_lane(class, rows)?;
                         // A capturing lane of a pageless form reads its key
                         // rows alone: its fire lays no page row.
-                        if *keys_only {
+                        if *flags & 1 != 0 {
                             lane.reads.retain(|read| read != SCORE_PAGES);
+                        }
+                        if *flags & 4 != 0 {
+                            lane.reads.clear();
+                            lane.word =
+                                self.trace.facts.with(lane.word, poem_ir::Builtin::Scores, false);
+                        }
+                        if *flags & 2 != 0 {
+                            lane.reads.extend(readable[class].iter().cloned());
                         }
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                         if *carried != Buffering::None {
@@ -10944,7 +11191,7 @@ impl<B: Serve> Shell<B> {
                     if *fed && rows == 1 && decoding[class] {
                         lane.feed = Some(&cell);
                     }
-                    if self.captures(class) {
+                    if self.captures(class) && *flags & 4 == 0 {
                         lane.scores = arming_room.as_ref();
                     }
                 }
@@ -10954,7 +11201,7 @@ impl<B: Serve> Shell<B> {
                     self.arms.take(before);
                 }
                 crate::kernel_profile::family_log(&format!(
-                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} keys_only {keys_only}"
+                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} flags {flags}"
                 ));
                 self.walk_at = Some(at);
                 let fired = self.fire_seated(&seated);
@@ -10992,14 +11239,23 @@ impl<B: Serve> Shell<B> {
                 // A body's cost: what it took of the host's memory or of the
                 // device's (a driver that keeps its command buffers and
                 // descriptors in device-visible memory), whichever is more.
+                // An arm that recorded no body (its fill derived, laid or
+                // walked into a family recorded before) cost none.
+                if self.recorded == bodies_ahead {
+                    recorded += 1;
+                    continue;
+                }
+                let probed = std::time::Instant::now();
                 let on_device = left_ahead.saturating_sub(self.device.left());
                 let cost = rss().saturating_sub(ahead).max(on_device);
                 dearest = dearest.max(cost);
                 dearest_device = dearest_device.max(on_device);
                 dearest_cmds = dearest_cmds.max(B::command_buffers(self).0.saturating_sub(cmds_ahead));
-                if let (Some(ahead), Some(after)) = (maps_ahead, map_count()) {
+                maps_seen = map_count();
+                if let (Some(ahead), Some(after)) = (maps_ahead, maps_seen) {
                     dearest_maps = dearest_maps.max(after.saturating_sub(ahead));
                 }
+                crate::kernel_profile::phase_if(9, probed);
                 recorded += 1;
             }
             if self.recorded > families {

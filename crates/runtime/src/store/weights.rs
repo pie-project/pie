@@ -121,8 +121,7 @@ pub fn pool_shapes(weights: &[WeightShape]) -> Vec<SlotShape> {
 /// The pool the weight shapes take their slots from until the pool switch
 /// sets them beside kv and state: the device's chunks above every reserved
 /// and pinned run, short of the activation at the top, in the engine's
-/// chunk ids; [`pool_shapes`] of `facts.weights` from shape 0. The
-/// degenerate mode's pinned runs take every chunk, so it has none.
+/// chunk ids; [`pool_shapes`] of `facts.weights` from shape 0.
 #[must_use]
 pub fn slot_pool(facts: &ChunkFacts) -> SlotPool {
     let total = facts.total_chunks.saturating_sub(facts.act_chunks_max());
@@ -207,16 +206,23 @@ pub enum Proposal {
 
 impl<E: ::engine::Engine + ?Sized> WeightPort for E {
     fn uses(&mut self) -> ::engine::Result<WeightUses> {
-        self.weight_uses()
+        let kind = self.kind();
+        self.weights()
+            .ok_or(::engine::Error::unsupported(kind, "weight_uses"))?
+            .uses()
     }
 
     fn set_residency(&mut self, residency: &WeightResidency) -> ::engine::Result<()> {
-        self.weight_residency(residency).map(|_held| ())
+        let kind = self.kind();
+        self.weights()
+            .ok_or(::engine::Error::unsupported(kind, "weight_residency"))?
+            .set_residency(residency)
+            .map(|_held| ())
     }
 
     fn propose(&mut self, residency: &WeightResidency) -> Proposal {
-        match self.weight_residency(residency) {
-            Ok(_held) => Proposal::Taken,
+        match WeightPort::set_residency(self, residency) {
+            Ok(()) => Proposal::Taken,
             Err(_) => Proposal::Refused,
         }
     }

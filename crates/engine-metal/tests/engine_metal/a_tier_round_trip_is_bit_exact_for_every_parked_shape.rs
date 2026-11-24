@@ -73,7 +73,7 @@ fn copy(shape: &SlotShape, src: MemoryDomain, dst: MemoryDomain, slots: Vec<(u32
 /// test fires nothing, so every chunk past it is its own).
 fn round_trip(shell: &mut Shell, shape: &SlotShape, model: &str, host_tier: bool, base: u32) {
     let (device, host, disk) = (
-        MemoryDomain::MetalShared,
+        MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
         MemoryDomain::HostPinned,
         MemoryDomain::LocalDisk,
     );

@@ -1,0 +1,59 @@
+// wafer/ops/smv.csl: a weight PE's matvec over a row stream. The tile stays and the step's rows
+// flow through it: each row's chunk (Hc f32) lands in one of two 16-bit x buffers, the tile matvec
+// (ops/mv.csl's tile32) gives the PE's Nc partials, and they go into the column chain (async) from
+// one of two y buffers, so a row's send overlaps the next row's multiply. A send is issued only
+// once the one before it has left. The 16-bit type is the build's (`--fp16-format`).
+// X32: an f32 row is multiplied as its two 16-bit halves, x = hi + lo, into one accumulator.
+//
+// Interface: w (the tile, Hc rows of Nc 16-bit words; w[0] unused: memcpy's 16-bit writes start at
+// an odd half), `rows(n)`, `row(t)` (one row of a stream interleaved with other matvecs).
+// Params: fab, red (the column chain), XQ (the rows' input queue), Hc, Nc, X32.
+param fab: imported_module;
+param red: imported_module;
+param XQ: input_queue;
+param Hc: u16;
+param Nc: u16;
+param X32: bool = false;
+
+const matvec = @import_module("ops/mv.csl");
+
+var w = @zeros([Hc * Nc + 1]u16);
+var xh = @zeros([2 * Hc]@fp16());
+var y: [2 * Nc]f32 align(16) = @zeros([2 * Nc]f32);
+const xh_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xh[i] });
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nc} -> y[i] });
+const a_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nc} -> w[1 + i] });
+
+const XN: u16 = if (X32) Hc else 1;
+var xs: [XN]f32 align(16) = @zeros([XN]f32);
+var xr: [XN]f32 align(16) = @zeros([XN]f32);
+var xl = @zeros([XN]@fp16());
+const xr_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xr[i] });
+const xs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xs[i] });
+const xl_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{XN} -> xl[i] });
+
+// Row t: its x chunk in, its partials into the chain.
+fn row(t: u16) void {
+  const b: u16 = t & 1;
+  const xv = @increment_dsd_offset(xh_d, @as(i16, b * Hc), @fp16());
+  const yv = @increment_dsd_offset(y_d, @as(i16, b * Nc), f32);
+  if (X32) {
+    @fmovs(xs_d, fab.fin(XQ, Hc));
+    @fs2h(xv, xs_d);
+    @fh2s(xr_d, xv);
+    @fsubs(xs_d, xs_d, xr_d);
+    @fs2h(xl_d, xs_d);
+    matvec.tile32(yv, a_d, xv);
+    matvec.mac32(yv, a_d, xl_d);
+  } else {
+    @fs2h(xv, fab.fin(XQ, Hc));
+    matvec.tile32(yv, a_d, xv);
+  }
+  red.send(yv, Nc);
+}
+
+// n rows through the tile.
+fn rows(n: u16) void {
+  var t: u16 = 0;
+  while (t < n) : (t += 1) { row(t); }
+}

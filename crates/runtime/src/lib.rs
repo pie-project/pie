@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #[cfg(feature = "engine-cuda")]
 extern crate engine_cuda as _;
 
@@ -24,6 +25,7 @@ pub(crate) mod sandbox_pool;
 pub mod scheduler;
 pub mod server;
 pub(crate) mod service;
+pub(crate) mod slot;
 pub mod store;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod telemetry;

@@ -1,0 +1,58 @@
+// wafer/ops/sconv.csl: ssm.short_conv at a unit's roots (kernels-cerebras kernel::ssm::short_conv):
+// a depthwise causal conv of each of a root's C channels over its last T rows, no activation:
+//   y[c] = w[c][T - 1] x[c] + sum_{j < T - 1} w[c][j] h_j[c]
+// the earlier rows (h, the oldest first) a slot's history, the root's own. In a decode step
+// (DECODE) row t steps slot rowp[3 t + 1], cleared first at its position rowp[3 t + 2] == 0; in a
+// stream step its rows are one sequence's, slot 0, cleared at the step's start (init).
+//
+// Interface: w ([C][T] the taps, the host's, through `w`), init() a step's start, row(x, y) each
+// row in order (counted from init).
+//
+// Params: C, T, SLOTS, ROWS, DECODE, w (the taps' array), rowp (a decode step's rows: lane slot,
+// state slot, position).
+param C: u16;
+param T: u16;
+param SLOTS: u16 = 1;
+param ROWS: u16 = 1;
+param DECODE: bool = false;
+param w: [*]f32;
+param rowp: [*]u32;
+
+const HW: u16 = (T - 1) * C;
+var hist = @zeros([SLOTS * HW]f32);
+var t: u16 = 0;
+
+fn below(v: u32, n: u32) u32 { return if (v < n) v else n - 1; }
+
+fn clear(s: u16) void {
+  var e: u16 = 0;
+  while (e < HW) : (e += 1) { hist[s * HW + e] = 0.0; }
+}
+
+// A step's start: its rows counted from 0 (a stream step's history cleared).
+fn init() void {
+  t = 0;
+  if (!DECODE) { clear(0); }
+}
+
+// The step's next row: its slot's history (cleared at its position 0), the conv, the history
+// shifted.
+fn row(x: [*]f32, y: [*]f32) void {
+  var s: u16 = 0;
+  if (DECODE) {
+    s = @as(u16, below(rowp[3 * t + 1], SLOTS));
+    if (rowp[3 * t + 2] == 0) { clear(s); }
+  }
+  t = if (t + 1 < ROWS) t + 1 else 0;
+  const hb = s * HW;
+  var c: u16 = 0;
+  while (c < C) : (c += 1) {
+    var acc: f32 = w[c * T + T - 1] * x[c];
+    var j: u16 = 0;
+    while (j < T - 1) : (j += 1) { acc += w[c * T + j] * hist[hb + j * C + c]; }
+    j = 0;
+    while (j + 1 < T - 1) : (j += 1) { hist[hb + j * C + c] = hist[hb + (j + 1) * C + c]; }
+    hist[hb + (T - 2) * C + c] = x[c];
+    y[c] = acc;
+  }
+}

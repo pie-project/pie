@@ -64,7 +64,7 @@ pub enum DecodeSplit {
     },
     /// `per` times the workgroups the device holds at once, as its rates
     /// step measured them (WebGPU reports no count of an adapter's compute
-    /// units: `profile::fire::RESIDENT_WORKGROUPS`).
+    /// units: `profile::rates::RESIDENT_WORKGROUPS`).
     PerCore {
         #[constant(range(1..=64), default = 1)]
         per: u32,

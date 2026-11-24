@@ -222,7 +222,7 @@ impl GuestEngine {
     }
 }
 
-impl Engine for GuestEngine {
+impl ::engine::Engine for GuestEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -233,51 +233,12 @@ impl Engine for GuestEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "fake-guests"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
@@ -288,7 +249,47 @@ impl Engine for GuestEngine {
         unreachable!("nothing fires here")
     }
 
-    fn program_facts(&self, _program: ProgramId) -> ::engine::Result<ProgramFacts> {
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for GuestEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn facts(&self, _program: ProgramId) -> ::engine::Result<ProgramFacts> {
         Ok(ProgramFacts::default())
     }
 
@@ -301,7 +302,7 @@ impl Engine for GuestEngine {
         Ok(self.state)
     }
 
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
         self.claim(InstanceId(self.next + 1), &binding.scratch)?;
         self.next += 1;
         self.bindings.push(binding.clone());
@@ -313,7 +314,7 @@ impl Engine for GuestEngine {
         })
     }
 
-    fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
+    fn rebind(&mut self, rebind: Rebind) -> ::engine::Result<()> {
         match &rebind {
             Rebind::Instance { id, scratch, .. } => self.claim(*id, scratch)?,
             Rebind::Parked { id, .. } => {
@@ -326,7 +327,72 @@ impl Engine for GuestEngine {
         self.rebinds.push(rebind);
         Ok(())
     }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
 }
+
+impl ::engine::Pool for GuestEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for GuestEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 fn holder(n: u128) -> super::Holder {
     uuid::Uuid::from_u128(n)
@@ -555,7 +621,7 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
         "none of another instance's: {fresh:?} {others:?}"
     );
     for rebind in stale {
-        engine.rebind_slots(rebind).unwrap();
+        <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
         roles.lock().unwrap().rebound(Owner::Instance(id));
     }
     assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
@@ -565,8 +631,8 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
 /// slots to anyone else, so an engine claiming where each instance lies
 /// (Vulkan, wgpu) takes another process's bind there, and the parked
 /// one's restore rebinds it to fresh slots none other claims. Untold, the
-/// next bind on the freed slots is refused by name: the Vulkan long-prompt
-/// mix on a0bfb512f ("Instance slots ... already hold instance N's run").
+/// next bind on the freed slots is refused by name ("Instance slots ...
+/// already hold instance N's run").
 #[test]
 fn a_park_is_said_to_the_engine_before_its_slots_are_another_s() {
     for told in [true, false] {
@@ -625,8 +691,8 @@ fn a_park_is_said_to_the_engine_before_its_slots_are_another_s() {
 /// its way: with one member's park in flight, another member's park leaves
 /// the pair where it lies, so when the first park is taken back (the tier
 /// below full) its member is resident on its pair, and another program's
-/// bind never takes that run as fresh room (the L40S at 3 GiB on
-/// c8077be0f: CUDA 700, program 4's pair run bound by program 6). Once
+/// bind never takes that run as fresh room (a device fault: one program's
+/// pair run bound by another). Once
 /// every member's park has landed, the run is given back.
 #[test]
 fn a_pair_run_is_never_another_program_s_while_a_member_may_still_fire() {
@@ -1379,7 +1445,7 @@ fn processes_cycling_through_park_restore_and_finish_all_finish_and_give_back_al
             program: ProgramId(program),
             ..InstanceBinding::default()
         };
-        let taken = take_bind(Some(roles), engine, &binding, |_| false, Some(holder(by)), |_| true, |_, _| false)?;
+        let taken = take_bind(Some(roles), engine, &binding, |_| false, Some(holder(by)), |_| true)?;
         registrations.set(registrations.get() + 1);
         bind_taken(Some(roles), engine, &binding, Some(holder(by)), taken)
             .map(|bound| bound.id)
@@ -1631,11 +1697,11 @@ fn free_and_live(device: &Shared) -> (u32, u64) {
     (pool.pool().free_chunks(), pool.pool().demand().live)
 }
 
-/// guest_mix's warm-up on the M1 Max: a guest bind needing two runs of four
-/// adjacent chunks waits on a segment commit while smaller guest binds keep
-/// arriving. Before the queue, each smaller bind took the fresh segment's
-/// chunks a few at a time, the long runs never stood free, and the long
-/// bind waited for ever. Now it heads the queue: the smaller binds wait
+/// A guest bind needing two runs of four adjacent chunks waits on a segment
+/// commit while smaller guest binds keep arriving. Unqueued, each smaller
+/// bind would take the fresh segment's chunks a few at a time, the long
+/// runs never stand free, and the long bind wait for ever. It heads the
+/// queue: the smaller binds wait
 /// behind it taking nothing (the free count does not drift), it binds in
 /// the committed segment, and they follow in arrival order.
 #[tokio::test(flavor = "current_thread")]
@@ -2013,7 +2079,7 @@ fn a_process_s_guest_chunk_slots_are_all_its_bound_slots() {
     assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
 }
 
-/// The Spark's beam restores (dbe9c0e93): fragmented Instance chunks, a
+/// Beam restores on unified memory: fragmented Instance chunks, a
 /// parked guest's freed run filled by another bind, then its restore. The
 /// unpark is short and waits, naming the runs of chunks it needs (what the
 /// planner funds, `RolesError::unpark_runs`), never refused; once room
@@ -2292,7 +2358,7 @@ async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() 
         roles.lock().unwrap().commit(back);
         let stale = roles.lock().unwrap().stale(holder(by));
         for rebind in stale {
-            engine.rebind_slots(rebind).unwrap();
+            <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
             roles.lock().unwrap().rebound(Owner::Instance(id));
         }
     }
@@ -2301,8 +2367,8 @@ async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() 
     assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
 }
 
-/// A failed process's teardown (Mac Pro's M5: pairs of dead processes left
-/// on the device and the host): the engine refuses its instances' closes
+/// A failed process's teardown (else pairs of dead processes are left on
+/// the device and the host): the engine refuses its instances' closes
 /// (a failed fire left them unusable), and the lane closes their books all
 /// the same. Its slots go back once no step on its way names them (a step
 /// still reads one when the close comes, and lands after), and the pair
@@ -2382,7 +2448,7 @@ fn with_no_host_tier_a_shared_pair_s_state_goes_back_once_every_holder_parked() 
         roles.lock().unwrap().commit(back);
         let stale = roles.lock().unwrap().stale(holder(by));
         for rebind in stale {
-            engine.rebind_slots(rebind).unwrap();
+            <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
             roles.lock().unwrap().rebound(Owner::Instance(id));
         }
     }
@@ -2392,7 +2458,7 @@ fn with_no_host_tier_a_shared_pair_s_state_goes_back_once_every_holder_parked() 
     assert_eq!(held(&device), before);
 }
 
-/// F21's bind at the pool's limit (every segment committed, nothing left
+/// A guest bind's run at the pool's limit (every segment committed, nothing left
 /// to evict for it): free chunks scattered by the binds before it, enough
 /// for its run of 4 but none adjacent. It is short (`BindShort`, to the
 /// planner); the planner asks for a compaction, the walk moves chunks
@@ -3007,7 +3073,7 @@ fn a_bind_short_of_room_asks_for_its_scratch_and_its_pair_together() {
     );
 }
 
-/// The L40S's guest-only restore (kv 0, rs 0, asking 21 one-chunk pieces
+/// A guest-only restore (kv 0, rs 0, asking 21 one-chunk pieces
 /// against 22 state chunks): what an unpark lays fresh is what its parked
 /// parts take, by shape, packed into chunks and into the free slots of the
 /// chunks open for that shape, not a chunk a part. A process of many small
@@ -3043,7 +3109,7 @@ fn an_unpark_asks_the_chunks_it_lays_not_a_chunk_a_part() {
     assert_eq!(asked, laid, "asked what the unpark lays: {asked} vs {laid}");
 }
 
-/// Mac Pro's 2 GiB stall (a restore needing three runs of nine, open
+/// A restore needing three runs of nine (open
 /// stretches of 10, 10 and 9 in three segments, nothing in flight): where
 /// the pool counts the runs a restore needs, the restore's own unpark
 /// seats it there. The count and the take read the same runs
@@ -3088,9 +3154,9 @@ fn a_restore_needing_three_runs_of_nine_is_seated_in_stretches_of_ten_ten_and_ni
     roles.lock().unwrap().commit(back);
 }
 
-/// The L40S's refusal of a run of two its need counted on: an unpark took
-/// its parts in its items' order, and a run of slots opened the lowest free
-/// chunk, splitting the only stretch the run of two stood in. It lays its
+/// A run of two its need counted on is never refused: taking its parts in
+/// its items' order, a run of slots would open the lowest free chunk,
+/// splitting the only stretch the run of two stands in. An unpark lays its
 /// runs of whole chunks first, the longest first, then its runs of slots:
 /// free chunks `c`, `c + 1` and `d` hold a run of two and a run of slots,
 /// and the unpark lands. (Its items lie in a hash map: five runs of slots
@@ -3149,10 +3215,9 @@ fn an_unpark_lays_its_runs_of_chunks_before_its_runs_of_slots() {
     }
 }
 
-/// Mac Pro at 5 GiB on 1e87ab171: a first-frame bind short of a run of
-/// three waited on a segment commit (the segments left within the budget
-/// held three more), the walk then had none left for it, and the bind was
-/// refused to the client. A commit that will not come is no refusal: the
+/// A first-frame bind short of a run of three waits on a segment commit
+/// (the segments left within the budget hold three more), and the walk
+/// then has none left for it. A commit that will not come is no refusal: the
 /// bind goes again, short of room the planner makes, and binds once it
 /// has made it.
 #[tokio::test(flavor = "current_thread")]
@@ -3237,12 +3302,11 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
     assert_eq!(long_engine.borrow().bindings.len(), 1);
 }
 
-/// Mac Pro at 2 GiB disk-only on 1e87ab171: a process's bind short of two
-/// runs of nine Instance chunks, the process evicted to disk and restored
-/// ~95 ms later, then "a restore waits for its instances' rebinds
-/// (InstanceId(5))" until teardown: the restore committed with an instance
-/// whose rebind named a dead part no slots held, and nothing made room for
-/// it. Such an instance's dead parts are its unpark's to take fresh, in
+/// A disk-only load: a process's bind short of two runs of nine Instance
+/// chunks, the process evicted to disk and restored, must not then wait
+/// "for its instances' rebinds" until teardown, committed with an
+/// instance whose rebind names a dead part no slots hold and nothing
+/// making room for it. Such an instance's dead parts are its unpark's to take fresh, in
 /// their class, before the restore commits: its need counts their runs, an
 /// unpark short of them is refused (the restore waits queued for room the
 /// planner makes, nothing committed), and once they stand it unparks, and
@@ -3304,16 +3368,16 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
     assert_eq!(*rebound, id);
     assert_eq!(pieces_of(&device, scratch).len(), 2, "two runs: {scratch:?}");
     for rebind in stale {
-        engine.rebind_slots(rebind).unwrap();
+        <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
         roles.lock().unwrap().rebound(Owner::Instance(id));
     }
     assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "nothing left unbound");
 }
 
-/// The L40S on 5aa45805b: a restore's need read [(1, 1)] while its unpark
-/// was refused a run of 465 slots (Slots { slots: 465, committable: 0 }):
-/// counted by the free slots partly filled chunks held, its run asked no
-/// chunk, the map stood the need, and nothing was moved. A restore's need
+/// A restore's need must not read [(1, 1)] while its unpark is refused a
+/// run of 465 slots: counted by the free slots partly filled chunks hold,
+/// its run would ask no chunk, the map stand the need, and nothing move.
+/// A restore's need
 /// and its standing are the pool's own placement of every piece it takes:
 /// a run of slots no partly filled chunk of its class holds asks a free
 /// chunk, and the state its serve takes first is laid before it.
@@ -3364,11 +3428,10 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
     drop(singles_part);
 }
 
-/// The L40S at 3 GiB on c10d7de5d: a beam pair's scratch (73 dead refs)
-/// stayed on chunk 17 for good: its first holder parked while the pair was
-/// still another's, that other then ended, and nothing moved the pair with
-/// the parked one. A move down for the parked holder takes it now, its dead
-/// parts given back.
+/// A beam pair's scratch (73 dead refs) whose first holder parked while
+/// the pair was still another's, that other then ending: nothing else
+/// moves the pair with the parked one. A move down for the parked holder
+/// takes it, its dead parts given back.
 #[test]
 fn a_pair_left_behind_by_a_parked_holder_goes_with_its_move_down() {
     let facts = facts(64);
@@ -3393,9 +3456,8 @@ fn a_pair_left_behind_by_a_parked_holder_goes_with_its_move_down() {
     );
 }
 
-/// The L40S at 3 GiB on c201812ea: a served restore's bind room was taken
-/// by another head between its serve and its unpark (PendingBindShort,
-/// run 1, none after its own unpark). What its placement chose is held for
+/// A served restore's bind room must not be taken by another head between
+/// its serve and its unpark (`PendingBindShort`). What its placement chose is held for
 /// it: another holder's bind cannot take those chunks, its unpark takes
 /// them, and its pending bind's run, held beside them, is its own bind's.
 #[test]
@@ -3446,9 +3508,9 @@ fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
     let _ = device;
 }
 
-/// Mac Pro g2 on bd4f4ffe7: a served restore's bind runs were held for it,
-/// and its pending-bind check, a count of free runs that left them out,
-/// found none (0 of 7 where 5 stood) every serve. Checked by the one
+/// A served restore's bind runs are held for it: a pending-bind check
+/// counting free runs that left them out would find none every serve.
+/// Checked by the one
 /// placement with its own reservation open to it, its bind stands; to any
 /// other take those chunks are not there.
 #[test]
@@ -3536,9 +3598,9 @@ fn a_held_part_round_trips_through_the_host_with_its_place_named() {
 /// A bind taken on a pair its other members hold, whose last member parks
 /// before the bind lands (the planner's moves run on other threads than
 /// the lane's take and bind): the pair stays the bind's. Given back with
-/// that park, its run went to another program's bind while the new member
-/// was bound on it (the L40S at 3 GiB on df488038b: `guest::claims`
-/// refused a rescore's bind over a live pair's run).
+/// that park, its run would go to another program's bind while the new
+/// member is bound on it (`guest::claims` refusing a bind over a live
+/// pair's run).
 #[test]
 fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
     let Pools { device: _, roles } = pools(64);
@@ -3550,7 +3612,7 @@ fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true, |_, _| false)
+    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
         .unwrap()
         .expect("slots taken");
     // The only member parks while the bind is on its way.
@@ -3593,7 +3655,7 @@ fn a_bind_of_a_process_not_resident_waits_for_its_restore() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(4)), |_| false, |_, _| false)
+    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(4)), |_| false)
         .expect_err("not resident: no take");
     assert!(
         matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(4)),
@@ -3620,7 +3682,7 @@ fn a_bind_on_its_way_holds_its_process_s_park_until_it_lands() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true, |_, _| false)
+    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
         .unwrap()
         .expect("slots taken");
     assert!(roles.lock().unwrap().binds_on_way(holder(2)), "on its way");
@@ -3632,7 +3694,7 @@ fn a_bind_on_its_way_holds_its_process_s_park_until_it_lands() {
     let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(3)), |_| {
         reads.set(reads.get() + 1);
         reads.get() == 1
-    }, |_, _| false)
+    })
     .expect_err("parked past the take");
     assert!(
         matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(3)),

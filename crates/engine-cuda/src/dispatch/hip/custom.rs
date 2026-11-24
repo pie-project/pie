@@ -365,8 +365,27 @@ impl Run<'_> {
     /// A fused op as the primitives it replaced, each over the values the
     /// fused op keeps.
     fn primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather, DispatchLinear};
-        use poem_ir::{Attn, Elemwise, Gather, Linear};
+        match op {
+            Fused::MatmulGlu { .. }
+            | Fused::MatmulSplitRows { .. }
+            | Fused::MatmulMoeRoute { .. } => self.primitives_matmul(op),
+            Fused::MoeSelectGlu { .. } | Fused::MoeMega { .. } | Fused::MoeExperts { .. } => {
+                self.primitives_moe(op)
+            }
+            Fused::LseSink { .. }
+            | Fused::RopeYarnAppend { .. }
+            | Fused::SplitRopeYarnAppend { .. } => self.primitives_attn(op),
+            _ => Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
+                op: op.name(),
+            })),
+        }
+    }
+
+    /// The fused products: a GLU over its matmul, a matmul split into row
+    /// ranges, a router over its matmul.
+    fn primitives_matmul(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchGather, DispatchLinear};
+        use poem_ir::{Gather, Linear};
         match op {
             Fused::MatmulGlu {
                 act,
@@ -474,6 +493,17 @@ impl Run<'_> {
                     },
                 )
             }
+            _ => Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
+                op: op.name(),
+            })),
+        }
+    }
+
+    /// The fused MoE layers: the selected experts' GLU, the whole MoE block,
+    /// the experts' MLP.
+    fn primitives_moe(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchElemwise, DispatchLinear};
+        match op {
             Fused::MoeSelectGlu { select, glu } => {
                 DispatchLinear::dispatch(self, select)?;
                 DispatchLinear::dispatch(self, glu)
@@ -521,6 +551,18 @@ impl Run<'_> {
                     _ => Ok(()),
                 }
             }
+            _ => Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
+                op: op.name(),
+            })),
+        }
+    }
+
+    /// The fused attention steps: the sink-weighted LSE merge, the YaRN rope
+    /// and its append (split or not).
+    fn primitives_attn(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather};
+        use poem_ir::{Attn, Elemwise, Gather};
+        match op {
             Fused::LseSink {
                 attn,
                 sink,

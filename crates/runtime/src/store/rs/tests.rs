@@ -36,6 +36,7 @@ fn tests_every_case() {
     a_truncate_takes_back_the_buffer_past_its_cut();
     a_state_others_read_is_folded_into_a_copy();
     a_checkpoint_is_cache_and_goes_when_idle();
+    new_weights_drop_every_checkpoint();
     idle_snapshots_go_in_retention_order();
     a_checkpoint_past_a_step_goes_first();
     a_checkpoint_resumes_a_fresh_working_set();
@@ -72,6 +73,25 @@ fn idle_snapshots_go_in_retention_order() {
     assert_eq!(s.reclaim_cache(rank), 1);
     assert!(!s.has_checkpoint(&[1; 32]));
     assert_eq!(s.reclaim_cache(rank), 0);
+}
+
+/// A reload in place drops every checkpoint, whatever its key: none of
+/// them may be resumed under the new weights.
+fn new_weights_drop_every_checkpoint() {
+    use crate::inferlet::process::ProcessId;
+    let mut s = store();
+    for (key, owner) in [([6; 32], 6), ([7; 32], 7)] {
+        let ws = s.create_working_set(geom());
+        write_state(&mut s, ws);
+        assert!(s.checkpoint(ws, key, Some(ProcessId::from_u128(owner))).unwrap());
+        s.release_working_set(ws);
+    }
+    assert!(s.cache_only() != RsUnits::default());
+    assert_eq!(s.drop_cache(), 2);
+    assert!(!s.holds_checkpoints());
+    assert!(!s.has_checkpoint(&[6; 32]) && !s.has_checkpoint(&[7; 32]));
+    assert_eq!(s.cache_only(), RsUnits::default());
+    assert_eq!(s.drop_cache(), 0);
 }
 
 fn a_checkpoint_past_a_step_goes_first() {

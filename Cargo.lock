@@ -816,10 +816,13 @@ dependencies = [
 name = "controller-api"
 version = "0.6.0"
 dependencies = [
+ "anyhow",
  "ids",
  "serde",
  "serde_json",
  "tarpc",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1766,23 +1769,27 @@ dependencies = [
  "blake3",
  "checkpoint",
  "engine",
+ "engine-cpu",
  "eta-compiler",
  "eta-exec",
  "kernels-cerebras",
  "libc",
  "libloading 0.9.0",
  "pie-dtype",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
+ "pie-profile",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "toml",
  "tracing",
+ "ztensor",
 ]
 
 [[package]]
@@ -1825,6 +1832,7 @@ dependencies = [
  "state",
  "tempfile",
  "toml",
+ "tracing",
  "windows-sys 0.61.2",
  "ztensor",
  "ztensor-compat",
@@ -2064,6 +2072,7 @@ dependencies = [
 name = "eta-compiler"
 version = "0.6.0"
 dependencies = [
+ "eta-compiler",
  "naga",
  "pie-eta-ir",
  "serde",
@@ -2073,6 +2082,7 @@ dependencies = [
 name = "eta-exec"
 version = "0.6.0"
 dependencies = [
+ "engine",
  "eta-compiler",
  "pie-eta-ir",
 ]
@@ -3107,8 +3117,10 @@ name = "kernels-cerebras"
 version = "0.6.0"
 dependencies = [
  "blake3",
+ "kernels-ir",
  "pie-poem-compiler",
  "pie-poem-ir",
+ "pie-profile",
  "serde",
  "serde_json",
 ]
@@ -3150,6 +3162,7 @@ version = "0.6.0"
 dependencies = [
  "engine",
  "kernels-ir",
+ "kernels-rocm",
  "libloading 0.9.0",
  "miniz_oxide 0.9.1",
  "pie-dtype",
@@ -4362,6 +4375,7 @@ version = "0.6.0"
 dependencies = [
  "pie-profile-macros",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -5150,7 +5164,6 @@ dependencies = [
  "http",
  "http-body-util",
  "ipnet",
- "libc",
  "lru",
  "media",
  "opentelemetry 0.33.1",
@@ -5166,6 +5179,7 @@ dependencies = [
  "pie-profile",
  "plex-host",
  "rand 0.10.3",
+ "runtime-sys",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
@@ -5189,8 +5203,17 @@ dependencies = [
  "wasmtime-web",
  "web-std",
  "wgpu",
- "windows-sys 0.61.2",
+ "winapi-util",
  "ztensor",
+]
+
+[[package]]
+name = "runtime-sys"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "wasmtime",
 ]
 
 [[package]]

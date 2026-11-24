@@ -320,14 +320,7 @@ impl Cluster {
             let _ = tokio::time::timeout(gate, heard.wait_for(|&h| h >= seq)).await;
         }
 
-        {
-            let mut queue = self.shared.waiting.lock().unwrap();
-            if queue.len() >= routing.max_queued_launches() {
-                drop(queue);
-                return waiting.leave(Err(AdmitReject::Full(RejectReason::QueueFull.to_string())));
-            }
-            queue.insert(seq, id);
-        }
+        self.shared.waiting.lock().unwrap().insert(seq, id);
         let mut table = routing.table_watch();
         loop {
             let changed = self.shared.changed.notified();
@@ -337,19 +330,16 @@ impl Cluster {
                 return waiting.leave(Ok(()));
             }
             if self.next(seq) {
-                match routing.admit(req) {
-                    AdmissionDecision::Admit => return waiting.leave(Ok(())),
-                    AdmissionDecision::Reject(RejectReason::ClusterSaturated) => {}
-                    AdmissionDecision::Reject(reason) => {
-                        return waiting.leave(Err(AdmitReject::Full(reason.to_string())));
-                    }
-                }
+                return waiting.leave(match routing.admit(req) {
+                    AdmissionDecision::Admit => Ok(()),
+                    AdmissionDecision::Reject(reason) => Err(AdmitReject::Full(reason.to_string())),
+                });
             }
             tokio::select! {
                 _ = changed => {}
                 closed = table.changed() => if closed.is_err() {
                     return waiting.leave(Err(AdmitReject::Full(
-                        RejectReason::ClusterSaturated.to_string(),
+                        RejectReason::NoHealthyWorker.to_string(),
                     )));
                 },
             }
@@ -377,7 +367,7 @@ impl Cluster {
     }
 
     /// Where the placement puts `req`: the workers it may run on, best
-    /// first (`None`: the router's choice), its props, and the workers its
+    /// first (`None`: the table's order), its props, and the workers its
     /// passes may run on, best first.
     pub fn placement(&self, req: &Request) -> (Option<Vec<WorkerId>>, Props, Vec<WorkerId>) {
         let decided = self.shared.decided.read().unwrap();
@@ -882,7 +872,7 @@ mod tests {
     }
 
     /// `default-cluster` names every worker that serves others' passes
-    /// (`pie/prefill-listen`) a helper of every process, and places none.
+    /// (`pie/prefill-listen`) a helper of every process.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_default_cluster_policy_names_the_listening_workers_helpers() {
         let directory = DirectoryView {
@@ -903,42 +893,54 @@ mod tests {
         }
         assert_eq!(
             placed_on(&rig, &req),
-            None,
-            "the router's own order places it"
+            Some(vec![WorkerId(1), WorkerId(2)]),
+            "equally loaded, by id"
         );
     }
 
-    /// Arrival to admitted, 50 launches one after another, under `names`.
-    async fn admit_waits(names: &[&str]) -> Vec<Duration> {
-        let rig = rig_of(0, names).await;
-        let mut waits = Vec::new();
-        for req in 1..=50 {
-            let launch = launch(req, serde_json::json!({}));
-            let at = Instant::now();
-            rig_admit(&rig.router, &launch, &rig.routing).await;
-            waits.push(at.elapsed());
-            rig.router.exited(&launch, Outcome::Completed);
-        }
-        waits.sort();
-        waits
-    }
-
-    /// `default-cluster` writes only defaults and imports nothing that
-    /// decides a pending process: a launch under it goes by the rows in
-    /// force, not after a policy round trip, which one that places
-    /// (`test-route`) still waits for.
+    /// `default-cluster` places a pending launch least loaded first (its
+    /// kv pressure, then its processes, then its id).
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_launch_under_the_default_cluster_policy_does_not_wait_for_it() {
+    async fn the_default_cluster_policy_places_a_launch_least_loaded_first() {
         let rig = rig_of(0, &["default-cluster"]).await;
-        assert_eq!(rig.host.decisions(GatewayId(0)).borrow().gate_ms, 0);
-        drop(rig);
-        let free = admit_waits(&["default-cluster"]).await;
-        let gated = admit_waits(&["test-route"]).await;
-        let (free, gated) = (free[free.len() / 2], gated[gated.len() / 2]);
-        assert!(
-            free * 10 < gated,
-            "median arrival to admitted: {free:?} under default-cluster, {gated:?} gated"
-        );
+        let mut loaded = table(0);
+        loaded.epoch = 2;
+        loaded.workers[0].coarse_load.kv_pressure_bucket = 100;
+        loaded.workers[1].coarse_load.kv_pressure_bucket = 10;
+        rig.table.send_replace(loaded);
+        let first = launch(1, serde_json::json!({}));
+        rig.router.admit(&first, &rig.routing).await.unwrap();
+        until_placed(&rig, &first, Some(vec![WorkerId(2), WorkerId(1)])).await;
+    }
+
+    /// Under `default-cluster` a launch waits at its gateway while every
+    /// worker is full (kv pressure 240 of 255), and launches leave in
+    /// arrival order once one has room.
+    #[tokio::test]
+    async fn waiting_launches_leave_in_arrival_order_when_room_opens() {
+        let rig = rig_of(255, &["default-cluster"]).await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waits = Vec::new();
+        for req in [1, 2, 3] {
+            let (router, routing, order) = (rig.router.clone(), rig.routing.clone(), order.clone());
+            waits.push(tokio::spawn(async move {
+                router
+                    .admit(&launch(req, serde_json::json!({})), &routing)
+                    .await
+                    .unwrap();
+                order.lock().unwrap().push(req);
+            }));
+            // Each is heard before the next arrives.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        assert!(order.lock().unwrap().is_empty(), "every worker is full");
+        let mut room = table(0);
+        room.epoch = 2;
+        rig.table.send_replace(room);
+        for wait in waits {
+            wait.await.unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), [1, 2, 3]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1052,33 +1054,8 @@ mod tests {
             props.get("cluster/note/test-route/said") == Some(&serde_json::json!("hi")),
             "its notes go with it, under the writer's name: {props:?}"
         );
-        assert_eq!(placed_on(&rig, &free), None, "no row: the router's choice");
+        assert_eq!(placed_on(&rig, &free), None, "no row: the table's order");
         waiting.abort();
-    }
-
-    #[tokio::test]
-    async fn waiting_launches_leave_in_arrival_order_when_room_opens() {
-        let rig = rig(255).await;
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let mut waits = Vec::new();
-        for req in [1, 2, 3] {
-            let (router, routing, order) = (rig.router.clone(), rig.routing.clone(), order.clone());
-            waits.push(tokio::spawn(async move {
-                router
-                    .admit(&launch(req, serde_json::json!({})), &routing)
-                    .await
-                    .unwrap();
-                order.lock().unwrap().push(req);
-            }));
-            // Each is heard before the next arrives.
-            tokio::time::sleep(Duration::from_millis(60)).await;
-        }
-        assert!(order.lock().unwrap().is_empty(), "the cluster is saturated");
-        rig.table.send_replace(table(0));
-        for wait in waits {
-            wait.await.unwrap();
-        }
-        assert_eq!(*order.lock().unwrap(), [1, 2, 3]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

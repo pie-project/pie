@@ -1,6 +1,7 @@
 [package]
 name = "kernels-slang"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "One Slang kernel tree for Vulkan and WebGPU: build.rs compiles every instantiation to SPIR-V (`spirv`) and WGSL (`wgsl`), and the host side names each entry once, for any engine that implements `Encode`."

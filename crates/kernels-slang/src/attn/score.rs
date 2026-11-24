@@ -250,13 +250,16 @@ pub fn capture(
              nothing; the caller states the width it wants, and zero is not one",
         ));
     }
-    nonzero(OP, "the capturing lanes this capture answers", at.capturing)?;
+    // No capturing lane: the dispatches launch no workgroup (a class whose
+    // program captures, fired with none of its lanes capturing).
     let page_size = u32::try_from(pool.page_size)
         .ok()
         .filter(|size| *size > 0)
         .ok_or_else(|| refuse(OP, "the kv page size is zero"))?;
     let context = at.scores.width;
     nonzero(OP, "the keys of the load's context", context)?;
+    // The normaliser's grid counts the capturing lanes too: none, none.
+    let heads_or_none = if at.capturing == 0 { 0 } else { heads };
     if at.scores.rows < at.capturing {
         return Err(refuse(
             OP,
@@ -318,7 +321,9 @@ pub fn capture(
         ));
     }
     ctx.fire(
-        Fire::at(SCORE, NORM[stamp]).apply(Grid::of([norm_x, heads, 1], [THREADS, 1, 1])),
+        Fire::at(SCORE, NORM[stamp])
+            .apply(Grid::of([norm_x, heads_or_none, 1], [THREADS, 1, 1]))
+            .idle(),
         &[
             &reads[..],
             &[at.stats.arg_mut()],
@@ -328,7 +333,9 @@ pub fn capture(
         .concat(),
     )?;
     ctx.fire(
-        Fire::at(SCORE, mass.entry).apply(Grid::of([mass_x, at.capturing, 1], [THREADS, 1, 1])),
+        Fire::at(SCORE, mass.entry)
+            .apply(Grid::of([mass_x, at.capturing, 1], [THREADS, 1, 1]))
+            .idle(),
         &[
             &reads[..],
             &[at.stats.arg(), at.scores.arg_mut()],
@@ -365,7 +372,6 @@ pub fn pages(
             format!("the capture table is {:?}, and this sum reads i32", table.dtype),
         ));
     }
-    nonzero(OP, "the capturing lanes this sum answers", capturing)?;
     nonzero(OP, "the kv page size", page_size)?;
     let context = keys.width;
     if pages.width != context.div_ceil(page_size) {
@@ -387,7 +393,9 @@ pub fn pages(
     let x = u32::try_from(u64::from(pages.width.div_ceil(THREADS)) * u64::from(THREADS))
         .map_err(|_| refuse(OP, "the page grid will not launch"))?;
     ctx.fire(
-        Fire::at(SCORE, PAGES).apply(Grid::of([x, capturing, 1], [THREADS, 1, 1])),
+        Fire::at(SCORE, PAGES)
+            .apply(Grid::of([x, capturing, 1], [THREADS, 1, 1]))
+            .idle(),
         &[
             table.arg(),
             keys.arg(),

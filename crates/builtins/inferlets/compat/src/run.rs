@@ -25,7 +25,6 @@ pub enum Finish {
     Length,
     /// The turn ended with tool calls.
     ToolCalls,
-    /// A stop sequence appeared.
     StopSequence,
     /// The host stopped it (a policy's terminate): the tokens so far stand,
     /// and [`Outcome::stop_reason`] says why.
@@ -43,6 +42,7 @@ pub struct Outcome {
     pub stop_sequence: Option<String>,
     /// Why the host stopped it, when it did ([`Finish::Abort`]).
     pub stop_reason: Option<String>,
+    pub stop_token: Option<u32>,
     pub prompt_tokens: usize,
     pub cached_tokens: usize,
     pub completion_tokens: usize,
@@ -56,6 +56,8 @@ pub struct Outcome {
     /// (`None` for the first, which nothing conditions), the model's prefix
     /// among them, where the request asked for them.
     pub prompt_logprobs: Vec<(u32, Option<Logprob>)>,
+    pub prompt_token_ids: Vec<u32>,
+    pub token_ids: Vec<u32>,
 }
 
 /// The prompt's tokens beside their scores: the first has none, each after
@@ -105,12 +107,25 @@ fn constraint(req: &Request) -> Result<Option<Box<dyn Guide>>, String> {
 /// filter lets through is the content. Every other event goes straight out.
 struct Output {
     stops: HoldBack,
+    include_stop: bool,
     content: String,
     finish: Option<Finish>,
-    stop_hit: Option<usize>,
+    stop_sequence: Option<String>,
+    stop_token: Option<u32>,
 }
 
 impl Output {
+    fn new(req: &Request) -> Self {
+        Self {
+            stops: HoldBack::new(req.stop.clone()),
+            include_stop: req.include_stop_str_in_output,
+            content: String::new(),
+            finish: None,
+            stop_sequence: None,
+            stop_token: None,
+        }
+    }
+
     fn deliver(&mut self, events: Vec<Event>, sink: &mut dyn FnMut(Event)) -> ControlFlow<()> {
         for event in events {
             match event {
@@ -118,8 +133,12 @@ impl Output {
                     let released = self.stops.push(&text);
                     self.send(released.text, sink);
                     if let Some(hit) = released.hit {
+                        let marker = self.stops.marker(hit).to_string();
+                        if self.include_stop {
+                            self.send(marker.clone(), sink);
+                        }
                         self.finish = Some(Finish::StopSequence);
-                        self.stop_hit = Some(hit);
+                        self.stop_sequence = Some(marker);
                         return ControlFlow::Break(());
                     }
                 }
@@ -127,6 +146,16 @@ impl Output {
             }
         }
         ControlFlow::Continue(())
+    }
+
+    fn end(&mut self, held: Vec<Event>, sink: &mut dyn FnMut(Event)) {
+        if self.stop_sequence.is_some() {
+            return;
+        }
+        if self.deliver(held, sink).is_continue() {
+            let rest = self.stops.flush();
+            self.send(rest, sink);
+        }
     }
 
     fn send(&mut self, text: String, sink: &mut dyn FnMut(Event)) {
@@ -158,21 +187,37 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     let mut generated = continued.len() as u32;
     let mut guide = constraint(req)?;
     let stop_tokens = chat::stop_tokens();
-    let mut demux = Demux::new(&chat::cue_thinking(prompt::thinks(req)), req.choice);
+    let callable = !req.callable_tools().is_empty();
+    let mut demux = Demux::new(
+        &chat::cue_thinking(prompt::thinks(req)),
+        req.choice,
+        callable,
+    );
     if req.raw_prompt.is_some() || req.prompt_tokens.is_some() {
         demux.verbatim();
     }
-    let mut out = Output {
-        stops: HoldBack::new(req.stop.clone()),
-        content: String::new(),
-        finish: None,
-        stop_hit: None,
-    };
+    let mut out = Output::new(req);
     let mut error: Option<String> = None;
+    let ids = req.return_token_ids;
+    let prompt_token_ids = if ids {
+        prompt.tokens[..prompt_len].to_vec()
+    } else {
+        Vec::new()
+    };
+    if ids && req.stream {
+        (sink.borrow_mut())(Event::PromptTokens(prompt_token_ids.clone()));
+    }
+    let mut token_ids: Vec<u32> = Vec::new();
     // What the client was sent already passes through the decoders, the
     // stop hold-back and the adapter's stream, whose frames the client has
     // (`crate::continuation`), so they all stand where they stood.
     for &token in &continued {
+        if ids {
+            token_ids.push(token);
+            if req.stream {
+                (sink.borrow_mut())(Event::Tokens(vec![token]));
+            }
+        }
         if let Ok(events) = demux.feed(token) {
             let _ = out.deliver(events, &mut *sink.borrow_mut());
         }
@@ -190,6 +235,12 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     let mut logprobs: Vec<(u32, Logprob)> = Vec::new();
     let mut on_token = |token: u32, logprob: Option<Logprob>| -> ControlFlow<()> {
         crate::continuation::note(token);
+        if ids {
+            token_ids.push(token);
+            if req.stream {
+                (sink.borrow_mut())(Event::Tokens(vec![token]));
+            }
+        }
         if let Some(logprob) = logprob {
             if req.stream {
                 (sink.borrow_mut())(Event::Logprobs(vec![(token, logprob.clone())]));
@@ -204,15 +255,27 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
             out.finish = Some(Finish::Stop);
             return ControlFlow::Break(());
         }
-        match demux.feed(token) {
+        let stop_token = req.stop_token_ids.contains(&token) && generated as usize > req.min_tokens;
+        if stop_token && !req.include_stop_str_in_output {
+            out.finish = Some(Finish::StopSequence);
+            out.stop_token = Some(token);
+            return ControlFlow::Break(());
+        }
+        let flow = match demux.feed(token) {
             Ok(events) => out.deliver(events, &mut *sink.borrow_mut()),
             Err(e) => {
                 error = Some(e);
-                ControlFlow::Break(())
+                return ControlFlow::Break(());
             }
+        };
+        if stop_token && flow.is_continue() {
+            out.finish = Some(Finish::StopSequence);
+            out.stop_token = Some(token);
+            return ControlFlow::Break(());
         }
+        flow
     };
-    // Its passes state their rows final (CONTRACT-BC 25), stop sequences or
+    // Its passes state their rows final, stop sequences or
     // none: a stop sequence only cuts the output (`Output::deliver`), the
     // set ends with the request, and nothing is taken back.
     let ran = generate(
@@ -242,11 +305,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         return Err(e);
     }
 
-    let _ = out.deliver(demux.finish(), &mut sink);
-    if out.finish.is_none() {
-        let rest = out.stops.flush();
-        out.send(rest, &mut sink);
-    }
+    out.end(demux.finish(), &mut sink);
 
     let mut finish = match out.finish {
         _ if stop_reason.is_some() => Finish::Abort,
@@ -263,7 +322,8 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     let continued = continued.len();
     Ok(Outcome {
         finish,
-        stop_sequence: out.stop_hit.and_then(|i| req.stop.get(i).cloned()),
+        stop_sequence: out.stop_sequence,
+        stop_token: out.stop_token,
         stop_reason,
         prompt_tokens: prompt.tokens.len() - continued,
         cached_tokens: cached_tokens.min(prompt.tokens.len() - continued),
@@ -273,6 +333,8 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         tool_calls: demux.tool_calls,
         logprobs,
         prompt_logprobs,
+        prompt_token_ids,
+        token_ids,
     })
 }
 
@@ -299,12 +361,9 @@ mod tests {
     /// reaches the working set, whose passes state their rows final.
     #[test]
     fn a_stop_sequence_cuts_the_output_and_breaks() {
-        let mut out = Output {
-            stops: HoldBack::new(vec!["STOP".to_string()]),
-            content: String::new(),
-            finish: None,
-            stop_hit: None,
-        };
+        let mut req = Request::new(Vec::new());
+        req.stop = vec!["STOP".to_string()];
+        let mut out = Output::new(&req);
         let mut sent = Vec::new();
         let mut sink = |event: Event| {
             if let Event::Text(text) = event {
@@ -318,6 +377,52 @@ mod tests {
         assert_eq!(out.content, "hello ");
         assert_eq!(sent.concat(), "hello ");
         assert_eq!(out.finish, Some(Finish::StopSequence));
-        assert_eq!(out.stop_hit, Some(0));
+        assert_eq!(out.stop_sequence.as_deref(), Some("STOP"));
+    }
+
+    fn stream(stop: &str, include: bool, pieces: &[&str]) -> (String, Option<String>) {
+        let mut req = Request::new(Vec::new());
+        req.stop = vec![stop.to_string()];
+        req.include_stop_str_in_output = include;
+        let mut out = Output::new(&req);
+        let mut sent = String::new();
+        let mut sink = |event: Event| {
+            if let Event::Text(text) = event {
+                sent.push_str(&text);
+            }
+        };
+        for piece in pieces {
+            if out
+                .deliver(vec![Event::Text(piece.to_string())], &mut sink)
+                .is_break()
+            {
+                break;
+            }
+        }
+        out.end(vec![Event::Text("<after>".into())], &mut sink);
+        assert_eq!(sent, out.content, "what streamed is the content");
+        (out.content, out.stop_sequence)
+    }
+
+    #[test]
+    fn a_stop_sequence_ends_the_content_and_is_in_it_only_when_asked() {
+        let pieces = ["{\"city\": 1}\n</tool", "_call>\nmore"];
+        let stop = Some("</tool_call>".to_string());
+        assert_eq!(
+            stream("</tool_call>", false, &pieces),
+            ("{\"city\": 1}\n".into(), stop.clone())
+        );
+        assert_eq!(
+            stream("</tool_call>", true, &pieces),
+            ("{\"city\": 1}\n</tool_call>".into(), stop)
+        );
+    }
+
+    #[test]
+    fn text_held_for_a_stop_sequence_that_never_came_is_content_at_the_end() {
+        assert_eq!(
+            stream("END", false, &["THE E"]),
+            ("THE E<after>".into(), None)
+        );
     }
 }

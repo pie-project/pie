@@ -116,6 +116,8 @@ fn shift_sigma(sigma: f32, shift: f32) -> f32 {
 
 #[must_use]
 pub fn dynamic_shift(rows: u32, base_mu: f32) -> f32 {
+    // The flow-match resolution-dependent shift line (diffusers'
+    // `calculate_shift`): `mu` runs from `base_mu` at 256 rows to 1.15 at 4096.
     const BASE_ROWS: f32 = 256.0;
     const MAX_ROWS: f32 = 4096.0;
     const MAX_MU: f32 = 1.15;
@@ -248,6 +250,14 @@ impl DenoiseLoop {
 
     pub fn close(&self) {
         self.pipe.close();
+    }
+}
+
+impl Drop for DenoiseLoop {
+    fn drop(&mut self) {
+        [self.step, self.timestep, self.ts, self.dts]
+            .into_iter()
+            .for_each(Channel::release);
     }
 }
 

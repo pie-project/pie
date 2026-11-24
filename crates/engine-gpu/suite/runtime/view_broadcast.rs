@@ -137,8 +137,7 @@ fn a_view_reshape_broadcasts_by_its_own_shape() {
         }),
         "a reshape is elided as a view"
     );
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut engine, &ProgramRegistration {
             program_hash: 0xb0ad,
             launch,
             ..Default::default()
@@ -196,13 +195,11 @@ fn a_view_reshape_broadcasts_by_its_own_shape() {
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     assert!(
-        engine
-            .publish_channel(instance, 1, &0.375f32.to_le_bytes())
+        engine::Channels::publish(&mut engine, instance, 1, &0.375f32.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
@@ -234,8 +231,7 @@ fn a_view_reshape_broadcasts_by_its_own_shape() {
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");
-    let cell = engine
-        .take_channel(instance, 0)
+    let cell = engine::Channels::take(&mut engine, instance, 0)
         .expect("the channel reads")
         .expect("the channel holds a cell");
     let got = i32::from_le_bytes(cell[..4].try_into().expect("an i32"));

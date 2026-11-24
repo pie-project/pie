@@ -219,7 +219,7 @@ struct Inner {
 /// The resolved profile a load runs under, and the rates and fire times its
 /// layers state. Cheap to clone.
 #[derive(Clone)]
-pub struct Profile(Arc<Inner>, Arc<crate::fire::Tuned>);
+pub struct Profile(Arc<Inner>, Arc<crate::rates::Tuned>);
 
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -253,19 +253,19 @@ impl Profile {
 
     /// The rates the layers state ([`crate::fire`]).
     #[must_use]
-    pub fn tuned(&self) -> &crate::fire::Tuned {
+    pub fn tuned(&self) -> &crate::rates::Tuned {
         &self.1
     }
 
     /// The device's rates, each where a layer states it.
     #[must_use]
-    pub fn rates(&self) -> crate::fire::Rates {
+    pub fn rates(&self) -> crate::rates::Rates {
         self.1.rates.clone()
     }
 
     /// This profile with the rates `tuned` states.
     #[must_use]
-    pub fn with_tuned(&self, tuned: crate::fire::Tuned) -> Profile {
+    pub fn with_tuned(&self, tuned: crate::rates::Tuned) -> Profile {
         Profile(self.0.clone(), Arc::new(tuned))
     }
 
@@ -666,14 +666,14 @@ impl Registry {
     }
 
     /// [`Registry::resolve`], the user's file's measurements sifted by their
-    /// keys against `now` first ([`crate::fire::Rates::sift`]): one whose
+    /// keys against `now` first ([`crate::rates::Rates::sift`]): one whose
     /// key no longer matches is dropped, so the load measures it again.
     #[must_use]
     pub fn resolve_keyed(
         &self,
         layers: &[Candidate],
         facts: &Facts,
-        now: &dyn crate::fire::Now,
+        now: &dyn crate::rates::Now,
     ) -> (Profile, Report) {
         self.resolve_with(layers, Some(facts), Some(now))
     }
@@ -690,19 +690,19 @@ impl Registry {
         &self,
         layers: &[Candidate],
         facts: Option<&Facts>,
-        now: Option<&dyn crate::fire::Now>,
+        now: Option<&dyn crate::rates::Now>,
     ) -> (Profile, Report) {
         let mut stored: Vec<String> = Vec::new();
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
-        let mut tuned = crate::fire::Tuned::default();
+        let mut tuned = crate::rates::Tuned::default();
         // The user's layer's rates (a load's measurement saved, or a `pie
         // tune --rates`) lie under the checked-in layers': a checked-in
         // profile's rate wins where it states one.
-        let mut user_tuned = crate::fire::Tuned::default();
+        let mut user_tuned = crate::rates::Tuned::default();
         // A committed measured profile's rates lie under the user's: an
         // entry the user's file stores under a matching key is taken over
         // the committed one, entry by entry.
-        let mut committed_tuned = crate::fire::Tuned::default();
+        let mut committed_tuned = crate::rates::Tuned::default();
         let mut user_from = String::from("no user file");
         let mut committed_from = String::from("no committed profile");
         let mut rates_measured: Option<String> = None;
@@ -741,29 +741,17 @@ impl Registry {
                 }
             };
             if !file.skipped_rates.is_empty() {
-                eprintln!(
-                    "WARN {origin}: skipped `[rates]` {}: each measured again, the rest of the file \
+                tracing::warn!(
+                    "{origin}: skipped `[rates]` {}: each measured again, the rest of the file \
                      read",
                     file.skipped_rates.join(", ")
                 );
             }
             if !file.ignored_rates.is_empty() {
-                eprintln!(
+                tracing::info!(
                     "{origin}: ignored `[rates]` {}, which this pie no longer reads; the rest is \
                      read and what it lacks is measured",
                     file.ignored_rates.join(", ")
-                );
-            }
-            if file
-                .ignored_rates
-                .iter()
-                .any(|key| key == crate::fire::KERNEL_CURVES_PER_DISPATCH)
-            {
-                eprintln!(
-                    "{origin}: the dense kernels' curves it states were timed per dispatch (~10x \
-                     long at few rows on a tiler): measured again this load, by frame spans \
-                     (`[rates] {}`)",
-                    crate::fire::KERNEL_CURVES
                 );
             }
             let spelled = match facts {
@@ -798,7 +786,7 @@ impl Registry {
             }
             // A layer stating rates says how they were measured, or leaves
             // the ones below standing as they were.
-            let how = (file.tuned.rates != crate::fire::Rates::default()).then(|| {
+            let how = (file.tuned.rates != crate::rates::Rates::default()).then(|| {
                 file.provenance
                     .iter()
                     .find(|(k, _)| k == "rates")
@@ -820,7 +808,7 @@ impl Registry {
                     );
                 }
                 // The settle is checked by the settle itself, after the
-                // user's stored one ([`crate::fire::Tuned::committed_settle`]).
+                // user's stored one ([`crate::rates::Tuned::committed_settle`]).
                 file.tuned.committed_settle = std::mem::take(&mut file.tuned.rates.dense_settled);
                 committed_from = origin.clone();
                 committed_tuned.lay(&file.tuned);

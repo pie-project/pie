@@ -256,145 +256,6 @@ fn finish_stage(plan: &ExecPlan, sp: &StagePlan, overlay: &mut Overlay, vals: &[
     }
 }
 
-/// Runs the stages of several instances of one program in lockstep: every
-/// stage once, for every lane that is still stepping (a device program
-/// carrying the lanes as rows, say).
-pub trait BatchRunner {
-    /// Computes stage `sp` for `lanes`, the instances still stepping (each
-    /// with its index in the batch and its values: roots resolved, puts to
-    /// be written). An error faults every lane.
-    fn run(&mut self, plan: &ExecPlan, sp: &StagePlan, lanes: &mut [Lane<'_>]) -> Result<()>;
-
-    /// Whether the runner binds the output `root` reads for lane `lane` itself.
-    fn binds(&self, _lane: usize, _root: &LaunchValue) -> bool {
-        false
-    }
-}
-
-/// One lane of a `BatchRunner`'s stage: the instance's index in the batch
-/// and its values.
-pub struct Lane<'v> {
-    pub index: usize,
-    pub vals: &'v mut [Value],
-}
-
-/// One pass of each of `insts` (instances of `plan`) with the stages run in
-/// lockstep by `runner`: lane `l` of a stage's batch is `insts[l]` while
-/// that instance is still stepping. A blocked or poisoned instance leaves
-/// the batch before its first stage, a faulted one when it faults; the
-/// others step on. Returns each instance's outcome, in order.
-#[must_use]
-pub fn step_many(
-    insts: &mut [&mut InterpInstance],
-    plan: &ExecPlan,
-    inputs: &PassInputs,
-    runner: &mut dyn BatchRunner,
-    at: Stage,
-) -> Vec<StepOutcome> {
-    let n = insts.len();
-    let mut outcomes: Vec<Option<StepOutcome>> = vec![None; n];
-    for (l, inst) in insts.iter().enumerate() {
-        if inst.poisoned {
-            outcomes[l] = Some(StepOutcome::Faulted("instance is poisoned".to_string()));
-            continue;
-        }
-        if let Some(channel) = blocked(inst, plan, at) {
-            outcomes[l] = Some(StepOutcome::Blocked(channel));
-        }
-    }
-    let mut overlays: Vec<Overlay> = insts
-        .iter()
-        .map(|inst| Overlay::new(inst.channels.len()))
-        .collect();
-    let mut vals: Vec<Vec<Value>> = (0..n)
-        .map(|_| vec![Value::F32(vec![]); plan.package.values.len()])
-        .collect();
-    fn fault(
-        outcomes: &mut [Option<StepOutcome>],
-        insts: &mut [&mut InterpInstance],
-        l: usize,
-        why: String,
-    ) {
-        insts[l].poisoned = true;
-        outcomes[l] = Some(StepOutcome::Faulted(why));
-    }
-    for kind in [Stage::Prologue, Stage::Epilogue] {
-        if kind == Stage::Epilogue && at != Stage::Prologue {
-            for (l, inst) in insts.iter().enumerate() {
-                if outcomes[l].is_some() {
-                    continue;
-                }
-                for port in &plan.package.ports {
-                    if port.is_const {
-                        continue;
-                    }
-                    if port_consumes(port.port) {
-                        let _ = overlays[l].take(inst, port.channel);
-                    }
-                }
-            }
-        }
-        for sp in &plan.stages {
-            if plan.package.stages[sp.stage_index].stage != kind
-                || !plan.runs_at(sp.stage_index, at)
-            {
-                continue;
-            }
-            for l in 0..n {
-                if outcomes[l].is_some() {
-                    continue;
-                }
-                let prepared = prepare_stage(
-                    insts[l],
-                    plan,
-                    sp,
-                    inputs,
-                    &mut overlays[l],
-                    &mut vals[l],
-                    &|root| matches!(root.source, ValueOrigin::Output) && runner.binds(l, root),
-                );
-                if let Err(why) = prepared {
-                    fault(&mut outcomes, insts, l, why.to_string());
-                }
-            }
-            let mut lanes: Vec<Lane<'_>> = vals
-                .iter_mut()
-                .enumerate()
-                .filter(|(l, _)| outcomes[*l].is_none())
-                .map(|(index, v)| Lane {
-                    index,
-                    vals: v.as_mut_slice(),
-                })
-                .collect();
-            if lanes.is_empty() {
-                break;
-            }
-            if let Err(why) = runner.run(plan, sp, &mut lanes) {
-                for l in 0..n {
-                    if outcomes[l].is_none() {
-                        fault(&mut outcomes, insts, l, why.to_string());
-                    }
-                }
-                break;
-            }
-            for l in 0..n {
-                if outcomes[l].is_none() {
-                    finish_stage(plan, sp, &mut overlays[l], &vals[l]);
-                }
-            }
-        }
-    }
-    for l in 0..n {
-        if outcomes[l].is_none() {
-            outcomes[l] = Some(commit(insts[l], &overlays[l]));
-        }
-    }
-    outcomes
-        .into_iter()
-        .map(|o| o.unwrap_or(StepOutcome::Committed))
-        .collect()
-}
-
 fn const_root_value(root: &LaunchValue) -> Value {
     match root.dtype {
         eta_ir::Dtype::I32 => Value::I32(vec![root.literal_bits as i32]),
@@ -513,17 +374,40 @@ fn run_kind(
 }
 
 fn commit(inst: &mut InterpInstance, overlay: &Overlay) -> StepOutcome {
+    match stage_commit(inst, overlay) {
+        Ok(words) => apply_commit(inst, overlay, &words),
+        Err(outcome) => outcome,
+    }
+}
+
+/// Each channel's head and tail as the step read them, and as it leaves them.
+struct CommitWords {
+    old_heads: Vec<u64>,
+    old_tails: Vec<u64>,
+    new_heads: Vec<u64>,
+    new_tails: Vec<u64>,
+}
+
+fn stage_commit(
+    inst: &mut InterpInstance,
+    overlay: &Overlay,
+) -> std::result::Result<CommitWords, StepOutcome> {
     let n = inst.channels.len();
-    let mut old_tails = vec![0u64; n];
-    let mut new_heads = vec![0u64; n];
-    let mut new_tails = vec![0u64; n];
+    let mut words = CommitWords {
+        old_heads: vec![0u64; n],
+        old_tails: vec![0u64; n],
+        new_heads: vec![0u64; n],
+        new_tails: vec![0u64; n],
+    };
 
     for (ci, ring) in inst.channels.iter().enumerate() {
         let head = ring.head();
         let tail = ring.tail();
         if tail < head {
             inst.poisoned = true;
-            return StepOutcome::Faulted(format!("channel {ci}: tail precedes head at commit"));
+            return Err(StepOutcome::Faulted(format!(
+                "channel {ci}: tail precedes head at commit"
+            )));
         }
         let mut next_head = head;
         let mut next_tail = tail;
@@ -535,29 +419,36 @@ fn commit(inst: &mut InterpInstance, overlay: &Overlay) -> StepOutcome {
         if overlay.put[ci] {
             if used >= ring.capacity() as u64 {
                 inst.poisoned = true;
-                return StepOutcome::Faulted(format!(
+                return Err(StepOutcome::Faulted(format!(
                     "channel {ci}: put overflows capacity {} at commit",
                     ring.capacity()
-                ));
+                )));
             }
             next_tail += 1;
         }
-        old_tails[ci] = tail;
-        new_heads[ci] = next_head;
-        new_tails[ci] = next_tail;
+        words.old_heads[ci] = head;
+        words.old_tails[ci] = tail;
+        words.new_heads[ci] = next_head;
+        words.new_tails[ci] = next_tail;
     }
+    Ok(words)
+}
 
+/// Writes only the words this step moved: the host takes a reader ring's
+/// head and puts a writer ring's tail while a step runs, so storing a word
+/// the step merely read would undo the host's move.
+fn apply_commit(inst: &InterpInstance, overlay: &Overlay, words: &CommitWords) -> StepOutcome {
     for (ci, ring) in inst.channels.iter().enumerate() {
         if overlay.put[ci] {
-            ring.encode_sequence(old_tails[ci], &overlay.pending[&(ci as u32)]);
+            ring.encode_sequence(words.old_tails[ci], &overlay.pending[&(ci as u32)]);
         }
     }
     for (ci, ring) in inst.channels.iter().enumerate() {
-        if new_heads[ci] != ring.head() {
-            ring.store_head(new_heads[ci]);
+        if words.new_heads[ci] != words.old_heads[ci] {
+            ring.store_head(words.new_heads[ci]);
         }
-        if new_tails[ci] != ring.tail() {
-            ring.store_tail(new_tails[ci]);
+        if words.new_tails[ci] != words.old_tails[ci] {
+            ring.store_tail(words.new_tails[ci]);
         }
     }
 
@@ -567,13 +458,15 @@ fn commit(inst: &mut InterpInstance, overlay: &Overlay) -> StepOutcome {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
     use eta_ir::op::Op;
     use eta_ir::registry::{EngineCaps, Stage};
     use eta_ir::types::{Dtype, Shape};
 
-    use super::{PassInputs, StepOutcome, step};
+    use super::*;
+    use crate::channel::ChannelState;
     use crate::{HostOp, Value, adopt_launch_package, host_put, host_take, make_host_instance};
 
     /// Integers scan in their own dtype, wrapping, through the plane's
@@ -659,5 +552,55 @@ mod tests {
             host_take(&inst, &plan, 3),
             (HostOp::Ok, Some(Value::U32(products)))
         );
+    }
+
+    #[test]
+    fn a_host_take_during_a_step_survives_its_commit() {
+        // The epilogue puts a token on a reader ring while the host takes the
+        // one before it: the commit must not write back the head it read.
+        let ring = Arc::new(ChannelState::host(eta_ir::Dtype::I32, 1, 4));
+        assert!(ring.push(&Value::zeros(eta_ir::Dtype::I32, 1)));
+        let mut inst = InterpInstance {
+            channels: vec![Arc::clone(&ring)],
+            poisoned: false,
+        };
+        let mut overlay = Overlay::new(1);
+        overlay.put[0] = true;
+        overlay
+            .pending
+            .insert(0, Value::zeros(eta_ir::Dtype::I32, 1));
+
+        let Ok(words) = stage_commit(&mut inst, &overlay) else {
+            panic!("the commit stages");
+        };
+        assert!(ring.pop().is_some(), "the host takes mid-step");
+        assert!(matches!(
+            apply_commit(&inst, &overlay, &words),
+            StepOutcome::Committed
+        ));
+        assert_eq!((ring.head(), ring.tail()), (1, 2));
+    }
+
+    #[test]
+    fn a_host_put_during_a_step_survives_its_commit() {
+        // The step takes from a writer ring while the host puts the next cell.
+        let ring = Arc::new(ChannelState::host(eta_ir::Dtype::I32, 1, 4));
+        assert!(ring.push(&Value::zeros(eta_ir::Dtype::I32, 1)));
+        let mut inst = InterpInstance {
+            channels: vec![Arc::clone(&ring)],
+            poisoned: false,
+        };
+        let mut overlay = Overlay::new(1);
+        overlay.taken[0] = true;
+
+        let Ok(words) = stage_commit(&mut inst, &overlay) else {
+            panic!("the commit stages");
+        };
+        assert!(ring.push(&Value::zeros(eta_ir::Dtype::I32, 1)));
+        assert!(matches!(
+            apply_commit(&inst, &overlay, &words),
+            StepOutcome::Committed
+        ));
+        assert_eq!((ring.head(), ring.tail()), (1, 2));
     }
 }

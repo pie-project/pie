@@ -48,8 +48,7 @@ pub enum RsPlan {
     /// share its folded window and fold it once.
     Groups(Vec<GroupPlan>),
     /// The model's state is window lists: each row lands its rows in each
-    /// list's slots, then moves its windows. Removed by the windowed-state
-    /// change: the integration commit deletes it, once every engine states
+    /// list's slots, then moves its windows: an engine that does not state
     /// `Capabilities::windowed_state`.
     Window(Vec<WindowRow>),
 }
@@ -348,7 +347,7 @@ impl PreparedRs {
 /// states one (`Lane::tables`, `Lane::fixed`, and the rs list slots a
 /// group's first lane copies before the fire, `Lane::slot_copies`, where it
 /// writes buffered rows into a slot it shares); nothing where `shared` is
-/// `None`. The legacy fields stay as they are. A lane's list table is its
+/// `None`. The lane's other fields stay as they are. A lane's list table is its
 /// translation where one is stated, else its pages (the list shape's slot
 /// refs either way), each window list's table its own (0 where trimmed)
 /// and the window slots it copies first among its `Lane::slot_copies`
@@ -504,55 +503,6 @@ fn lower_window(
     }
 }
 
-/// Names each lane's kv pages by the slot refs of `pinned`, the kv run an
-/// engine that pins its pools states (the degenerate mode): its list table
-/// ([`::engine::chunk::DEGENERATE_KV`]), and, where it pins state records
-/// (`state`), each lane's record. Nothing where `pinned` is `None`.
-pub fn apply_pinned(
-    req: &mut crate::engine::FireRequest,
-    pinned: Option<&crate::store::chunks::ShapeRun>,
-    state: Option<&crate::store::chunks::ShapeRun>,
-    rs: Option<&PreparedRs>,
-) {
-    // A load that holds state states every lane's record: the state slot
-    // its rs store bound it, by the pinned run's refs, or none.
-    if let Some(run) = state {
-        let at = |id: u32| id - run.ids_from + run.ref_from;
-        for (row, lane) in req.lanes.iter_mut().enumerate() {
-            lane.record = match rs.and_then(|rs| rs.run_cow(row)) {
-                Some((read, write)) => ::engine::LaneRecord::Pieces(vec![(
-                    ::engine::chunk::DEGENERATE_STATE,
-                    vec![[at(read), at(write)]],
-                )]),
-                None => ::engine::LaneRecord::Null,
-            };
-        }
-    }
-    let Some(run) = pinned else {
-        return;
-    };
-    for lane in &mut req.lanes {
-        lane.lane.list = if lane.translation.is_empty() {
-            ::engine::ListKind::Pages
-        } else {
-            ::engine::ListKind::Translation
-        };
-        let list = if lane.translation.is_empty() {
-            &lane.pages
-        } else {
-            &lane.translation
-        };
-        if list.is_empty() {
-            continue;
-        }
-        let refs = list
-            .iter()
-            .map(|&id| id - run.ids_from + run.ref_from)
-            .collect();
-        lane.tables = vec![(::engine::chunk::DEGENERATE_KV, refs)];
-    }
-}
-
 /// Records every slot the batch hands the engine as read by it, so a
 /// slot one of its fires reads outlives that fire however it is dropped.
 fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {
@@ -673,8 +623,7 @@ pub fn prepare_many(
     }
     let groups = match plan {
         RsPlan::Window(rows) => {
-            // The window-list path's own refusal: removed by the
-            // windowed-state change with `RsPlan::Window`. An engine that
+            // The window-list path's own refusal. An engine that
             // states `windowed_state` plans `RsPlan::Groups`, its beams
             // sharing one folded window.
             for (index, ws) in working_sets.iter().enumerate() {

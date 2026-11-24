@@ -112,10 +112,9 @@ fn try_bind_in(
         },
         None => binding,
     };
-    let instance = engine.bind_instance(&binding)?.id;
+    let instance = engine::Programs::bind(engine, &binding)?.id;
     assert!(
-        engine
-            .publish_channel(instance, 2, &T.to_le_bytes())
+        engine::Channels::publish(engine, instance, 2, &T.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
@@ -172,16 +171,13 @@ fn fire(
     bound
         .iter()
         .map(|&(instance, _)| {
-            let ids = engine
-                .take_channel(instance, 0)
+            let ids = engine::Channels::take(engine, instance, 0)
                 .expect("the channel reads")
                 .expect("the channel holds a cell");
-            engine
-                .take_channel(instance, 1)
+            engine::Channels::take(engine, instance, 1)
                 .expect("the channel reads")
                 .expect("the channel holds a cell");
-            engine
-                .publish_channel(instance, 2, &T.to_le_bytes())
+            engine::Channels::publish(engine, instance, 2, &T.to_le_bytes())
                 .expect("the timestep publishes");
             i32::from_le_bytes(ids.try_into().expect("one i32"))
         })
@@ -211,9 +207,7 @@ fn setup_bound(
 ) -> Option<(Loaded, engine::program::ProgramId, Slots, u32)> {
     let mut loaded = loaded_bound(tag, &Outputs, lanes, bound)?;
     let decls = output_decls(&loaded.caps);
-    let program = loaded
-        .engine
-        .register_program(&registration_of(&decls, epilogue(), 0x0e7))
+    let program = engine::Programs::register(&mut loaded.engine, &registration_of(&decls, epilogue(), 0x0e7))
         .expect("the program registers");
     let chunks = &loaded.caps.caps.chunks;
     let slots = Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
@@ -283,14 +277,12 @@ fn guest_states_no_fire_term_and_64_lanes_fire_in_the_rungs_span(
         ..
     } = loaded;
     assert_eq!(
-        engine
-            .fire_facts(program, &EXTENTS)
+        engine::Programs::fire_facts(&engine, program, &EXTENTS)
             .expect("the program's fire facts"),
         engine::FireFacts::default(),
         "a guest's state lies in no fire's span"
     );
-    let state = engine
-        .guest_state(program, &EXTENTS, GeometryClass::Host)
+    let state = engine::Programs::guest_state(&engine, program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     eprintln!("guest state: {state:?}");
     assert!(
@@ -376,8 +368,7 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
     let ids = fire(&mut engine, word, t_input, &bound, &[5]);
     assert_eq!(ids, [argmax(&planes, 5)], "the first pass reads its row");
 
-    let state = engine
-        .guest_state(program, &EXTENTS, GeometryClass::Host)
+    let state = engine::Programs::guest_state(&engine, program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     let scratch = slots.state(state.instance_bytes(), state.run);
     let pair = slots.state(state.per_pair, state.run);
@@ -403,8 +394,7 @@ fn an_unparked_guest_serves_on_from_fresh_room_with_nothing_copied() {
     // Fresh room is dead: whatever lies there.
     fill(&engine, &scratch, state.instance_bytes(), 0x7f);
     fill(&engine, &pair, state.per_pair, 0x7f);
-    engine
-        .rebind_slots(Rebind::Instance {
+    engine::Programs::rebind(&mut engine, Rebind::Instance {
             id: instance,
             instance: binding.instance_slots.clone(),
             rings: Vec::new(),
@@ -450,8 +440,7 @@ fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
         dir,
         ..
     } = loaded;
-    let state = engine
-        .guest_state(program, &EXTENTS, GeometryClass::Host)
+    let state = engine::Programs::guest_state(&engine, program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     let word = trace.facts.word(&Request::new(ROWS, false));
     let per_chunk = slots.instance.expect("an Instance shape").per_chunk;
@@ -468,8 +457,7 @@ fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
     let ids = fire(&mut engine, word, t_input, &a_bound, &[5]);
     assert_eq!(ids, [argmax(&planes, 5)], "A's pass reads its row");
 
-    engine
-        .rebind_slots(Rebind::Parked { id: a, kept: true })
+    engine::Programs::rebind(&mut engine, Rebind::Parked { id: a, kept: true })
         .expect("A parks, its tables kept in place");
     // A's tables' chunk onto a chunk nothing holds: the chunk that lay
     // there takes the bytes A's tables left.
@@ -479,8 +467,7 @@ fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
     };
     let onto = pieces[0];
     assert_ne!(tables, onto);
-    engine
-        .evacuate(&Evacuation {
+    engine::Pool::evacuate(&mut engine, &Evacuation {
             moves: vec![(tables, onto)],
         })
         .expect("the chunk moves under the kept park");
@@ -508,8 +495,7 @@ fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
     assert_eq!(ids, [argmax(&planes, 9)], "B serves from A's old bytes");
 
     let unparked = fresh(&mut slots, 6, &a_binding);
-    engine
-        .rebind_slots(Rebind::Instance {
+    engine::Programs::rebind(&mut engine, Rebind::Instance {
             id: a,
             instance: a_binding.instance_slots.clone(),
             rings: Vec::new(),
@@ -591,8 +577,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
         dir,
         ..
     } = loaded;
-    let state = engine
-        .guest_state(program, &EXTENTS, GeometryClass::Host)
+    let state = engine::Programs::guest_state(&engine, program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     assert!(state.instance_bytes() > 0, "the epilogue's heap is its instance's");
     let word = trace.facts.word(&Request::new(ROWS, false));
@@ -603,7 +588,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     // Whatever A's launches left, A's bytes are in its room as it closes.
     fill_room(&engine, &a_binding.scratch, state.instance_bytes(), 0xa5);
     fill_room(&engine, &a_binding.pair, state.per_pair, 0xa5);
-    engine.close_instance(a).expect("A closes");
+    engine::Programs::close(&mut engine, a).expect("A closes");
 
     let (b, b_channels, b_binding) =
         bind_in(&mut engine, &mut slots, program, 4, Some(&a_binding));
@@ -637,7 +622,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
                 .all(|&byte| byte == 0x11),
             "a bind on a live taking leaves the pair as it stands"
         );
-        engine.close_instance(c).expect("C closes");
+        engine::Programs::close(&mut engine, c).expect("C closes");
     }
 
     // An unpark: fresh room holding garbage reads zero once B is there.
@@ -645,8 +630,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     let pair = slots.state(state.per_pair, state.run);
     fill_room(&engine, &scratch, state.instance_bytes(), 0x7f);
     fill_room(&engine, &pair, state.per_pair, 0x7f);
-    engine
-        .rebind_slots(Rebind::Instance {
+    engine::Programs::rebind(&mut engine, Rebind::Instance {
             id: b,
             instance: b_binding.instance_slots.clone(),
             rings: Vec::new(),
@@ -710,8 +694,7 @@ fn an_evacuation_refused_at_its_rebind_moves_nothing() {
         dir,
         ..
     } = loaded;
-    let state = engine
-        .guest_state(program, &EXTENTS, GeometryClass::Host)
+    let state = engine::Programs::guest_state(&engine, program, &EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     assert!(state.instance_bytes() > 0, "the epilogue's heap is its instance's");
     let word = trace.facts.word(&Request::new(ROWS, false));
@@ -743,8 +726,7 @@ fn an_evacuation_refused_at_its_rebind_moves_nothing() {
         run: 2,
         pieces: vec![head],
     };
-    engine
-        .rebind_slots(Rebind::Instance {
+    engine::Programs::rebind(&mut engine, Rebind::Instance {
             id: a,
             instance: a_binding.instance_slots.clone(),
             rings: Vec::new(),
@@ -758,12 +740,11 @@ fn an_evacuation_refused_at_its_rebind_moves_nothing() {
     let ids = fire(&mut engine, word, t_input, &bound, &[5]);
     assert_eq!(ids, [argmax(&planes, 5)], "A reads its row from its run");
 
-    let table = engine.chunk_table().expect("the engine's chunk table");
+    let table = engine::Pool::chunk_table(&engine).expect("the engine's chunk table");
     let head_bytes = read_chunk(&engine, head);
     let table_bytes = read_chunk(&engine, tables);
     let onto = table.physical(tables).expect("the tables' chunk lies somewhere");
-    let refused = engine
-        .evacuate(&Evacuation {
+    let refused = engine::Pool::evacuate(&mut engine, &Evacuation {
             moves: vec![(head, onto)],
         })
         .expect_err("A's run would cross segment 0's end");
@@ -773,7 +754,7 @@ fn an_evacuation_refused_at_its_rebind_moves_nothing() {
         "refused at the rebind, by the run's place: {refused}"
     );
     assert_eq!(
-        engine.chunk_table().expect("the engine's chunk table"),
+        engine::Pool::chunk_table(&engine).expect("the engine's chunk table"),
         table,
         "a refused evacuation leaves the chunk table as it stood"
     );
@@ -790,11 +771,9 @@ fn an_evacuation_refused_at_its_rebind_moves_nothing() {
 
     // A's claim stood: a park and an unpark onto its own slots lay it
     // again.
-    engine
-        .rebind_slots(Rebind::Parked { id: a, kept: true })
+    engine::Programs::rebind(&mut engine, Rebind::Parked { id: a, kept: true })
         .expect("A parks, its tables kept in place");
-    engine
-        .rebind_slots(Rebind::Instance {
+    engine::Programs::rebind(&mut engine, Rebind::Instance {
             id: a,
             instance: a_binding.instance_slots.clone(),
             rings: Vec::new(),
@@ -919,8 +898,7 @@ fn scores_rig() -> Option<ScoresRig> {
         externs: Vec::new(),
         inputs: Vec::new(),
     };
-    let program = engine
-        .register_program(&registration_of(&decls, program, 0x5c0e))
+    let program = engine::Programs::register(&mut engine, &registration_of(&decls, program, 0x5c0e))
         .expect("the program registers");
 
     // The test's chunks: past the seats' runs where the pool is laid whole
@@ -945,7 +923,7 @@ fn scores_rig() -> Option<ScoresRig> {
         facts.segments.max
     };
     assert!(most >= commit, "the test's chunks span {commit} segments of {most}");
-    engine.commit_segments(commit).expect("the segments commit");
+    engine::Pool::commit(&mut engine, commit).expect("the segments commit");
     let top = first + need;
     let slots = Slots::of(&facts, top - 1, top - 2);
     Some(ScoresRig {
@@ -1002,9 +980,7 @@ impl ScoresRig {
             },
             None => binding,
         };
-        let instance = self
-            .engine
-            .bind_instance(&binding)
+        let instance = engine::Programs::bind(&mut self.engine, &binding)
             .expect("the instance binds")
             .id;
         (instance, binding)
@@ -1042,9 +1018,7 @@ impl ScoresRig {
         self.engine
             .settle_frame(&mut ticket)
             .expect("the frame settles");
-        let cell = self
-            .engine
-            .take_channel(instance, 0)
+        let cell = engine::Channels::take(&mut self.engine, instance, 0)
             .expect("the channel reads")
             .expect("the program put the key row");
         let row: Vec<f32> = cell
@@ -1091,9 +1065,7 @@ fn a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(kept: bool)
     let Some(mut rig) = scores_rig() else {
         return;
     };
-    let state = rig
-        .engine
-        .guest_state(rig.program, &SCORE_EXTENTS, GeometryClass::Host)
+    let state = engine::Programs::guest_state(&rig.engine, rig.program, &SCORE_EXTENTS, GeometryClass::Host)
         .expect("the program's guest state");
     assert!(state.per_pair > 0, "the pair keeps the score room");
     let chunk_bytes = rig.facts.chunk_bytes;
@@ -1113,8 +1085,7 @@ fn a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(kept: bool)
     );
 
     for id in [a, b] {
-        rig.engine
-            .rebind_slots(Rebind::Parked { id, kept })
+        engine::Programs::rebind(&mut rig.engine, Rebind::Parked { id, kept })
             .expect("the member parks");
     }
     // The pair's chunks onto whole chunks nothing holds: the chunks that
@@ -1134,8 +1105,7 @@ fn a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(kept: bool)
         onto + run <= from || from + run <= onto,
         "the run moves apart from itself"
     );
-    rig.engine
-        .evacuate(&Evacuation {
+    engine::Pool::evacuate(&mut rig.engine, &Evacuation {
             moves: (0..run).map(|at| (from + at, onto + at)).collect(),
         })
         .expect("the pair's chunks move while every member is parked");
@@ -1161,8 +1131,7 @@ fn a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(kept: bool)
     // A and B come back at the pair, the joiner's live taking.
     for (id, binding) in [(a, &a_binding), (b, &b_binding)] {
         let scratch = rig.slots.state(state.instance_bytes(), state.run);
-        rig.engine
-            .rebind_slots(Rebind::Instance {
+        engine::Programs::rebind(&mut rig.engine, Rebind::Instance {
                 id,
                 instance: binding.instance_slots.clone(),
                 rings: Vec::new(),
@@ -1185,7 +1154,7 @@ fn a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(kept: bool)
         "the returning members leave the bytes the pair left as they stand"
     );
     for id in [a, b, c] {
-        rig.engine.close_instance(id).expect("the instance closes");
+        engine::Programs::close(&mut rig.engine, id).expect("the instance closes");
     }
 }
 
@@ -1197,43 +1166,6 @@ fn a_fresh_joiner_of_a_pair_parked_kept_lays_it_where_a_move_left_it() {
 #[test]
 fn a_fresh_joiner_of_a_pair_parked_shed_lays_it_where_a_move_left_it() {
     a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(false);
-}
-
-/// What binding and closing a guest costs, its state cleared at each bind:
-/// `PIE_GUEST_BIND_ROUNDS` rounds (default 200) of one bind and one close.
-#[test]
-#[ignore = "a measurement: run on its own"]
-fn guest_bind_close_rounds_timed() {
-    let Some((loaded, program, mut slots, _)) = setup("guest-state-binds", 4) else {
-        return;
-    };
-    let Loaded {
-        mut engine, dir, ..
-    } = loaded;
-    let rounds: u64 = std::env::var("PIE_GUEST_BIND_ROUNDS")
-        .ok()
-        .and_then(|rounds| rounds.parse().ok())
-        .unwrap_or(200);
-    let state = engine
-        .guest_state(program, &EXTENTS, GeometryClass::Host)
-        .expect("the program's guest state");
-    let (first, _, room) = bind(&mut engine, &mut slots, program, 1);
-    engine.close_instance(first).expect("closes");
-    let started = std::time::Instant::now();
-    for round in 0..rounds {
-        let (instance, _, _) =
-            bind_in(&mut engine, &mut slots, program, 4 + 3 * round, Some(&room));
-        engine.close_instance(instance).expect("closes");
-    }
-    let took = started.elapsed();
-    eprintln!(
-        "guest bind+close: {rounds} rounds, {:.1} us a round, state {} B an instance + {} B its pair",
-        took.as_secs_f64() * 1e6 / rounds as f64,
-        state.instance_bytes(),
-        state.per_pair
-    );
-    drop(engine);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A beam group's state (`engine_gpu::beam::Resident`, first in the

@@ -1169,9 +1169,8 @@ mod tests {
     }
 
     // `Fire::at` names an entry point by string and nothing resolves it until a
-    // real device does, where a typo is a nil pipeline. The Metal audit's
-    // `--table` mode, which used to hold the two sides together, is retired, so
-    // this holds its own: the shipped width is `d_256` and no test launches it.
+    // real device does, where a typo is a nil pipeline. This holds the two sides
+    // together: the shipped width is `d_256` and no test launches it.
     //
     // A shader stamps its entry points through an `instantiate_*` macro, so the
     // name never appears whole in the source; read the invocations and spell the

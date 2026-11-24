@@ -86,7 +86,6 @@ fn a_lagged_decode_answers_the_unlagged() {
             // The rows through this fire's own, less the lag, fold: the
             // runtime's accepted length; every 5th step none, step 27 all.
             let through = held + 1;
-            let carried = held - folded_at[at];
             let target = if k == 38 {
                 through
             } else if k % 5 == 4 {
@@ -107,10 +106,6 @@ fn a_lagged_decode_answers_the_unlagged() {
             folded_at[at] = target;
             let rel = spread(&want, &got) / scale;
             let flipped = argmax(&got).0 != top && top_logit - runner_up > 0.02;
-            eprintln!(
-                "lag {lag} step {k}: carries {carried} rows, {rel:.4} of the logits' scale{}",
-                if flipped { ", greedy flipped" } else { "" }
-            );
             if rel > 0.05 || flipped {
                 failures.push(format!("lag {lag} step {k}: {rel:.4}{}", if flipped { " (flip)" } else { "" }));
             }

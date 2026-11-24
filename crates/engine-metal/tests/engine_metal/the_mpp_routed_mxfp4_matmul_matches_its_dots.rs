@@ -5,22 +5,11 @@ use engine_metal::encode::Sink;
 use kernels_metal::linear::moe::{self, RoutedScratch};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
+use crate::common::{bf16, noise};
 
 const LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
-
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
 
 #[test]
 fn every_routed_row_answers_its_experts_exact_mxfp4_reference() {
@@ -37,7 +26,6 @@ moe.tile_rows = [{ when = "per_expert >= 64", value = 64 }, { value = 32 }]
 "#,
         false,
     );
-    let mut checked = 0;
     // (experts, tokens, fan-out, K, N, codes as one row an expert): row tiles of 64 and 32.
     let cases = [
         (4u32, 160u32, 2u32, 128u32, 128u32, false),
@@ -198,12 +186,10 @@ moe.tile_rows = [{ when = "per_expert >= 64", value = 64 }, { value = 32 }]
                                     "random experts={experts} bias={biased} token={token} slot={slot} col={col}: {actual_f32} vs {want}"
                                 );
                             }
-                            checked += 1;
                         }
                     }
                 }
             }
         }
     }
-    eprintln!("checked {checked} routed outputs against exact and random mxfp4 dots");
 }

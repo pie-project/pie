@@ -126,8 +126,7 @@ fn every_row_of_a_wide_reduction_is_folded_whatever_the_rows() {
     let mut slots = Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
     let mut wrong = Vec::new();
     for (k, &rows) in ROWS.iter().enumerate() {
-        let program = engine
-            .register_program(&registration_of(&decls, program(rows), 0x5917_0000 + u64::from(rows)))
+        let program = engine::Programs::register(&mut engine, &registration_of(&decls, program(rows), 0x5917_0000 + u64::from(rows)))
             .expect("the program registers");
         let shapes = [
             (vec![1, 1], EtaDtype::F32, HostRole::Writer),
@@ -180,10 +179,9 @@ fn every_row_of_a_wide_reduction_is_folded_whatever_the_rows() {
             },
             &channels,
         );
-        let instance = engine.bind_instance(&binding).expect("the instance binds").id;
+        let instance = engine::Programs::bind(&mut engine, &binding).expect("the instance binds").id;
         assert!(
-            engine
-                .publish_channel(instance, 0, &0.375f32.to_le_bytes())
+            engine::Channels::publish(&mut engine, instance, 0, &0.375f32.to_le_bytes())
                 .expect("the timestep publishes")
         );
         let lane = Lane {
@@ -215,8 +213,7 @@ fn every_row_of_a_wide_reduction_is_folded_whatever_the_rows() {
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");
         let mut take = |at: u32| {
-            engine
-                .take_channel(instance, at)
+            engine::Channels::take(&mut engine, instance, at)
                 .expect("the channel reads")
                 .expect("the channel holds a cell")
         };

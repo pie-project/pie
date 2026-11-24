@@ -748,7 +748,7 @@ unsafe extern "system" fn on_validation(
     let message = unsafe { (*data).message_as_c_str() }
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    eprintln!("vulkan validation [{:#x}]: {message}", severity.as_raw());
+    tracing::warn!(severity = severity.as_raw(), "vulkan validation: {message}");
     vk::FALSE
 }
 
@@ -774,6 +774,9 @@ pub struct Context {
     /// Whether the next frame's rows are constants of its commands
     /// ([`Context::fixed_next`]).
     fixed_next: Mutex<Option<bool>>,
+    /// A frame submitted empty and landed, once: what a fire that runs
+    /// nothing lands on ([`Context::landed`]).
+    landed_frame: Mutex<Option<Arc<Inner>>>,
     /// The workgroups the device holds at once, as the load's rates step
     /// measured them ([`Context::resident`]).
     resident: std::sync::OnceLock<u32>,
@@ -1264,7 +1267,11 @@ impl Context {
                 && f12.vulkan_memory_model_device_scope == vk::TRUE,
             subgroup_size_control: size_control,
             memory_budget,
+            // PowerVR's shader compiler faults on the coopmat kernels
+            // (SIGSEGV in `emitCooperativeMatrixOp`, a C-Series), and its
+            // profile tunes the register-tiled ones.
             coopmat: coopmat_shape
+                && profile::vendor::of_pci(props.vendor_id) != "imagination"
                 && fcm.cooperative_matrix == vk::TRUE
                 && f12.shader_float16 == vk::TRUE
                 && f12.vulkan_memory_model == vk::TRUE
@@ -1273,11 +1280,12 @@ impl Context {
         // A recording's pool segment bindings are written as the segments
         // are backed and given back, while it stands: update-after-bind
         // storage buffers. A device without them lays its pool whole
-        // (`Context::resizes_pool`). `PIE_VULKAN_WHOLE_POOL` takes that path
-        // on one that has them, to test it.
-        let update_after_bind = f12.descriptor_binding_storage_buffer_update_after_bind
-            == vk::TRUE
-            && std::env::var_os("PIE_VULKAN_WHOLE_POOL").is_none();
+        // (`Context::resizes_pool`); a test's boot takes that path on one
+        // that has them (`DeviceBoot::whole_pool`).
+        let update_after_bind =
+            f12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE;
+        #[cfg(feature = "test-limits")]
+        let update_after_bind = update_after_bind && !boot.whole_pool;
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
                 detail: format!(
@@ -1502,6 +1510,7 @@ impl Context {
             arm_next: Mutex::new(None),
             room_next: Mutex::new(None),
             fixed_next: Mutex::new(None),
+            landed_frame: Mutex::new(None),
             resident: std::sync::OnceLock::new(),
         })
     }
@@ -1560,7 +1569,7 @@ impl Context {
     }
 
     /// The workgroups the device holds at once, as the load's rates step
-    /// measured them on every device (`profile::fire::RESIDENT_WORKGROUPS`):
+    /// measured them on every device (`profile::rates::RESIDENT_WORKGROUPS`):
     /// what a guest step's grid strides over. `None` before the load has.
     #[must_use]
     pub fn resident(&self) -> Option<u32> {
@@ -1884,6 +1893,31 @@ impl Context {
         self.frame_with(true)
     }
 
+    /// A submission already landed: what a fire that runs nothing (the arm
+    /// walk's) lands on, `on_done` run by the watcher as for any other,
+    /// with no command buffer, no submit and no wait on the device. It
+    /// takes what the next frame would of the settings laid for it.
+    pub fn landed(&self, on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        self.arm_next.lock().expect("arm lock poisoned").take();
+        self.room_next.lock().expect("room lock poisoned").take();
+        self.fixed_next.lock().expect("fixed lock poisoned").take();
+        self.indirect_next.lock().expect("indirect lock poisoned").take();
+        let inner = {
+            let mut held = self.landed_frame.lock().expect("landed lock poisoned");
+            match held.as_ref() {
+                Some(inner) => Arc::clone(inner),
+                None => {
+                    let pending = self.frame_with(true)?.commit_async(None)?;
+                    pending.wait()?;
+                    let inner = Arc::clone(&pending.submission.inner);
+                    *held = Some(Arc::clone(&inner));
+                    inner
+                }
+            }
+        };
+        Ok(Pending::watched(Pending::of_frame(&inner), on_done))
+    }
+
     /// The dispatches, by their place in the walk, the next frame opened
     /// makes indirect: those whose group counts differ between the shapes of
     /// one recording. Every other dispatch carries its counts.
@@ -2071,6 +2105,15 @@ impl Context {
         Ok(frame)
     }
 
+    /// A dry frame whose walk lays the fire's block alone: each dispatch's
+    /// scalars and group counts, and the kernels it runs (its picks), with
+    /// none of what it binds, its barriers or its hash.
+    pub fn frame_lay(&self) -> Result<Frame> {
+        let mut frame = self.frame_dry()?;
+        frame.lay_only = true;
+        Ok(frame)
+    }
+
     fn frame_with(&self, one_time: bool) -> Result<Frame> {
         let core = &self.core;
         let d = &core.device;
@@ -2196,6 +2239,8 @@ impl Context {
             copies: std::cell::RefCell::new(Vec::new()),
             baked: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
             trail: std::cell::RefCell::new(Vec::new()),
+            picks: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
+            lay_only: false,
         })
     }
 }
@@ -2610,6 +2655,13 @@ pub struct Frame {
     /// Each readout copy's mark (its most rows: its regions are the copier's
     /// table), in order.
     copies: std::cell::RefCell<Vec<[u32; 3]>>,
+
+    /// The kernels its dispatches run and its other commands, hashed
+    /// ([`Frame::pick`]).
+    picks: std::cell::RefCell<std::collections::hash_map::DefaultHasher>,
+
+    /// Lays the block alone ([`Context::frame_lay`]).
+    lay_only: bool,
 }
 
 impl Frame {
@@ -2651,10 +2703,21 @@ impl Frame {
     /// chunk's buffer, and its place among the chunks with the offset, which
     /// is the same in every walk laid alike.
     pub(crate) fn lay(&self, bytes: &[u8], align: u64) -> Result<(vk::Buffer, (usize, u64))> {
+        self.lay_kept(bytes, align, bytes.len())
+    }
+
+    /// [`Self::lay`], the bytes past `kept` zero: an arm's image keeps them
+    /// unscanned.
+    pub(crate) fn lay_kept(
+        &self,
+        bytes: &[u8],
+        align: u64,
+        kept: usize,
+    ) -> Result<(vk::Buffer, (usize, u64))> {
         let (slab, chunk, at) = self
             .block
             .borrow_mut()
-            .lay(&self.inner.core, bytes, align)?;
+            .lay(&self.inner.core, bytes, align, kept)?;
         self.retain(&slab);
         Ok((slab.buffer, (chunk, at)))
     }
@@ -2862,6 +2925,7 @@ impl Frame {
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             image: self.block.borrow_mut().take_image().seal(),
+            picks: self.picks.borrow().finish(),
             cuts: self.cuts(),
             room_pasts: self.room_pasts.borrow().clone(),
         }
@@ -2878,10 +2942,27 @@ impl Frame {
         if tracing::enabled!(target: "vkbakeall", tracing::Level::TRACE) {
             tracing::trace!(target: "vkbakeall", what = ?what, "bake");
         }
+        // A command other than a dispatch picks itself whole: a copy's
+        // regions, a zeroed span (a dispatch picks its kernel, [`Self::pick`]).
+        if name.is_empty() {
+            self.pick(what);
+        }
         what.hash(&mut *self.baked.borrow_mut());
         if trailing() {
             self.trail.borrow_mut().push(format!("{what:?} {name}"));
         }
+    }
+
+    /// Folds `what` into the frame's picks: the kernels its dispatches
+    /// run and its other commands, in order, apart from what they bind. A
+    /// lay-only walk's picks name the family whose fill it lays.
+    pub(crate) fn pick(&self, what: &impl std::hash::Hash) {
+        what.hash(&mut *self.picks.borrow_mut());
+    }
+
+    /// A lay-only frame ([`Context::frame_lay`]).
+    pub(crate) fn lay_only(&self) -> bool {
+        self.lay_only
     }
 
     pub(crate) fn core(&self) -> &Arc<Core> {
@@ -2908,6 +2989,10 @@ impl Frame {
     }
 
     pub(crate) fn retain(&self, slab: &Slab) {
+        // A fill walk's frame is never submitted: it holds nothing.
+        if self.dry {
+            return;
+        }
         let key = Arc::as_ptr(slab) as usize;
         if !self.retained.borrow_mut().insert(key) {
             return;
@@ -3762,6 +3847,7 @@ impl Frame {
             trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
+            picks: self.picks.borrow().finish(),
             indirect: self.indirect.clone(),
             indirect_all: true,
         })
@@ -3809,6 +3895,8 @@ pub struct Fill {
     pub image: super::block::Image,
     pub cuts: usize,
     pub room_pasts: Vec<u64>,
+    /// The walk's picks ([`Frame::pick`]).
+    pub picks: u64,
 }
 
 pub struct Kept {
@@ -3831,6 +3919,7 @@ pub struct Kept {
     groups: Vec<[u32; 3]>,
 
     copies: Vec<[u32; 3]>,
+    picks: u64,
 
     indirect: Option<Arc<Vec<bool>>>,
 
@@ -3872,12 +3961,14 @@ impl Kept {
         for (&at, &past) in views.iter().zip(pasts) {
             binds[at].2 = past;
         }
+        // A fire with no room captures nothing: its room bindings are read
+        // by no workgroup, and stand as they are.
+        let Some((buffer, at)) = room else {
+            return Ok(true);
+        };
         if self.inner.room_fixed.load(Ordering::Acquire) {
             return Ok(false);
         }
-        let Some((buffer, at)) = room else {
-            return Ok(false);
-        };
         // A copier binds its source buffer whole, which may hold another
         // plane's rows beside the room's: it follows a room within its
         // buffer, never into another.
@@ -3951,6 +4042,12 @@ impl Kept {
     #[must_use]
     pub fn groups(&self) -> &[[u32; 3]] {
         &self.groups
+    }
+
+    /// The walk's picks ([`Frame::pick`]).
+    #[must_use]
+    pub fn picks(&self) -> u64 {
+        self.picks
     }
 
     /// Each readout copy's mark (its most rows), in order.

@@ -65,6 +65,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         use poem_compiler::fuse::rules;
         vec![
             rules::qkv_fused_padded(),
+            rules::residual_add_rmsnorm(),
             rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
@@ -136,6 +137,30 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
     ]
 }
 
+#[cfg(not(feature = "rocm"))]
+const RESIDUAL_NORM: &str = "fused.residual_add_rmsnorm";
+
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn fusions(chip: &profile::Profile) -> Vec<&'static poem_compiler::fuse::Rule> {
+    poem_compiler::fuse::flags::on(chip, &FUSIONS)
+        .into_iter()
+        .filter(|rule| rule.kernel() != RESIDUAL_NORM)
+        .collect()
+}
+
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn residual_norms(
+    chip: &profile::Profile,
+    synth_regions: bool,
+) -> Vec<&'static poem_compiler::fuse::Rule> {
+    poem_compiler::fuse::flags::on(chip, &FUSIONS)
+        .into_iter()
+        .filter(|rule| !synth_regions && rule.kernel() == RESIDUAL_NORM)
+        .collect()
+}
+
 /// What `op` reads of a seat's rows: the seat table's entry for its name,
 /// but a gated unit of routed rows (each times its route's weight) reads
 /// routed rows, none of the seat's, a predicted route only the prediction's,
@@ -188,7 +213,7 @@ pub use run::{
 };
 pub use serve::{
     Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, QueueMasks, Recording, Seal,
-    Seated, Shell,
+    Seated, Shell, WeightPin,
 };
 
 pub use blob::{

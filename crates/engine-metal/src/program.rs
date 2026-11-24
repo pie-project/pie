@@ -30,7 +30,7 @@ use crate::store::Pools;
 
 /// A ring's facts at `channel_slot`-byte `Channel` slots, `per_chunk` a
 /// chunk: cells packed whole a slot, or, where a cell is past a slot, one
-/// contiguous run (STATE-ROLES.md A+D). `None` where the run would not fit
+/// contiguous run. `None` where the run would not fit
 /// a chunk: the engine keeps that ring.
 #[must_use]
 pub fn ring_facts(
@@ -152,7 +152,7 @@ pub struct Plane {
     /// 0 where the load reads out no scores.
     capture: u64,
     /// The pages a beam group's lists span and the frames its pending
-    /// pages wait (BEAM-PAGE-LISTS §3): the context's pages and the frames
+    /// pages wait: the context's pages and the frames
     /// in flight.
     beam_bounds: (u32, u32),
     /// The widest beam group the device's threadgroup memory holds for the
@@ -171,8 +171,8 @@ pub struct Plane {
     claims: Claims,
 }
 
-/// A beam group's resident state, as its instance lays it
-/// (BEAM-PAGE-LISTS §4): its beams, the list width and pool pages it is
+/// A beam group's resident state, as its instance lays it:
+/// its beams, the list width and pool pages it is
 /// laid for, and its ring of pending pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeamLayout {
@@ -276,8 +276,8 @@ impl Plane {
         let state = guest::guest_state(&pair, &instance, self.resident_of(program), room_of(pools)?);
         // A place lies in one run of a segment's chunks: a run past a segment
         // can never be opened, compaction or not, so it is refused here by
-        // name rather than asked of the pool (where a restore waited on it
-        // for good: Mac Pro's w32 on the M5, a run of 57 past a segment's 35).
+        // name rather than asked of the pool (where a restore would wait on
+        // it for good: a beam of 32 on an M5, a run of 57 past a segment's 35).
         let segment = pools.chunk_facts().segment_chunks;
         if state.run > segment {
             let chunk = pools.chunk_bytes();
@@ -288,8 +288,8 @@ impl Plane {
                 state.run, state.scratch, state.resident
             );
             // A beam group's width is named, not a width it would fit at: its
-            // scratch a beam moves with the bind's extents (Mac Pro: 6.7 MB a
-            // beam at w32, 3.4 MB at w20), so no one figure bounds it.
+            // scratch a beam moves with the bind's extents (6.7 MB a beam at
+            // w32, 3.4 MB at w20 on an M5), so no one figure bounds it.
             if let Some(layout) = self.beam_of(program) {
                 why.push_str(&format!("; a beam group of {} beams", layout.lanes));
             }
@@ -791,7 +791,7 @@ impl Plane {
     /// (`Port::Parents`, `[lanes]` u32 in a channel): its pool holds its
     /// beams' pages (each at most a sequence's), the pages a fire hands
     /// out, those pending over the frames in flight and the prompt's own
-    /// page (BEAM-PAGE-LISTS §3). `None` for any other program.
+    /// page. `None` for any other program.
     fn beam_of(&self, program: &Program) -> Option<BeamLayout> {
         let binding = program
             .plan
@@ -832,7 +832,7 @@ impl Plane {
     }
 
     /// Beam `beam`'s page list of instance `id`'s beam group as its last
-    /// fire left it (`BEAM-PAGE-LISTS.md` §6.6): the lists are kept twice by
+    /// fire left it: the lists are kept twice by
     /// the fire count's parity (`runtime/beam.metal`), the last fire's at
     /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. The
     /// caller lands every fire in flight first.
@@ -880,8 +880,8 @@ impl Plane {
             .collect())
     }
 
-    /// The host address of instance `id`'s beam group's common slot word
-    /// (BEAM-PAGE-LISTS §11.3): its header's fourth, below which every live
+    /// The host address of instance `id`'s beam group's common slot word:
+    /// its header's fourth, below which every live
     /// beam's rows are one, as its last head step left it. `None` where it
     /// holds no beam state.
     #[must_use]
@@ -1105,7 +1105,7 @@ impl Plane {
             bound.scratch = scratch;
             bound.beam = beam;
             // A bind's first lay: the group's state starts unprimed
-            // (header zero, BEAM-PAGE-LISTS §5).
+            // (header zero).
             if fresh && let Some(beam) = bound.beam.as_mut() {
                 beam.zero_span(0, beam.bytes())?;
             }
@@ -1223,13 +1223,12 @@ impl Plane {
             .iter()
             // A parked instance that shed its state holds nothing here
             // (`engine::Rebind::Parked`): repointed, claimed and laid at its
-            // rebind, never here over what another owner holds (Mac Pro: a
-            // shed pair laid at its stale place after every evacuation). One
+            // rebind, never here over what another owner holds (a shed pair
+            // would be laid at its stale place after every evacuation). One
             // whose park kept its tables and rings in place holds them where
             // the evacuation moved them, its scratch not (given back at the
-            // park): left on the old bytes, its claim let another instance
-            // bind over its tables at its own refs (the L40S's kept park,
-            // 743e8a54e on engine-cuda).
+            // park): left on the old bytes, its claim would let another
+            // instance bind over its tables at its own refs.
             .filter(|(_, bound)| !bound.parked || bound.kept)
             .map(|(id, bound)| {
                 let scratch = if bound.parked {
@@ -2606,8 +2605,8 @@ mod tests {
     /// Top-k and top-p over short vectors, under what a streamed select
     /// (`select_count` x 51,200 B) or a streamed top-k (`rows` x (2,072 +
     /// 12 x 1,024) B) keeps in its temporaries: the whole-value rule alone
-    /// sized those areas at 16 B an element, so the kernel wrote past its
-    /// lane's temporary into what lay next. The stage's temporary now takes
+    /// sizes those areas at 16 B an element, and the kernel would write past
+    /// its lane's temporary into what lies next. The stage's temporary takes
     /// what each region's emitter publishes it needs
     /// (`eta_exec::stage_temporaries`), and every form cuts as its rule
     /// names.
@@ -3265,11 +3264,11 @@ mod tests {
     /// interpreter answers at every mask size: each beam inherits its
     /// parent's row (`gather(mask, parent)`) and marks its own new cell
     /// (`or` with `iota == cell`), over `[beams, cells]` bools from below to
-    /// past one 1,024-thread block. (On the tiny-region merge of 3ee539f31
-    /// the step's put shared a streamed step with the `or` writing its
-    /// value, and packing eight bools a byte read cells the other
-    /// threadgroup had not yet written: past cell 512 the mask came back
-    /// zero, and a beam of 7 read the wrong ancestry.)
+    /// past one 1,024-thread block. (Where a tiny-region merge puts the
+    /// step's put in one streamed step with the `or` writing its value,
+    /// packing eight bools a byte reads cells the other threadgroup has not
+    /// yet written: past cell 512 the mask comes back zero, and a beam of 7
+    /// reads the wrong ancestry.)
     #[test]
     fn a_beam_mask_step_answers_what_the_interpreter_answers_at_every_size() {
         use eta_compiler::contract::wire;
@@ -4729,7 +4728,7 @@ mod tests {
         pools.seat_tier(2 * CHUNK);
         let to_host = |shape, slots: &[u32], first: u32| engine::chunk::SlotCopy {
             shape,
-            src: engine::MemoryDomain::MetalShared,
+            src: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
             dst: engine::MemoryDomain::HostPinned,
             slots: slots
                 .iter()
@@ -4741,7 +4740,7 @@ mod tests {
         let from_host = |copy: &engine::chunk::SlotCopy, back: &[u32]| engine::chunk::SlotCopy {
             shape: copy.shape,
             src: engine::MemoryDomain::HostPinned,
-            dst: engine::MemoryDomain::MetalShared,
+            dst: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
             slots: copy
                 .slots
                 .iter()
@@ -4808,9 +4807,8 @@ mod tests {
     /// an evacuation that moves their chunks moves the claim with them: an
     /// instance bound at the parked one's refs is refused by name (it would
     /// lie on the kept tables), and the parked instance, rebound at the same
-    /// refs, fires as it did before the move. Before, the rebind skipped
-    /// every parked instance and the overlapping bind was accepted (the
-    /// L40S's kept park on engine-cuda, 743e8a54e).
+    /// refs, fires as it did before the move. A rebind that skipped every
+    /// parked instance would accept the overlapping bind.
     #[test]
     fn an_evacuation_moves_a_kept_park_s_claim_with_its_tables() {
         use crate::store::Pools;
@@ -4922,8 +4920,8 @@ mod tests {
     /// A guest state whose place needs a run past a segment is refused by
     /// name at guest_state, naming the run, the segment and (for a beam
     /// group) its beams, never asked of the pool,
-    /// where a restore waited on a run that can never open (Mac Pro's w32
-    /// on the M5). The same program over a pool whose segment holds its run
+    /// where a restore would wait on a run that can never open (a beam of 32
+    /// on an M5). The same program over a pool whose segment holds its run
     /// is stated as before.
     #[test]
     fn a_place_past_a_segment_is_refused_by_name() {
@@ -4988,7 +4986,7 @@ mod tests {
     }
 
     /// A beam group's state is resident in its instance's place
-    /// (`GuestState::resident`, BEAM-PAGE-LISTS §4), first in it, and the
+    /// (`GuestState::resident`), first in it, and the
     /// runtime copies the place byte for byte wherever a park or a move
     /// takes it: a rebind naming a fresh place carries the group's state
     /// there, its bytes as they stood, and one that moves only the tables
@@ -5257,7 +5255,7 @@ mod tests {
                     &mut frame,
                     &engine::chunk::SlotCopy {
                         shape: *shape,
-                        src: engine::MemoryDomain::MetalShared,
+                        src: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                         dst: engine::MemoryDomain::HostPinned,
                         slots: slots.iter().copied().zip(host.iter().copied()).collect(),
                         runs: Vec::new(),
@@ -5294,7 +5292,7 @@ mod tests {
                     &engine::chunk::SlotCopy {
                         shape: *shape,
                         src: engine::MemoryDomain::HostPinned,
-                        dst: engine::MemoryDomain::MetalShared,
+                        dst: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                         slots: host.iter().copied().zip(slots.iter().copied()).collect(),
                         runs: Vec::new(),
                     },
@@ -5306,7 +5304,7 @@ mod tests {
         assert_eq!(fire(&mut plane, &mut logits, 654), 654, "after the round trip");
 
         // A role slot asked to the disk tier of a load that seated none is
-        // refused by name (CONTRACT-BC 22: any shape goes to disk, within
+        // refused by name (any shape goes to disk, within
         // the disk chunks the load seats).
         let standing = read(&pools);
         let mut frame = context.frame().expect("a frame");
@@ -5315,7 +5313,7 @@ mod tests {
                 &mut frame,
                 &engine::chunk::SlotCopy {
                     shape: INSTANCE,
-                    src: engine::MemoryDomain::MetalShared,
+                    src: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                     dst: engine::MemoryDomain::LocalDisk,
                     slots: vec![(instance[0], 0)],
                     runs: Vec::new(),

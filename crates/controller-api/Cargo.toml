@@ -1,6 +1,7 @@
 [package]
 name = "controller-api"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Controller control-plane RPC contract: the `Control` tarpc service plus its registry/liveness/routing data types, shared by the controller (server) and worker/gateway (clients)."
@@ -15,6 +16,22 @@ path = "src/lib.rs"
 ids = { path = "../ids" }
 serde = { version = "1.0", features = ["derive"] }
 tarpc = { version = "0.38", features = ["serde1"] }
+anyhow = { version = "1", optional = true }
+tokio = { version = "1", optional = true, features = ["sync", "time", "rt"] }
+tracing = { version = "0.1", optional = true }
+
+[features]
+# The healing controller link a worker or a gateway dials (`ControllerLink`).
+client = [
+    "dep:anyhow",
+    "dep:tokio",
+    "dep:tracing",
+    "tarpc/serde-transport",
+    "tarpc/serde-transport-bincode",
+    "tarpc/tcp",
+    "tarpc/unix",
+    "tarpc/tokio1",
+]
 
 [dev-dependencies]
 serde_json = "1.0"

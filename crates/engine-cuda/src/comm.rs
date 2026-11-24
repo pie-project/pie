@@ -183,11 +183,11 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
     {
         match wire_peers(ordinals) {
             Ok(peers) => {
-                eprintln!("engine-cuda: peer collectives carry the group's bf16 messages");
+                tracing::info!("peer collectives carry the group's bf16 messages");
                 peers
             }
             Err(fault) => {
-                eprintln!("engine-cuda: peer collectives are off, NCCL carries them: {fault}");
+                tracing::info!("peer collectives are off, NCCL carries them: {fault}");
                 None
             }
         }

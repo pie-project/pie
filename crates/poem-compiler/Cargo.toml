@@ -1,6 +1,7 @@
 [package]
 name = "pie-poem-compiler"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Bakes a traced Plan once: fusion into the kernels a backend ships, class resolution, region coalescing and the arena carve, into the backend-neutral CompiledModel artifact an engine records and replays. Pure functions — no device, no I/O."

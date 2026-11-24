@@ -8,7 +8,7 @@ const PAGE: u32 = 16;
 const CONTEXT: u32 = 1024;
 const SLOTS: u32 = 2;
 
-// CONTRACT-BC 19: a windowed load's ring pages (its record's pieces, read
+// A windowed load's ring pages (its record's pieces, read
 // as window-buffer pages) and its own-row pages (at the activation's top)
 // are named by page ids of the buffer's grain, which the kernels read at
 // `base + id * grain`: each page's id reaches the address its fold and its
@@ -51,8 +51,6 @@ fn a_ring_page_id_reaches_its_address() {
         1 << 20,
         None,
         &[],
-        true,
-        false,
         true,
         256,
     )

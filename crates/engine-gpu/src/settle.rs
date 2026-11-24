@@ -366,7 +366,7 @@ impl FedCheck {
                 if code == 0 {
                     continue;
                 }
-                let why = crate::beam::fault_reason(code, beam.lane as usize);
+                let why = engine::beam::fault_reason(code, beam.lane as usize, "engine-gpu");
                 tracing::warn!(lane = beam.lane, instance = beam.instance.0, %why, "a beam lane faults");
                 outcome.fault_lanes(beam.lane..beam.lane + 1, Some(beam.instance), &why);
             }

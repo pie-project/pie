@@ -11,7 +11,6 @@
 
 use std::time::{Duration, Instant};
 
-use engine::Engine;
 use engine::program::ProgramRegistration;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
@@ -122,9 +121,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
     }
 
     let cold = registration(&model);
-    let compile = model
-        .engine
-        .prepare_program(&cold)
+    let compile = engine::Programs::prepare(&mut model.engine, &cold)
         .expect("the program prepares");
     let began = Instant::now();
     let compiling = std::thread::spawn(move || {
@@ -140,9 +137,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
         fires += 1;
     }
     let (prepared, took) = compiling.join().expect("the compile thread");
-    let id = model
-        .engine
-        .finish_program(prepared)
+    let id = engine::Programs::finish(&mut model.engine, prepared)
         .expect("the cold program registers at the finish");
     eprintln!(
         "cold registration: compiled in {:.3} s off the lane; {fires} fires meanwhile, the \

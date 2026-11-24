@@ -1,6 +1,7 @@
 [package]
 name = "pie-browser"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "pie in a browser tab: the runtime, the WebGPU engine and the Pulley-interpreted inferlet sandbox compiled to wasm32, driven by the page through a handful of exports. Sessions carry the same MessagePack frames as `pie serve`'s WebSocket."
@@ -39,3 +40,6 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [features]
 profile-fire = ["runtime/profile-fire"]
+
+[lints]
+workspace = true

@@ -1,25 +1,21 @@
-//! `wafer-stage`: the checkpoint cut a load makes, made outside the engine (to stage it ahead of a
-//! chip session, or compare it): a catalog deployment's trace planned as a load plans it, its
-//! checkpoint landed through the import contract and cut into the plan's tiles; or a plan
-//! already made over params already landed (a test checkpoint's, under the trace's names).
+//! `wafer-stage`: the checkpoint cut a load makes, made outside the engine (to stage it ahead
+//! of a session, or compare it). The cut goes to `<out>/<name>.npy`, the plan to `<out>/plan.json`.
 //!
 //! ```text
-//! wafer-stage --model <deployment> --checkpoint <dir> --out <dir> [--preset <name>]
-//!             [--set K=V,...] [--positions N]
+//! wafer-stage --model <deployment> --checkpoint <dir | .zt> --out <dir> [--set K=V,...]
+//!             [--positions N]
 //! wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>
 //! ```
-//!
-//! The cut goes to `<out>/<name>.npy`, the plan to `<out>/plan.json`.
 
 use std::path::PathBuf;
 
-use engine_cerebras::spatial::prepare::{Landed, land};
-use kernels_cerebras::spatial::plan::Plan;
-use kernels_cerebras::spatial::target::{self, Ask};
-use kernels_cerebras::spatial::tiles;
+use engine_cerebras::prepare::{Landed, land};
+use kernels_cerebras::compile::plan::Plan;
+use kernels_cerebras::compile::target::{self, Ask};
+use kernels_cerebras::compile::tiles;
 
-const USAGE: &str = "usage: wafer-stage --model <deployment> --checkpoint <dir> --out <dir> \
-                     [--preset <name>] [--set K=V,...] [--positions N]\n       \
+const USAGE: &str = "usage: wafer-stage --model <deployment> --checkpoint <dir | .zt> --out <dir> \
+                     [--set K=V,...] [--positions N]\n       \
                      wafer-stage --plan <plan.json> --landed <params.safetensors> --out <dir>";
 
 fn main() {
@@ -58,7 +54,6 @@ fn run() -> Result<(), String> {
                 .try_trace(poem_ir::Platform::Cerebras)
                 .map_err(|e| format!("{model}: {e}"))?;
             let ask = Ask {
-                preset: get.get("preset").cloned(),
                 set: get.get("set").cloned().unwrap_or_default(),
                 positions: get
                     .get("positions")
@@ -66,11 +61,8 @@ fn run() -> Result<(), String> {
                     .transpose()?,
             };
             let plan = target::plan(&trace, &ask)?.plan;
-            let source = checkpoint::file::snapshot::open(&checkpoint)
-                .map_err(|e| format!("{}: {e}", checkpoint.display()))?;
-            let contract = d
-                .contract(&source, poem_ir::Platform::Cerebras)
-                .map_err(|e| format!("the import contract of {model}: {e}"))?;
+            let contract =
+                poem_compiler::catalog::repository().contract_for(&trace, &checkpoint)?;
             (plan, land(&trace, &contract, &checkpoint)?)
         }
     };

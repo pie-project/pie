@@ -3,10 +3,8 @@
 //! A windowed lane whose fold lags (CONTRACT-BC 19, 21: rows past `folded`
 //! held in window-buffer slots for some fires, as a run-ahead program's are)
 //! answers each step what the same tokens folded every fire answer, through
-//! its ring and past the ring's wrap. Gemma 4 E4B served through its rings
-//! garbled from its first decode steps on north-star: each fire refilled a
-//! buffer slot whole from its ring page, over the unfolded rows the slot
-//! alone held.
+//! its ring and past the ring's wrap: a fire never refills a buffer slot
+//! whole from its ring page over the unfolded rows the slot alone holds.
 //!
 //! Every windowed load on Metal lays rings (`chunks::MetalRing`), so the
 //! same holds where windowed layers sit beside a kv list (a sliding-window
@@ -26,12 +24,15 @@ use super::a_scattered_pool_serves_the_same_logits::{
     argmax, close, fixture_from, fixture_of, load_with, word, Fixture,
 };
 
-/// Rows a lane's fold trails its written end by (the M1's run-ahead
-/// window less one: the bench's carried rows).
+/// Rows a lane's fold trails its written end by (a run-ahead window less
+/// one).
 const LAG: u32 = 7;
 
 #[test]
 fn a_lagged_window_fold_serves_the_folded_logits() {
+    // One case at a time, its fixture built under the lock too: each takes
+    // much of the device beside the host memory its checkpoint holds.
+    let _heavy = crate::common::one_heavy_load();
     lagged("gemma4-e4b-mini-l1", &fixture_of("gemma4-e4b-mini-l1", None), 1024, 40);
 }
 
@@ -39,6 +40,9 @@ fn a_lagged_window_fold_serves_the_folded_logits() {
 /// window from the prompt on.
 #[test]
 fn a_lagged_window_fold_of_small_slots_serves_the_folded_logits() {
+    // One case at a time, its fixture built under the lock too: each takes
+    // much of the device beside the host memory its checkpoint holds.
+    let _heavy = crate::common::one_heavy_load();
     lagged(
         "muse-glimmer-30b-mini-l8",
         &fixture_of("muse-glimmer-30b-mini-l8", Some(4)),
@@ -51,6 +55,9 @@ fn a_lagged_window_fold_of_small_slots_serves_the_folded_logits() {
 /// compressor reads the windowed rows where they lie.
 #[test]
 fn a_lagged_window_fold_beside_a_compressed_kv_list_serves_the_folded_logits() {
+    // One case at a time, its fixture built under the lock too: each takes
+    // much of the device beside the host memory its checkpoint holds.
+    let _heavy = crate::common::one_heavy_load();
     lagged("dsv4-flash-mini", &fixture_of("dsv4-flash-mini", None), 1024, 700);
 }
 
@@ -60,6 +67,9 @@ fn a_lagged_window_fold_beside_a_compressed_kv_list_serves_the_folded_logits() {
 /// layer's reads bound by its own window.
 #[test]
 fn a_lagged_window_fold_over_two_windows_serves_the_folded_logits() {
+    // One case at a time, its fixture built under the lock too: each takes
+    // much of the device beside the host memory its checkpoint holds.
+    let _heavy = crate::common::one_heavy_load();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

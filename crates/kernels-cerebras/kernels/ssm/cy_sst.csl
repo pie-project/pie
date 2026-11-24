@@ -1,0 +1,152 @@
+// wafer/ops/cy_sst.csl: a state column's root: a head's gated delta rule a step (the PEs' side:
+// ops/sst.csl). Row in: [q | k | v | b | a] (raw q / k, DK each; v, DV; beta and decay logits).
+// The short causal conv over the last CONV rows (history cleared at a sequence's first step) and
+// SiLU; q, k l2-normed, q times 1/sqrt(DK); beta = sigmoid(b), decay = exp(-exp(A) softplus(a +
+// dt)); [decay k | decay q | k] down, their partials over the state up the chain; delta =
+// beta (v - decay Sᵀk); o = decay Sᵀq + (k . q) delta; [delta | decay] down for the update.
+// cw: [channels][CONV] conv taps (oldest first), then A, dt; the host's.
+//
+// MAMBA (Mamba-2): row [C | B | x | dt | dt]; conv with per-channel bias, no norm; decay =
+// exp(-exp(A) softplus(dt + dt_bias)), delta = softplus(dt + dt_bias) x;
+// o = decay Sᵀ C + (B . C) delta + D x.
+// KDA (Kimi delta attention): row [q | k | v | b | f], a decay per key channel: g_i = -exp(A)
+// softplus(f_i + dt_i) (or, FLOOR non-zero, FLOOR sigmoid(exp(A) (f_i + dt_i))); norms' eps L2EPS.
+// SLOTS: a conv history a lane slot (row t steps slot rowp[3 t + 1], cleared at its position 0).
+//
+// Params: fab, math, YO (the column multicast's output queue), IN (the chain's input queue), DK,
+// DV, CONV, SLOTS, ROWS.
+param fab: imported_module;
+param math: imported_module;
+param YO: output_queue;
+param IN: input_queue;
+param DK: u16;
+param DV: u16;
+param CONV: u16 = 4;
+param SLOTS: u16 = 1;
+param ROWS: u16 = 1;
+param MAMBA: bool = false;
+param KDA: bool = false;
+param FLOOR: f32 = 0.0;
+param L2EPS: f32 = 1.0e-6;
+
+const NCH: u16 = 2 * DK + DV;
+// the decay's logits a row (a head's, or a key's under KDA)
+const AW: u16 = if (KDA) DK else 1;
+// the taps, A, dt_bias (a key's under KDA; and MAMBA's D and a bias a channel)
+const CW: u16 = NCH * CONV + 1 + AW + (if (MAMBA) 1 + NCH else 0);
+var cw = @zeros([CW]f32);
+const HW: u16 = (CONV - 1) * NCH;
+var hist = @zeros([SLOTS * HW]f32);
+var rowp = @zeros([3 * ROWS]u32);
+var hb: u16 = 0;
+var y = @zeros([NCH]f32);
+var sk: [2 * DV]f32 align(16) = @zeros([2 * DV]f32);
+var dd: [DV + DK]f32 align(16) = @zeros([DV + DK]f32);
+var kt: [2 * DK]f32 align(16) = @zeros([2 * DK]f32);
+var dk: [DK]f32 align(16) = @zeros([DK]f32);
+const y_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> y[i] });
+const sk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DV} -> sk[i] });
+const dd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV + DK} -> dd[i] });
+const kt_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK} -> kt[i] });
+const dk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DK} -> dk[i] });
+
+// A sequence's first step: the conv's history cleared.
+fn init() void { clear(0); }
+
+fn clear(s: u16) void {
+  var e: u16 = 0;
+  while (e < HW) : (e += 1) { hist[s * HW + e] = 0.0; }
+}
+
+// Row t of a step: its slot's history (cleared at its position 0), the step.
+fn row(t: u16, x: [*]f32, o: [*]f32) void {
+  const s = @as(u16, fab.below(rowp[3 * t + 1], SLOTS));
+  if (rowp[3 * t + 2] == 0) { clear(s); }
+  hb = s * HW;
+  step(x, o);
+  hb = 0;
+}
+
+// A decode step's end, every row's read: each row's position + 1, so the host writes `rowp` only
+// where its rows differ (a prompt, a rollback, a new slot).
+fn advance() void {
+  var r: u16 = 0;
+  while (r < ROWS) : (r += 1) { rowp[3 * r + 2] += 1; }
+}
+
+// One step: x [q | k | v | b | a] (NCH + 1 + AW f32) in, o (DV f32) out.
+fn step(x: [*]f32, o: [*]f32) void {
+  // the conv over the history (oldest first) and this row, its SiLU; the history shifted
+  var c: u16 = 0;
+  while (c < NCH) : (c += 1) {
+    var acc: f32 = cw[c * CONV + CONV - 1] * x[c];
+    if (MAMBA) { acc += cw[NCH * CONV + 3 + c]; }
+    var j: u16 = 0;
+    while (j < CONV - 1) : (j += 1) { acc += cw[c * CONV + j] * hist[hb + j * NCH + c]; }
+    j = 0;
+    while (j + 1 < CONV - 1) : (j += 1) { hist[hb + j * NCH + c] = hist[hb + (j + 1) * NCH + c]; }
+    hist[hb + (CONV - 2) * NCH + c] = x[c];
+    y[c] = math.silu(acc);
+  }
+  // q, k l2-normed; q scaled (the delta rule's; Mamba-2's C and B as they are)
+  var i: u16 = 0;
+  if (!MAMBA) {
+    var qq: f32 = 0.0;
+    var kk: f32 = 0.0;
+    while (i < DK) : (i += 1) { qq += y[i] * y[i]; kk += y[DK + i] * y[DK + i]; }
+    const rq = math.rsqrt(qq + L2EPS) * math.rsqrt(@as(f32, DK));
+    const rk = math.rsqrt(kk + L2EPS);
+    i = 0;
+    while (i < DK) : (i += 1) { y[i] *= rq; y[DK + i] *= rk; }
+  }
+  i = 0;
+  var kq: f32 = 0.0;
+  while (i < DK) : (i += 1) { kq += y[i] * y[DK + i]; }
+  const beta = math.sigm(x[NCH]);
+  var step: f32 = 0.0;
+  var decay: f32 = 0.0;
+  const kk_d = @increment_dsd_offset(@set_dsd_length(y_d, DK), @as(i16, DK), f32);
+  if (KDA) {
+    // a decay a key channel
+    const alpha = math.exp1(cw[NCH * CONV]);
+    i = 0;
+    while (i < DK) : (i += 1) {
+      const z = x[NCH + 1 + i] + cw[NCH * CONV + 1 + i];
+      if (FLOOR != 0.0) {
+        dk[i] = math.exp1(FLOOR * math.sigm(alpha * z));
+      } else {
+        dk[i] = math.exp1(-alpha * math.softplus(z));
+      }
+    }
+    @fmuls(@set_dsd_length(kt_d, DK), kk_d, dk_d);
+    @fmuls(@increment_dsd_offset(@set_dsd_length(kt_d, DK), @as(i16, DK), f32), @set_dsd_length(y_d, DK), dk_d);
+  } else {
+    step = math.softplus(x[NCH + 1] + cw[NCH * CONV + 1]);
+    decay = math.exp1(-math.exp1(cw[NCH * CONV]) * step);
+    @fmuls(@set_dsd_length(kt_d, DK), kk_d, decay);
+    @fmuls(@increment_dsd_offset(@set_dsd_length(kt_d, DK), @as(i16, DK), f32), @set_dsd_length(y_d, DK), decay);
+  }
+  // [decay k | decay q | k] down, [Σ decay k_i S_i | Σ decay q_i S_i] up
+  @fmovs(fab.fout(YO, 2 * DK), kt_d);
+  @fmovs(fab.fout(YO, DK), kk_d);
+  @fmovs(sk_d, fab.fin(IN, 2 * DV));
+  i = 0;
+  while (i < DV) : (i += 1) {
+    if (MAMBA) {
+      const d = step * y[2 * DK + i];
+      dd[i] = d;
+      o[i] = sk[DV + i] + kq * d + cw[NCH * CONV + 2] * y[2 * DK + i];
+    } else {
+      const d = beta * (y[2 * DK + i] - sk[i]);
+      dd[i] = d;
+      o[i] = sk[DV + i] + kq * d;
+    }
+  }
+  if (KDA) {
+    @fmovs(@increment_dsd_offset(@set_dsd_length(dd_d, DK), @as(i16, DV), f32), dk_d);
+  } else {
+    i = 0;
+    while (i < DK) : (i += 1) { dd[DV + i] = decay; }
+  }
+  @fmovs(fab.fout(YO, DV + DK), dd_d);
+}

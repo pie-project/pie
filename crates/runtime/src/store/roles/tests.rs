@@ -166,14 +166,14 @@ pub(crate) struct FakeEngine {
     no_channels: bool,
     /// The adapter an instance lands, where the program carries one.
     adapter: Footprint,
-    /// The key of the adapter the next binding lands ([`Engine::adapter_key`]).
+    /// The key of the adapter the next binding lands ([`Programs::adapter_key`]).
     key: Option<u128>,
     /// The instances it closed: as the engine's plane, it holds them no
     /// longer and refuses a rebind of one by name.
     closed: Vec<InstanceId>,
     /// Channels closed while an instance was still bound on them: kept
     /// registered until the last such instance closes
-    /// (`Engine::close_channel`).
+    /// (`Channels::close`).
     closing: Vec<ChannelId>,
     /// Channels released: a rebind of one is refused by name, as an engine
     /// that no longer holds the channel refuses it.
@@ -190,7 +190,7 @@ impl FakeEngine {
     }
 }
 
-impl Engine for FakeEngine {
+impl ::engine::Engine for FakeEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -201,51 +201,12 @@ impl Engine for FakeEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "fake-roles"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
@@ -256,7 +217,55 @@ impl Engine for FakeEngine {
         unreachable!("nothing fires here")
     }
 
-    fn program_facts(&self, program: ProgramId) -> ::engine::Result<ProgramFacts> {
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn ::engine::Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn ::engine::Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for FakeEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn facts(&self, program: ProgramId) -> ::engine::Result<ProgramFacts> {
         assert_eq!(program, PROGRAM);
         Ok(ProgramFacts {
             instance: Footprint {
@@ -290,6 +299,63 @@ impl Engine for FakeEngine {
         })
     }
 
+    fn adapter_key(&self, _binding: &InstanceBinding) -> ::engine::Result<Option<u128>> {
+        Ok(self.key)
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
+        self.next += 1;
+        self.bindings.push(binding.clone());
+        Ok(BoundInstance {
+            id: InstanceId(self.next),
+            program: binding.program,
+            geometry: binding.geometry,
+            standing_guest_bytes: 0,
+        })
+    }
+
+    fn rebind(&mut self, rebind: Rebind) -> ::engine::Result<()> {
+        if let Rebind::Instance { id, .. } = &rebind
+            && self.closed.contains(id)
+        {
+            return Err(::engine::Error::Program(format!(
+                "program::plane: no instance {id}"
+            )));
+        }
+        if let Rebind::Channel { id, .. } = &rebind
+            && self.released.contains(id)
+        {
+            return Err(::engine::Error::Program(format!(
+                "channel {id} is not registered on this engine"
+            )));
+        }
+        self.rebinds.push(rebind);
+        Ok(())
+    }
+
+    fn close(&mut self, id: InstanceId) -> ::engine::Result<u64> {
+        self.closed.push(id);
+        let closing = std::mem::take(&mut self.closing);
+        for channel in closing {
+            if self.bound_on(channel) {
+                self.closing.push(channel);
+            } else {
+                self.released.push(channel);
+            }
+        }
+        Ok(0)
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Channels for FakeEngine {
     fn ring_facts(
         &self,
         _registration: &ChannelRegistration,
@@ -312,15 +378,11 @@ impl Engine for FakeEngine {
         }))
     }
 
-    fn holds_channel(&self, _registration: &ChannelRegistration) -> bool {
+    fn holds(&self, _registration: &ChannelRegistration) -> bool {
         !self.no_channels
     }
 
-    fn adapter_key(&self, _binding: &InstanceBinding) -> ::engine::Result<Option<u128>> {
-        Ok(self.key)
-    }
-
-    fn register_channel(
+    fn open(
         &mut self,
         registration: &ChannelRegistration,
     ) -> ::engine::Result<RegisteredChannel> {
@@ -339,50 +401,7 @@ impl Engine for FakeEngine {
         })
     }
 
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
-        self.next += 1;
-        self.bindings.push(binding.clone());
-        Ok(BoundInstance {
-            id: InstanceId(self.next),
-            program: binding.program,
-            geometry: binding.geometry,
-            standing_guest_bytes: 0,
-        })
-    }
-
-    fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
-        if let Rebind::Instance { id, .. } = &rebind
-            && self.closed.contains(id)
-        {
-            return Err(::engine::Error::Program(format!(
-                "program::plane: no instance {id}"
-            )));
-        }
-        if let Rebind::Channel { id, .. } = &rebind
-            && self.released.contains(id)
-        {
-            return Err(::engine::Error::Program(format!(
-                "channel {id} is not registered on this engine"
-            )));
-        }
-        self.rebinds.push(rebind);
-        Ok(())
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> ::engine::Result<u64> {
-        self.closed.push(id);
-        let closing = std::mem::take(&mut self.closing);
-        for channel in closing {
-            if self.bound_on(channel) {
-                self.closing.push(channel);
-            } else {
-                self.released.push(channel);
-            }
-        }
-        Ok(0)
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> ::engine::Result<()> {
+    fn close(&mut self, id: ChannelId) -> ::engine::Result<()> {
         if self.bound_on(id) {
             self.closing.push(id);
         } else {
@@ -390,7 +409,68 @@ impl Engine for FakeEngine {
         }
         Ok(())
     }
+
+    fn publish(&mut self, _instance: ::engine::InstanceId, _channel: u32, _cell: &[u8]) -> ::engine::Result<bool> {
+        Err(::engine::Error::unsupported(self.kind(), "publish_channel"))
+    }
+
+    fn take(&mut self, _instance: ::engine::InstanceId, _channel: u32) -> ::engine::Result<Option<Vec<u8>>> {
+        Err(::engine::Error::unsupported(self.kind(), "take_channel"))
+    }
 }
+
+impl ::engine::Pool for FakeEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for FakeEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 pub(crate) fn holder(n: u128) -> super::Holder {
     uuid::Uuid::from_u128(n)
@@ -412,7 +492,7 @@ pub(crate) fn registered(
         engine,
         &plan,
         Some(holder(by)),
-        |engine, plan| Ok(engine.register_channel(plan)?),
+        |engine, plan| Ok(crate::engine::verbs::serve(engine, ::engine::Engine::channels, "register_channel")?.open(plan)?),
     )
     .unwrap();
     plan.id
@@ -551,7 +631,7 @@ fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
     assert_eq!(stale.len(), 2);
     for rebind in stale {
         let owner = Owner::of(&rebind);
-        engine.rebind_slots(rebind).unwrap();
+        <FakeEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
         roles.lock().unwrap().rebound(owner);
     }
     assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
@@ -612,7 +692,7 @@ fn a_channel_closed_while_parked_is_rebound_at_unpark_and_freed_with_its_instanc
 
     // The lane closes the channel while it is parked: the engine first,
     // then the roles, as `QueuedItem::CloseChannels` runs.
-    engine.close_channel(channel).unwrap();
+    <FakeEngine as ::engine::Channels>::close(&mut engine, channel).unwrap();
     roles.lock().unwrap().close_channel(channel);
     assert!(
         !roles
@@ -880,7 +960,7 @@ fn a_cell_past_a_chunk_is_refused_by_name() {
         ..ChannelRegistration::default()
     };
     let error = register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
-        Ok(engine.register_channel(plan)?)
+        Ok(crate::engine::verbs::serve(engine, ::engine::Engine::channels, "register_channel")?.open(plan)?)
     })
     .unwrap_err();
     assert_eq!(
@@ -1072,7 +1152,6 @@ fn bind_registering(engine: &mut FakeEngine) -> (InstanceBinding, u64) {
         |id| held_ids.contains(&id),
         None,
         |_| true,
-        |_, _| false,
     )
     .unwrap();
     let mut rings = super::take_rings(Some(&roles), engine, &plans)
@@ -1223,7 +1302,7 @@ fn a_shared_adapter_is_one_set_of_slots_freed_at_the_last_close() {
 /// one holder's park in flight, another's park leaves the adapter where it
 /// lies, so when the first park is taken back (the tier below full) its
 /// instance is resident on its adapter, never on slots given back (the
-/// pair's alias, the L40S's CUDA 700 on c8077be0f). Once every holder's
+/// pair's alias, a device fault). Once every holder's
 /// park has landed, the adapter is parked where it lies, for a move down.
 #[test]
 fn a_shared_adapter_stays_while_a_holder_may_still_fire() {
@@ -1392,7 +1471,7 @@ fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
         ..ChannelRegistration::default()
     };
     let error = register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
-        Ok(engine.register_channel(plan)?)
+        Ok(crate::engine::verbs::serve(engine, ::engine::Engine::channels, "register_channel")?.open(plan)?)
     })
     .unwrap_err();
     let short = error.downcast_ref::<RolesError>().expect("named");
@@ -1408,7 +1487,7 @@ fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
     let freed: Vec<u32> = kv.drain(..16).collect();
     device.lock().unwrap().give_refs(list, &freed);
     register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
-        Ok(engine.register_channel(plan)?)
+        Ok(crate::engine::verbs::serve(engine, ::engine::Engine::channels, "register_channel")?.open(plan)?)
     })
     .expect("it registers once a chunk is free");
     assert!(adjacent(&engine.registrations[0].slots, PER_CHUNK));
@@ -1417,7 +1496,7 @@ fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
 /// What the lane does for a `CloseInstance`: the engine closes it, then
 /// the roles give its slots back.
 fn close_on_lane(roles: &RolesHandle, engine: &mut FakeEngine, id: InstanceId) {
-    engine.close_instance(id).unwrap();
+    <FakeEngine as ::engine::Programs>::close(engine, id).unwrap();
     roles.lock().unwrap().close_instance(id);
 }
 
@@ -1514,8 +1593,7 @@ fn an_instance_closed_between_a_restore_and_its_rebind_is_not_rebound() {
             .is_empty()
     );
     // Asked anyway, the engine refuses it by name.
-    let error = engine
-        .rebind_slots(Rebind::Instance {
+    let error = <FakeEngine as ::engine::Programs>::rebind(&mut engine, Rebind::Instance {
             id: instance,
             instance: Vec::new(),
             rings: Vec::new(),
@@ -1643,12 +1721,11 @@ impl super::DiskSlots for FakeDisk {
     }
 }
 
-/// The M1 shape, a load on unified memory: no host tier. A park sends an
+/// A load on unified memory: no host tier. A park sends an
 /// instance's tables and rings straight to the disk tier's slot file, a
 /// slot of it a role slot, freeing every device slot; the restore copies
 /// them back into fresh device slots and gives the file's slots back. Left
-/// on the device at the park (the M1 on 0d96fb179: 379 opened chunks of the
-/// Instance shape after 107 evictions, no move down ever asked), they held
+/// on the device at the park (no move down ever asked), they would hold
 /// their chunks. With no slot file either, nothing below holds them: they
 /// stay, and are no movable room.
 #[test]
@@ -1840,9 +1917,9 @@ fn a_role_slot_wider_than_a_kv_slot_parks_to_disk_in_a_run_and_restores_whole() 
 /// before the lane ran them (an eviction while its restore waited on its
 /// rebinds): the rebind of the instance's old device refs is cancelled at
 /// the lane, never sent, while the park itself is said. Sent, the engine
-/// claimed slots the park's commit gave back, and the next bind there was
-/// refused (the L40S and the M1 on batch 3: slot 12537 rebound 4 ms after
-/// its park, at the same refs, bound to another instance 1 ms later).
+/// would claim slots the park's commit gave back, and the next bind there
+/// be refused (a slot rebound just after its park, at the same refs, then
+/// bound to another instance).
 #[test]
 fn a_rebind_read_before_a_park_is_cancelled_once_its_item_moved() {
     let Pools { roles, .. } = pools();

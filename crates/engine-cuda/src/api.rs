@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
+use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Taps, Tiers, WeightCache};
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
@@ -15,7 +15,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain};
+use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -65,7 +65,7 @@ pub struct Cuda {
     attached: BTreeMap<InstanceId, Vec<ChannelId>>,
     /// Channels closed while an instance was still bound on them: kept
     /// registered, slots and all, so a rebind of their ring is served,
-    /// until the last of those instances closes ([`Engine::close_channel`]).
+    /// until the last of those instances closes ([`Channels::close`]).
     closing: std::collections::BTreeSet<ChannelId>,
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
@@ -80,6 +80,9 @@ pub struct Cuda {
     /// Run between a load's staging and its arming: an expert-parallel
     /// group wires its ranks there, since arming fires their collectives.
     before_arming: Option<BeforeArming>,
+    /// A weight reload failed partway: the weights are part old, part new,
+    /// and nothing fires until a reload lands whole.
+    torn: bool,
 }
 
 pub(crate) type BeforeArming = Box<dyn FnMut(&mut Shell) -> std::result::Result<(), String> + Send>;
@@ -106,6 +109,7 @@ impl Cuda {
             replay: None,
             expert: World::default(),
             before_arming: None,
+            torn: false,
         }
     }
 
@@ -189,7 +193,7 @@ impl Cuda {
             })
     }
 
-    fn settle(
+    fn settle_plan(
         &self,
         trace: &Trace,
         path: &Path,
@@ -200,8 +204,7 @@ impl Cuda {
         // Dense weights always live on the device. The weight cache streams
         // the routed banks it takes an expert at a time: the plan seats none
         // itself.
-        let diagnostics = &self.boot.knobs.diagnostics;
-        let cached = if self.boot.knobs.dense_weights() || diagnostics.dense_experts {
+        let cached = if self.boot.knobs.dense_experts() {
             Vec::new()
         } else {
             crate::store::layout::streamed_experts(trace)
@@ -235,7 +238,7 @@ impl Cuda {
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -604,8 +607,8 @@ impl Engine for Cuda {
 
     fn cover_fingerprint(&self) -> Option<String> {
         let print = self.shell.as_ref()?.cover_fingerprint();
-        eprintln!(
-            "engine-cuda: the host cover's key: {print} (the device, its kernels' code, the \
+        tracing::info!(
+            "the host cover's key: {print} (the device, its kernels' code, the \
              guest emitter's version, the decode products' picks and a fire's lanes and tokens)"
         );
         Some(print)
@@ -628,10 +631,6 @@ impl Engine for Cuda {
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
-    }
-
-    fn export_kv_handle(&self) -> Option<engine::KvHandle> {
-        self.caps.as_ref()?.kv_handle.clone()
     }
 
     fn live(&self) -> engine::live::Live {
@@ -689,7 +688,7 @@ impl Engine for Cuda {
             trace.platform.backend(),
             width_free(&trace.name),
         )?;
-        let (contract, plan) = self.settle(&trace, &path)?;
+        let (contract, plan) = self.settle_plan(&trace, &path)?;
         let kv_budget = match (residency.device_kv_budget, residency.device_kv_tokens) {
             (Some(_), Some(_)) => {
                 return Err(Error::Load(
@@ -730,8 +729,8 @@ impl Engine for Cuda {
         };
         if let Some(ring) = &ring {
             let size = ring.size();
-            eprintln!(
-                "engine-cuda: the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
+            tracing::info!(
+                "the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
                  piece for each of 2 stages for each of {frames} frames in flight)",
                 size.bytes() >> 20,
                 size.pieces,
@@ -819,8 +818,8 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
         if memory.unified() {
-            eprintln!(
-                "engine-cuda: {} ({} disk kv pages)",
+            tracing::info!(
+                "{} ({} disk kv pages)",
                 engine::DeviceMemory::NO_HOST_TIER,
                 disk_pages
             );
@@ -848,7 +847,10 @@ impl Engine for Cuda {
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cuda".to_string(),
-                domain: MemoryDomain::CudaDevice(u32::try_from(shell.ordinal()).unwrap_or(0)),
+                domain: MemoryDomain::Device {
+                    ordinal: u32::try_from(shell.ordinal()).unwrap_or(0),
+                    reach: DeviceReach::Peer,
+                },
                 sms: shell.sms(),
                 unified_memory: memory.unified(),
                 fp8_native: false,
@@ -886,6 +888,7 @@ impl Engine for Cuda {
                 // no table holds a row, so a fire replays what its lanes'
                 // contexts hold.
                 replayed_rows: shell.fire_lanes().saturating_mul(paging.context()),
+                dispatch_depth: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -928,7 +931,7 @@ impl Engine for Cuda {
             steps: engine::StatedSteps::default(),
         };
         // The set as the load states it, from its stated facts, with those
-        // the arm walk left eager (CONTRACT-BC 24). It is the set the walk
+        // the arm walk left eager. It is the set the walk
         // took: a fire's stamped shape names the walk's shape.
         let stated = engine::StepShapes::of(
             &steps,
@@ -944,16 +947,16 @@ impl Engine for Cuda {
         }
         let mut caps = caps;
         caps.steps = shell.stated_steps(stated);
-        eprintln!(
-            "engine-cuda: step set: {}; {} stated eager",
+        tracing::info!(
+            "step set: {}; {} stated eager",
             caps.steps.shapes.census(),
             caps.steps.eager.len(),
         );
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
         // decode wave seats at most `max_lanes` lanes.
-        eprintln!(
-            "engine-cuda: fire limits: {} lanes, {} rows, {} readouts",
+        tracing::info!(
+            "fire limits: {} lanes, {} rows, {} readouts",
             caps.limits.max_lanes, caps.limits.max_tokens, caps.limits.max_readouts,
         );
         self.replay = crate::replay::Replay::of(&shell);
@@ -978,7 +981,121 @@ impl Engine for Cuda {
         })
     }
 
-    fn register_adapter(
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(readout_facts())
+    }
+
+    fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        if self.torn {
+            return Err(Error::Load(
+                "a weight reload failed partway, so this engine's weights are part old and \
+                 part new; reload them again before anything fires"
+                    .into(),
+            ));
+        }
+        let submitted = self.submit_frame(frame);
+        // A frame whose step refused its lanes by name fired the steps
+        // before it alone: a refusal too.
+        if submitted
+            .as_ref()
+            .is_ok_and(|ticket| !ticket.refused.is_empty())
+        {
+            engine::Engine::live(self).tally(engine::live::Tally::Refused, 1);
+        }
+        self.refused(submitted)
+    }
+
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
+        let Some((id, _)) = self.pending.as_ref() else {
+            return Err(Error::Invalid(format!(
+                "frame {}'s numbers are gone: nothing is pending, so either it was \
+                 never submitted to this engine or a later frame has already carved \
+                 over its arena rectangles",
+                ticket.id
+            )));
+        };
+        if *id != ticket.id {
+            return Err(Error::Invalid(format!(
+                "frame {}'s numbers are gone: frame {id} has been submitted since, and \
+                 the readout plane is one arena rectangle that every fire carves over. Ask \
+                 for a frame's readouts before submitting the next one",
+                ticket.id
+            )));
+        }
+        let (_, mut settled) = self.pending.take().expect("checked just above");
+        let shell = self.loaded_mut()?;
+        for step in &mut settled {
+            shell
+                .read_out_rows(&mut step.settled, &step.readout)
+                .map_err(fault)?;
+        }
+        for (receipt, step) in ticket.steps.iter_mut().zip(&settled) {
+            receipt.readouts = readouts_of(step);
+        }
+        self.pending = Some((ticket.id, settled));
+        Ok(())
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+
+    fn peers(&mut self) -> Option<&mut dyn Peers> {
+        Some(self)
+    }
+
+    fn taps(&mut self) -> Option<&mut dyn Taps> {
+        Some(self)
+    }
+}
+
+impl Completion for Cuda {
+    fn asynchronous(&self) -> bool {
+        true
+    }
+
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.reap_landed_guests().map_err(fault),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Programs for Cuda {
+    fn adapter(
         &mut self,
         registration: &engine::adapter::AdapterRegistration,
     ) -> EngineResult<()> {
@@ -995,70 +1112,11 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_segments(segments).map_err(fault)
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_segments(segments).map_err(fault)
-    }
-
-    fn weight_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
-        self.loaded_mut()?
-            .weight_residency(residency)
-            .map_err(fault)
-    }
-
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
-    }
-
-    /// All or nothing: an `Err` moved nothing (`Shell::evacuate_with`).
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        let endpoints: Vec<_> = self
-            .channels
-            .values()
-            .filter(|endpoint| !endpoint.slots().is_empty())
-            .cloned()
-            .collect();
-        let channels: Vec<(Vec<u32>, u64)> = endpoints
-            .iter()
-            .map(|endpoint| {
-                (
-                    endpoint.slots(),
-                    crate::program::Endpoint::cell_span(endpoint.wire_bytes(), endpoint.cap1() - 1),
-                )
-            })
-            .collect();
-        let at = self
-            .loaded_mut()?
-            .evacuate_with(evacuation, &channels)
-            .map_err(fault)?;
-        for (endpoint, at) in endpoints.iter().zip(at) {
-            endpoint.rebase(at);
-        }
-        Ok(())
-    }
-
-    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
-        self.shell
-            .as_ref()
-            .map(|shell| shell.chunk_table().clone())
-            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))
-    }
-
-    fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+    fn facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
         match self.shell.as_ref() {
             Some(shell) => shell.program_facts(program).map_err(fault),
             None => Ok(engine::program::ProgramFacts::default()),
         }
-    }
-
-    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
-        Ok(readout_facts())
     }
 
     fn guest_state(
@@ -1076,36 +1134,7 @@ impl Engine for Cuda {
         }
     }
 
-    /// Every registration: a device channel's ring in its `Channel` slots,
-    /// a host one's in the mirror it publishes.
-    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
-        let _ = registration;
-        true
-    }
-
-    fn ring_facts(
-        &self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<Option<engine::program::RingFacts>> {
-        let Some(shell) = self.shell.as_ref() else {
-            return Ok(None);
-        };
-        if registration.host_role != eta_ir::container::HostRole::None {
-            return Ok(None);
-        }
-        let (cell_bytes, capacity) = cell_of(registration)?;
-        Ok(Some(engine::program::RingFacts {
-            channel: 0,
-            cell_bytes: u64::from(cell_bytes),
-            capacity,
-            footprint: shell.guest_footprint(
-                engine::chunk::SlotRole::Channel,
-                crate::program::Endpoint::cell_span(cell_bytes, capacity),
-            ),
-        }))
-    }
-
-    fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+    fn rebind(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
         match rebind {
             engine::program::Rebind::Instance {
                 id,
@@ -1149,161 +1178,14 @@ impl Engine for Cuda {
         }
     }
 
-    /// Waits, on the host, for every move between the device and the host
-    /// tier still landing; every other copy lands inside the call or in the
-    /// main stream's order, which a later fire or move stands behind.
-    fn settle_copies(&mut self) -> EngineResult<()> {
-        self.loaded_mut()?.settle_moves().map_err(fault)
-    }
-
-    /// A move from the device to the host tier rides the swap stream and is
-    /// still reading its device slots when the call returns: told landed
-    /// once the stream has run it, by a waiter on an event recorded behind
-    /// it (`serve::landing`), which enqueues nothing a later move would wait
-    /// on. Every other copy's sources are free at once: a move from the host
-    /// reads host slots, which the next move into them (on the same swap
-    /// stream) or a host write (behind every move still landing) reaches
-    /// only after it; the slot file's moves read inside the call; a move
-    /// within the device runs on the main stream, ahead of everything after.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
-        let host = |domain| matches!(domain, MemoryDomain::HostPinned);
-        let device = |domain| matches!(domain, MemoryDomain::CudaDevice(_));
-        let disk = |domain| matches!(domain, MemoryDomain::LocalDisk);
-        // A move between the host tier and the slot file runs on the tier's
-        // landing thread and is told how it ended: the engine thread only
-        // enqueues it.
-        let host_disk = (host(copy.src) && disk(copy.dst)) || (disk(copy.src) && host(copy.dst));
-        if host_disk && let Some(sink) = self.landed.clone() {
-            let told: crate::serve::landing::Told =
-                Box::new(move |landing| sink(token, landing));
-            self.loaded_mut()?.defer_disk_tell(Some(told));
-            let copied = self.copy_slots(copy);
-            // Not taken (nothing to move, or refused before enqueueing):
-            // answered in the call.
-            let untaken = self.loaded_mut()?.defer_disk_tell(None).is_some();
-            copied?;
-            return Ok(untaken);
-        }
-        self.copy_slots(copy)?;
-        let parked = device(copy.src) && host(copy.dst);
-        let Some(sink) = self.landed.clone().filter(|_| parked) else {
-            return Ok(true);
-        };
-        let told = self
-            .loaded_mut()?
-            .tell_swaps_landed(Box::new(move |landing| sink(token, landing)))
-            .map_err(fault)?;
-        Ok(!told)
-    }
-
-    fn on_landed(&mut self, sink: engine::LandingSink) {
-        self.landed = Some(sink);
-    }
-
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        use crate::store::Tier;
-        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
-        let tier = |domain| match domain {
-            MemoryDomain::CudaDevice(_) => Some(Tier::Device),
-            MemoryDomain::HostPinned => Some(Tier::Host),
-            MemoryDomain::LocalDisk => Some(Tier::Disk),
-            _ => None,
-        };
-        let (Some(from), Some(to)) = (tier(copy.src), tier(copy.dst)) else {
-            return Err(Error::Unsupported {
-                verb: "copy_slots to or from a domain other than the device, the host tier \
-                       and the slot file",
-                engine: "cuda",
-            });
-        };
-        let shell = self.loaded_mut()?;
-        shell.take_refs();
-        if from != Tier::Device || to != Tier::Device {
-            // Between tiers (CONTRACT-BC 22): whole slots, each laid alike.
-            if !copy.runs.is_empty() {
-                return Err(Error::Invalid(
-                    "token runs move within the device; between tiers a slot moves whole".into(),
-                ));
-            }
-            return shell
-                .copy_tier_slots(copy.shape, from, to, &copy.slots)
-                .map_err(fault);
-        }
-        if copy.shape == FIXED || copy.shape == RING {
-            if !copy.runs.is_empty() {
-                return Err(Error::Invalid(
-                    "a fixed record is copied whole, not a run of its tokens".into(),
-                ));
-            }
-            // A record is one unit across its shapes: named by any shape's
-            // first piece, copied whole.
-            for &(src, dst) in &copy.slots {
-                shell
-                    .fork_state(shell.record_key(src), shell.record_key(dst))
-                    .map_err(fault)?;
-            }
-            return Ok(());
-        }
-        if copy.shape != LIST && copy.shape != WINDOW {
-            // Any other shape this load states (the rs list): whole slots.
-            if !copy.runs.is_empty() {
-                return Err(Error::Invalid(format!(
-                    "copy_slots names token runs of shape {}, whose slots are copied whole",
-                    copy.shape
-                )));
-            }
-            let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
-            return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
-        }
-        let page = shell.paging().page_size;
-        let runs: Vec<engine::transfer::KvRun> = copy
-            .slots
-            .iter()
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: page,
-            })
-            .chain(copy.runs.iter().map(|run| engine::transfer::KvRun {
-                src_page: run.src,
-                src_token: run.src_token,
-                dst_page: run.dst,
-                dst_token: run.dst_token,
-                tokens: run.tokens,
-            }))
-            .collect();
-        shell
-            .copy_token_slots(copy.shape == WINDOW, &runs)
-            .map_err(fault)
-    }
-
-    fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        let submitted = self.submit_frame(frame);
-        // A frame whose step refused its lanes by name fired the steps
-        // before it alone: a refusal too.
-        if submitted
-            .as_ref()
-            .is_ok_and(|ticket| !ticket.refused.is_empty())
-        {
-            engine::Engine::live(self).tally(engine::live::Tally::Refused, 1);
-        }
-        self.refused(submitted)
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         let registered = self
             .loaded_mut()
             .and_then(|shell| shell.register_program(registration).map_err(fault));
         self.refused(registered)
     }
 
-    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+    fn prewarm(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
         self.loaded_mut()
             .and_then(|shell| shell.prewarm_programs(registrations).map_err(fault))
     }
@@ -1311,8 +1193,8 @@ impl Engine for Cuda {
     /// The program adopted and its build planned here; its regions compile
     /// (NVRTC, or the kernel cache's files) in the returned compile, off
     /// the engine's thread, while fires go on. Their modules load into the
-    /// context at [`Engine::finish_program`].
-    fn prepare_program(
+    /// context at [`Programs::finish`].
+    fn prepare(
         &mut self,
         registration: &ProgramRegistration,
     ) -> EngineResult<engine::ProgramCompile> {
@@ -1326,7 +1208,7 @@ impl Engine for Cuda {
         }))
     }
 
-    fn finish_program(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
         let Ok(pending) = prepared.0.downcast::<crate::program::Pending>() else {
             return Err(Error::Program(
                 "a prepared program CUDA did not prepare".to_string(),
@@ -1342,117 +1224,7 @@ impl Engine for Cuda {
         self.loaded_mut()?.close_program(program).map_err(fault)
     }
 
-    fn settles_asynchronously(&self) -> bool {
-        true
-    }
-
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
-    }
-
-    /// One rank's planes hold a band of each layer's heads, so a
-    /// tensor-parallel rank taps nothing.
-    fn tap_groups(&self) -> Option<engine::TapGroups> {
-        self.shell.as_ref()?.tap_groups()
-    }
-
-    fn on_tapped(&mut self, sink: engine::TapSink) {
-        if let Some(shell) = self.shell.as_mut() {
-            shell.on_tapped(sink.clone());
-        }
-        self.tap_sink = Some(sink);
-    }
-
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
-        let Some((id, _)) = self.pending.as_ref() else {
-            return Err(Error::Invalid(format!(
-                "frame {}'s numbers are gone: nothing is pending, so either it was \
-                 never submitted to this engine or a later frame has already carved \
-                 over its arena rectangles",
-                ticket.id
-            )));
-        };
-        if *id != ticket.id {
-            return Err(Error::Invalid(format!(
-                "frame {}'s numbers are gone: frame {id} has been submitted since, and \
-                 the readout plane is one arena rectangle that every fire carves over. Ask \
-                 for a frame's readouts before submitting the next one",
-                ticket.id
-            )));
-        }
-        let (_, mut settled) = self.pending.take().expect("checked just above");
-        let shell = self.loaded_mut()?;
-        for step in &mut settled {
-            shell
-                .read_out_rows(&mut step.settled, &step.readout)
-                .map_err(fault)?;
-        }
-        for (receipt, step) in ticket.steps.iter_mut().zip(&settled) {
-            receipt.readouts = readouts_of(step);
-        }
-        self.pending = Some((ticket.id, settled));
-        Ok(())
-    }
-
-    fn publish_landed(&mut self) -> EngineResult<()> {
-        match self.shell.as_mut() {
-            Some(shell) => shell.reap_landed_guests().map_err(fault),
-            None => Ok(()),
-        }
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        if self.channels.contains_key(&registration.id) {
-            return Err(Error::Program(format!(
-                "channel {} is already registered on this engine",
-                registration.id
-            )));
-        }
-        let device_only = registration.host_role == eta_ir::container::HostRole::None;
-        let (cell_bytes, capacity) = cell_of(registration)?;
-        let shell = self.loaded_mut()?;
-        let stream = shell.stream();
-        let cells = device_only
-            .then(|| {
-                shell
-                    .guest_span(
-                        engine::chunk::SlotRole::Channel,
-                        &registration.slots,
-                        crate::program::Endpoint::cell_span(cell_bytes, capacity),
-                    )
-                    .map(|at| (at, registration.slots.clone()))
-            })
-            .transpose()
-            .map_err(fault)?;
-        let endpoint = Arc::new(
-            crate::program::Endpoint::open(
-                registration.host_role,
-                cell_bytes,
-                capacity,
-                cells,
-                stream,
-            )
-            .map_err(fault)?,
-        );
-        let mirror = (!device_only).then(|| HostMirror {
-            mirror: endpoint.mirror_host(),
-            words: endpoint.words_host(),
-            cell_bytes,
-            capacity,
-        });
-        self.channels.insert(registration.id, endpoint);
-        Ok(RegisteredChannel {
-            id: registration.id,
-            reader_wait_id: 0,
-            writer_wait_id: 0,
-            mirror,
-        })
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         let caps = self
             .caps
             .as_ref()
@@ -1521,7 +1293,7 @@ impl Engine for Cuda {
         })
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<u64> {
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
         let held = self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
         if let Some(held) = held {
@@ -1540,11 +1312,96 @@ impl Engine for Cuda {
         Ok(0)
     }
 
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
+    }
+}
+
+impl Channels for Cuda {
+    /// Every registration: a device channel's ring in its `Channel` slots,
+    /// a host one's in the mirror it publishes.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        let Some(shell) = self.shell.as_ref() else {
+            return Ok(None);
+        };
+        if registration.host_role != eta_ir::container::HostRole::None {
+            return Ok(None);
+        }
+        let (cell_bytes, capacity) = cell_of(registration)?;
+        Ok(Some(engine::program::RingFacts {
+            channel: 0,
+            cell_bytes: u64::from(cell_bytes),
+            capacity,
+            footprint: shell.guest_footprint(
+                engine::chunk::SlotRole::Channel,
+                crate::program::Endpoint::cell_span(cell_bytes, capacity),
+            ),
+        }))
+    }
+
+    fn open(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<RegisteredChannel> {
+        if self.channels.contains_key(&registration.id) {
+            return Err(Error::Program(format!(
+                "channel {} is already registered on this engine",
+                registration.id
+            )));
+        }
+        let device_only = registration.host_role == eta_ir::container::HostRole::None;
+        let (cell_bytes, capacity) = cell_of(registration)?;
+        let shell = self.loaded_mut()?;
+        let stream = shell.stream();
+        let cells = device_only
+            .then(|| {
+                shell
+                    .guest_span(
+                        engine::chunk::SlotRole::Channel,
+                        &registration.slots,
+                        crate::program::Endpoint::cell_span(cell_bytes, capacity),
+                    )
+                    .map(|at| (at, registration.slots.clone()))
+            })
+            .transpose()
+            .map_err(fault)?;
+        let endpoint = Arc::new(
+            crate::program::Endpoint::open(
+                registration.host_role,
+                cell_bytes,
+                capacity,
+                cells,
+                stream,
+            )
+            .map_err(fault)?,
+        );
+        let mirror = (!device_only).then(|| HostMirror {
+            memory: endpoint.clone(),
+            cell_bytes,
+            capacity,
+        });
+        self.channels.insert(registration.id, endpoint);
+        Ok(RegisteredChannel {
+            id: registration.id,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+            mirror,
+        })
+    }
+
     /// Closes channel `id`. With an instance still bound on it, the channel
     /// is only marked closing: its registration and slots stay, and a
     /// rebind of its ring is served, until the last such instance closes
-    /// ([`Engine::close_channel`]).
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
+    /// ([`Channels::close`]).
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
         if self.bound_on(id) {
             self.closing.insert(id);
         } else {
@@ -1554,7 +1411,7 @@ impl Engine for Cuda {
         Ok(())
     }
 
-    fn publish_channel(
+    fn publish(
         &mut self,
         instance: InstanceId,
         channel: u32,
@@ -1566,40 +1423,253 @@ impl Engine for Cuda {
             .map_err(fault)
     }
 
-    fn take_channel(
+    fn take(
         &mut self,
         instance: InstanceId,
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
         self.instance(instance)?.take(channel).map_err(fault)
     }
+}
 
-    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
-        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
+impl Pool for Cuda {
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
     }
 
-    fn host_kv_layout(&self) -> Option<state::PageLayout> {
-        self.shell.as_ref()?.host_kv_layout(1)
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
-    fn read_host_kv(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_host_kv(slots).map_err(fault)
+    /// All or nothing: an `Err` moved nothing (`Shell::evacuate_with`).
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        let endpoints: Vec<_> = self
+            .channels
+            .values()
+            .filter(|endpoint| !endpoint.slots().is_empty())
+            .cloned()
+            .collect();
+        let channels: Vec<(Vec<u32>, u64)> = endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.slots(),
+                    crate::program::Endpoint::cell_span(endpoint.wire_bytes(), endpoint.cap1() - 1),
+                )
+            })
+            .collect();
+        let at = self
+            .loaded_mut()?
+            .evacuate_with(evacuation, &channels)
+            .map_err(fault)?;
+        for (endpoint, at) in endpoints.iter().zip(at) {
+            endpoint.rebase(at);
+        }
+        Ok(())
     }
 
-    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        self.shell
+            .as_ref()
+            .map(|shell| shell.chunk_table().clone())
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))
+    }
+}
+
+impl WeightCache for Cuda {
+    fn set_residency(
+        &mut self,
+        residency: &engine::chunk::WeightResidency,
+    ) -> EngineResult<u64> {
         self.loaded_mut()?
-            .write_host_kv(slots, bytes)
+            .weight_residency(residency)
             .map_err(fault)
     }
 
-    fn read_tier_slots(
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
+    }
+
+    fn reload(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
+        if self.expert.size > 1 {
+            return Err(Error::Unsupported {
+                verb: "reload_weights on a rank of an expert-parallel group",
+                engine: "cuda",
+            });
+        }
+        let target = self.target();
+        let path = reload.checkpoint.as_path();
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))?;
+        refuse_an_artifact_for_another_deployment(
+            path,
+            shell.trace().platform.backend(),
+            width_free(&shell.trace().name),
+        )?;
+        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
+        let (planes, bytes) = shell
+            .reload_weights(&contract, path, target, &mut self.torn)
+            .map_err(fault)?;
+        Ok(engine::Reloaded { planes, bytes })
+    }
+}
+
+impl Tiers for Cuda {
+    /// Waits, on the host, for every move between the device and the host
+    /// tier still landing; every other copy lands inside the call or in the
+    /// main stream's order, which a later fire or move stands behind.
+    fn settle(&mut self) -> EngineResult<()> {
+        self.loaded_mut()?.settle_moves().map_err(fault)
+    }
+
+    /// A move from the device to the host tier rides the swap stream and is
+    /// still reading its device slots when the call returns: told landed
+    /// once the stream has run it, by a waiter on an event recorded behind
+    /// it (`serve::landing`), which enqueues nothing a later move would wait
+    /// on. Every other copy's sources are free at once: a move from the host
+    /// reads host slots, which the next move into them (on the same swap
+    /// stream) or a host write (behind every move still landing) reaches
+    /// only after it; the slot file's moves read inside the call; a move
+    /// within the device runs on the main stream, ahead of everything after.
+    fn copy_landing(
+        &mut self,
+        copy: &engine::chunk::SlotCopy,
+        token: u64,
+    ) -> EngineResult<bool> {
+        let host = |domain| matches!(domain, MemoryDomain::HostPinned);
+        let device = |domain| {
+            matches!(
+                domain,
+                MemoryDomain::Device {
+                    reach: DeviceReach::Peer,
+                    ..
+                }
+            )
+        };
+        let disk = |domain| matches!(domain, MemoryDomain::LocalDisk);
+        // A move between the host tier and the slot file runs on the tier's
+        // landing thread and is told how it ended: the engine thread only
+        // enqueues it.
+        let host_disk = (host(copy.src) && disk(copy.dst)) || (disk(copy.src) && host(copy.dst));
+        if host_disk && let Some(sink) = self.landed.clone() {
+            let told: crate::serve::landing::Told =
+                Box::new(move |landing| sink(token, landing));
+            self.loaded_mut()?.defer_disk_tell(Some(told));
+            let copied = Tiers::copy(self, copy);
+            // Not taken (nothing to move, or refused before enqueueing):
+            // answered in the call.
+            let untaken = self.loaded_mut()?.defer_disk_tell(None).is_some();
+            copied?;
+            return Ok(untaken);
+        }
+        Tiers::copy(self, copy)?;
+        let parked = device(copy.src) && host(copy.dst);
+        let Some(sink) = self.landed.clone().filter(|_| parked) else {
+            return Ok(true);
+        };
+        let told = self
+            .loaded_mut()?
+            .tell_swaps_landed(Box::new(move |landing| sink(token, landing)))
+            .map_err(fault)?;
+        Ok(!told)
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        use crate::store::Tier;
+        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
+        let tier = |domain| match domain {
+            MemoryDomain::Device {
+                reach: DeviceReach::Peer,
+                ..
+            } => Some(Tier::Device),
+            MemoryDomain::HostPinned => Some(Tier::Host),
+            MemoryDomain::LocalDisk => Some(Tier::Disk),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (tier(copy.src), tier(copy.dst)) else {
+            return Err(Error::Unsupported {
+                verb: "copy_slots to or from a domain other than the device, the host tier \
+                       and the slot file",
+                engine: "cuda",
+            });
+        };
+        let shell = self.loaded_mut()?;
+        shell.take_refs();
+        if from != Tier::Device || to != Tier::Device {
+            // Between tiers: whole slots, each laid alike.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "token runs move within the device; between tiers a slot moves whole".into(),
+                ));
+            }
+            return shell
+                .copy_tier_slots(copy.shape, from, to, &copy.slots)
+                .map_err(fault);
+        }
+        if copy.shape == FIXED || copy.shape == RING {
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(
+                    "a fixed record is copied whole, not a run of its tokens".into(),
+                ));
+            }
+            // A record is one unit across its shapes: named by any shape's
+            // first piece, copied whole.
+            for &(src, dst) in &copy.slots {
+                shell
+                    .fork_state(shell.record_key(src), shell.record_key(dst))
+                    .map_err(fault)?;
+            }
+            return Ok(());
+        }
+        if copy.shape != LIST && copy.shape != WINDOW {
+            // Any other shape this load states (the rs list): whole slots.
+            if !copy.runs.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "copy_slots names token runs of shape {}, whose slots are copied whole",
+                    copy.shape
+                )));
+            }
+            let pairs: Vec<[u32; 2]> = copy.slots.iter().map(|&(src, dst)| [src, dst]).collect();
+            return shell.copy_whole_slots(copy.shape, &pairs).map_err(fault);
+        }
+        let page = shell.paging().page_size;
+        let runs: Vec<engine::transfer::KvRun> = copy
+            .slots
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page,
+            })
+            .chain(copy.runs.iter().map(|run| engine::transfer::KvRun {
+                src_page: run.src,
+                src_token: run.src_token,
+                dst_page: run.dst,
+                dst_token: run.dst_token,
+                tokens: run.tokens,
+            }))
+            .collect();
+        shell
+            .copy_token_slots(copy.shape == WINDOW, &runs)
+            .map_err(fault)
+    }
+
+    fn read(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
     ) -> EngineResult<Vec<u8>> {
         self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
     }
 
-    fn write_tier_slots(
+    fn write(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
@@ -1611,8 +1681,8 @@ impl Engine for Cuda {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
-        // 22): a kv copy is within the device.
+        // The host and disk tiers move through `copy_slots`, whole slots
+        // laid alike: a kv copy is within the device.
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
@@ -1623,7 +1693,7 @@ impl Engine for Cuda {
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
         // Windowed pages a write into a shared one copies first ride the
-        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
+        // pre-launch copy beside the kv list's.
         let windowed: Vec<engine::transfer::KvRun> = copy
             .windowed
             .iter()
@@ -1638,6 +1708,41 @@ impl Engine for Cuda {
         self.loaded_mut()?
             .copy_kv_with(&moves, &windowed, !copy.moves.is_empty())
             .map_err(fault)
+    }
+}
+
+impl Peers for Cuda {
+    fn export(&self) -> Option<engine::KvHandle> {
+        self.caps.as_ref()?.kv_handle.clone()
+    }
+
+    fn layout(&self) -> Option<state::PageLayout> {
+        self.shell.as_ref()?.host_kv_layout(1)
+    }
+
+    fn read(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_host_kv(slots).map_err(fault)
+    }
+
+    fn write(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_host_kv(slots, bytes)
+            .map_err(fault)
+    }
+}
+
+impl Taps for Cuda {
+    /// One rank's planes hold a band of each layer's heads, so a
+    /// tensor-parallel rank taps nothing.
+    fn groups(&self) -> Option<engine::TapGroups> {
+        self.shell.as_ref()?.tap_groups()
+    }
+
+    fn subscribe(&mut self, sink: engine::TapSink) {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.on_tapped(sink.clone());
+        }
+        self.tap_sink = Some(sink);
     }
 }
 
@@ -1670,7 +1775,7 @@ impl Cuda {
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -1841,8 +1946,8 @@ impl Cuda {
             nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
             let record = match pieces {
                 [] => None,
-                // A record's pieces: its rings' first, then its state's
-                // (CONTRACT-BC 21), named as one record by its first.
+                // A record's pieces: its rings' first, then its state's,
+                // named as one record by its first.
                 stated
                     if stated.iter().all(|(shape, _)| *shape == FIXED || *shape == RING)
                         && stated.windows(2).all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>
@@ -1904,16 +2009,6 @@ impl Cuda {
                 .find(|(id, _)| *id == shape)
                 .map(|(_, refs)| refs.as_slice())
         }
-        // Each lane's refs of the window lists past the first, a list each.
-        let more_windows: Vec<Vec<&[u32]>> = submission
-            .lanes
-            .iter()
-            .map(|lane| {
-                (1..crate::store::layout::MOST_WINDOWS)
-                    .map_while(|at| table(lane, crate::store::layout::window_id(at)))
-                    .collect()
-            })
-            .collect();
         // A lane's list kind says what its list table holds: its pages, or
         // the working set's mapped pages its program's page indexes address
         // (a device-geometry instance's lane).
@@ -1954,7 +2049,6 @@ impl Cuda {
                     write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
                     window_fold: lane.window.clone(),
-                    more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),
@@ -2109,7 +2203,16 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
             "`copy_kv` into host-pinned memory, which needs a swap pool this load does not \
              reserve"
         }
-        (MemoryDomain::CudaDevice(_), MemoryDomain::CudaDevice(_)) => {
+        (
+            MemoryDomain::Device {
+                reach: DeviceReach::Peer,
+                ..
+            },
+            MemoryDomain::Device {
+                reach: DeviceReach::Peer,
+                ..
+            },
+        ) => {
             "`copy_kv` between two CUDA ordinals, which needs a peer mapping this load has not \
              opened"
         }

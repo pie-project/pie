@@ -55,6 +55,11 @@ pub struct ChunkProfile {
     /// KDA layer's) or its convolved `x | B` (a Mamba-2 layer's) beside its
     /// conv input and gates, written once, when the row is a fire's own.
     pub rs_corrected: bool,
+    /// Whether a gated-delta row's corrected planes keep its per-head
+    /// scalars after its corrected values ([`crate::rs::gdn_scalars_bytes`]):
+    /// a backend whose decode reads them (Metal). One that recomputes them
+    /// from the row's `[b | a]` and keys lays none.
+    pub rs_scalars: bool,
     /// The tokens a slot of the kv list holds, where the backend's kernels
     /// page their rows by a count of their own (and a slot of each window
     /// list too where `one_window` holds; else a window list still picks
@@ -107,6 +112,7 @@ impl ChunkProfile {
         state_f32: false,
         rs_mamba2: true,
         rs_corrected: true,
+        rs_scalars: false,
         token_slot: None,
         one_window: false,
         full_from: None,
@@ -128,6 +134,7 @@ impl ChunkProfile {
         state_f32: true,
         rs_mamba2: false,
         rs_corrected: true,
+        rs_scalars: true,
         token_slot: None,
         one_window: false,
         full_from: None,
@@ -148,6 +155,7 @@ impl ChunkProfile {
         state_f32: false,
         rs_mamba2: false,
         rs_corrected: false,
+        rs_scalars: false,
         token_slot: None,
         one_window: false,
         full_from: None,

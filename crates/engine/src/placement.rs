@@ -137,8 +137,8 @@ impl Placement {
             let mut edit = None;
 
             // A replica slot of `a` given to `b`, which its rank lacks.
-            for p in 0..ranks * slots {
-                let (a, r) = (next.held[p] as usize, p / slots);
+            for (p, &held) in next.held.iter().enumerate() {
+                let (a, r) = (held as usize, p / slots);
                 if replicas[a] < 2 {
                     continue;
                 }

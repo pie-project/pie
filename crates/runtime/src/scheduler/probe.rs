@@ -151,6 +151,21 @@ pub struct HostSubmitProbes {
     pub validate_frame_calls: AtomicU64,
 }
 
+impl HostSubmitProbes {
+    /// Every count back to none: a boot's probes count that boot's submits.
+    pub(crate) fn reset(&self) {
+        self.submits.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.total_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.drain_settled_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.geometry_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.kv_prepare_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.scheduler_submit_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.shadow_advance_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.validate_frame_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.validate_frame_calls.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub fn host_submit() -> &'static HostSubmitProbes {
     static PROBES: std::sync::OnceLock<HostSubmitProbes> = std::sync::OnceLock::new();
     PROBES.get_or_init(HostSubmitProbes::default)

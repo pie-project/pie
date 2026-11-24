@@ -1,0 +1,440 @@
+
+// ---- the tiled regime's image PE ops (kernels-cerebras src/emit/tiled_pe.csl) ----
+// An op at prog[a]: its code, its length, its words from a + 2, a layout an index into lays (six
+// words each: a tile's rows and columns, the strides' logs (y, x), the busy blocks (y, x)).
+
+var X: u16 = 0;
+var Y: u16 = 0;
+
+fn md(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(D_mem, @as(i16, o), f32), n); }
+fn hd(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(D_hx, @as(i16, o), @fp16()), n); }
+// the staging buffer as words, two 16-bit values each (o: an even 16-bit offset; n words)
+var D_hx32 = D_wb;
+fn h32(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(D_hx32, @as(i16, o >> 1), u32), n); }
+fn shr(v: u16, n: u16) u16 { var q = v; var l: u16 = 0; while (l < n) : (l += 1) { q = q >> 1; } return q; }
+fn shl(v: u16, n: u16) u16 { var q = v; var l: u16 = 0; while (l < n) : (l += 1) { q = q << 1; } return q; }
+// rounded to the build's 16-bit type, held f32
+fn rnd(o: u16, n: u16) void { if (n == 0) { return; } @fs2h(hd(0, n), md(o, n)); @fh2s(md(o, n), hd(0, n)); }
+
+// the layout at prog[a..a + 6], for this PE
+var th: u16 = 1;
+var tw: u16 = 1;
+var lsy: u16 = 0;
+var lsx: u16 = 0;
+var nrb: u16 = 1;
+var ncb: u16 = 1;
+var ract = false;
+var cact = false;
+var act = false;
+var pr: u16 = 0;
+var pc: u16 = 0;
+var np: u16 = 0;
+fn lay(a: u16) void {
+  const l = 6 * prog[a];
+  th = lays[l]; tw = lays[l + 1]; lsy = lays[l + 2]; lsx = lays[l + 3]; nrb = lays[l + 4]; ncb = lays[l + 5];
+  ract = (Y & (shl(1, lsy) - 1)) == 0;
+  cact = (X & (shl(1, lsx) - 1)) == 0;
+  act = ract and cact;
+  pr = shr(Y, lsy);
+  pc = shr(X, lsx);
+  np = if (act) th * tw else 0;
+}
+
+// n wavelets passed through, as they come (32-bit ones: a forward of 16-bit sends hangs, so
+// halos and keys go two 16-bit values a wavelet)
+fn fwd(comptime qo: output_queue, comptime qi: input_queue, n: u16) void {
+  if (n > 0) { @mov32(fab.fout(qo, n), fab.fin(qi, n)); }
+}
+
+// The hub's loop: what a PE sends towards the hub (an all-reduce's partial sums, a key) comes back
+// to it on the broadcast tree, so its receive of the broadcast is posted while it sends: the send
+// async (on its output queue's microthread), the receive blocking. A send that finished before
+// the receive was posted would need the whole of it held in the loop's routers and queues (a
+// few dozen wavelets): past that the broadcast stalls on the PE's own full queue, the hub behind
+// it, the send behind the hub.
+const ut_e = @get_ut_id(2);
+const ut_s = @get_ut_id(4);
+fn fwd_hub(comptime qo: output_queue, comptime qi: input_queue, comptime ut: ut_id, n: u16) void {
+  if (n > 0) { @mov32(fab.fout(qo, n), fab.fin(qi, n), .{ .async = true, .ut_id = ut }); }
+}
+
+// A 3 x 3 input's halo: E / W along busy rows (a block of parity ph sends while the next
+// receives, then the reverse; a PE between two busy ones forwards), then N / S whole halo rows.
+fn halo(cin: u16) void {
+  const tw2 = tw + 2;
+  const cw = cin >> 1;
+  if (ract) {
+    var ph: u16 = 0;
+    while (ph < 2) : (ph += 1) {
+      if (cact) {
+        if ((pc & 1) == ph and pc + 1 < ncb) {
+          var i: u16 = 0;
+          while (i < th) : (i += 1) { @mov32(fab.fout(q_eo, cw), h32(((i + 1) * tw2 + tw) * cin, cw)); }
+        }
+        if ((pc & 1) != ph and pc > 0) {
+          var i: u16 = 0;
+          while (i < th) : (i += 1) { @mov32(h32((i + 1) * tw2 * cin, cw), fab.fin(q_ei, cw)); }
+        }
+      } else if ((pc & 1) == ph and pc + 1 < ncb) { fwd(q_eo, q_ei, th * cw); }
+    }
+    ph = 0;
+    while (ph < 2) : (ph += 1) {
+      if (cact) {
+        if ((pc & 1) == ph and pc > 0) {
+          var i: u16 = 0;
+          while (i < th) : (i += 1) { @mov32(fab.fout(q_wo, cw), h32(((i + 1) * tw2 + 1) * cin, cw)); }
+        }
+        if ((pc & 1) != ph and pc + 1 < ncb) {
+          var i: u16 = 0;
+          while (i < th) : (i += 1) { @mov32(h32(((i + 1) * tw2 + tw + 1) * cin, cw), fab.fin(q_wi, cw)); }
+        }
+      } else if (((pc + 1) & 1) == ph and pc + 1 < ncb) { fwd(q_wo, q_wi, th * cw); }
+    }
+  }
+  if (cact) {
+    const rl = tw2 * cin;
+    const rw = rl >> 1;
+    var ph: u16 = 0;
+    while (ph < 2) : (ph += 1) {
+      if (ract) {
+        if ((pr & 1) == ph and pr + 1 < nrb) { @mov32(fab.fout(q_so, rw), h32(th * rl, rw)); }
+        if ((pr & 1) != ph and pr > 0) { @mov32(h32(0, rw), fab.fin(q_si, rw)); }
+      } else if ((pr & 1) == ph and pr + 1 < nrb) { fwd(q_so, q_si, rw); }
+    }
+    ph = 0;
+    while (ph < 2) : (ph += 1) {
+      if (ract) {
+        if ((pr & 1) == ph and pr > 0) { @mov32(fab.fout(q_no, rw), h32(rl, rw)); }
+        if ((pr & 1) != ph and pr + 1 < nrb) { @mov32(h32((th + 1) * rl, rw), fab.fin(q_ni, rw)); }
+      } else if (((pr + 1) & 1) == ph and pr + 1 < nrb) { fwd(q_no, q_ni, rw); }
+    }
+  }
+}
+
+// A convolution (k x k taps, 1 or 3): its input staged 16-bit (with its halo), its weights a
+// block of kb input rows x cout at a time off the tree, each block the tile of every pixel's
+// tile32; the bias, the rounding.
+fn conv(a: u16) void {
+  const b = a + 2;
+  const x = prog[b]; const y = prog[b + 1]; const cin = prog[b + 2]; const cout = prog[b + 3];
+  const k = prog[b + 4]; const kb = prog[b + 5]; const nb = prog[b + 6]; const fl = prog[b + 7];
+  const bt = prog[b + 8]; const kc = prog[b + 9];
+  lay(b + 10);
+  const tw2 = tw + 2;
+  if (act) { @fmovs(md(y, np * cout), 0.0); }
+  const nw = kb * cout / 2;
+  const wa = @set_dsd_length(D_wa, cout);
+  var c0: u16 = 0;
+  while (c0 < cin) : (c0 += kc) {
+    // the chunk's input staged (and its halo exchanged)
+    if (k == 3) {
+      if (act) {
+        @fmovh(hd(0, (th + 2) * tw2 * kc), @as(@fp16(), 0.0));
+        var i: u16 = 0;
+        while (i < th) : (i += 1) {
+          var j: u16 = 0;
+          while (j < tw) : (j += 1) { @fs2h(hd(((i + 1) * tw2 + j + 1) * kc, kc), md(x + (i * tw + j) * cin + c0, kc)); }
+        }
+      }
+      halo(kc);
+    } else if (act) {
+      var p: u16 = 0;
+      while (p < np) : (p += 1) { @fs2h(hd(p * kc, kc), md(x + p * cin + c0, kc)); }
+    }
+    // every tap's blocks of it
+    var ta: u16 = 0;
+    while (ta < k) : (ta += 1) {
+      var tb: u16 = 0;
+      while (tb < k) : (tb += 1) {
+        var bl: u16 = 0;
+        while (bl < nb) : (bl += 1) {
+          @mov32(@set_dsd_length(D_wb, nw), fab.fin(q_t, nw));
+          if (act) {
+            var i: u16 = 0;
+            while (i < th) : (i += 1) {
+              var j: u16 = 0;
+              while (j < tw) : (j += 1) {
+                const xo = if (k == 3) ((i + ta) * tw2 + j + tb) * kc + bl * kb else (i * tw + j) * kc + bl * kb;
+                matvec.mac32(md(y + (i * tw + j) * cout, cout), wa, hd(xo, kb));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if ((fl & 1) != 0) {
+    @fmovs(md(bt, cout), fab.fin(q_t, cout));
+    var p: u16 = 0;
+    while (p < np) : (p += 1) { @fadds(md(y + p * cout, cout), md(y + p * cout, cout), md(bt, cout)); }
+  }
+  if ((fl & 2) != 0) { rnd(y, np * cout); }
+}
+
+// n words summed over the array, every PE given the sum: east along the rows, south down the
+// last column, the corner's to the hub, back from it along the broadcast tree. A PE's send is the
+// hub's loop's (async, its receive of the sum posted behind it); the last column's add of its
+// row's sums blocking (none of it comes back before the column's send).
+fn allreduce(r: u16, n: u16) void {
+  const d = md(r, n);
+  if (X > 0) {
+    if (X + 1 < GX) { @fadds(fab.fout(q_eo, n), fab.fin(q_ei, n), d, .{ .async = true, .ut_id = ut_e }); }
+    else { @fadds(d, d, fab.fin(q_ei, n)); }
+  } else if (GX > 1) { @fmovs(fab.fout(q_eo, n), d, .{ .async = true, .ut_id = ut_e }); }
+  if (X + 1 == GX) {
+    if (Y > 0) {
+      if (Y + 1 < GY) { @fadds(fab.fout(q_so, n), fab.fin(q_si, n), d, .{ .async = true, .ut_id = ut_s }); }
+      else { @fadds(fab.fout(q_eo, n), fab.fin(q_si, n), d, .{ .async = true, .ut_id = ut_e }); }
+    } else if (GY > 1) { @fmovs(fab.fout(q_so, n), d, .{ .async = true, .ut_id = ut_s }); }
+    else { @fmovs(fab.fout(q_eo, n), d, .{ .async = true, .ut_id = ut_e }); }
+  }
+  @fmovs(d, fab.fin(q_bi, n));
+}
+
+// st's c channels summed a group (g of cpg) into gs
+fn gsum(st: u16, gs: u16, g: u16, cpg: u16) void {
+  var e: u16 = 0;
+  var q: u16 = 0;
+  while (q < g) : (q += 1) {
+    var s: f32 = 0.0;
+    var j: u16 = 0;
+    while (j < cpg) : (j += 1) { s += mem[st + e]; e += 1; }
+    mem[gs + q] = s;
+  }
+}
+
+// A group norm: the means, then the centred squares, each an all-reduce of the groups' sums;
+// gamma and beta off the tree; a channel's scale and shift; the apply a printed region.
+fn norm(a: u16) void {
+  const b = a + 2;
+  const x = prog[b]; const c = prog[b + 2]; const g = prog[b + 3]; const cpg = prog[b + 4];
+  const kc = prog[b + 5]; const m = prog[b + 6]; const tp = prog[b + 7];
+  lay(b + 8);
+  const sc = tp; const sh = tp + c; const st = tp + 2 * c; const gs = tp + 3 * c; const gm = gs + g; const gr = gm + g;
+  const inv = fk[kc]; const eps = fk[kc + 1];
+  @fmovs(md(st, c), 0.0);
+  var p: u16 = 0;
+  while (p < np) : (p += 1) { @fadds(md(st, c), md(st, c), md(x + p * c, c)); }
+  gsum(st, gs, g, cpg);
+  allreduce(gs, g);
+  var q: u16 = 0;
+  var e: u16 = 0;
+  while (q < g) : (q += 1) {
+    const mg = mem[gs + q] * inv;
+    mem[gm + q] = mg;
+    var j: u16 = 0;
+    while (j < cpg) : (j += 1) { mem[sc + e] = mg; e += 1; }
+  }
+  @fmovs(md(st, c), 0.0);
+  p = 0;
+  while (p < np) : (p += 1) {
+    @fsubs(md(sh, c), md(x + p * c, c), md(sc, c));
+    @fmuls(md(sh, c), md(sh, c), md(sh, c));
+    @fadds(md(st, c), md(st, c), md(sh, c));
+  }
+  gsum(st, gs, g, cpg);
+  allreduce(gs, g);
+  q = 0;
+  while (q < g) : (q += 1) { mem[gr + q] = math.rsqrt(mem[gs + q] * inv + eps); }
+  @fmovs(md(st, c), fab.fin(q_t, c));
+  @fmovs(md(sh, c), fab.fin(q_t, c));
+  q = 0;
+  e = 0;
+  while (q < g) : (q += 1) {
+    var j: u16 = 0;
+    while (j < cpg) : (j += 1) {
+      const s = mem[st + e] * mem[gr + q];
+      mem[sc + e] = s;
+      mem[sh + e] = mem[sh + e] - mem[gm + q] * s;
+      e += 1;
+    }
+  }
+  p = 0;
+  while (p < np) : (p += 1) { reg(m, b + 9, p); }
+}
+
+// A printed region: its residents off the tree, then each pixel's row.
+fn region_op(a: u16) void {
+  const b = a + 2;
+  const m = prog[b]; const nres = prog[b + 1]; const ro = prog[b + 2]; const c = prog[b + 3];
+  lay(b + 4);
+  var k: u16 = 0;
+  while (k < nres) : (k += 1) { @fmovs(md(ro + k * c, c), fab.fin(q_t, c)); }
+  var p: u16 = 0;
+  while (p < np) : (p += 1) { reg(m, b + 5, p); }
+}
+
+// A pixel's co channels from src (every other at offset s where sel)
+fn pick(dst: mem1d_dsd, src: u16, co: u16, sel: u16, s: u16) void {
+  if (sel != 0) { @fmovs(dst, @set_dsd_stride(md(src + s, co), 2)); } else { @fmovs(dst, md(src, co)); }
+}
+fn pick_send(comptime qo: output_queue, src: u16, co: u16, sel: u16) void {
+  if (sel != 0) { @fmovs(fab.fout(qo, co), @set_dsd_stride(md(src + 1, co), 2)); } else { @fmovs(fab.fout(qo, co), md(src, co)); }
+}
+
+// An upsampling by two along an axis (a pixel shuffle's half where sel): local where the input
+// tiles that axis, else a move of half its stride.
+fn up(a: u16) void {
+  const b = a + 2;
+  const x = prog[b]; const y = prog[b + 1]; const ci = prog[b + 2]; const co = prog[b + 3];
+  const ax = prog[b + 4]; const sel = prog[b + 5]; const rd = prog[b + 6];
+  lay(b + 7);
+  const ith = th; const itw = tw; const iract = ract; const icact = cact;
+  const ils = if (ax == 0) lsy else lsx;
+  lay(b + 8);
+  if (ils == 0) {
+    if (act) {
+      var i: u16 = 0;
+      while (i < th) : (i += 1) {
+        var j: u16 = 0;
+        while (j < tw) : (j += 1) {
+          const si = if (ax == 0) i >> 1 else i;
+          const sj = if (ax == 0) j else j >> 1;
+          const s = if (ax == 0) i & 1 else j & 1;
+          pick(md(y + (i * tw + j) * co, co), x + (si * itw + sj) * ci, co, sel, s);
+        }
+      }
+    }
+  } else {
+    const d = shl(1, ils - 1);
+    const mk = shl(1, ils) - 1;
+    if (ax == 0) {
+      if (icact) {
+        const r = Y & mk;
+        const n = itw * co;
+        if (r == 0) {
+          var j: u16 = 0;
+          while (j < itw) : (j += 1) { pick(md(y + j * co, co), x + j * ci, co, sel, 0); }
+          j = 0;
+          while (j < itw) : (j += 1) { pick_send(q_so, x + j * ci, co, sel); }
+        } else if (r == d) {
+          @fmovs(md(y, n), fab.fin(q_si, n));
+        } else if (r < d) { fwd(q_so, q_si, n); }
+      }
+    } else {
+      if (iract) {
+        const r = X & mk;
+        const n = ith * co;
+        if (r == 0) {
+          var i: u16 = 0;
+          while (i < ith) : (i += 1) { pick(md(y + i * co, co), x + i * ci, co, sel, 0); }
+          i = 0;
+          while (i < ith) : (i += 1) { pick_send(q_eo, x + i * ci, co, sel); }
+        } else if (r == d) {
+          @fmovs(md(y, n), fab.fin(q_ei, n));
+        } else if (r < d) { fwd(q_eo, q_ei, n); }
+      }
+    }
+  }
+  if (rd != 0) { rnd(y, np * co); }
+}
+
+// The attention: every key's [k | v] (16-bit) along its row east, down the last column, to the
+// hub and back along the broadcast tree, in the blocks' order; each of this PE's queries over
+// it as it passes (a running max and sum a query).
+fn attend(a: u16) void {
+  const b = a + 2;
+  const q = prog[b]; const k = prog[b + 1]; const v = prog[b + 2]; const o = prog[b + 3];
+  const c = prog[b + 4]; const ks = fk[prog[b + 5]]; const rd = prog[b + 6]; const tp = prog[b + 7];
+  lay(b + 8);
+  // kv: a key widened, then its value; pd: a product (the key itself where a PE holds one
+  // query); mm / ll / ss: a query's max, sum, score
+  const npx = th * tw;
+  const kv = tp;
+  const pd = if (npx > 1) tp + c else tp;
+  const mm = pd + c; const ll = mm + npx; const ss = ll + npx;
+  var p: u16 = 0;
+  while (p < np) : (p += 1) { mem[mm + p] = -1.0e30; mem[ll + p] = 0.0; }
+  if (act) { @fmovs(md(o, np * c), 0.0); }
+  var br: u16 = 0;
+  while (br < nrb) : (br += 1) {
+    const yo = shl(br, lsy);
+    var bc: u16 = 0;
+    while (bc < ncb) : (bc += 1) {
+      const xo = shl(bc, lsx);
+      var e: u16 = 0;
+      while (e < npx) : (e += 1) {
+        if (Y == yo) {
+          if (X == xo) {
+            @fs2h(hd(0, c), md(k + e * c, c));
+            @fs2h(hd(c, c), md(v + e * c, c));
+            if (X + 1 < GX) { @mov32(fab.fout(q_eo, c), h32(0, c), .{ .async = true, .ut_id = ut_e }); }
+            else if (Y + 1 < GY) { @mov32(fab.fout(q_so, c), h32(0, c), .{ .async = true, .ut_id = ut_s }); }
+            else { @mov32(fab.fout(q_eo, c), h32(0, c), .{ .async = true, .ut_id = ut_e }); }
+          } else if (X > xo) {
+            if (X + 1 < GX) { fwd_hub(q_eo, q_ei, ut_e, c); }
+            else if (Y + 1 < GY) { fwd_hub(q_so, q_ei, ut_s, c); }
+            else { fwd_hub(q_eo, q_ei, ut_e, c); }
+          }
+        } else if (X + 1 == GX and Y > yo) {
+          if (Y + 1 < GY) { fwd_hub(q_so, q_si, ut_s, c); } else { fwd_hub(q_eo, q_si, ut_e, c); }
+        }
+        @mov32(h32(0, c), fab.fin(q_bi, c));
+        if (act) {
+          @fh2s(md(kv, c), hd(0, c));
+          p = 0;
+          while (p < np) : (p += 1) {
+            @fmuls(md(pd, c), md(kv, c), md(q + p * c, c));
+            var n: u16 = c;
+            while (n > 1) {
+              const h = n >> 1;
+              if ((n & 1) != 0) { mem[pd] = mem[pd] + mem[pd + n - 1]; }
+              @fadds(md(pd, h), md(pd, h), md(pd + h, h));
+              n = h;
+            }
+            mem[ss + p] = mem[pd] * ks;
+          }
+          @fh2s(md(kv, c), hd(c, c));
+          p = 0;
+          while (p < np) : (p += 1) {
+            const s = mem[ss + p];
+            var m0 = mem[mm + p];
+            if (s > m0) {
+              const cr = math.exp1(m0 - s);
+              @fmuls(md(o + p * c, c), md(o + p * c, c), cr);
+              mem[ll + p] = mem[ll + p] * cr;
+              mem[mm + p] = s;
+              m0 = s;
+            }
+            const ex = math.exp1(s - m0);
+            mem[ll + p] = mem[ll + p] + ex;
+            @fmacs(md(o + p * c, c), md(o + p * c, c), md(kv, c), ex);
+          }
+        }
+      }
+    }
+  }
+  p = 0;
+  while (p < np) : (p += 1) { @fmuls(md(o + p * c, c), md(o + p * c, c), math.recip(mem[ll + p])); }
+  if (rd != 0) { rnd(o, np * c); }
+}
+
+// The host's value into its slot; a value out to the host's.
+fn opin(a: u16) void {
+  const b = a + 2;
+  lay(b + 3);
+  const n = np * prog[b + 2];
+  if (n > 0) { @fmovs(md(prog[b], n), @set_dsd_length(@increment_dsd_offset(D_hin, @as(i16, prog[b + 1]), f32), n)); }
+}
+fn opout(a: u16) void {
+  const b = a + 2;
+  lay(b + 3);
+  const n = np * prog[b + 2];
+  if (n > 0) { @fmovs(@set_dsd_length(@increment_dsd_offset(D_hout, @as(i16, prog[b + 1]), f32), n), md(prog[b], n)); }
+}
+
+fn run_all() void {
+  var a: u16 = 0;
+  while (a < NPROG) {
+    const op = prog[a];
+    if (op == 1) { opin(a); }
+    else if (op == 2) { opout(a); }
+    else if (op == 3) { conv(a); }
+    else if (op == 4) { norm(a); }
+    else if (op == 5) { region_op(a); }
+    else if (op == 6) { up(a); }
+    else if (op == 8) { attend(a); }
+    a += prog[a + 1];
+  }
+}
+// ---- end of the ops ----

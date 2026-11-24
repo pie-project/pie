@@ -155,8 +155,8 @@ fn serve(fixture: &Fixture, fork: Fork) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         shell
             .copy_slots(&SlotCopy {
                 shape: LIST,
-                src: MemoryDomain::MetalShared,
-                dst: MemoryDomain::MetalShared,
+                src: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+                dst: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                 slots: copies,
                 runs: Vec::new(),
             })
@@ -222,10 +222,6 @@ fn check(model: &str) {
         &forked,
         &kept[1..],
     );
-    eprintln!(
-        "{model}: both sides of a fork across buffers = kept over {} rows",
-        forked.len()
-    );
     if fixture
         .trace
         .caches
@@ -238,7 +234,6 @@ fn check(model: &str) {
             kept[1..].to_vec(),
             "{model}: a fork with a blank record moves the logits"
         );
-        eprintln!("{model}: a blank-record fork moves the logits (the control)");
     }
 }
 

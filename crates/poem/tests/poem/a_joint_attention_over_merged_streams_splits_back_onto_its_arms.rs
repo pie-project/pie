@@ -136,11 +136,7 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
         .word(&Request::new(1, false).switched("stream", "text"))
         & classes.mask;
     let class = classes.class_of(word).expect("a text lane has a class");
-    for row in 0..classes.merges.len() {
-        assert_eq!(
-            classes.merge_arm[row][class],
-            Some(0),
-            "arm 0 is the text arm"
-        );
+    for arms in &classes.merge_arm[..classes.merges.len()] {
+        assert_eq!(arms[class], Some(0), "arm 0 is the text arm");
     }
 }

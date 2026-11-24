@@ -85,8 +85,7 @@ pub fn guest_state(
     let (per_pair, pair_run) = state_of(pair_sets, room);
     let (per_instance, instance_run) = state_of(&with_resident(resident, instance_sets), room);
     GuestState {
-        // What a later fire reads as a fire left it (a beam group's state,
-        // BEAM-PAGE-LISTS §4): laid first in the instance's place, copied
+        // What a later fire reads as a fire left it (a beam group's state): laid first in the instance's place, copied
         // down a tier at a park and back byte for byte. A group's state
         // grows with its beams squared, past an Instance slot's chunk, so it
         // lies in the place's run of whole chunks rather than the tables.

@@ -107,7 +107,6 @@ struct Bench {
 impl Bench {
     fn new() -> Option<Bench> {
         let device = Context::bind().ok()?;
-        eprintln!("device: {}", device.name());
         Some(Bench {
             device,
             handles: Handles::new(),
@@ -673,7 +672,4 @@ fn a_verify_walk_is_the_committed_walk() {
         walks_agree(&bench, &lanes, snaps);
         convs_agree(&bench, &lanes, snaps);
     }
-    eprintln!(
-        "the verify arm's banks, windows, snapshots, readouts and gates are the committed arm's, bit for bit"
-    );
 }

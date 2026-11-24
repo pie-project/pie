@@ -1,6 +1,7 @@
 [package]
 name = "engine-cuda"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The menlo CUDA engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-cuda entries on the stream Ctx. Merges into engine-cuda when the old stack is deleted."
@@ -15,6 +16,7 @@ path = "src/lib.rs"
 state = { path = "../state" }
 memmap2 = "0.9"
 toml = "1.1"
+tracing = "0.1"
 libc = "0.2"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-cuda = { path = "../kernels-cuda", optional = true }
@@ -65,7 +67,7 @@ device = []
 # sees it. Off, no build writes those bytes.
 test-slot-fill = []
 
-# A test build's pins (`Knobs::pin`, `Knobs::dense_weights`): fires launched
+# A test build's pins (`Knobs::pin`, `Knobs::weights`): fires launched
 # eagerly, or a load with no weight shape. No profile or config reaches them;
 # serving captures every fire. The crate's own tests turn it on below.
 test-pins = []
@@ -79,6 +81,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 engine-cuda = { path = ".", features = ["test-pins"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 inferlet = { path = "../inferlet" }
 poem = { package = "pie-poem", path = "../poem" }

@@ -82,13 +82,6 @@ impl Shortfall {
         self.waiters.contains_key(&id)
     }
 
-    /// Whether waiter `id` lacks room on the host.
-    pub(super) fn host_short(&self, id: u64) -> bool {
-        self.waiters
-            .get(&id)
-            .is_some_and(|short| short.bytes[Tier::Host.index()] > 0)
-    }
-
     /// What each tier is short of in all.
     pub(super) fn sums(&self) -> [u64; 2] {
         let mut sums = [0u64; 2];

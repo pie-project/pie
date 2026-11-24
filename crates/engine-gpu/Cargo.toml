@@ -1,6 +1,7 @@
 [package]
 name = "engine-gpu"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "What engine-vulkan and engine-wgpu share: the dispatch layer, the stores, the step pipeline and the guest programs, generic over a Backend that owns buffers, frames and kernel encoding."

@@ -195,9 +195,8 @@ pub fn fixture_deployed(
         .trace(model, deploy, model, backend::PLATFORM)
         .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
     // The written checkpoints are the same bits every time (written from the
-    // trace alone), so every run shares one directory: a run per process
-    // used to leave its own copy behind (gigabytes each), and per-test runs
-    // filled the disk. `$PIE_VK_FIXTURES` (`$PIE_WGPU_FIXTURES`) names
+    // trace alone), so every run shares one directory: a copy per process or per
+    // test would be gigabytes each. `$PIE_VK_FIXTURES` (`$PIE_WGPU_FIXTURES`) names
     // another.
     let dir = std::env::var_os(backend::FIXTURES).map_or_else(
         || std::env::temp_dir().join(format!("pie-{}-fixtures", backend::NAME)),
@@ -897,7 +896,7 @@ fn every_rung_of_a_miniature_with_unservable_classes_names_what_the_largest_name
 /// encodes no more dispatches than the load named.
 ///
 /// The lanes are the order's, read off the compiled model, not assumed:
-/// since the mask is per-lane data (5b538b76d, 20a6c0cdf) a lane's mask is
+/// since the mask is per-lane data, a lane's mask is
 /// no class bit, so the seriated order lays every prompt class before every
 /// decode class, and a plain prompt beside an adapted one (this test's fire
 /// before the fold) cuts no region.
@@ -2086,17 +2085,6 @@ fn a_scattered_dense_pool_serves_the_same_logits() {
 #[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
     scattered("qwen35-tiny");
-}
-
-/// A model with a compressed kv pool: its compressor state, rows of the list
-/// slots it describes, moves with the slots an evacuation moves.
-/// Ignored: dsv4-flash-mini does not serve here, before the pool as after
-/// (before it, its side planes overran a binding; now its index top-k
-/// refuses the index pool's pitch).
-#[test]
-#[ignore = "dsv4-flash-mini does not serve on this backend"]
-fn a_scattered_compressed_pool_serves_the_same_logits() {
-    scattered("dsv4-flash-mini");
 }
 
 /// A record cut over several slots (a chunk smaller than it, as

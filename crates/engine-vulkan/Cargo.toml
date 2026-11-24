@@ -1,6 +1,7 @@
 [package]
 name = "engine-vulkan"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The Vulkan engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-slang entries through dyn Encode."
@@ -51,6 +52,7 @@ ash = { version = "0.38", default-features = false, features = [
 
 [dev-dependencies]
 engine-vulkan = { path = ".", features = ["test-limits"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
 # The CPU oracle the score capture is held against.
 engine-cpu = { path = "../engine-cpu" }
 ztensor = { workspace = true }

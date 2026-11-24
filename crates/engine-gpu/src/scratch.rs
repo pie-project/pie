@@ -3,7 +3,7 @@ use kernels_slang::linear::moe::select::RoutedScratch;
 use poem_compiler::{ArenaMap, Budget, Budgets, CompiledModel, Fallback, FireRows};
 use poem_exec::fire::fallback;
 use poem_exec::store::arena::rect;
-use poem_ir::{Attn, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use poem_ir::{Attn, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
 
 use crate::store::kv::Paging;
 
@@ -104,6 +104,10 @@ pub struct Rooms {
     /// fires a row.
     score: Option<Room>,
 
+    /// The logits a projection whose bank outgrows one binding lands a run
+    /// of its rows at a time, side by side, before they take their columns.
+    logits: Option<Room>,
+
     copy: Option<CopyRoom>,
 
     bytes: u64,
@@ -123,6 +127,8 @@ impl Rooms {
         paging: Paging,
         tuning: &T,
         routers: &[u32],
+        planes: &[u64],
+        max_buffer: u64,
     ) -> Rooms {
         let budget = &budgets.tokens;
         let narrow = narrowed(budget, tokens);
@@ -291,12 +297,42 @@ impl Rooms {
                 Room::lay(&mut at, u64::from(narrow.max_lanes), floats, Dtype::F32)
             });
 
+        let logits = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Linear(Linear::Matmul {
+                    w, y, logits: true, ..
+                }) => match trace.values.get(w.0 as usize).map(|decl| &decl.def) {
+                    Some(Def::Weight(at))
+                        if planes
+                            .get(*at as usize)
+                            .is_some_and(|bytes| *bytes > max_buffer) =>
+                    {
+                        of(*y)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .max_by_key(|rect| rect.bytes)
+            .map(|rect| {
+                let mut at = 0u64;
+                Room::lay(
+                    &mut at,
+                    u64::from(rect.rows),
+                    u64::from(rect.width),
+                    rect.dtype,
+                )
+            });
+
         let union = routed
             .map_or(0, |r| r.y.at + r.y.bytes())
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()))
-            .max(score.map_or(0, |r| r.at + r.bytes()));
+            .max(score.map_or(0, |r| r.at + r.bytes()))
+            .max(logits.map_or(0, |r| r.at + r.bytes()));
 
         let copy =
             copy_ceiling(trace, compiled, map, budget, narrow.max_tokens).map(|bytes| CopyRoom {
@@ -312,6 +348,7 @@ impl Rooms {
             split,
             spatial,
             score,
+            logits,
             copy,
             bytes,
         }
@@ -448,6 +485,12 @@ impl<'a, B: Backend> FireScratch<'a, B> {
     /// A score capture's normalisers' room.
     pub fn score_stats(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {
         Some(self.bind(handles, self.rooms.score?))
+    }
+
+    /// The room a projection whose bank outgrows one binding lands its
+    /// logits in a run of rows at a time.
+    pub fn logits(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {
+        Some(self.bind(handles, self.rooms.logits?))
     }
 
     pub fn index_scores(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {

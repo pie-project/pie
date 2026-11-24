@@ -123,6 +123,9 @@ impl<'a> Streams<'a> {
             }
             RowClass::Other => return false,
         }
+        if self.reshaped_intrinsic(value).is_some() {
+            return true;
+        }
         let Some(&node) = self.producers.get(value as usize) else {
             return false;
         };
@@ -130,10 +133,18 @@ impl<'a> Streams<'a> {
             return false;
         }
         let node = node as usize;
-        // An output is read in place from any region of the stage.
-        if !self.region.nodes.iter().any(|n| n.index() == node)
-            && self.ops[node].tag != tags::OUTPUT
+        let inside = self.region.nodes.iter().any(|n| n.index() == node);
+        // A row below the root that is stored anyway is loaded, not
+        // recomputed.
+        if depth > 0
+            && (!inside
+                || self.region.outputs.contains(&value)
+                || self.role(node, &mut None).is_none())
         {
+            return true;
+        }
+        // An output is read in place from any region of the stage.
+        if !inside && self.ops[node].tag != tags::OUTPUT {
             return false;
         }
         let op = &self.ops[node];
@@ -153,6 +164,60 @@ impl<'a> Streams<'a> {
             }
             _ => false,
         }
+    }
+
+    fn reshaped_intrinsic(&self, value: u32) -> Option<usize> {
+        if !matches!(self.class(value), RowClass::Full(_))
+            || self.dtype(value) != Dtype::F32
+            || self.region.outputs.contains(&value)
+            || self.region.sinks.iter().any(|sink| sink.value == value)
+        {
+            return None;
+        }
+        let inside = |v: u32| -> Option<usize> {
+            let node = *self.producers.get(v as usize)?;
+            (node != u32::MAX
+                && self.skipped[node as usize] == 0
+                && self.region.nodes.iter().any(|n| n.index() == node as usize))
+            .then_some(node as usize)
+        };
+        let reshape = &self.ops[inside(value)?];
+        if reshape.tag != tags::RESHAPE || reshape.args.len() != 1 {
+            return None;
+        }
+        let source = reshape.args[0];
+        if !crate::codegen::alias::covers(&self.stage.normalized.value_types, source, value) {
+            return None;
+        }
+        let output = inside(source)?;
+        (self.ops[output].tag == tags::OUTPUT
+            && self.ops[output].results == 1
+            && self.dtype(source) == Dtype::F32)
+            .then_some(output)
+    }
+
+    pub(super) fn intrinsic_unread(&self, value: u32) -> bool {
+        if self.region.outputs.contains(&value)
+            || self.region.sinks.iter().any(|sink| sink.value == value)
+        {
+            return false;
+        }
+        let Some(readers) = self.readers.get(value as usize) else {
+            return false;
+        };
+        !readers.is_empty()
+            && readers
+                .iter()
+                .all(|&reshape| self.reshape_read_off_intrinsic(reshape))
+    }
+
+    fn reshape_read_off_intrinsic(&self, node: usize) -> bool {
+        let reshaped = self.bases[node];
+        self.ops[node].tag == tags::RESHAPE
+            && self.reshaped_intrinsic(reshaped).is_some()
+            && self.readers[reshaped as usize]
+                .iter()
+                .all(|&reader| self.stream_reader(reader))
     }
 
     fn stream_reader(&self, node: usize) -> bool {
@@ -632,6 +697,7 @@ impl<'a> Streams<'a> {
             (remat && self.stream_reader(*node))
                 || self.topk_reads_direct(*node, value)
                 || (in_place && self.scans_model_row(*node))
+                || self.reshape_read_off_intrinsic(*node)
         };
         if outside.iter().any(|node| !served(node)) {
             return true;
@@ -1029,6 +1095,10 @@ fn read(streams: &Streams<'_>, value: u32, want: Dtype, pass: &mut Pass<'_>) -> 
 }
 
 fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> String {
+    if let Some(output) = streams.reshaped_intrinsic(value) {
+        intrinsic_read(streams, output, value, pass);
+        return format!("r{value}");
+    }
     let node = streams.producers[value as usize] as usize;
     let op = &streams.ops[node];
     let out = streams.bases[node];

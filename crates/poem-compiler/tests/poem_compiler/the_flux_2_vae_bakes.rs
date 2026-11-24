@@ -26,13 +26,13 @@ fn readings(deployment: &str) -> Vec<String> {
 
 #[test]
 fn the_flux_2_vae_bakes_every_case() {
-    the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
+    the_flagship_and_the_miniature_declare_the_two_vae_readings();
     the_trace_reads_its_voxel_inputs_and_plants_pixels_twice();
     the_shapes_are_the_flux2_autoencoders();
     each_vae_lane_has_a_class_of_its_own();
 }
 
-fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
+fn the_flagship_and_the_miniature_declare_the_two_vae_readings() {
     assert_eq!(
         readings(KLEIN),
         ["text", "denoise", "vae.decode", "vae.encode"].map(String::from)
@@ -50,12 +50,14 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         "the denoiser's 128-wide rows are the VAE's 32 channels packed 2x2"
     );
 
-    assert!(
-        !readings(MINI).iter().any(|r| r.starts_with("vae.")),
-        "the miniature has no VAE"
+    // the miniature is a whole pipeline too: its text encoder, its DiT and a VAE of its own
+    assert_eq!(
+        readings(MINI),
+        ["text", "denoise", "vae.decode", "vae.encode"],
+        "the miniature runs the flagship's readings"
     );
     let mini = trace(MINI);
-    let voxel_inputs: Vec<&str> = mini
+    let mut voxel_inputs: Vec<&str> = mini
         .values
         .iter()
         .filter_map(|v| match &v.def {
@@ -67,10 +69,12 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
             _ => None,
         })
         .collect();
+    voxel_inputs.sort_unstable();
+    voxel_inputs.dedup();
     assert_eq!(
         voxel_inputs,
-        vec!["latents"],
-        "and reads no voxel input but the denoiser's latent"
+        vec!["latents", "pixels"],
+        "and reads the latent and the encoder's pixels on the voxel axis"
     );
 }
 

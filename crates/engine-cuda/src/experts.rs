@@ -769,8 +769,8 @@ impl Tier {
                 .iter()
                 .filter(|plane| plan.filed(plane.param))
                 .count();
-            eprintln!(
-                "engine-cuda: the MAPPED tier holds {groups} group(s), {} plane(s), {bytes} \
+            tracing::info!(
+                "the MAPPED tier holds {groups} group(s), {} plane(s), {bytes} \
                  byte(s) left in {}: {filed} plane(s) the pool will hold, copied into their \
                  slots at the first weight residency and never read where they lie; the \
                  rest read in place, a GPU touch faulting the page in over HMM",

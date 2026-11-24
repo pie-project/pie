@@ -44,6 +44,9 @@ pub enum ArgValue {
     I32(i32),
     U32(u32),
     F32(f32),
+    /// That many zero u32 scalars: a fired table's rows past those a fire
+    /// fills (`gather.rs_copy_runs`'s runs), laid without one argument each.
+    Zeros(u32),
 }
 
 impl ArgValue {
@@ -55,6 +58,7 @@ impl ArgValue {
             Self::I32(_) => "an i32",
             Self::U32(_) => "a u32",
             Self::F32(_) => "an f32",
+            Self::Zeros(_) => "zero scalars",
         }
     }
 }
@@ -193,6 +197,11 @@ pub struct Fire {
     pub groups: [u32; 3],
 
     pub group: [u32; 3],
+
+    /// A zero count on any axis launches no workgroup at all (its fire
+    /// has nothing to do: a capture with no capturing lane), where a zero
+    /// axis is otherwise taken as one.
+    pub idle: bool,
 }
 
 impl Fire {
@@ -204,7 +213,23 @@ impl Fire {
             tier: Tier::Baseline,
             groups: [1, 1, 1],
             group: [1, 1, 1],
+            idle: false,
         }
+    }
+
+    /// A zero count on any axis launches none ([`Fire::idle`]).
+    #[must_use]
+    pub const fn idle(mut self) -> Self {
+        self.idle = true;
+        self
+    }
+
+    /// Its workgroup counts as a backend launches them: none where
+    /// [`Fire::idle`] and an axis counts zero, the counts as they are
+    /// otherwise.
+    #[must_use]
+    pub fn launched(&self) -> Option<[u32; 3]> {
+        (self.idle && self.groups.contains(&0)).then_some([0, 0, 0])
     }
 
     #[must_use]
@@ -334,12 +359,10 @@ pub(crate) fn instantiated(op: &'static str, name: String) -> Result<&'static st
         .ok_or_else(|| refuse(op, format!("no kernel is instantiated as `{name}`")))
 }
 
-#[allow(dead_code)]
 pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the shader's int")))
 }
 
-#[allow(unused_macros)]
 macro_rules! dtype_dispatch {
     ($op:expr, $dtype:expr, { $($stamped:ident => $arm:expr),+ $(,)? }) => {
         match $dtype {
@@ -354,5 +377,4 @@ macro_rules! dtype_dispatch {
     };
 }
 
-#[allow(unused_imports)]
 pub(crate) use dtype_dispatch;

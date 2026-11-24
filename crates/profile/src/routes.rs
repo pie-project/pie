@@ -35,7 +35,13 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [Kind::Plain, Kind::Gated, Kind::Normed, Kind::NormedGated, Kind::PlainF32];
+    pub const ALL: [Kind; 5] = [
+        Kind::Plain,
+        Kind::Gated,
+        Kind::Normed,
+        Kind::NormedGated,
+        Kind::PlainF32,
+    ];
 }
 
 /// A product's shape as the table keys it.
@@ -57,20 +63,23 @@ pub struct Wanted {
     pub candidates: Vec<u32>,
 }
 
+/// A bank: a product's `(rows, k, m)` as the table keys it.
+type Bank = (u32, u32, u32);
+
 /// A device's measured product times and the shapes they lacked.
 #[derive(Debug, Default)]
 pub struct Routes {
-    times: HashMap<((u32, u32, u32), u32), (Kind, f64, f64)>,
+    times: HashMap<(Bank, u32), (Kind, f64, f64)>,
     wanted: Mutex<BTreeMap<Shape, Wanted>>,
     /// Every shape answered by one kernel: a test's table ([`Routes::all`]).
     all: Option<u32>,
     /// Banks answered by one kernel whatever is measured: a probe's table
     /// while it times a body under each choice ([`Routes::forcing`]).
-    forced: HashMap<(u32, u32, u32), u32>,
+    forced: HashMap<Bank, u32>,
     /// The entries of `times` that are estimates: figures stored under a
-    /// stale key (`profile::fire::Rates::stale`), served as they stand
+    /// stale key (`profile::rates::Rates::stale`), served as they stand
     /// ([`Routes::estimating`]).
-    estimated: std::collections::HashSet<((u32, u32, u32), u32)>,
+    estimated: std::collections::HashSet<(Bank, u32)>,
     /// The shapes [`Routes::pick`] answered by an estimate since the last
     /// call of [`Routes::behind`].
     behind: Mutex<BTreeMap<Shape, Wanted>>,
@@ -78,21 +87,26 @@ pub struct Routes {
     /// the tables a load's measuring lays over this one ([`Routes::with`]),
     /// not with a probe's ([`Routes::forcing`]): what the load's bodies
     /// were armed under ([`Routes::fingerprint`]).
-    picked: std::sync::Arc<Mutex<BTreeMap<(u32, u32, u32), u32>>>,
+    picked: std::sync::Arc<Mutex<BTreeMap<Bank, u32>>>,
 }
 
 impl Routes {
     /// The table `[rates] product_ns` states (entries of a kind this crate
     /// does not know are not read).
     #[must_use]
-    pub fn of(times: &[crate::fire::ProductTime]) -> Self {
+    pub fn of(times: &[crate::rates::ProductTime]) -> Self {
         let mut table = HashMap::new();
         for t in times {
             if let Some(kind) = Kind::ALL.into_iter().find(|k| *k as u32 == t.kind) {
-                table.entry(((t.rows, t.k, t.m), t.kernel)).or_insert((kind, t.ns, t.spread));
+                table
+                    .entry(((t.rows, t.k, t.m), t.kernel))
+                    .or_insert((kind, t.ns, t.spread));
             }
         }
-        Self { times: table, ..Self::default() }
+        Self {
+            times: table,
+            ..Self::default()
+        }
     }
 
     /// The table `measured` states, each entry it lacks answered by
@@ -101,8 +115,8 @@ impl Routes {
     /// load says which banks serve by them.
     #[must_use]
     pub fn estimating(
-        measured: &[crate::fire::ProductTime],
-        estimates: &[crate::fire::ProductTime],
+        measured: &[crate::rates::ProductTime],
+        estimates: &[crate::rates::ProductTime],
     ) -> Self {
         let mut routes = Self::of(measured);
         for (at, time) in Self::of(estimates).times {
@@ -125,7 +139,10 @@ impl Routes {
     /// through the path a body takes.
     #[must_use]
     pub fn all(kernel: u32) -> Self {
-        Self { all: Some(kernel), ..Self::default() }
+        Self {
+            all: Some(kernel),
+            ..Self::default()
+        }
     }
 
     /// The kernel for `shape` among `candidates` (the stated kernel first):
@@ -166,7 +183,9 @@ impl Routes {
             .iter()
             .filter_map(|&kernel| time(kernel).map(|(_, ns, spread)| (kernel, ns, spread)))
             .collect();
-        let estimated = candidates.iter().any(|&kernel| self.estimated.contains(&(bank, kernel)));
+        let estimated = candidates
+            .iter()
+            .any(|&kernel| self.estimated.contains(&(bank, kernel)));
         if known.len() < candidates.len() && !estimated {
             note(&self.wanted, shape, weight, candidates);
             return stated;
@@ -178,13 +197,16 @@ impl Routes {
         if estimated {
             note(&self.behind, shape, weight, candidates);
         }
-        let Some(&(_, stated_ns, stated_spread)) = known.iter().find(|&&(kernel, ..)| kernel == stated)
+        let Some(&(_, stated_ns, stated_spread)) =
+            known.iter().find(|&&(kernel, ..)| kernel == stated)
         else {
             return stated;
         };
         known
             .iter()
-            .filter(|&&(kernel, ns, spread)| kernel != stated && stated_ns - ns > spread.max(stated_spread))
+            .filter(|&&(kernel, ns, spread)| {
+                kernel != stated && stated_ns - ns > spread.max(stated_spread)
+            })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map_or(stated, |&(kernel, ..)| kernel)
     }
@@ -197,7 +219,7 @@ impl Routes {
     #[must_use]
     pub fn fingerprint(&self) -> u32 {
         let picked = self.picked.lock().expect("routes lock poisoned").clone();
-        crate::fire::fingerprint(format!("{picked:?}|{:?}", self.all).as_bytes())
+        crate::rates::fingerprint(format!("{picked:?}|{:?}", self.all).as_bytes())
     }
 
     /// The shapes [`Routes::pick`] met unmeasured since the last call, with
@@ -224,7 +246,12 @@ impl Routes {
             times.insert(at, (shape.kind, ns, spread));
             estimated.remove(&at);
         }
-        Self { times, estimated, picked: self.picked.clone(), ..Self::default() }
+        Self {
+            times,
+            estimated,
+            picked: self.picked.clone(),
+            ..Self::default()
+        }
     }
 
     /// The table with `shape`'s bank answered by `kernel`, whatever is
@@ -262,10 +289,10 @@ fn note(notes: &Mutex<BTreeMap<Shape, Wanted>>, shape: Shape, weight: u64, candi
 
 /// `measured` as `[rates] product_ns` entries.
 #[must_use]
-pub fn product_times(measured: &[(Shape, u32, f64, f64)]) -> Vec<crate::fire::ProductTime> {
+pub fn product_times(measured: &[(Shape, u32, f64, f64)]) -> Vec<crate::rates::ProductTime> {
     measured
         .iter()
-        .map(|&(s, kernel, ns, spread)| crate::fire::ProductTime {
+        .map(|&(s, kernel, ns, spread)| crate::rates::ProductTime {
             kind: s.kind as u32,
             rows: s.rows,
             k: s.k,
@@ -281,7 +308,12 @@ pub fn product_times(measured: &[(Shape, u32, f64, f64)]) -> Vec<crate::fire::Pr
 mod tests {
     use super::*;
 
-    const GATE_UP: Shape = Shape { kind: Kind::NormedGated, rows: 6144, k: 1024, m: 4 };
+    const GATE_UP: Shape = Shape {
+        kind: Kind::NormedGated,
+        rows: 6144,
+        k: 1024,
+        m: 4,
+    };
     const STATED: u32 = 0;
     const OTHER: u32 = 1;
     const THIRD: u32 = 0xdead_beef;
@@ -289,12 +321,24 @@ mod tests {
     #[test]
     fn another_kernel_serves_only_where_it_is_faster_past_the_noise() {
         let routes = |other: f64, stated: f64| {
-            Routes::default().with(&[(GATE_UP, OTHER, other, 100.0), (GATE_UP, STATED, stated, 60.0)])
+            Routes::default().with(&[
+                (GATE_UP, OTHER, other, 100.0),
+                (GATE_UP, STATED, stated, 60.0),
+            ])
         };
-        assert_eq!(routes(9000.0, 9500.0).pick(GATE_UP, 1, &[STATED, OTHER]), OTHER);
+        assert_eq!(
+            routes(9000.0, 9500.0).pick(GATE_UP, 1, &[STATED, OTHER]),
+            OTHER
+        );
         // Within the larger spread: the stated kernel, by rule.
-        assert_eq!(routes(9000.0, 9080.0).pick(GATE_UP, 1, &[STATED, OTHER]), STATED);
-        assert_eq!(routes(9500.0, 9000.0).pick(GATE_UP, 1, &[STATED, OTHER]), STATED);
+        assert_eq!(
+            routes(9000.0, 9080.0).pick(GATE_UP, 1, &[STATED, OTHER]),
+            STATED
+        );
+        assert_eq!(
+            routes(9500.0, 9000.0).pick(GATE_UP, 1, &[STATED, OTHER]),
+            STATED
+        );
     }
 
     #[test]
@@ -309,9 +353,14 @@ mod tests {
 
     #[test]
     fn a_bank_takes_one_kernel_whatever_the_product_does_around_it() {
-        let routes =
-            Routes::default().with(&[(GATE_UP, OTHER, 9000.0, 50.0), (GATE_UP, STATED, 9500.0, 50.0)]);
-        let plain = Shape { kind: Kind::Plain, ..GATE_UP };
+        let routes = Routes::default().with(&[
+            (GATE_UP, OTHER, 9000.0, 50.0),
+            (GATE_UP, STATED, 9500.0, 50.0),
+        ]);
+        let plain = Shape {
+            kind: Kind::Plain,
+            ..GATE_UP
+        };
         assert_eq!(routes.pick(plain, 1, &[STATED, OTHER]), OTHER);
     }
 
@@ -332,7 +381,7 @@ mod tests {
     /// wanted before ready; once timed it is measured, no longer noted.
     #[test]
     fn a_stale_figure_answers_and_is_noted_behind() {
-        let time = |kernel, ns| crate::fire::ProductTime {
+        let time = |kernel, ns| crate::rates::ProductTime {
             kind: Kind::NormedGated as u32,
             rows: GATE_UP.rows,
             k: GATE_UP.k,
@@ -345,7 +394,10 @@ mod tests {
         assert_eq!(routes.pick(GATE_UP, 1, &[STATED, OTHER]), OTHER);
         assert!(routes.wanted().is_empty(), "nothing before ready");
         assert_eq!(routes.behind()[&GATE_UP].candidates, [STATED, OTHER]);
-        let timed = routes.with(&[(GATE_UP, STATED, 9400.0, 10.0), (GATE_UP, OTHER, 9100.0, 10.0)]);
+        let timed = routes.with(&[
+            (GATE_UP, STATED, 9400.0, 10.0),
+            (GATE_UP, OTHER, 9100.0, 10.0),
+        ]);
         assert_eq!(timed.pick(GATE_UP, 1, &[STATED, OTHER]), OTHER);
         assert!(timed.behind().is_empty(), "measured now");
         // A candidate whose code changed (none states it) is not taken; the
@@ -359,13 +411,24 @@ mod tests {
     /// a probe's forced picks never reach the table it was forced off.
     #[test]
     fn the_fingerprint_is_the_picks() {
-        let a = Routes::default().with(&[(GATE_UP, OTHER, 9000.0, 10.0), (GATE_UP, STATED, 9500.0, 10.0)]);
-        let b = Routes::default().with(&[(GATE_UP, OTHER, 8000.0, 10.0), (GATE_UP, STATED, 9600.0, 10.0)]);
+        let a = Routes::default().with(&[
+            (GATE_UP, OTHER, 9000.0, 10.0),
+            (GATE_UP, STATED, 9500.0, 10.0),
+        ]);
+        let b = Routes::default().with(&[
+            (GATE_UP, OTHER, 8000.0, 10.0),
+            (GATE_UP, STATED, 9600.0, 10.0),
+        ]);
         a.pick(GATE_UP, 1, &[STATED, OTHER]);
         b.pick(GATE_UP, 1, &[STATED, OTHER]);
         assert_eq!(a.fingerprint(), b.fingerprint());
-        a.forcing(GATE_UP, STATED).pick(GATE_UP, 1, &[STATED, OTHER]);
-        assert_eq!(a.fingerprint(), b.fingerprint(), "a probe's pick is its own");
+        a.forcing(GATE_UP, STATED)
+            .pick(GATE_UP, 1, &[STATED, OTHER]);
+        assert_eq!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "a probe's pick is its own"
+        );
     }
 
     #[test]

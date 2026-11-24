@@ -26,11 +26,6 @@ pub fn fp8_w8a8_capable() -> bool {
         .is_some_and(|cc| cc >= 89)
 }
 
-/// The fewest routes a block-FP8 select takes [`select_fp8_w8a8`] at, and
-/// the rows of a dense plane [`matmul_fp8_w8a8`] takes, between a decode's
-/// register-held W8A16 kernels and a prefill's widened cuBLAS GEMM.
-pub const FP8_W8A8_FROM: u32 = 64;
-
 pub const FP8_W8A8_DENSE: core::ops::RangeInclusive<u32> = 33..=256;
 
 /// Under an expert table an expert's atom-laid exponents are a run of their
@@ -297,7 +292,16 @@ pub fn select_fp8_w8a8(
         );
     }
     if hopper_wgmma() {
-        let slice: u32 = if per <= 32 { 32 } else { 64 };
+        let window = (ctx.tuning().fp8a8_wgtma && !table.streams())
+            .then(|| map_window(OP, table, codes, experts * y.width, x.width).ok())
+            .flatten();
+        let slice: u32 = if window.is_some() && per <= 8 {
+            16
+        } else if per <= 32 {
+            32
+        } else {
+            64
+        };
         let RouteOrder {
             order,
             offsets,
@@ -320,6 +324,42 @@ pub fn select_fp8_w8a8(
         // `kWgStages` stages of 128 code rows and the slice's route rows, a
         // 128-code K step each, past the 1024-byte alignment.
         let smem = 3 * (128 + slice) * 128 + 1024;
+        if let Some((map_base, map_rows)) = window {
+            use crate::linear::gemm_sm100::{Map, encode};
+            use cudarc::driver::sys as dr;
+            let map_w = encode(Map {
+                ptr: map_base,
+                ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                dims: [x.width, map_rows, 0],
+                strides: [u64::from(x.width), 0],
+                boxes: [128, 128, 1],
+                swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            })?;
+            return ctx.fire(
+                OP,
+                Fire::at(kernel(
+                    SELECT_SM90,
+                    &format!("::pie::linear::moe_select_fp8a8_wgtma<{slice}>"),
+                ))
+                .apply(Launch::grid([y.width / 128, work_cap, 1], [128, 1, 1]).smem(smem + 3 * 8)),
+                &[
+                    ArgValue::of(&map_w),
+                    ArgValue::Ptr(xq),
+                    ArgValue::Ptr(xe),
+                    ArgValue::Ptr(order),
+                    ArgValue::Ptr(offsets),
+                    ArgValue::Ptr(work),
+                    ArgValue::Ptr(atoms),
+                    y.arg(),
+                    act_div.arg(),
+                    n.arg(),
+                    stated(OP, x.width)?.arg(),
+                    stated(OP, experts)?.arg(),
+                    ArgValue::Ptr(table.at()),
+                    ArgValue::Ptr(map_base),
+                ],
+            );
+        }
         return ctx.fire(
             OP,
             Fire::at(kernel(

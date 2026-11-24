@@ -20,6 +20,15 @@ pub use top::{
     Counts, Kept, Refused, choose, choose_shaped, choose_tiled, estimate, line_of, measured_line, rectangle,
 };
 
+/// The lanes one fire may carry on the CUDA shell `pie serve` loads (its
+/// tokens are the largest rung its card holds, derived at load): the
+/// worker's budget and the estimate check's served-shape load both read it.
+pub const CUDA_FIRE_LANES: u32 = 512;
+
+/// The tokens a kv page holds on the CUDA shell `pie serve` loads: the
+/// planner's page.
+pub const CUDA_PAGE_SIZE: u32 = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     pub max_lanes: u32,
@@ -147,7 +156,7 @@ pub struct Residency {
     #[serde(default)]
     pub disk_kv_persistent: bool,
     /// Hands the kv planes to other workers to read in place
-    /// ([`crate::Engine::export_kv_handle`]): the engine commits them whole
+    /// ([`crate::Peers::export`]): the engine commits them whole
     /// at load and keeps them mapped for its life.
     #[serde(default)]
     pub kv_export: bool,
@@ -218,6 +227,17 @@ pub struct LoadRequest {
 pub struct Loaded {
     pub facts: LoadFacts,
     pub caps: Capabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reload {
+    pub checkpoint: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reloaded {
+    pub planes: u32,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

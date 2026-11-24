@@ -396,7 +396,9 @@ async fn main(input: String) -> Result<String, String> {
             Event::Reasoning(_)
             | Event::ReasoningEnd
             | Event::Logprobs(_)
-            | Event::PromptLogprobs(_) => return,
+            | Event::PromptLogprobs(_)
+            | Event::PromptTokens(_)
+            | Event::Tokens(_) => return,
             Event::Text(text) => json!({"text": text}),
             Event::ToolCall(call) => function_call_part(&call),
         };

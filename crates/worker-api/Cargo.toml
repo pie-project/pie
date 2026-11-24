@@ -1,6 +1,7 @@
 [package]
 name = "worker-api"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Gateway↔worker data-plane RPC interface: the `GatewayInbound` (gateway-served) + `WorkerControl` (worker-served) tarpc services that ride one worker→gateway connection, the shared two-way mux glue that splits that one connection into both, the single-sourced MessagePack data-plane codec, and the turn vocabulary those calls carry (Request/Accepted/Tokens/BlobRef/Priority/Control). Final DAG: deps pie-ids (atoms), pie-client-api (ClientMessage/ServerMessage), pie-controller-rpc (WorkerStatus), plus tarpc and its transitive foundations."

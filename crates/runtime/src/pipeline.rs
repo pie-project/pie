@@ -51,6 +51,17 @@ fn opening() {
     *IDLE_AT.lock().unwrap() = None;
 }
 
+/// Forgets the boot's programs, claims and fires, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    program::reset();
+    coalesce::reset();
+    fire::reset();
+    ACTIVE.store(0, std::sync::atomic::Ordering::Release);
+    OPENED.store(0, std::sync::atomic::Ordering::Release);
+    *IDLE_AT.lock().unwrap() = None;
+}
+
 pub struct Pipeline {
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,

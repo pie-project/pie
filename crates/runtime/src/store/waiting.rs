@@ -211,6 +211,16 @@ static LOOKUP_NS: AtomicU64 = AtomicU64::new(0);
 static LOCK_NS: AtomicU64 = AtomicU64::new(0);
 static LOCK_NS_MAX: AtomicU64 = AtomicU64::new(0);
 
+/// Forgets the boot's waiting prompts and counts.
+pub(crate) fn reset() {
+    *WAITING.lock().unwrap() = Waiting::default();
+    WATCHED.store(false, Ordering::Release);
+    REFRESHING.store(false, Ordering::Release);
+    for count in [&REFRESHES, &LOOKUPS, &REPORTS, &LOOKUP_NS, &LOCK_NS, &LOCK_NS_MAX] {
+        count.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The counters above, as `/metrics` lines.
 pub fn metrics() -> String {
     let load = |c: &AtomicU64| c.load(Ordering::Relaxed);

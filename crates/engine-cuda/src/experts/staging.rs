@@ -271,7 +271,7 @@ impl Staging {
     pub fn fact(&self) -> Option<String> {
         (!self.banks.is_empty()).then(|| {
             format!(
-                "engine-cuda: the routed bank(s) {} lie on the host with no table of the \
+                "the routed bank(s) {} lie on the host with no table of the \
                  weight cache: a fire reads its routes back and stages the experts they name \
                  into {} MiB laid at load (each plane the most experts {} rows route to, a \
                  lane for each of {} stream(s) that runs a select), so its fires walk \

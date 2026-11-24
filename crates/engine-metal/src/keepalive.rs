@@ -39,7 +39,7 @@ impl KeepAlive {
     pub fn end(&self) {
         let _ = self
             .busy
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
     #[cfg(target_vendor = "apple")]

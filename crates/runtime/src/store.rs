@@ -169,9 +169,7 @@ pub fn kv_tokens() -> (u64, u64) {
     // The report asks every 100 ms, and counting the cached pages walks every
     // cache entry under the kv lock every guest's fire waits on: the count
     // stands for a second.
-    static LAST: std::sync::Mutex<Option<(crate::rt::Instant, (u64, u64))>> =
-        std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
+    let mut last = KV_TOKENS_LAST.lock().unwrap();
     if let Some((at, tokens)) = *last
         && at.elapsed() < std::time::Duration::from_secs(1)
     {
@@ -242,3 +240,18 @@ pub fn kv_pressure_bucket() -> u8 {
 /// `/metrics`' `pie_kv_cached_from_below_tokens_total`.
 pub static CACHED_FROM_BELOW_TOKENS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Forgets the boot's stores and what their engines were set to, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    registry::reset();
+    shared::reset();
+    waiting::reset();
+    *KV_TOKENS_LAST.lock().unwrap() = None;
+    CACHED_FROM_BELOW_TOKENS.store(0, std::sync::atomic::Ordering::Relaxed);
+    kv::RELIST_COPIES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The last [`kv_tokens`] count and when it was taken.
+static KV_TOKENS_LAST: std::sync::Mutex<Option<(crate::rt::Instant, (u64, u64))>> =
+    std::sync::Mutex::new(None);

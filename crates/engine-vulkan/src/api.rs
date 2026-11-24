@@ -5,11 +5,9 @@
 
 use std::path::PathBuf;
 
-#[cfg(feature = "vulkan")]
-use engine::Engine;
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireTicket, Step};
-use engine::transfer::MemoryDomain;
+use engine::transfer::{DeviceReach, MemoryDomain};
 use eta_ir::registry::{PortMask, Stage};
 
 use engine_gpu::api::{Envelope, Host, PendingStep, each_pass, fault, program_attachments};
@@ -61,11 +59,18 @@ pub struct DeviceBoot {
     pub submit_bound: Option<std::time::Duration>,
 
     /// A test's load whose harness states what the test fires: its fires
-    /// laid to the rows its budgets state, in place of the ruling's fire
+    /// laid to the rows its budgets state, in place of the fire-top rule's fire
     /// top (`engine_gpu::serve::Serve::fires_stated`). Test builds only
     /// (`test-limits`): no config or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub fires_stated: bool,
+
+    /// A test's device that lays its pool whole, as one without
+    /// update-after-bind storage buffers does (`Context::resizes_pool`),
+    /// though it has them. Test builds only (`test-limits`): no config or
+    /// profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub whole_pool: bool,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;
@@ -77,7 +82,10 @@ impl Host for Api {
     type Programs = crate::program::Plane;
 
     fn domain(boot: &DeviceBoot) -> MemoryDomain {
-        MemoryDomain::VulkanDevice(boot.device_index)
+        MemoryDomain::Device {
+            ordinal: boot.device_index,
+            reach: DeviceReach::Private,
+        }
     }
 
     fn measured_on(device: &crate::device::Context) -> String {
@@ -321,7 +329,7 @@ fn defers(gpu: &Vulkan, step: &Step) -> bool {
     #[cfg(feature = "vulkan")]
     {
         gpu.sink.is_some()
-            && gpu.settles_asynchronously()
+            && Api::settles_asynchronously(gpu)
             && program_attachments(step).next().is_some()
             && program_attachments(step).all(|attachment| gpu.programs.defers(attachment.instance))
     }

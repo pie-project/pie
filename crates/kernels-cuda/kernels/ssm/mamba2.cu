@@ -581,7 +581,7 @@ __global__ void __launch_bounds__(128) mamba2_scan(
     }
 }
 
-// A beam group's fold of its Mamba-2 state (BEAM-PAGE-LISTS §11.3): its fold
+// A beam group's fold of its Mamba-2 state: its fold
 // rows (step sizes and `x | B`: planes 0 and 1, through the representative
 // lane's pages) folded in order, `S <- a S + (dt x) B^T`, `a = exp(-exp(A_log)
 // dt)`, as a decode step folds a committed row, and the state stored once. A

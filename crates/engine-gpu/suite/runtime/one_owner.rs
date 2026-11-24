@@ -125,13 +125,12 @@ fn one_program_driving_eight_lanes_settles_every_step() {
     let table = planes["embed"].1.clone();
     let (tx, heard) = mpsc::channel::<(StepDone, StepOutcome)>();
     let tx = Mutex::new(tx);
-    engine.on_complete(Arc::new(move |at, outcome| {
+    engine::Completion::on_complete(&mut engine, Arc::new(move |at, outcome| {
         let _ = tx.lock().expect("the sink's sender").send((at, outcome));
     }));
-    let asynchronous = engine.settles_asynchronously();
+    let asynchronous = engine::Completion::asynchronous(&engine);
 
-    let program = engine
-        .register_program(&registration_of(&output_decls(&caps), sampler(), 0x0e8))
+    let program = engine::Programs::register(&mut engine, &registration_of(&output_decls(&caps), sampler(), 0x0e8))
         .expect("the sampler registers");
     let chunks = &caps.caps.chunks;
     let mut slots = Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
@@ -187,8 +186,7 @@ fn one_program_driving_eight_lanes_settles_every_step() {
                 },
                 &channels,
             );
-            engine
-                .bind_instance(&binding)
+            engine::Programs::bind(&mut engine, &binding)
                 .expect("a lane's sampler binds")
                 .id
         })
@@ -278,8 +276,7 @@ fn one_program_driving_eight_lanes_settles_every_step() {
         let mut want = seed;
         for at in 0..STEPS {
             want = argmax(&table, want);
-            let cell = engine
-                .take_channel(instance, 1)
+            let cell = engine::Channels::take(&mut engine, instance, 1)
                 .expect("the token ring reads")
                 .unwrap_or_else(|| panic!("lane {lane}: no token at step {at}"));
             let got = i32::from_le_bytes(cell[..4].try_into().expect("an i32 cell"));

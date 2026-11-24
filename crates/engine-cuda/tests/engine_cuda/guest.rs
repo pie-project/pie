@@ -95,15 +95,19 @@ impl Guest {
     pub fn on(engine: &mut dyn Engine, facts: &ChunkFacts) -> Guest {
         let segments = facts.segments.committed.max(1);
         engine
-            .commit_segments(segments)
+            .pool()
+            .expect("the engine keeps a pool")
+            .commit(segments)
             .expect("the first segment commits");
         Guest::of(facts, segments * facts.segment_chunks)
     }
 
     /// Fresh `Channel` slots for a ring of `registration`, where the runtime
     /// would copy it back to on a restore.
-    pub fn ring(&mut self, engine: &dyn Engine, registration: &ChannelRegistration) -> Vec<u32> {
+    pub fn ring(&mut self, engine: &mut dyn Engine, registration: &ChannelRegistration) -> Vec<u32> {
         engine
+            .channels()
+            .expect("the engine holds channels")
             .ring_facts(registration)
             .expect("the channel's ring facts")
             .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint))
@@ -117,12 +121,13 @@ impl Guest {
 
     /// Registers `registration` over the channel slots its ring facts state.
     pub fn register(&mut self, engine: &mut dyn Engine, registration: ChannelRegistration) {
-        let slots = engine
+        let channels = engine.channels().expect("the engine holds channels");
+        let slots = channels
             .ring_facts(&registration)
             .expect("the channel's ring facts")
             .map_or_else(Vec::new, |facts| self.channel.take(&facts.footprint));
-        engine
-            .register_channel(&ChannelRegistration {
+        channels
+            .open(&ChannelRegistration {
                 slots,
                 ..registration
             })
@@ -205,8 +210,9 @@ impl Guest {
     /// state where its guest state says; every channel it names is a
     /// registered one.
     pub fn bind(&mut self, engine: &mut dyn Engine, binding: InstanceBinding) -> BoundInstance {
+        let engine = engine.programs().expect("the engine runs programs");
         let facts = engine
-            .program_facts(binding.program)
+            .facts(binding.program)
             .expect("the program's facts");
         let named: Vec<ChannelId> = binding.channels.clone();
         let (instance_slots, ring_slots) =
@@ -216,7 +222,7 @@ impl Guest {
             .expect("the program's guest state");
         let (scratch, pair) = self.places((binding.program, binding.extents), &state);
         engine
-            .bind_instance(&InstanceBinding {
+            .bind(&InstanceBinding {
                 instance_slots,
                 ring_slots,
                 scratch,
