@@ -22,22 +22,6 @@ pub struct Diagnostics {
     /// device profile's: a small one cuts a miniature's records into the
     /// pieces only a full model's take.
     pub chunk_bytes: Option<u64>,
-    /// States no expert shape: the routed banks stay dense on the device,
-    /// while the tables streamed by their rows are stated.
-    pub dense_experts: bool,
-    /// States no expert shape and still moves the routed banks the weight
-    /// cache would stream to the host tier: no table reads them, and each
-    /// fire stages the experts it routes to (`experts::staging`).
-    pub untabled_experts: bool,
-    /// Lays every windowed kv row in one window list, of the widest window:
-    /// a row of a narrower window then keeps pages its kernels no longer
-    /// read. The same logits as a list a window.
-    pub one_window: bool,
-    /// Serves the windowed kv rows as ring + buffer (CONTRACT-BC 19, 21):
-    /// each windowed layer's last folded rows a ring in the lane's record,
-    /// its unfolded rows in the window buffer. The window lists' path until
-    /// the windowed-state change integrates.
-    pub windowed_state: bool,
     /// Copies between the device and the host tier ride the compute stream,
     /// ahead of every fire after them, not the swap stream beside those
     /// fires: to weigh the overlap.
@@ -79,10 +63,6 @@ impl Default for Diagnostics {
             fuse_chains: true,
             sync_guard: None,
             chunk_bytes: None,
-            dense_experts: false,
-            untabled_experts: false,
-            one_window: false,
-            windowed_state: false,
             tier_inline: false,
             unwritten_nan: false,
         }
@@ -136,18 +116,6 @@ impl Diagnostics {
         if let Some(bytes) = self.chunk_bytes {
             words.push(format!("chunk-bytes={bytes}"));
         }
-        if self.dense_experts {
-            words.push("dense-experts".to_string());
-        }
-        if self.untabled_experts {
-            words.push("untabled-experts".to_string());
-        }
-        if self.one_window {
-            words.push("one-window".to_string());
-        }
-        if self.windowed_state {
-            words.push("windowed-state".to_string());
-        }
         if self.tier_inline {
             words.push("tier-inline".to_string());
         }
@@ -173,8 +141,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, \
-     `dense-experts`, `untabled-experts`, `one-window`, `windowed-state`, `tier-inline`, \
-     `unwritten-nan`";
+     `tier-inline`, `unwritten-nan`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -198,10 +165,6 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
-                "dense-experts" => diag.dense_experts = switch(word, value)?,
-                "untabled-experts" => diag.untabled_experts = switch(word, value)?,
-                "one-window" => diag.one_window = switch(word, value)?,
-                "windowed-state" => diag.windowed_state = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
                 "unwritten-nan" => diag.unwritten_nan = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
@@ -253,8 +216,8 @@ static PUBLISHED: OnceLock<Diagnostics> = OnceLock::new();
 pub(crate) fn publish(stated: &Diagnostics) {
     let published = PUBLISHED.get_or_init(|| stated.clone());
     if published != stated {
-        eprintln!(
-            "engine-cuda: this process already published a diagnostics record \
+        tracing::warn!(
+            "this process already published a diagnostics record \
              ({}), so the one this boot states ({}) is ignored; every rank of a \
              group traces the same thing",
             published.words().unwrap_or_else(|| "none".to_string()),

@@ -396,35 +396,6 @@ pub fn causal_conv1d_carried(
     )
 }
 
-/// [`short_conv`] over each lane's carried rows then its own, as
-/// [`causal_conv1d_carried`].
-#[allow(clippy::too_many_arguments)]
-pub fn short_conv_carried(
-    ctx: &Ctx,
-    x: Tensor,
-    weight: Tensor,
-    state: &RecurrentPool,
-    conv_width: u32,
-    y: &mut Tensor,
-    carry: &Carry,
-) -> Result<(), Error> {
-    const OP: &str = "ssm.short_conv";
-    conv1d_carried(
-        ctx,
-        OP,
-        x,
-        weight,
-        None,
-        state,
-        conv_width,
-        1,
-        y,
-        ConvOut::Residual,
-        carry,
-        None,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn conv1d_carried(
     ctx: &Ctx,

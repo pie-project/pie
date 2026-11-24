@@ -139,11 +139,31 @@ pub struct Knobs {
     /// profile's bodies), in place of serving's captured bodies.
     #[cfg(feature = "test-pins")]
     pub pin: Option<(Graphs, Option<Recording>)>,
-    /// A test's load that states no weight shape: every table and routed
-    /// bank the weight cache would stream stays dense on the device, as a
-    /// load that predates the cache seats it.
+    /// A test's weight residency in place of the weight cache's
+    /// ([`WeightPin`]).
     #[cfg(feature = "test-pins")]
-    pub dense_weights: bool,
+    pub weights: WeightPin,
+}
+
+/// A test build's weight residency (feature `test-pins`): what the weight
+/// cache streams, or a part of it seated otherwise. Serving is always
+/// [`WeightPin::Cached`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeightPin {
+    /// The weight cache streams its tables by their rows and its routed
+    /// banks an expert at a time.
+    #[default]
+    Cached,
+    /// No weight shape stated: every table and routed bank the cache would
+    /// stream stays dense on the device.
+    Dense,
+    /// The routed banks stay dense on the device; the tables streamed by
+    /// their rows are stated.
+    DenseExperts,
+    /// The routed banks move to the host tier with no shape: no table reads
+    /// them, and each fire stages the experts it routes to
+    /// (`experts::staging`).
+    UntabledExperts,
 }
 
 impl Knobs {
@@ -164,14 +184,26 @@ impl Knobs {
         (Graphs::On, bodies)
     }
 
-    /// Whether the load states no weight shape ([`Knobs::dense_weights`]);
-    /// never outside a test build.
+    /// The weight residency the load seats ([`Knobs::weights`]); the
+    /// cache's outside a test build.
+    #[must_use]
+    pub fn weight_pin(&self) -> WeightPin {
+        #[cfg(feature = "test-pins")]
+        return self.weights;
+        #[cfg(not(feature = "test-pins"))]
+        WeightPin::Cached
+    }
+
+    /// Whether the load states no weight shape ([`WeightPin::Dense`]).
     #[must_use]
     pub fn dense_weights(&self) -> bool {
-        #[cfg(feature = "test-pins")]
-        return self.dense_weights;
-        #[cfg(not(feature = "test-pins"))]
-        false
+        self.weight_pin() == WeightPin::Dense
+    }
+
+    /// Whether the routed banks stay dense on the device: no expert shape.
+    #[must_use]
+    pub fn dense_experts(&self) -> bool {
+        matches!(self.weight_pin(), WeightPin::Dense | WeightPin::DenseExperts)
     }
 }
 

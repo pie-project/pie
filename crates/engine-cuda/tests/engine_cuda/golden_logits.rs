@@ -655,16 +655,13 @@ pub(super) fn knobs() -> engine_cuda::Knobs {
     if std::env::var_os("PIE_GOLDEN_EAGER").is_some() {
         knobs.pin = Some((engine_cuda::Graphs::Off, Some(engine_cuda::Recording::Off)));
     }
-    // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
-    knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
-    knobs.diagnostics.windowed_state = std::env::var_os("PIE_GOLDEN_WINDOWED_STATE").is_some();
     knobs.diagnostics.arm_trace = std::env::var_os("PIE_GOLDEN_ARM_TRACE").is_some();
     // `PIE_GOLDEN_TIER_INLINE`: tier copies ride the compute stream.
     knobs.diagnostics.tier_inline = std::env::var_os("PIE_GOLDEN_TIER_INLINE").is_some();
     // No weight shape stated: the tables and routed banks dense on the
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
-    knobs.dense_weights = true;
+    knobs.weights = engine_cuda::WeightPin::Dense;
     knobs.chip = picked(&cache_dir(), knobs.profiles.as_deref());
     knobs
 }
@@ -966,10 +963,9 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             u32::try_from(tokens.len()).expect("a count"),
             false,
         ));
-        let more: Vec<&[u32]> = windows.iter().skip(1).map(Vec::as_slice).collect();
         let window = windows.first().map_or(&[][..], Vec::as_slice);
         fn seat<'a>(
-            (pages, window, more, record): (&'a [u32], &'a [u32], &'a [&'a [u32]], Option<u32>),
+            (pages, window, record): (&'a [u32], &'a [u32], Option<u32>),
             word: u64,
             tokens: &'a [u32],
             held: u32,
@@ -978,7 +974,6 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 pages,
                 held: Some(held),
                 window,
-                more_windows: more,
                 rs_slot: record,
                 ..Seated::of(Lane {
                     slot: 0,
@@ -987,7 +982,7 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
                 })
             }
         }
-        let tables = (&pages[..], window, &more[..], record);
+        let tables = (&pages[..], window, record);
         let seated = |word, tokens, held| seat(tables, word, tokens, held);
         // A long prompt of a load that replays (`engine_cuda::replay`) fires
         // as the runtime's step and `Shell::fire` split it: its leading rows
@@ -3059,8 +3054,7 @@ fn served_rows(fixture: &Fixture, cache: &Path, rows: Rows) -> (Vec<(u64, u32)>,
     // The table's rows alone: the model's routed experts dense, as the
     // base engine seats them.
     let mut knobs = knobs();
-    knobs.dense_weights = false;
-    knobs.diagnostics.dense_experts = true;
+    knobs.weights = engine_cuda::WeightPin::DenseExperts;
     let mut shell = load_with(fixture, cache, knobs);
     let facts = shell.chunk_facts().expect("the pool states its chunks");
     facts.validate().expect("the engine's chunk facts hold");
@@ -3207,7 +3201,7 @@ fn served_experts_as(fixture: &Fixture, cache: &Path, rows: Rows, told: bool) ->
     let began = std::time::Instant::now();
     use engine::chunk::{ResidentWeight, WeightAtom, WeightKind, WeightResidency};
     let mut knobs = knobs();
-    knobs.dense_weights = false;
+    knobs.weights = engine_cuda::WeightPin::Cached;
     knobs.weights_held = told;
     let mut shell = load_with(fixture, cache, knobs);
     let loaded = began.elapsed();
@@ -3431,7 +3425,7 @@ fn golden_measuring_refit() {
         std::fs::create_dir_all(&own).unwrap_or_else(|why| panic!("{}: {why}", own.display()));
         let told = || {
             let mut knobs = knobs();
-            knobs.dense_weights = false;
+            knobs.weights = engine_cuda::WeightPin::Cached;
             knobs.weights_held = true;
             knobs
         };
@@ -4013,8 +4007,7 @@ fn golden_budget_probe() {
         for &budget in &budgets {
             let mut knobs = knobs();
             if std::env::var_os("PIE_GOLDEN_UNTABLED").is_some() {
-                knobs.dense_weights = false;
-                knobs.diagnostics.untabled_experts = true;
+                knobs.weights = engine_cuda::WeightPin::UntabledExperts;
             }
             let allowance = engine::Allowance {
                 budget: Some(budget),
@@ -4050,8 +4043,7 @@ fn least_budget(
     let knobs = || {
         let mut knobs = knobs();
         if untabled {
-            knobs.dense_weights = false;
-            knobs.diagnostics.untabled_experts = true;
+            knobs.weights = engine_cuda::WeightPin::UntabledExperts;
         }
         knobs
     };
@@ -4111,7 +4103,7 @@ fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
 /// The staged-experts probe: `PIE_GOLDEN_MODELS` (quantized MoE miniatures;
 /// DeepSeek-V4-Flash's u4g64 one by default) loaded with its routed banks on
 /// the host tier and no table of the weight cache reading them
-/// (`untabled-experts`), so each fire stages the experts it routes to into
+/// (`WeightPin::UntabledExperts`), so each fire stages the experts it routes to into
 /// the run the load laid. The staging is the bound times its streams, the
 /// steps serve the device-resident banks' logits, a fire past the first
 /// round takes no device memory, the ledger enters it, no budget loads it
@@ -4144,8 +4136,7 @@ fn golden_staged_experts() {
 
         let staged = || {
             let mut knobs = knobs();
-            knobs.dense_weights = false;
-            knobs.diagnostics.untabled_experts = true;
+            knobs.weights = engine_cuda::WeightPin::UntabledExperts;
             knobs
         };
         let mut shell = load_with(&fixture, &cache, staged());
@@ -4354,8 +4345,8 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
 }
 
 /// CONTRACT-BC 19: a load serving its windowed rows as ring + buffer arms
-/// every composition it fires, as its window lists do (the arming pass's
-/// synthetic lanes fold on records of their own): `PIE_GOLDEN_MODELS`
+/// every composition it fires (the arming pass's synthetic lanes fold on
+/// records of their own): `PIE_GOLDEN_MODELS`
 /// (default the mini Gemma and MiMo, windowed beside full attention, MiMo's
 /// routed), many seats.
 #[test]
@@ -4372,9 +4363,7 @@ fn golden_windowed_arms() {
     );
     for model in models {
         let fixture = fixture(&model, &cache);
-        let mut knobs = knobs();
-        knobs.diagnostics.windowed_state = true;
-        let shell = load_lanes(&fixture, &cache, knobs, 16, None);
+        let shell = load_lanes(&fixture, &cache, knobs(), 16, None);
         assert!(
             !shell.windowed_layers().is_empty(),
             "{model}: the load keeps rings"

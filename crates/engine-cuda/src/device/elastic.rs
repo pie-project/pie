@@ -158,7 +158,7 @@ impl PhysicalPool {
             let (free, total) = crate::device::card::memory()?;
             let beside = Beside::read()?;
             if !beside.said.is_empty() {
-                eprintln!("engine-cuda: outside the pool, {}", beside.said);
+                tracing::info!("outside the pool, {}", beside.said);
             }
             let budget = room_under(ceiling, free, total);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);

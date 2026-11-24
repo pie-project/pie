@@ -346,7 +346,7 @@ fn serve(
             Ok(Some(done)) => Some(Ok(done)),
             Ok(None) => None,
             Err(error) => {
-                eprintln!("engine-cuda: expert-parallel rank {rank} refused: {error}");
+                tracing::warn!("expert-parallel rank {rank} refused: {error}");
                 Some(Err(error))
             }
         };

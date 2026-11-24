@@ -1975,8 +1975,8 @@ pub fn masked_units(units: u32, ordinal: u32) -> u32 {
         masks.global_cu_mask.as_deref(),
     );
     if held != units {
-        eprintln!(
-            "engine-cuda: {held} of the device's {units} compute units are this process's \
+        tracing::info!(
+            "{held} of the device's {units} compute units are this process's \
              queues' (a CU mask); every grid, arena and sampler is laid over those"
         );
     }
