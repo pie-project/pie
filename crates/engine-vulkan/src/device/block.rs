@@ -23,36 +23,47 @@ use super::ctx::{Context, Core};
 /// last, so a walk of any length lays its block in a handful.
 const FIRST_CHUNK: u64 = 64 << 10;
 
-/// What a walk laid in a fire block, chunk by chunk, through each chunk's
-/// last byte laid: what a fire of that walk's shape writes there.
+/// What a walk laid in a fire block: what a fire of that walk's shape
+/// writes there. An arm-less frame's lies chunk by chunk, through each
+/// chunk's last byte laid. An arm's is sparse: each lay's bytes through its
+/// last non-zero one (a table laid at its full width is mostly zeros past
+/// its rows), where in the block each run lies, and the block's extent;
+/// what lies between the runs is zero.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Image {
     chunks: Vec<Vec<u8>>,
+    /// An arm's runs' bytes, one after another.
+    bytes: Vec<u8>,
+    /// Each run's place in the block and length, in order, none touching.
+    runs: Vec<(u32, u32)>,
+    /// The block's bytes through the last laid.
+    extent: u64,
     /// The bytes' hash, taken once the walk is done ([`Image::sealed`]).
     hash: u64,
 }
 
 impl Image {
-    /// Whether `other` holds the same bytes in the same chunks.
+    /// Whether `other` holds the same bytes in the same places.
     #[must_use]
     pub fn same(&self, other: &Image) -> bool {
         self.chunks == other.chunks
+            && self.runs == other.runs
+            && self.bytes == other.bytes
+            && self.extent == other.extent
     }
 
-    /// The bytes each chunk holds, in order: the block's layout.
+    /// The bytes the image keeps, each chunk's or the runs'.
     #[must_use]
     pub fn layout(&self) -> Vec<usize> {
-        self.chunks.iter().map(Vec::len).collect()
+        let mut kept: Vec<usize> = self.chunks.iter().map(Vec::len).collect();
+        kept.push(self.bytes.len());
+        kept
     }
 
     /// The image with its hash taken, as a fire keeps it.
     #[must_use]
     pub fn sealed(&self) -> Image {
-        Image {
-            chunks: self.chunks.clone(),
-            hash: 0,
-        }
-        .seal()
+        self.clone().seal()
     }
 
     /// [`Self::sealed`], taking the image rather than copying it.
@@ -62,12 +73,48 @@ impl Image {
         for chunk in &mut self.chunks {
             chunk.shrink_to_fit();
         }
-        self.hash = words_hash(&self.chunks);
+        self.bytes.shrink_to_fit();
+        self.runs.shrink_to_fit();
+        let mut hash = words_hash(&self.chunks) ^ words_hash(std::slice::from_ref(&self.bytes));
+        for &(at, len) in &self.runs {
+            hash = (hash ^ (u64::from(at) << 32 | u64::from(len))).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.hash = (hash ^ self.extent) | 1;
         self
     }
 
     fn bytes(&self) -> u64 {
-        self.chunks.first().map_or(0, |chunk| chunk.len() as u64)
+        if self.chunks.is_empty() {
+            self.extent
+        } else {
+            self.chunks.first().map_or(0, |chunk| chunk.len() as u64)
+        }
+    }
+
+    /// Each run's place and bytes, in order.
+    fn runs(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        let mut from = 0usize;
+        self.runs.iter().map(move |&(at, len)| {
+            let run = &self.bytes[from..from + len as usize];
+            from += len as usize;
+            (u64::from(at), run)
+        })
+    }
+
+    /// Lays `bytes` at `at` of an arm's block: through their last non-zero
+    /// byte, joined to the run before where it ends at `at`.
+    fn lay_sparse(&mut self, at: u64, bytes: &[u8]) {
+        self.extent = self.extent.max(at + bytes.len() as u64);
+        let kept = bytes.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1);
+        if kept == 0 {
+            return;
+        }
+        let place = u32::try_from(at).expect("an arm's block lies inside u32 bytes");
+        match self.runs.last_mut() {
+            Some((start, len)) if u64::from(*start) + u64::from(*len) == at => *len += kept as u32,
+            _ => self.runs.push((place, kept as u32)),
+        }
+        self.bytes.extend_from_slice(&bytes[..kept]);
     }
 }
 
@@ -81,7 +128,7 @@ pub struct ArmBlock {
     /// The bytes of the sealed image the staging slice holds (and, every
     /// write being followed by a head that copies the slice, the block),
     /// with their hash: a fire's image that matches both needs no head.
-    staged: Mutex<Option<(u64, Vec<u8>)>>,
+    staged: Mutex<Option<Image>>,
     /// The heads recordings of the arm share ([`super::Frame`]'s head), by
     /// the bytes each copies (a power of two, at most the block's): one
     /// command buffer for every recording whose image fits, not one each.
@@ -120,23 +167,48 @@ impl ArmBlock {
     /// the arm: its last fire has landed.
     pub(crate) fn stage(&self, image: &Image) -> Result<bool> {
         let mut staged = self.staged.lock().expect("staged lock poisoned");
-        let bytes = image.chunks.first().map_or(&[][..], Vec::as_slice);
-        // The hash over the whole image, then the bytes themselves: a few
-        // kilobytes, against a head's copy and two barriers.
         if image.hash != 0
             && staged
                 .as_ref()
-                .is_some_and(|(hash, held)| *hash == image.hash && held.as_slice() == bytes)
+                .is_some_and(|held| held.hash == image.hash && held.same(image))
         {
             return Ok(false);
         }
-        // Forgotten first: a write that fails leaves no image held.
-        *staged = None;
-        if !bytes.is_empty() {
-            self.staging.write_shared(0, bytes)?;
+        // Forgotten first: a write that fails leaves the slice unknown, and
+        // the next stage writes it whole.
+        let before = staged.take();
+        // Each run, then zeros where the image the slice held had bytes the
+        // new one does not cover (between its runs the block is zero).
+        for (at, run) in image.runs() {
+            self.staging.write_shared(at, run)?;
+        }
+        let zeros = |from: u64, to: u64| -> Result<()> {
+            const ZEROS: [u8; 4096] = [0; 4096];
+            let mut at = from;
+            while at < to {
+                let len = (to - at).min(ZEROS.len() as u64);
+                self.staging.write_shared(at, &ZEROS[..len as usize])?;
+                at += len;
+            }
+            Ok(())
+        };
+        let stale = match &before {
+            Some(held) => stale(&held.runs, &image.runs),
+            // Nothing known of what the slice holds: zeros between the runs
+            // through the image's extent.
+            None => gaps(&image.runs, image.extent),
+        };
+        for (from, to) in stale {
+            zeros(from, to)?;
         }
         if image.hash != 0 {
-            *staged = Some((image.hash, bytes.to_vec()));
+            *staged = Some(Image {
+                chunks: Vec::new(),
+                bytes: image.bytes.clone(),
+                runs: image.runs.clone(),
+                extent: image.extent,
+                hash: image.hash,
+            });
         }
         Ok(true)
     }
@@ -153,6 +225,55 @@ enum Place {
     Own(Vec<Buffer>),
     /// The arm's block, the host laying the image alone.
     Arm(Arc<ArmBlock>),
+}
+
+/// What of `held`'s runs `new`'s do not cover, each `(from, to)` in order:
+/// the bytes a slice that held `held` must zero to hold `new`.
+fn stale(held: &[(u32, u32)], new: &[(u32, u32)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut next = new.iter().peekable();
+    for &(at, len) in held {
+        let (mut from, to) = (u64::from(at), u64::from(at) + u64::from(len));
+        while from < to {
+            while next
+                .peek()
+                .is_some_and(|&&(start, len)| u64::from(start) + u64::from(len) <= from)
+            {
+                next.next();
+            }
+            match next.peek() {
+                Some(&&(start, len)) if u64::from(start) <= from => {
+                    from = u64::from(start) + u64::from(len);
+                }
+                Some(&&(start, _)) => {
+                    let end = u64::from(start).min(to);
+                    out.push((from, end));
+                    from = end;
+                }
+                None => {
+                    out.push((from, to));
+                    from = to;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The bytes through `extent` no run of `runs` covers, in order.
+fn gaps(runs: &[(u32, u32)], extent: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut from = 0u64;
+    for &(at, len) in runs {
+        if u64::from(at) > from {
+            out.push((from, u64::from(at)));
+        }
+        from = u64::from(at) + u64::from(len);
+    }
+    if extent > from {
+        out.push((from, extent));
+    }
+    out
 }
 
 /// A hash of `chunks`' bytes, eight at a time: what tells a staged image
@@ -176,6 +297,7 @@ fn words_hash(chunks: &[Vec<u8>]) -> u64 {
     // 0 is no hash at all ([`ArmBlock::stage`]).
     hash | 1
 }
+
 
 pub(crate) struct FireBlock {
     place: Place,
@@ -222,11 +344,7 @@ impl FireBlock {
         let len = bytes.len() as u64;
         match &mut self.place {
             Place::Arm(arm) => {
-                if self.image.chunks.is_empty() {
-                    self.image.chunks.push(Vec::new());
-                }
-                let used = &mut self.image.chunks[0];
-                let at = (used.len() as u64).next_multiple_of(align);
+                let at = self.image.extent.next_multiple_of(align);
                 if at + len > arm.bytes() {
                     return Err(Fault::Ceiling {
                         what: "bytes of an arm's fire block (laid at load for the load's widest fire)",
@@ -234,8 +352,7 @@ impl FireBlock {
                         have: arm.bytes(),
                     });
                 }
-                used.resize(at as usize, 0);
-                used.extend_from_slice(bytes);
+                self.image.lay_sparse(at, bytes);
                 Ok((Arc::clone(arm.block.slab()), 0, at))
             }
             Place::Own(chunks) => {
@@ -288,5 +405,37 @@ impl FireBlock {
             Place::Arm(_) => self.image.bytes(),
             Place::Own(_) => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Image, gaps, stale};
+
+    #[test]
+    fn a_lay_keeps_its_bytes_through_the_last_non_zero_and_joins_its_neighbour() {
+        let mut image = Image::default();
+        image.lay_sparse(0, &[1, 2, 0, 0]);
+        image.lay_sparse(4, &[3, 0]);
+        image.lay_sparse(64, &[0, 0, 0]);
+        image.lay_sparse(128, &[0, 5, 0]);
+        assert_eq!(image.runs, vec![(0, 2), (4, 1), (128, 2)]);
+        assert_eq!(image.bytes, vec![1, 2, 3, 0, 5]);
+        assert_eq!(image.extent, 131);
+        let mut joined = Image::default();
+        joined.lay_sparse(0, &[1, 1]);
+        joined.lay_sparse(2, &[2]);
+        assert_eq!(joined.runs, vec![(0, 3)]);
+    }
+
+    #[test]
+    fn the_slice_zeros_what_the_held_runs_had_and_the_new_ones_miss() {
+        assert_eq!(stale(&[(0, 10)], &[(2, 3)]), vec![(0, 2), (5, 10)]);
+        assert_eq!(stale(&[(0, 4), (8, 4)], &[(0, 4), (8, 2)]), vec![(10, 12)]);
+        assert_eq!(stale(&[(4, 4)], &[]), vec![(4, 8)]);
+        assert_eq!(stale(&[(4, 4)], &[(0, 16)]), Vec::<(u64, u64)>::new());
+        assert_eq!(stale(&[(0, 16)], &[(2, 2), (6, 2)]), vec![(0, 2), (4, 6), (8, 16)]);
+        assert_eq!(gaps(&[(2, 2), (8, 4)], 16), vec![(0, 2), (4, 8), (12, 16)]);
+        assert_eq!(gaps(&[], 5), vec![(0, 5)]);
     }
 }
