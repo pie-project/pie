@@ -11,23 +11,12 @@ use engine_metal::encode::Sink;
 use kernels_metal::linear::{mlp, moe, qmm};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
+use crate::common::{bf16, noise};
 
 const EXPERTS: u32 = 24;
 const TOP_K: u32 = 8;
 const HIDDEN: u32 = 2048;
 const INTER: u32 = 512;
-
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
 
 fn floats(raw: &[u8]) -> Vec<f32> {
     raw.chunks(2)

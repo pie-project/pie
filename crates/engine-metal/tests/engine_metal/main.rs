@@ -1,5 +1,6 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
+mod common;
 mod a_bank_past_2_gib_reads_its_last_rows;
 mod a_beam_step_follows_the_spec;
 mod a_bound_guest_leaves_the_span_as_it_was;

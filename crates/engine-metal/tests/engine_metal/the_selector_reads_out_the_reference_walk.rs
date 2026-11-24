@@ -7,6 +7,7 @@ use kernels_metal::sampling;
 use kernels_metal::sampling::selector_walk;
 use kernels_metal::tensor::RaggedTensor;
 use poem_ir::Dtype;
+use crate::common::{bf16_bytes, bf16_round};
 
 const K: u32 = 16;
 const RANK: u32 = 256;
@@ -23,19 +24,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {

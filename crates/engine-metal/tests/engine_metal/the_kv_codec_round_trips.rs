@@ -27,6 +27,7 @@ use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::attn::kv_codec;
 use poem_ir::Dtype;
+use crate::common::{bf16_bits_to_f32, f32_to_bf16_bits};
 
 const BLOCK: usize = 256;
 
@@ -93,17 +94,6 @@ fn f32_floats(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|c| f32::from_le_bytes(*c))
         .collect()
-}
-
-/// bf16 store/load: bf16 is the top 16 bits of f32 with round-to-nearest-even.
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
-}
-
-fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
 }
 
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {

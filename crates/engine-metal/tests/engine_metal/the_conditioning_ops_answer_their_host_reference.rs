@@ -6,6 +6,7 @@ use kernels_metal::elemwise::{gate, modulate, norm, pointwise, rope_axes, sinuso
 use kernels_metal::gather;
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
@@ -16,28 +17,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
-}
-
-fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-        .collect()
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {

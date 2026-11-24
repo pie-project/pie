@@ -25,25 +25,11 @@ use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::qmv;
 use poem_ir::Dtype;
+use crate::common::{bf16, noise};
 
 const K: u32 = 2048; // contraction; a multiple of every group size and pack width
 const N: u32 = 256; // output columns
 const ROWS_MAX: u32 = 33; // the widest row_count we launch
-
-/// Splitmix-style byte noise, deterministic per index.
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
-/// Store an f32 as bf16 exactly the way the kernel's inputs are laid down:
-/// keep the high 16 bits (truncation). Little-endian pair.
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
 
 /// The f64 value the kernel actually sees after a bf16 input store: the same
 /// top-16-bit truncation `bf16` applies, promoted back. Using this in the

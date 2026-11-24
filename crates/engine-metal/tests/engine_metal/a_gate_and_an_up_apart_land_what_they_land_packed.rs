@@ -9,19 +9,13 @@ use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::linear::mlp;
 use poem_ir::Dtype;
+use crate::common::{bf16_bytes};
 
 fn unit(at: u64) -> f32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     ((x >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
 }
 
 struct Rig {

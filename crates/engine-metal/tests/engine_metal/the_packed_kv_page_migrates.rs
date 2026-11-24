@@ -24,6 +24,7 @@ use engine_metal::store::{Pools, Rows, Seats, TableSeat};
 use kernels_metal::Tensor;
 use poem_compiler::chunk::{ChunkProfile, ChunkRecipe, RowId, SlotLayout, TokenRun};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
+use crate::common::{f32_to_bf16_bits};
 
 const HEADS: usize = 2; // kv_heads
 const PAGE_SIZE: u32 = 8;
@@ -76,12 +77,6 @@ fn outlier_plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32>
         }
     }
     v
-}
-
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
 }
 
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {

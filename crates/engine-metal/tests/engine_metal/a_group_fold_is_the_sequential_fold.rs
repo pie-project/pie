@@ -13,6 +13,7 @@ use kernels_metal::ssm::{self, Corrected, GroupFolds, Paged};
 use kernels_metal::tensor::RecurrentPool;
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
+use crate::common::{bf16_round};
 
 const K_HEADS: u32 = 16;
 const V_HEADS: u32 = 32;
@@ -35,12 +36,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
 }
 
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {

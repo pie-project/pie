@@ -28,6 +28,7 @@ use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::{qmm, qmv};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
+use crate::common::{bf16, noise};
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], expect_bits:
 // [u32;128] }` and `FORK_BLOCKS`, generated from the real GGUF + the fork dequant.
@@ -38,11 +39,6 @@ const QMV_GROUP: [u32; 3] = [32, 2, 1];
 const BLOCK_BYTES: usize = 28;
 const BLOCK: usize = 128;
 
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
-
 fn f32_at(bytes: &[u8], i: usize) -> f32 {
     let b = &bytes[i * 4..i * 4 + 4];
     f32::from_le_bytes([b[0], b[1], b[2], b[3]])
@@ -51,13 +47,6 @@ fn f32_at(bytes: &[u8], i: usize) -> f32 {
 fn bf16_at(bytes: &[u8], i: usize) -> f32 {
     let b = &bytes[i * 2..i * 2 + 2];
     f32::from_bits((u32::from(b[1]) << 24) | (u32::from(b[0]) << 16))
-}
-
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
 }
 
 #[test]

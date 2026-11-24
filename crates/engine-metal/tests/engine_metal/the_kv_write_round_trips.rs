@@ -28,6 +28,7 @@ use engine_metal::store::pool_demand;
 use kernels_metal::attn;
 use kernels_metal::{KvPool, Tensor};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
+use crate::common::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits};
 
 /// Packed bytes for one head at codec block `block`: `block/2` nibble bytes plus
 /// one inline fp16 scale (130 at block 256, 66 at 128).
@@ -82,16 +83,6 @@ fn outlier_plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32>
 
 // --- bf16 / fp16 bit helpers -------------------------------------------------
 
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
-}
-
-fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
-
 /// The value the kernel actually sees for a seeded f32: rounded to bf16.
 fn bf16_view(x: f32) -> f32 {
     bf16_bits_to_f32(f32_to_bf16_bits(x))
@@ -101,24 +92,6 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
         .flat_map(|&f| f32_to_bf16_bits(f).to_le_bytes())
         .collect()
-}
-
-/// Decode an IEEE binary16 bit pattern to f32 (exact — every f16 is an f32).
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = if (bits >> 15) & 1 == 1 { -1.0f32 } else { 1.0 };
-    let exp = (bits >> 10) & 0x1f;
-    let mant = bits & 0x3ff;
-    if exp == 0 {
-        sign * f32::from(mant) * 2f32.powi(-24)
-    } else if exp == 0x1f {
-        if mant == 0 {
-            sign * f32::INFINITY
-        } else {
-            f32::NAN
-        }
-    } else {
-        sign * (1.0 + f32::from(mant) / 1024.0) * 2f32.powi(i32::from(exp) - 15)
-    }
 }
 
 /// Pull the integer codes [-7, 7] and the fp16 scale out of one packed

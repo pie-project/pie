@@ -26,11 +26,7 @@ use engine_metal::encode::Sink;
 use kernels_metal::attn::{self, PrefillPlan};
 use kernels_metal::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
-
-/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
-fn mask_words(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
+use crate::common::{bf16_bits_to_f32, f16_bits_to_f32, mask_words};
 
 const KV_HEADS: usize = 2;
 const Q_HEADS: usize = 4; // gqa = 2
@@ -147,10 +143,6 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
     ((bits.wrapping_add(rounding_bias)) >> 16) as u16
 }
 
-fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
-
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
         .flat_map(|&f| f32_to_bf16_bits(f).to_le_bytes())
@@ -171,24 +163,6 @@ fn f32_floats(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
-}
-
-/// Decode an IEEE binary16 bit pattern to f32 (exact — every f16 is an f32).
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = if (bits >> 15) & 1 == 1 { -1.0f32 } else { 1.0 };
-    let exp = (bits >> 10) & 0x1f;
-    let mant = bits & 0x3ff;
-    if exp == 0 {
-        sign * f32::from(mant) * 2f32.powi(-24)
-    } else if exp == 0x1f {
-        if mant == 0 {
-            sign * f32::INFINITY
-        } else {
-            f32::NAN
-        }
-    } else {
-        sign * (1.0 + f32::from(mant) / 1024.0) * 2f32.powi(i32::from(exp) - 15)
-    }
 }
 
 /// The fp32 K/V a correct read reconstructs from one packed `block`-element head
