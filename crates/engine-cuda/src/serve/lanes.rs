@@ -46,6 +46,10 @@ pub struct Seated<'a> {
     /// lane's rows land in `rs_slot`'s. `None`: `rs_slot`'s.
     pub rs_read: Option<u32>,
     pub rs_snapshots: &'a [RsSnapshot],
+    /// The lane's replay as the runtime stated it (`Lane::replay_stated`):
+    /// what the submit check's cross-check compares this engine's count
+    /// with (`engine::fire::replay_agrees`).
+    pub replay_stated: Option<engine::fire::LaneReplay>,
     pub readout: Option<&'a [u32]>,
     pub group: Option<u32>,
     pub inputs: &'a [InputFeed],
@@ -77,6 +81,7 @@ impl<'a> Seated<'a> {
             rs_slot: None,
             rs_read: None,
             rs_snapshots: &[],
+            replay_stated: None,
             readout: None,
             group: None,
             inputs: &[],
