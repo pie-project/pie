@@ -277,9 +277,7 @@ impl Inner {
         // where the turn landed, and `dispatch` can cancel it there.
         let inner = self.clone();
         let open = open.clone();
-        match tokio::spawn(async move { inner.dispatch(req_id, &request, &open).await })
-            .await
-        {
+        match tokio::spawn(async move { inner.dispatch(req_id, &request, &open).await }).await {
             Ok(Ok(worker)) => Ok((req_id, TokenRx { rx, lost }, worker)),
             // Busy or draining is not gone: the handles are still there.
             _ if pinned
@@ -924,10 +922,7 @@ mod tests {
     async fn a_session_with_handles_goes_nowhere_but_where_they_are() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (handle, _rx) = sessions
-            .create(ident(), handles())
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), handles()).await.unwrap();
         let _ = handle.turn(handles()).await.unwrap();
         let _ = handle.turn(launch()).await.unwrap();
         assert_eq!(
@@ -953,10 +948,7 @@ mod tests {
     async fn a_turn_naming_handles_is_never_run_again() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (handle, _rx) = sessions
-            .create(ident(), handles())
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), handles()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         assert!(!sessions.migrate(req, WorkerId(8)).await);
         assert_eq!(router.dispatched.lock().unwrap().len(), 1);
@@ -975,10 +967,7 @@ mod tests {
     async fn the_router_hears_where_a_launch_started_and_how_each_turn_ended() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (handle, mut rx) = sessions
-            .create(ident(), launch())
-            .await
-            .unwrap();
+        let (handle, mut rx) = sessions.create(ident(), launch()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         let started = Tokens::Chunk(ServerMessage::Response {
             corr_id: 4,
@@ -1046,10 +1035,7 @@ mod tests {
     async fn create_then_stream_chunk_and_eos() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (_h, mut rx) = sessions
-            .create(ident(), input())
-            .await
-            .unwrap();
+        let (_h, mut rx) = sessions.create(ident(), input()).await.unwrap();
 
         let req_id = router.dispatched.lock().unwrap()[0];
         assert_eq!(sessions.feed(req_id, chunk()).await, Control::Continue);
@@ -1071,10 +1057,7 @@ mod tests {
     async fn dropped_consumer_aborts_feed() {
         let router = MockRouter::new(Some(WorkerId(1)));
         let sessions = Sessions::new(router.clone());
-        let (_h, rx) = sessions
-            .create(ident(), input())
-            .await
-            .unwrap();
+        let (_h, rx) = sessions.create(ident(), input()).await.unwrap();
         let req_id = router.dispatched.lock().unwrap()[0];
         drop(rx);
         assert_eq!(sessions.feed(req_id, chunk()).await, Control::Abort);
@@ -1084,10 +1067,7 @@ mod tests {
     async fn closing_a_session_ends_it_on_the_worker() {
         let router = MockRouter::new(Some(WorkerId(3)));
         let sessions = Sessions::new(router.clone());
-        let (handle, _rx) = sessions
-            .create(ident(), input())
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), input()).await.unwrap();
         let session = handle.id();
         handle.close().await;
         assert!(router.ended.lock().unwrap().contains(&session));
@@ -1115,10 +1095,7 @@ mod tests {
         if let ClientMessage::LaunchProcess { input, .. } = &mut turn.message {
             *input = r#"{"prompt":"hi"}"#.into();
         }
-        let (_h, mut rx) = sessions
-            .create(ident(), turn)
-            .await
-            .unwrap();
+        let (_h, mut rx) = sessions.create(ident(), turn).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         let answer = || {
             Tokens::Chunk(ServerMessage::Response {
@@ -1177,10 +1154,7 @@ mod tests {
     async fn a_turn_that_sent_output_fails_with_its_worker_and_says_why() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (_h, mut rx) = sessions
-            .create(ident(), launch())
-            .await
-            .unwrap();
+        let (_h, mut rx) = sessions.create(ident(), launch()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         sessions
             .feed_from(req, event("message"), Some(WorkerId(7)))
@@ -1208,10 +1182,7 @@ mod tests {
     async fn a_turn_that_sent_output_is_not_moved() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (_h, _rx) = sessions
-            .create(ident(), launch())
-            .await
-            .unwrap();
+        let (_h, _rx) = sessions.create(ident(), launch()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         assert!(
             sessions.migrate(req, WorkerId(8)).await,
@@ -1226,6 +1197,35 @@ mod tests {
             "run again, it would send what the client has"
         );
         assert_eq!(router.dispatched.lock().unwrap().len(), 2);
+    }
+
+    /// A turn that can go on (it has a `Resume`) moves after it sent
+    /// output: it is cancelled where it was and launched again elsewhere
+    /// from what the client was sent.
+    #[tokio::test]
+    async fn a_turn_that_can_go_on_moves_after_output_under_its_process() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let mut input = launch();
+        input.resume = Some(Resume(Arc::new(|value: &str| {
+            Some(format!("after {value}"))
+        })));
+        let (_h, _rx) = sessions.create(ident(), input).await.unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        let said = Tokens::Chunk(ServerMessage::ProcessEvent {
+            process_id: "p".into(),
+            event: "message".into(),
+            value: "one".into(),
+        });
+        sessions.feed_from(req, said, Some(WorkerId(7))).await;
+        *router.dispatch_worker.lock().unwrap() = Some(WorkerId(8));
+        assert!(sessions.migrate(req, WorkerId(8)).await);
+        assert_eq!(*router.cancels.lock().unwrap(), [(WorkerId(7), req)]);
+        let ClientMessage::LaunchProcess { input, .. } = router.messages.lock().unwrap()[1].clone()
+        else {
+            panic!("a launch");
+        };
+        assert_eq!(input, "after one", "it goes on after what was sent");
     }
 
     #[tokio::test]
@@ -1251,10 +1251,7 @@ mod tests {
         assert_eq!(sessions.live(), 0);
 
         router.held.store(false, Ordering::Release);
-        let (handle, _rx) = sessions
-            .create(ident(), input())
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), input()).await.unwrap();
         router.held.store(true, Ordering::Release);
         {
             let mut turn = Box::pin(handle.turn(input()));
