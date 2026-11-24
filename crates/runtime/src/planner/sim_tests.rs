@@ -4053,6 +4053,23 @@ fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_en
     assert!(waits > 0, "no newcomer waited at the gate");
 }
 
+/// The Metal mix's seeds 30, 44 and 131: a restore carrying the bind that
+/// suspended its process lays that bind's fresh chunks, new state, which
+/// the capacity gate weighs as it weighs a bind's ask; ungated, every tier
+/// together fell short of the finisher's headroom (seed 44: a chunk taken
+/// with nothing spare, 14 pages short). Every process ends, the finisher's
+/// headroom kept.
+#[test]
+fn sim_metal_seeds_30_44_131_a_restores_bind_waits_on_the_gate() {
+    for seed in [30, 44, 131] {
+        let (failures, _) = run(&Workload::metal(seed), None);
+        for failure in &failures {
+            eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
+        }
+        assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
+    }
+}
+
 /// What a run did, as a string two runs of one seed must agree on.
 fn fingerprint(workload: &Workload) -> String {
     let (failures, coverage) = run(workload, None);

@@ -344,7 +344,144 @@ impl ResidencyPlanner {
             // What one not in the order (a new process's first ask) may
             // take: the place after the last.
             gate.spare = last;
+            gate.chunks = self.chunk_spare(read.finisher);
             (gate, places.into_iter().collect())
+        })
+    }
+
+    /// The finisher's need in whole device chunks weighed in chunks
+    /// ([`super::inner::ChunkSpare`]): its bind's room queued, or the bind
+    /// its restore carries, else its claim (the largest bind room it asked
+    /// so far); `None` where it needs none, or where the chunks
+    /// cannot stand even now (the gate keeps a state the finisher can
+    /// finish from; holding every other ask there would stop the
+    /// completions that free the room).
+    ///
+    /// What can stand is read as the eviction pass reads it: the chunk map
+    /// over every other resident and the parked state lying on the device
+    /// ([`Self::occupants`], [`Self::parked_map`]), the cheapest occupants
+    /// of the finisher's runs and `extra` single chunks beside them
+    /// ([`super::pool::ChunkMap::cheapest_need`]), and those occupants'
+    /// whole moves (each moves all its state, as an eviction does) within
+    /// the free room below on the host and disk tiers. The spare is the
+    /// most such single chunks.
+    pub(super) fn chunk_spare(&self, finisher: ProcessId) -> Option<super::inner::ChunkSpare> {
+        let (need, others) = self.with_inner(|inner| {
+            let queued = inner.queue.values().find_map(|waiter| match waiter.kind {
+                WaitKind::BindRoom {
+                    run,
+                    pieces,
+                    singles,
+                    rise: None,
+                    ..
+                } if waiter.pid == finisher && waiter.is_unmet() => {
+                    Some(super::pool::RunNeed::of([(run, pieces), (1, singles)]))
+                }
+                _ => None,
+            });
+            let carried = inner
+                .procs
+                .get(&finisher)
+                .filter(|proc| proc.state != Residency::Resident)
+                .and_then(|proc| proc.bind_room)
+                .map(|bind| bind.runs());
+            let others: Vec<ProcessId> = inner
+                .procs
+                .iter()
+                .filter(|(pid, proc)| **pid != finisher && proc.state == Residency::Resident)
+                .map(|(pid, _)| *pid)
+                .collect();
+            (queued.or(carried), others)
+        });
+        // Before it asks: the largest bind room it asked so far, its
+        // claim. A bind it asks replaces it (the gate reserves the
+        // finisher's claim, not only its asks: by its ask, the chunks it
+        // needed were the others' already, the wide shape's seed 729).
+        let need = need
+            .unwrap_or_else(|| self.port.bind_claim(finisher))
+            .filter_chunks()?;
+        let mut map = self.occupants(&others);
+        map.merge(self.parked_map(finisher));
+        // The pages the planner gathered for its heads: free to the gate,
+        // as the page count reads them (the head they go to asks them
+        // again), so a chunk only they fill stands at no move. Read as
+        // held, gathering for a head left its chunks short, the gate held
+        // the head, the pages went back and were gathered again, for good
+        // (the Metal mix's seed 25: one reservation of 25 pages taken and
+        // given back every pass).
+        let gathered = self.with_inner(|inner| inner.accum.pages().to_vec());
+        let gathered = self.port.kv_pages_by_chunk(&gathered);
+        let planner = ProcessId::nil();
+        for (chunk, used, count) in gathered {
+            match map.held.iter_mut().find(|held| held.chunk == chunk) {
+                Some(held) => held.by.push((planner, count)),
+                None => map.held.push(super::pool::ChunkHeld {
+                    chunk,
+                    used,
+                    by: vec![(planner, count)],
+                }),
+            }
+        }
+        let (model, engine) = self.port.locus();
+        // What one process's move puts below: its kv on the device, its
+        // recurrent state and its guest state, as the census counts them.
+        let move_cost = |pid: ProcessId| -> u64 {
+            if pid == planner {
+                return 0;
+            }
+            let kv = super::holdings::held_page_count(pid, model, engine)
+                .saturating_sub(super::holdings::swapped_page_count(pid, model, engine));
+            let rs = self.port.rs_as_pages(super::holdings::held_rs_units(pid, model, engine));
+            u64::from(kv) + u64::from(rs) + self.port.guest_pages_of(pid)
+        };
+        let below = u64::from(self.port.host_stats().0) + u64::from(self.port.disk_stats().0);
+        // The finisher's runs stand: their cheapest occupants' moves fit
+        // the room below.
+        let movers = map.cheapest_need(&need)?;
+        let laid: u64 = movers.iter().map(|&pid| move_cost(pid)).sum();
+        if laid > below {
+            return None;
+        }
+        // The chunks that can stand in all: the free ones, and those the
+        // moves the room below takes empty, cheapest moves first (each
+        // process moved whole, once). Past the finisher's own, the spare.
+        let mut moved: HashSet<ProcessId> = movers.into_iter().collect();
+        moved.insert(planner);
+        let mut left = below - laid;
+        let mut others: Vec<(u64, ProcessId)> = map
+            .held
+            .iter()
+            .filter(|held| held.emptiable())
+            .flat_map(|held| held.by.iter().map(|&(pid, _)| pid))
+            .collect::<HashSet<ProcessId>>()
+            .into_iter()
+            .filter(|pid| !moved.contains(pid))
+            .map(|pid| (move_cost(pid), pid))
+            .collect();
+        others.sort_unstable();
+        for (cost, pid) in others {
+            if cost > left {
+                break;
+            }
+            left -= cost;
+            moved.insert(pid);
+        }
+        let emptied = map
+            .held
+            .iter()
+            .filter(|held| held.emptiable() && held.by.iter().all(|(pid, _)| moved.contains(pid)))
+            .count() as u64;
+        let standing = map.free.len() as u64 + emptied;
+        let low = u32::try_from(standing.saturating_sub(need.chunks())).unwrap_or(u32::MAX);
+        let per_chunk = self.port.chunks_as_pages(1).max(1);
+        let free_pages = u64::from(self.port.device_stats().0);
+        let list_free = free_pages.saturating_sub(map.free.len() as u64 * u64::from(per_chunk));
+        Some(super::inner::ChunkSpare {
+            spare: low,
+            per_chunk,
+            list_free,
+            kv_used: 0,
+            whole_used: 0,
         })
     }
 
@@ -593,6 +730,12 @@ impl ResidencyPlanner {
     /// each grant taken past it out of its spare: a fire's grant pays one
     /// lock, never a read of every tier.
     pub(super) fn capacity_holds(&self, pid: ProcessId, pages: u32) -> bool {
+        self.capacity_holds_as(pid, pages, false)
+    }
+
+    /// [`Self::capacity_holds`] for kv pages, or (`whole`) whole chunks of
+    /// fresh state.
+    fn capacity_holds_as(&self, pid: ProcessId, pages: u32, whole: bool) -> bool {
         // No pass has read it yet: read now, before the first grant.
         if self.with_counts(|inner| inner.capacity.is_none()) {
             self.read_capacity();
@@ -600,9 +743,9 @@ impl ResidencyPlanner {
         let Some((gate, holds)) = self.with_counts(|inner| {
             let place = inner.capacity_allow.get(&pid).copied();
             let gate = inner.capacity.as_mut()?;
-            let holds = gate.holds(pid, pages, place);
-            if !holds && pid != gate.finisher {
-                gate.used = gate.used.saturating_add(gate.cost(pid, pages));
+            let holds = gate.holds(pid, pages, place, whole);
+            if !holds {
+                gate.take(pid, pages, whole);
             }
             Some((*gate, holds))
         }) else {
@@ -625,7 +768,7 @@ impl ResidencyPlanner {
 
     /// [`Self::capacity_holds`] for a bind's `chunks` of fresh guest state.
     pub fn capacity_holds_chunks(&self, pid: ProcessId, chunks: u32) -> bool {
-        self.capacity_holds(pid, self.port.chunks_as_pages(chunks))
+        self.capacity_holds_as(pid, self.port.chunks_as_pages(chunks), true)
     }
 
     /// Whether the gate would hold `chunks` of fresh state for `pid` now,
@@ -634,7 +777,7 @@ impl ResidencyPlanner {
         let pages = self.port.chunks_as_pages(chunks);
         self.with_inner(|inner| {
             let place = inner.capacity_allow.get(&pid).copied();
-            inner.capacity.is_some_and(|gate| gate.holds(pid, pages, place))
+            inner.capacity.is_some_and(|gate| gate.holds(pid, pages, place, true))
         })
     }
 
@@ -2516,8 +2659,9 @@ impl ResidencyPlanner {
         crate::store::shared::forget_process(pid);
         // Out of the order: the newcomers held at its last place look again.
         let _woken = ScopeNotify(&self.allowance_rose);
-        // What was held for its restore goes back with it.
+        // What was held for its restore goes back with it, and its claim.
         self.port.release_restore(pid);
+        self.port.forget_claim(pid);
         let (model, engine) = self.port.locus();
         let held = held_page_count(pid, model, engine);
         let held_rs = held_rs_units(pid, model, engine);

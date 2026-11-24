@@ -191,6 +191,11 @@ impl DevicePageReservation {
         }
     }
 
+    /// The pages it holds.
+    pub(super) fn pages(&self) -> &[PhysicalKvPageId] {
+        &self.pages
+    }
+
     pub(super) fn len(&self) -> usize {
         self.pages.len()
     }
