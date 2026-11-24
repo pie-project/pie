@@ -33,6 +33,7 @@ use serde::Deserialize;
 use verify::{Record, Taps};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
@@ -341,4 +342,23 @@ async fn main(input: Input) -> Result<String> {
 fn outgrown(why: &str) -> bool {
     why.contains("outgrows the kv pool")
         || why.contains("this process alone holds what the pool holds")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key the request does not name is refused by name, not ignored: the
+    /// removed `rollback_mode` and `ckpt_sync` among them.
+    #[test]
+    fn an_unknown_key_is_refused() {
+        for key in ["rollback_mode", "ckpt_sync"] {
+            let why = serde_json::from_str::<Input>(&format!(r#"{{"{key}": true}}"#))
+                .err()
+                .expect("an unknown key is refused")
+                .to_string();
+            assert!(why.contains(&format!("unknown field `{key}`")), "{why}");
+        }
+        assert!(serde_json::from_str::<Input>(r#"{"beams": 4, "verify": true}"#).is_ok());
+    }
 }
