@@ -61,11 +61,18 @@ pub struct DeviceBoot {
     pub submit_bound: Option<std::time::Duration>,
 
     /// A test's load whose harness states what the test fires: its fires
-    /// laid to the rows its budgets state, in place of the ruling's fire
+    /// laid to the rows its budgets state, in place of the fire-top rule's fire
     /// top (`engine_gpu::serve::Serve::fires_stated`). Test builds only
     /// (`test-limits`): no config or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub fires_stated: bool,
+
+    /// A test's device that lays its pool whole, as one without
+    /// update-after-bind storage buffers does (`Context::resizes_pool`),
+    /// though it has them. Test builds only (`test-limits`): no config or
+    /// profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub whole_pool: bool,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;
