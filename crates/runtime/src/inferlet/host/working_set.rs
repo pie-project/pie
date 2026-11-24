@@ -191,6 +191,7 @@ impl Cursor {
 
     /// The written end a snapshot states: what the set reserved while a
     /// fire is still to settle.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn written_end(&self) -> u32 {
         match self.standing() {
             (written, 0) => written,

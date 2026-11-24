@@ -148,6 +148,7 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     broadcast(|| SchedulerItem::ExecutionSlotConsumed(pid));
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "no policy runs in the browser"))]
 pub(crate) fn notify_schedule_changed() {
     broadcast(|| SchedulerItem::Nudge);
 }
@@ -444,17 +445,17 @@ pub(crate) enum HostKvOp {
     /// one item on the lane, with no completion to settle between.
     CopyRead(::engine::KvCopy, Vec<u32>),
     /// The bytes of host kv slots.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     Read(Vec<u32>),
     /// The bytes of host rs rows: state slots, then buffer pages.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     ReadState(Vec<u32>, Vec<u32>),
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
     /// The bytes of host tier slots, shape by shape (`Engine::read_tier_slots`).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     ReadTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>),
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
     /// The engine's tap groups (`Engine::tap_groups`), as JSON.
     TapGroups,
