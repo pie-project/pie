@@ -338,8 +338,26 @@ fn cases(rank: bool) -> Vec<Case> {
     out
 }
 
+/// The process's queue masks, as the worker states them from its start's
+/// environment (`worker::backend`): these cases drive the plane with no
+/// load, which is where a serving process states them, so they state them
+/// here, before anything reads the device's units. In the child
+/// `blocks_that_meet_run_on_a_few_units` runs under `HSA_CU_MASK`, a
+/// sampler laid over every unit while its queues run on four would wait on
+/// blocks that never become resident. The shells read no environment; a
+/// test is no shell.
+fn state_masks() {
+    let var = |name: &str| std::env::var(name).ok();
+    engine_cuda::program::launch::state_queue_masks(&engine_cuda::QueueMasks {
+        visible_devices: var("HIP_VISIBLE_DEVICES").or_else(|| var("CUDA_VISIBLE_DEVICES")),
+        hsa_cu_mask: var("HSA_CU_MASK"),
+        global_cu_mask: var("ROC_GLOBAL_CU_MASK"),
+    });
+}
+
 #[test]
 fn a_lane_sampler_draws_what_the_interpreter_draws() {
+    state_masks();
     if !engine_cuda::device::present() {
         eprintln!("no device: skipping");
         return;
@@ -364,6 +382,7 @@ fn a_lane_sampler_draws_what_the_interpreter_draws() {
 /// or hang its blocks, and none lands past the lane arenas.
 #[test]
 fn a_wide_fire_s_lanes_draw_what_the_interpreter_draws() {
+    state_masks();
     if !engine_cuda::device::present() {
         eprintln!("no device: skipping");
         return;
