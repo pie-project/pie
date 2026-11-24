@@ -2797,6 +2797,9 @@ mod landing_tests {
 #[cfg(test)]
 mod behind_tests {
     use super::*;
+
+    /// The behind tests read the process-wide pipeline count: one at a time.
+    static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use ::engine::chunk::SlotCopy;
     use ::engine::fire::{FrameSubmission, FrameTicket};
     use ::engine::load::{LoadRequest, Loaded};
@@ -2943,6 +2946,7 @@ mod behind_tests {
     /// between the steps of live traffic.
     #[test]
     fn behind_work_waits_while_a_pipeline_is_open() {
+        let _alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         open_behind();
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut engine: Option<EngineBox> = Some(Box::new(Pending(Arc::clone(&ran))));
@@ -2959,6 +2963,7 @@ mod behind_tests {
     /// slice; past it, the work runs (a slice at a time).
     #[test]
     fn behind_work_waits_a_served_step_after_the_last_pipeline_closes() {
+        let _alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         open_behind();
         note_step(60_000_000);
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2968,18 +2973,34 @@ mod behind_tests {
             // Another test holds a pipeline: nothing to read here.
             return;
         }
-        assert!(
-            Lane::measure_behind(usize::MAX, &mut engine, &|| false).is_none(),
-            "inside the grace, nothing runs"
-        );
-        assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 0);
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        if crate::pipeline::none_active() && crate::pipeline::idle_for().is_some() {
+        // Inside the grace nothing runs: read where the measure is known
+        // to have fallen inside it (the grace is still unspent after it).
+        let inside = Lane::measure_behind(usize::MAX, &mut engine, &|| false);
+        let unspent = crate::pipeline::idle_for().is_some_and(|idle| idle < behind_grace());
+        if unspent {
+            assert!(inside.is_none(), "inside the grace, nothing runs");
+            assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        // Past it, a slice runs: wait for the grace to be spent, not for a
+        // fixed time.
+        let spent = || {
+            crate::pipeline::idle_for().is_some_and(|idle| idle >= behind_grace())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !spent() && crate::pipeline::none_active() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if spent() && crate::pipeline::none_active() {
+            let before = ran.load(std::sync::atomic::Ordering::Relaxed);
             assert!(
                 Lane::measure_behind(usize::MAX, &mut engine, &|| false).is_some(),
                 "past the grace, a slice runs"
             );
-            assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 1, "one slice a turn");
+            assert_eq!(
+                ran.load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "one slice a turn"
+            );
         }
     }
 }
