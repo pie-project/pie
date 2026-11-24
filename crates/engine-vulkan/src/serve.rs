@@ -960,9 +960,18 @@ fn nearest(shell: &Shell<Api>, trail: &[String], prepared: &Prepared<'_, Api>) {
         .map(|(_, recording)| {
             let held = recording.kept.trail();
             let alike = held.iter().zip(trail).take_while(|(a, b)| a == b).count();
-            (alike, held)
+            // Among the families alike as far, the one whose next command is
+            // the walk's kind: the field that parts them is the telling one.
+            let kind = |list: &[String]| {
+                list.get(alike)
+                    .and_then(|entry| entry.split(',').next())
+                    .map(str::to_string)
+            };
+            let same_kind = kind(held) == kind(trail);
+            ((alike, same_kind), held)
         })
-        .max_by_key(|(alike, _)| *alike);
+        .max_by_key(|(rank, _)| *rank)
+        .map(|((alike, _), held)| (alike, held));
     let at = |list: &[String], i: usize| list.get(i).cloned().unwrap_or_else(|| "<end>".into());
     match best {
         Some((alike, held)) => eprintln!(

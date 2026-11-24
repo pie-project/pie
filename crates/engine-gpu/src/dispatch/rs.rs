@@ -142,10 +142,36 @@ impl<B: Backend> Run<'_, B> {
     ) -> Result<(), Error> {
         // A fire moving no run still dispatches its copies, empty, beside
         // the arena its planes lie in: its commands are its family's.
-        let Some(&(_, a)) = arenas.bound.first() else {
+        use kernels_slang::gather::rows::Space;
+        let Some(&(first, a)) = arenas.bound.first() else {
             return Ok(());
         };
-        let b = arenas.bound.get(1).map_or(a, |&(_, b)| b);
+        let (b_slab, b) = arenas.bound.get(1).copied().unwrap_or((first, a));
+        // The arenas in their buffers' order, whatever run named one first:
+        // the binding a buffer takes is the same on every fire.
+        if b_slab < first {
+            let swap = |space: Space| match space {
+                Space::ArenaA => Space::ArenaB,
+                Space::ArenaB => Space::ArenaA,
+                other => other,
+            };
+            let runs: Vec<_> = runs
+                .iter()
+                .map(|run| kernels_slang::gather::rows::CopyRun {
+                    from: (swap(run.from.0), run.from.1),
+                    to: (swap(run.to.0), run.to.1),
+                    words: run.words,
+                })
+                .collect();
+            return kernels_slang::gather::rows::copy_runs(
+                self.ctx,
+                b,
+                a,
+                seat.pool,
+                &runs,
+                seat.run_dispatches,
+            );
+        }
         kernels_slang::gather::rows::copy_runs(self.ctx, a, b, seat.pool, runs, seat.run_dispatches)
     }
 
