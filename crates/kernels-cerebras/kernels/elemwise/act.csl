@@ -12,7 +12,7 @@ param Ic: u16;
 param SILU: u16 = 0;
 param GELU: u16 = 0;
 param SILUQ: u16 = 1;
-param SLW: u16 = 0;
+param SLW: u16 = 1;
 param GELUT: u16 = 2;
 
 var va: [AN]f32 align(16) = @zeros([AN]f32);

@@ -93,3 +93,35 @@ pub fn tile(prog: &Program, kinds: &Kernels, at: Coord) -> Result<Option<(Kind, 
     }
     Ok(Some((kind, p)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compile::target::{SHIPPING, searched};
+
+    /// The numerics every shipping pick emits whatever its partition: the f16 SiLU without the
+    /// subnormal flush (`SLW` 1; flushed, Qwen3-8B's logits sit ~5x further from f32 and its greedy
+    /// run leaves the golden at a 0.017 margin).
+    #[test]
+    fn shipping_picks_emit_the_numerics_defaults() {
+        let mut silu16 = 0;
+        for name in SHIPPING {
+            let plan = searched(name).plan;
+            let levers = Levers::of(&plan.levers, "").unwrap();
+            let prog = Program::of(plan).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let ks = kernels(&prog, &levers).unwrap();
+            for (kind, kb) in &ks {
+                if kb.params.get("SILU16") == Some(&Value::Int(1)) {
+                    silu16 += 1;
+                    assert_eq!(
+                        kb.params.get("SLW"),
+                        Some(&Value::Int(1)),
+                        "{name}: {} runs the f16 SiLU",
+                        kind.name
+                    );
+                }
+            }
+        }
+        assert!(silu16 > 0, "no shipping pick runs the f16 SiLU");
+    }
+}

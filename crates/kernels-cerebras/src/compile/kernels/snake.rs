@@ -239,7 +239,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 ATTL: 2,
                 TSTAMP: 0,
                 GATE: gate,
-                SLW: 0,
+                SLW: 1,
                 RLV: plan.contract.rope_levels,
                 RBITS: plan.contract.rope_bits,
                 EPS: Lit::f32(s.norm.eps),
