@@ -44,6 +44,21 @@ struct Want {
     buffers: bool,
 }
 
+/// A fire's layout key (`Shell::layout_key`): bucket, buffered, and each
+/// word's one-row and wider lane counts.
+type LayoutKey = (u32, bool, Vec<(u64, bool, u32)>);
+
+/// The stated compositions the ladder lays no program for
+/// (`Shell::unlaid_compositions`).
+#[derive(Default)]
+struct Gaps {
+    /// Canonical layouts no ladder shape takes, each with a shape that lays it.
+    unlaid: Vec<(String, Vec<Want>)>,
+    /// Compositions `canonical_layout` finds no layout for, and the first.
+    uncanonical: u64,
+    first_uncanonical: Vec<String>,
+}
+
 /// The step composition (`engine::StepComposition`) a fire of `shape`'s lanes
 /// forms, under `treatment`.
 fn composition(shape: &[Want], treatment: engine::Treatment) -> engine::StepComposition {
@@ -506,6 +521,18 @@ impl Shell {
                 .collect();
             parts.push(("buffered", shapes.len()));
             shapes.extend(buffered);
+        }
+        // the stated compositions no shape of the ladder lays: each would
+        // compile in its first fire, after ready
+        let gaps = self.unlaid_compositions(&shapes, decode, prefill);
+        if !gaps.unlaid.is_empty() || gaps.uncanonical > 0 {
+            tracing::warn!(
+                unlaid = gaps.unlaid.len(),
+                first_unlaid = ?gaps.unlaid.iter().take(4).map(|u| u.0.as_str()).collect::<Vec<_>>(),
+                uncanonical = gaps.uncanonical,
+                first_uncanonical = ?gaps.first_uncanonical,
+                "xla warm ladder: compositions the stated set holds that it lays no program for (unlaid: a canonical layout no ladder shape takes; uncanonical: one canonical_pads finds no layout for, keyed by its own counts)"
+            );
         }
         let mut added: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         let started = std::time::Instant::now();
@@ -1039,6 +1066,155 @@ impl Shell {
             }
         }
         Ok(left_out.len())
+    }
+
+    /// A fire's program as `canonical_layout` lays it out: its bucket, its
+    /// treatment, and how many one-row and wider lanes each word takes once
+    /// padded (a one-row lane runs the per-row walk, a wider one the chunked
+    /// scan; how a prompt's rows split is data). `None`: the fire takes no
+    /// canonical layout.
+    fn layout_key(&self, lanes: &[(usize, u64, u32)], buffered: Option<u32>) -> Option<LayoutKey> {
+        let real: u32 = lanes.iter().map(|l| l.2).sum();
+        let pads = self.canonical_layout(lanes, real, buffered)?;
+        let bucket = real + pads.iter().map(|p| p.0).sum::<u32>();
+        // (word, any one-row lane, lanes)
+        let mut counts: Vec<(u64, bool, u32)> = Vec::new();
+        let all = lanes
+            .iter()
+            .map(|&(_, w, r)| (w, r))
+            .chain(pads.iter().map(|&(r, w)| (w, r)));
+        for (word, rows) in all {
+            let one = rows <= 1;
+            match counts.iter_mut().find(|c| c.0 == word) {
+                Some(c) => {
+                    c.1 |= one;
+                    c.2 += 1;
+                }
+                None => counts.push((word, one, 1)),
+            }
+        }
+        counts.sort_unstable();
+        Some((bucket, buffered.is_some(), counts))
+    }
+
+    /// The compositions the stated set holds (`engine::StepShapes`: every
+    /// prompt and decode count its mixed and prefill shapes span, their rows
+    /// where padding changes its form) whose layout no shape of `laid`
+    /// takes: a fire of one would compile after ready (v6e Qwen3.5 c64: 61
+    /// prompts and a rest lane at 1792 rows, 67 s). Each with a shape that
+    /// lays it.
+    fn unlaid_compositions(&self, laid: &[Vec<Want>], decode: u64, prefill: u64) -> Gaps {
+        let mut gaps = Gaps::default();
+        let Some(steps) = self.steps.as_ref() else {
+            return gaps;
+        };
+        let classes = &self.compiled.classes;
+        let class = |word: u64| classes.class_of(word & classes.mask);
+        let (Some(dc), Some(pc)) = (class(decode), class(prefill)) else {
+            return gaps;
+        };
+        let rung_of_shape = |shape: &[Want]| {
+            if shape.iter().any(|w| w.buffers) {
+                steps
+                    .fire_shape(&composition(shape, engine::Treatment::Buffers))
+                    .ok()
+                    .and_then(|f| steps.shapes.get(f.id as usize))
+                    .map(|s| s.rung)
+            } else {
+                None
+            }
+        };
+        let mut keys = std::collections::HashSet::new();
+        for shape in laid {
+            if shape.iter().all(|w| w.rows <= 1) || shape.iter().any(|w| w.all_rows || w.masked) {
+                continue;
+            }
+            let lanes: Option<Vec<_>> = shape
+                .iter()
+                .map(|w| Some((class(w.word)?, w.word, w.rows)))
+                .collect();
+            if let Some(key) = lanes.and_then(|l| self.layout_key(&l, rung_of_shape(shape))) {
+                keys.insert(key);
+            }
+        }
+        let buckets = &self.budgets.tokens.buckets;
+        let pad = self.pad;
+        for stated in &steps.shapes {
+            // (`attachments.mask`: a lane may state a mask, which is data)
+            if stated.kind == engine::StepKind::Decode {
+                continue;
+            }
+            let buffered = (stated.treatment == engine::Treatment::Buffers).then_some(stated.rung);
+            let mixed = stated.kind == engine::StepKind::Mixed;
+            for n in stated.prompt_lanes.lo.max(1)..=stated.prompt_lanes.hi {
+                // a fire's lanes are the load's at most
+                let most = self.budgets.tokens.max_lanes.saturating_sub(n);
+                for d in stated.decode_lanes.lo..=stated.decode_lanes.hi.min(most) {
+                    let mut prev = 0;
+                    for &b in buckets {
+                        let lo = prev + 1;
+                        prev = b;
+                        let exact = b.saturating_sub(pad.rung(n) - n);
+                        let mut rows = if mixed {
+                            vec![lo, b]
+                        } else {
+                            vec![lo, exact.saturating_sub(1), exact, b - 1, b]
+                        };
+                        rows.sort_unstable();
+                        rows.dedup();
+                        for r in rows {
+                            let p = r.saturating_sub(d);
+                            if r < lo
+                                || !(stated.rows.lo..=stated.rows.hi).contains(&r)
+                                || !(stated.prompt_rows.lo..=stated.prompt_rows.hi).contains(&p)
+                                || p < n * stated.lane_rows.lo.max(2)
+                                || p > n * stated.lane_rows.hi
+                            {
+                                continue;
+                            }
+                            let each = p / n;
+                            let mut lanes = vec![(dc, decode, 1); d as usize];
+                            lanes.extend((0..n).map(|i| {
+                                (pc, prefill, if i == 0 { p - each * (n - 1) } else { each })
+                            }));
+                            let Some(key) = self.layout_key(&lanes, buffered) else {
+                                // no canonical layout: a fire of it keys on
+                                // its own counts (`fire_inner`'s one pad lane)
+                                gaps.uncanonical += 1;
+                                if gaps.first_uncanonical.len() < 4 {
+                                    gaps.first_uncanonical.push(format!(
+                                        "{} {n} prompts of {p} rows beside {d} decodes",
+                                        stated.treatment
+                                    ));
+                                }
+                                continue;
+                            };
+                            if keys.insert(key) {
+                                let shape: Vec<Want> = lanes
+                                    .iter()
+                                    .map(|&(_, word, rows)| Want {
+                                        word,
+                                        rows,
+                                        held_pages: u32::from(rows == 1),
+                                        all_rows: false,
+                                        masked: false,
+                                        buffers: buffered.is_some(),
+                                    })
+                                    .collect();
+                                gaps.unlaid.push((
+                                    format!(
+                                        "{} {} prompts of {p} rows beside {d} decodes ({r} rows)",
+                                        stated.treatment, n
+                                    ),
+                                    shape,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        gaps
     }
 
     fn warm_fire(&mut self, shape: &[Want]) -> Result<()> {

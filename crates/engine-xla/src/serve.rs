@@ -2159,12 +2159,32 @@ impl Shell {
     }
 
     fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
+        let plain = lanes
+            .iter()
+            .map(|seated| {
+                Some((
+                    self.ladder_class(seated)?,
+                    seated.lane.word,
+                    seated.lane.tokens.len() as u32,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.canonical_layout(&plain, real_rows, self.buffered_rung())
+    }
+
+    /// [`Self::canonical_pads`] of lanes as `(class, word, rows)`, a
+    /// buffered fire's stated rung `buffered`: what the load-time walk of the
+    /// compositions the runtime forms maps each through
+    /// (`Shell::unlaid_compositions`).
+    pub(crate) fn canonical_layout(
+        &self,
+        lanes: &[(usize, u64, u32)],
+        real_rows: u32,
+        buffered: Option<u32>,
+    ) -> Option<Vec<(u32, u64)>> {
         // (class, word, lanes, rows)
         let mut by: Vec<(usize, u64, u32, u32)> = Vec::new();
-        for seated in lanes {
-            let class = self.ladder_class(seated)?;
-            let word = seated.lane.word;
-            let rows = seated.lane.tokens.len() as u32;
+        for &(class, word, rows) in lanes {
             match by.iter_mut().find(|(c, ..)| *c == class) {
                 Some(entry) => {
                     entry.2 += 1;
@@ -2220,7 +2240,7 @@ impl Shell {
             if !mixed
                 && exact >= pad.prefill_floor
                 && buckets.contains(&exact)
-                && self.buffered_rung().is_none_or(|rung| rung == exact)
+                && buffered.is_none_or(|rung| rung == exact)
                 && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize
             {
                 return Some(ones);
@@ -2289,7 +2309,7 @@ impl Shell {
             bucket
         };
         // a buffered fire at its stated rung
-        let bucket = bucket.max(self.buffered_rung().unwrap_or(0));
+        let bucket = bucket.max(buffered.unwrap_or(0));
         pads.push((bucket - real_rows - ones, by[host].1));
         if lanes.len() + pads.len() > self.budgets.tokens.max_lanes as usize {
             return None;

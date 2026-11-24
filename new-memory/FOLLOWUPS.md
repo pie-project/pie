@@ -1529,3 +1529,24 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **Idea.** Keep a key's settled points across yields (per point, as engine-gpu does) and time only the rest at the next turn, with the clock and overlap checks applying to each point's frames.
 
 **Why later.** Behind work runs only when no process is live, so yields are rare. Each yield already waits for at most one fire (a frame of long fires is cut between them).
+
+## F?? XLA decode: a page walk whose cost does not follow the page bound, so the bound can be data (v6e, 2026-11-25)
+
+**What.** Each decode lane rung is compiled at every page bound (16/32/64/128/256 pages), times masked or not: 70 folded and 31 buffered decode programs on Qwen3.5-0.8B. The per-row walk (`kernels-xla` `attn/paged.rs` `per_row`) already loops only to the chunk that holds the largest admitted key. Laying every decode at the cap (256 pages) instead was measured slower (Qwen3-0.6B, ABBA, tok/s medians): c1 −2% and c8 −5% at a 16-page context, c1 −1% and c8 −3% at a 64-page context. What still follows the bound is the chunk width (`c = min(budget c, span)`, so a short span reads narrower chunks) and the in-graph `[lanes, max_pages]` page table and walk.
+
+**Idea.** Make the chunk width independent of the span (chosen per fire from the runtime bound, e.g. a few widths switched inside one program), and gather the page table only to the runtime bound. Then one program per lane rung holds every page bound.
+
+**Why later.** Decode is a small share of the ladder's compile time (~1,400 of ~18,000 compile-s on Qwen3.5); the prefill and mixed programs dominate it.
+
+## F?? XLA prefill on a hybrid: lanes cost real work, and power-of-two lane padding costs up to ~25% (v6e, 2026-11-25)
+
+**What.** A recurrent layer's chunked scan lays chunks per lane, so one prefill fire's time grows with its lane count at a fixed row bucket. qwen35-d0.8b, full depth, one fire of R rows as n prompts (median ms):
+- 128 rows: n=1 3.34, 2 3.81, 4 5.04, 8 8.03, 16 13.40, 32 21.84, 64 46.65.
+- 512 rows: 4.66, 5.85, 7.01, 8.96, 13.65, 23.42, 38.64.
+- 2048 rows: 10.64, 12.12, 13.14, 15.38, 21.72, 28.48, 48.18.
+
+So no coarser lane rung is within 2% at any bucket, and the canonical power-of-two padding (`canonical_pads`) costs up to ~25% over the exact count. The ~13 programs per bucket are not duplicates of the same work either. A one-row pad or rest lane turns on the per-row attention path but skips the chunked scan, while a multi-row one runs it. At 512 rows, 4 lanes: 2 prompts with a one-row pad took 6.44 ms; 4 exact prompts took 6.65; the same rows over 4 multi-row lanes took 7.41. One 511-row prompt with a one-row rest lane took 5.01, with a two-row rest 6.10.
+
+**Idea.** Exact lane counts for small prompt counts (fewer padding lanes in the scan) traded against program count, or a chunked scan whose cost follows the live lanes (padding lanes skipped as data).
+
+**Why later.** A perf opportunity against the program count; the boot-time work keeps today's rungs.
