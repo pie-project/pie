@@ -93,6 +93,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
     let products = chip.rates().product_ns.clone().unwrap_or_default();
+    // How the device's profile says this machine lands weights, under a
+    // matching key: a load that finds it measures nothing of it.
+    let landing = chip.rates().landing;
     device.set_routes(std::sync::Arc::new(
         kernels_cuda::linear::routes::Routes::of(&products),
     ));
@@ -625,6 +628,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         anchored,
         keys,
         products,
+        landing,
         asked,
         ceiling,
         weighed,
@@ -1018,6 +1022,7 @@ impl Shell {
             anchored,
             keys,
             products,
+            landing,
             asked,
             ceiling,
             weighed,
@@ -1130,7 +1135,17 @@ impl Shell {
             // A load told its weights are held seats every bank before a
             // fire: its banks' host copy is pageable (`Tier::open`).
             boot.knobs.weights_held,
+            landing,
         )?;
+        if let Some(measured) = weights.landing() {
+            match crate::rates::save_landing(boot.knobs.profiles.as_deref(), device.name(), &keys, measured) {
+                Ok(Some(path)) => eprintln!(
+                    "engine-cuda: how this machine lands weights, measured, saved to {path}"
+                ),
+                Ok(None) => {}
+                Err(why) => eprintln!("engine-cuda: the landing's rates were not saved: {why}"),
+            }
+        }
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]
@@ -2926,6 +2941,8 @@ pub(super) struct Baked {
     /// The decode products' times the device's profile states under a
     /// matching key, which a measurement of more joins.
     pub(super) products: Vec<profile::fire::ProductTime>,
+    /// How the device's profile says this machine lands weights.
+    pub(super) landing: Option<profile::fire::Landing>,
     pub(super) asked: Budget,
     /// What the card may hold in all under the load's allowance, resolved
     /// before the load took anything (`elastic::ceiling_of`).

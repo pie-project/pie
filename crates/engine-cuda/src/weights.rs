@@ -39,6 +39,9 @@ pub struct Weights {
     experts: Option<crate::experts::Tier>,
     from_cache: bool,
     decoded: Vec<Buffer>,
+    /// How this load landed its weights, where it measured it: for the
+    /// device's profile, so a later load measures nothing.
+    landing: Option<profile::fire::Landing>,
 }
 
 pub(crate) fn decodes_at_load(param: &poem_ir::Param) -> bool {
@@ -322,34 +325,6 @@ enum Rotten {
     Machine(String),
 }
 
-enum Scratch {
-    Ram(Vec<u8>),
-    Disk(SpillArena),
-}
-
-impl Scratch {
-    fn fitting(arena: usize, mapped: u64, beside: &Path) -> Result<Scratch> {
-        let need = arena as u64 + mapped + (2 << 30);
-        let free = available_memory();
-        if arena == 0 || need <= free {
-            return Ok(Scratch::Ram(vec![0u8; arena]));
-        }
-        eprintln!(
-            "engine-cuda: the load's {arena}-byte transform arena does not fit \
-             the {free} bytes left of this machine's memory beside its {mapped} \
-             mapped bytes; spilling the arena to disk"
-        );
-        SpillArena::new(arena, &[std::env::temp_dir(), beside.to_path_buf()]).map(Scratch::Disk)
-    }
-
-    fn as_mut(&mut self) -> &mut [u8] {
-        match self {
-            Scratch::Ram(vec) => vec.as_mut_slice(),
-            Scratch::Disk(map) => map.as_mut(),
-        }
-    }
-}
-
 /// Lets go of the resident pages of `plane`, a span of a read-only file
 /// mapping whose bytes were copied elsewhere: a later read faults them back
 /// in from the page cache.
@@ -413,126 +388,6 @@ fn headroom(
         (Some(a), Some(b)) => a.min(b),
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => u64::MAX,
-    }
-}
-
-struct Volume {
-    free: u64,
-    tmpfs: bool,
-}
-
-#[cfg(target_os = "linux")]
-fn volume(at: &Path) -> Option<Volume> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(at.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `statfs` is a plain C struct of integers; zero is a valid value.
-    let mut said: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: a NUL-terminated path and a struct this frame owns.
-    if unsafe { libc::statfs(path.as_ptr(), &raw mut said) } != 0 {
-        return None;
-    }
-    Some(Volume {
-        free: said
-            .f_bavail
-            .checked_mul(u64::try_from(said.f_bsize).ok()?)?,
-        tmpfs: said.f_type == libc::TMPFS_MAGIC,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn volume(_at: &Path) -> Option<Volume> {
-    None
-}
-
-/// A tmpfs is the memory the spill is leaving, and a volume short of `len`
-/// takes the sparse `ftruncate` and SIGBUSes the landing; a volume `statfs`
-/// cannot describe is taken on trust.
-fn spill_site(
-    candidates: &[(std::path::PathBuf, Option<Volume>)],
-    len: u64,
-) -> std::result::Result<std::path::PathBuf, String> {
-    let mut refused = Vec::new();
-    for (dir, volume) in candidates {
-        match volume {
-            Some(Volume { tmpfs: true, .. }) => {
-                refused.push(format!("{} is a tmpfs", dir.display()));
-            }
-            Some(Volume { free, .. }) if *free < len => refused.push(format!(
-                "{} has {:.2} GiB free",
-                dir.display(),
-                *free as f64 / (1u64 << 30) as f64
-            )),
-            _ => return Ok(dir.clone()),
-        }
-    }
-    Err(format!(
-        "no volume has {:.2} GiB of real disk for the arena: {}. Point TMPDIR at one that does",
-        len as f64 / (1u64 << 30) as f64,
-        refused.join(", ")
-    ))
-}
-
-struct SpillArena {
-    map: memmap2::MmapMut,
-    len: usize,
-}
-
-impl SpillArena {
-    fn new(len: usize, candidates: &[std::path::PathBuf]) -> Result<SpillArena> {
-        let refuse = |why: String| Fault::Load(checkpoint::error::Error::Checkpoint(why));
-        let sites: Vec<_> = candidates
-            .iter()
-            .map(|dir| (dir.clone(), volume(dir)))
-            .collect();
-        let dir = spill_site(&sites, len as u64).map_err(refuse)?;
-        let path = dir.join(format!("pie-arena-{}", std::process::id()));
-        eprintln!("engine-cuda: the arena spills to {}", path.display());
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(|why| {
-                refuse(format!(
-                    "the arena spill file {} does not open: {why}",
-                    path.display()
-                ))
-            })?;
-        let _ = std::fs::remove_file(&path);
-        file.set_len(len as u64).map_err(|why| {
-            refuse(format!(
-                "the arena spill file does not grow to {len} bytes: {why}"
-            ))
-        })?;
-        // Claim the pages now so a full volume refuses by name instead of
-        // SIGBUS on the first write it cannot back.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: the open descriptor and the length it was just sized to.
-            if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) } != 0 {
-                let why = std::io::Error::last_os_error();
-                if !matches!(
-                    why.raw_os_error(),
-                    Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
-                ) {
-                    return Err(refuse(format!(
-                        "the arena spill file under {} does not preallocate {len} bytes: {why}",
-                        dir.display()
-                    )));
-                }
-            }
-        }
-        // SAFETY: a fresh shared mapping over a file this fn just created,
-        // sized, and unlinked, so no other process can reach it.
-        let map = unsafe { memmap2::MmapMut::map_mut(&file) }
-            .map_err(|why| refuse(format!("the arena spill file does not map: {why}")))?;
-        Ok(SpillArena { map, len })
-    }
-
-    fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.map[..self.len]
     }
 }
 
@@ -671,6 +526,7 @@ impl Weights {
         target: StorageTarget,
         decode_dense: bool,
         held: bool,
+        known: Option<profile::fire::Landing>,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -756,11 +612,59 @@ impl Weights {
             false
         };
 
+        let mut measured_landing = None;
         let landed = if from_cache {
             vec![true; places.len()]
         } else {
+            // The tensors the device store takes cross by a pinned ring, each
+            // copy overlapped with the next read; where none opens, each is
+            // copied as it lands.
+            let largest = places
+                .iter()
+                .enumerate()
+                .filter(|&(at, _)| !plan.mapped(at) && !plan.pinned(at))
+                .map(|(_, place)| usize::try_from(place.bytes).unwrap_or(usize::MAX))
+                .max()
+                .unwrap_or(0);
+            let opening = std::time::Instant::now();
+            let ring = match largest {
+                0 => None,
+                _ => match crate::landing_ring::Ring::open(
+                    largest,
+                    known.map(|known| crate::landing_ring::Rates {
+                        latency: known.copy_latency_ns / 1e9,
+                        copy: known.copy_gbps * 1e9,
+                        saturated: known.copy_full_bytes as usize,
+                        fill: known.fill_gbps * 1e9,
+                    }),
+                ) {
+                    Ok(ring) => {
+                        eprintln!(
+                            "engine-cuda: the weights cross by a pinned ring of 2 x {} KiB: the \
+                             link moves {:.1} GB/s from {} KiB copies past a {:.1} us latency; \
+                             a slot fills at {:.1} GB/s ({} in {} ms)",
+                            ring.slot_bytes() >> 10,
+                            ring.rates.copy / 1e9,
+                            ring.rates.saturated >> 10,
+                            ring.rates.latency * 1e6,
+                            ring.rates.fill / 1e9,
+                            if known.is_some() { "from the device's profile" } else { "measured" },
+                            opening.elapsed().as_millis(),
+                        );
+                        Some(ring)
+                    }
+                    Err(why) => {
+                        eprintln!(
+                            "engine-cuda: no pinned ring for the weights ({why}); each is copied \
+                             as it lands"
+                        );
+                        None
+                    }
+                },
+            };
             let mut sink = Landing {
                 store: &mut store,
+                ring,
                 experts: experts.as_ref(),
                 plan: &plan,
                 places: &places,
@@ -768,25 +672,49 @@ impl Weights {
                 landed: vec![false; places.len()],
             };
 
-            if plan.streams() {
-                let streaming = compile_streaming(&metadata, contract, target)?;
-                Execution::new(&streaming, snapshot)
-                    .streaming()
-                    .sink(&mut sink)
-                    .run()?;
-                sink.landed
-            } else {
-                let bytes = usize::try_from(landing.memory.arena_bytes()).unwrap_or(0);
-                let mut scratch = Scratch::fitting(bytes, plan.spill_demand(), snapshot)?;
-                let mut backing: &mut [u8] = scratch.as_mut();
-                Execution::new(&landing, snapshot)
-                    .arena(&mut backing)
-                    .sink(&mut sink)
-                    .run()?;
-                let landed = sink.landed;
-                drop(scratch);
-                landed
+            // Every tensor is published as it lands, so none is held past
+            // its last use: the walk holds what the plan's transforms keep
+            // live (each buffer until its last use), never a host image of
+            // the whole model.
+            let streaming = compile_streaming(&metadata, contract, target)?;
+            let landing_started = std::time::Instant::now();
+            let mut reads = known.map_or_else(checkpoint::executor::ReadRates::default, |known| {
+                checkpoint::executor::ReadRates {
+                    spawn_s: known.read_spawn_ns / 1e9,
+                    thread_bytes_per_s: known.read_thread_gbps * 1e9,
+                    whole_bytes_per_s: known.read_whole_gbps * 1e9,
+                }
+            });
+            Execution::new(&streaming, snapshot)
+                .streaming()
+                .read_rates(&mut reads)
+                .sink(&mut sink)
+                .run()?;
+            if let Some(ring) = &sink.ring {
+                ring.drain()?;
             }
+            eprintln!(
+                "engine-cuda: the weights landed in {} ms",
+                landing_started.elapsed().as_millis()
+            );
+            // What this machine's landing measured, where it measured it
+            // (every rate stated, none from the profile).
+            let all = [reads.spawn_s, reads.thread_bytes_per_s, reads.whole_bytes_per_s];
+            measured_landing = match (&sink.ring, known) {
+                (Some(ring), None) if all.iter().all(|v| *v > 0.0) => {
+                    Some(profile::fire::Landing {
+                        copy_latency_ns: ring.rates.latency * 1e9,
+                        copy_gbps: ring.rates.copy / 1e9,
+                        copy_full_bytes: ring.rates.saturated as f64,
+                        fill_gbps: ring.rates.fill / 1e9,
+                        read_spawn_ns: reads.spawn_s * 1e9,
+                        read_thread_gbps: reads.thread_bytes_per_s / 1e9,
+                        read_whole_gbps: reads.whole_bytes_per_s / 1e9,
+                    })
+                }
+                _ => None,
+            };
+            sink.landed
         };
 
         // A boot that read its image out of the serving file copied each
@@ -903,6 +831,7 @@ impl Weights {
             experts,
             from_cache,
             decoded,
+            landing: measured_landing,
         })
     }
 
@@ -1490,6 +1419,11 @@ impl Weights {
     }
 
     #[must_use]
+    pub fn landing(&self) -> Option<profile::fire::Landing> {
+        self.landing
+    }
+
+    #[must_use]
     pub fn from_cache(&self) -> bool {
         self.from_cache
     }
@@ -1693,6 +1627,7 @@ fn rectangle(shape: &[u64]) -> (u64, u64) {
 
 struct Landing<'a> {
     store: &'a mut Buffer,
+    ring: Option<crate::landing_ring::Ring>,
     experts: Option<&'a crate::experts::Tier>,
     plan: &'a crate::experts::Plan,
     places: &'a [Place],
@@ -1738,10 +1673,17 @@ impl TensorSink for Landing<'_> {
                     )));
                 }
             }
-            None => self
-                .store
-                .write(place.offset, bytes)
-                .map_err(|fault| LoadError::Internal(fault.to_string()))?,
+            None => {
+                let fits = place
+                    .offset
+                    .checked_add(bytes.len() as u64)
+                    .is_some_and(|end| end <= self.store.bytes() as u64);
+                match self.ring.as_mut().filter(|_| fits) {
+                    Some(ring) => ring.send(self.store.ptr() + place.offset, bytes),
+                    None => self.store.write(place.offset, bytes),
+                }
+                .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+            }
         }
         self.landed[at] = true;
         Ok(())

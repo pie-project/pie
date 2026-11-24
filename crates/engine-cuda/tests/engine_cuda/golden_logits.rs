@@ -1562,12 +1562,14 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
     }
 }
 
-/// The md5 of the profile the probe's loads keep their measurements in
-/// (`knobs`: the cache's `profiles`), every file of it in path order, by
-/// `md5sum`; "none" where there is no file.
+/// The md5 of every stored input a load selects its kernels and bodies by:
+/// the profile its measurements are kept in (`knobs`: the cache's
+/// `profiles`), the bodies records and the host covers, every file in path
+/// order, by `md5sum`; "none" where there is no file. A cold cache reads as
+/// another configuration.
 fn profile_md5(cache: &Path) -> String {
     let mut files = Vec::new();
-    let mut dirs = vec![cache.join("profiles")];
+    let mut dirs = vec![cache.join("profiles"), cache.join("bodies"), cache.join("cover")];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let path = entry.path();
