@@ -58,6 +58,8 @@ fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
         max_buffer: None,
         #[cfg(feature = "test-limits")]
         submit_bound: None,
+        #[cfg(feature = "test-limits")]
+        fires_stated: false,
     })
 }
 
