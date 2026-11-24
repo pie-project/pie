@@ -1402,13 +1402,23 @@ fn resolve_snapshot(repo_id: &str, revision: Option<&str>, json: bool) -> Result
         let path = snapshots.join(revision);
         let fetched = !has_weights(&path);
         if fetched {
-            crate::ops::model::fetch_snapshot(repo_id, Some(revision), json)?;
+            crate::ops::model::fetch_snapshot(
+                repo_id,
+                Some(revision),
+                &crate::local::hf::runtime_snapshot_allow_patterns(),
+                json,
+            )?;
         }
         return Ok((path, fetched));
     }
     let mut fetched = !snapshots.exists();
     if fetched {
-        crate::ops::model::fetch_snapshot(repo_id, None, json)?;
+        crate::ops::model::fetch_snapshot(
+            repo_id,
+            None,
+            &crate::local::hf::runtime_snapshot_allow_patterns(),
+            json,
+        )?;
     }
     let entries = std::fs::read_dir(&snapshots)
         .map_err(|_| anyhow!("{repo_id} is neither a path nor a model any registry has"))?;
@@ -1421,7 +1431,12 @@ fn resolve_snapshot(repo_id: &str, revision: Option<&str>, json: bool) -> Result
     };
     // A snapshot an earlier download left without its weights fetches the rest.
     if !fetched && !has_weights(&path) {
-        crate::ops::model::fetch_snapshot(repo_id, None, json)?;
+        crate::ops::model::fetch_snapshot(
+            repo_id,
+            None,
+            &crate::local::hf::runtime_snapshot_allow_patterns(),
+            json,
+        )?;
         fetched = true;
     }
     Ok((path, fetched))

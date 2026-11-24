@@ -7,9 +7,9 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::Subcommand;
 
-use crate::local::hf::runtime_snapshot_allow_patterns;
 use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
 
+pub mod check;
 pub mod facts;
 pub mod import;
 pub mod reload;
@@ -29,6 +29,12 @@ pub enum ModelCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Every architecture this build's packages hold models of.
+    Families,
+    /// Whether an import takes a repository or a folder, and whether this Mac holds it, before a weight is downloaded.
+    Check(check::CheckArgs),
+    /// An adapter's files at a pinned commit, hash-checked, linked into a folder.
+    Fetch(check::FetchArgs),
 }
 
 pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs, json: bool) -> Result<Answer> {
@@ -38,6 +44,9 @@ pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs, json: bool) -> Resul
         ModelCmd::Import(args) => import::run(args, global, json),
         ModelCmd::Reload(args) => reload::run(args, global),
         ModelCmd::Remove { name, yes } => remove(name, yes),
+        ModelCmd::Families => check::families(),
+        ModelCmd::Check(args) => check::run(args),
+        ModelCmd::Fetch(args) => check::fetch(args, json),
     }
 }
 
@@ -528,6 +537,7 @@ impl crate::ui::Report for ModelInfo {
 pub(crate) fn fetch_snapshot(
     repo_id: &str,
     revision: Option<&str>,
+    allow: &[String],
     json: bool,
 ) -> Result<std::path::PathBuf> {
     parse_repo_id(repo_id)?;
@@ -538,16 +548,11 @@ pub(crate) fn fetch_snapshot(
         .build()?;
     let label = repo_id.to_string();
     let revision = revision.map(str::to_string);
+    let allow = allow.to_vec();
     let progress = ProgressBar::new(json);
     let sink = progress.sink();
     let snapshot_path = runtime.block_on(async move {
-        crate::local::hf::snapshot_download(
-            &label,
-            revision.as_deref(),
-            &runtime_snapshot_allow_patterns(),
-            sink,
-        )
-        .await
+        crate::local::hf::snapshot_download(&label, revision.as_deref(), &allow, sink).await
     });
     progress.finish();
     let snapshot_path = snapshot_path?;

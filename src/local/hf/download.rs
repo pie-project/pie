@@ -337,6 +337,197 @@ pub async fn snapshot_download(
     Ok(snapshot_dir)
 }
 
+/// The files a check reads whole: what a checkpoint or an adapter states of itself.
+const STATED: [&str; 6] = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer_config.json",
+    "adapter_config.json",
+    "stanza.json",
+    "model.safetensors.index.json",
+];
+
+/// The files an adapter is made of, which `pie model fetch` fetches.
+pub const ADAPTER_FILES: [&str; 2] = ["*.json", "adapter*.safetensors"];
+
+/// The most bytes one of [`STATED`] may take.
+const STATED_CAP: u64 = 16 << 20;
+
+/// The most bytes a safetensors header may take.
+const HEADER_CAP: u64 = 64 << 20;
+
+/// A repository at one commit, as a check read it.
+pub struct Stated {
+    /// The commit.
+    pub sha: String,
+    /// The bytes an import fetches at that commit.
+    pub download_bytes: u64,
+    /// The bytes a fetch of it as an adapter takes ([`ADAPTER_FILES`]).
+    pub adapter_bytes: u64,
+    /// The bytes of its `model*.safetensors` files.
+    pub weights_bytes: u64,
+}
+
+/// The hub refused a file of a repository whose terms this machine has not accepted.
+#[derive(Debug)]
+pub struct Gated(pub String);
+
+impl std::fmt::Display for Gated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is gated: its files need an account that accepted its terms",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Gated {}
+
+/// Fetches what `repo_id` at `revision` (or `main`'s head) states of itself
+/// into `dir`, and never a weight: each of [`STATED`] it lists, hash-checked,
+/// and each top-level `model*.safetensors` as a sparse file of its listed
+/// size that holds only its header, read through two range requests.
+pub async fn stated_download(repo_id: &str, revision: Option<&str>, dir: &Path) -> Result<Stated> {
+    let client = client()?;
+    let token = token();
+    let sha = revision_sha(
+        &client,
+        repo_id,
+        revision.unwrap_or("main"),
+        token.as_deref(),
+    )
+    .await?;
+    if let Some(revision) = revision
+        && sha != revision
+    {
+        bail!("{repo_id}: the hub resolves revision {revision} to commit {sha}");
+    }
+    let files = list_files(&client, repo_id, &sha, token.as_deref()).await?;
+    // The hub masks the object ids of a gated repository's weights from an
+    // account that has not accepted its terms.
+    if files
+        .iter()
+        .any(|entry| !entry.etag.is_empty() && entry.etag.bytes().all(|b| b == b'*'))
+    {
+        return Err(Gated(repo_id.to_string()).into());
+    }
+    if let Some(entry) = files.iter().find(|entry| !is_safe(entry)) {
+        bail!(
+            "{repo_id}@{sha} lists {:?} named {:?}, which is not a relative path of plain \
+             segments named by a lowercase hex object id; refusing the listing",
+            entry.path,
+            entry.etag
+        );
+    }
+    let allow = super::runtime_snapshot_allow_patterns();
+    let wanted = |entry: &&Entry| allow.iter().any(|pattern| glob_match(pattern, &entry.path));
+    let weights = |entry: &&Entry| glob_match("model*.safetensors", &entry.path);
+    let adapter = |entry: &&Entry| {
+        ADAPTER_FILES
+            .iter()
+            .any(|pattern| glob_match(pattern, &entry.path))
+    };
+    let stated = Stated {
+        sha: sha.clone(),
+        download_bytes: files.iter().filter(wanted).map(|entry| entry.size).sum(),
+        adapter_bytes: files.iter().filter(adapter).map(|entry| entry.size).sum(),
+        weights_bytes: files.iter().filter(weights).map(|entry| entry.size).sum(),
+    };
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    for entry in &files {
+        let url = format!("{}/{repo_id}/resolve/{sha}/{}", endpoint(), entry.path);
+        let at = dir.join(&entry.path);
+        if STATED.contains(&entry.path.as_str()) {
+            if entry.size > STATED_CAP {
+                bail!(
+                    "{repo_id}: {} is {} bytes, over the {STATED_CAP} a check reads",
+                    entry.path,
+                    entry.size
+                );
+            }
+            let bytes = ranged(&client, repo_id, &url, None, token.as_deref()).await?;
+            if bytes.len() as u64 != entry.size {
+                bail!("{repo_id}: {} came short", entry.path);
+            }
+            let mut hash = Hash::of(entry);
+            hash.update(&bytes);
+            std::fs::write(&at, &bytes).with_context(|| format!("writing {}", at.display()))?;
+            hash.check(entry, &at)?;
+        } else if weights(&entry) {
+            let length = ranged(&client, repo_id, &url, Some((0, 8)), token.as_deref()).await?;
+            let length = u64::from_le_bytes(
+                length
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("{repo_id}: {} has no header length", entry.path))?,
+            );
+            if length > HEADER_CAP || 8 + length > entry.size {
+                bail!(
+                    "{repo_id}: {} states a {length}-byte header, which is not a safetensors \
+                     header a check reads",
+                    entry.path
+                );
+            }
+            let header =
+                ranged(&client, repo_id, &url, Some((8, length)), token.as_deref()).await?;
+            if header.len() as u64 != length
+                || serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&header)
+                    .is_err()
+            {
+                bail!("{repo_id}: {} has no safetensors header", entry.path);
+            }
+            let file =
+                std::fs::File::create(&at).with_context(|| format!("creating {}", at.display()))?;
+            use std::io::Write;
+            (&file)
+                .write_all(&length.to_le_bytes())
+                .and_then(|()| (&file).write_all(&header))
+                .and_then(|()| file.set_len(entry.size))
+                .with_context(|| format!("writing {}", at.display()))?;
+        }
+    }
+    Ok(stated)
+}
+
+/// The bytes of `url`, or the `range` (start, length) of them, refusing a
+/// reply longer than asked or, with no range, than [`STATED_CAP`].
+async fn ranged(
+    client: &reqwest::Client,
+    repo_id: &str,
+    url: &str,
+    range: Option<(u64, u64)>,
+    token: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut request = authorized(client.get(url), token);
+    if let Some((start, length)) = range {
+        request = request.header(
+            reqwest::header::RANGE,
+            format!("bytes={start}-{}", start + length - 1),
+        );
+    }
+    let mut response = request
+        .send()
+        .await
+        .with_context(|| format!("reading {url}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(Gated(repo_id.to_string()).into());
+    }
+    if !status.is_success() || (range.is_some() && status != reqwest::StatusCode::PARTIAL_CONTENT) {
+        bail!("{repo_id}: the hub answered {status} for {url}");
+    }
+    let most = range.map_or(STATED_CAP, |(_, length)| length);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading response body")? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > most {
+            bail!("{repo_id}: the hub sent more than asked for {url}");
+        }
+    }
+    Ok(bytes)
+}
+
 /// A listed file pie may join onto its folders: a relative path of plain
 /// segments, named by an object id of its hash's length in lowercase hex.
 fn is_safe(entry: &Entry) -> bool {
