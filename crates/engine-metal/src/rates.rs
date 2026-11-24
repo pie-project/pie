@@ -40,11 +40,11 @@ use kernels_metal::linear::gemm;
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
-use profile::fire::Rates;
+use profile::rates::Rates;
 
 
 /// The rates this backend's estimate weighs a fire by, of
-/// `profile::fire::KEYS` (every one): what its load measures where its
+/// `profile::rates::KEYS` (every one): what its load measures where its
 /// chip's profile states none.
 pub const KEYS: [&str; 8] = [
     "launch_ns",
@@ -848,7 +848,7 @@ pub fn measure_keys(
         resident_workgroups: None,
         attn_tflops_by_rows_keys: None,
         product_ns: None,
-        kernel_tflops_by_shape: None,
+        kernel_curves: None,
         dense_settled: Vec::new(),
         measured_on: Some(crate::stored::measured_on(device.name())),
         measured_by: Some(

@@ -64,7 +64,7 @@ impl Shell {
             .map_or(0, |routes| routes.fingerprint());
         format!(
             "cuda|{}|kernels {}|emitter {}|routes {routes:#010x}|lanes {} tokens {}",
-            profile::fire::Now::on(&self.keys),
+            profile::rates::Now::on(&self.keys),
             self.keys.codes_said(),
             eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION,
             self.budget.max_lanes,

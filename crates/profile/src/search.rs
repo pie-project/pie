@@ -21,6 +21,10 @@ pub type Entries = Vec<(String, String)>;
 /// them, which compiles or records: the median is kept.
 pub const FIRE_REPS: usize = 3;
 
+/// `(tokens, ns)` of a fire at each rung width, ascending in tokens: what a
+/// check of the estimate measures. Never a profile's.
+pub type FireTable = Vec<(u32, u64)>;
+
 /// The fires a check of the estimate times on every backend: a fire of
 /// each width in `widths` (the rungs its load lays, in tokens), `fire`
 /// timing one in nanoseconds (told whether it is timed: the first a width,
@@ -29,7 +33,7 @@ pub fn time_fires(
     widths: &[u32],
     mut fire: impl FnMut(u32, bool) -> Result<u64, String>,
     say: &mut dyn FnMut(&str),
-) -> Result<crate::fire::FireTable, String> {
+) -> Result<FireTable, String> {
     let mut widths = widths.to_vec();
     widths.sort_unstable();
     widths.dedup();
@@ -307,7 +311,7 @@ pub fn assemble(
         let mut tuned = profile.tuned().clone();
         tuned.rates.measured_on = None;
         tuned.rates.measured_by = None;
-        tuned.rates.kernel_tflops_by_shape = None;
+        tuned.rates.kernel_curves = None;
         tuned.rates.dense_settled = Vec::new();
         tuned.committed_settle = Vec::new();
         profile.with_tuned(tuned)
@@ -433,15 +437,58 @@ fn median(mut v: Vec<f64>) -> f64 {
     v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
-/// One serving's weighted time against another's: the prompt and the
-/// one-lane step count 0.3 each, the 4- and 8-lane steps 0.2.
+/// What a serving's time is weighed by: the prompt and the one-lane step
+/// 0.3 each, the 4- and 8-lane steps 0.2 ([`Serving::measures`]'s order).
+const WEIGHTS: [f64; 4] = [0.3, 0.3, 0.2, 0.2];
+
+impl Serving {
+    /// The prompt's timings, then each lane count's steps.
+    fn measures(&self) -> [&[f64]; 4] {
+        [&self.prompt, &self.steps[0], &self.steps[1], &self.steps[2]]
+    }
+}
+
+/// One serving's weighted time against another's ([`WEIGHTS`]).
 fn relative(got: &Serving, against: &Serving) -> f64 {
     let m = |v: &[f64]| median(v.to_vec());
-    let mut r = 0.3 * m(&got.prompt) / m(&against.prompt);
-    for (i, w) in [0.3, 0.2, 0.2].iter().enumerate() {
-        r += w * m(&got.steps[i]) / m(&against.steps[i]);
+    let (g, a) = (got.measures(), against.measures());
+    (0..4).map(|i| WEIGHTS[i] * m(g[i]) / m(a[i])).sum()
+}
+
+/// A median's standard error relative to it, from the timings it is the
+/// median of: `sqrt(pi / 2)` times the timings' standard deviation over
+/// the root of their count (the median of normal noise). Zero where fewer
+/// than two timings say nothing of their spread.
+fn median_error(v: &[f64]) -> f64 {
+    if v.len() < 2 {
+        return 0.0;
     }
-    r
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+    let m = median(v.to_vec());
+    if m > 0.0 {
+        (std::f64::consts::PI / 2.0).sqrt() * sd / n.sqrt() / m
+    } else {
+        0.0
+    }
+}
+
+/// What two servings' own timings can tell apart, as a relative error of
+/// one against the other: each measure's two median errors joined (their
+/// noise is independent), `(of the weighted time, of the worst measure)`.
+/// A comparison holds a change to this at the least, where the incumbent's
+/// drift between two servings says less.
+fn resolution(got: &Serving, against: &Serving) -> (f64, f64) {
+    let (g, a) = (got.measures(), against.measures());
+    let each: Vec<f64> = (0..4)
+        .map(|i| median_error(g[i]).hypot(median_error(a[i])))
+        .collect();
+    let weighted = (0..4)
+        .map(|i| (WEIGHTS[i] * each[i]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    (weighted, each.iter().copied().fold(0.0, f64::max))
 }
 
 /// The worst single measure of `got` against `against`: the prompt, or a
@@ -502,14 +549,12 @@ pub struct Check {
     pub cosine: f64,
     pub same_top: bool,
     /// How much slower the tuned file may read and still pass: today's own
-    /// drift between its two servings, twice over, and 2% at least.
+    /// drift between its two servings, or what the servings' timings can
+    /// resolve where that is more, twice over.
     pub allowance: f64,
 }
 
 impl Check {
-    /// The least a tuned profile may be slower than today's, as noise.
-    pub const NOISE: f64 = 1.02;
-
     #[must_use]
     pub fn passes(&self) -> bool {
         let ok = |a: f64, b: f64| b <= a * self.allowance;
@@ -569,7 +614,7 @@ pub fn check(
             .collect(),
         cosine: cosine(&a.readout, &b.readout),
         same_top: top(&a.readout) == top(&b.readout),
-        allowance: 1.0 + (2.0 * noise).max(Check::NOISE - 1.0),
+        allowance: 1.0 + 2.0 * noise.max(resolution(&b, &a).1).max(resolution(&b, &c).1),
     })
 }
 
@@ -686,8 +731,10 @@ pub fn search(
         // Every candidate that served, as `best` would hold it.
         let mut served_all: Vec<Best> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
-        // Each model's drift between two servings of the incumbent.
+        // Each model's drift between two servings of the incumbent, and
+        // what its last comparison's timings resolve.
         let mut noise: Vec<f64> = vec![0.0; names.len()];
+        let mut floor: Vec<f64> = vec![0.0; names.len()];
         let mut queue: Vec<String> = knob.candidates.iter().map(|(l, _)| l.clone()).collect();
         // The incumbent counts as tried, so halfway never skips it.
         let mut tried: Vec<(String, bool)> = vec![(knob.current.clone(), true)];
@@ -780,10 +827,14 @@ pub fn search(
                     continue 'candidate;
                 }
                 let rm = relative(&served, base);
+                // What this pair's timings resolve, where the incumbent's
+                // drift says less.
+                let (mean_floor, worst_floor) = resolution(&served, base);
+                floor[m] = mean_floor;
                 // No measure of any model may lose more than its noise twice
-                // over (and 2%): the final check holds the file to the same.
+                // over: the final check holds the file to the same.
                 let (w, what) = worst(&served, base);
-                if w > 1.0 + (2.0 * noise[m]).max(Check::NOISE - 1.0) {
+                if w > 1.0 + 2.0 * noise[m].max(worst_floor) {
                     worse = Some(format!("{what} {:+.1}% on {}", (w - 1.0) * 100.0, names[m]));
                 }
                 r += rm / on.len() as f64;
@@ -801,11 +852,17 @@ pub fn search(
                 notes.push(format!("{seen} costs a model ({worse})"));
                 continue;
             }
-            // The mean must beat the models' noise, which averaging over
-            // `n` of them shrinks by its root, and a percent at least.
+            // The mean must beat the models' noise (each its drift, or what
+            // its timings resolve where that is more), which averaging over
+            // `n` of them shrinks by its root.
             let n = on.len() as f64;
-            let rms = (on.iter().map(|&m| noise[m] * noise[m]).sum::<f64>() / n).sqrt();
-            let bar = 1.0 - (2.0 * rms / n.sqrt()).max(0.01);
+            let rms = (on
+                .iter()
+                .map(|&m| noise[m].max(floor[m]).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            let bar = 1.0 - 2.0 * rms / n.sqrt();
             served_all.push((r, label.clone(), text.clone(), got.clone(), bar));
             if best.as_ref().is_none_or(|(b, ..)| r < *b) {
                 best = Some((r, label.clone(), text, got, bar));
@@ -1048,7 +1105,11 @@ mod tests {
         fn serve(&mut self, _: usize, file: &str) -> Result<Serving, String> {
             self.0 += 1;
             // Every other serve is 10% faster, whatever it serves.
-            let t = if self.0.is_multiple_of(2) { 90.0 } else { 100.0 };
+            let t = if self.0.is_multiple_of(2) {
+                90.0
+            } else {
+                100.0
+            };
             let _ = value(file, "noop");
             Ok(Serving {
                 prompt: vec![t],

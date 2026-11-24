@@ -94,7 +94,7 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
 /// [`resolve`] for a load on the device `on` names (its vendor, device id
 /// and driver): the measurements the user's file stores kept where their
 /// keys match this build on this device, the rest dropped to be measured
-/// again ([`profile::fire::Rates::sift`]), each said in the load log.
+/// again ([`profile::rates::Rates::sift`]), each said in the load log.
 #[must_use]
 pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Profile, Report) {
     let keys = engine_gpu::stored::Keys::new(
@@ -115,13 +115,13 @@ pub fn probe() -> Option<(String, Facts)> {
 }
 
 /// What this build keys device `index`'s stored measurements by
-/// (`profile::fire::Now`: its device and driver, each kernel's code): what a
+/// (`profile::rates::Now`: its device and driver, each kernel's code): what a
 /// committed entry is checked against before an export carries it.
 #[must_use]
-pub fn now_at(index: u32) -> Option<Box<dyn profile::fire::Now>> {
+pub fn now_at(index: u32) -> Option<Box<dyn profile::rates::Now>> {
     measured_on_at(index).map(|on| {
         Box::new(engine_gpu::stored::Keys::new(on, kernels_slang::Target::Spirv))
-            as Box<dyn profile::fire::Now>
+            as Box<dyn profile::rates::Now>
     })
 }
 

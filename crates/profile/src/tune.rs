@@ -107,14 +107,17 @@ impl Fit {
 pub struct Options {
     /// A rung is added only if it saves this fraction of the floor.
     pub min_gain: f64,
-    pub max_rungs: usize,
+    /// The most rungs a ladder holds, its tail with them; `None` for as
+    /// many as the samples lie at distinct points: a rung past those lands
+    /// no point another does not, and saves nothing measured.
+    pub max_rungs: Option<usize>,
 }
 
 impl Default for Options {
     fn default() -> Options {
         Options {
             min_gain: 0.01,
-            max_rungs: 8,
+            max_rungs: None,
         }
     }
 }
@@ -282,7 +285,9 @@ fn search(
                 if replace && at == ladder.len() {
                     continue;
                 }
-                if !replace && (!insert || ladder.len() + 1 >= options.max_rungs) {
+                if !replace
+                    && (!insert || ladder.len() + 1 >= options.max_rungs.unwrap_or(usize::MAX))
+                {
                     continue;
                 }
                 let next = if replace { at + 1 } else { at };
@@ -352,6 +357,16 @@ pub fn fit(
         return Err(Refusal::NoSamples);
     }
     let floor: f64 = samples.iter().map(|s| s.weight).sum();
+    let max_rungs = options.max_rungs.unwrap_or_else(|| {
+        let mut points: Vec<&[i64]> = samples.iter().map(|s| s.at.as_slice()).collect();
+        points.sort_unstable();
+        points.dedup();
+        points.len()
+    });
+    let options = Options {
+        max_rungs: Some(max_rungs),
+        ..options
+    };
     // rel[s][c]: the weighted relative time, infinite where c did not run.
     let rel: Vec<Vec<f64>> = samples
         .iter()
@@ -392,7 +407,7 @@ pub fn fit(
         }
     }
 
-    while chosen.len() + 1 < options.max_rungs {
+    while chosen.len() + 1 < max_rungs {
         let settled: f64 = (0..samples.len())
             .filter_map(|s| landed[s].map(|c| rel[s][c]))
             .sum();

@@ -550,7 +550,7 @@ fn held(
     cache: &Path,
     committed: Option<&str>,
     committed_covers: &[&str],
-    now: Option<&dyn profile::fire::Now>,
+    now: Option<&dyn profile::rates::Now>,
     on: impl FnOnce() -> Option<String>,
 ) -> Exported {
     let origin = from.display().to_string();
@@ -578,7 +578,7 @@ fn held(
         let mine = match stored {
             Some(Ok(file)) => file.tuned.rates,
             Some(Err(why)) => return Err(why.to_string()),
-            None => profile::fire::Rates::default(),
+            None => profile::rates::Rates::default(),
         };
         let theirs = match committed_rates {
             Some(Ok(file)) => {
@@ -595,7 +595,7 @@ fn held(
             }
             None => None,
         };
-        if mine == profile::fire::Rates::default() && theirs.is_none() {
+        if mine == profile::rates::Rates::default() && theirs.is_none() {
             return Err(user.clone().err().unwrap_or_else(|| format!("{origin}: stores nothing")));
         }
         let (merged, lines) = profile::merge_committed(mine, theirs, now)?;
@@ -619,10 +619,10 @@ fn held(
 }
 
 /// What this build keys `backend`'s device `index` (named `device`) by
-/// (`profile::fire::Now`): what a committed entry is checked against before
+/// (`profile::rates::Now`): what a committed entry is checked against before
 /// an export carries it. `None` where the engine states none here (its
 /// committed entries are carried unchecked, and a boot checks them).
-fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::fire::Now>> {
+fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::rates::Now>> {
     let _ = (index, device);
     match backend.name {
         #[cfg(feature = "vulkan")]
@@ -666,7 +666,7 @@ fn device_on(backend: &Backend, index: u32, device: &str) -> Option<String> {
         #[cfg(feature = "wgpu")]
         "wgpu" => engine_wgpu::chip::measured_on_at(index),
         #[cfg(feature = "engine-cuda")]
-        "cuda" => Some(profile::fire::Now::on(&engine_cuda::stored::Keys::of(
+        "cuda" => Some(profile::rates::Now::on(&engine_cuda::stored::Keys::of(
             i32::try_from(index).unwrap_or(0),
             device,
         ))),

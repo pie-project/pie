@@ -1,5 +1,5 @@
 //! What a measurement stored in a device's profile is keyed by on ROCm
-//! (`profile::fire::Now`, stated by `engine-cuda`): the device as its
+//! (`profile::rates::Now`, stated by `engine-cuda`): the device as its
 //! measurements depend on it, and the code of what a measurement fired.
 //!
 //! A kernel of this crate is compiled at run time from the units it carries
@@ -68,7 +68,7 @@ pub fn blaslt_code() -> Option<u32> {
     }
 }
 
-use profile::fire::fingerprint;
+use profile::rates::fingerprint;
 
 #[cfg(test)]
 mod tests {

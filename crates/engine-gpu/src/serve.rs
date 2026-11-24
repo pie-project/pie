@@ -156,12 +156,12 @@ pub trait Serve: Backend {
     fn save_rates(
         device: &Self::Context,
         boot: &Self::DeviceBoot,
-        rates: &profile::fire::Rates,
+        rates: &profile::rates::Rates,
     ) -> Result<()>;
 
     /// `tuning` with each dense kernel's rate curve at each of the model's
     /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
-    /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
+    /// fire of the load may bring (`profile::rates::Rates::kernel_curves`):
     /// those its profile lacks measured now, on `device`, and saved with the
     /// device's rates (`crate::rates::measure_shapes`); what the dense
     /// matmul's kernel at each rung is chosen by (`crate::dense`).
@@ -740,7 +740,7 @@ pub struct Settled {
 /// The version of the dense settle's method ([`Shell::settle_dense`]: how
 /// it weighs each range in whole served steps, or on its widest plane
 /// alone), its stored settle's key beside what it weighed and the kernels'
-/// code (`profile::fire::DenseSettled`): bumped only when how it weighs
+/// code (`profile::curves::DenseSettled`): bumped only when how it weighs
 /// changes.
 pub const SETTLE_METHOD: u32 = 1;
 
@@ -764,7 +764,7 @@ fn tier_of(number: u32) -> kernels_slang::Tier {
     }
 }
 
-/// A row of a stored settle (`profile::fire::DenseSettled::ranges`) as the
+/// A row of a stored settle (`profile::curves::DenseSettled::ranges`) as the
 /// kernel it takes over its range where it replaced the curves' one.
 fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
     let [_, _, replaced, vector, wide, tier] = row;
@@ -1189,16 +1189,16 @@ pub struct Shell<B: Serve> {
     /// The dense planes and the rates the dense kernel was chosen by: what
     /// the settle prices an option's step by under a stated submit bound.
     dense_planes: Vec<(u32, u32, u32, f64)>,
-    dense_rates: profile::fire::Rates,
+    dense_rates: profile::rates::Rates,
     /// The dense settle a committed measured profile states, taken where
     /// the user's stored one's key does not match and its own does
-    /// (`profile::fire::Tuned::committed_settle`).
-    committed_settle: Vec<profile::fire::DenseSettled>,
+    /// (`profile::rates::Tuned::committed_settle`).
+    committed_settle: Vec<profile::curves::DenseSettled>,
     /// The key the settle looked its stored entries up by, once it ran:
     /// `(of, code)` ([`Shell::settle_key`]).
     settle_keyed: Option<(u32, u32)>,
     /// What the shell timed at load beside its profile's
-    /// (`profile::fire::Tuned::timed`): the bound probe, the settle.
+    /// (`profile::rates::Tuned::timed`): the bound probe, the settle.
     timed: Vec<String>,
     /// Whether the load times what no stored or committed profile states
     /// (`[engine] measure`): skipped, the settle fires nothing.
@@ -1206,7 +1206,7 @@ pub struct Shell<B: Serve> {
     /// What the dense settle did at each range ([`Shell::settled`]).
     settled: Vec<Settled>,
     /// The settle this load ran, for the engine to keep in the profile.
-    to_store: Option<profile::fire::DenseSettled>,
+    to_store: Option<profile::curves::DenseSettled>,
     /// The dense settle left to weigh behind serving, where no stored or
     /// committed settle of the load's key decided every range.
     behind: Option<Behind>,
@@ -1526,7 +1526,7 @@ impl<B: Serve> Shell<B> {
             .into_iter()
             .map(|(n, k, ..)| (n, k))
             .collect();
-        let before = fitted.tuning.profile().rates().kernel_tflops_by_shape;
+        let before = fitted.tuning.profile().rates().kernel_curves;
         fitted.tuning = B::rate_shapes(
             &fitted.device,
             boot.device,
@@ -1535,7 +1535,7 @@ impl<B: Serve> Shell<B> {
             counts.weight_bytes,
             top.max(1),
         )?;
-        Ok(fitted.tuning.profile().rates().kernel_tflops_by_shape != before)
+        Ok(fitted.tuning.profile().rates().kernel_curves != before)
     }
 
     /// Opens the device `boot` names and fits the load to it: the trace
@@ -2554,7 +2554,7 @@ impl<B: Serve> Shell<B> {
                             "skipped: `[rates] {}`, served by the estimate: a step is held at \
                              the ratio 1 of its estimate until a served step's measured ratio \
                              passes it",
-                            profile::fire::SUBMIT_WORST_RATIO
+                            profile::rates::SUBMIT_WORST_RATIO
                         );
                         Some(1.0)
                     }
@@ -2568,7 +2568,7 @@ impl<B: Serve> Shell<B> {
                          measures it",
                         bound.as_millis(),
                         device.name(),
-                        profile::fire::SUBMIT_WORST_RATIO
+                        profile::rates::SUBMIT_WORST_RATIO
                     )));
                 };
                 // A prompt step's attention against a longer prefix,
@@ -2587,7 +2587,7 @@ impl<B: Serve> Shell<B> {
                             "skipped: `[rates] {}`, served by the estimate: a prompt step's \
                              attention against a longer prefix is read off the square attention \
                              curve",
-                            profile::fire::ATTN_BY_ROWS_KEYS
+                            profile::rates::ATTN_BY_ROWS_KEYS
                         );
                         Some(Vec::new())
                     }
@@ -2601,7 +2601,7 @@ impl<B: Serve> Shell<B> {
                          measures it",
                         bound.as_millis(),
                         device.name(),
-                        profile::fire::ATTN_BY_ROWS_KEYS
+                        profile::rates::ATTN_BY_ROWS_KEYS
                     )));
                 };
                 let held = crate::submit::SubmitBound {
@@ -3280,7 +3280,7 @@ impl<B: Serve> Shell<B> {
         self.settle_keyed = Some((of, code));
         // The user's stored settle first, then a committed profile's: the
         // first whose key matches is taken, each other said and why.
-        let why_not = |stored: &profile::fire::DenseSettled| {
+        let why_not = |stored: &profile::curves::DenseSettled| {
             if stored.method != SETTLE_METHOD {
                 Some(format!(
                     "its method is version {SETTLE_METHOD} now, {} when stored",
@@ -3297,7 +3297,7 @@ impl<B: Serve> Shell<B> {
                 None
             }
         };
-        let mut taken: Option<(&str, profile::fire::DenseSettled)> = None;
+        let mut taken: Option<(&str, profile::curves::DenseSettled)> = None;
         for (whence, settled) in [
             ("stored", self.dense_rates.dense_settled.clone()),
             ("committed", self.committed_settle.clone()),
@@ -3467,8 +3467,8 @@ impl<B: Serve> Shell<B> {
     /// committed one; else the settle whose model shares the most planes
     /// with this one's (the stored first on a tie). `(whence, settle, how
     /// near)`; `None` where no settle shares a plane.
-    fn nearest_settle(&self, of: u32) -> Option<(&'static str, profile::fire::DenseSettled, String)> {
-        let all: Vec<(&'static str, &profile::fire::DenseSettled)> = self
+    fn nearest_settle(&self, of: u32) -> Option<(&'static str, profile::curves::DenseSettled, String)> {
+        let all: Vec<(&'static str, &profile::curves::DenseSettled)> = self
             .dense_rates
             .dense_settled
             .iter()
@@ -3479,7 +3479,7 @@ impl<B: Serve> Shell<B> {
             return Some((whence, same.clone(), "the same model's".to_string()));
         }
         let mine: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
-        let mut best: Option<(usize, &'static str, &profile::fire::DenseSettled)> = None;
+        let mut best: Option<(usize, &'static str, &profile::curves::DenseSettled)> = None;
         for &(whence, settle) in &all {
             let shared = settle.planes.iter().filter(|p| mine.contains(p)).count();
             if shared > 0 && best.is_none_or(|(most, ..)| shared > most) {
@@ -3843,12 +3843,12 @@ impl<B: Serve> Shell<B> {
 
     /// The settle entry for the profile as `behind` stands: the rows stored
     /// before and every range weighed since whose clock held.
-    fn behind_entry(&self, behind: &Behind) -> profile::fire::DenseSettled {
+    fn behind_entry(&self, behind: &Behind) -> profile::curves::DenseSettled {
         let mut planes: Vec<(u32, u32)> =
             self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
         planes.sort_unstable();
         planes.dedup();
-        profile::fire::DenseSettled {
+        profile::curves::DenseSettled {
             method: SETTLE_METHOD,
             of: behind.of,
             code: behind.code,
@@ -4369,7 +4369,7 @@ impl<B: Serve> Shell<B> {
         // stored entry, a committed one, a measurement, the estimate under
         // skip): the dense kernel each rung takes after the settle, and the
         // workgroups a guest step strides over; never which file stated them.
-        let tuning = profile::fire::fingerprint(
+        let tuning = profile::rates::fingerprint(
             format!(
                 "{decisions:?}|{:?}|{:?}|{}|{}|cores {} resident {:?}",
                 self.dense,
@@ -4464,7 +4464,7 @@ impl<B: Serve> Shell<B> {
     }
 
     /// The stored settle's row of a range `bottom..=top` that replaced the
-    /// curves' kernel with `tactic` (`profile::fire::DenseSettled::ranges`).
+    /// curves' kernel with `tactic` (`profile::curves::DenseSettled::ranges`).
     #[must_use]
     pub fn settled_row(
         bottom: u32,
@@ -4482,7 +4482,7 @@ impl<B: Serve> Shell<B> {
     }
 
     /// The settle the load ran and the profile should keep, taken once.
-    pub fn take_settled(&mut self) -> Option<profile::fire::DenseSettled> {
+    pub fn take_settled(&mut self) -> Option<profile::curves::DenseSettled> {
         self.to_store.take()
     }
 

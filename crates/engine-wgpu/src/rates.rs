@@ -106,7 +106,7 @@ pub fn at_load(
                 "rates: `[rates] {}` timed despite measure = false (no layer states it, and the \
                  device states no count a guest step's grid can stride over): a {}-row matmul of \
                  width {} against one workgroup of it, single fires; stored nowhere",
-                profile::fire::RESIDENT_WORKGROUPS,
+                profile::rates::RESIDENT_WORKGROUPS,
                 engine_gpu::rates::RESIDENT_ROWS,
                 engine_gpu::rates::RESIDENT_SHAPE
             );
@@ -123,7 +123,7 @@ pub fn at_load(
     device.hold_resident(resident);
     if tuning.resident().is_none() && measuring == engine::rates::Measuring::Skip {
         let mut tuned = tuning.profile().tuned().clone();
-        tuned.timed.push(profile::fire::RESIDENT_WORKGROUPS.to_string());
+        tuned.timed.push(profile::rates::RESIDENT_WORKGROUPS.to_string());
         return Ok(tuning.with_profile(tuning.profile().with_tuned(tuned)));
     }
     Ok(tuning)
@@ -148,7 +148,7 @@ pub fn measure(
     device: &Context,
     tuning: &crate::tuning::Tuning,
     max_submit: Option<std::time::Duration>,
-    stated: &profile::fire::Rates,
+    stated: &profile::rates::Rates,
 ) -> Result<engine::rates::Measured> {
     measure_saying(device, tuning, max_submit, stated, &mut |_| {})
 }
@@ -158,7 +158,7 @@ pub fn measure_saying(
     device: &Context,
     tuning: &crate::tuning::Tuning,
     max_submit: Option<std::time::Duration>,
-    stated: &profile::fire::Rates,
+    stated: &profile::rates::Rates,
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
@@ -176,7 +176,7 @@ pub fn measure_saying(
 pub fn save_rates(
     device: &Context,
     profiles: Option<&std::path::Path>,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
 ) -> Result<()> {
     let Some(profiles) = profiles else {
         return Ok(());
@@ -187,7 +187,7 @@ pub fn save_rates(
         provenance: provenance(&measured.name),
         registry: crate::chip::registry(),
     };
-    let rates = profile::fire::Rates {
+    let rates = profile::rates::Rates {
         measured_on: Some(device.measured_on()),
         ..rates.clone()
     };

@@ -558,12 +558,12 @@ fn composed(measured: &str, shapes: &[(u32, u32)], base: &str) -> String {
     out
 }
 
-/// The curve `d` is stored as (`profile::fire::KernelCurve` kind and key):
+/// The curve `d` is stored as (`profile::curves::KernelCurve` kind and key):
 /// the few-row vector forms as a vector kernel of 8 rows, the simdgroup
 /// row tiles as a tile (key 0: its row tile follows the rows), the
 /// tensor-op tile as an MPP tile of 32 rows.
 fn curve_id(d: Dense) -> (u32, u32) {
-    use profile::fire::KernelCurve;
+    use profile::curves::KernelCurve;
     match d {
         Dense::Rows => (KernelCurve::VECTOR, Dense::ROWS_MAX),
         Dense::Tile => (KernelCurve::TILE, 0),
@@ -590,8 +590,8 @@ fn curve_file(d: Dense) -> &'static str {
 /// rows with each point's spread, keyed by the candidate's kernel source.
 /// The vector forms end at 8 rows, the most they take: their curve stops
 /// there, as one beaten past it.
-fn curves_of(measured: &Measured) -> Vec<profile::fire::KernelCurve> {
-    use profile::fire::KernelCurve;
+fn curves_of(measured: &Measured) -> Vec<profile::curves::KernelCurve> {
+    use profile::curves::KernelCurve;
     let mut out: Vec<KernelCurve> = Vec::new();
     for p in &measured.points {
         for (c, d) in measured.candidates.iter().enumerate() {
@@ -618,7 +618,7 @@ fn curves_of(measured: &Measured) -> Vec<profile::fire::KernelCurve> {
                     curve: vec![(p.rows, tflops)],
                     stop: None,
                     spread: vec![(p.rows, spread)],
-                    by: crate::stored::by(profile::fire::KERNEL_CURVES, &[curve_file(*d)]),
+                    by: crate::stored::by(profile::rates::KERNEL_CURVES, &[curve_file(*d)]),
                 }),
             }
         }
@@ -638,7 +638,7 @@ fn curves_of(measured: &Measured) -> Vec<profile::fire::KernelCurve> {
 /// [`Measured`]'s form for the fit: each candidate's time from its TFLOP/s;
 /// `today` the route the load would take without them.
 fn points_of(
-    curves: &[profile::fire::KernelCurve],
+    curves: &[profile::curves::KernelCurve],
     candidates: &[Dense],
     shapes: &[(u32, u32)],
     today: &kernels_metal::Tuning,
@@ -815,7 +815,7 @@ fn winners(measured: &Measured, today: &kernels_metal::Tuning) -> (String, Strin
 }
 
 /// `chip` with `kernel.dense` stated by this model's own bf16 shapes,
-/// from each shape's curves (`[rates] kernel_tflops_by_shape_keyed`, one a
+/// from each shape's curves (`[rates] kernel_curves`, one a
 /// candidate kernel): taken where the user's file or the device's committed
 /// measured profile states them under a matching key (`crate::stored`: the
 /// device, its OS release, the kernel's source), else measured here before
@@ -841,13 +841,13 @@ pub(crate) fn at_load(
     let name = device.name().to_string();
     let family = device.family();
     let candidates = candidates(family);
-    let stated: Vec<profile::fire::KernelCurve> = chip
+    let stated: Vec<profile::curves::KernelCurve> = chip
         .rates()
-        .kernel_tflops_by_shape
+        .kernel_curves
         .clone()
         .unwrap_or_default();
     let top = *LOAD_ROWS.last().expect("rows");
-    let lacks = |curves: &[profile::fire::KernelCurve], n: u32, k: u32| {
+    let lacks = |curves: &[profile::curves::KernelCurve], n: u32, k: u32| {
         candidates.iter().filter(|d| runs_shape(**d, n, k)).any(|d| {
             let (kind, key) = curve_id(*d);
             !curves
@@ -870,16 +870,16 @@ pub(crate) fn at_load(
     // that a figure exists for, and nothing behind serving (a timing lays
     // buffers of its own, and nothing is laid after ready). Only a shape no
     // layer states at all is timed here.
-    let stale: Vec<profile::fire::KernelCurve> = chip
+    let stale: Vec<profile::curves::KernelCurve> = chip
         .rates()
         .stale
         .as_ref()
-        .and_then(|stale| stale.kernel_tflops_by_shape.clone())
+        .and_then(|stale| stale.kernel_curves.clone())
         .unwrap_or_default();
     let lacking: Vec<(u32, u32)> = if stale.is_empty() || lacking.is_empty() {
         lacking
     } else {
-        let with: Vec<profile::fire::KernelCurve> = curves
+        let with: Vec<profile::curves::KernelCurve> = curves
             .iter()
             .chain(stale.iter().filter(|s| !curves.iter().any(|c| c.id() == s.id())))
             .cloned()
@@ -936,10 +936,10 @@ pub(crate) fn at_load(
                 provenance: crate::rates::provenance(&name),
                 registry: crate::chip::registry(),
             };
-            let stored = profile::fire::Rates {
-                kernel_tflops_by_shape: Some(fresh.clone()),
+            let stored = profile::rates::Rates {
+                kernel_curves: Some(fresh.clone()),
                 measured_on: Some(crate::stored::measured_on(&name)),
-                ..profile::fire::Rates::default()
+                ..profile::rates::Rates::default()
             };
             if let Err(why) = engine::rates::save_rates(&save, &stored) {
                 eprintln!("{name}: kernel.dense curves not stored: {why}");

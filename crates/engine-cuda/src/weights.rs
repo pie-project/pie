@@ -41,7 +41,7 @@ pub struct Weights {
     decoded: Vec<Buffer>,
     /// How this load landed its weights, where it measured it: for the
     /// device's profile, so a later load measures nothing.
-    landing: Option<profile::fire::Landing>,
+    landing: Option<profile::rates::Landing>,
 }
 
 pub(crate) fn decodes_at_load(param: &poem_ir::Param) -> bool {
@@ -526,7 +526,7 @@ impl Weights {
         target: StorageTarget,
         decode_dense: bool,
         held: bool,
-        known: Option<profile::fire::Landing>,
+        known: Option<profile::rates::Landing>,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -696,7 +696,7 @@ impl Weights {
             let all = [reads.spawn_s, reads.thread_bytes_per_s, reads.whole_bytes_per_s];
             measured_landing = match (&sink.ring, known) {
                 (Some(ring), None) if all.iter().all(|v| *v > 0.0) => {
-                    Some(profile::fire::Landing {
+                    Some(profile::rates::Landing {
                         copy_latency_ns: ring.rates.latency * 1e9,
                         copy_gbps: ring.rates.copy / 1e9,
                         copy_full_bytes: ring.rates.saturated as f64,
@@ -1413,7 +1413,7 @@ impl Weights {
     }
 
     #[must_use]
-    pub fn landing(&self) -> Option<profile::fire::Landing> {
+    pub fn landing(&self) -> Option<profile::rates::Landing> {
         self.landing
     }
 

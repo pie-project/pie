@@ -202,7 +202,7 @@ pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     context: u32,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     shape: impl FnOnce(
         engine::roofline::Constants,
     ) -> std::result::Result<engine::roofline::Constants, &'static str>,
@@ -245,14 +245,14 @@ mod tests {
     }
 
     /// The L40S device file's rates.
-    fn l40s() -> profile::fire::Rates {
-        profile::fire::Rates {
+    fn l40s() -> profile::rates::Rates {
+        profile::rates::Rates {
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 249.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 100.0)]),
             hbm_gbps: Some(654.0),
             elementwise_gbps: Some(400.0),
             launch_ns: Some(1620),
-            ..profile::fire::Rates::default()
+            ..profile::rates::Rates::default()
         }
     }
 
@@ -277,7 +277,7 @@ mod tests {
             &rungs,
             8 << 30,
             u32::MAX,
-            &profile::fire::Rates::default(),
+            &profile::rates::Rates::default(),
             Ok,
             "NVIDIA L40S",
             &counts(),

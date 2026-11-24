@@ -82,7 +82,7 @@ impl Shelf {
         device: &str,
         facts: &Facts,
         profiles: Option<&Path>,
-        now: &dyn crate::fire::Now,
+        now: &dyn crate::rates::Now,
     ) -> (Profile, Report) {
         self.resolve_with(registry, device, facts, profiles, Some(now))
     }
@@ -93,7 +93,7 @@ impl Shelf {
         device: &str,
         facts: &Facts,
         profiles: Option<&Path>,
-        now: Option<&dyn crate::fire::Now>,
+        now: Option<&dyn crate::rates::Now>,
     ) -> (Profile, Report) {
         let mut layers = Vec::new();
         let family = self
@@ -306,7 +306,7 @@ impl Shelf {
             let file = registry
                 .parse(text, name, Strict::Measured)
                 .map_err(|e| e.to_string())?;
-            if file.tuned.rates == crate::fire::Rates::default() {
+            if file.tuned.rates == crate::rates::Rates::default() {
                 return Err(format!(
                     "{name} is a measured profile, and states no measurement"
                 ));
@@ -362,13 +362,41 @@ impl Shelf {
         }
         Ok(())
     }
+
+    /// Every checked-in decision profile (not a committed measured one,
+    /// which holds measurements alone) loads, dumps as `pie tune` writes a
+    /// profile, and reads back strictly to the same rungs and assumed facts.
+    pub fn check_dumps(&self, registry: &Registry) -> Result<(), String> {
+        for (name, text) in self
+            .seeded
+            .iter()
+            .filter(|(name, _)| !name.ends_with(MEASURED_SUFFIX))
+        {
+            let p = registry
+                .load(text, name)
+                .map_err(|e| format!("{name}: {e}"))?;
+            let dumped = crate::render::dump(&p);
+            let again = registry
+                .parse(&dumped, "dump", Strict::CheckedIn)
+                .map_err(|e| format!("{name}: {e}\n---\n{dumped}"))?;
+            for (spec, rungs, _) in p.entries() {
+                if again.entries.get(spec.id).map(Vec::as_slice) != Some(rungs) {
+                    return Err(format!("{name}: `{}` dumps to other rungs", spec.id));
+                }
+            }
+            if again.target.assumes != p.target().assumes {
+                return Err(format!("{name}: the facts it assumes dump to others"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What `pie tune export` writes of a device's stored measurements: the
 /// `[rates]` of `user` (the device's user file, read from `origin`) in
 /// committed form ([`crate::Strict::Measured`], filed as
 /// [`measured_name`]): each entry with its key, in a fixed order
-/// ([`crate::fire::Rates::ordered`]), no date, path or decision. An entry
+/// ([`crate::rates::Rates::ordered`]), no date, path or decision. An entry
 /// stored without a key, or a file naming no device it was measured on, is
 /// refused by name; so is a file that does not read, or states no
 /// measurement. The text reads back to the same entries.
@@ -404,12 +432,12 @@ pub fn export_reporting(
 pub fn export_rates(
     registry: &Registry,
     device: &str,
-    rates: crate::fire::Rates,
+    rates: crate::rates::Rates,
     origin: &str,
 ) -> Result<(String, Vec<String>), String> {
     let mut rates = rates.ordered();
     let report = settles_carried(&mut rates);
-    if rates == crate::fire::Rates::default() {
+    if rates == crate::rates::Rates::default() {
         return Err(format!("{origin}: stores no measurement of `{device}`"));
     }
     if let Some(why) = rates.unkeyed() {
@@ -447,11 +475,11 @@ pub fn export_rates(
 /// profile stated is dropped and the home did not measure it again: a boot
 /// would then measure it.
 pub fn merge_committed(
-    measured: crate::fire::Rates,
-    committed: Option<crate::fire::Rates>,
-    now: Option<&dyn crate::fire::Now>,
-) -> Result<(crate::fire::Rates, Vec<String>), String> {
-    use crate::fire::{DENSE_SETTLED, KERNEL_CURVES, KEYED};
+    measured: crate::rates::Rates,
+    committed: Option<crate::rates::Rates>,
+    now: Option<&dyn crate::rates::Now>,
+) -> Result<(crate::rates::Rates, Vec<String>), String> {
+    use crate::rates::{DENSE_SETTLED, KERNEL_CURVES, KEYED};
     let mut report = Vec::new();
     // The home's own entries are checked as the committed ones are: one
     // stored under a key this build no longer matches is never written.
@@ -490,17 +518,17 @@ pub fn merge_committed(
             (false, false, false) => {}
         }
     }
-    let curve_ids = |r: &crate::fire::Rates| -> Vec<(u32, u32, u32, u32)> {
-        r.kernel_tflops_by_shape
+    let curve_ids = |r: &crate::rates::Rates| -> Vec<(u32, u32, u32, u32)> {
+        r.kernel_curves
             .iter()
             .flatten()
-            .map(crate::fire::KernelCurve::id)
+            .map(crate::curves::KernelCurve::id)
             .collect()
     };
     // A committed curve whose key no longer matches, which the home did not
     // measure again: never carried, and a boot would time it.
     let (kept, mine_now) = (curve_ids(&committed), curve_ids(&measured));
-    for curve in before.kernel_tflops_by_shape.iter().flatten() {
+    for curve in before.kernel_curves.iter().flatten() {
         let id = curve.id();
         if !kept.contains(&id) && !mine_now.contains(&id) {
             refused.push(format!("curve {}", curve.name()));
@@ -546,8 +574,8 @@ pub fn merge_committed(
 /// settle one of whose planes `rates` states no curve at is taken out of
 /// `rates` and said: carried, a boot of the model would time that plane's
 /// curves and settle again over them.
-pub fn settles_carried(rates: &mut crate::fire::Rates) -> Vec<String> {
-    let curves = rates.kernel_tflops_by_shape.clone().unwrap_or_default();
+pub fn settles_carried(rates: &mut crate::rates::Rates) -> Vec<String> {
+    let curves = rates.kernel_curves.clone().unwrap_or_default();
     let mut report = Vec::new();
     let mut kept = Vec::new();
     for settled in std::mem::take(&mut rates.dense_settled) {

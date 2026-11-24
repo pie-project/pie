@@ -431,30 +431,9 @@ mod tests {
     #[cfg(not(feature = "rocm"))]
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
-        // A committed measured profile is a device's keyed measurements, read
-        // as such (`profile::Strict::Measured`, the shelf's check), not a
-        // decision profile.
-        for (name, text) in SEEDED
-            .iter()
-            .filter(|(name, _)| !name.ends_with(profile::MEASURED_SUFFIX))
-        {
-            let p = registry()
-                .load(text, name)
-                .unwrap_or_else(|e| panic!("{e}"));
-            let dumped = profile::render::dump(&p);
-            let again = registry()
-                .parse(&dumped, "dump", profile::Strict::CheckedIn)
-                .unwrap_or_else(|e| panic!("{name}: {e}\n---\n{dumped}"));
-            for (spec, rungs, _) in p.entries() {
-                assert_eq!(
-                    again.entries.get(spec.id).map(Vec::as_slice),
-                    Some(rungs),
-                    "{name}: {}",
-                    spec.id
-                );
-            }
-            assert_eq!(again.target.assumes, p.target().assumes, "{name}");
-        }
+        SHELF
+            .check_dumps(registry())
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[cfg(not(feature = "rocm"))]
