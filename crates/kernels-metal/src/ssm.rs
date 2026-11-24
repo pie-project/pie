@@ -1536,7 +1536,7 @@ fn gated_delta_verify_at(
 }
 
 /// A decode step over each lane's buffered rows read as a linear attention
-/// (`gated_delta_carried`, new-memory/designs/lagged-fold.md): every lane a
+/// (`gated_delta_carried`): every lane a
 /// row of its own and any number of carried rows (their gates and weights a
 /// chunk at a time), read through
 /// the fire's page table from the buffer's `[b | a]` plane (`ba_paged`) and
@@ -1594,8 +1594,8 @@ pub fn gated_delta_carried(
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
     // A carry of one chunk (a decode at its run-ahead lag): the fused
-    // step's tiling, each row's scalars once a threadgroup
-    // (new-memory/designs/carried-kernel.md §1), a head's value tiles over
+    // step's tiling, each row's scalars once a threadgroup,
+    // a head's value tiles over
     // as many threadgroups as the lanes and heads leave room for.
     if table.max_rep <= GDN_CARRIED_INLINE {
         // Four value rows a simdgroup, as the scan step's, eight simdgroups
@@ -1770,7 +1770,7 @@ pub fn gated_delta_carried(
     )
 }
 
-/// A fire's beam groups' folds (BEAM-PAGE-LISTS §11.3): `[lane, n]` a group,
+/// A fire's beam groups' folds: `[lane, n]` a group,
 /// each folding the `n` rows every live beam shares into its set's state
 /// from its first fire lane `lane`'s buffer before the layer's step (that
 /// lane's page table row starts `n` rows past them). The folding groups lead

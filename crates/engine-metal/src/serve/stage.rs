@@ -6,8 +6,7 @@ use super::*;
 impl Shell {
 
     #[must_use]
-    /// A windowed lane's window table for this fire (CONTRACT-BC 19, 21;
-    /// `store::windowed`): its ring's pages below the buffer's base, its
+    /// A windowed lane's window table for this fire (/// `store::windowed`): its ring's pages below the buffer's base, its
     /// window-buffer slots from it, and the fire's own rows past them: in
     /// their ring rows where none of them overwrites a row a query of the
     /// fire reads ([`crate::store::windowed::direct_allowed`]), else in pages
@@ -837,7 +836,7 @@ impl Shell {
         // helper takes, from the same verb values the plan is built from.
         let rs_one_run: Vec<bool> = Vec::with_capacity(lanes.len());
         // Per seat, its buffer's base and its set's rs pages (slab slots),
-        // where it buffers: what a hybrid's beams resolve over (§11).
+        // where it buffers: what a hybrid's beams resolve over (hybrid beams).
         let rs_sets: Vec<Option<(u32, Vec<u32>)>> = Vec::with_capacity(lanes.len());
         // Per seat, its own rows: what its carried rows count toward the
         // rung by (`engine::fire::lane_carried`).
@@ -861,7 +860,7 @@ impl Shell {
         let writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         // What each lane writes and reads of its set (`engine::extent`).
         let extents = engine::extent::FireExtents::default();
-        // Each beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): the slot its
+        // Each beam group's fold: the slot its
         // set's state is folded to before any of its lanes reads it, as its
         // lanes state it (the runtime states it on the first); the fold the
         // fire runs, `[seat, rows]` a group; and per seat the rows its page
@@ -1102,8 +1101,8 @@ impl Shell {
             }
         }
         let geometries = geometries;
-        // The beam groups' head step, planned over the tables as staged
-        // (BEAM-PAGE-LISTS §6): its records point into this arm's inputs.
+        // The beam groups' head step, planned over the tables as staged:
+        // its records point into this arm's inputs.
         let (mut beam_records, beam_faults) = if beam_groups.is_empty() || self.warming {
             (crate::inputs::BeamRecords::default(), Vec::new())
         } else {
@@ -1363,7 +1362,7 @@ impl Shell {
         let rs_ext_replay_i32: Vec<i32> = rs_ext_replay.iter().map(|&n| n as i32).collect();
         // A beam lane whose group folds first replays from the fold: its
         // row starts that many rows on, the rows below it the group fold's
-        // (§11.3), which reads them through the same row.
+        // (the group fold), which reads them through the same row.
         let rs_pages = match rs_pages {
             Some(mut table) => {
                 let ints = rs_page_ints as usize;
@@ -1379,12 +1378,12 @@ impl Shell {
                     "serve::rs",
                     "a beam group folds its shared rows before its step, and its lanes' rows lie \
                      in no one stretch of pages a lane: a group fold reads them through a page \
-                     table (BEAM-PAGE-LISTS.md §11.3); the fire is refused and writes nothing",
+                     table; the fire is refused and writes nothing",
                 ));
             }
             None => None,
         };
-        // A hybrid's beams (BEAM-PAGE-LISTS §11): each beam's rs page table,
+        // A hybrid's beams: each beam's rs page table,
         // resolved over its list by the head step, and its rs copies over
         // every rs plane, through its set's rs entries.
         if !beam_records.groups.is_empty()
@@ -2239,7 +2238,7 @@ impl Shell {
         self.feed_positions(&mut frame, p)?;
         self.land_merges(&mut frame, p)?;
         if !dry && let Some(beam) = p.beam {
-            // The beam groups' head step (BEAM-PAGE-LISTS §6): reorder and
+            // The beam groups' head step: reorder and
             // resolve, then the forks' tail copies, ahead of every append
             // and read of the fire, in its own command buffer.
             #[cfg(target_vendor = "apple")]
@@ -2262,7 +2261,7 @@ impl Shell {
                 )
                 .map_err(crate::error::kernel)?;
             }
-            // A hybrid's rs copies (BEAM-PAGE-LISTS §11.2), after the kv
+            // A hybrid's rs copies, after the kv
             // copies and ahead of the fire's first append or read.
             if beam.rs_copy_count > 0 {
                 #[cfg(target_vendor = "apple")]
@@ -2810,8 +2809,8 @@ impl Shell {
             lists.push(if seated.kv_less {
                 Vec::new()
             } else if self.pools.ring().is_none() {
-                // Windowed layers are a lane's ring and window buffer
-                // (CONTRACT-BC 19, 21), on every load that has them.
+                // Windowed layers are a lane's ring and window buffer,
+                // on every load that has them.
                 return Err(Fault::program(
                     "serve::windowed",
                     "a load with window lists and no rings: Metal serves windowed layers \
@@ -3038,7 +3037,7 @@ impl Shell {
             .and_then(|slots| slots.first().copied())
             .unwrap_or(have);
         // The buffer's rows live in the rs list: the verb's pages, in
-        // token order from its base (CONTRACT-BC 18).
+        // token order from its base.
         // Where the record stands: the stated frozen length, or past it
         // where this engine's last fold of the record froze more than
         // the runtime has yet been told.
@@ -3055,7 +3054,7 @@ impl Shell {
                 lineage,
             } => {
                 // A beam group's set is folded by the runtime alone
-                // (§11.3): its lanes read the length it states, and an
+                // (the group fold): its lanes read the length it states, and an
                 // entry left on the record's slot by an earlier set
                 // (a fold writes a fresh record) is dropped.
                 let beam_lane = group_of[source].is_some();
@@ -3102,7 +3101,7 @@ impl Shell {
         });
         // A beam group's lanes share their set's state: what its lanes
         // fold is folded once for all of them, from the first's buffered
-        // rows, before any reads it (§11.3). Each lane then replays only
+        // rows, before any reads it (the group fold). Each lane then replays only
         // the rows past it, from its page table row started past them,
         // and folds none itself.
         let beam_group = group_of[source].filter(|_| {
@@ -3120,7 +3119,7 @@ impl Shell {
                         folded = *folded,
                         stated = beam_to[group].unwrap_or(0),
                         first,
-                        "a beam group's fold is stated past its lanes' first row (§11.3)"
+                        "a beam group's fold is stated past its lanes' first row (the group fold)"
                     );
                 }
                 if skip > 0 && plan.gathers.len() != 1 {
@@ -3129,7 +3128,7 @@ impl Shell {
                         format!(
                             "lane {source} of a beam group folds {skip} shared row(s) before \
                              its step and replays {} run(s) of its buffer; a group fold \
-                             reads one run from the set's fold (BEAM-PAGE-LISTS.md §11.3)",
+                             reads one run from the set's fold",
                             plan.gathers.len()
                         ),
                     ));
@@ -3161,7 +3160,7 @@ impl Shell {
                             .and_then(engine::ports::LanePorts::fold),
                     };
                     // A beam lane folds nothing itself: its group's fold
-                    // is the runtime's, applied to the set (§11.3).
+                    // is the runtime's, applied to the set (the group fold).
                     if beam_fold_to.is_some() {
                         Some(0)
                     } else {
@@ -3191,7 +3190,7 @@ impl Shell {
                 }
             };
             // A beam group's set is folded by the runtime as it prepares
-            // the fire (§11.3): nothing is frozen ahead of what it states.
+            // the fire (the group fold): nothing is frozen ahead of what it states.
             let to = n.map_or(*folded, |n| {
                 folded.saturating_add(n).min(first.saturating_add(row.rows))
             });
@@ -3207,10 +3206,10 @@ impl Shell {
         }
         // The state the lane's kernels read and fold: the record it
         // writes, but a lane of a copy-on-write group that folds nothing
-        // reads the run side, which no other lane writes this fire
-        // (CONTRACT-BC 15); its buffered rows still land in `record`.
+        // reads the run side, which no other lane writes this fire;
+        // its buffered rows still land in `record`.
         // A beam group's lanes read the record its fold, if any, has
-        // written before them (§11.3).
+        // written before them (the group fold).
         let state = match seated.record_run {
             Some(run) if plan.commit == 0 && beam_fold_to.is_none() => {
                 self.pools.record(Some(run), lane.slot)?

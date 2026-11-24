@@ -842,7 +842,7 @@ fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
 }
 
 /// Where a fire's value scratch lies: the activation span's guest region,
-/// laid per fire under the model's carve (REDESIGN 3, guest programs), or
+/// laid per fire under the model's carve (guest programs), or
 /// nowhere before a fire seats it.
 #[derive(Debug, Clone)]
 pub struct ScratchAt {
@@ -856,7 +856,7 @@ pub struct Prepared {
     /// The status word and the output address table: the instance's, in
     /// its `Instance` slots, as the tables below.
     status: Held,
-    /// The bind-time tables (the instance's state, REDESIGN step 4): in
+    /// The bind-time tables (the instance's state): in
     /// `Instance` slots where the runtime took them.
     descriptors: Held,
     params: Held,
