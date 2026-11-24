@@ -1018,7 +1018,16 @@ impl<B: Backend> Inputs<B> {
                         have: self.laid.mask_plane_bytes,
                     });
                 }
-                self.store.write(self.laid.mask_planes, &staged.bytes)?;
+                // Whole words, as `valid` above: the plane's body as it is,
+                // its last part-word padded with zeros no row's columns reach.
+                let (body, tail) = staged.bytes.split_at(staged.bytes.len() & !3);
+                self.store.write(self.laid.mask_planes, body)?;
+                if !tail.is_empty() {
+                    let mut word = [0u8; 4];
+                    word[..tail.len()].copy_from_slice(tail);
+                    self.store
+                        .write(self.laid.mask_planes + body.len() as u64, &word)?;
+                }
                 self.store.write(self.laid.mask_words, words_of(&staged.words))?;
                 self.laid.words_none = 0;
             }
