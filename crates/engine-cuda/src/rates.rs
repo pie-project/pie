@@ -176,6 +176,7 @@ fn ensure_by(
             Ok(engine::rates::Measured {
                 rates: keys.stamp(measure(&measure_chip)?),
                 unsettled: false,
+                throttled: None,
             })
         },
     )
