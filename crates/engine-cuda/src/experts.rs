@@ -11,21 +11,17 @@ pub mod staging;
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
 #[derive(Debug)]
-pub enum Spill {
-    Serving(crate::checkpoint_serving::Serving),
-}
+pub struct Spill(pub crate::checkpoint_serving::Serving);
 
 impl Spill {
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
-        let Spill::Serving(serving) = self;
-        serving.path()
+        self.0.path()
     }
 
     #[must_use]
     pub fn plane(&self, id: u32) -> Option<&[u8]> {
-        let Spill::Serving(serving) = self;
-        serving.plane(id)
+        self.0.plane(id)
     }
 
     fn remedy(&self) -> &'static str {
@@ -850,10 +846,6 @@ impl Tier {
         let bytes = self.host.bytes() as u64;
         self.host = Pinned::empty();
         bytes
-    }
-
-    pub fn zero_host(&self) {
-        self.host.zero();
     }
 
     #[must_use]

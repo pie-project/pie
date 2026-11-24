@@ -1,14 +1,14 @@
 [
   {
-    "key": "Spirv|vulkan 5143:44050a31 driver 0x8034a013|kernels 23 0x2e7a41d6|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0x7bede997|qwen3-0.6b-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
+    "key": "Spirv|vulkan 5143:44050a31 driver 0x8034a013|kernels 23 0x2e7a41d6|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0x06de30e1|qwen3-0.6b-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
     "cover": 1,
-    "frame_us": 43635.0,
-    "turnaround_us": 68.5
+    "frame_us": 54870.75,
+    "turnaround_us": 189.0
   },
   {
-    "key": "Spirv|vulkan 5143:44050a31 driver 0x8034a013|kernels 38 0xc0b372fc|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0x441e0b25|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
-    "cover": 1,
-    "frame_us": 52753.0,
-    "turnaround_us": 61.5
+    "key": "Spirv|vulkan 5143:44050a31 driver 0x8034a013|kernels 38 0xc0b372fc|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0x9974de4b|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
+    "cover": 0,
+    "frame_us": 54196.0,
+    "turnaround_us": 0.0
   }
 ]

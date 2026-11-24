@@ -160,7 +160,6 @@ pub struct PrefillPlan {
     pub window: Option<u32>,
     pub causal: bool,
     pub graph_capturable: bool,
-    pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
     /// Per request, the committed boundary its mask speaks of the keys past
     /// and its wide bit (`PrefillPagedParams::maybe_mask_origin`); the engine
@@ -255,8 +254,6 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
-    pub chunk_floor_128: bool,
-
     pub prefill_ctas_per_sm: u32,
 
     pub decode_gqa: crate::attn::decode_gqa::Gate,
@@ -266,7 +263,6 @@ impl Toggles {
     #[must_use]
     pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            chunk_floor_128: tuning.decode_chunk_floor_128(),
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
@@ -375,7 +371,6 @@ pub fn plan_decode(
         page_size: shape.page_size,
         head_dim: shape.head_dim,
         enable_cuda_graph,
-        chunk_floor_128: toggles.chunk_floor_128,
         window_left: u32::try_from(window_left).ok(),
         whole: ranks > 0
             || toggles
@@ -446,20 +441,7 @@ pub fn plan_prefill(
         ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
-    let (built, capturable, graph_refusal) =
-        match prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
-            Ok(built) => (built, enable_cuda_graph, None),
-            Err(declined) if enable_cuda_graph => {
-                let req = prefill::Request {
-                    enable_cuda_graph: false,
-                    ..req
-                };
-                let built =
-                    prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
-                (built, false, Some(declined.to_string()))
-            }
-            Err(declined) => return Err(declined),
-        };
+    let built = prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
 
     let cta_tile_q = u32::try_from(built.info.cta_tile_q).unwrap_or(0);
     if shape.head_dim >= 256 && cta_tile_q == 128 {
@@ -483,8 +465,7 @@ pub fn plan_prefill(
         total_tokens,
         window,
         causal,
-        graph_capturable: capturable,
-        graph_refusal,
+        graph_capturable: enable_cuda_graph,
         mask_indptr,
         mask_origin: None,
         device: *device,

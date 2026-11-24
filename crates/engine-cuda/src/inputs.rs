@@ -2406,7 +2406,7 @@ mod prefill_grant_tests {
                             *qo.last_mut().unwrap() = rows as i32;
                         }
                         let kv: Vec<i32> = (0..=live as i32).map(|lane| lane * 128).collect();
-                        let plan = plan_prefill(
+                        plan_prefill(
                             &qo,
                             &kv,
                             &[],
@@ -2439,13 +2439,12 @@ mod prefill_grant_tests {
                                 float_bytes: grant as usize,
                             },
                         )
-                        .unwrap();
-                        assert!(
-                            plan.graph_capturable,
-                            "top {top} over {max_lanes} lanes: b{rows} over {lanes} lanes \
-                             declines its graph form in a {grant}-byte grant: {:?}",
-                            plan.graph_refusal
-                        );
+                        .unwrap_or_else(|declined| {
+                            panic!(
+                                "top {top} over {max_lanes} lanes: b{rows} over {lanes} lanes \
+                                 declines its graph form in a {grant}-byte grant: {declined}"
+                            )
+                        });
                     }
                 }
             }

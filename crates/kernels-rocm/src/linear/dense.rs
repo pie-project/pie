@@ -103,14 +103,14 @@ fn vector_operands(w: u64, act: u64, y: u64) -> bool {
 /// hipBLASLt or the batch engine the turned kernel takes them.
 fn route(ctx: &Ctx, kind: Kind, m: i32, rows: i32, k: i32, w: u64, vectors: bool) -> Route {
     let t = ctx.tuning();
-    let until = if rows.unsigned_abs() >= t.gemm_skinny_batch_min_n {
-        t.gemm_turn_wide_until
+    let until = if rows.unsigned_abs() >= t.gemm_skinny_batch_min_n() {
+        t.gemm_turn_wide_until()
     } else {
-        t.gemm_turn_until.min(16)
+        t.gemm_turn_until().min(16)
     };
     let apart = route_apart(ctx, m, rows, k, vectors);
-    let turns = t.gemm_turn_from > 0
-        && (t.gemm_turn_from as i32..=until as i32).contains(&m)
+    let turns = t.gemm_turn_from() > 0
+        && (t.gemm_turn_from() as i32..=until as i32).contains(&m)
         && vectors
         && turn_fits(m.unsigned_abs(), rows.unsigned_abs(), k.unsigned_abs());
     if !turns {
@@ -137,14 +137,14 @@ fn route_apart(ctx: &Ctx, m: i32, rows: i32, k: i32, vectors: bool) -> Route {
     // kernel its L2 rereads, where hipBLASLt still tiles a short bank faster;
     // a bank of the whole-product kernel's width keeps it.
     let reread = m > 2 && 2 * i64::from(m) * i64::from(k) > SKINNY_LDS && rows < SKINNY_QUAD_ROWS;
-    if skinny && m <= t.gemm_skinny_dense_rows as i32 && !reread {
+    if skinny && m <= t.gemm_skinny_dense_rows() as i32 && !reread {
         return Route::Skinny;
     }
     // Past the skinny rows an lm_head-wide bank streams best on the batch
     // engine; others take
     // hipBLASLt unless the batch window holds them.
     if batch_on(ctx, m, rows, k)
-        || (m <= SKINNY_SMALL && rows.unsigned_abs() >= t.gemm_skinny_batch_min_n)
+        || (m <= SKINNY_SMALL && rows.unsigned_abs() >= t.gemm_skinny_batch_min_n())
     {
         Route::Batch
     } else {
@@ -327,8 +327,8 @@ pub(crate) fn act_x_wt_swiglu(
 fn batch_on(ctx: &Ctx, m: i32, n: i32, k: i32) -> bool {
     let t = ctx.tuning();
     let weight = i64::from(n) * i64::from(k);
-    (t.dense_batch_from as i32..=t.dense_batch_until as i32).contains(&m)
-        && (i64::from(t.dense_batch_weight_mi) << 20..=i64::from(t.dense_batch_weight_max_mi) << 20)
+    (t.dense_batch_from() as i32..=t.dense_batch_until() as i32).contains(&m)
+        && (i64::from(t.dense_batch_weight_mi()) << 20..=i64::from(t.dense_batch_weight_max_mi()) << 20)
             .contains(&weight)
 }
 
@@ -351,7 +351,7 @@ pub(crate) fn act_x_wt_live(
     use crate::hip::lt_grouped::{USER_ARGS_BYTES, library};
     use crate::jit::{ArgValue, Fire, Launch};
     let lib = library(dtype::Dtype::Bf16).map_err(|why| refuse(op, why))?;
-    let tiles = ctx.tuning().gemm_live_tiles;
+    let tiles = ctx.tuning().gemm_live_tiles();
     let at = tiles
         .iter()
         .map(|&t| {

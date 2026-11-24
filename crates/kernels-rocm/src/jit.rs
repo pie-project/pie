@@ -23,7 +23,7 @@ pub mod hiprtc;
 pub(crate) mod root;
 
 pub use abi::{Arg, ArgValue};
-pub use ctx::{Ctx, Fire, Launch, PLACED_ALIGN, Pad, SlabKey, Slabs, TICKETS, kernels_strict, strict_kernels};
+pub use ctx::{Ctx, Fire, Launch, PLACED_ALIGN, Pad, SlabKey, Slabs, TICKETS};
 pub(crate) use kernel::generated;
 pub use kernel::{Kernel, kernel};
 pub use root::Root;

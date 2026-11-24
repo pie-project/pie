@@ -555,7 +555,7 @@ impl Weights {
                 .as_ref()
                 .is_some_and(|serving| serving.covers(&plan.host_layout()).is_ok());
         let source = match plan.spill_demand() > 0 {
-            true => serving.clone().map(crate::experts::Spill::Serving),
+            true => serving.clone().map(crate::experts::Spill),
             false => None,
         };
         let mut experts = match plan.streams() {
@@ -588,19 +588,13 @@ impl Weights {
                     ) {
                         Ok(()) => true,
                         Err(rotten) => {
-                            store.zero_span(0, store.bytes())?;
-                            if let Some(tier) = experts.as_mut() {
-                                tier.zero_host();
-                            }
                             let why = match rotten {
                                 Rotten::Bytes(why) => format!(
-                                    "the checkpoint's own images do not read back ({why}); \
-                                     this boot lands them the cold way. {}",
+                                    "the checkpoint's own images do not read back ({why}). {}",
                                     checkpoint::serving::rebuild(None),
                                 ),
                                 Rotten::Machine(why) => format!(
-                                    "this machine could not read the checkpoint's images \
-                                     ({why}); this boot lands them the cold way"
+                                    "this machine could not read the checkpoint's images ({why})"
                                 ),
                             };
                             return Err(Fault::Residency(why));

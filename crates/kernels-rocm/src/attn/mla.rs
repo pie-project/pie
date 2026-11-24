@@ -191,7 +191,7 @@ pub fn absorb_q(
 ) -> Result<(), Error> {
     const OP: &str = "attn.mla_absorb_q";
     dtype_dispatch!(OP, q_nope.dtype, { Bf16 => () });
-    if q_nope.rows <= ctx.tuning().mla_absorb_q_until {
+    if q_nope.rows <= ctx.tuning().mla_absorb_q_until() {
         return absorb_native(
             ctx,
             OP,
@@ -260,7 +260,7 @@ pub fn absorb_out(
     const OP: &str = "attn.mla_absorb_out";
     dtype_dispatch!(OP, latent.dtype, { Bf16 => () });
     let t = ctx.tuning();
-    if (t.mla_absorb_out_from..=t.mla_absorb_out_until).contains(&latent.rows) {
+    if (t.mla_absorb_out_from()..=t.mla_absorb_out_until()).contains(&latent.rows) {
         return absorb_native(
             ctx,
             OP,

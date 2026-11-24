@@ -155,7 +155,6 @@ pub struct PrefillPlan {
     pub window: Option<u32>,
     pub causal: bool,
     pub graph_capturable: bool,
-    pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
     /// Per request its mask word (`kernels_cuda`'s `PrefillPlan::mask_origin`):
     /// the engine binds it beside `mask_indptr`; ROCm's paged prefill takes
@@ -253,10 +252,10 @@ pub struct Toggles {
 
 impl Toggles {
     #[must_use]
-    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
+    pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            chunk_floor_tokens: tuning.decode_chunk_floor_tokens,
-            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
+            chunk_floor_tokens: tuning.decode_chunk_floor_tokens(),
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
         }
     }
 }
@@ -399,25 +398,7 @@ pub fn plan_prefill(
         ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
-    let (built, capturable, graph_refusal) =
-        match sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
-            Ok(built) => (built, enable_cuda_graph, None),
-            Err(declined) if enable_cuda_graph => {
-                let req = sched_prefill::Request {
-                    enable_cuda_graph: false,
-                    ..req
-                };
-                let built = sched_prefill::plan(
-                    OP,
-                    &req,
-                    device,
-                    workspace.int_bytes,
-                    workspace.float_bytes,
-                )?;
-                (built, false, Some(declined.to_string()))
-            }
-            Err(declined) => return Err(declined),
-        };
+    let built = sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
 
     Ok(PrefillPlan {
         info: built.info,
@@ -429,8 +410,7 @@ pub fn plan_prefill(
         total_tokens,
         window,
         causal,
-        graph_capturable: capturable,
-        graph_refusal,
+        graph_capturable: enable_cuda_graph,
         mask_indptr,
         mask_origin: None,
         device: *device,

@@ -388,7 +388,6 @@ pub struct Stamp {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
     Shared(Stamp),
-    Own(engine::InstanceId),
     /// An instance's own planes, by their contents: every pass that carries
     /// the same adapter shares one slot, landed once.
     Planes(u64),

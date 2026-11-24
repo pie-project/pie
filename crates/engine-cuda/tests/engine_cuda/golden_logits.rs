@@ -4085,7 +4085,11 @@ fn read_set(model: &str, cache: &Path) -> Vec<&'static str> {
 }
 
 /// A kernel decision only a routed, recurrent, MLA, indexed or NVFP4 model
-/// can reach.
+/// can reach. The compiler's prices (`compiler.cost.*`) and fusion rules
+/// (`fuse.*`) are not among them though every load reads them: `pie tune`
+/// serves a candidate of those only where it changes the compiled plan
+/// (`profile::search`'s `plan_only`), and a dense model's plan never moves
+/// with an ssm price or an MoE fusion.
 fn family_only(id: &str) -> bool {
     [
         "kernel.moe.",
@@ -4112,7 +4116,13 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
     println!("reads qwen3-0.6b {dense:?}");
     let stray: Vec<&str> = dense.iter().copied().filter(|id| family_only(id)).collect();
     assert!(stray.is_empty(), "qwen3-0.6b reads {stray:?}");
-    assert!(dense.contains(&"kernel.gemm.skinny_rows"), "{dense:?}");
+    // The control: a dense model reads its products' decisions, whichever
+    // a backend's dense dispatch consults (CUDA's skinny rows, ROCm's turn
+    // and live tiles).
+    assert!(
+        dense.iter().any(|id| id.starts_with("kernel.gemm.")),
+        "qwen3-0.6b reads no dense product decision: {dense:?}"
+    );
     let routed = read_set("gptoss-20b-mini-u4g64-mxfp4-kv-bf16", &cache);
     println!("reads gptoss-20b-mini-u4g64-mxfp4-kv-bf16 {routed:?}");
     assert!(
