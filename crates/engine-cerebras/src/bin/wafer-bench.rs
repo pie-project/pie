@@ -34,6 +34,9 @@ const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix
 const HIDDEN_REL: f64 = 3e-2;
 const HIDDEN_COS: f64 = 0.999;
 
+/// Words of static arrays made and written at a time (`--decode`): bounded host memory.
+const STATIC_RUN: usize = 1 << 26;
+
 fn main() {
     match run() {
         Ok(true) => println!("WAFER_BENCH ok"),
@@ -291,13 +294,19 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
     let t0 = std::time::Instant::now();
     // (a stamped artifact's own planes, or a raw checkpoint's through the import contract)
     let contract = poem_compiler::catalog::repository().contract_for(&trace, &ckpt)?;
-    let landed = engine_cerebras::prepare::land(&trace, &contract, &ckpt)?;
-    let of = |name: &str, count: usize| engine_cerebras::prepare::plane(&landed, name, count);
-    let mut weights = engine_cpu::Forward::new(trace.clone(), None, &of)?;
-    let statics = reading.statics(&mut weights, &reading.step(&trace, None, &[]))?;
+    let landed = std::cell::RefCell::new(engine_cerebras::prepare::land(&trace, &contract, &ckpt)?);
+    let of =
+        |name: &str, count: usize| engine_cerebras::prepare::plane(&landed.borrow(), name, count);
     let mut host = engine_cpu::Forward::host_for(trace.clone(), &of, &reading.entry_values())?;
+    // (each landed param dropped once the forward holds it; the statics are made from the
+    // forward's weights a run of rows at a time once the program is loaded: bounded host memory)
+    let take = |name: &str, count: usize| {
+        engine_cerebras::prepare::take_plane(&mut landed.borrow_mut(), name, count)
+    };
+    let mut weights = engine_cpu::Forward::new(trace.clone(), None, &take)?;
+    drop(landed);
     println!(
-        "DECODE {} landed and its statics made in {:.0} s",
+        "DECODE {} landed in {:.0} s",
         reading.model,
         t0.elapsed().as_secs_f64()
     );
@@ -316,7 +325,17 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         Runtime::new(sdk, Path::new(&program), platform, "WARNING").map_err(|e| e.to_string())?;
     rt.load();
     rt.run();
-    reading.write_statics(&mut rt, &statics)?;
+    let t0 = std::time::Instant::now();
+    reading.statics_streamed(
+        &mut weights,
+        &reading.step(&trace, None, &[]),
+        STATIC_RUN,
+        &mut |a, w| engine_cerebras::reading::Fabric::write(&mut rt, &a, &w),
+    )?;
+    println!(
+        "DECODE statics made and written in {:.0} s",
+        t0.elapsed().as_secs_f64()
+    );
     // B lanes: lane t teacher-forced through the golden from step 3t, its pages its own
     let stagger = 3;
     if let Some(g) = reading.paging {

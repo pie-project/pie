@@ -695,6 +695,13 @@ fn checkpoint_stamp(checkpoint: &Path) -> R<String> {
     Ok(format!("{}:{files:?}", checkpoint.display()))
 }
 
+/// [`plane`], its landed bytes then dropped: a forward built param by param holds each once.
+pub fn take_plane(landed: &mut Landed, name: &str, count: usize) -> Vec<f32> {
+    let v = plane(landed, name, count);
+    landed.bytes.remove(name);
+    v
+}
+
 /// A checkpoint plane's values as f32 (`landed` holds it bf16 or f32 as the contract lands it).
 pub fn plane(landed: &Landed, name: &str, count: usize) -> Vec<f32> {
     use kernels_cerebras::compile::tiles::Params;
