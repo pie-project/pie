@@ -15,6 +15,7 @@ mod a_prefill_reads_no_kv_cell_past_its_keys;
 mod a_prewarmed_program_registers_off_thread_without_compiling;
 mod a_faulted_epilogue_fails_its_own_lanes_alone;
 mod a_few_row_dense_matmul_reads_each_weight_once;
+mod a_guest_over_two_lanes_reads_each_lanes_own_row;
 mod a_guest_reads_only_its_own_lanes_rows;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
