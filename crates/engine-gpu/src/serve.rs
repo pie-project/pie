@@ -8464,11 +8464,18 @@ impl<B: Serve> Shell<B> {
     /// pixels laid in a fill frame, and the backend's fill from what they
     /// laid. Whether an armed body took it.
     fn fill_once(&mut self, prepared: &mut Prepared<'_, B>) -> Result<bool> {
+        // An arm walk's fill that finds no family is walked again to record
+        // one: the fire's own staged rows stand.
+        let mark = self.arming.then(|| self.handles.len());
+        let rewind = |handles: &Handles<B>| match mark {
+            Some(len) => handles.rewind_to(len),
+            None => handles.rewind(),
+        };
         let walked = self.walk_fill(prepared);
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
-                self.handles.rewind();
+                rewind(&self.handles);
                 return Err(fault);
             }
         };
@@ -8480,7 +8487,7 @@ impl<B: Serve> Shell<B> {
             self.copy_pixels(&mut frame, prepared)?;
             Ok(layout)
         });
-        self.handles.rewind();
+        rewind(&self.handles);
         let layout = laid?;
         B::fill(self, frame, prepared, &layout, walked.launches)
     }

@@ -218,6 +218,11 @@ impl<B: Backend> Handles<B> {
         self.rows.borrow_mut().truncate(self.sealed.get());
     }
 
+    /// Drops the rows past `len` (a mark of [`Handles::len`]), none sealed.
+    pub fn rewind_to(&self, len: usize) {
+        self.rows.borrow_mut().truncate(len.max(self.sealed.get()));
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.rows.borrow().len()
