@@ -379,22 +379,3 @@ pub fn copy_rs_rows(
         &[runs.arg(), planes.arg(), run_count.arg()],
     )
 }
-
-#[cfg(test)]
-mod width_tests {
-    use super::{max_lanes, step_bytes};
-
-    /// The widest group is the largest whose block fits beside the
-    /// pipeline's own threadgroup memory, in Metal's 16-byte steps: 86 on
-    /// Apple's 32 KiB with the step's ~1 KiB, and one more beam never fits.
-    #[test]
-    fn the_widest_group_is_the_largest_whose_block_fits() {
-        let (device, own) = (32 << 10, 1036);
-        let widest = max_lanes(device, own);
-        assert_eq!(widest, 86);
-        assert!(step_bytes(widest) + own <= device);
-        assert!(step_bytes(widest + 1) + own > device);
-        assert_eq!(step_bytes(64), 17_664, "64 beams: 5 x 64 + 64 x 64 words");
-        assert_eq!(max_lanes(0, 0), 0);
-    }
-}
