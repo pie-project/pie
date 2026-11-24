@@ -1125,7 +1125,7 @@ impl Cache {
             persistent_hits: 0,
             compilations: 0,
         };
-        let built = build.build_region(&mut region, &mut std::collections::HashMap::new());
+        let built = build.build_regions(vec![&mut region]);
         self.stats.persistent_hits += build.persistent_hits;
         self.stats.compilations += build.compilations;
         built?;
