@@ -253,10 +253,10 @@ pub struct Toggles {
 
 impl Toggles {
     #[must_use]
-    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
+    pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            chunk_floor_tokens: tuning.decode_chunk_floor_tokens,
-            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
+            chunk_floor_tokens: tuning.decode_chunk_floor_tokens(),
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
         }
     }
 }

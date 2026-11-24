@@ -127,7 +127,7 @@ pub fn matmul(
     biases: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows());
     tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
@@ -139,7 +139,7 @@ pub fn lm_head(
     biases: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows());
     tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
@@ -261,12 +261,12 @@ pub const GEMV_ROWS: u32 = 16;
 fn carve_for(n: u32, rows: u32, ctx: &Ctx, sms: u32) -> Carve {
     let tuning = ctx.tuning();
     // The knob counts 32-lane warps; a 64-lane wavefront is two.
-    let warps = (sms.saturating_mul(tuning.qmm_split_warps_per_sm) / 2).max(1);
+    let warps = (sms.saturating_mul(tuning.qmm_split_warps_per_sm()) / 2).max(1);
     let bands = n.div_ceil(BAND);
     let deepest = if rows <= THIN_ROWS {
-        tuning.qmm_split_thin_max
+        tuning.qmm_split_thin_max()
     } else {
-        tuning.qmm_split_wide_max
+        tuning.qmm_split_wide_max()
     };
     #[allow(clippy::manual_checked_ops)]
     let want = if bands == 0 {

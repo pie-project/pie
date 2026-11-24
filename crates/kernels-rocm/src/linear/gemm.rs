@@ -148,7 +148,7 @@ pub fn lm_head_live(
     const OP: &str = "linear.matmul";
     #[cfg(feature = "rocm")]
     {
-        let from = ctx.tuning().gemm_live_from;
+        let from = ctx.tuning().gemm_live_from();
         if live != 0
             && from > 0
             && y.rows >= from
