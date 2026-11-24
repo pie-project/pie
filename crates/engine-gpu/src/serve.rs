@@ -411,6 +411,10 @@ pub trait Serve: Backend {
         false
     }
 
+    /// Lays what the arm walk's fill frame of `prepared` binds, as a serving
+    /// fill's plan does before it fills.
+    fn ready_fill(_shell: &mut Shell<Self>, _prepared: &Prepared<'_, Self>) {}
+
     /// The most memory maps the device's host lets a process hold, where
     /// its profile states it (a host that hides vm.max_map_count).
     fn max_maps(_shell: &Shell<Self>) -> Option<u64> {
@@ -9238,6 +9242,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             // family (its fill kept before ready, for the serving fires of
             // its shape) and records nothing: a body is recorded once, each
             // composition of it a table of data.
+            B::ready_fill(self, &prepared);
             self.arm_filled = self.fill_once(&mut prepared)?;
             B::plan(self, &mut prepared)?
         } else {
