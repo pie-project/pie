@@ -462,10 +462,34 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 
 fn adapter_of(
     shell: &mut Shell,
+    world: World,
     program: engine::program::ProgramId,
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
 ) -> EngineResult<Option<crate::Binding>> {
+    if let Some(channel) = shell.program_adapter_bundle(program).map_err(fault)? {
+        let wire = seeds
+            .iter()
+            .find(|(seeded, _)| *seeded == channel)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| {
+                Error::Load(format!(
+                    "this program's `adapter` sink reads its bundle out of channel \
+                     {channel} and this bind seeded nothing into it"
+                ))
+            })?;
+        let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
+        return shell
+            .bind_adapter(crate::AdapterSource::Bundle {
+                bundle: &bundle,
+                rank: engine::bundle::Rank {
+                    rank: world.rank,
+                    world: world.size,
+                },
+            })
+            .map(Some)
+            .map_err(fault);
+    }
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
         return Ok(None);
     };
@@ -964,6 +988,7 @@ impl Programs for Cuda {
             .iter()
             .map(|id| self.channels.get(id).cloned())
             .collect();
+        let world = self.boot.world;
         let shell = self.loaded_mut()?;
         let id = shell
             .bind_program(
@@ -976,7 +1001,7 @@ impl Programs for Cuda {
                 &binding.channels,
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let landed = adapter_of(shell, world, binding.program, id, &seeds);
         let bound = match landed {
             Ok(bound) => bound,
             Err(why) => {

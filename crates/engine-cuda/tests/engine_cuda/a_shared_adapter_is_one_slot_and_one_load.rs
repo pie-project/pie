@@ -32,6 +32,8 @@ fn seats() -> Vec<BankSeat> {
                     rows: BANK_RANK,
                     cols: HIDDEN,
                     elem: ELEM,
+                    dtype: poem_ir::Dtype::Bf16,
+                    shard: poem_ir::Shard::Replicated,
                 },
                 BankSeat {
                     name: format!("layer.{layer}.lora_b"),
@@ -40,6 +42,8 @@ fn seats() -> Vec<BankSeat> {
                     rows: HIDDEN,
                     cols: BANK_RANK,
                     elem: ELEM,
+                    dtype: poem_ir::Dtype::Bf16,
+                    shard: poem_ir::Shard::Replicated,
                 },
             ]
         })

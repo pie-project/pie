@@ -722,6 +722,17 @@ impl Shell {
         crate::adapter::sink_of(&program.plan.package)
     }
 
+    /// The channel whose seed is the bundle `program_id` attaches, if it does.
+    pub fn program_adapter_bundle(&self, program_id: engine::ProgramId) -> Result<Option<u32>> {
+        let program = self.programs.program(program_id).ok_or_else(|| {
+            Fault::program(
+                "serve::shell",
+                format!("no program {program_id} to read an adapter bundle off"),
+            )
+        })?;
+        Ok(engine::bundle::channel_of(&program.plan.package)?)
+    }
+
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
         let bit = self.adapter_fact?;

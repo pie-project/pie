@@ -119,16 +119,6 @@ pub(crate) fn one_direction_per_mask(trace: &Trace, compiled: &CompiledModel) ->
 }
 
 #[must_use]
-pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
-    classes_running(trace, compiled, |op| {
-        matches!(
-            op,
-            poem_ir::Operation::Linear(poem_ir::Linear::LoraCorrect { .. })
-        )
-    })
-}
-
-#[must_use]
 pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
         matches!(

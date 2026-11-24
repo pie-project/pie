@@ -28,6 +28,8 @@ fn pair(prefix: &str) -> [BankSeat; 2] {
             rows: BANK_RANK,
             cols: HIDDEN,
             elem: ELEM,
+            dtype: poem_ir::Dtype::Bf16,
+            shard: poem_ir::Shard::Replicated,
         },
         BankSeat {
             name: format!("{prefix}.lora_b"),
@@ -36,6 +38,8 @@ fn pair(prefix: &str) -> [BankSeat; 2] {
             rows: HIDDEN,
             cols: BANK_RANK,
             elem: ELEM,
+            dtype: poem_ir::Dtype::Bf16,
+            shard: poem_ir::Shard::Replicated,
         },
     ]
 }

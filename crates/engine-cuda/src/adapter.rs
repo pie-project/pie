@@ -297,6 +297,22 @@ pub fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
+/// This load's banks as `engine::bundle` fills them.
+#[must_use]
+pub fn banks(seats: &[BankSeat]) -> Vec<engine::bundle::Bank<'_>> {
+    seats
+        .iter()
+        .map(|seat| engine::bundle::Bank {
+            name: &seat.name,
+            rows: seat.rows,
+            cols: seat.cols,
+            slot: seat.slot,
+            dtype: seat.dtype,
+            shard: &seat.shard,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +326,8 @@ mod tests {
             rows,
             cols,
             elem: 2,
+            dtype: poem_ir::Dtype::Bf16,
+            shard: poem_ir::Shard::Replicated,
         }
     }
 

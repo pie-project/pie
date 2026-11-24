@@ -70,8 +70,9 @@ pub struct Session {
     /// A decode envelope's device-computed mask is packed into the staged
     /// mask on the device and never read on the host ([`Self::resolve_on`]).
     mask_on_device: bool,
-    /// The channels that are only a `lora` sink's planes: the bank is landed
-    /// from their seeds at bind, so a fire never pulls their cells again.
+    /// The channels that are only a `lora` sink's planes or an adapter
+    /// bundle: the banks are landed from their seeds at bind, so a fire never
+    /// pulls their cells again.
     sink_planes: Vec<usize>,
 }
 
@@ -126,16 +127,19 @@ impl Session {
             shadow,
             device: PortMask::NONE,
             mask_on_device: false,
-            sink_planes: crate::adapter::sink_of(&plan.package)
-                .ok()
-                .flatten()
-                .map(|sink| {
-                    sink.planes
-                        .iter()
-                        .map(|&(_, channel)| channel as usize)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            sink_planes: match engine::bundle::channel_of(&plan.package) {
+                Ok(Some(bundle)) => vec![bundle as usize],
+                _ => crate::adapter::sink_of(&plan.package)
+                    .ok()
+                    .flatten()
+                    .map(|sink| {
+                        sink.planes
+                            .iter()
+                            .map(|&(_, channel)| channel as usize)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
         };
         for (channel, wire) in seeds {
             if shadow
