@@ -48,6 +48,10 @@ struct Want {
 /// word's one-row and wider lane counts.
 type LayoutKey = (u32, bool, Vec<(u64, bool, u32)>);
 
+/// The warm ladder's parts (each its name and its first shape's index) and
+/// shapes ([`Shell::ladder`]).
+type Ladder = (Vec<(&'static str, usize)>, Vec<Vec<Want>>);
+
 /// The stated compositions the ladder lays no program for
 /// (`Shell::unlaid_compositions`).
 #[derive(Default)]
@@ -93,8 +97,34 @@ fn composition(shape: &[Want], treatment: engine::Treatment) -> engine::StepComp
 }
 
 impl Shell {
+    /// What each of the ladder's fires stages, `(bucket, rows)`: the
+    /// stage-only pass over the ladder's own shapes (`Shell::staged_sets`),
+    /// so no fire it lays outgrows the slab (a stated buffered fire of a
+    /// decode beside a 511-row prompt, padded to the top rung over 80
+    /// lanes, staged past a slab sized on synthetic fires alone).
+    pub(super) fn ladder_staged(&mut self) -> Result<Vec<(u32, u32)>> {
+        let Some((_, shapes)) = self.ladder()? else {
+            return Ok(Vec::new());
+        };
+        let mut staged = Vec::with_capacity(shapes.len());
+        for shape in &shapes {
+            self.sizing = Some(0);
+            self.warm_fire(shape)?;
+            if let Some(rows) = self.sizing.take() {
+                staged.push((self.sized_bucket, rows));
+            }
+        }
+        Ok(staged)
+    }
+
     /// Fires the warm ladder; answers how many fires ran.
-    pub fn prewarm(&mut self) -> Result<usize> {
+    /// The warm ladder's shapes, by part (each part's first shape's index):
+    /// every fire shape the load serves, the stated set's compositions no
+    /// other part takes included. `None`: the load lays no ladder (a class
+    /// past the plain ones, or no row rung). A stated composition no padded
+    /// layout holds refuses the load by name.
+    #[allow(clippy::too_many_lines)]
+    fn ladder(&mut self) -> Result<Option<Ladder>> {
         let facts = &self.trace().facts;
         let decode = facts.word(&Request::new(1, false));
         let prefill = facts.word(&Request::new(2, false));
@@ -114,7 +144,7 @@ impl Shell {
             })
         };
         if !plain(self, decode) || !plain(self, prefill) || self.patch_seat.is_some() {
-            return Ok(0);
+            return Ok(None);
         }
         let buckets = self.budgets.tokens.buckets.clone();
         let pad = self.pad;
@@ -122,7 +152,7 @@ impl Shell {
         let widest = match buckets.as_slice() {
             [.., below, top] if pad.room > 0 && top - below == pad.room => *below,
             [.., top] => *top,
-            [] => return Ok(0),
+            [] => return Ok(None),
         };
         let lanes_cap = self
             .budgets
@@ -542,6 +572,13 @@ impl Shell {
             parts.push(("stated", shapes.len()));
             shapes.extend(gaps.unlaid.into_iter().map(|(_, shape)| shape));
         }
+        Ok(Some((parts, shapes)))
+    }
+
+    pub fn prewarm(&mut self) -> Result<usize> {
+        let Some((parts, shapes)) = self.ladder()? else {
+            return Ok(0);
+        };
         let mut added: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         let started = std::time::Instant::now();
         // Trace every shape (nothing runs), then compile the new programs
@@ -574,7 +611,25 @@ impl Shell {
                 match r {
                     Ok(()) => fired += 1,
                     Err(fault) => {
-                        failed = Some(fault);
+                        // the shape named: which of the ladder's fires faulted
+                        failed = Some(crate::error::Fault::Program {
+                            at: "serve::warm",
+                            why: format!(
+                                "the ladder's {fired_part} fire of {} lanes (rows {:?}{}{}) faulted: {fault}",
+                                shape.len(),
+                                shape.iter().map(|w| w.rows).collect::<Vec<_>>(),
+                                if shape.iter().any(|w| w.buffers) {
+                                    ", buffered"
+                                } else {
+                                    ""
+                                },
+                                if shape.iter().any(|w| w.masked) {
+                                    ", masked"
+                                } else {
+                                    ""
+                                },
+                            ),
+                        });
                         break 'passes;
                     }
                 }

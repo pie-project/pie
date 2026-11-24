@@ -49,6 +49,7 @@ fn shell(name: &str) -> Shell {
             kv_budget: Some(kv_budget),
             allowance: engine::Allowance::WHOLE,
             device: &DeviceBoot::default(),
+            steps: None,
         },
         None,
         false,

@@ -83,6 +83,11 @@ pub struct Boot<'a> {
     pub allowance: engine::Allowance,
 
     pub device: &'a crate::api::DeviceBoot,
+
+    /// The rules the runtime forms steps by (`LoadRequest::steps`): the
+    /// stage-only pass sizes the slab over the ladder the load's step set
+    /// lays. `None`: a load stating no set (a test's).
+    pub steps: Option<&'a engine::StepRules>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -370,7 +375,12 @@ pub struct Shell {
     stated_limits: Option<engine::FireLimits>,
     /// The stage-only pass (`size`): a fire stops once its inputs are
     /// staged, before anything is traced, leaving their rows here.
+    /// The budget the load asked (`Boot::budget`), before the padding room
+    /// the ladder adds: what its step set is stated over.
+    asked: Budget,
     sizing: Option<u32>,
+    /// The bucket the fire `sizing` measured ran at.
+    sized_bucket: u32,
     /// What this load stages its fires' inputs in.
     staging_facts: StagingFacts,
     /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
@@ -605,6 +615,10 @@ impl Shell {
             ..*boot
         };
         let mut shell = Shell::load_on(dry, voxels, Device::quiet()?, false)?;
+        if let Some(rules) = boot.steps {
+            let stated = shell.stated_steps(rules);
+            shell.set_steps(stated.shapes);
+        }
         let rungs = shell.staged_sets()?;
         let rows = rungs.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
         let staging = crate::store::Staging {
@@ -681,6 +695,8 @@ impl Shell {
         // The row ladder every fire is padded up to (powers of two to
         // `max_tokens`, as the CUDA shell arms its graphs), and lane room
         // for the padding lanes that fill a decode up to its rung.
+        // the budget the load asked, before the ladder's padding room
+        let asked = boot.budget.clone();
         let mut budget = boot.budget.clone();
         if budget.buckets.is_empty() {
             budget.buckets = pad.ladder(budget.max_tokens);
@@ -1267,6 +1283,8 @@ impl Shell {
             laid_mixed: false,
             stated_limits: None,
             sizing: None,
+            sized_bucket: 0,
+            asked,
             staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),
             disk: None,
@@ -1433,6 +1451,35 @@ impl Shell {
     /// for the warm ladder (`Shell::prewarm`).
     pub fn set_steps(&mut self, steps: engine::StepShapes) {
         self.steps = Some(steps);
+    }
+
+    /// The step set the runtime's `rules` form over this load's stated
+    /// facts (CONTRACT-BC 24): its activation rungs, the asked lanes and
+    /// tokens, the rows a fire reads out, its attachments and the mixed
+    /// steps it lays out at its lane rungs (`Shell::mixed_lanes`).
+    #[must_use]
+    pub fn stated_steps(&self, rules: &engine::StepRules) -> engine::StatedSteps {
+        let max_readouts =
+            u32::try_from(poem_compiler::arena::readouts_ceiling(&self.asked)).unwrap_or(u32::MAX);
+        engine::StatedSteps::of(
+            rules,
+            &engine::StepFacts::of(
+                &self.tiered_facts(),
+                self.asked.max_lanes,
+                self.asked.max_tokens,
+                engine::ReadoutFacts {
+                    landing: engine::ReadoutLanding::InSpan,
+                    store_rows: Shell::readout_store_rows(self),
+                }
+                .fire_rows(max_readouts),
+                engine::Attachments::served(
+                    true,
+                    !self.input_decls().is_empty(),
+                    self.snapshots() > 0,
+                ),
+            )
+            .with_mixed(self.mixed_lanes()),
+        )
     }
 
     #[must_use]
@@ -3455,6 +3502,7 @@ impl Shell {
 
         if let Some(rows) = self.sizing.as_mut() {
             *rows = inputs.rows();
+            self.sized_bucket = descriptor.bucket;
             return Ok(Fired::default());
         }
         let t1 = std::time::Instant::now();

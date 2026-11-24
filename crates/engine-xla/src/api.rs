@@ -551,6 +551,7 @@ impl Engine for Xla {
                 kv_budget: residency.device_kv_budget,
                 allowance: residency.device,
                 device: &boot,
+                steps: Some(&steps),
             },
             voxels,
         )
@@ -564,30 +565,7 @@ impl Engine for Xla {
         // The step compositions the runtime's builder forms over this load's
         // facts (CONTRACT-BC 24), computed before the warm ladder, which lays
         // the buffered treatment for exactly the shapes the set states so.
-        let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
-            &budgets,
-        )))
-        .unwrap_or(u32::MAX);
-        let stated = engine::StatedSteps::of(
-            &steps,
-            &engine::StepFacts::of(
-                &shell.tiered_facts(),
-                budgets.max_lanes,
-                budgets.max_tokens,
-                engine::ReadoutFacts {
-                    landing: engine::ReadoutLanding::InSpan,
-                    store_rows: Shell::readout_store_rows(&shell),
-                }
-                .fire_rows(max_readouts),
-                engine::Attachments::served(
-                    true,
-                    !shell.input_decls().is_empty(),
-                    shell.snapshots() > 0,
-                ),
-            )
-            // the mixed steps it pads to lane rungs: no other is stated
-            .with_mixed(shell.mixed_lanes()),
-        );
+        let stated = shell.stated_steps(&steps);
         shell.set_steps(stated.shapes.clone());
         // The warm ladder, every fire shape the load serves, built before
         // ready: none is built after it (a fire outside it is a ladder miss,
