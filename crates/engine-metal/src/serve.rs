@@ -1488,11 +1488,18 @@ impl PreparedLoad<'_> {
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
             // A seat's slots of each window list: its context in `T_w`-token
-            // slots.
+            // slots; on a ring load, at least a ring's, which a seat-addressed
+            // lane takes as its ring (`Pools::window_seat_ring`).
             let window_pages: Vec<u32> = rows
                 .windows
                 .iter()
-                .map(|w| seated.context().div_ceil(w.tokens.max(1)).max(1))
+                .map(|w| {
+                    let context = seated.context().div_ceil(w.tokens.max(1)).max(1);
+                    let ring = rows.ring.as_ref().map_or(0, |_| {
+                        crate::chunks::MetalRing::rows(w.rows, w.tokens.max(1)) / w.tokens.max(1)
+                    });
+                    context.max(ring)
+                })
                 .collect();
             let window_chunks: u32 = rows
                 .windows
@@ -3758,35 +3765,40 @@ impl Shell {
         let window = self.pools.layout().window(k).map_or(0, |list| list.rows);
         let per_chunk = self.pools.window_slots_a_chunk(k)?;
         let ring_rows = crate::chunks::MetalRing::rows(window, page);
-        let pieces = seated
-            .ring
-            .ok_or_else(|| refuse("a windowed lane states no ring pieces in its record".to_string()))?;
-        // A shared ring (`cow != run`) was copied run onto cow before the
-        // fire (`Shell::copy_records`): the fire reads and writes cow.
-        // Ring page j: piece j / per_chunk, the window slot j % per_chunk of
-        // that chunk (a ring piece is one slot of one chunk, its ref the
-        // chunk).
-        let ring_refs: Vec<u32> = (0..ring_rows / page)
-            .map(|j| {
-                pieces
-                    .get((j / per_chunk) as usize)
-                    .map(|&[_, cow]| cow * per_chunk + j % per_chunk)
-                    .ok_or_else(|| {
-                        refuse(format!(
-                            "a ring of {} pages in {} piece(s) of {per_chunk} pages",
-                            ring_rows / page,
-                            pieces.len()
-                        ))
+        let (ring_refs, shared): (Vec<u32>, bool) = match seated.ring {
+            // A shared ring (`cow != run`) was copied run onto cow before the
+            // fire (`Shell::copy_records`): the fire reads and writes cow.
+            // Ring page j: piece j / per_chunk, the window slot j % per_chunk
+            // of that chunk (a ring piece is one slot of one chunk, its ref
+            // the chunk).
+            Some(pieces) => (
+                (0..ring_rows / page)
+                    .map(|j| {
+                        pieces
+                            .get((j / per_chunk) as usize)
+                            .map(|&[_, cow]| cow * per_chunk + j % per_chunk)
+                            .ok_or_else(|| {
+                                refuse(format!(
+                                    "a ring of {} pages in {} piece(s) of {per_chunk} pages",
+                                    ring_rows / page,
+                                    pieces.len()
+                                ))
+                            })
                     })
-            })
-            .collect::<Result<_>>()?;
-        let ring = self.pools.window_pages(k, &ring_refs, None)?;
+                    .collect::<Result<_>>()?,
+                pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow)),
+            ),
+            // A seat-addressed lane: its seat's ring, its own.
+            None if !seated.refs => (self.pools.window_seat_ring(k, seated.lane.slot, ring_rows / page)?, false),
+            None => return Err(refuse("a windowed lane states no ring pieces in its record".to_string())),
+        };
+        let ring = self.pools.window_pages(k, &ring_refs)?;
         let ring_at: Vec<u64> = ring_refs
             .iter()
             .map(|&slot| self.pools.window_slot_offset(k, slot))
             .collect::<Result<_>>()?;
         let buffer_refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
-        let buffer = self.pools.window_pages(k, buffer_refs, None)?;
+        let buffer = self.pools.window_pages(k, buffer_refs)?;
         let buffer_at: Vec<u64> = buffer_refs
             .iter()
             .map(|&slot| self.pools.window_slot_offset(k, slot))
@@ -3794,7 +3806,6 @@ impl Shell {
         let end = have + rows;
         let held = u64::from(fold.base) + buffer.len() as u64 * u64::from(page);
         // The fire's own rows past the buffer: their ring rows, or own pages.
-        let shared = pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow));
         let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window);
         // Rows of the fire no buffer slot holds: below the buffer's base (the
         // rows it folds itself) or past its last slot.
@@ -5176,12 +5187,19 @@ impl Shell {
             for (k, lists) in window_tables.iter_mut().enumerate() {
                 lists.push(if seated.kv_less {
                     Vec::new()
-                } else if self.pools.ring().is_some()
-                    && let Some(fold) = seated.window
-                {
+                } else if self.pools.ring().is_none() {
+                    // Windowed layers are a lane's ring and window buffer
+                    // (CONTRACT-BC 19, 21), on every load that has them.
+                    return Err(Fault::program(
+                        "serve::windowed",
+                        "a load with window lists and no rings: Metal serves windowed layers \
+                         as ring + buffer only"
+                            .to_string(),
+                    ));
+                } else if let Some(fold) = seated.window {
                     let port_fold = ports.as_ref().and_then(engine::ports::LanePorts::fold);
                     self.windowed_pages(k, seated, fold, port_fold, have, row.rows)?
-                } else if self.pools.ring().is_some() && seated.ring.is_some() {
+                } else if seated.ring.is_some() {
                     // A lane whose record holds rings states how it folds
                     // them; its buffer slots are no whole window.
                     return Err(Fault::program(
@@ -5192,13 +5210,29 @@ impl Shell {
                             lane.slot
                         ),
                     ));
-                } else if self.pools.ring().is_some() {
-                    // A lane with no fold and no ring on a ring + buffer load
-                    // (arming, the load's own fires, the pipeline walk): no
-                    // seat holds a run of window slots, and nothing reads what
-                    // such a fire computes, so every page it names is one
-                    // scratch page, in the own-row region's last chunk (past
-                    // every arm's share).
+                } else if !seated.refs {
+                    // A seat-addressed lane (a caller firing directly, the
+                    // tuner): its seat's ring, every row it writes folded in
+                    // the fire, no buffer.
+                    let page_size = self.pools.window_paging(k).page_size.max(1);
+                    let after = have.saturating_add(row.rows);
+                    let fold = engine::fire::WindowFold {
+                        base: after / page_size * page_size,
+                        fold: engine::fire::FoldLen::Host(row.rows),
+                        lineage: engine::fire::Lineage::Set,
+                    };
+                    let seat = Seated {
+                        folded: have,
+                        windows: &[],
+                        ..*seated
+                    };
+                    self.windowed_pages(k, &seat, fold, None, have, row.rows)?
+                } else {
+                    // A runtime lane with no fold and no ring (arming, the
+                    // load's own fires, the pipeline walk): nothing reads
+                    // what such a fire computes, so every page it names is
+                    // one scratch page, in the own-row region's last chunk
+                    // (past every arm's share).
                     let page_size = self.pools.window_paging(k).page_size.max(1);
                     let (first, chunks) = self.own_top;
                     if chunks == 0 {
@@ -5208,25 +5242,9 @@ impl Shell {
                                 .to_string(),
                         ));
                     }
-                    if seated.refs {
-                        tracing::warn!(
-                            "windowed: runtime lane in slot {} (have {have}, rows {}, record {:?}) \
-                             states no fold and no ring: the scratch page",
-                            lane.slot,
-                            row.rows,
-                            seated.record.map(|r| r.len())
-                        );
-                    }
                     let (_, id) = self.pools.window_slot_at(k, first + chunks - 1, 0)?;
                     let after = have.saturating_add(row.rows);
                     vec![id; after.div_ceil(page_size).max(1) as usize]
-                } else {
-                    let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
-                    let after = u64::from(have) + u64::from(row.rows);
-                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
-                    let refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
-                    let seat = (!seated.refs || refs.is_empty()).then_some((lane.slot, pages));
-                    self.pools.window_pages(k, refs, seat)?
                 });
             }
             state_top = record
