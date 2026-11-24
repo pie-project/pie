@@ -206,8 +206,14 @@ impl RestorePlacement {
         // chunks: the runs of each length stand where both do.
         let bind_free_runs = bind.first().map(|&(run, _)| placement.free_runs(run));
         let bind_chunks: u32 = bind.iter().map(|&(run, pieces)| run.saturating_mul(pieces)).sum();
+        // Laid by the takes themselves in what its own left, within the
+        // budget's headroom, as its reservation lays them: counts of free
+        // runs beside it read room past the headroom, and a restore went
+        // whose reservation then failed (field seed 934: a restore served
+        // in the same pass took its runs, its bind came back short).
         let bind_short = bind.first().is_some_and(|&(run, pieces)| placement.free_runs(run) < pieces)
-            || (!bind.is_empty() && placement.free_runs(1) < bind_chunks);
+            || (!bind.is_empty() && placement.free_runs(1) < bind_chunks)
+            || (!bind.is_empty() && !placement.places_runs(bind));
         if !bind.is_empty() && (!rest.is_empty() || bind_short) {
             for &(run, pieces) in bind {
                 short.add(run, pieces);
@@ -814,10 +820,10 @@ pub trait PoolPort: Send + Sync + 'static {
     /// ([`crate::store::roles::Roles::reserve_restore`]), closed to every
     /// other take until its unpark and bind take them or
     /// [`Self::release_restore`]. Whether it was held (its placement
-    /// stands). Where the pool keeps no roles, nothing is held.
-    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
+    /// stands); `None` where the pool keeps no roles and holds nothing.
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> Option<bool> {
         let _ = (pid, bind);
-        false
+        None
     }
     /// `pid`'s reservation goes back: its restore failed, was queued again,
     /// was withdrawn, landed with no bind pending, or its process is gone.
@@ -1381,10 +1387,10 @@ impl PoolPort for RegistryPool {
         RestorePlacement::of(&own, &placement, bind, pool_alone)
     }
 
-    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> Option<bool> {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.roles)
-            .is_some_and(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
+            .map(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
     }
 
     fn release_restore(&self, pid: ProcessId) {

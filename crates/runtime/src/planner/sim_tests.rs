@@ -4194,6 +4194,24 @@ fn replay_one_simulated_seed() {
     );
 }
 
+/// [`replay_one_simulated_seed`] under the built-in `default` policy's
+/// seat-to-end holds ([`Workload::default_policy`]).
+#[test]
+#[ignore]
+fn replay_one_simulated_seed_under_the_default_policy() {
+    let seed = std::env::var("PIE_SIM_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut workload = Workload::of(seed);
+    workload.default_policy = true;
+    let failures = run(&workload, None).0;
+    for failure in &failures {
+        eprintln!("SIM seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
+    }
+    assert!(failures.is_empty(), "seed {seed}: {} failures", failures.len());
+}
+
 /// A pool of `total` chunks in segments of `segment`, a bind of `run`
 /// adjacent chunks arriving once the decoders around it have scattered
 /// their pages over the pool ([`a_run_the_pool_can_open_is_opened`]).

@@ -1162,6 +1162,15 @@ impl ResidencyPlanner {
                     // the restore's own check, after its unpark took its live
                     // parts and its runs of two, would not: sent, refused
                     // (PendingBindShort), sent again.
+                    // Sent only with that room held for it: the takes'
+                    // own placement reserves its unpark's pieces and its
+                    // bind's runs at once ([`super::pool::PoolPort::reserve_restore`]),
+                    // closed to every other take until they land. A take
+                    // that raced the read (a resident's growth) leaves it
+                    // unheld: it waits, funded on the room as it now is.
+                    // Sent unheld, a restore served after it took its runs,
+                    // and its bind came back short and suspended it again
+                    // (field seed 934).
                     let whole = self.head_room(key).unwrap_or_else(|| need.runs());
                     if pid.is_some_and(|pid| {
                         !self.no_more_room_than_refused(pid)
@@ -1169,6 +1178,7 @@ impl ResidencyPlanner {
                                 .head_placement(key, &whole)
                                 .is_some_and(|placement| placement.stands())
                                 || self.take_send_regardless(pid))
+                            && self.port.reserve_restore(pid, &need.entries()) != Some(false)
                     }) {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
@@ -1646,7 +1656,7 @@ impl ResidencyPlanner {
                             let bind = self.with_inner(|inner| {
                                 inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| need.entries())
                             });
-                            let held = self.port.reserve_restore(pid, bind.as_deref().unwrap_or_default());
+                            let held = self.port.reserve_restore(pid, bind.as_deref().unwrap_or_default()) == Some(true);
                             // What held it for the head it was moved for, as
                             // that head stood when it went (the hold's terms,
                             // [`super::inner::Inner::unmet_head`]).
