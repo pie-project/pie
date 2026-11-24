@@ -1,0 +1,14 @@
+[
+  {
+    "key": "Spirv|vulkan 10de:2e03 driver 0x9a454000|kernels 22 0x7fa6da29|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0xd96b4dfd|qwen3-0.6b-bf16-kv-bf16|sampler source 165e99eeab8c3c41|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 12858.0,
+    "turnaround_us": 211.0
+  },
+  {
+    "key": "Spirv|vulkan 10de:2e03 driver 0x9a454000|kernels 36 0x36552edc|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0x4df875e7|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 165e99eeab8c3c41|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 16132.0,
+    "turnaround_us": 185.0
+  }
+]
