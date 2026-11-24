@@ -488,6 +488,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     reg_store(tid, state_base);
 #endif
 #else
+    // A padding row holds no record (its slot -1): it folds nothing.
+    if (pie_state_none(params.row0 + r)) {
+        return;
+    }
     uint state_base = state_at(params.row0 + r, hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, state_base);

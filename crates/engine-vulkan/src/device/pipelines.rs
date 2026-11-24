@@ -21,6 +21,16 @@ pub struct Pipeline {
 
     pub writable: Vec<bool>,
     pub push_bytes: u32,
+    /// The scalars the kernel reads from the fire block.
+    pub fire: Option<spirv::Fire>,
+    /// The bindings laid update-after-bind, a pool segment's each: bit `i`
+    /// binding `i`. A recording binding a segment there has it rebound as
+    /// the segment is backed or given back
+    /// ([`super::Context::rebind_segments`]); 0 on a device that lays none.
+    pub segments: u64,
+    /// The bindings laid update-after-bind for a pair's score room, which a
+    /// replay rewrites as the room moves ([`super::Kept::bind_room`]).
+    pub rooms: u64,
     pub local: [u32; 3],
 }
 
@@ -63,6 +73,23 @@ impl Pipelines {
     #[must_use]
     pub fn compiled(&self) -> u64 {
         self.order.borrow().len() as u64
+    }
+
+    /// The most bytes of scalars any built kernel takes.
+    #[must_use]
+    pub fn most_scalars(&self) -> u32 {
+        self.built
+            .borrow()
+            .values()
+            .map(|pipeline| {
+                pipeline
+                    .fire
+                    .as_ref()
+                    .map_or(0, |fire| fire.bytes)
+                    .max(pipeline.push_bytes)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// The kernels whose pipelines were built after the first `from`, in
@@ -120,10 +147,12 @@ impl Pipelines {
             .core()
             .limits
             .max_per_stage_descriptor_storage_buffers;
-        if declared.bindings > limit {
+        // The scalars' uniform is not a storage buffer.
+        let storage = declared.bindings - u32::from(declared.fire.is_some());
+        if storage > limit {
             return Err(Fault::StageBuffers {
                 kernel: key.to_string(),
-                binds: declared.bindings,
+                binds: storage,
                 limit,
             });
         }
@@ -131,7 +160,7 @@ impl Pipelines {
     }
 }
 
-fn build(
+pub(crate) fn build(
     core: &Arc<Core>,
     cache: vk::PipelineCache,
     file: &'static str,
@@ -147,13 +176,43 @@ fn build(
     let declared = spirv::declared(&words).map_err(shader)?;
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..declared.bindings)
         .map(|i| {
+            let ty = if declared.fire.as_ref().is_some_and(|fire| fire.binding == i) {
+                vk::DescriptorType::UNIFORM_BUFFER
+            } else {
+                vk::DescriptorType::STORAGE_BUFFER
+            };
             vk::DescriptorSetLayoutBinding::default()
                 .binding(i)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_type(ty)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         })
         .collect();
+    // A pool segment's bindings are written after a recording binds them:
+    // laid update-after-bind where the device lets them be, and only those
+    // (a binding laid so is read slower).
+    let (segments, rooms) = if core.update_after_bind {
+        (declared.segments, declared.rooms & !declared.segments)
+    } else {
+        (0, 0)
+    };
+    let flags: Vec<vk::DescriptorBindingFlags> = (0..declared.bindings)
+        .map(|i| {
+            if i < 64 && (segments | rooms) & (1 << i) != 0 {
+                vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+            } else {
+                vk::DescriptorBindingFlags::empty()
+            }
+        })
+        .collect();
+    let mut binding_flags =
+        vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
+    let mut layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    if segments | rooms != 0 {
+        layout_info = layout_info
+            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+            .push_next(&mut binding_flags);
+    }
     let d = &core.device;
     // SAFETY: `d` is live; every create info and the arrays it borrows are
     // locals that outlive their call. `words` is SPIR-V that `spirv::words`
@@ -162,10 +221,7 @@ fn build(
     // Each failure path destroys exactly what was made before it.
     unsafe {
         let set_layout = d
-            .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                None,
-            )
+            .create_descriptor_set_layout(&layout_info, None)
             .map_err(|e| core.fault("vkCreateDescriptorSetLayout", e))?;
         let set_layouts = [set_layout];
         let ranges = [vk::PushConstantRange::default()
@@ -220,6 +276,9 @@ fn build(
                 used: declared.used,
                 writable: declared.writable,
                 push_bytes: declared.push_bytes,
+                fire: declared.fire,
+                segments,
+                rooms,
                 local: declared.local,
             }),
             Err((_, e)) => {

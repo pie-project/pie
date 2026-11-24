@@ -86,6 +86,84 @@ pub fn copy_words(
     )
 }
 
+/// The most runs one [`copy_runs`] dispatch moves (`PIE_RUNS`,
+/// `kernels/gather/rows.slang`).
+pub const COPY_RUNS: usize = 512;
+
+/// Where a run of [`copy_runs`] reads or writes: a segment of the state
+/// pool, or one of the two arena buffers the dispatch binds whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Space {
+    Segment(u32),
+    ArenaA,
+    ArenaB,
+}
+
+impl Space {
+    fn code(self) -> u32 {
+        match self {
+            Space::Segment(segment) => segment,
+            Space::ArenaA => 4,
+            Space::ArenaB => 5,
+        }
+    }
+}
+
+/// One run of [`copy_runs`]: `words` words from word `from` of one space to
+/// word `to` of another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyRun {
+    pub from: (Space, u32),
+    pub to: (Space, u32),
+    pub words: u32,
+}
+
+/// `runs` moved between the state pool's segments (`pool`) and two arena
+/// buffers bound whole (`arena_a`, `arena_b`), a dispatch for every
+/// [`COPY_RUNS`] of them: the runs and their count are the dispatch's fired
+/// scalars, so its commands are the same however many runs a fire moves
+/// and wherever they lie.
+pub fn copy_runs(
+    ctx: &Ctx<'_>,
+    arena_a: Tensor,
+    arena_b: Tensor,
+    pool: crate::Segments,
+    runs: &[CopyRun],
+) -> Result<(), Error> {
+    const OP: &str = "gather.rs_copy_runs";
+    if runs.is_empty() {
+        return Ok(());
+    }
+    for chunk in runs.chunks(COPY_RUNS) {
+        let longest = chunk.iter().map(|run| run.words).max().unwrap_or(0).max(1);
+        let count = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
+        let mut args = vec![arena_a.arg_mut(), arena_b.arg_mut()];
+        args.extend(pool.args(true));
+        args.extend([count.arg(), 0u32.arg(), 0u32.arg(), 0u32.arg()]);
+        for at in 0..COPY_RUNS {
+            let [spaces, from, to, words] = chunk.get(at).map_or([0; 4], |run| {
+                [
+                    run.from.0.code() << 16 | run.to.0.code(),
+                    run.from.1,
+                    run.to.1,
+                    run.words,
+                ]
+            });
+            args.extend([spaces.arg(), from.arg(), to.arg(), words.arg()]);
+        }
+        ctx.fire(
+            Fire::at(ROWS, "gather_rows_copy_runs_words")
+                .threads([longest, count, 1], [GROUP, 1, 1]),
+            &args,
+        )
+        .map_err(|why| match why {
+            Error::Backend { detail, .. } => Error::Backend { op: OP, detail },
+            other => other,
+        })?;
+    }
+    Ok(())
+}
+
 /// Rows moved between the fire-wide rectangle and a compacted one by an i32
 /// row map: `args` are (read, written).
 fn move_rows(

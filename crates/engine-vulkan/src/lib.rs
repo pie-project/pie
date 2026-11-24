@@ -1,4 +1,5 @@
 pub mod api;
+pub mod armed;
 pub mod boot;
 pub mod check;
 pub mod chip;

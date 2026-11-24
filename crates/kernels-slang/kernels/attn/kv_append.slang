@@ -38,7 +38,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint d = 2u * gid.x;
     uint h = gid.y;
     uint i = gid.z;
-    if (d >= head_dim) {
+    // A padding row's write entry is -1: it writes nothing.
+    if (d >= head_dim || w_page[i] == 0xFFFFFFFFu) {
         return;
     }
     uint row = uint(params.n_kv_heads) * head_dim;

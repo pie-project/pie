@@ -34,6 +34,7 @@ mod unplaced;
 mod two_widens;
 mod rs_layout;
 mod buffered_fold;
+mod churn;
 mod lagged;
 mod switched;
 mod view_broadcast;

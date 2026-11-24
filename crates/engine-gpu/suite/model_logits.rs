@@ -1175,6 +1175,104 @@ fn a_hybrid_miniature_fires_every_rung_from_what_the_load_built() {
     every_rung_fires_what_the_load_built("qwen35-tiny");
 }
 
+/// A hybrid's lane that buffers its recurrent rows (a beam's, a draft's)
+/// moves them through the buffer and commits as of the fold: kernels no
+/// folding fire asks for, which the load names and builds all the same.
+#[test]
+fn a_hybrid_miniatures_buffering_fires_build_nothing_the_load_did_not() {
+    use engine::fire::{FoldLen, Lineage, RsVerb};
+    let fixture = fixture("qwen35-tiny", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let built = shell.compiled();
+    let per_page = shell
+        .pools()
+        .rs_rows()
+        .expect("a hybrid's pool lays an rs list")
+        .tokens
+        .max(1);
+    shell.open(0).expect("the slot opens");
+    let tokens: Vec<u32> = (0..8).map(|at| (at * 37 + 11) % 256).collect();
+    let buffer = |folded: u32, fold: u32| RsVerb::Buffer {
+        pages: vec![0; 8u32.div_ceil(per_page) as usize],
+        base: 0,
+        folded,
+        fold: FoldLen::Host(fold),
+        lineage: Lineage::Set,
+    };
+    // A prefill that folds, two rows buffered, then one row that replays
+    // them and folds them.
+    let fires = [
+        (0u32, 4usize, RsVerb::Fold),
+        (4, 2, buffer(4, 0)),
+        (6, 1, buffer(4, 2)),
+    ];
+    for (held, rows, rs) in &fires {
+        let seated = [Seated {
+            rs,
+            held: Some(*held),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, *rows as u32),
+                tokens: &tokens[*held as usize..*held as usize + rows],
+            })
+        }];
+        let got = shell
+            .fire_seated(&seated)
+            .unwrap_or_else(|why| panic!("{rows} row(s) held {held} under {rs:?} fire: {why}"));
+        assert!(got.iter().all(|row| row.iter().all(|v| v.is_finite())));
+        assert_eq!(
+            shell.compiled(),
+            built,
+            "{rows} row(s) held {held} under {rs:?} built a pipeline the load's walks did not name"
+        );
+    }
+}
+
+/// A decode's body replays what it fired the first time: two buckets of
+/// one load alternate on the same arms' fire blocks, a yield and a restore
+/// of the pool's segments between, and every fire of a bucket lands the
+/// logits its first fire did (a replay that skips its head copy because the
+/// block holds its image already reads that image).
+#[test]
+fn a_decodes_bodies_replay_their_logits_across_buckets_and_a_yield() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let tokens: Vec<u32> = (0..SEATS).map(|at| (at * 37 + 11) % 256).collect();
+    let decode = |shell: &mut Shell, lanes: u32| -> Vec<Vec<f32>> {
+        let seated: Vec<Seated<'_>> = (0..lanes)
+            .map(|lane| Seated {
+                held: Some(4),
+                ..Seated::of(Lane {
+                    slot: lane,
+                    word: word(&fixture.trace, 1),
+                    tokens: &tokens[lane as usize..lane as usize + 1],
+                })
+            })
+            .collect();
+        shell
+            .fire_seated(&seated)
+            .unwrap_or_else(|why| panic!("a decode of {lanes} lane(s) fires: {why}"))
+    };
+    let wide = SEATS.min(2);
+    let first = (decode(&mut shell, 1), decode(&mut shell, wide));
+    for round in 0..3 {
+        if round == 1 {
+            let segments = shell.pool_chunk_facts().segments;
+            if segments.growth != engine::chunk::Growth::Fixed && segments.committed > 1 {
+                let committed = segments.committed;
+                shell.release_segments(1).expect("the top segments go back");
+                shell.commit_segments(committed).expect("the segments commit again");
+            }
+        }
+        assert_eq!(decode(&mut shell, 1), first.0, "round {round}: one lane");
+        assert_eq!(decode(&mut shell, wide), first.1, "round {round}: {wide} lanes");
+    }
+}
+
 #[test]
 fn a_windowed_miniature_fires_every_rung_from_what_the_load_built() {
     every_rung_fires_what_the_load_built("gemma4-e4b-mini-l1");

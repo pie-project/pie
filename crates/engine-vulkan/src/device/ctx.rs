@@ -175,9 +175,12 @@ pub(crate) struct Core {
     /// Woken as pools come back.
     given: std::sync::Condvar,
 
-    /// The frame whose fenced submission went to the queue last: the
-    /// queue has emptied once it landed ([`Context::idle`]).
-    last: Mutex<std::sync::Weak<Inner>>,
+    /// The one thread that waits on every watched submission's fence, in
+    /// the queue's order, started with the device ([`Watch`]).
+    watcher: Mutex<Option<std::sync::mpsc::Sender<Watch>>>,
+    /// The submission that went to the queue last: the queue has emptied
+    /// once it landed ([`Context::idle`]).
+    last: Mutex<Last>,
 
     /// Command buffers whose frame was dropped off the thread that owns
     /// their pool, which a pool's own thread frees: a pool is not shared.
@@ -207,6 +210,19 @@ pub(crate) struct Core {
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
+    /// The device writes storage-buffer descriptors after a recording binds
+    /// them (descriptorBindingStorageBufferUpdateAfterBind): a recording's
+    /// pool segments are rebound as they are backed and given back.
+    pub(crate) update_after_bind: bool,
+    /// The pool's segment buffers and their stand-ins, by raw handle, each
+    /// to its segment ([`Context::rebind_segments`]): a kept frame notes each
+    /// descriptor that binds one, to write it when the segment changes.
+    pub(crate) segments: Mutex<std::collections::HashMap<u64, u32>>,
+    /// What each segment's descriptors bind now, by raw handle: a rebind
+    /// writes only the segments whose buffer changed.
+    pub(crate) segments_bound: Mutex<Vec<u64>>,
+    /// Every kept frame that binds a pool segment, which a rebind writes.
+    pub(crate) rebound: Mutex<Vec<std::sync::Weak<Inner>>>,
     /// The device's PCI id and its driver's version, as the physical
     /// device states them: with the vendor, what a stored measurement is
     /// keyed by ([`Context::measured_on`]).
@@ -500,13 +516,27 @@ impl Core {
     }
 
     fn new_descriptor_pool(&self) -> Result<vk::DescriptorPool> {
-        let sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(BUFFERS_PER_POOL)];
+        // A set binds its kernel's scalars as one uniform (the fire block's).
+        let sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(BUFFERS_PER_POOL),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(SETS_PER_POOL),
+        ];
+        // A recording's pool segments are written after it binds them: its
+        // sets are allocated from pools that allow it.
+        let flags = if self.update_after_bind {
+            vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
+        } else {
+            vk::DescriptorPoolCreateFlags::empty()
+        };
         // SAFETY: `device` is live and the create info is complete.
         unsafe {
             self.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
+                    .flags(flags)
                     .max_sets(SETS_PER_POOL)
                     .pool_sizes(&sizes),
                 None,
@@ -576,10 +606,27 @@ pub struct Context {
     pub(crate) dummy: Slab,
     pipeline_cache: Arc<PipelineCache>,
     device_index: u32,
+    /// The kernel a frame moves a fire's readout rows with
+    /// ([`Frame::copy_rows`]), built with the device.
+    copier: Arc<super::pipelines::Pipeline>,
+    /// The dispatches the next frame makes indirect, by their place in its
+    /// walk ([`Context::indirect_next`]).
+    indirect_next: Mutex<Option<Arc<Vec<bool>>>>,
+    /// The fire block the next frame opened lays in ([`Context::arm_next`]).
+    arm_next: Mutex<Option<Arc<super::block::ArmBlock>>>,
+    /// The score room the next frame's capturing lanes lay their rows in
+    /// ([`Context::room_next`]): its buffer and byte.
+    room_next: Mutex<Option<(vk::Buffer, u64)>>,
+    /// Whether the next frame's rows are constants of its commands
+    /// ([`Context::fixed_next`]).
+    fixed_next: Mutex<Option<bool>>,
     /// The workgroups the device holds at once, as the load's rates step
     /// measured them ([`Context::resident`]).
     resident: std::sync::OnceLock<u32>,
 }
+
+/// The kernel [`Frame::copy_rows`] dispatches.
+const COPIER: (&str, &str) = ("gather/rows.slang", "gather_rows_copy_regions_words");
 
 /// The device's pipeline cache, which kernel and guest pipelines share. A
 /// build marks it changed, and it reaches its file shortly after rather
@@ -1069,6 +1116,14 @@ impl Context {
                 && f12.vulkan_memory_model == vk::TRUE
                 && (pinned == Some(32) || subgroup.subgroup_size == 32),
         };
+        // A recording's pool segment bindings are written as the segments
+        // are backed and given back, while it stands: update-after-bind
+        // storage buffers. A device without them lays its pool whole
+        // (`Context::resizes_pool`). `PIE_VULKAN_WHOLE_POOL` takes that path
+        // on one that has them, to test it.
+        let update_after_bind = f12.descriptor_binding_storage_buffer_update_after_bind
+            == vk::TRUE
+            && std::env::var_os("PIE_VULKAN_WHOLE_POOL").is_none();
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
                 detail: format!(
@@ -1089,7 +1144,8 @@ impl Context {
                 f12.uniform_and_storage_buffer8_bit_access == vk::TRUE,
             )
             .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
-            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE);
+            .vulkan_memory_model_device_scope(f12.vulkan_memory_model_device_scope == vk::TRUE)
+            .descriptor_binding_storage_buffer_update_after_bind(update_after_bind);
         let mut e13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(enabled.subgroup_size_control)
             .synchronization2(f13.synchronization2 == vk::TRUE);
@@ -1211,7 +1267,8 @@ impl Context {
             spare_fences: Mutex::new(Vec::new()),
             spares: Mutex::new(Spares::default()),
             given: std::sync::Condvar::new(),
-            last: Mutex::new(std::sync::Weak::new()),
+            watcher: Mutex::new(None),
+            last: Mutex::new(Last::None),
             orphans: Mutex::new(Vec::new()),
             family,
             memory,
@@ -1228,6 +1285,10 @@ impl Context {
             whose_memory,
             heap,
             vendor_id: props.vendor_id,
+            update_after_bind,
+            segments: Mutex::new(std::collections::HashMap::new()),
+            segments_bound: Mutex::new(Vec::new()),
+            rebound: Mutex::new(Vec::new()),
             device_id: props.device_id,
             driver_version: props.driver_version,
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
@@ -1242,6 +1303,38 @@ impl Context {
             engine_gpu::books::owners::DUMMY,
         )?;
         let pipeline_cache = Arc::new(PipelineCache::open(&core, boot.pipeline_cache.clone())?);
+        let (file, entry) = COPIER;
+        let unbuilt = |why: &str| Fault::Shader {
+            file,
+            entrypoint: entry,
+            why: why.to_string(),
+        };
+        let key = kernels_slang::key(entry, kernels_slang::Tier::Baseline)
+            .ok_or_else(|| unbuilt("kernels-slang names no such instantiation"))?;
+        let code = kernels_slang::spirv(key)
+            .ok_or_else(|| unbuilt("kernels-slang holds no SPIR-V module by that key"))?;
+        let copier = Arc::new(super::pipelines::build(
+            &core,
+            pipeline_cache.handle(),
+            file,
+            key,
+            code,
+        )?);
+        pipeline_cache.built();
+        // The watcher starts with the device: no thread is spawned per
+        // submission, nor after the load.
+        let (watches, watched) = std::sync::mpsc::channel::<Watch>();
+        std::thread::Builder::new()
+            .name("vk-fence-watch".to_string())
+            .spawn(move || {
+                for watch in watched {
+                    watch.run();
+                }
+            })
+            .map_err(|e| Fault::NoDevice {
+                detail: format!("the fence watcher did not start: {e}"),
+            })?;
+        *core.watcher.lock().expect("watcher lock poisoned") = Some(watches);
         Ok(Context {
             core,
             budget,
@@ -1249,6 +1342,11 @@ impl Context {
             dummy,
             pipeline_cache,
             device_index: boot.device_index,
+            copier,
+            indirect_next: Mutex::new(None),
+            arm_next: Mutex::new(None),
+            room_next: Mutex::new(None),
+            fixed_next: Mutex::new(None),
             resident: std::sync::OnceLock::new(),
         })
     }
@@ -1491,6 +1589,114 @@ impl Context {
         self.core.staging(&mut transfer).map(|_| ())
     }
 
+    /// States the pool's segments below the span's: for each, the buffer
+    /// backing it (or `None`) and its stand-in. Each kept frame's descriptor
+    /// of a segment is written to bind the segment's buffer, or its stand-in
+    /// where it is not backed; a segment whose buffer stands as it was is
+    /// not written. Called with every frame that reads them landed (a
+    /// release drains first; a segment just backed is read by no fire yet),
+    /// and before a released segment's buffer goes. The descriptors written.
+    pub fn rebind_segments(&self, segments: &[(Option<&Buffer>, &Buffer)]) -> Result<u64> {
+        use ash::vk::Handle;
+        let bound: Vec<&Buffer> = segments
+            .iter()
+            .map(|(backed, stand_in)| backed.unwrap_or(stand_in))
+            .collect();
+        {
+            let mut held = self.core.segments.lock().expect("segments lock poisoned");
+            held.clear();
+            for (at, (backed, stand_in)) in segments.iter().enumerate() {
+                held.insert(stand_in.slab().buffer.as_raw(), at as u32);
+                if let Some(backed) = backed {
+                    held.insert(backed.slab().buffer.as_raw(), at as u32);
+                }
+            }
+        }
+        let now: Vec<u64> = bound.iter().map(|b| b.slab().buffer.as_raw()).collect();
+        let changed: Vec<bool> = {
+            let mut before = self
+                .core
+                .segments_bound
+                .lock()
+                .expect("segments lock poisoned");
+            let changed = (0..now.len())
+                .map(|at| before.get(at) != Some(&now[at]))
+                .collect();
+            *before = now;
+            changed
+        };
+        if !changed.iter().any(|&c| c) {
+            return Ok(0);
+        }
+        let kept: Vec<Arc<Inner>> = {
+            let mut rebound = self.core.rebound.lock().expect("rebound lock poisoned");
+            rebound.retain(|held| held.strong_count() > 0);
+            rebound.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        let range = u64::from(self.core.limits.max_storage_buffer_range);
+        let mut infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+        let mut places: Vec<(vk::DescriptorSet, u32)> = Vec::new();
+        for inner in &kept {
+            for &(set, binding, segment, offset, bytes) in
+                inner.rebinds.lock().expect("rebinds lock poisoned").iter()
+            {
+                if !changed.get(segment as usize).copied().unwrap_or(false) {
+                    continue;
+                }
+                let buffer = bound.get(segment as usize).ok_or_else(|| Fault::Unbound {
+                    what: format!("pool segment {segment}, past the {} stated", bound.len()),
+                })?;
+                // A whole binding (`u64::MAX` bytes) binds the buffer whole;
+                // a view past a stand-in's few bytes binds the stand-in whole,
+                // which no fire reads while the segment is not backed.
+                let (offset, view) = if bytes != u64::MAX && offset + bytes <= buffer.bytes() {
+                    (offset, bytes)
+                } else {
+                    (0, buffer.bytes())
+                };
+                infos.push(
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buffer.slab().buffer)
+                        .offset(offset)
+                        .range(view.min(range)),
+                );
+                places.push((set, binding));
+            }
+        }
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = places
+            .iter()
+            .zip(&infos)
+            .map(|(&(set, binding), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        if !writes.is_empty() {
+            // SAFETY: every set named is a live kept frame's (its `Inner`
+            // upgraded above), its binding laid update-after-bind (only those
+            // are noted, `Frame::rebinds`), and no submission in flight
+            // reads it (the caller's contract); each buffer is a live slab.
+            unsafe { self.core.device.update_descriptor_sets(&writes, &[]) };
+        }
+        tracing::debug!(
+            segments = ?changed,
+            descriptors = writes.len(),
+            recordings = kept.len(),
+            "the recordings' descriptors of the pool segments that changed are rebound"
+        );
+        Ok(writes.len() as u64)
+    }
+
+    /// Whether a recording's pool segments are rebound as they change
+    /// (update-after-bind storage buffers), else the pool is laid whole.
+    #[must_use]
+    pub fn rebinds_segments(&self) -> bool {
+        self.core.update_after_bind
+    }
+
     /// Serving starts: the spares are stocked to `frames` free pools (the
     /// frames serving holds at once, each one pool: the load's kept frames
     /// hold their own beside them), and from here no frame makes one
@@ -1517,6 +1723,56 @@ impl Context {
         self.frame_with(true)
     }
 
+    /// The dispatches, by their place in the walk, the next frame opened
+    /// makes indirect: those whose group counts differ between the shapes of
+    /// one recording. Every other dispatch carries its counts.
+    pub fn indirect_next(&self, at: Option<Arc<Vec<bool>>>) {
+        *self.indirect_next.lock().expect("indirect lock poisoned") = at;
+    }
+
+    /// The offset alignments a fire block lays at: a uniform's and a
+    /// storage view's.
+    #[must_use]
+    pub fn fire_alignments(&self) -> (u64, u64) {
+        let limits = &self.core.limits;
+        (
+            limits.min_uniform_buffer_offset_alignment.max(4),
+            limits.min_storage_buffer_offset_alignment.max(4),
+        )
+    }
+
+    /// The bytes of scalars the readout copier takes.
+    #[must_use]
+    pub fn copier_scalars(&self) -> u32 {
+        self.copier
+            .fire
+            .as_ref()
+            .map_or(0, |fire| fire.bytes)
+            .max(self.copier.push_bytes)
+    }
+
+    /// The fire block the next frame opened lays in: the arm's whose fire
+    /// it walks. A frame opened with none lays its block in chunks of its
+    /// own.
+    pub fn arm_next(&self, arm: Option<Arc<super::block::ArmBlock>>) {
+        *self.arm_next.lock().expect("arm lock poisoned") = arm;
+    }
+
+    /// The score room (`room`'s buffer at byte `at`) the next frame opened
+    /// lays its capturing lanes' rows in: a recording binds it by place
+    /// ([`Kept::bind_room`]).
+    pub fn room_next(&self, room: Option<(&Buffer, u64)>) {
+        *self.room_next.lock().expect("room lock poisoned") =
+            room.map(|(buffer, at)| (buffer.slab().buffer, at));
+    }
+
+    /// Whether the next frame opened carries its rows as constants of its
+    /// commands (a decode body, a fire no wider than a row tile) or reads
+    /// them from the fire block (a body every row count of a rung shares).
+    pub fn fixed_next(&self, fixed: bool) {
+        *self.fixed_next.lock().expect("fixed lock poisoned") = Some(fixed);
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
         self.frame_with(false)
     }
@@ -1529,21 +1785,35 @@ impl Context {
     /// its fence signaled now.
     #[must_use]
     pub fn idle(&self) -> bool {
-        let last = self.core.last.lock().expect("last lock poisoned").upgrade();
-        let Some(last) = last else {
-            return true;
+        let last = match &*self.core.last.lock().expect("last lock poisoned") {
+            Last::None => return true,
+            Last::Frame(frame) => frame.upgrade().map(Ok),
+            Last::Replay(replay) => replay.upgrade().map(Err),
         };
-        if last.landed.load(Ordering::Acquire) >= last.seq.load(Ordering::Acquire) {
-            return true;
+        match last {
+            None => true,
+            Some(Ok(last)) => {
+                if last.landed.load(Ordering::Acquire) >= last.seq.load(Ordering::Acquire) {
+                    return true;
+                }
+                // SAFETY: the fence lives as long as `last`; querying it
+                // needs no external sync.
+                let signaled =
+                    unsafe { self.core.device.get_fence_status(last.fence) }.unwrap_or(false);
+                if signaled {
+                    last.landed_now();
+                }
+                signaled
+            }
+            // A replay's lent fence goes back once it landed, its
+            // submission's last holder gone with it.
+            Some(Err(replay)) => {
+                replay.landed.load(Ordering::Acquire)
+                    // SAFETY: the lent fence is the submission's until it
+                    // drops, which `replay` holds off.
+                    || unsafe { self.core.device.get_fence_status(replay.fence) }.unwrap_or(false)
+            }
         }
-        // SAFETY: the fence lives as long as `last`; querying it needs no
-        // external sync.
-        let signaled =
-            unsafe { self.core.device.get_fence_status(last.fence) }.unwrap_or(false);
-        if signaled {
-            last.landed_now();
-        }
-        signaled
     }
 
     /// A frame whose device time [`Frame::commit_spanned`] reads back: a
@@ -1630,6 +1900,16 @@ impl Context {
         Ok(frame)
     }
 
+    /// A frame a fire walks to fill an armed body ([`Frame::dry`]): what the
+    /// walk lays in the fire block and what its commands would carry,
+    /// hashed, with no command recorded and no descriptor set taken. It is
+    /// dropped unsubmitted ([`Frame::into_fill`]).
+    pub fn frame_dry(&self) -> Result<Frame> {
+        let mut frame = self.frame_with(true)?;
+        frame.dry = true;
+        Ok(frame)
+    }
+
     fn frame_with(&self, one_time: bool) -> Result<Frame> {
         let core = &self.core;
         let d = &core.device;
@@ -1706,6 +1986,7 @@ impl Context {
                 one_time,
                 cmd: std::sync::atomic::AtomicU64::new(vk::Handle::as_raw(cmd)),
                 cuts: Mutex::new(Vec::new()),
+                heads: Mutex::new(Vec::new()),
                 segments: Mutex::new(Vec::new()),
                 held: Mutex::new(Vec::new()),
                 segmented: std::sync::atomic::AtomicBool::new(false),
@@ -1721,12 +2002,45 @@ impl Context {
                 landed: std::sync::atomic::AtomicU64::new(0),
                 waiters: std::sync::atomic::AtomicU32::new(0),
                 most_waiters: std::sync::atomic::AtomicU32::new(0),
+                rebinds: Mutex::new(Vec::new()),
+                pinned: Mutex::new(None),
+                room_binds: Mutex::new(Vec::new()),
+                room_bound: Mutex::new(None),
+                room_fixed: std::sync::atomic::AtomicBool::new(false),
             }),
             open: true,
+            room: self.room_next.lock().expect("room lock poisoned").take(),
+            room_pasts: std::cell::RefCell::new(Vec::new()),
+            dry: false,
             kept: !one_time,
             hazards: std::cell::RefCell::new(Hazards::default()),
             retained: std::cell::RefCell::new(std::collections::HashSet::new()),
             dispatches: std::cell::Cell::new(0),
+            block: std::cell::RefCell::new(
+                match self.arm_next.lock().expect("arm lock poisoned").take() {
+                    Some(arm) => super::block::FireBlock::of_arm(arm),
+                    None => super::block::FireBlock::own(),
+                },
+            ),
+            copier: Arc::clone(&self.copier),
+            fixed_rows: self
+                .fixed_next
+                .lock()
+                .expect("fixed lock poisoned")
+                .take()
+                .unwrap_or(true),
+            indirect: if one_time {
+                None
+            } else {
+                self.indirect_next
+                    .lock()
+                    .expect("indirect lock poisoned")
+                    .take()
+            },
+            groups: std::cell::RefCell::new(Vec::new()),
+            copies: std::cell::RefCell::new(Vec::new()),
+            baked: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
+            trail: std::cell::RefCell::new(Vec::new()),
         })
     }
 }
@@ -1757,6 +2071,8 @@ pub(crate) struct Inner {
     /// expert stage); a replay submits each, waits, and lets its caller do
     /// that host work before the next.
     cuts: Mutex<Vec<vk::CommandBuffer>>,
+    /// Each head ([`Frame::head`]) recorded for the frame's submissions.
+    heads: Mutex<Vec<vk::CommandBuffer>>,
     /// A split step's segments before its last, submitted unawaited
     /// ([`Frame::submit_segment`]): each held until the frame is dropped,
     /// whose last segment's fence lands after them (it begins with a barrier
@@ -1793,6 +2109,25 @@ pub(crate) struct Inner {
     /// Threads blocked on `fence` now, and the most at once.
     waiters: std::sync::atomic::AtomicU32,
     most_waiters: std::sync::atomic::AtomicU32,
+
+    /// A kept frame's descriptors that bind a pool segment: the set, the
+    /// binding, the segment, and the view's offset and bytes in it
+    /// ([`Context::rebind_segments`]).
+    pub(crate) rebinds: Mutex<Vec<(vk::DescriptorSet, u32, u32, u64, u64)>>,
+    /// A kept frame binds a pool segment where no rebind can write it (a
+    /// binding its layout does not lay update-after-bind, or a copy's
+    /// command): it stands only while the segments do, the name of what
+    /// pinned it beside.
+    pub(crate) pinned: Mutex<Option<String>>,
+    /// A kept frame's descriptors that bind its score room: the set, the
+    /// binding, the view's byte past the room's and its bytes
+    /// ([`Kept::bind_room`]).
+    pub(crate) room_binds: Mutex<Vec<(vk::DescriptorSet, u32, u64, u64)>>,
+    /// The room its descriptors bind now: its buffer and byte.
+    pub(crate) room_bound: Mutex<Option<(vk::Buffer, u64)>>,
+    /// A command of it names the room directly (a copy of its rows): it
+    /// replays only at the room it was recorded at.
+    pub(crate) room_fixed: std::sync::atomic::AtomicBool,
 }
 
 impl Inner {
@@ -1845,8 +2180,12 @@ impl Drop for Inner {
         // device). The command buffer is freed only on the thread whose pool
         // it came from, and otherwise left to that thread as an orphan.
         unsafe {
+            // A fence already signaled is not waited on: the frame landed,
+            // its segments before it.
             if self.submitted.load(Ordering::Acquire) {
-                let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
+                if d.get_fence_status(self.fence) != Ok(true) {
+                    let _ = d.wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS);
+                }
             } else if self.segmented.load(Ordering::Acquire) {
                 let queue = self.core.queue.lock().expect("queue lock poisoned");
                 let _ = d.queue_wait_idle(*queue);
@@ -1865,6 +2204,9 @@ impl Drop for Inner {
                 .get(&std::thread::current().id())
                 == Some(&self.cmd_pool);
             let mut buffers = std::mem::take(self.cuts.get_mut().expect("cuts lock poisoned"));
+            buffers.extend(std::mem::take(
+                self.heads.get_mut().expect("heads lock poisoned"),
+            ));
             buffers.extend(std::mem::take(
                 self.segments.get_mut().expect("segments lock poisoned"),
             ));
@@ -1985,9 +2327,28 @@ impl Hazards {
     }
 }
 
+/// Whether frames keep what each command carried, rendered
+/// (`PIE_VK_BAKE_TRAIL`): to tell a fill walk that matches no armed family
+/// apart from the nearest one.
+pub(crate) fn trailing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_VK_BAKE_TRAIL").is_some())
+}
+
 pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
+    /// The score room its capturing lanes lay their rows in: its buffer and
+    /// byte ([`Context::room_next`]).
+    pub(crate) room: Option<(vk::Buffer, u64)>,
+    /// Each room binding's bytes past the room's byte, in the walk's order.
+    room_pasts: std::cell::RefCell<Vec<u64>>,
+    /// A fill walk's frame ([`Context::frame_dry`]): it lays what a fire
+    /// writes in its block and hashes what its commands carry, and records
+    /// no command; it is never submitted.
+    pub(crate) dry: bool,
+    /// The fire's rows are constants of its commands ([`Context::fixed_next`]).
+    fixed_rows: bool,
     /// Opened by `frame_kept`: a flush cuts a segment rather than reusing
     /// the command buffer, so the whole frame replays.
     kept: bool,
@@ -1996,9 +2357,278 @@ pub struct Frame {
     pub(crate) hazards: std::cell::RefCell<Hazards>,
 
     retained: std::cell::RefCell<std::collections::HashSet<usize>>,
+
+    /// Where the walk lays each dispatch's scalars and group counts.
+    block: std::cell::RefCell<super::block::FireBlock>,
+
+    /// Everything the frame's commands carry, hashed: two walks whose
+    /// commands hash alike differ only in what their fire blocks hold.
+    baked: std::cell::RefCell<std::collections::hash_map::DefaultHasher>,
+
+    /// What each command folded into `baked` carried, rendered, where
+    /// `PIE_VK_BAKE_TRAIL` asks ([`trailing`]): what a fill walk that
+    /// matches no armed family is told apart from the nearest by.
+    trail: std::cell::RefCell<Vec<String>>,
+
+    copier: Arc<super::pipelines::Pipeline>,
+
+    /// The dispatches made indirect, by their place in the walk.
+    indirect: Option<Arc<Vec<bool>>>,
+
+    /// Each dispatch's group counts, in the walk's order.
+    groups: std::cell::RefCell<Vec<[u32; 3]>>,
+
+    /// Each readout copy's mark (its most rows: its regions are the copier's
+    /// table), in order.
+    copies: std::cell::RefCell<Vec<[u32; 3]>>,
 }
 
 impl Frame {
+    /// Opened to be kept and replayed (a recording).
+    pub(crate) fn kept(&self) -> bool {
+        self.kept
+    }
+
+    pub(crate) fn fixed_rows(&self) -> bool {
+        self.fixed_rows
+    }
+
+    /// Takes the next dispatch's group counts, and answers whether it reads
+    /// them from the fire block (indirect) rather than carrying them.
+    pub(crate) fn dispatched(&self, groups: [u32; 3]) -> bool {
+        let mut seen = self.groups.borrow_mut();
+        let at = seen.len();
+        seen.push(groups);
+        // A kept frame reads every dispatch's group counts from the block:
+        // what sizes a grid but the fire's rows (a lane's buffered rows, the
+        // fold / buffer split of a prompt) is the fire's data, so one
+        // recording serves every fire of its commands.
+        self.kept
+            || self
+                .indirect
+                .as_ref()
+                .is_some_and(|set| set.get(at).copied().unwrap_or(false))
+    }
+
+    /// Lays `bytes` in the frame's fire block at an offset a multiple of
+    /// `align`, the chunk retained with the frame, and answers where: the
+    /// chunk's buffer, and its place among the chunks with the offset, which
+    /// is the same in every walk laid alike.
+    pub(crate) fn lay(&self, bytes: &[u8], align: u64) -> Result<(vk::Buffer, (usize, u64))> {
+        let (slab, chunk, at) = self
+            .block
+            .borrow_mut()
+            .lay(&self.inner.core, bytes, align)?;
+        self.retain(&slab);
+        Ok((slab.buffer, (chunk, at)))
+    }
+
+    /// The commands a submission of the frame runs first: the arm's staging
+    /// slice copied into its fire block, then a barrier before every read
+    /// of it (a uniform, an indirect dispatch's counts, a table). `None`
+    /// where the frame laid nothing in an arm's block. The head is recorded
+    /// once and kept with the frame.
+    fn head(&self, one_time: bool) -> Result<Option<vk::CommandBuffer>> {
+        let block = self.block.borrow();
+        let (Some(arm), bytes) = (block.arm(), block.arm_bytes()) else {
+            return Ok(None);
+        };
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let core = &self.inner.core;
+        let d = &core.device;
+        // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
+        // owned by this thread (frames record on the thread that opened
+        // them); the head is recorded here alone and freed with the frame.
+        let head = unsafe {
+            d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.inner.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        self.inner
+            .heads
+            .lock()
+            .expect("heads lock poisoned")
+            .push(head);
+        let flags = if one_time {
+            vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
+        } else {
+            vk::CommandBufferUsageFlags::empty()
+        };
+        // SAFETY: `head` was just allocated and is recorded only here; both
+        // slabs are the arm's, live as long as the arm the frame holds, and
+        // `bytes` lies inside both (`FireBlock::lay` bounds it by the
+        // block's size, which the staging slice shares). The barrier makes
+        // the copy visible to every compute read and indirect fetch after.
+        unsafe {
+            d.begin_command_buffer(head, &vk::CommandBufferBeginInfo::default().flags(flags))
+                .map_err(|e| core.fault("vkBeginCommandBuffer", e))?;
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::UNIFORM_READ
+                        | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                )
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            d.cmd_pipeline_barrier(
+                head,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            d.cmd_copy_buffer(
+                head,
+                arm.staging.slab().buffer,
+                arm.block.slab().buffer,
+                &[vk::BufferCopy::default().size(bytes)],
+            );
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::UNIFORM_READ
+                        | vk::AccessFlags::INDIRECT_COMMAND_READ,
+                );
+            d.cmd_pipeline_barrier(
+                head,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::DRAW_INDIRECT,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+            d.end_command_buffer(head)
+                .map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        }
+        Ok(Some(head))
+    }
+
+    /// Writes what the frame laid so far into its arm's staging slice and
+    /// records the head that copies it: what a submission of the frame as it
+    /// walks runs first. The arm's last fire has landed: the arm was taken.
+    fn staged_head(&self) -> Result<Option<vk::CommandBuffer>> {
+        if let Some(arm) = self.block.borrow().arm() {
+            // A walk's image is unsealed: it is always written, and its head
+            // always copies it.
+            arm.stage(self.block.borrow().image())?;
+        }
+        self.head(true)
+    }
+
+    /// The pool segment (below the span's, which stands for good) `buffer`
+    /// is, or stands in for ([`Context::rebind_segments`]).
+    pub(crate) fn segment_of(&self, buffer: vk::Buffer) -> Option<u32> {
+        use ash::vk::Handle;
+        self.inner
+            .core
+            .segments
+            .lock()
+            .expect("segments lock poisoned")
+            .get(&buffer.as_raw())
+            .copied()
+    }
+
+    /// A kept frame whose command names a pool segment directly (`what`)
+    /// stands only while the segments do: no rebind writes a command.
+    fn pin_copied(&self, buffers: &[vk::Buffer], what: &str) {
+        if self.kept && buffers.iter().any(|&buffer| self.segment_of(buffer).is_some()) {
+            self.pin(what.to_string());
+        }
+    }
+
+    /// Notes that the kept frame binds a pool segment where a rebind cannot
+    /// write it, `what` naming where.
+    pub(crate) fn pin(&self, what: String) {
+        self.inner
+            .pinned
+            .lock()
+            .expect("pinned lock poisoned")
+            .get_or_insert(what);
+    }
+
+    /// Notes descriptor `binding` of `set`, a kept frame's, as binding pool
+    /// segment `segment` at `offset` for `bytes` (`u64::MAX`: the buffer
+    /// whole): a rebind writes it.
+    pub(crate) fn rebinds(&self, set: vk::DescriptorSet, binding: u32, segment: u32, offset: u64, bytes: u64) {
+        self.inner
+            .rebinds
+            .lock()
+            .expect("rebinds lock poisoned")
+            .push((set, binding, segment, offset, bytes));
+    }
+
+    /// Notes descriptor `binding` of `set`, a kept frame's, as binding its
+    /// score room `past` bytes past the room's byte, for `bytes`.
+    pub(crate) fn room_binds(&self, set: vk::DescriptorSet, binding: u32, past: u64, bytes: u64) {
+        *self.inner.room_bound.lock().expect("room lock poisoned") = self.room;
+        self.inner
+            .room_binds
+            .lock()
+            .expect("room lock poisoned")
+            .push((set, binding, past, bytes));
+    }
+
+    /// Notes the next room binding lies `past` bytes past the room's byte.
+    pub(crate) fn room_past(&self, past: u64) {
+        self.room_pasts.borrow_mut().push(past);
+    }
+
+    /// Each room binding's bytes past the room's byte, in order.
+    #[must_use]
+    pub fn room_pasts(&self) -> Vec<u64> {
+        self.room_pasts.borrow().clone()
+    }
+
+    /// Whether `buffer` is the frame's score room's.
+    pub(crate) fn is_room(&self, buffer: vk::Buffer) -> bool {
+        self.room.is_some_and(|(room, _)| room == buffer)
+    }
+
+    /// A command copies `buffers`: one the frame's score room is makes a
+    /// kept frame replay only at that room.
+    fn fix_room(&self, buffers: &[vk::Buffer]) {
+        if self.kept && buffers.iter().any(|&buffer| self.is_room(buffer)) {
+            self.inner.room_fixed.store(true, Ordering::Release);
+        }
+    }
+
+    /// What a dry walk laid ([`Context::frame_dry`]): the hash of what its
+    /// commands would carry, each dispatch's group counts, each readout
+    /// copy's regions hashed, the block's image, and the cuts it made.
+    #[must_use]
+    pub fn into_fill(self) -> Fill {
+        use std::hash::Hasher;
+        Fill {
+            baked: self.baked.borrow().finish(),
+            trail: std::mem::take(&mut *self.trail.borrow_mut()),
+            groups: std::mem::take(&mut *self.groups.borrow_mut()),
+            copies: std::mem::take(&mut *self.copies.borrow_mut()),
+            image: self.block.borrow().image().sealed(),
+            cuts: self.cuts(),
+            room_pasts: self.room_pasts.borrow().clone(),
+        }
+    }
+
+    /// Folds `what`, a command the frame records, into its hash.
+    pub(crate) fn bake(&self, what: &(impl std::hash::Hash + std::fmt::Debug)) {
+        if tracing::enabled!(target: "vkbakeall", tracing::Level::TRACE) {
+            tracing::trace!(target: "vkbakeall", what = ?what, "bake");
+        }
+        what.hash(&mut *self.baked.borrow_mut());
+        if trailing() {
+            self.trail.borrow_mut().push(format!("{what:?}"));
+        }
+    }
+
     pub(crate) fn core(&self) -> &Arc<Core> {
         &self.inner.core
     }
@@ -2106,6 +2736,18 @@ impl Frame {
         into: &Buffer,
         regions: &[(u64, u64, u64)],
     ) -> Result<()> {
+        self.copy_regions_baked(source, into, regions, true)
+    }
+
+    /// [`Frame::copy_regions`]; `bake` false leaves the regions out of the
+    /// frame's hash, for a caller that weighs them itself.
+    fn copy_regions_baked(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+        bake: bool,
+    ) -> Result<()> {
         let regions: Vec<vk::BufferCopy> = regions
             .iter()
             .filter(|&&(_, _, len)| len > 0)
@@ -2122,6 +2764,19 @@ impl Frame {
             return Ok(());
         }
         let (read_back, source, into) = (into.is_host(), source.slab(), into.slab());
+        if bake {
+            use ash::vk::Handle;
+            let spans: Vec<(u64, u64, u64)> = regions
+                .iter()
+                .map(|r| (r.src_offset, r.dst_offset, r.size))
+                .collect();
+            self.bake(&("copy", source.buffer.as_raw(), into.buffer.as_raw(), spans));
+        }
+        self.pin_copied(&[source.buffer, into.buffer], "a buffer copy");
+        self.fix_room(&[source.buffer, into.buffer]);
+        if self.dry {
+            return Ok(());
+        }
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`.
@@ -2168,12 +2823,231 @@ impl Frame {
         Ok(())
     }
 
+    /// Copies each `(source_at, into_at, len)` region of `source` into
+    /// `into`, the regions and their count laid in the fire block under a
+    /// table of `most` rows. Where the frame's shapes move other regions the
+    /// copier kernel moves them from the table, under commands the same for
+    /// every fire of at most `most` regions; elsewhere they are copied as
+    /// carried commands.
+    /// Regions the kernel cannot move (not whole words, past a binding's
+    /// range, more than `most`) are copied as [`Frame::copy_regions`] does.
+    pub fn copy_rows(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+        most: usize,
+    ) -> Result<()> {
+        use ash::vk::Handle;
+        let core = Arc::clone(&self.inner.core);
+        let limits = &core.limits;
+        let range = u64::from(limits.max_storage_buffer_range);
+        let (src, dst) = (source.slab(), into.slab());
+        let (src_range, dst_range) = (src.size.min(range), dst.size.min(range));
+        // The rows a fire reads out are its lanes': a recording moves them
+        // with the copier, their regions its table (data), so one body serves
+        // every fire of its commands whatever its lanes read. Rows copied out
+        // of the fire's score room move with it too: the room is bound where
+        // the fire's lies ([`Kept::bind_room`]).
+        let room_src = self.is_room(src.buffer);
+        let signature = [u32::MAX, u32::MAX, u32::try_from(most).unwrap_or(u32::MAX)];
+        self.copies.borrow_mut().push(signature);
+        let words = |n: u64| n.is_multiple_of(4);
+        let movable = regions.len() <= most
+            && most as u64 <= u64::from(limits.max_compute_work_group_count[1])
+            && regions.iter().all(|&(from, to, len)| {
+                words(from)
+                    && words(to)
+                    && words(len)
+                    && from + len <= src_range
+                    && to + len <= dst_range
+                    && (from + len) / 4 <= u64::from(u32::MAX)
+                    && (to + len) / 4 <= u64::from(u32::MAX)
+            });
+        if most == 0 || !movable {
+            return self.copy_regions(source, into, regions);
+        }
+        let mut table = vec![0u8; most * 16];
+        for (row, &(from, to, len)) in table.as_chunks_mut::<16>().0.iter_mut().zip(regions) {
+            let (words, _) = row.as_chunks_mut::<4>();
+            for (word, value) in words.iter_mut().zip([from / 4, to / 4, len / 4]) {
+                *word = (value as u32).to_le_bytes();
+            }
+        }
+        let longest = regions
+            .iter()
+            .map(|&(_, _, len)| len / 4)
+            .max()
+            .unwrap_or(0);
+        let groups = [
+            longest
+                .div_ceil(u64::from(self.copier.local[0]))
+                .min(u64::from(limits.max_compute_work_group_count[0])) as u32,
+            regions.len() as u32,
+            1,
+        ];
+        let group_words: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+        let fire = self.copier.fire.clone().ok_or_else(|| Fault::Shader {
+            file: COPIER.0,
+            entrypoint: COPIER.1,
+            why: "the copier reads no fire block".to_string(),
+        })?;
+        let count = (regions.len() as u32).to_le_bytes();
+        let (table_buffer, table_place) =
+            self.lay(&table, limits.min_storage_buffer_offset_alignment)?;
+        let (params_buffer, params_place) =
+            self.lay(&count, limits.min_uniform_buffer_offset_alignment)?;
+        let (groups_buffer, groups_place) = self.lay(&group_words, 4)?;
+        // The regions' own hash stands for them in the family's weighing: a
+        // family whose shapes move the same regions copies them as carried
+        // commands; one whose shapes differ moves them with the copier, from
+        // the table.
+        let indirect = self.dispatched(signature) || room_src || self.kept;
+        // The count is read from the fire block alone: the push block
+        // carries none of it.
+        let pushed = vec![0u8; self.copier.push_bytes as usize];
+        self.bake(&(
+            "rows",
+            if room_src { u64::MAX } else { src.buffer.as_raw() },
+            dst.buffer.as_raw(),
+            table_place,
+            params_place,
+            groups_place,
+            most,
+        ));
+        if !indirect {
+            return self.copy_regions_baked(source, into, regions, false);
+        }
+        // The copier reads its regions from the table: a room it copies from
+        // is bound whole, by its buffer (which the frame's hash carries).
+        self.pin_copied(&[src.buffer, dst.buffer], "a readout copier's binding");
+        if self.dry {
+            return Ok(());
+        }
+        let set = self.descriptor_set(self.copier.set_layout)?;
+        if room_src && self.kept && self.copier.rooms & 1 != 0 {
+            self.room_binds(set, 0, 0, u64::MAX);
+        } else if room_src && self.kept {
+            self.inner.room_fixed.store(true, Ordering::Release);
+        }
+        let infos = [
+            vk::DescriptorBufferInfo::default()
+                .buffer(src.buffer)
+                .offset(0)
+                .range(src_range),
+            vk::DescriptorBufferInfo::default()
+                .buffer(dst.buffer)
+                .offset(0)
+                .range(dst_range),
+            vk::DescriptorBufferInfo::default()
+                .buffer(table_buffer)
+                .offset(table_place.1)
+                .range(table.len() as u64),
+            vk::DescriptorBufferInfo::default()
+                .buffer(params_buffer)
+                .offset(params_place.1)
+                .range(u64::from(fire.bytes)),
+        ];
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = infos
+            .iter()
+            .enumerate()
+            .map(|(at, info)| {
+                let ty = if at as u32 == fire.binding {
+                    vk::DescriptorType::UNIFORM_BUFFER
+                } else {
+                    vk::DescriptorType::STORAGE_BUFFER
+                };
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(at as u32)
+                    .descriptor_type(ty)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        let host = into.is_host();
+        let d = &core.device;
+        let cmd = self.inner.cmd();
+        // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
+        // `set` was handed to this dispatch alone and no submitted command
+        // uses it yet. Both slabs are live and retained below, every region
+        // was checked to lie inside the ranges bound, and the table, the
+        // count and the group counts lie in fire block chunks the frame
+        // retains, at offsets the device's alignments allow.
+        unsafe {
+            d.update_descriptor_sets(&writes, &[]);
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[before],
+                &[],
+                &[],
+            );
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.copier.pipeline);
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.copier.layout,
+                0,
+                &[set],
+                &[],
+            );
+            if self.copier.push_bytes > 0 {
+                d.cmd_push_constants(
+                    cmd,
+                    self.copier.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &pushed,
+                );
+            }
+            d.cmd_dispatch_indirect(cmd, groups_buffer, groups_place.1);
+            let (host_stage, host_read) = if host {
+                (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ)
+            } else {
+                (vk::PipelineStageFlags::empty(), vk::AccessFlags::empty())
+            };
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::TRANSFER_READ
+                        | host_read,
+                );
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | host_stage,
+                vk::DependencyFlags::empty(),
+                &[after],
+                &[],
+                &[],
+            );
+        }
+        self.retain(src);
+        self.retain(dst);
+        self.hazards_settled();
+        Ok(())
+    }
+
     pub fn fill_zero(&mut self, into: &Buffer, at: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
         into.span(at, len)?;
         let into = into.slab();
+        self.bake(&("zero", ash::vk::Handle::as_raw(into.buffer), at, len));
+        self.pin_copied(&[into.buffer], "a buffer fill");
+        if self.dry {
+            return Ok(());
+        }
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd();
         // SAFETY: `&mut self` is the only recorder of this open frame's `cmd`;
@@ -2245,15 +3119,23 @@ impl Frame {
     /// them. A kept frame's segment is a cut its replays wait on
     /// ([`Frame::flush`]).
     pub fn submit_segment(&self) -> Result<()> {
-        if self.kept {
+        if self.kept || self.dry {
             return self.flush();
         }
         let core = &self.inner.core;
         let d = &core.device;
         let cmd = self.inner.cmd();
+        // The segment reads what the walk laid in the fire block so far: its
+        // head writes it first (the bytes an earlier segment read again, as
+        // they were).
+        let head = self.staged_head()?;
         // SAFETY: as in `flush`: this frame's `cmd` is recording and only
         // `&self` records into it.
         unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        // The segment's head runs before it, submitted with it.
+        if let Some(head) = head {
+            self.inner.held.lock().expect("held lock poisoned").push(head);
+        }
         self.inner
             .segments
             .lock()
@@ -2304,16 +3186,27 @@ impl Frame {
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.bake(&"flush");
+        if self.dry {
+            // A cut the fill's body was recorded with: counted, nothing run.
+            self.inner
+                .cuts
+                .lock()
+                .expect("cuts lock poisoned")
+                .push(vk::CommandBuffer::null());
+            return Ok(());
+        }
         let core = &self.inner.core;
         let d = &core.device;
         let cmd = self.inner.cmd();
         // In `flush`, `Frame` is not `Sync`, so `&self` here is the only
         // thread using this frame's `cmd` and fence, and the frame is open:
         // every method that ends it consumes the frame.
+        let head = self.staged_head()?;
         // SAFETY: `cmd` is recording, so it may be ended.
         unsafe { d.end_command_buffer(cmd) }.map_err(|e| core.fault("vkEndCommandBuffer", e))?;
         {
-            let bufs = [cmd];
+            let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
             // A split step's held segments go first, in order.
@@ -2399,9 +3292,10 @@ impl Frame {
     }
 
     fn submit(&mut self) -> Result<()> {
+        let head = self.staged_head()?;
         self.end()?;
         let core = &self.inner.core;
-        let bufs = [self.inner.cmd()];
+        let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([self.inner.cmd()]).collect();
         let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
         let queue = core.queue.lock().expect("queue lock poisoned");
         // A split step's segments first, each its own submission, back to
@@ -2427,21 +3321,13 @@ impl Frame {
 
     pub fn commit(mut self) -> Result<()> {
         self.submit()?;
-        Pending {
-            inner: Arc::clone(&self.inner),
-            landing: None,
-        }
-        .wait()
+        Pending::watched(Pending::of_frame(&self.inner), None).wait()
     }
 
     pub fn commit_timed(mut self) -> Result<f64> {
         let started = std::time::Instant::now();
         self.submit()?;
-        Pending {
-            inner: Arc::clone(&self.inner),
-            landing: None,
-        }
-        .wait()?;
+        Pending::watched(Pending::of_frame(&self.inner), None).wait()?;
         Ok(started.elapsed().as_secs_f64())
     }
 
@@ -2450,11 +3336,7 @@ impl Frame {
     pub fn commit_spanned(mut self) -> Result<Option<u64>> {
         self.stamp_end();
         self.submit()?;
-        Pending {
-            inner: Arc::clone(&self.inner),
-            landing: None,
-        }
-        .wait()?;
+        Pending::watched(Pending::of_frame(&self.inner), None).wait()?;
         self.inner.span_ns()
     }
 
@@ -2492,10 +3374,33 @@ impl Frame {
     /// Kept to replay; a spanned frame's closing timestamp written first,
     /// so each replay writes both anew.
     pub fn into_kept(mut self) -> Result<Kept> {
+        use std::hash::Hasher;
         self.stamp_end();
         self.end()?;
+        let head = self.head(false)?;
+        // A rebind writes the pool segments it binds, as they change.
+        if !self
+            .inner
+            .rebinds
+            .lock()
+            .expect("rebinds lock poisoned")
+            .is_empty()
+        {
+            let mut rebound = self.inner.core.rebound.lock().expect("rebound lock poisoned");
+            rebound.retain(|held| held.strong_count() > 0);
+            rebound.push(Arc::downgrade(&self.inner));
+        }
         Ok(Kept {
+            head,
+            copy: std::sync::atomic::AtomicBool::new(true),
             inner: Arc::clone(&self.inner),
+            block: std::mem::take(&mut *self.block.borrow_mut()),
+            baked: self.baked.borrow().finish(),
+            trail: std::mem::take(&mut *self.trail.borrow_mut()),
+            groups: std::mem::take(&mut *self.groups.borrow_mut()),
+            copies: std::mem::take(&mut *self.copies.borrow_mut()),
+            indirect: self.indirect.clone(),
+            indirect_all: true,
         })
     }
 
@@ -2509,7 +3414,7 @@ impl Frame {
         if let Some(at) = at {
             crate::encode::credit_submit(at.elapsed().as_nanos() as u64);
         }
-        Ok(Pending::watched(&self.inner, on_done))
+        Ok(Pending::watched(Pending::of_frame(&self.inner), on_done))
     }
 }
 
@@ -2526,8 +3431,45 @@ impl Drop for Frame {
     }
 }
 
+/// What a fill walk laid ([`Frame::into_fill`]).
+#[derive(Debug)]
+pub struct Fill {
+    pub baked: u64,
+    /// What each command carried, rendered ([`trailing`]); empty elsewhere.
+    pub trail: Vec<String>,
+    pub groups: Vec<[u32; 3]>,
+    pub copies: Vec<[u32; 3]>,
+    pub image: super::block::Image,
+    pub cuts: usize,
+    pub room_pasts: Vec<u64>,
+}
+
 pub struct Kept {
     inner: Arc<Inner>,
+
+    /// What a submission of it runs first ([`Frame::head`]), where the
+    /// block does not hold its image already.
+    head: Option<vk::CommandBuffer>,
+
+    /// The next replay runs the head: its image reached the staging slice
+    /// since the last head copied it.
+    copy: std::sync::atomic::AtomicBool,
+
+    block: super::block::FireBlock,
+
+    baked: u64,
+
+    trail: Vec<String>,
+
+    groups: Vec<[u32; 3]>,
+
+    copies: Vec<[u32; 3]>,
+
+    indirect: Option<Arc<Vec<bool>>>,
+
+    /// Every dispatch reads its group counts from the block (a body whose
+    /// rows vary).
+    indirect_all: bool,
 }
 
 impl std::fmt::Debug for Kept {
@@ -2537,6 +3479,156 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
+    /// Binds the score room `room` (its buffer at byte `at`) in every
+    /// descriptor that binds its recording's room, where it moved: written
+    /// with the arm staged, whose last fire has landed, so no submission in
+    /// flight reads the set. Whether the recording replays at it: one whose
+    /// commands name the room it was recorded at (a copy of its rows)
+    /// replays only there.
+    pub fn bind_room(&self, room: Option<(&Buffer, u64)>, pasts: &[u64]) -> Result<bool> {
+        let mut binds = self.inner.room_binds.lock().expect("room lock poisoned");
+        let mut bound = self.inner.room_bound.lock().expect("room lock poisoned");
+        let now = room.map(|(buffer, at)| (buffer.slab().buffer, at));
+        if binds.is_empty() {
+            return Ok(true);
+        }
+        // The kernels' room bindings take the fire's places in the room (a
+        // copier's whole-buffer binding none: its regions are its table).
+        let views: Vec<usize> = (0..binds.len()).filter(|&at| binds[at].3 != u64::MAX).collect();
+        if views.len() != pasts.len() {
+            return Ok(false);
+        }
+        let moved = views.iter().zip(pasts).any(|(&at, &past)| binds[at].2 != past);
+        if now == *bound && !moved {
+            return Ok(true);
+        }
+        for (&at, &past) in views.iter().zip(pasts) {
+            binds[at].2 = past;
+        }
+        if self.inner.room_fixed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let Some((buffer, at)) = room else {
+            return Ok(false);
+        };
+        // A copier binds its source buffer whole, which may hold another
+        // plane's rows beside the room's: it follows a room within its
+        // buffer, never into another.
+        let whole = binds.iter().any(|&(_, _, _, bytes)| bytes == u64::MAX);
+        if whole && bound.is_some_and(|(held, _)| held != buffer.slab().buffer) {
+            return Ok(false);
+        }
+        let range = u64::from(self.inner.core.limits.max_storage_buffer_range);
+        let infos: Vec<vk::DescriptorBufferInfo> = binds
+            .iter()
+            .map(|&(_, _, past, bytes)| {
+                // `u64::MAX` bytes: the room's buffer whole (a copier's
+                // source, its regions the fire's table).
+                let (offset, bytes) = match bytes {
+                    u64::MAX => (0, buffer.bytes()),
+                    // To the buffer's end, as a view of the room binds.
+                    0 => (at + past, buffer.bytes().saturating_sub(at + past)),
+                    bytes => (at + past, bytes),
+                };
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.slab().buffer)
+                    .offset(offset)
+                    .range(bytes.min(buffer.bytes().saturating_sub(offset)).min(range))
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet<'_>> = binds
+            .iter()
+            .zip(&infos)
+            .map(|(&(set, binding, _, _), info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        // SAFETY: every set is this kept frame's, each binding laid
+        // update-after-bind (only those are noted), and no submission in
+        // flight reads them: the caller holds the arm, whose last fire
+        // landed. The room's buffer is live, held by its pair.
+        unsafe { self.inner.core.device.update_descriptor_sets(&writes, &[]) };
+        *bound = now;
+        Ok(true)
+    }
+
+    /// What binds a pool segment in it where no rebind writes it, if any: it
+    /// stands only while the segments do.
+    #[must_use]
+    pub fn pinned(&self) -> Option<String> {
+        self.inner.pinned.lock().expect("pinned lock poisoned").clone()
+    }
+
+    /// What its commands carry, hashed ([`Frame::bake`]).
+    #[must_use]
+    pub fn trail(&self) -> &[String] {
+        &self.trail
+    }
+
+    #[must_use]
+    pub fn baked(&self) -> u64 {
+        self.baked
+    }
+
+    /// What its walk laid in its fire block.
+    #[must_use]
+    pub fn image(&self) -> &super::block::Image {
+        self.block.image()
+    }
+
+    /// Each dispatch's group counts in its walk, in order.
+    #[must_use]
+    pub fn groups(&self) -> &[[u32; 3]] {
+        &self.groups
+    }
+
+    /// Each readout copy's mark (its most rows), in order.
+    #[must_use]
+    pub fn copies(&self) -> &[[u32; 3]] {
+        &self.copies
+    }
+
+    /// Whether its commands carry their rows: no dispatch reads its group
+    /// counts from the block.
+    #[must_use]
+    pub fn fixed(&self) -> bool {
+        !self.indirect_all && self.indirect.as_ref().is_none_or(|set| !set.iter().any(|&v| v))
+    }
+
+    /// Whether dispatch `at` of its walk reads its group counts from the
+    /// fire block.
+    #[must_use]
+    pub fn indirect(&self, at: usize) -> bool {
+        self.indirect_all
+            || self
+                .indirect
+                .as_ref()
+                .is_some_and(|set| set.get(at).copied().unwrap_or(false))
+    }
+
+    /// Writes `image`, a walk's whose commands hash as this frame's, into
+    /// its arm's staging slice, where its next submission's head copies it
+    /// from. The caller holds the arm: its last fire has landed, so nothing
+    /// in flight reads the slice and no wait is owed.
+    pub fn stage(&self, image: &super::block::Image) -> Result<()> {
+        match self.block.arm() {
+            Some(arm) => {
+                let wrote = arm.stage(image)?;
+                // The block holds the image already where the slice did:
+                // the next replay runs no head.
+                self.copy.store(wrote, Ordering::Release);
+                Ok(())
+            }
+            None => Err(Fault::Unbound {
+                what: "an arm's fire block for a kept frame walked without one".to_string(),
+            }),
+        }
+    }
+
     /// The segments before the last ([`Frame::cuts`] at `into_kept`).
     #[must_use]
     pub fn cuts(&self) -> usize {
@@ -2571,12 +3663,13 @@ impl Kept {
             .map_err(|e| core.fault("vkResetFences", e))?;
         self.inner.submitted.store(false, Ordering::Release);
         {
-            let bufs = [cmd];
+            let head = self.head.filter(|_| at == 0);
+            let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
-            // SAFETY: `cmd` is executable (ended when the next segment
-            // began) and not pending; the fence is unsignaled; the queue is
-            // held under its lock.
+            // SAFETY: `cmd` (and the head) are executable (ended when the
+            // next segment began) and not pending; the fence is unsignaled;
+            // the queue is held under its lock.
             unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
                 .map_err(|e| core.fault("vkQueueSubmit", e))?;
             self.inner.submitted_now();
@@ -2605,40 +3698,51 @@ impl Kept {
         // In `replay`, the kept `cmd` is executable, ended by `into_kept`; its
         // one caller keeps only frames opened by `frame_kept`, so it was
         // recorded without `ONE_TIME_SUBMIT` (`into_kept` does not check
-        // this). It also relies on one replay at a
-        // time per `Kept`: `Kept` is `Sync` and nothing here stops two threads
-        // from submitting the same buffer and fence at once; the serve loop
-        // replays from one thread only.
-        if self.inner.submitted.load(Ordering::Acquire) {
-            // SAFETY: the fence is this kept frame's own.
-            unsafe { d.wait_for_fences(&[self.inner.fence], true, FENCE_TIMEOUT_NS) }
-                .map_err(|e| core.fault("vkWaitForFences", e))?;
-            self.inner.landed_now();
-        }
-        // SAFETY: any previous submission has signaled (waited above), so no
-        // pending submission names the fence.
-        unsafe { d.reset_fences(&[self.inner.fence]) }
-            .map_err(|e| core.fault("vkResetFences", e))?;
+        // this). Each replay takes a fence of its own, so it waits on no
+        // earlier one: the queue orders it behind its arm's last fire, which
+        // had landed before the arm was taken again.
+        let fence = core.lend_fence()?;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         {
-            let bufs = [self.inner.cmd()];
+            let head = self.head.filter(|_| self.copy.swap(true, Ordering::AcqRel));
+            let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([self.inner.cmd()]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             let queue = core.queue.lock().expect("queue lock poisoned");
-            // SAFETY: `cmd` is executable and no longer pending, the fence is
-            // unsignaled, and the queue is held under its lock.
-            unsafe { d.queue_submit(*queue, &submits, self.inner.fence) }
-                .map_err(|e| core.fault("vkQueueSubmit", e))?;
-            self.inner.submitted_now();
+            // SAFETY: the head and `cmd` are executable and recorded without
+            // `ONE_TIME_SUBMIT`, so they may be pending again; `fence` was
+            // just lent unsignaled; the queue is held under its lock.
+            if let Err(e) = unsafe { d.queue_submit(*queue, &submits, fence) } {
+                drop(queue);
+                core.return_fence(fence);
+                if let Some(arm) = self.block.arm() {
+                    arm.forget_staged();
+                }
+                return Err(core.fault("vkQueueSubmit", e));
+            }
         }
-        self.inner.submitted.store(true, Ordering::Release);
         if let Some(at) = at {
             crate::encode::credit_submit(at.elapsed().as_nanos() as u64);
         }
+        let submission = Arc::new(Submission {
+            inner: Arc::clone(&self.inner),
+            fence,
+            lent: true,
+            landed: std::sync::atomic::AtomicBool::new(false),
+        });
+        *core.last.lock().expect("last lock poisoned") = Last::Replay(Arc::downgrade(&submission));
         Ok(Pending::watched(
-            &self.inner,
+            submission,
             on_done.map(|f| -> engine_gpu::backend::OnDone { Box::new(move |refused| f(refused)) }),
         ))
     }
+}
+
+/// The submission that went to the queue last ([`Context::idle`]): a
+/// frame's, on its own fence, or a replay's, on a lent one.
+enum Last {
+    None,
+    Frame(std::sync::Weak<Inner>),
+    Replay(std::sync::Weak<Submission>),
 }
 
 /// What a frame's one fence waiter tells every other: the fence's wait
@@ -2669,12 +3773,75 @@ impl Landing {
     }
 }
 
+/// A submission's fence and the frame it ran: a replay's fence is lent from
+/// the device's spares and handed back once the submission landed.
+struct Submission {
+    inner: Arc<Inner>,
+    fence: vk::Fence,
+    lent: bool,
+    landed: std::sync::atomic::AtomicBool,
+}
+
+impl Submission {
+    /// Notes the wait on the fence returned: a lent fence goes back unwaited,
+    /// and a frame's own one is not waited on again when the frame drops.
+    fn landed(&self, ok: bool) {
+        self.landed.store(ok, Ordering::Release);
+        if ok && !self.lent {
+            // Its segments landed before its last (which began with a
+            // barrier on every command ahead of it).
+            self.inner.submitted.store(false, Ordering::Release);
+            self.inner.segmented.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for Submission {
+    fn drop(&mut self) {
+        if !self.lent {
+            return;
+        }
+        // A lent fence goes back once nothing waits on it: its wait has
+        // returned (the watcher's, or the caller's), else it is waited on
+        // here (a submission dropped unwaited, as on a refused step).
+        if !self.landed.load(Ordering::Acquire) {
+            let _ = self.inner.block_on_fence(self.fence);
+        }
+        self.inner.core.return_fence(self.fence);
+    }
+}
+
+/// A watched submission: the watcher waits on its fence, runs `on_done`,
+/// then releases every [`Pending::wait`] through `landing`.
+struct Watch {
+    submission: Arc<Submission>,
+    on_done: engine_gpu::backend::OnDone,
+    landing: Arc<Landing>,
+}
+
+impl Watch {
+    fn run(self) {
+        let submission = self.submission;
+        let result = submission.inner.block_on_fence(submission.fence);
+        submission.landed(result.is_ok());
+        if result.is_ok() {
+            submission.inner.landed_pools();
+        }
+        (self.on_done)(
+            result
+                .err()
+                .map(|e| submission.inner.core.fault("vkWaitForFences", e).to_string()),
+        );
+        self.landing.land(result);
+    }
+}
+
 /// A clone is the same submission: each of the sessions whose passes one
 /// frame carries keeps one, and the frame's last drop waits on its fence.
 #[derive(Clone)]
 pub struct Pending {
-    inner: Arc<Inner>,
-    /// Set where a watcher thread is the fence's one waiter.
+    submission: Arc<Submission>,
+    /// Set where the watcher is the fence's one waiter.
     landing: Option<Arc<Landing>>,
 }
 
@@ -2685,56 +3852,81 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
-    #[must_use]
-    pub fn landed(&self) -> bool {
-        // SAFETY: the fence lives as long as `inner`, which `self` holds;
-        // querying a fence needs no external sync.
-        unsafe { self.inner.core.device.get_fence_status(self.inner.fence) }.unwrap_or(true)
+    /// A frame's one submission, on its own fence.
+    fn of_frame(inner: &Arc<Inner>) -> Arc<Submission> {
+        Arc::new(Submission {
+            inner: Arc::clone(inner),
+            fence: inner.fence,
+            lent: false,
+            landed: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
-    /// A pending submission; where `on_done` is given, a watcher thread
-    /// blocks on the fence, runs it, then releases every [`Pending::wait`],
-    /// so the fence has the one waiter.
-    fn watched(inner: &Arc<Inner>, on_done: Option<engine_gpu::backend::OnDone>) -> Pending {
+    #[must_use]
+    pub fn landed(&self) -> bool {
+        // SAFETY: the fence lives as long as the submission, which `self`
+        // holds; querying a fence needs no external sync.
+        unsafe {
+            self.submission
+                .inner
+                .core
+                .device
+                .get_fence_status(self.submission.fence)
+        }
+        .unwrap_or(true)
+    }
+
+    /// A pending submission; where `on_done` is given, the device's watcher
+    /// thread blocks on the fence, runs it, then releases every
+    /// [`Pending::wait`], so the fence has the one waiter.
+    fn watched(submission: Arc<Submission>, on_done: Option<engine_gpu::backend::OnDone>) -> Pending {
         let Some(on_done) = on_done else {
             return Pending {
-                inner: Arc::clone(inner),
+                submission,
                 landing: None,
             };
         };
         let landing = Arc::new(Landing::default());
-        let (watched, told) = (Arc::clone(inner), Arc::clone(&landing));
-        std::thread::spawn(move || {
-            let result = watched.block_on_fence();
-            if result.is_ok() {
-                watched.landed_pools();
-            }
-            on_done(
-                result
-                    .err()
-                    .map(|e| watched.core.fault("vkWaitForFences", e).to_string()),
-            );
-            told.land(result);
-        });
+        let watch = Watch {
+            submission: Arc::clone(&submission),
+            on_done,
+            landing: Arc::clone(&landing),
+        };
+        let core = &submission.inner.core;
+        let sent = core
+            .watcher
+            .lock()
+            .expect("watcher lock poisoned")
+            .as_ref()
+            .map(|watcher| watcher.send(watch));
+        if let Some(Err(std::sync::mpsc::SendError(watch))) = sent {
+            // The watcher is gone only with the device: wait here instead.
+            watch.run();
+        }
         Pending {
-            inner: Arc::clone(inner),
+            submission,
             landing: Some(landing),
         }
     }
 
     pub fn wait(&self) -> Result<()> {
-        let core = &self.inner.core;
+        let inner = &self.submission.inner;
+        let core = &inner.core;
         let at = crate::encode::profiling().then(std::time::Instant::now);
         match &self.landing {
             Some(landing) => landing.wait(),
-            None => self.inner.block_on_fence(),
+            None => {
+                let result = inner.block_on_fence(self.submission.fence);
+                self.submission.landed(result.is_ok());
+                result
+            }
         }
         .map_err(|e| core.fault("vkWaitForFences", e))?;
         if let Some(at) = at {
             crate::encode::credit_fence(at.elapsed().as_nanos() as u64);
         }
-        self.inner.landed_pools();
-        self.inner.harvest_timing();
+        inner.landed_pools();
+        inner.harvest_timing();
         Ok(())
     }
 
@@ -2742,7 +3934,7 @@ impl Pending {
     /// once it landed (its fence waited: the read waits on nothing more);
     /// `None` for a frame that writes none.
     pub fn span_ns(&self) -> Result<Option<u64>> {
-        self.inner.span_ns()
+        self.submission.inner.span_ns()
     }
 }
 
@@ -2765,9 +3957,10 @@ impl Inner {
         self.core.give_pools(pools, self.one_time);
     }
 
-    /// Blocks on this frame's fence. Only a frame's one waiter calls this:
-    /// a watcher thread where the frame has one, else [`Pending::wait`].
-    fn block_on_fence(&self) -> std::result::Result<(), vk::Result> {
+    /// Blocks on `fence`, one of this frame's submissions'. Only its one
+    /// waiter calls this: the watcher where it has one, else
+    /// [`Pending::wait`].
+    fn block_on_fence(&self, fence: vk::Fence) -> std::result::Result<(), vk::Result> {
         let waiting = self.waiters.fetch_add(1, Ordering::AcqRel) + 1;
         self.most_waiters.fetch_max(waiting, Ordering::AcqRel);
         // SAFETY: the fence lives as long as `self`; waiting needs no
@@ -2775,7 +3968,7 @@ impl Inner {
         let result = unsafe {
             self.core
                 .device
-                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+                .wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)
         };
         self.waiters.fetch_sub(1, Ordering::AcqRel);
         if result.is_ok() {
@@ -2788,7 +3981,7 @@ impl Inner {
     /// last ([`Context::idle`]).
     fn submitted_now(self: &Arc<Self>) {
         self.seq.fetch_add(1, Ordering::AcqRel);
-        *self.core.last.lock().expect("last lock poisoned") = Arc::downgrade(self);
+        *self.core.last.lock().expect("last lock poisoned") = Last::Frame(Arc::downgrade(self));
     }
 
     /// This frame's fence was seen signaled: every submission of it so far
@@ -3046,3 +4239,4 @@ mod tests {
         eprintln!("caller woke {median:?} (median), {worst:?} (worst) after the watcher's landing");
     }
 }
+

@@ -8,10 +8,18 @@ use engine_gpu::serve::{Landed, Launch, Plan, Prepared, ReadSpan, Serve, Shell, 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
 
+/// The tables of runs (a recurrent copy's scalars, [`kernels_slang::gather::rows::copy_runs`])
+/// an arm's fire block holds room for in one fire: a recurrent layer's
+/// extends and lands.
+const RUN_TABLES: u64 = 512;
+
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
 pub struct Shelf {
     recorder: crate::record::Recorder,
+
+    /// Each arm's fire block, laid at load for the load's widest fire.
+    arms: Vec<std::sync::Arc<crate::device::ArmBlock>>,
 
     landed_seats: BTreeMap<u64, LandedSeat>,
 
@@ -213,6 +221,19 @@ impl Serve for Api {
         boot.chunk_bytes
     }
 
+    /// Beside the pipeline cache, in the engine's cache.
+    fn records_dir(boot: &crate::api::DeviceBoot) -> Option<std::path::PathBuf> {
+        crate::armed::dir(boot)
+    }
+
+    fn armed_build(pipelines: &Pipelines) -> u64 {
+        crate::armed::build(pipelines)
+    }
+
+    fn committed_armed() -> &'static [(&'static str, &'static str)] {
+        crate::armed::COMMITTED
+    }
+
     fn committed_covers() -> &'static [&'static str] {
         crate::chip::COVERS
     }
@@ -345,11 +366,40 @@ impl Serve for Api {
 
     fn shelf(
         device: &Context,
-        _pipelines: &Pipelines,
-        _readout: &[Buffer],
+        pipelines: &Pipelines,
+        readout: &[Buffer],
         weights_stream: bool,
+        fires: engine_gpu::serve::FireBound,
         guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
+        // An arm's fire block holds what its widest fire lays: each dispatch's
+        // group counts and its scalars at the uniform alignment, each with
+        // its alignment's slack, and the readout copier's region tables.
+        let (uniform, storage) = device.fire_alignments();
+        // A dispatch's scalars at the uniform alignment; the few kernels whose
+        // scalars are a table of runs (a recurrent copy's, read from the block
+        // alone) at their own size, a run of them each fire's recurrent layers
+        // take.
+        let most = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
+        let scalars = most.min(512);
+        let tables = if most > scalars {
+            RUN_TABLES * most.next_multiple_of(uniform)
+        } else {
+            0
+        };
+        let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
+        // A recording moves every readout copy with the copier (its table,
+        // count and group counts laid in the block, each at its alignment):
+        // one copier's slack beside each plane's rows.
+        let copier = 16 + uniform + storage + 64;
+        // Twice the naming walk's widest fire: a fire that buffers its rows
+        // copies them a lane at a time, past what the naming walk counted.
+        let bytes = 2 * u64::from(fires.dispatches.max(1)) * (per_dispatch + copier)
+            + fires.readout_rows * 16
+            + tables;
+        let arms = (0..readout.len())
+            .map(|_| crate::device::ArmBlock::new(device, bytes))
+            .collect::<Result<Vec<_>>>()?;
         // A guest bind writes its tables through the device's staging slab,
         // laid here where the load has not yet written through it.
         device.lay_staging()?;
@@ -375,6 +425,7 @@ impl Serve for Api {
             } else {
                 crate::record::Recorder::new()
             },
+            arms,
             landed_seats: BTreeMap::new(),
             generation: 0,
             guest,
@@ -405,49 +456,88 @@ impl Serve for Api {
     }
 
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
-        // The custom-mask buffer grows: a recording would keep the one it outgrew.
-        // A fire landing snapshots binds a table of its own: not recorded.
+        // The kinds no recording holds, which the load states eager
+        // (by name, `engine_gpu::api`): the custom-mask buffer grows (a recording
+        // would keep the one it outgrew); a fire landing snapshots binds a
+        // table of its own; a token table streamed with no ring lays its
+        // misses in a stage of its own; a split step submits a layer at a
+        // time (a recording replays as one submit: a step past the
+        // platform's bound on one submission walks a layer at a time by the
+        // shell's own admission, `engine_gpu::submit`; whole, a 512x512 VAE
+        // decode outlasts one Adreno submission and loses the device).
+        let split = prepared.bindings.voxels.is_some();
         let key = (shell.shelf.recorder.records()
             && prepared.bindings.group_masks.is_empty()
             && prepared.bindings.rs_snaps.is_none()
-            && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole()))
+            && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole())
+            && !split)
         .then(|| record_key(shell, prepared));
 
-        let replayable = key
-            .and_then(|key| shell.shelf.recorder.get(key))
-            .map(|replay| (replay.layout.clone(), replay.launches));
+
+        let mut varying = None;
+        let replayable = match key.map(|key| shell.shelf.recorder.next(key)) {
+            Some(crate::record::Next::Replay(fill, _)) => {
+                Some((fill.layout.clone(), fill.launches))
+            }
+            Some(crate::record::Next::Walk(known)) => {
+                varying = known;
+                None
+            }
+            None => None,
+        };
         if let Some((rows, launches)) = replayable {
-            let key = key.expect("a recording was found under a key");
+            let key = key.expect("a fill was found under a key");
             let pixels = shell.pixel_spans(prepared)?;
             shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
             let seq = shell.airborne.enter();
             let counts = shell.airborne.clone();
             let done = prepared.done.take();
             let fed = prepared.fed_check.clone();
-            let recording = shell
-                .shelf
-                .recorder
-                .get(key)
-                .expect("the recording was there a line ago");
+            let crate::record::Next::Replay(fill, recording) = shell.shelf.recorder.next(key)
+            else {
+                unreachable!("the fill replayed a line ago");
+            };
+            // The fire's score room, where its recording's descriptors bind
+            // another: the arm is held, its last fire landed.
+            let room = prepared
+                .score_room
+                .as_ref()
+                .map(|(buffer, at)| (buffer, *at));
+            let roomed = recording.kept.bind_room(room, &fill.room_pasts).and_then(|replays| {
+                if replays {
+                    Ok(())
+                } else {
+                    Err(Fault::Unbound {
+                        what: "a recording that copies its score room's rows, replayed at \
+                               another room"
+                            .to_string(),
+                    })
+                }
+            });
+            // The fire's own scalars and group counts, where the recording's
+            // commands read them.
+            let filled = roomed.and_then(|()| recording.kept.stage(&fill.image));
             // The segments an expert stage cut, each landed before its stage.
-            let staged = if recording.cuts.is_empty() {
-                Ok(())
-            } else {
-                match shell.weights.host() {
-                    None => Err(Fault::Unbound {
-                        what: "the host copy of the weight cache's banks".to_string(),
-                    }),
-                    Some(host) => {
-                        let planes = shell.weights.cached_planes(|at| {
-                            shell.row_caches.streams(at) || shell.expert_caches.streams(at)
-                        });
-                        recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
-                            recording.kept.replay_cut(at)?;
-                            shell.expert_caches.stage_cut(host, &planes, cut)
-                        })
+            let staged = filled.and_then(|()| {
+                if recording.cuts.is_empty() {
+                    Ok(())
+                } else {
+                    match shell.weights.host() {
+                        None => Err(Fault::Unbound {
+                            what: "the host copy of the weight cache's banks".to_string(),
+                        }),
+                        Some(host) => {
+                            let planes = shell.weights.cached_planes(|at| {
+                                shell.row_caches.streams(at) || shell.expert_caches.streams(at)
+                            });
+                            recording.cuts.iter().enumerate().try_for_each(|(at, cut)| {
+                                recording.kept.replay_cut(at)?;
+                                shell.expert_caches.stage_cut(host, &planes, cut)
+                            })
+                        }
                     }
                 }
-            };
+            });
             let pending = staged.and_then(|()| {
                 recording
                     .kept
@@ -482,20 +572,170 @@ impl Serve for Api {
             });
         }
 
-        // A split step is not recorded: a recording replays as one submit.
-        // A step past the platform's bound on one submission walks a layer
-        // at a time by the shell's own admission (`engine_gpu::submit`);
-        // whole, a 512x512 VAE decode outlasts one Adreno submission and
-        // loses the device, and nothing estimates it.
-        let split = prepared.bindings.voxels.is_some();
-        let keep = key.filter(|_| !split && shell.shelf.recorder.has_room());
-        Ok(Plan::Walk { keep, split })
+        // Only the load's arming walk records: a fire of a kind its bodies
+        // cover fills one from a walk that records nothing, and every other
+        // walks eagerly, as the load stated.
+        let rows: u32 = prepared.seats.iter().map(|seat| seat.rows).sum();
+        let plan = match key {
+            None => {
+                shell.eager_next = true;
+                Plan::Walk { keep: None, split }
+            }
+            Some(shape) if shell.arming => {
+                // A shape whose family varies where its recording does not
+                // walks with those dispatches indirect, to record its family
+                // again.
+                shell.device.indirect_next(varying);
+                Plan::Walk {
+                    keep: Some(shape).filter(|_| shell.shelf.recorder.has_room()),
+                    split: false,
+                }
+            }
+            Some(_) if shell.eager_by_rows(rows) => {
+                shell.eager_next = true;
+                Plan::Walk { keep: None, split }
+            }
+            // Before the load armed its bodies (its settle, its probes) a
+            // fire walks as it is, the load's own.
+            Some(_) if !shell.armed => Plan::Walk { keep: None, split },
+            Some(_) => {
+                shell.device.indirect_next(None);
+                Plan::Fill
+            }
+        };
+        // The walk lays in its arm's fire block, and its capturing lanes'
+        // rows in the fire's score room, which a recording binds by place.
+        shell
+            .device
+            .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
+        shell.device.room_next(
+            prepared
+                .score_room
+                .as_ref()
+                .map(|(buffer, at)| (buffer, *at)),
+        );
+        // A decode (padded to its bucket) or a fire no wider than the vector
+        // GEMM's widest row tile carries its rows in its commands; a wider
+        // one reads them from the fire block, one body for every row count
+        // of its rung.
+        let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
+            .last()
+            .expect("the vector GEMM states its row tiles");
+        let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
+        shell.device.fixed_next(decode || rows <= tile);
+        Ok(plan)
+    }
+
+    fn fill_frame(device: &Context, _arm: usize) -> Result<Frame> {
+        device.frame_dry()
+    }
+
+    /// The fill walk's commands, hashed, name the family the load armed for
+    /// the fire's kind; its block image, group counts and readout copies
+    /// are the fire's fill, kept under its shape for its replays. A walk
+    /// whose commands match no armed family, or whose counts its family's
+    /// recording carries differently, fills none.
+    fn fill(
+        shell: &mut Shell<Api>,
+        frame: Frame,
+        prepared: &mut Prepared<'_, Api>,
+        layout: &[ReadSpan],
+        launches: u32,
+    ) -> Result<bool> {
+        let fill = frame.into_fill();
+        let shape = record_key(shell, prepared);
+        let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
+        if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
+            nearest(shell, &fill.trail, prepared);
+        }
+        let Some(held) = shell.shelf.recorder.family(family) else {
+            tracing::debug!(
+                arm = prepared.arm,
+                rung = prepared.rung,
+                classes = ?prepared.descriptor.classes,
+                baked = fill.baked,
+                "a fill walk's commands are no armed family's"
+            );
+            return Ok(false);
+        };
+        if held.recording.cuts.len() != fill.cuts || !held.recording.serves(&fill.groups) {
+            if crate::device::ctx::trailing() {
+                let recorded = held.recording.kept.groups();
+                let parts: Vec<String> = (recorded.iter().zip(&fill.groups).enumerate())
+                    .filter(|&(at, (held, wanted))| {
+                        held != wanted && !held_indirect(&held_family_kept(shell, family), at)
+                    })
+                    .take(8)
+                    .map(|(at, (held, wanted))| {
+                        format!(
+                            "dispatch {at} ({}): held {held:?}, the fire's {wanted:?}",
+                            fill.trail
+                                .iter()
+                                .filter(|entry| !entry.starts_with('"'))
+                                .nth(at)
+                                .map_or("?", String::as_str)
+                                .chars()
+                                .take(160)
+                                .collect::<String>()
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "[vk-bake] arm {} rung {} rows {:?}: the armed family's commands are the fill \
+                     walk's, and its recording carries group counts the fire's differ from \
+                     ({} dispatches held, {} walked; cuts {} / {}):\n  {}",
+                    prepared.arm,
+                    prepared.rung,
+                    prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
+                    recorded.len(),
+                    fill.groups.len(),
+                    held.recording.cuts.len(),
+                    fill.cuts,
+                    parts.join("\n  ")
+                );
+            }
+            return Ok(false);
+        }
+        shell.shelf.recorder.insert_fill(
+            shape,
+            crate::record::Fill::new(
+                family,
+                std::sync::Arc::new(fill.groups),
+                std::sync::Arc::new(fill.image),
+                layout.to_vec(),
+                launches,
+                std::sync::Arc::new(fill.room_pasts),
+            ),
+        );
+        Ok(true)
+    }
+
+    /// A recording binds the pool's segments by place: each is rebound to
+    /// what stands there now. A recording that binds a segment where no
+    /// rebind writes it stands no longer, and is named. A device that cannot
+    /// rebind lays its pool whole, so no segment changes under one.
+    fn rebind(shell: &mut Shell<Api>) -> Result<()> {
+        if !shell.device().rebinds_segments() {
+            shell.shelf.recorder.forget();
+            return Ok(());
+        }
+        let placed = shell.placed_segments();
+        let written = shell.device().rebind_segments(&placed)?;
+        let dropped = shell.shelf.recorder.forget_pinned();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                written,
+                dropped = ?dropped,
+                "recordings that bind a pool segment where no rebind writes it stand no longer"
+            );
+        }
+        Ok(())
     }
 
     fn submit(
         shell: &mut Shell<Api>,
         frame: Frame,
-        _prepared: &mut Prepared<'_, Api>,
+        prepared: &mut Prepared<'_, Api>,
         launch: Launch<'_, Api>,
     ) -> Result<Pending> {
         let Launch {
@@ -522,19 +762,128 @@ impl Serve for Api {
                 counts.leave();
             });
         match keep {
-            Some(key) => frame.into_kept().and_then(|kept| {
-                let pending = kept.replay(Some(on_done))?;
+            Some(shape) => {
+                let room_pasts = frame.room_pasts();
+                let kept = frame.into_kept()?;
                 // Each segment a flush cut must have an expert stage's host
                 // step to replay after it; a flush of anything else would
                 // not repeat, so such a fire is not kept.
-                if kept.cuts() == cuts.len() {
-                    shell.shelf.recorder.insert(
-                        key,
-                        crate::record::Recording::new(kept, layout.to_vec(), launches, cuts),
-                    );
+                let image = std::sync::Arc::new(kept.image().sealed());
+                if kept.cuts() != cuts.len() {
+                    kept.stage(&image)?;
+                    return kept.replay(Some(on_done));
                 }
+                // A walk whose commands are a held family's but for the fire
+                // block and the group counts its recording reads from there
+                // fills that recording; its own frame goes unsubmitted. A walk
+                // whose segments ran with it replays its own last segment.
+                let family = family_key(
+                    kept.baked(),
+                    prepared.arm,
+                    (!cuts.is_empty()).then_some(shape),
+                );
+                let groups = std::sync::Arc::new(kept.groups().to_vec());
+                enum Act {
+                    Fill,
+                    Record(std::sync::Arc<Vec<bool>>),
+                    Alone,
+                }
+                let act = match shell.shelf.recorder.family_mut(family) {
+                    Some(held) if cuts.is_empty() && held.recording.serves(&groups) => Act::Fill,
+                    Some(held) => {
+                        held.varies(&groups);
+                        if !cuts.is_empty() || held.covered_by(&kept) {
+                            Act::Record(std::sync::Arc::clone(&held.varying))
+                        } else {
+                            Act::Alone
+                        }
+                    }
+                    None => Act::Record(std::sync::Arc::new(
+                        (0..groups.len()).map(|at| kept.indirect(at)).collect(),
+                    )),
+                };
+                // A load recording its bodies runs none of them: the fire
+                // lands on an empty submission, and its block is written by
+                // the first serving fire's head.
+                let arming = shell.arming;
+                let pending = match act {
+                    _ if arming => {
+                        if let Act::Record(varying) = act {
+                            tracing::debug!(
+                                arm = prepared.arm,
+                                classes = ?prepared.descriptor.classes,
+                                family = ?family,
+                                indirect = varying.iter().filter(|&&v| v).count(),
+                                "vulkan recorded a body at load"
+                            );
+                            shell.shelf.recorder.insert(
+                                family,
+                                crate::record::Recording::new(kept, cuts),
+                                varying,
+                            );
+                        } else {
+                            shell.kept_none();
+                        }
+                        shell.device.frame()?.commit_async(Some(on_done))?
+                    }
+                    Act::Fill => {
+                        shell.kept_none();
+                        let held = shell
+                            .shelf
+                            .recorder
+                            .family(family)
+                            .expect("the family was held a line ago");
+                        held.recording.kept.stage(&image)?;
+                        held.recording.kept.replay(Some(on_done))?
+                    }
+                    Act::Record(varying) => {
+                        kept.stage(&image)?;
+                        let pending = kept.replay(Some(on_done))?;
+                        tracing::debug!(
+                            arm = prepared.arm,
+                            rung = ?prepared.rung,
+                            classes = ?prepared.descriptor.classes,
+                            indirect = varying.iter().filter(|&&v| v).count(),
+                            "vulkan recorded a fire's commands"
+                        );
+                        shell.shelf.recorder.insert(
+                            family,
+                            crate::record::Recording::new(kept, cuts),
+                            varying,
+                        );
+                        pending
+                    }
+                    // Its family varies where neither its recording nor this
+                    // walk reads the counts from the block: this fire replays
+                    // its own walk, and the shape's next fire records the
+                    // family with them indirect.
+                    Act::Alone => {
+                        tracing::debug!(
+                            arm = prepared.arm,
+                            rung = ?prepared.rung,
+                            classes = ?prepared.descriptor.classes,
+                            "vulkan walked a fire its family's recording does not serve"
+                        );
+                        kept.stage(&image)?;
+                        kept.replay(Some(on_done))?
+                    }
+                };
+                let recorder = &mut shell.shelf.recorder;
+                recorder.insert_fill(
+                    shape,
+                    crate::record::Fill::new(
+                        family,
+                        groups,
+                        image,
+                        layout.to_vec(),
+                        launches,
+                        std::sync::Arc::new(room_pasts),
+                    ),
+                );
+                let (recorded, filled) = recorder.counts();
+                tracing::debug!(recorded, filled, "vulkan filled a fire shape");
                 Ok(pending)
-            }),
+            }
             None => frame.commit_async(Some(on_done as engine_gpu::backend::OnDone)),
         }
     }
@@ -608,8 +957,77 @@ impl Serve for Api {
     }
 }
 
-fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
+/// The kept frame of `family`, for a diagnostic.
+fn held_family_kept(shell: &Shell<Api>, family: crate::record::Key) -> Option<&crate::device::Kept> {
+    shell
+        .shelf
+        .recorder
+        .family(family)
+        .map(|held| &held.recording.kept)
+}
+
+/// Whether dispatch `at` of `kept` reads its group counts from the block.
+fn held_indirect(kept: &Option<&crate::device::Kept>, at: usize) -> bool {
+    kept.is_some_and(|kept| kept.indirect(at))
+}
+
+/// Says where a fill walk whose commands match no armed family parts from
+/// the nearest one (the most commands alike from the first): the command of
+/// each there, rendered (`PIE_VK_BAKE_TRAIL`).
+fn nearest(shell: &Shell<Api>, trail: &[String], prepared: &Prepared<'_, Api>) {
+    let best = shell
+        .shelf
+        .recorder
+        .families()
+        .map(|(_, recording)| {
+            let held = recording.kept.trail();
+            let alike = held.iter().zip(trail).take_while(|(a, b)| a == b).count();
+            (alike, held)
+        })
+        .max_by_key(|(alike, _)| *alike);
+    let at = |list: &[String], i: usize| list.get(i).cloned().unwrap_or_else(|| "<end>".into());
+    match best {
+        Some((alike, held)) => eprintln!(
+            "[vk-bake] arm {} rung {} rows {:?}: the fill walk parts from the nearest armed family \
+             after {alike} of {} commands ({} held)\n  walk: {}\n  held: {}",
+            prepared.arm,
+            prepared.rung,
+            prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
+            trail.len(),
+            held.len(),
+            at(trail, alike),
+            at(held, alike),
+        ),
+        None => eprintln!("[vk-bake] no family is armed"),
+    }
+}
+
+/// A family's key: what its walk's commands carry, hashed
+/// ([`crate::device::Frame::bake`]), on its arm; where an expert stage cut
+/// it, its shape too (the host steps between its segments are the shape's).
+fn family_key(
+    baked: u64,
+    arm: usize,
+    cut_shape: Option<crate::record::Key>,
+) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
+    key.hashed(&baked);
+    key.shown(&arm);
+    if let Some(shape) = cut_shape {
+        key.hashed(&shape);
+    }
+    key.finish()
+}
+
+/// A fire's shape: what its fill (the block image, the group counts, the
+/// readout layout) is kept under.
+fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
+    keyed(shell, p, true)
+}
+
+fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
+    let mut key = crate::record::KeyBuilder::new();
+    key.hashed(&reads);
     key.bytes(&p.descriptor.pack());
     key.shown(&p.arm);
     key.shown(&shell.readout[p.arm].bytes());
@@ -645,9 +1063,11 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     // it nowhere, and the kv refs it counts climb as lanes grow.
 
     for lane in p.lanes {
-        key.shown(&lane.readout);
-        key.shown(&lane.hosts);
-        key.shown(&lane.reads);
+        if reads {
+            key.shown(&lane.readout);
+            key.shown(&lane.hosts);
+            key.shown(&lane.reads);
+        }
         // A score room is its pair's place in the pool, which an unpark
         // or an evacuation moves: a recording binds the one it was taken at.
         key.hashed(

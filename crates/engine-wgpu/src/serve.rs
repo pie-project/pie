@@ -348,6 +348,7 @@ impl Serve for Api {
         pipelines: &Pipelines,
         readout: &[Buffer],
         _weights_stream: bool,
+        _fires: engine_gpu::serve::FireBound,
         guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
         // A frame takes a scratch chunk from the ring: stocked for each frame

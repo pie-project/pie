@@ -618,6 +618,10 @@ impl<B: Host> Gpu<B> {
             self.live.tally(engine::live::Tally::BuiltInFire, guest);
             self.warn_in_fire("a guest step's pipeline");
         }
+        let eager = self.shell.as_mut().map_or(0, Shell::eager_serving);
+        if eager > 0 {
+            self.live.tally(engine::live::Tally::Eager, eager);
+        }
         // The submit-bound probes, apart from the model's fires: recorded at
         // load where the backend keeps recordings.
         let probed = self.shell.as_mut().map_or(0, Shell::probed_serving);
@@ -1182,10 +1186,6 @@ where
                 "every fire shape the load serves walked bind-only: what a dispatch binds is built"
             );
         }
-        // What the load itself walked is the load's: serving counts from here.
-        shell.unkept_serving();
-        shell.bound_serving();
-        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
         // The fire the shell took, which a binding may have bounded below
         // the one asked.
         let (max_lanes, max_tokens) = (shell.budget().max_lanes, shell.budget().max_tokens);
@@ -1212,9 +1212,6 @@ where
             "load phases: the dense settle's picks (nothing fires before ready)"
         );
         shell.walk_binds().map_err(fault)?;
-        shell.unkept_serving();
-        shell.bound_serving();
-
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let weights_resident = !shell.weights_stream();
@@ -1342,11 +1339,61 @@ where
             &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
         );
         tracing::info!(
-            "engine-gpu: step set: {}; its arm walk does not key on the set yet, so none \
-             of the {} is checked against what it records",
+            "engine-gpu: step set: {}; the arm walk keys on it",
             caps.steps.shapes.census(),
-            caps.steps.shapes.len(),
         );
+        shell.steps = Some(caps.steps.shapes.clone());
+        // The bodies are armed last, once every kernel a fire takes is
+        // settled: a body records the kernels its fires walk.
+        let started = std::time::Instant::now();
+        let records = <B as crate::serve::Serve>::records_dir(&self.boot);
+        let bodies = shell
+            .record_bodies(records.as_deref(), Some(&caps.steps.shapes))
+            .map_err(fault)?;
+        if bodies > 0 {
+            tracing::info!(
+                engine = B::KIND,
+                bodies,
+                recorded = shell.recorded_serving(),
+                ms = started.elapsed().as_millis() as u64,
+                "the load's bodies armed before ready, on every arm, smallest first"
+            );
+        }
+        if B::RECORDS {
+            tracing::info!(
+                engine = B::KIND,
+                "stated eager at load, each fire walked and never recorded: a fire past the \
+                 bodies' allowance (named above where one is), one with a group mask, one \
+                 landing a recurrent snapshot, one whose token table streams with no ring, one \
+                 whose lanes capture scores, a split step"
+            );
+        } else {
+            tracing::info!(
+                engine = B::KIND,
+                "this backend keeps no recording: every fire is encoded as it is served, \
+                 stated eager at load, and nothing is recorded or armed while serving"
+            );
+        }
+        // What the load itself walked is the load's: serving counts from here.
+        shell.recorded_serving();
+        shell.eager_serving();
+        shell.unkept_serving();
+        shell.bound_serving();
+        shell.serving = true;
+        <B as crate::serve::Serve>::serving(&mut shell).map_err(fault)?;
+
+        // What the allowance left: the set's tail from a shape on, stated
+        // eager at load by its index.
+        caps.steps.eager = shell.eager_shapes_from();
+        if !caps.steps.eager.is_empty() {
+            tracing::info!(
+                engine = B::KIND,
+                eager = caps.steps.eager.len(),
+                of = caps.steps.shapes.len(),
+                first = %caps.steps.shapes.shapes[caps.steps.eager[0] as usize],
+                "the step shapes past the bodies' allowance run eager, as stated"
+            );
+        }
 
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
@@ -2467,6 +2514,8 @@ impl<B: Host> Gpu<B> {
                 }
             }
         }
+        // The step's composition, which a stated eager shape is told by.
+        shell.step = Some(engine::StepComposition::of(&submission.lanes));
         // A refused lane still fires (token 0) to keep the composition; one
         // whose program places its rows has no run of its own the host may
         // append to, so its rows land in the null chunk, never its table.
@@ -2535,8 +2584,43 @@ impl<B: Host> Gpu<B> {
                 feed: feeds[at].as_ref(),
                 group: lane.group,
                 inputs: &input_cells[at],
+                pad: false,
             })
             .collect();
+        // A decode of one-row lanes of one class pads to its bucket with
+        // lanes that read as its first and write nothing: every decode of a
+        // bucket is then one body, recorded at load.
+        let mut seated = seated;
+        if submission.media.is_empty()
+            && submission.voxels.is_empty()
+            && let Some(first) = seated.first().copied()
+            && seated.iter().all(|lane| {
+                lane.lane.tokens.len() == 1
+                    && lane.lane.word == first.lane.word
+                    && lane.group.is_none()
+                    && lane.rs_snapshots.is_empty()
+                    && matches!(lane.rs, engine::fire::RsVerb::Fold)
+            })
+            && let Some(bucket) = shell.pad_bucket(seated.len())
+        {
+            const PAD_TOKEN: [u32; 1] = [0];
+            let pad = Seated {
+                lane: Lane {
+                    tokens: &PAD_TOKEN,
+                    ..first.lane
+                },
+                mask: None,
+                readout: None,
+                hosts: false,
+                reads: &[],
+                scores: None,
+                feed: None,
+                inputs: &[],
+                pad: true,
+                ..first
+            };
+            seated.resize(bucket, pad);
+        }
 
         let wrote;
         let mut faulted = faulted.faulted;

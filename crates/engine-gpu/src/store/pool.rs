@@ -29,6 +29,16 @@ use crate::handles::Handles;
 #[derive(Debug)]
 pub struct Pool<B: Backend> {
     segments: Vec<Option<B::Buffer>>,
+    /// A buffer of a few bytes for each segment, bound in its place while
+    /// it is not backed: what a fire binds of the pool is the same places
+    /// whatever is backed, and a backend that keeps recordings rebinds each
+    /// place as its segment comes and goes ([`Pool::placed`]). Laid with the
+    /// load's first commit.
+    stand_ins: Vec<B::Buffer>,
+    /// Whether segments commit and release while serving: the backend's
+    /// statement ([`Backend::RESIZES_POOL`]), unless its device lays the
+    /// pool whole ([`Pool::lay_whole`]).
+    resizes: bool,
     chunk_bytes: u64,
     total_chunks: u32,
     segment_chunks: u32,
@@ -257,6 +267,8 @@ impl<B: Backend> Pool<B> {
         }
         Ok(Pool {
             segments: (0..segments).map(|_| None).collect(),
+            stand_ins: Vec::new(),
+            resizes: B::RESIZES_POOL,
             chunk_bytes,
             total_chunks,
             segment_chunks,
@@ -313,9 +325,21 @@ impl<B: Backend> Pool<B> {
         self.span
     }
 
+    /// The pool is laid whole and stands so: its device cannot rebind what a
+    /// recording binds of it ([`crate::backend::Context::resizes_pool`]).
+    pub fn lay_whole(&mut self) {
+        self.resizes = false;
+    }
+
+    /// Whether segments commit and release while serving.
+    #[must_use]
+    pub fn resizes(&self) -> bool {
+        self.resizes
+    }
+
     #[must_use]
     pub fn growth(&self) -> Growth {
-        if !B::RESIZES_POOL {
+        if !self.resizes {
             Growth::Fixed
         } else if self.span > 0 {
             Growth::TwoEnded
@@ -407,12 +431,26 @@ impl<B: Backend> Pool<B> {
         Ok((buffer, at % span))
     }
 
+    /// Each segment's buffer where it is backed, beside its stand-in
+    /// ([`Pool::bind`]), for the segments below the span's (those commit
+    /// and release; the span's stand for good); empty before the load's
+    /// first commit.
+    #[must_use]
+    pub fn placed(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.segments
+            .iter()
+            .take(self.top as usize)
+            .zip(&self.stand_ins)
+            .map(|(backed, stand_in)| (backed.as_ref(), stand_in))
+            .collect()
+    }
+
     /// The pool as kernels bind it: every committed segment, the rest
-    /// absent.
+    /// their stand-ins (absent before the first commit).
     pub fn bind(&self, handles: &Handles<B>) -> Result<Segments> {
         let mut bufs = [kernels_slang::ABSENT; SEGMENTS];
         for (at, segment) in self.segments.iter().enumerate() {
-            if let Some(buffer) = segment {
+            if let Some(buffer) = segment.as_ref().or(self.stand_ins.get(at)) {
                 bufs[at] = handles.bind(buffer, 0, buffer.bytes())?;
             }
         }
@@ -434,6 +472,11 @@ impl<B: Backend> Pool<B> {
                 need: u64::from(segments),
                 have: u64::from(max),
             });
+        }
+        if self.stand_ins.is_empty() {
+            self.stand_ins = (0..max)
+                .map(|_| B::Buffer::zeroed(device, 16, crate::books::owners::DUMMY))
+                .collect::<Result<Vec<_>>>()?;
         }
         for segment in (0..segments).chain(self.top..max) {
             if self.segments[segment as usize].is_some() {
@@ -459,10 +502,14 @@ impl<B: Backend> Pool<B> {
     /// Gives back every segment at and past `segments` below the span's.
     /// The caller has drained every frame, and the runtime evacuated their
     /// chunks first.
-    pub fn release_segments(&mut self, segments: u32) {
-        for segment in segments..self.top {
-            self.segments[segment as usize] = None;
-        }
+    ///
+    /// The buffers given back are answered, for the caller to drop once
+    /// nothing binds them (a recording is rebound to the stand-ins first).
+    #[must_use = "the buffers given back are dropped once nothing binds them"]
+    pub fn release_segments(&mut self, segments: u32) -> Vec<B::Buffer> {
+        (segments..self.top)
+            .filter_map(|segment| self.segments[segment as usize].take())
+            .collect()
     }
 
     /// Records each moved chunk's copy onto its new physical chunk in

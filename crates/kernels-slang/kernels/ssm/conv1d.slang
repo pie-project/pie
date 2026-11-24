@@ -245,6 +245,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #endif
     walk(column(params.row0 + uint(begin), chans, c), begin, span, span, chans, c, snap);
 #else
+    // A padding row holds no record (its slot -1): it folds nothing.
+    if (pie_state_none(params.row0 + r)) {
+        return;
+    }
     Column slab = column(params.row0 + r, chans, c);
     float2 past[HIST_MAX];
     past_load(slab, hist, past);
