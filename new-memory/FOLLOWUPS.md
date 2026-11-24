@@ -1570,3 +1570,9 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F87. Split the large ETA emitter files
+
+**What.** `crates/eta-compiler/src/codegen/metal/streamed.rs` (2,175 lines; two functions under `allow(clippy::too_many_lines)` at :263 and :1157), `codegen/simt/stream.rs` (1,920) and `codegen/wgsl.rs` (1,641) each hold a whole emitter in one file. Split them along their schedule / step-kind seams, emitting byte-identical source (the `emitter_version` fingerprints pin it).
+
+**Why later.** It moves emitter code shared by every backend, so it needs a booted server on every backend; the cleanup pass changes no emitted code.

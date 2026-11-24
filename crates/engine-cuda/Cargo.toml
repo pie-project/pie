@@ -79,6 +79,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 engine-cuda = { path = ".", features = ["test-pins"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 inferlet = { path = "../inferlet" }
 poem = { package = "pie-poem", path = "../poem" }

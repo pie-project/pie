@@ -59,6 +59,7 @@ wgpu = { version = "30", default-features = false, features = [
 
 [dev-dependencies]
 engine-wgpu = { path = ".", features = ["test-limits"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
 # The CPU oracle the score capture is held against.
 engine-cpu = { path = "../engine-cpu" }
 poem = { package = "pie-poem", path = "../poem" }
