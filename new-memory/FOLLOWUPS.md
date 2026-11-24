@@ -1421,3 +1421,38 @@ weight … so no bandwidth or flops makes another faster"), where the measured r
 Qwen3.5's shapes. Fix shape: a family-level committed entry, with no hard-coded default. The vendor family file
 (`qualcomm.toml`) carries a measured device's crossover as an estimate, keyed so an exact-device entry (the device's
 own committed or stored profile) wins over it.
+
+## F72. ROCm's causal masked prefill: split or merged, chosen per bucket, picks wrong where live rows decide (frozen, ~1%; MI300X, 2026-11-23)
+A causal masked prefill serves its requests that read no bit either split (`paged_prefill_unmasked_of`
+then the skipping `paged_prefill_masked`, landed in 385b52884) or merged (one launch, the plain body
+behind a branch). Split gains Qwen3-30B-A3B about 4.3 ms at pf2048; merged is about 0.75 ms faster
+on Qwen3-8B served (forced, same build and home: split 71.4 / 71.9 ms, merged 70.9 / 70.9).
+- A per-shape choice keyed and timed per body bucket (prototype: `profile::routes`
+  `Kind::PrefillMasked`, the bucket's prefill body timed on lanes stating no mask, local
+  sc/amd-prefill-split-measured, not pushed) picks split for 8B: equal or faster at every bucket
+  from 64 rows (2048: 56.07 vs 56.35 ms; 2234: 58.07 vs 58.11). Its timing lane fills its bucket;
+  a served 2061-row prompt runs in the 2234 bucket with about 8% of its tiles empty (block_valid).
+  The tradeoff turns on how many query tiles fill 304 CUs at one block a CU against two, which a
+  bucket key cannot see.
+- If reopened (the bar: more than 2%): choose per fire by live tiles against a measured crossover
+  in tiles per CU (stored keyed, measured once by sweeping live rows on one bucket's body), the
+  pick staged as a per-fire word both kernels read, as the mask word is, so one recorded body
+  serves both ways. No constant and no residency guess.
+
+## F73. A product pick decided inside its own measured spread lands either way from boot to boot, and moved served c64 ~2% (MI300X, 2026-11-23)
+Of a kind with F51 (a measured quantity that does not reproduce across boots), on the choosing side:
+`profile::routes` keeps a decode product's stated kernel unless another is faster past the two
+measurements' spread, but where the two kernels sit within a few microseconds of each other the
+measured times land on either side of that line from one measuring boot to the next. Qwen3-30B-A3B,
+two fresh homes of one build family: Normed 128x2048 m8 took the turned kernel in one (5691.4 vs
+5672.4 us) and the skinny kernel in the other (5667.9 vs 5670.4 us). Served c64 between the two
+homes moved about 2% (mean of 10, 6006 vs 5859 tok/s); with both builds on one shared home the
+difference went away (5921 vs 5981, sd 132 / 216), so the profile's pick, not the code, carried it.
+- Bounded mostly by committed profiles: a device's committed `<device>.measured.toml` fixes the
+  pick once per device, so every boot of a shipped build serves the same choice. What stays open
+  is a user's own measuring boot (a home with no committed entry for its key, or a code change that
+  retires the committed one), which can land the other way and serve ~2% differently.
+- If it matters: a pick inside the noise could keep the stated kernel unless the margin holds
+  across repeated rounds (re-time the near-ties, or widen the spread to the rounds' range), so a
+  near-tie stays stated instead of a coin flip; or the export can mark near-ties so a reviewer sees
+  which committed picks are noise-decided.
