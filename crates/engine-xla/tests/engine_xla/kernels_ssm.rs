@@ -1344,6 +1344,68 @@ fn the_gated_delta_decode_in_rounds_folds_one_token_per_lane() {
     bs.finish();
 }
 
+#[test]
+fn the_gated_delta_decode_pads_a_partial_round_and_folds_each_lane() {
+    let g = Gdn {
+        hk: 1,
+        hv: 64,
+        dk: 128,
+        dv: 128,
+    };
+    // A 4 MiB round holds 4 of these 1M-element states: 7 lanes are a round
+    // and a partial one, padded to a whole round and walked in the loop (a
+    // buffered fire's carried rows beside its lanes leave such a remainder).
+    let (rows, slots, width) = (7usize, 9usize, 16384usize);
+    let per = g.stride() / width;
+    let mut rng = Rng(23);
+    let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
+    let bank0 = rng.f32s(slots * g.stride(), -0.5, 0.5);
+    let slot_of = [7i32, 2, 3, 0, 4, 8, 1];
+    let mut b = Bench::new();
+    let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+    let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+    let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+    let bank = b.f32((slots * per) as u32, width as u32, &bank0);
+    let sl = b.i32(rows as u32, 1, &slot_of);
+    let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+    let p = pool(bank, sl);
+    if !b
+        .run(|ctx| {
+            ssm::gated_delta(
+                ctx,
+                x,
+                z,
+                gt,
+                &p,
+                g.hk as u32,
+                g.hv as u32,
+                g.dk as u32,
+                g.dv as u32,
+                y,
+            )
+        })
+        .unwrap()
+    {
+        return;
+    }
+    let mut want = bank0.clone();
+    let mut mag: Vec<f32> = bank0.iter().map(|v| v.abs()).collect();
+    let mut ys = Bf16Check::new("the rows", g.dk);
+    let got = b.read_f32(y);
+    let w = g.hv * g.dv;
+    for t in 0..rows {
+        let s = slot_of[t] as usize;
+        let at = s * g.stride()..(s + 1) * g.stride();
+        let yr = g.token(&qkv, &gates, t, &mut want[at.clone()]);
+        let ym = g.token_mag(&qkv, &gates, t, &mut mag[at]);
+        ys.add(&got[t * w..(t + 1) * w], &yr, &ym);
+    }
+    ys.finish();
+    let mut bs = Bf16Check::new("the bank", g.dk);
+    bs.add(&b.read_f32(bank), &want, &mag);
+    bs.finish();
+}
+
 /// `bank` (`slots` blocks of `block` elements) laid with slot `s` at block
 /// `map(s)` of a bank of `blocks` blocks, a loud garbage value elsewhere.
 fn lay_bank(bank: &[f32], block: usize, slots: usize, map: PageMap, blocks: usize) -> Vec<f32> {
