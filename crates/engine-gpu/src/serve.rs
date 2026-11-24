@@ -10545,13 +10545,40 @@ impl<B: Serve> Shell<B> {
                 })
                 .map_or(0, |kib| kib * 1024)
         };
-        let allowance = if self.device.host_room().is_some() {
-            self.device.left()
-        } else {
-            available().saturating_sub(self.pools.host_tier_bytes())
+        // What the host can still give the walk, read live before each
+        // shape: what it has available past what a low-memory killer
+        // defends and under the process's cgroups, less the safety floor
+        // (`host_memory::Room::net`), less what the load still places on
+        // the host after the walk (the host tier, pageable, taken as it
+        // fills). A driver that cannot get host memory for a recording
+        // aborts the process (an allocator's mmap fails inside it, past any
+        // error a call returns), so the walk stays under this before it
+        // records, never finding the line by crossing it.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let host_room: Box<dyn Fn() -> Option<u64>> = match crate::host_memory::reader() {
+            Ok(reader) => Box::new(move || {
+                reader
+                    .read()
+                    .ok()
+                    .map(|room| u64::try_from(room.net()).unwrap_or(0))
+            }),
+            Err(_) => Box::new(|| None),
         };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let host_room: Box<dyn Fn() -> Option<u64>> = Box::new(|| None);
+        let still_placed = if self.device.host_room().is_some() {
+            0
+        } else {
+            self.pools.host_tier_bytes()
+        };
+        let remaining = || -> u64 {
+            let room = host_room().unwrap_or_else(available);
+            room.saturating_sub(still_placed)
+        };
+        let allowance = remaining();
         let before = rss();
         let mut dearest = 0u64;
+        let mut dearest_device = 0u64;
         if let Some(known) = &known {
             match steps {
                 Some(_) => self.eager_from = known.eager.map(|at| at as usize),
@@ -10565,7 +10592,17 @@ impl<B: Serve> Shell<B> {
                 continue;
             }
             let used = rss().saturating_sub(before);
-            if known.is_none() && used.saturating_add(dearest.saturating_mul(depth as u64)) > allowance {
+            // The next shape's bodies cost what the dearest so far did, on
+            // each arm: on the host (its resident bytes) and on the device
+            // (what the driver's budget says the process took, live). The
+            // walk stops where either would not hold them, known record or
+            // not: a body the device cannot hold faults the driver.
+            let next = dearest.saturating_mul(depth as u64);
+            let next_device = dearest_device.saturating_mul(depth as u64);
+            let device_short =
+                next_device > 0 && self.device.left() < next_device.saturating_mul(2);
+            let host_short = remaining() < next;
+            if device_short || host_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
@@ -10581,6 +10618,8 @@ impl<B: Serve> Shell<B> {
                 tracing::info!(
                     allowance,
                     used,
+                    device_left = self.device.left(),
+                    next_bodies = next,
                     from_rows = from,
                     eager = ?eager,
                     "the bodies past the allowance run eager: every fire of at least these rows"
@@ -10595,6 +10634,7 @@ impl<B: Serve> Shell<B> {
             let families = self.recorded;
             for arm in 0..depth {
                 let ahead = rss();
+                let left_ahead = self.device.left();
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
@@ -10652,7 +10692,13 @@ impl<B: Serve> Shell<B> {
                     self.arming = false;
                     return Err(fault);
                 }
-                dearest = dearest.max(rss().saturating_sub(ahead));
+                // A body's cost: what it took of the host's memory or of the
+                // device's (a driver that keeps its command buffers and
+                // descriptors in device-visible memory), whichever is more.
+                let on_device = left_ahead.saturating_sub(self.device.left());
+                let cost = rss().saturating_sub(ahead).max(on_device);
+                dearest = dearest.max(cost);
+                dearest_device = dearest_device.max(on_device);
                 recorded += 1;
             }
             if self.recorded > families {
