@@ -20,10 +20,7 @@ use crate::spatial::wafer;
 #[derive(Default)]
 pub(super) struct Kv {
     pub(super) page_size: u32,
-    /// The slot ref of page 0 in the kv run the load pinned: a lane's list
-    /// table names page `p` as ref `p + ref_from`.
-    pub(super) ref_from: u32,
-    /// Pool page -> the token at each offset (`None`: never written).
+    /// Kv list slot ref -> the token at each offset (`None`: never written).
     pub(super) pages: std::collections::HashMap<u32, Vec<Option<u32>>>,
     /// The slot's tokens.
     pub(super) slots: std::collections::HashMap<u32, Vec<u32>>,
@@ -35,14 +32,12 @@ pub(super) struct Kv {
 }
 
 impl Kv {
-    /// The pages a lane's list table names, as this engine's page ids.
-    pub(super) fn lane_pages(&self, lane: &engine::fire::Lane) -> Vec<u32> {
+    /// The kv list slot refs a lane's table names.
+    pub(super) fn lane_pages(lane: &engine::fire::Lane) -> Vec<u32> {
         lane.tables
             .iter()
-            .find(|(shape, _)| *shape == engine::chunk::DEGENERATE_KV)
-            .map_or_else(Vec::new, |(_, refs)| {
-                refs.iter().map(|&r| r - self.ref_from).collect()
-            })
+            .find(|(shape, _)| *shape == super::pool::KV)
+            .map_or_else(Vec::new, |(_, refs)| refs.clone())
     }
 
     /// The lane's first `n` positions' tokens.
