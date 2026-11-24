@@ -1207,6 +1207,9 @@ pub struct Paged {
     pub page_ints: u32,
 }
 
+/// The fewest lanes a short carry takes the prepared form at.
+const GDN_PREP_MIN_LANES: u32 = 4;
+
 /// The floats a lane's short-carry record takes (`GdnShortRecord` in
 /// `ssm/gdn_scan.metal`): the own row's normed q and k a key head, each of
 /// up to [`GDN_CARRIED_INLINE`] carried rows' normed keys a key head and
@@ -1607,7 +1610,11 @@ pub fn gated_delta_carried(
         // which every simdgroup of the short scan otherwise makes for itself.
         let record = short_record_floats(k_heads, v_heads);
         let holds = u64::from(k_heads) * u64::from(table.rows) * 4 >= record;
-        if holds {
+        // Its two more launches a layer are a fixed cost a fire of few
+        // lanes does not win back: below [`GDN_PREP_MIN_LANES`] the short
+        // scan makes its own (M1 Max, Qwen3.5-0.8B: prep -9.2% against the
+        // short scan's -4.5% at one lane, ahead from eight).
+        if holds && lanes >= GDN_PREP_MIN_LANES {
             let args = |table_arg| -> Result<Vec<_>, Error> {
                 Ok(vec![
                     qkv.arg(),
