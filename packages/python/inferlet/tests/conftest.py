@@ -447,6 +447,9 @@ class WorkingSetStub:
     def fork(self, on):
         return WorkingSetStub()
 
+    def share(self, scope) -> None:
+        pass
+
 
 def _make_working_set() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.working_set")

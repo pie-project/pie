@@ -70,6 +70,9 @@ pub struct ResidencyPlanner {
     /// Room grants give back as they drop, the queue's length and the drain
     /// task's wake: shared with every reservation handed out.
     pub(super) returns: Arc<RoomReturns>,
+    /// The runtime the planner was made on: where a tiers sweep asked from
+    /// off it (the policy port's thread) runs.
+    runtime: Option<tokio::runtime::Handle>,
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
@@ -181,6 +184,7 @@ impl ResidencyPlanner {
             pause_due: AtomicBool::new(false),
             nonresident: AtomicUsize::new(0),
             returns,
+            runtime: tokio::runtime::Handle::try_current().ok(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
@@ -1148,6 +1152,11 @@ impl ResidencyPlanner {
         self.port.host_stats().0.saturating_add(self.port.disk_stats().0)
     }
 
+    /// The retention table changed: a sweep is wanted at the next plan.
+    pub fn sweep_wanted(self: &Arc<Self>) {
+        self.poke();
+    }
+
     pub(super) fn poke(self: &Arc<Self>) {
         self.events.fetch_add(1, Ordering::AcqRel);
         self.wake_planner();
@@ -1189,8 +1198,8 @@ impl ResidencyPlanner {
     }
 
     /// Idle cache the device is short of room for moves down a tier, host
-    /// first then disk, rather than being dropped, where a policy keys it
-    /// above the retention floor (the stores gate it: floor-keyed cache is
+    /// first then disk, rather than being dropped, where its tiers row lets
+    /// it on the host (the stores gate it: what a row keeps off the host is
     /// dropped by [`Self::reclaim_idle_once`] instead, never copied): whether
     /// a move is on its way (its landing frees the pages and pokes the
     /// planner). Only under
@@ -1209,7 +1218,7 @@ impl ResidencyPlanner {
         if self.demoting.swap(true, Ordering::AcqRel) {
             return true;
         }
-        let (mut host_free, host_total) = self.port.host_stats();
+        let (host_free, host_total) = self.port.host_stats();
         let (disk_free, _) = self.port.disk_stats();
         // A full host is under pressure too: its own idle cache, lowest key
         // first, goes on down to disk before the device's lands there, as
@@ -1224,14 +1233,11 @@ impl ResidencyPlanner {
                 exec::spawn_spill(self.clone(), txn, Self::spill_done);
                 return true;
             }
-            // Settling pages on their disk copies may have freed some.
-            host_free = self.port.host_stats().0;
         }
-        let (disk_free, _) = self.port.disk_stats();
-        let room = (host_free + disk_free).min(wanted.max(1));
-        let txn = (room > 0)
-            .then(|| self.port.prepare_demote(room as usize))
-            .flatten();
+        // Short of free slots below, the store makes the room from idle cache
+        // the host holds keyed below what moves down (each tier holds the
+        // highest keys first), or moves nothing.
+        let txn = self.port.prepare_demote(wanted.max(1) as usize);
         let Some(txn) = txn else {
             self.demoting.store(false, Ordering::Release);
             return false;
@@ -1258,6 +1264,70 @@ impl ResidencyPlanner {
             self.spill_failed.store(true, Ordering::Release);
         }
         self.demote_done(moved);
+    }
+
+    /// The retention table changed: idle cache its tiers rows allow
+    /// nowhere it is goes now, and what they keep off the device moves
+    /// down now, with no waiter's want.
+    pub(super) fn sweep_tiers(self: &Arc<Self>) {
+        // A move runs on the runtime: called off it, the sweep goes there,
+        // or (a planner made off any runtime) waits for the next plan that
+        // runs on one.
+        if !crate::rt::has_runtime() {
+            match &self.runtime {
+                Some(runtime) => {
+                    let planner = self.clone();
+                    runtime.spawn(async move { planner.sweep_tiers() });
+                }
+                None => crate::policy::retention::idle_cache_appeared(),
+            }
+            return;
+        }
+        tracing::debug!(target: "pie::retention", busy = self.demoting.load(Ordering::Acquire), "tiers sweep");
+        // A process waiting on its client whose row keeps its KV off the
+        // device is paused, its KV moved down for the wait.
+        let off: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(pid, proc)| proc.idle && Self::kept_off_device(**pid))
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        let idle = self.with_inner(|inner| inner.procs.values().filter(|proc| proc.idle).count());
+        tracing::debug!(target: "pie::retention", idle, off = off.len(), "tiers sweep: idle processes");
+        if !off.is_empty() {
+            self.pause(off, |proc| proc.idle);
+        }
+        if self.port.drop_disallowed() > 0 {
+            self.re_arm_idle_reclaim();
+            self.poke();
+        }
+        if self.demoting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let txn = self.port.prepare_demote_now();
+        tracing::debug!(target: "pie::retention", moves = txn.is_some(), "tiers sweep: demote now");
+        match txn {
+            Some(txn) => exec::spawn_move_out(self.clone(), txn, "demote", Self::tiers_done),
+            None => self.demoting.store(false, Ordering::Release),
+        }
+    }
+
+    /// Whether `pid`'s own working set may not sit on the device.
+    fn kept_off_device(pid: ProcessId) -> bool {
+        use crate::policy::retention::{DEVICE, Installed, Keys};
+        Installed.tiers_at(Some(pid), 0) & DEVICE == 0
+    }
+
+    /// A move a tiers row asked for landed: the next group goes, until none
+    /// is left.
+    fn tiers_done(self: &Arc<Self>, moved: bool) {
+        tracing::debug!(target: "pie::retention", moved, "tiers sweep: demote landed");
+        self.demote_done(moved);
+        if moved {
+            self.sweep_tiers();
+        }
     }
 
     fn demote_done(self: &Arc<Self>, moved: bool) {
@@ -1810,10 +1880,14 @@ impl ResidencyPlanner {
         self.poke();
     }
 
-    /// Reads each holder's retention key again: the table has changed.
-    pub fn rekey_holders(&self) {
+    /// Reads each holder's retention key again, of those `only` names (by
+    /// PLEX id) or all: the table has changed.
+    pub fn rekey_holders(&self, only: Option<&std::collections::HashSet<ProcessId>>) {
         self.with_inner(|inner| {
-            for (pid, proc) in inner.procs.iter_mut().filter(|(_, proc)| proc.holder) {
+            for (pid, proc) in inner.procs.iter_mut().filter(|(pid, proc)| {
+                proc.holder
+                    && only.is_none_or(|only| only.contains(&crate::policy::schedule::plex_id(**pid)))
+            }) {
                 proc.kept = holder_key(*pid);
             }
         });
@@ -2071,6 +2145,17 @@ impl ResidencyPlanner {
         }
     }
 
+    /// What this planner has learned of its processes' footprints: the
+    /// lanes its pools hold to their end at once, and a process's life past
+    /// the gate. `None` until one has finished.
+    pub fn to_end_facts(&self) -> Option<(u64, Option<std::time::Duration>)> {
+        let (_, kv_total) = self.port.device_stats();
+        let (_, rs_total) = self.port.rs_stats();
+        self.with_inner(|inner| {
+            Some((inner.to_end.lanes_to_end(kv_total, rs_total)?, inner.to_end.life()))
+        })
+    }
+
     /// Holds `pid` back, oldest first, until the pools hold it to the end
     /// beside the processes already started.
     async fn admit_to_end(&self, pid: ProcessId) {
@@ -2177,6 +2262,11 @@ impl ResidencyPlanner {
                 return;
             };
             proc.idle = idle;
+            if idle {
+                // A tiers row may keep its working set off the device while
+                // it waits.
+                crate::policy::retention::idle_cache_appeared();
+            }
             if self.seat_to_end {
                 self.to_end_notify.notify_waiters();
             }
@@ -2193,14 +2283,24 @@ impl ResidencyPlanner {
     }
 
     pub fn reschedule(self: &Arc<Self>) {
+        self.reschedule_only(None);
+    }
+
+    /// [`Self::reschedule`] for the processes `only` names (by PLEX id), or
+    /// all: nothing else is read again, and a change that moves no key and
+    /// no hold here reorders nothing.
+    pub fn reschedule_only(self: &Arc<Self>, only: Option<&std::collections::HashSet<ProcessId>>) {
         let schedule = crate::policy::schedule::current();
-        self.with_inner(|inner| {
-            inner.reschedule(|pid| {
+        let changed = self.with_inner(|inner| {
+            inner.reschedule(only, |pid| {
                 schedule
                     .as_ref()
                     .map_or((0, false), |s| (s.key(*pid), s.held(*pid)))
-            });
+            })
         });
+        if !changed {
+            return;
+        }
         self.vacate_held_seats();
         self.pause_due.store(true, Ordering::Release);
         self.poke();

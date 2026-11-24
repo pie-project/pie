@@ -162,10 +162,32 @@ pub fn planner_of(pid: ProcessId) -> Option<Arc<ResidencyPlanner>> {
     planner_for(0, engine_of(pid))
 }
 
-pub fn rekey_holders() {
+/// Reads holders' retention keys again on every planner: those `only`
+/// names (by PLEX id), or all.
+pub fn rekey_holders(only: Option<&std::collections::HashSet<ProcessId>>) {
     for planner in planners() {
-        planner.rekey_holders();
+        planner.rekey_holders(only);
     }
+}
+
+/// The worker's `pie/lanes-to-end` and `pie/starts-spread` (ns): the lanes
+/// every engine's pools hold to their end at once, summed, and the interval
+/// between starts that keeps them finishing apart (a life over the lanes,
+/// the engines' start rates summed). Each `None` until learned, and the
+/// spread `None` while no lane fits.
+pub fn to_end_facts() -> (Option<u64>, Option<u64>) {
+    let facts: Vec<(u64, Option<std::time::Duration>)> =
+        planners().iter().filter_map(|p| p.to_end_facts()).collect();
+    if facts.is_empty() {
+        return (None, None);
+    }
+    let lanes = facts.iter().map(|(lanes, _)| lanes).sum();
+    let rate: f64 = facts
+        .iter()
+        .filter_map(|&(lanes, life)| Some(lanes as f64 / life?.as_nanos().max(1) as f64))
+        .sum();
+    let spread = (rate > 0.0).then(|| (1.0 / rate).round() as u64);
+    (Some(lanes), spread)
 }
 
 /// Every engine's planner, engine 0's first: for what frees pages or

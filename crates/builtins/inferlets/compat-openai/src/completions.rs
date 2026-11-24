@@ -190,6 +190,7 @@ fn finish_reason(finish: Finish) -> &'static str {
     match finish {
         Finish::Stop | Finish::StopSequence | Finish::ToolCalls => "stop",
         Finish::Length => "length",
+        Finish::Abort => "abort",
     }
 }
 
@@ -408,6 +409,9 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                 Value::Null
             };
             let mut choice = json!({"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish_reason(outcome.finish)});
+            if let Some(reason) = &outcome.stop_reason {
+                choice["stop_reason"] = json!(reason);
+            }
             if let Some(top) = parsed.prompt_logprobs {
                 choice["prompt_logprobs"] = crate::vllm_prompt_logprobs(scored, top as usize);
             }

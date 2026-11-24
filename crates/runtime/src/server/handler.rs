@@ -580,6 +580,7 @@ impl Session {
                 tenant: self.tenant.clone(),
                 session,
                 props,
+                keys_under: None,
             },
             executors,
         ) {

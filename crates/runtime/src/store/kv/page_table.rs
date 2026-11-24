@@ -122,6 +122,9 @@ struct KvTrieNode {
     parent: Option<NodeId>,
     children: SmallVec<[NodeId; 2]>,
     pages: Pages,
+    /// Its sealed pages are a shared set's (or came from elsewhere by key):
+    /// what the directory hears of. A private set's keys are never told.
+    published: bool,
     exact_anchors: u32,
     path_anchors: u32,
 }
@@ -443,6 +446,7 @@ impl KvPageTable {
                         token_hashes,
                         page_hashes,
                     },
+                    published: false,
                     exact_anchors: 0,
                     path_anchors: 0,
                 });
@@ -691,11 +695,14 @@ impl KvPageTable {
         Ok(self.page_hash_at(ws, index)?.is_some())
     }
 
+    /// `published`: `ws` shares, so the pages it seals are told to the
+    /// directory.
     pub fn commit_hashes(
         &mut self,
         ws: WorkingSetId,
         first: u64,
         pages: Vec<(Vec<Option<Hash256>>, Option<Hash256>)>,
+        published: bool,
     ) -> Result<(), KvTableError> {
         self.rev += 1;
         let entry = self.entry(ws)?;
@@ -715,7 +722,9 @@ impl KvPageTable {
                 .copied()
                 .expect("published mapping covers [0, mapped_len)");
             let (owner, local) = self.resolve_owner(seg.node, (index as i64 - seg.start) as u64);
-            match &mut self.nodes.get_mut(owner).expect("live node").pages {
+            let node = self.nodes.get_mut(owner).expect("live node");
+            node.published |= published && page.is_some();
+            match &mut node.pages {
                 Pages::Owned {
                     token_hashes,
                     page_hashes,
@@ -955,6 +964,11 @@ impl KvPageTable {
         Ok(self.entry(ws)?.owner)
     }
 
+    /// The owners of the live working sets.
+    pub fn working_set_owners(&self) -> impl Iterator<Item = ProcessId> + '_ {
+        self.working_sets.iter().filter_map(|(_, entry)| entry.owner)
+    }
+
     pub fn page_hash_at(
         &self,
         ws: WorkingSetId,
@@ -1028,8 +1042,37 @@ impl KvPageTable {
     pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
         let mut keys = Vec::new();
         for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
+            if !node.published {
+                continue;
+            }
             if let Pages::Owned { page_hashes, .. } = &node.pages {
                 keys.extend(page_hashes.iter().flatten().copied());
+            }
+        }
+        keys
+    }
+
+    /// The sealed pages of the nodes of `ids` that are off the device, by
+    /// key: `false` on the host, `true` on disk.
+    pub fn off_device_key_list(&self, ids: &[NodeId]) -> Vec<(Hash256, bool)> {
+        let mut keys = Vec::new();
+        for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
+            if let Pages::Owned {
+                page_hashes,
+                backings,
+                ..
+            } = &node.pages
+            {
+                for (key, backing) in page_hashes.iter().zip(backings) {
+                    let on_disk = match backing {
+                        KvPageBacking::Resident(_) => continue,
+                        KvPageBacking::Swapped(_) => false,
+                        KvPageBacking::OnDisk(_) => true,
+                    };
+                    if let Some(key) = key {
+                        keys.push((*key, on_disk));
+                    }
+                }
             }
         }
         keys
@@ -1067,6 +1110,7 @@ impl KvPageTable {
                 token_hashes,
                 page_hashes: page_hashes.into_iter().map(Some).collect(),
             },
+            published: true,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -1432,6 +1476,7 @@ impl KvPageTable {
             parent: Some(owner),
             children: SmallVec::new(),
             pages: Pages::ParentSelection { runs },
+            published: false,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -2156,6 +2201,7 @@ impl KvPageTable {
                 token_hashes,
                 page_hashes,
             },
+            published: false,
             exact_anchors: 0,
             path_anchors: 0,
         });

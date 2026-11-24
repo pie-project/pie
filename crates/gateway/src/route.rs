@@ -316,7 +316,6 @@ mod tests {
         RoutingTable {
             epoch: 1,
             workers,
-            scales: false,
             author: None,
         }
     }

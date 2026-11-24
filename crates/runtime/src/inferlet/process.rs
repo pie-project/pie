@@ -5,6 +5,7 @@ mod output;
 pub(crate) mod residency;
 pub(crate) mod teardown;
 
+pub(crate) use ctx::Keying;
 pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
@@ -455,13 +456,29 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
-    // Only the first gate, prewarm, holds below the floor. With no count
-    // stated it counts nothing: what a newcomer may take is the capacity
-    // gate's, read at each gate ([`wait_for_room`]).
-    let sem = limit.map(|n| OrderedSemaphore::new("execution", n, false));
-    let prewarm = Some(OrderedSemaphore::new("prewarm", limit.unwrap_or(usize::MAX / 2), true));
+    // Passed in this order: none passes a gate ahead of a higher key
+    // waiting at an earlier one.
+    let prewarm = Some(OrderedSemaphore::new(
+        "prewarm",
+        limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
+        true,
+    ));
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead = limit.map(|n| OrderedSemaphore::new("bind", n, false));
+    let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
+        gates
+            .iter()
+            .filter_map(|gate| gate.as_ref().map(Arc::clone))
+            .collect()
+    };
+    let bind_ahead = limit.map(|n| OrderedSemaphore::after("bind", n, false, earlier(&[&prewarm])));
+    // Execution looks back at bind alone: what waits before bind is bind's
+    // to order, and a process there may wait on bind permits that
+    // execution's own waiters hold.
+    let sem = limit.map(|n| {
+        // A held process is not started: it waits here, bound, until its
+        // row lets it, and the others pass it.
+        OrderedSemaphore::after("execution", n, true, earlier(&[&bind_ahead]))
+    });
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
         Relaxed,
@@ -1008,8 +1025,28 @@ impl Process {
         // A process arrives, as a policy sees it, before it waits: every gate
         // below orders by its key.
         let props = arrival.props.clone();
+        let keying = match arrival.keys_under {
+            Some(domain) => Keying::OnBehalf(domain),
+            None => Keying::Asker(crate::policy::share::Asker {
+                tenant: crate::policy::share::TenantId(arrival.tenant.clone()),
+                session: match &arrival.session {
+                    Some(session) => crate::policy::share::SessionId::Named(session.clone()),
+                    None => crate::policy::share::SessionId::Process(process_id),
+                },
+            }),
+        };
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
-        crate::store::waiting::arrived(process_id, &props);
+        crate::store::waiting::arrived(
+            process_id,
+            &props,
+            match &keying {
+                Keying::Asker(asker) => crate::policy::share::ShareAs::Scope(
+                    crate::policy::share::ShareScope::Tenant,
+                    asker.clone(),
+                ),
+                Keying::OnBehalf(domain) => crate::policy::share::ShareAs::OnBehalf(*domain),
+            },
+        );
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
         if let Some(planner) = crate::planner::planner_of(process_id) {
@@ -1036,6 +1073,7 @@ impl Process {
                 .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
+            store.data_mut().set_keying(keying);
             store.data_mut().set_props(props);
             store.data_mut().set_files(files);
             if let Some(lease) = lease {

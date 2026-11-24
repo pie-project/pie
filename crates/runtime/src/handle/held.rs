@@ -427,7 +427,7 @@ pub(super) mod tests {
                 };
                 let seq = store.publish_prepared(prepared, &[commit]).unwrap();
                 store.settle(seq);
-                let floor = |_: Option<ProcessId>| crate::policy::retention::FLOOR;
+                let floor = |_: Option<ProcessId>| crate::policy::retention::DEFAULT_KEY;
                 let txn = store.prepare_suspend(&HashSet::from([ws]), floor).unwrap();
                 (ws, txn.expect("its page moves"))
             };

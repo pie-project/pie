@@ -622,10 +622,9 @@ pub trait PoolPort: Send + Sync + 'static {
         self.chunk_stats().rs
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits);
-    /// Drops idle cache for what a waiter is `short` of, and no more, but
-    /// only what its retention key lets the runtime drop unasked
-    /// (`pressure::may_drop`); room past that is asked of the policy with
-    /// tier pressure.
+    /// Drops idle cache for what a waiter is `short` of, and no more,
+    /// lowest retention key first, then least recently used: the planner
+    /// runs it once a demote had nothing to move.
     fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
@@ -1033,6 +1032,11 @@ pub trait PoolPort: Send + Sync + 'static {
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache a `retention/tiers` row keeps off the device, to move
+    /// down now.
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache a `retention/tiers` row allows nowhere it is, dropped now.
+    fn drop_disallowed(&self) -> usize;
     /// [`Self::prepare_sweep`] of the tails past the heads `order` names
     /// alone: those heads stay however few pages move.
     fn prepare_tail_sweep(
@@ -2090,7 +2094,7 @@ impl PoolPort for RegistryPool {
     }
 
     fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets))
     }
 
     fn prepare_sweep(
@@ -2139,6 +2143,27 @@ impl PoolPort for RegistryPool {
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()
         .flatten()
+    }
+
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        if !self.suspend_capable {
+            return None;
+        }
+        self.with_kv_tagged("planner-demote", |kv| {
+            kv.prepare_demote_now(crate::policy::retention::Installed)
+        })
+        .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
+        .ok()
+        .flatten()
+    }
+
+    fn drop_disallowed(&self) -> usize {
+        self.with_kv_tagged("planner-tiers", |kv| {
+            Ok::<_, crate::store::kv::KvStoreError>(
+                kv.drop_disallowed(crate::policy::retention::Installed),
+            )
+        })
+        .unwrap_or(0)
     }
 
     fn prepare_spill(&self, room: usize) -> Option<crate::store::kv::KvSpillTxn> {

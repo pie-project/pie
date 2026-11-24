@@ -20,6 +20,11 @@ use eta_ir::types::Dtype;
 
 use super::pie;
 
+/// Asked checkpoints, on a lane whose set shares nothing: refused, whichever
+/// of `state` and `checkpoints` comes second.
+const UNSHARED_CHECKPOINT: &str =
+    "a checkpoint on a set that shares nothing can never be resumed; ask share first";
+
 type Anyhow<T> = anyhow::Result<T>;
 
 /// The rows or clip a channel bound to `input` carries, once its shape and dtype match it.
@@ -557,6 +562,11 @@ impl ProcessCtx {
             let _ = self.ctx().table.get(channel)?;
         }
         let reps: Vec<u32> = lanes.iter().map(Resource::rep).collect();
+        if !self.ctx().table.get(&this)?.bindings.checkpoints.is_empty()
+            && self.shares_nothing(&reps)?
+        {
+            return Ok(Err(UNSHARED_CHECKPOINT.to_string()));
+        }
         // The window-list path's refusal: removed by the windowed-state
         // change (the integration commit deletes it). A load whose engine
         // serves windowed layers as ring + buffer states no window tokens
@@ -625,6 +635,21 @@ impl ProcessCtx {
         Ok((kv, rs))
     }
 
+    /// Whether some lane's working set shares nothing (`working-set.share`).
+    fn shares_nothing(&mut self, lanes: &[u32]) -> Anyhow<bool> {
+        let (kv_lanes, _) = self.lane_parts(lanes)?;
+        for rep in kv_lanes {
+            let kv = super::working_set::kv_of(self, rep)?;
+            let stores = crate::store::registry::get(kv.model, kv.engine);
+            if !crate::store::registry::with_kv_lock(&stores.kv, "host-forward", |s| {
+                s.shares(kv.id)
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn core_checkpoints(
         &mut self,
         this: Resource<ForwardPass>,
@@ -632,6 +657,13 @@ impl ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         slots.sort_unstable();
         slots.dedup();
+        let lanes = self.ctx().table.get(&this)?.bindings.state.as_ref().map(|s| s.lanes.clone());
+        if !slots.is_empty()
+            && let Some(lanes) = lanes
+            && self.shares_nothing(&lanes)?
+        {
+            return Ok(Err(UNSHARED_CHECKPOINT.to_string()));
+        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
@@ -1865,6 +1897,84 @@ mod tests {
         let disagree = [bound("latents", Some(256)), bound("positions", Some(128))];
         assert!(input_rows(&disagree).unwrap_err().contains("`positions`"));
         assert_eq!(input_rows(&[bound("timestep", None)]), Ok(None));
+    }
+
+    /// An asked checkpoint on a set that shares nothing is refused by name,
+    /// whichever of `state` and `checkpoints` comes second; on a set that
+    /// shares it is taken, and asking none is no fault.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_checkpoint_on_a_set_that_shares_nothing_is_refused() -> anyhow::Result<()> {
+        use super::*;
+        use crate::store::kv::working_set::KvWorkingSet;
+        let model = crate::store::registry::register_model(16, &[8], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let mut context = ProcessCtx::new(
+            uuid::Uuid::new_v4(),
+            crate::inferlet::process::OutputMode::Discard,
+            &crate::inferlet::sandbox::InstancePolicy::deny_all(),
+            None,
+        )
+        .await?;
+        let lane = |context: &mut ProcessCtx, shared: bool| -> anyhow::Result<u32> {
+            let id = {
+                let mut kv = stores.kv.lock();
+                let id = kv.create_working_set();
+                if shared {
+                    kv.share(id, crate::policy::share::test_tenant())
+                        .map_err(anyhow::Error::msg)?;
+                }
+                id
+            };
+            let kv = context.ctx().table.push(KvWorkingSet::new(model, 0, id, 16))?.rep();
+            Ok(context
+                .ctx()
+                .table
+                .push(WorkingSet {
+                    kv,
+                    rs: None,
+                    cursor: Default::default(),
+                })?
+                .rep())
+        };
+        let geom = || pie::inferlet::forward::StateGeometry {
+            positions: None,
+            slots: None,
+            kv_len: None,
+            fold: None,
+        };
+        let refused = Err(UNSHARED_CHECKPOINT.to_string());
+        let bind = |context: &mut ProcessCtx, pass: u32, ws: u32| -> anyhow::Result<()> {
+            let pass: Resource<ForwardPass> = Resource::new_borrow(pass);
+            context.ctx().table.get_mut(&pass)?.bindings.state = Some(StateBinding {
+                lanes: vec![ws],
+                positions: None,
+                slots: None,
+                kv_len: None,
+                fold: None,
+            });
+            Ok(())
+        };
+        for shared in [false, true] {
+            let want = if shared { Ok(()) } else { refused.clone() };
+            // The state first, then the ask.
+            let ws = lane(&mut context, shared)?;
+            let pass = context.ctx().table.push(ForwardPass::default())?.rep();
+            bind(&mut context, pass, ws)?;
+            let none = context.core_checkpoints(Resource::new_borrow(pass), Vec::new()).await?;
+            assert_eq!(none, Ok(()), "asking none is no fault");
+            let asked = context.core_checkpoints(Resource::new_borrow(pass), vec![16]).await?;
+            assert_eq!(asked, want, "shared: {shared}");
+        }
+        // The ask first, then the state: refused at the state.
+        let ws = lane(&mut context, false)?;
+        let pass = context.ctx().table.push(ForwardPass::default())?.rep();
+        let asked = context.core_checkpoints(Resource::new_borrow(pass), vec![16]).await?;
+        assert_eq!(asked, Ok(()), "no lane bound yet");
+        let bound = context
+            .core_state(Resource::new_borrow(pass), vec![Resource::new_borrow(ws)], geom())
+            .await?;
+        assert_eq!(bound, refused);
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]

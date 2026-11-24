@@ -24,6 +24,12 @@ struct TierPool {
 }
 
 impl PoolPort for TierPool {
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
     fn chunk_stats(&self) -> ChunkStats {
         ChunkStats {
             pages: self.device,

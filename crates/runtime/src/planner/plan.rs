@@ -107,6 +107,9 @@ thread_local! {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
+        if crate::policy::retention::take_idle_cache_new() {
+            self.sweep_tiers();
+        }
         // A grant dropped unspent during the pass gave back room the pass
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
@@ -812,6 +815,12 @@ impl ResidencyPlanner {
 
     fn plan_heads(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
+            // A hold may have named the finisher the last pass read: the
+            // gate is read again, without the held, before any is paused.
+            // Read stale, the held finisher was never paused (conform's
+            // running hold on the L40S: 502 tokens while held).
+            let order = self.capacity_order();
+            self.with_inner(|inner| inner.set_capacity(order));
             self.pause_held();
         }
         self.reseat_released();
@@ -1084,7 +1093,12 @@ impl ResidencyPlanner {
                     // allocation: a bind is new demand, not a restore, and
                     // it is funded whether or not the fleet has stalled (a
                     // fleet that keeps decoding never stalls, and the bind
-                    // waited behind it for good).
+                    // waited behind it for good). Idle cache its tiers let
+                    // below the device moves down before any is dropped.
+                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                        self.plan_stopped("short of runs: idle cache moves down");
+                        return false;
+                    }
                     let short = IdleShort {
                         kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
                         rs: true,
@@ -1167,6 +1181,10 @@ impl ResidencyPlanner {
                         self.plan_stopped("bind-suspended restore sent: its placement stands");
                         room_stood = Some(key);
                         continue;
+                    }
+                    if self.demote_idle(self.port.chunks_as_pages(need.run.saturating_mul(need.pieces))) {
+                        self.plan_stopped("bind short of runs: idle cache moves down");
+                        return false;
                     }
                     let short = IdleShort {
                         kv_pages: self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
@@ -1307,9 +1325,14 @@ impl ResidencyPlanner {
                         self.plan_stopped("restore short of runs: something in flight, not funded");
                         return false;
                     }
-                    // Idle cache holds chunks too: one set goes, and the
+                    // Idle cache holds chunks too: what its tiers let below
+                    // the device moves down, else one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
+                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                        self.plan_stopped("restore short of runs: idle cache moves down");
+                        return false;
+                    }
                     let short = IdleShort {
                         kv_pages: self
                             .port
@@ -1379,8 +1402,9 @@ impl ResidencyPlanner {
                         self.plan_stopped("short of kv: waits on a grow the walk makes");
                         return true;
                     }
-                    // Idle cache a policy keys above the floor moves down
-                    // a tier before any is dropped; the rest is dropped.
+                    // Idle cache its tiers let below the device moves down
+                    // a tier before any is dropped; what cannot move now is
+                    // dropped, lowest key first.
                     if self.demote_idle(count) {
                         self.plan_stopped("short of kv: idle cache moves down");
                         return false;
@@ -1441,8 +1465,8 @@ impl ResidencyPlanner {
                         return true;
                     }
                     // On a shared pool the chunks idle cache holds open for
-                    // state too: what is keyed above the floor moves down a
-                    // tier before any is dropped.
+                    // state too: what its tiers let below the device moves
+                    // down a tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle(as_pages) {
                         self.plan_stopped("short of state: idle cache moves down");

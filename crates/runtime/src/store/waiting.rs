@@ -22,6 +22,7 @@
 //! on its path, and one leaving those whose last held key is (a page of a
 //! run cannot go while a later one stays, the keys being chained).
 
+use crate::policy::share::ShareAs;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -265,10 +266,11 @@ pub(crate) fn prompt_tokens(props: &Props) -> Option<Vec<u32>> {
     ))
 }
 
-/// The store's page keys for `tokens`: whole pages from row 0, hashed
-/// outside its lock.
-fn page_keys(stores: &Stores, tokens: &[u32]) -> Arc<[Hash256]> {
-    let domain = registry::with_kv_lock(&stores.kv, "waiting-prefix", |kv| kv.domain());
+/// The store's page keys for `tokens` as `ask` would key them: whole pages
+/// from row 0, hashed outside its lock.
+fn page_keys(stores: &Stores, ask: &ShareAs, tokens: &[u32]) -> Arc<[Hash256]> {
+    let model = registry::with_kv_lock(&stores.kv, "waiting-prefix", |kv| kv.domain());
+    let domain = crate::policy::share::domain_now(&model, ask);
     let slots = hash::chain_slots(&domain, None, 0, tokens);
     KvStore::fresh_page_keys(&slots, stores.kv_page_size).into()
 }
@@ -333,8 +335,9 @@ fn watch(stores: &[Stores], pid: ProcessId, keys: Vec<(StoreId, Arc<[Hash256]>)>
 }
 
 /// `pid` arrived with `props`: if they give its prompt, it is looked up now
-/// and kept up to date while it waits.
-pub(crate) fn arrived(pid: ProcessId, props: &Props) {
+/// and kept up to date while it waits, in what `ask` would find (its
+/// tenant's scope: it has asked nothing yet, and sees no other tenant's).
+pub(crate) fn arrived(pid: ProcessId, props: &Props, ask: ShareAs) {
     if !props.contains_key(props::PROMPT_TOKENS) && !props.contains_key(props::RAW_PROMPT) {
         return;
     }
@@ -366,7 +369,7 @@ pub(crate) fn arrived(pid: ProcessId, props: &Props) {
         };
         let keys = stores
             .iter()
-            .map(|stores| (store_id(stores), page_keys(stores, &tokens)))
+            .map(|stores| (store_id(stores), page_keys(stores, &ask, &tokens)))
             .collect();
         watch(&stores, pid, keys);
         if !REFRESHING.swap(true, Ordering::AcqRel) {
@@ -469,7 +472,7 @@ pub(crate) mod tests {
 
     /// `pid` waits on `tokens`, looked up in `stores` (what [`arrived`]
     /// does once it has hashed them).
-    pub(crate) fn waits(stores: &[Stores], pid: ProcessId, tokens: &[u32]) {
+    pub(crate) fn waits(stores: &[Stores], pid: ProcessId, ask: &ShareAs, tokens: &[u32]) {
         waiting().watches.insert(
             pid,
             Watch {
@@ -481,7 +484,7 @@ pub(crate) mod tests {
         WATCHED.store(true, Ordering::Relaxed);
         let keys = stores
             .iter()
-            .map(|stores| (store_id(stores), page_keys(stores, tokens)))
+            .map(|stores| (store_id(stores), page_keys(stores, ask, tokens)))
             .collect();
         watch(stores, pid, keys);
     }

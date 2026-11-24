@@ -1,0 +1,96 @@
+package plex:retention@1.1.0;
+
+/// What KV a worker keeps, and in which tier. One row per prefix of a
+/// working set.
+///
+/// A row covers the tokens of its prefix. A token follows every row that
+/// covers it, on any working set it belongs to: it takes the highest of
+/// their priorities and may sit in any tier one of them names. So a
+/// shared prefix is kept as long as anything that extends it is, and
+/// along one working set priority never rises toward the tail.
+///
+/// Each tier holds, of the tokens that may sit there, the highest
+/// priority first, as many as fit; the rest move to the next tier they may
+/// sit in, or are dropped. The KV of a running process stays on the device
+/// while it runs, whatever its row says, and cached KV yields to running
+/// work, whatever its priority.
+@since(version = 1.1.0)
+interface types {
+    /// Higher is kept longer and in a higher tier. Equal priorities fall
+    /// to the engine's own order.
+    @since(version = 1.1.0)
+    type priority = s64;
+}
+
+/// Default: 0.
+@since(version = 1.1.0)
+interface priority {
+    use plex:core/types@1.1.0.{prefix, error-code};
+    use types.{priority};
+
+    @since(version = 1.1.0)
+    get: func(prefix: prefix) -> option<priority>;
+
+    @since(version = 1.1.0)
+    set: func(prefix: prefix, value: priority) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    set-list: func(entries: list<tuple<prefix, priority>>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    delete: func(prefix: prefix);
+
+    @since(version = 1.1.0)
+    set-default: func(value: priority) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    clear: func();
+
+    @since(version = 1.1.0)
+    get-refused: func() -> list<tuple<prefix, error-code>>;
+}
+
+/// The tiers KV should sit in: a set, in any order. Default: every tier
+/// the worker has.
+///
+/// The host keeps KV in the highest tier of the set that has room for it,
+/// and moves it there without waiting for a process to need it: naming
+/// only lower tiers demotes it now, naming a higher one brings it back
+/// (where the host can move KV ahead of a hit; otherwise it comes back
+/// when a process is admitted). The empty set is nowhere: the KV is
+/// dropped.
+@since(version = 1.1.0)
+interface tiers {
+    use plex:core/types@1.1.0.{prefix, tier, error-code};
+
+    @since(version = 1.1.0)
+    get: func(prefix: prefix) -> option<list<tier>>;
+
+    @since(version = 1.1.0)
+    set: func(prefix: prefix, value: list<tier>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    set-list: func(entries: list<tuple<prefix, list<tier>>>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    delete: func(prefix: prefix);
+
+    @since(version = 1.1.0)
+    set-default: func(value: list<tier>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    clear: func();
+
+    @since(version = 1.1.0)
+    get-refused: func() -> list<tuple<prefix, error-code>>;
+}
+
+@since(version = 1.1.0)
+world imports {
+    @since(version = 1.1.0)
+    import types;
+    @since(version = 1.1.0)
+    import priority;
+    @since(version = 1.1.0)
+    import tiers;
+}

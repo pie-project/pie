@@ -557,9 +557,24 @@ impl Inner {
         self.queue.keys().find(|(_, id)| *id == key.1).copied()
     }
 
-    pub(super) fn reschedule(&mut self, order_of: impl Fn(&ProcessId) -> (i64, bool)) {
-        for (pid, proc) in self.procs.iter_mut().filter(|(_, proc)| !proc.holder) {
-            (proc.key, proc.held) = order_of(pid);
+    /// Reads the keys and holds of the processes `only` names (by PLEX id),
+    /// or all, and reorders what waits by them. Whether any changed.
+    pub(super) fn reschedule(
+        &mut self,
+        only: Option<&std::collections::HashSet<ProcessId>>,
+        order_of: impl Fn(&ProcessId) -> (i64, bool),
+    ) -> bool {
+        let mut changed = false;
+        for (pid, proc) in self.procs.iter_mut().filter(|(pid, proc)| {
+            !proc.holder
+                && only.is_none_or(|only| only.contains(&crate::policy::schedule::plex_id(**pid)))
+        }) {
+            let now = order_of(pid);
+            changed |= (proc.key, proc.held) != now;
+            (proc.key, proc.held) = now;
+        }
+        if !changed {
+            return false;
         }
         let held_restores: Vec<EntryKey> = self
             .queue
@@ -598,6 +613,7 @@ impl Inner {
             .into_iter()
             .map(|((was, pid), notify)| ((rank(&pid, was), pid), notify))
             .collect();
+        true
     }
 
     pub(super) fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
