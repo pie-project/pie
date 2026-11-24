@@ -1,5 +1,5 @@
-// On-device beam search with logical ancestry masks — the JavaScript twin of
-// `beam-search`.
+// On-device beam search with logical ancestry masks: the JavaScript port of
+// `beam-search`'s search, which there keeps per-beam page lists instead.
 //
 // The chat-templated prompt (or `prompt_tokens`) is prefilled once; that fire
 // picks the first `beams` tokens, and the beams then share one working set,

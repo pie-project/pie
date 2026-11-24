@@ -339,7 +339,11 @@ async fn main(input: Input) -> Result<String> {
 
             // `--corrupt parent`: each beam continues the next beam's
             // hypothesis, the control the verifier must catch.
-            let parent = if corrupt_parent { (&parent + 1u32) % b } else { parent };
+            let parent = if corrupt_parent {
+                (&parent + 1u32) % b
+            } else {
+                parent
+            };
             group.reorder(&cast(&parent, dtype::u32));
         });
 
@@ -525,9 +529,8 @@ async fn main(input: Input) -> Result<String> {
                     Some("finish-stale") => FinishRead::Committed(n),
                     _ => FinishRead::Set,
                 };
-                finished = Some(
-                    finish_check(&ws, &prompt, &hypotheses[best], n + fired, read).await?,
-                );
+                finished =
+                    Some(finish_check(&ws, &prompt, &hypotheses[best], n + fired, read).await?);
             }
         }
     }
@@ -718,7 +721,11 @@ async fn finish_check(
         let fed: Vec<i32> = prompt
             .iter()
             .map(|&t| (t + 1) as i32)
-            .chain(hypothesis[..hypothesis.len() - 1].iter().map(|&t| (t + 1) as i32))
+            .chain(
+                hypothesis[..hypothesis.len() - 1]
+                    .iter()
+                    .map(|&t| (t + 1) as i32),
+            )
             .collect();
         let rows = u32::try_from(fed.len()).map_err(|_| "a sequence past u32 rows")?;
         let toks = Channel::from(&fed[..]);
@@ -764,8 +771,14 @@ async fn finish_check(
         next.put(cast(&i, dtype::i32));
     });
     fwd.submit(&pipeline).context("finished-set submit")?;
-    let got = out.take_host::<Vec<f32>>().await.context("finished-set drain")?;
-    let token = next.take_host::<Vec<i32>>().await.context("finished-set drain")?;
+    let got = out
+        .take_host::<Vec<f32>>()
+        .await
+        .context("finished-set drain")?;
+    let token = next
+        .take_host::<Vec<i32>>()
+        .await
+        .context("finished-set drain")?;
     pipeline.close();
     if got.len() != FINISH_TOKENS as usize || token.len() != got.len() {
         return Err("the finished set's fire returned nothing".into());
@@ -845,11 +858,22 @@ async fn fresh_last(prompt: &[u32], hypothesis: &[u32], last: &[u32]) -> Result<
         out.put(cast(gather(log_softmax(&logits), &wanted), dtype::f32));
     });
     fwd.submit(&pipeline).context("fresh-prefill submit")?;
-    let step = out.take_host::<Vec<f32>>().await.context("fresh-prefill drain")?;
-    let picked = picked.take_host::<Vec<f32>>().await.context("fresh-prefill drain")?;
-    let largest = largest.take_host::<Vec<f32>>().await.context("fresh-prefill drain")?;
+    let step = out
+        .take_host::<Vec<f32>>()
+        .await
+        .context("fresh-prefill drain")?;
+    let picked = picked
+        .take_host::<Vec<f32>>()
+        .await
+        .context("fresh-prefill drain")?;
+    let largest = largest
+        .take_host::<Vec<f32>>()
+        .await
+        .context("fresh-prefill drain")?;
     pipeline.close();
-    let largest = *largest.first().ok_or("the fresh prefill returned nothing")?;
+    let largest = *largest
+        .first()
+        .ok_or("the fresh prefill returned nothing")?;
     if step.len() != last.len() || picked.len() != last.len() {
         return Err("the fresh prefill returned fewer targets than it was given".into());
     }
@@ -910,7 +934,8 @@ enum FinishRead {
 /// pool has nothing left beside what it holds. The columns searched before
 /// stand as the output.
 fn outgrown(why: &str) -> bool {
-    why.contains("outgrows the kv pool") || why.contains("this process alone holds what the pool holds")
+    why.contains("outgrows the kv pool")
+        || why.contains("this process alone holds what the pool holds")
 }
 
 /// One step of a hypothesis rescored alone: its log-probability, target and
@@ -988,7 +1013,9 @@ async fn rescore(
 ) -> Result<Vec<Rescored>> {
     let (one, _) = teacher_forced(prompt, hypothesis, 1, Fold::All, &[]).await?;
     let mut others = vec![
-        teacher_forced(prompt, hypothesis, width, Fold::None, &[]).await?.0,
+        teacher_forced(prompt, hypothesis, width, Fold::None, &[])
+            .await?
+            .0,
         replay(prompt, hypothesis).await?,
     ];
     if let Some(shaped) = shaped {
@@ -1396,7 +1423,10 @@ mod tests {
         let err = rollback(&request(r#"{"rollback_mode": "ckpt"}"#)).unwrap_err();
         assert!(err.contains("unknown rollback_mode `ckpt`"), "{err}");
         assert_eq!(rollback(&request("{}")), Ok(Rollback::FlushFree));
-        assert_eq!(rollback(&request(r#"{"ckpt_sync": true}"#)), Ok(Rollback::CkptSync));
+        assert_eq!(
+            rollback(&request(r#"{"ckpt_sync": true}"#)),
+            Ok(Rollback::CkptSync)
+        );
         assert_eq!(
             rollback(&request(r#"{"rollback_mode": "stop_wait"}"#)),
             Ok(Rollback::StopWait)

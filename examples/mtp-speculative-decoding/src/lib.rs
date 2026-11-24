@@ -16,13 +16,12 @@
 //! `(hidden_i, argmax_i)` and drafts what follows — the model text's
 //! contract, its `mtp.drafts` output — so row `m`'s chain is conditioned on exactly the
 //! token the next window starts with. That is what lets one fire both verify
-//! this window and draft the next; a head fed the row's own token could not
-//! (see `.wiki/big/dsv4.md` §3.4).
+//! this window and draft the next; a head fed the row's own token could not.
 //!
 //! **THE ANSWER IS THE ANSWER, BY CONSTRUCTION.** Verification keeps the
 //! trunk's argmax at every position, so the text equals greedy decoding
 //! whatever the head proposes; `k = 0` runs the same loop with a one-row
-//! window and nothing drafted — the controlled A/B `test_eagle.py` reads.
+//! window and nothing drafted, the controlled A/B against plain greedy.
 //! Acceptance is reported, not asserted: it is a property of the head.
 //!
 //! **ROLLBACK IS OVERWRITE.** The next fire writes again the slots past the accepted run.
@@ -101,7 +100,11 @@ fn rollback(input: &Input) -> Result<Rollback> {
 /// drafts, then the correction.
 fn replay_of(start: u32, live: &[u32], base: u32) -> (Vec<i32>, std::ops::Range<u32>) {
     let mut rows = vec![start as i32];
-    rows.extend(live[..live.len().saturating_sub(1)].iter().map(|&t| t as i32));
+    rows.extend(
+        live[..live.len().saturating_sub(1)]
+            .iter()
+            .map(|&t| t as i32),
+    );
     let end = base + rows.len() as u32;
     (rows, base..end)
 }
@@ -280,7 +283,10 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p.epilogue(move || {
             // The span's last readout row seeds the first window.
             let last = broadcast(Tensor::constant(rows - 1), [1]);
-            let t = gather(&reshape(reduce_argmax(intrinsics::output(0, "logits")), [rows]), &last);
+            let t = gather(
+                &reshape(reduce_argmax(intrinsics::output(0, "logits")), [rows]),
+                &last,
+            );
             let i = iota(w);
             let first = eq(&i, Tensor::constant(0u32));
             let window = if drafting {
@@ -338,8 +344,17 @@ async fn main(input: Input) -> Result<Output> {
         // One diagnostic channel, the margin or the trace: a declared channel
         // takes a reader cell whether or not a stage touches it, and the pass
         // has room for twelve. f32 for both — a token id is exact in f32.
-        let aux = Channel::new([if tracing { 2 * w } else if margin { 2 } else { 1 }], dtype::f32)
-            .capacity(channel_capacity() as u32);
+        let aux = Channel::new(
+            [if tracing {
+                2 * w
+            } else if margin {
+                2
+            } else {
+                1
+            }],
+            dtype::f32,
+        )
+        .capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
         // The next window overwrites the slots of the drafts this one
@@ -441,7 +456,9 @@ async fn main(input: Input) -> Result<Output> {
             let mut round_base = n;
             let mut round_fold = 0u32;
             for _ in 0..budget {
-                let ckpt_ws = ws.fork(&pipe).context("checkpoint the set before the round's fire")?;
+                let ckpt_ws = ws
+                    .fork(&pipe)
+                    .context("checkpoint the set before the round's fire")?;
                 fwd.submit(&pipe)?;
                 let committed = out.take_host::<Vec<i32>>().await?;
                 if tracing {
@@ -474,7 +491,9 @@ async fn main(input: Input) -> Result<Output> {
                     let replays = if stop_wait { 2 } else { 1 };
                     let (rows, at) = replay_of(start, &live, round_base);
                     for _ in 0..replays {
-                        let restore_ws = ckpt_ws.fork(&pipe).context("restore the round's checkpoint")?;
+                        let restore_ws = ckpt_ws
+                            .fork(&pipe)
+                            .context("restore the round's checkpoint")?;
                         let r_len = rows.len() as u32;
                         let toks_r = Channel::from(rows.as_slice());
                         let ind_r = Channel::from([0u32, r_len]);
@@ -494,10 +513,7 @@ async fn main(input: Input) -> Result<Output> {
                             },
                         )?;
                         fwd_r.epilogue(move || {
-                            out_r.put(reshape(
-                                reduce_argmax(intrinsics::output(0, "logits")),
-                                [1],
-                            ));
+                            out_r.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
                         });
                         fwd_r.submit(&pipe).context("restore replay")?;
                         let answer = out_r.take_host::<Vec<i32>>().await?;
@@ -512,8 +528,7 @@ async fn main(input: Input) -> Result<Output> {
                 round_fold = live.len() as u32;
                 for t in live {
                     generated.push(t);
-                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens
-                    {
+                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens {
                         stopped = true;
                         break;
                     }
@@ -553,8 +568,7 @@ async fn main(input: Input) -> Result<Output> {
                 commits_trace.push(live.len() as u32);
                 for t in live {
                     generated.push(t);
-                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens
-                    {
+                    if stop_tokens.contains(&t) || generated.len() >= input.max_tokens {
                         stopped = true;
                         break;
                     }
@@ -612,8 +626,7 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    /// A key the request does not name is refused by name, not ignored: a
-    /// removed option (`bench_accept`) cannot quietly run something else.
+    /// A key the request does not name is refused by name, not ignored.
     #[test]
     fn an_unknown_key_is_refused() {
         let why = serde_json::from_str::<Input>(r#"{"bench_accept": true}"#)
@@ -629,7 +642,10 @@ mod tests {
         let err = rollback(&request(r#"{"rollback_mode": "ckpt"}"#)).unwrap_err();
         assert!(err.contains("unknown rollback_mode `ckpt`"), "{err}");
         assert_eq!(rollback(&request("{}")), Ok(Rollback::FlushFree));
-        assert_eq!(rollback(&request(r#"{"ckpt_sync": true}"#)), Ok(Rollback::CkptSync));
+        assert_eq!(
+            rollback(&request(r#"{"ckpt_sync": true}"#)),
+            Ok(Rollback::CkptSync)
+        );
         for (name, mode) in [
             ("flush_free", Rollback::FlushFree),
             ("ckpt_sync", Rollback::CkptSync),
