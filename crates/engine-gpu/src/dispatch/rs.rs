@@ -140,11 +140,13 @@ impl<B: Backend> Run<'_, B> {
         arenas: &Arenas,
         runs: &[kernels_slang::gather::rows::CopyRun],
     ) -> Result<(), Error> {
+        // A fire moving no run still dispatches its copies, empty, beside
+        // the arena its planes lie in: its commands are its family's.
         let Some(&(_, a)) = arenas.bound.first() else {
             return Ok(());
         };
         let b = arenas.bound.get(1).map_or(a, |&(_, b)| b);
-        kernels_slang::gather::rows::copy_runs(self.ctx, a, b, seat.pool, runs)
+        kernels_slang::gather::rows::copy_runs(self.ctx, a, b, seat.pool, runs, seat.run_dispatches)
     }
 
     fn kernel(fault: crate::error::Fault, op: &'static str) -> Error {

@@ -524,6 +524,13 @@ pub struct Seat {
     pub work: Tensor,
     pub rows_ext: u32,
 
+    /// The dispatches every recurrent copy of a fire takes
+    /// ([`kernels_slang::gather::rows::copy_runs`]): enough for the most
+    /// runs a fire of the load can move (every lane's rows over the most
+    /// pages the room's rows span, twice, and a run of its own each), the
+    /// same for every fire.
+    pub run_dispatches: usize,
+
     pub ext: RefCell<HashMap<u32, Tensor>>,
 
     /// The fire's beam groups' folds (`BEAM-PAGE-LISTS.md` §11.3): their
@@ -656,6 +663,7 @@ impl Seat {
         rows_ext: u32,
         folds: Option<Folds>,
         fold_lanes: Vec<u32>,
+        max_lanes: u32,
     ) -> Result<Seat> {
         // The planes lie where the load's reservation lays them for the top
         // rung's rows, bound at their room: one view whatever the fire.
@@ -703,6 +711,17 @@ impl Seat {
             u32::try_from(layout.work_elems).unwrap_or(u32::MAX),
             Dtype::F32,
         );
+        // The most runs a fire's recurrent copy moves: a lane's gathered and
+        // scattered rows each split at the pages they span (at most the
+        // room's rows over a page, and one more a run), and its own rows.
+        let pages = u64::from(room_rows.div_ceil(buffers.page_tokens.max(1)));
+        let most_lanes = u64::from(max_lanes.max(1)).min(u64::from(room_rows.max(1)));
+        let most = 2 * (pages + most_lanes) + most_lanes;
+        let run_dispatches = usize::try_from(
+            most.div_ceil(kernels_slang::gather::rows::COPY_RUNS as u64),
+        )
+        .unwrap_or(usize::MAX)
+        .max(1);
         Ok(Seat {
             lanes,
             carried,
@@ -719,6 +738,7 @@ impl Seat {
             ext_out,
             work,
             rows_ext,
+            run_dispatches,
             ext: RefCell::new(HashMap::new()),
             folds,
             fold_lanes,

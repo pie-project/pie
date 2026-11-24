@@ -8337,6 +8337,7 @@ impl<B: Serve> Shell<B> {
                         count: u32::try_from(fold_lanes.len()).unwrap_or(u32::MAX),
                     }),
                     fold_lanes,
+                    self.budgets.tokens.max_lanes,
                 )?);
                 Some(seat)
             } else {

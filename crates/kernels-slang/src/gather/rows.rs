@@ -119,22 +119,34 @@ pub struct CopyRun {
 }
 
 /// `runs` moved between the state pool's segments (`pool`) and two arena
-/// buffers bound whole (`arena_a`, `arena_b`), a dispatch for every
-/// [`COPY_RUNS`] of them: the runs and their count are the dispatch's fired
-/// scalars, so its commands are the same however many runs a fire moves
-/// and wherever they lie.
+/// buffers bound whole (`arena_a`, `arena_b`), in exactly `dispatches`
+/// dispatches of [`COPY_RUNS`] runs each (a dispatch past the runs moves
+/// none): the runs and their count are the dispatches' fired scalars, so
+/// the commands are the same however many runs a fire moves and wherever
+/// they lie. More runs than the dispatches hold is refused by name.
 pub fn copy_runs(
     ctx: &Ctx<'_>,
     arena_a: Tensor,
     arena_b: Tensor,
     pool: crate::Segments,
     runs: &[CopyRun],
+    dispatches: usize,
 ) -> Result<(), Error> {
     const OP: &str = "gather.rs_copy_runs";
-    if runs.is_empty() {
-        return Ok(());
+    if runs.len() > dispatches.saturating_mul(COPY_RUNS) {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} runs, past the {dispatches} dispatch(es) of {COPY_RUNS} the load states for \
+                 a fire's recurrent copy",
+                runs.len()
+            ),
+        ));
     }
-    for chunk in runs.chunks(COPY_RUNS) {
+    for at in 0..dispatches {
+        let chunk = runs.get(at * COPY_RUNS..).map_or(&[][..], |rest| {
+            &rest[..rest.len().min(COPY_RUNS)]
+        });
         let longest = chunk.iter().map(|run| run.words).max().unwrap_or(0).max(1);
         let count = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
         let mut args = vec![arena_a.arg_mut(), arena_b.arg_mut()];
@@ -153,7 +165,7 @@ pub fn copy_runs(
         }
         ctx.fire(
             Fire::at(ROWS, "gather_rows_copy_runs_words")
-                .threads([longest, count, 1], [GROUP, 1, 1]),
+                .threads([longest, count.max(1), 1], [GROUP, 1, 1]),
             &args,
         )
         .map_err(|why| match why {
