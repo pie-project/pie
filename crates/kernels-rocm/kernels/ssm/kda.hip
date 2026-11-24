@@ -614,7 +614,7 @@ __global__ __launch_bounds__(256) void ssm_kda_tail_corrected(
     }
 }
 
-// A beam group's fold of its KDA state (BEAM-PAGE-LISTS §11.3): its fold rows
+// A beam group's fold of its KDA state (its rows below the common ancestor): its fold rows
 // (forget rows, keys and u from the kept planes 0, 2 and 3) folded in order,
 // M <- M diag(a) + u k̂^T, and the rows stored once. Grid (H,
 // D / ROWS), block 256.

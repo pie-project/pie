@@ -204,7 +204,7 @@ __global__ void ssm_mamba2_tail_rows(const bf16* __restrict__ xbc, const u32* __
     }
 }
 
-// A beam group's fold of its Mamba-2 state (BEAM-PAGE-LISTS §11.3): its fold
+// A beam group's fold of its Mamba-2 state (its rows below the common ancestor): its fold
 // rows (step sizes and convolved x | B from the kept planes 0 and 1) folded in
 // order, S <- a S + (dt x) B^T, and the state stored once. Grid H, a block folding each group in turn,
 // block 256.
