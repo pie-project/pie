@@ -210,7 +210,6 @@ pub(crate) fn reset() {
         held.write().unwrap().clear();
     }
     super::departure::reset();
-    super::lock::reset();
 }
 
 /// Every engine's planner, engine 0's first: for what frees pages or

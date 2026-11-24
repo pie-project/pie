@@ -1,6 +1,3 @@
-#[macro_use]
-mod trace;
-
 mod acquire;
 mod departure;
 mod diagnostics;
@@ -53,7 +50,6 @@ pub use pool::{ChunkMap, ChunkStats, PoolPort, RegistryPool, RiseRoom};
 pub use residency_planner::ResidencyPlanner;
 pub use short::WeightShed;
 pub use stats::PlannerStats;
-pub use trace::trace_enabled;
 
 pub type ProcessId = uuid::Uuid;
 

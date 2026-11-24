@@ -1029,7 +1029,7 @@ impl ResidencyPlanner {
         // A fire that landed while the pass ran was in flight when the
         // wait was chosen: its landing plans again, and the wait is no
         // bug (the restored one's bind fired under the pass).
-        ptrace!("plan ended head={head:?} ended={ended}");
+        tracing::debug!("plan ended head={head:?} ended={ended}");
         let landed_since = self.stats.fires_landed.load(Ordering::Acquire)
             != self.pass_landed.load(Ordering::Acquire);
         if WAITS_ON_FLIGHT.iter().any(|wait| ended.contains(wait))
@@ -1351,7 +1351,7 @@ impl ResidencyPlanner {
         });
         let any = !spawned.is_empty();
         for pid in &spawned {
-            ptrace!("evict pid={} head={:?}", pid, head_key);
+            tracing::debug!("evict pid={} head={:?}", pid, head_key);
         }
         self.start_evictions(wake, spawned);
         any
