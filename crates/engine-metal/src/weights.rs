@@ -175,7 +175,7 @@ impl Weights {
             Err(None) => {}
             Err(Some(why)) => {
                 let held = std::fs::metadata(path).map(|it| it.len()).unwrap_or(0);
-                eprintln!(
+                tracing::warn!(
                     "engine-metal: {} loads cold — {why}.\n\
                      engine-metal: that road reads all {:.2} GiB of it through the executor; \
                      the warm arm would have read no weight byte at all.",

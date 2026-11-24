@@ -660,7 +660,7 @@ impl Engine for Metal {
                 {
                     break prepared;
                 }
-                eprintln!(
+                tracing::warn!(
                     "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
                  resident weights on this device: fires narrowed to {narrower} tokens",
                     budgets.max_tokens,
@@ -690,7 +690,7 @@ impl Engine for Metal {
             }
         };
         if let Some(short) = cut {
-            eprintln!(
+            tracing::warn!(
                 "the widest fire narrowed from {asked} to {} forward tokens at load: at the \
                  wider fire, {short}",
                 budgets.max_tokens
@@ -1592,9 +1592,6 @@ impl Metal {
                 }
             }
         }
-        if !ring_forks.is_empty() {
-            eprintln!("ringfork {} pair(s), first {:?}", ring_forks.len(), ring_forks.first());
-        }
         if !forks.is_empty() || !ring_forks.is_empty() {
             shell.copy_records(&forks, &ring_forks).map_err(fault)?;
         }
@@ -1605,14 +1602,6 @@ impl Metal {
             .iter()
             .flat_map(|lane| lane.slot_copies.iter().cloned())
             .collect();
-        if !slot_copies.is_empty() || !forks.is_empty() {
-            eprintln!(
-                "wanomaly submit slot_copies {} forks {} first copy {:?}",
-                slot_copies.len(),
-                forks.len(),
-                slot_copies.first()
-            );
-        }
         shell.copy_slot_pairs(&slot_copies).map_err(fault)?;
         let seated: Vec<Seated<'_>> = submission
             .lanes

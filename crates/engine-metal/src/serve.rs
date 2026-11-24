@@ -918,7 +918,7 @@ impl PreparedLoad<'_> {
                 )?;
                 let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip)
                     .unwrap_or_else(|why| {
-                        eprintln!("the Neural Engine stays out of this load: {why}");
+                        tracing::info!("the Neural Engine stays out of this load: {why}");
                         None
                     });
                 // The compiler's on-device Metal recipe is the one layout source: the
@@ -2275,9 +2275,8 @@ impl Shell {
         // resolve): the evacuation is taken back whole, so the refusal
         // means nothing moved (`Engine::evacuate`), the runtime takes its
         // raise back too, and the two keep one map. Answered as half done,
-        // the runtime's map and this one parted: a later hand-out landed on
-        // bytes the engine had moved a holder onto (beamx40 on d821e8d1c, a
-        // rescore's bind over a pair; a NaN where no claim stood guard).
+        // the runtime's map and this one would part, and a later hand-out
+        // could land on bytes the engine had moved a holder onto.
         tracing::warn!(
             %refused,
             moves = evacuation.moves.len(),
@@ -3025,7 +3024,7 @@ impl Shell {
                     engine::disk::derived_need(state_rows, state_bytes, pages, page_bytes, guest);
                 let bytes = need.min(room.for_us());
                 // Its inputs, stated at load: what the field rules on.
-                eprintln!(
+                tracing::info!(
                     "engine-metal: the unstated disk tier: {bytes} bytes of a derived need of \
                      {need} bytes ({seats} seats x (state {state_bytes} B + {context} tokens of \
                      kv in {} pages of {page_bytes} B) + {guest} B of guest state the device \
@@ -3383,7 +3382,7 @@ impl Shell {
         let started = std::time::Instant::now();
         let steps_before = crate::program::compile::step_pipelines_built();
         let compiled = self.programs.prewarm(&self.device, registrations)?;
-        eprintln!(
+        tracing::info!(
             "engine-metal: guest regions prewarmed for {} standard program(s): {} compiled \
              ({} step pipeline(s)), in {} ms",
             registrations.len(),
