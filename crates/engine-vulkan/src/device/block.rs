@@ -12,7 +12,6 @@
 //! with no arm (a test's, a tune's) lays its block in chunks of its own that
 //! the host writes as it walks.
 
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use engine_gpu::error::{Fault, Result};
@@ -34,6 +33,12 @@ pub struct Image {
 }
 
 impl Image {
+    /// Whether `other` holds the same bytes in the same chunks.
+    #[must_use]
+    pub fn same(&self, other: &Image) -> bool {
+        self.chunks == other.chunks
+    }
+
     /// The bytes each chunk holds, in order: the block's layout.
     #[must_use]
     pub fn layout(&self) -> Vec<usize> {
@@ -43,12 +48,22 @@ impl Image {
     /// The image with its hash taken, as a fire keeps it.
     #[must_use]
     pub fn sealed(&self) -> Image {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.chunks.hash(&mut hasher);
         Image {
             chunks: self.chunks.clone(),
-            hash: hasher.finish(),
+            hash: 0,
         }
+        .seal()
+    }
+
+    /// [`Self::sealed`], taking the image rather than copying it.
+    #[must_use]
+    pub fn seal(mut self) -> Image {
+        // Kept as long as its shape's fill: no room past its bytes.
+        for chunk in &mut self.chunks {
+            chunk.shrink_to_fit();
+        }
+        self.hash = words_hash(&self.chunks);
+        self
     }
 
     fn bytes(&self) -> u64 {
@@ -138,6 +153,28 @@ enum Place {
     Own(Vec<Buffer>),
     /// The arm's block, the host laying the image alone.
     Arm(Arc<ArmBlock>),
+}
+
+/// A hash of `chunks`' bytes, eight at a time: what tells a staged image
+/// from another before its bytes are compared (a walk lays hundreds of KiB
+/// of it, sealed once a fill).
+fn words_hash(chunks: &[Vec<u8>]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ chunks.len() as u64;
+    let mut mix = |word: u64| {
+        hash = (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+    };
+    for chunk in chunks {
+        mix(chunk.len() as u64);
+        let (words, tail) = chunk.as_chunks::<8>();
+        for word in words {
+            mix(u64::from_le_bytes(*word));
+        }
+        let mut last = [0u8; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        mix(u64::from_le_bytes(last));
+    }
+    // 0 is no hash at all ([`ArmBlock::stage`]).
+    hash | 1
 }
 
 pub(crate) struct FireBlock {
@@ -234,6 +271,11 @@ impl FireBlock {
                 Ok((Arc::clone(chunk.slab()), chunks.len() - 1, at))
             }
         }
+    }
+
+    /// The image laid so far, taken from the block.
+    pub(crate) fn take_image(&mut self) -> Image {
+        std::mem::take(&mut self.image)
     }
 
     pub(crate) fn image(&self) -> &Image {

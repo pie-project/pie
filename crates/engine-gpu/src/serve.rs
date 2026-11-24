@@ -415,6 +415,14 @@ pub trait Serve: Backend {
     /// fill's plan does before it fills.
     fn ready_fill(_shell: &mut Shell<Self>, _prepared: &Prepared<'_, Self>) {}
 
+    /// The arm walk's fill of `prepared` on an arm past the first, laid
+    /// from the first arm's fill of the same composition
+    /// ([`Shell::walk_at`]) into the family the arm recorded for it, with
+    /// no walk: whether it was. A backend that derives none walks.
+    fn derive_fill(_shell: &mut Shell<Self>, _prepared: &Prepared<'_, Self>) -> bool {
+        false
+    }
+
     /// The most memory maps the device's host lets a process hold, where
     /// its profile states it (a host that hides vm.max_map_count).
     fn max_maps(_shell: &Shell<Self>) -> Option<u64> {
@@ -1245,6 +1253,8 @@ pub struct Shell<B: Serve> {
     pub step: Option<engine::StepComposition>,
     /// The load records its bodies: a kept walk is recorded and not run.
     pub arming: bool,
+    /// The arm walk's composition in hand, by its place in the walk.
+    pub walk_at: Option<usize>,
     /// The arm walk's fire filled a family the load already holds
     /// ([`Shell::fill_once`] before its plan): its walk lays into a frame
     /// that records nothing, and nothing runs.
@@ -3134,6 +3144,7 @@ impl<B: Serve> Shell<B> {
             steps: None,
             step: None,
             arming: false,
+            walk_at: None,
             arm_filled: false,
             eager: 0,
             eager_next: false,
@@ -5550,6 +5561,7 @@ impl<B: Serve> Shell<B> {
             let seats = self.pools.seat_segments();
             self.commit_segments(seats)?;
         }
+        let t = std::time::Instant::now();
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -5565,9 +5577,17 @@ impl<B: Serve> Shell<B> {
             },
             None,
         )?;
+        crate::kernel_profile::phase(0, t);
+        let t = std::time::Instant::now();
         let enqueued = FrameShell::enqueue(self, prepared)?;
+        crate::kernel_profile::phase(1, t);
+        let t = std::time::Instant::now();
         let landed = FrameShell::settle(self, enqueued)?;
-        self.rows_of(&landed)
+        crate::kernel_profile::phase(2, t);
+        let t = std::time::Instant::now();
+        let rows = self.rows_of(&landed);
+        crate::kernel_profile::phase(3, t);
+        rows
     }
 
     /// Fires `lanes` and reads back every output their programs read, the
@@ -8536,7 +8556,9 @@ impl<B: Serve> Shell<B> {
             Some(len) => handles.rewind_to(len),
             None => handles.rewind(),
         };
+        let t = std::time::Instant::now();
         let walked = self.walk_fill(prepared);
+        crate::kernel_profile::phase(4, t);
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
@@ -8554,7 +8576,10 @@ impl<B: Serve> Shell<B> {
         });
         rewind(&self.handles);
         let layout = laid?;
-        B::fill(self, frame, prepared, &layout, walked.launches)
+        let t = std::time::Instant::now();
+        let filled = B::fill(self, frame, prepared, &layout, walked.launches);
+        crate::kernel_profile::phase(5, t);
+        filled
     }
 
     /// A serving fire whose walk matched no armed body and which the load
@@ -9243,8 +9268,11 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
             // its shape) and records nothing: a body is recorded once, each
             // composition of it a table of data.
             B::ready_fill(self, &prepared);
-            self.arm_filled = self.fill_once(&mut prepared)?;
-            B::plan(self, &mut prepared)?
+            self.arm_filled = B::derive_fill(self, &prepared) || self.fill_once(&mut prepared)?;
+            let t = std::time::Instant::now();
+            let plan = B::plan(self, &mut prepared)?;
+            crate::kernel_profile::phase(6, t);
+            plan
         } else {
             B::plan(self, &mut prepared)?
         };
@@ -9314,7 +9342,19 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         self.recorded += u64::from(keep.is_some());
         self.eager += u64::from(stated_eager);
         self.unkept += u64::from(keep.is_none() && !stated_eager);
-        let walked = self.walk_once(&prepared, keep.is_some(), split);
+        // An arm walk's fire its fill answered runs nothing: it lands on an
+        // empty submission, and walking it again would only lay what the
+        // fill laid.
+        let walked = if self.arming && self.arm_filled {
+            B::fill_frame(&self.device, prepared.arm).map(|frame| Walked {
+                frame: Some(frame),
+                cuts: Vec::new(),
+                launches: 0,
+                picks: Vec::new(),
+            })
+        } else {
+            self.walk_once(&prepared, keep.is_some(), split)
+        };
         self.split_layers = 1;
         let walked = walked?;
         // The kernels the walk picked, by class: what a split step ran
@@ -10892,7 +10932,9 @@ impl<B: Serve> Shell<B> {
                 crate::kernel_profile::family_log(&format!(
                     "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} keys_only {keys_only}"
                 ));
+                self.walk_at = Some(at);
                 let fired = self.fire_seated(&seated);
+                self.walk_at = None;
                 self.arm_filled = false;
                 for before in 0..arm {
                     self.arms.give(before);

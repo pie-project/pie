@@ -65,3 +65,17 @@ pub fn family_log(line: &str) {
         let _ = writeln!(file, "{line}");
     }
 }
+
+/// The arm walk's host time by phase (prepare, enqueue, settle, read back,
+/// the fill walk, the backend's fill, its plan), in ns: a diagnostic the
+/// load logs at ready under `PIE_VK_KERNEL_PROFILE`.
+pub static WALK_PHASES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Credits `since`'s elapsed time to phase `phase`.
+pub fn phase(phase: usize, since: std::time::Instant) {
+    WALK_PHASES[phase].fetch_add(
+        u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}

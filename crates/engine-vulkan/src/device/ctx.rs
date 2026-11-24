@@ -2861,7 +2861,7 @@ impl Frame {
             trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
-            image: self.block.borrow().image().sealed(),
+            image: self.block.borrow_mut().take_image().seal(),
             cuts: self.cuts(),
             room_pasts: self.room_pasts.borrow().clone(),
         }
@@ -2931,6 +2931,17 @@ impl Frame {
         key: u64,
     ) -> Result<vk::DescriptorSet> {
         self.inner.core.shared_set(layout, key).map(|(set, _)| set)
+    }
+
+    /// [`Self::shared_set`], and whether it is new: a held one's bindings
+    /// are the ones its key hashes (a pool segment's and a score room's
+    /// written by a rebind or a replay), written when it was made.
+    pub(crate) fn shared_set_fresh(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        key: u64,
+    ) -> Result<(vk::DescriptorSet, bool)> {
+        self.inner.core.shared_set(layout, key)
     }
 
     /// The fire block's set of `layout` over `buffer` (its uniform at the

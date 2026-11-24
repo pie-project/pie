@@ -28,6 +28,108 @@ pub struct Shelf {
     /// ([`engine_gpu::guest::ring`]): laid here, before the pool is sized.
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(crate) guest: GuestRing,
+
+    /// The arm walk's fill on the first arm of the composition in hand (the
+    /// walk lays a composition on every arm before the next): what an arm
+    /// past it lays without a walk ([`Serve::derive_fill`]). Only the one:
+    /// a fill's image is the fire's whole block.
+    derived: Option<(usize, Derived)>,
+
+    /// Each first-arm family's on every other arm, as the walk recorded it.
+    arm_families: std::collections::HashMap<(crate::record::Key, usize), crate::record::Key>,
+
+    /// Fills laid without a walk; fills a verification walk found other
+    /// than its derived one (`PIE_VK_VERIFY_ARMS`).
+    derived_fills: u64,
+    derived_checked: u64,
+    derived_mismatches: u64,
+    /// The first arm's fills' image bytes, and how many.
+    image_bytes: (u64, u64),
+}
+
+/// A first-arm fill, as an arm past it lays it.
+struct Derived {
+    family: crate::record::Key,
+    groups: std::sync::Arc<Vec<[u32; 3]>>,
+    image: std::sync::Arc<crate::device::Image>,
+    layout: Vec<ReadSpan>,
+    launches: u32,
+    room_pasts: std::sync::Arc<Vec<u64>>,
+}
+
+/// Whether the arm walk walks every arm and checks each fill against the
+/// one it would derive (`PIE_VK_VERIFY_ARMS`), deriving none.
+fn verifying_arms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_VK_VERIFY_ARMS").is_some())
+}
+
+/// The arm walk filled composition `walk_at` on `arm` into `family`: the
+/// first arm's fill is kept to derive the others' from; another arm's
+/// family is kept as the first's on it, and, verifying, its fill is held
+/// to what it would have derived.
+#[allow(clippy::too_many_arguments)]
+fn note_fill(
+    shell: &mut Shell<Api>,
+    arm: usize,
+    family: crate::record::Key,
+    groups: &std::sync::Arc<Vec<[u32; 3]>>,
+    image: &std::sync::Arc<crate::device::Image>,
+    layout: &[ReadSpan],
+    launches: u32,
+    room_pasts: &std::sync::Arc<Vec<u64>>,
+) {
+    let Some(at) = shell.walk_at.filter(|_| shell.arming) else {
+        return;
+    };
+    if arm == 0 {
+        let bytes: usize = image.layout().iter().sum();
+        shell.shelf.image_bytes.0 += bytes as u64;
+        shell.shelf.image_bytes.1 += 1;
+        shell.shelf.derived = Some((
+            at,
+            Derived {
+                family,
+                groups: std::sync::Arc::clone(groups),
+                image: std::sync::Arc::clone(image),
+                layout: layout.to_vec(),
+                launches,
+                room_pasts: std::sync::Arc::clone(room_pasts),
+            },
+        ));
+        return;
+    }
+    let Some((_, first)) = shell.shelf.derived.as_ref().filter(|(held, _)| *held == at) else {
+        return;
+    };
+    let first_family = first.family;
+    if verifying_arms() {
+        shell.shelf.derived_checked += 1;
+        let mut parts = Vec::new();
+        if shell.shelf.arm_families.get(&(first_family, arm)).is_some_and(|&held| held != family) {
+            parts.push("family");
+        }
+        if first.groups != *groups {
+            parts.push("groups");
+        }
+        if !first.image.same(image) {
+            parts.push("image");
+        }
+        if format!("{:?}", first.layout) != format!("{layout:?}") {
+            parts.push("layout");
+        }
+        if first.launches != launches {
+            parts.push("launches");
+        }
+        if first.room_pasts != *room_pasts {
+            parts.push("room_pasts");
+        }
+        if !parts.is_empty() {
+            shell.shelf.derived_mismatches += 1;
+            tracing::warn!(at, arm, parts = ?parts, "an arm's fill is not the one the first arm's derives");
+        }
+    }
+    shell.shelf.arm_families.insert((first_family, arm), family);
 }
 
 /// The guest plane's ring of host room, a berth a pass in flight.
@@ -402,6 +504,12 @@ impl Serve for Api {
             landed_seats: BTreeMap::new(),
             generation: 0,
             guest,
+            derived: None,
+            arm_families: std::collections::HashMap::new(),
+            derived_fills: 0,
+            derived_checked: 0,
+            derived_mismatches: 0,
+            image_bytes: (0, 0),
         })
     }
 
@@ -424,10 +532,25 @@ impl Serve for Api {
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
         crate::encode::profile_ready();
+        if shell.shelf.derived_fills > 0 || verifying_arms() {
+            tracing::info!(
+                derived = shell.shelf.derived_fills,
+                checked = shell.shelf.derived_checked,
+                image_bytes = ?shell.shelf.image_bytes,
+                mismatches = shell.shelf.derived_mismatches,
+                verifying = verifying_arms(),
+                "vulkan arm walk: fills laid from the first arm's"
+            );
+        }
+        shell.shelf.derived = None;
         if crate::encode::profiling() {
             tracing::info!(
                 encode_ms = crate::encode::host_encode_ns() / 1_000_000,
                 between_ms = crate::encode::between_fires_ns() / 1_000_000,
+                phases_ms = ?engine_gpu::kernel_profile::WALK_PHASES
+                    .iter()
+                    .map(|ns| ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000)
+                    .collect::<Vec<_>>(),
                 "vulkan host encode before ready (the arm walk's dispatches)"
             );
         }
@@ -625,6 +748,44 @@ impl Serve for Api {
         next_frame(shell, prepared);
     }
 
+    /// The first arm's fill of the composition in hand, laid for this arm
+    /// into the family this arm recorded for the first's, where it did and
+    /// its recording serves the fill's counts.
+    fn derive_fill(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) -> bool {
+        if prepared.arm == 0 || !shell.arming || verifying_arms() {
+            return false;
+        }
+        let Some((_, first)) = shell
+            .shelf
+            .derived
+            .as_ref()
+            .filter(|(held, _)| Some(*held) == shell.walk_at)
+        else {
+            return false;
+        };
+        let Some(&family) = shell.shelf.arm_families.get(&(first.family, prepared.arm)) else {
+            return false;
+        };
+        let Some(held) = shell.shelf.recorder.family(family) else {
+            return false;
+        };
+        if !held.recording.cuts.is_empty() || !held.recording.serves(&first.groups) {
+            return false;
+        }
+        let fill = crate::record::Fill::new(
+            family,
+            std::sync::Arc::clone(&first.groups),
+            std::sync::Arc::clone(&first.image),
+            first.layout.clone(),
+            first.launches,
+            std::sync::Arc::clone(&first.room_pasts),
+        );
+        let shape = record_key(shell, prepared);
+        shell.shelf.recorder.insert_fill(shape, fill);
+        shell.shelf.derived_fills += 1;
+        true
+    }
+
     fn fill_frame(device: &Context, _arm: usize) -> Result<Frame> {
         device.frame_dry()
     }
@@ -641,7 +802,9 @@ impl Serve for Api {
         layout: &[ReadSpan],
         launches: u32,
     ) -> Result<bool> {
+        let t = std::time::Instant::now();
         let fill = frame.into_fill();
+        engine_gpu::kernel_profile::phase(2, t);
         let shape = record_key(shell, prepared);
         let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
         if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
@@ -700,15 +863,23 @@ impl Serve for Api {
             }
             return Ok(false);
         }
+        let (groups, image, room_pasts) = (
+            std::sync::Arc::new(fill.groups),
+            std::sync::Arc::new(fill.image),
+            std::sync::Arc::new(fill.room_pasts),
+        );
+        if fill.cuts == 0 {
+            note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+        }
         shell.shelf.recorder.insert_fill(
             shape,
             crate::record::Fill::new(
                 family,
-                std::sync::Arc::new(fill.groups),
-                std::sync::Arc::new(fill.image),
+                groups,
+                image,
                 layout.to_vec(),
                 launches,
-                std::sync::Arc::new(fill.room_pasts),
+                room_pasts,
             ),
         );
         Ok(true)
@@ -825,6 +996,8 @@ impl Serve for Api {
                 // lands on an empty submission, and its block is written by
                 // the first serving fire's head.
                 let arming = shell.arming;
+                let alone = matches!(act, Act::Alone);
+                let uncut = cuts.is_empty();
                 let pending = match act {
                     _ if arming => {
                         // Under PIE_VK_BAKE_TRAIL, what parts a new family
@@ -892,6 +1065,10 @@ impl Serve for Api {
                         kept.replay(Some(on_done))?
                     }
                 };
+                let room_pasts = std::sync::Arc::new(room_pasts);
+                if uncut && !alone {
+                    note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+                }
                 let recorder = &mut shell.shelf.recorder;
                 recorder.insert_fill(
                     shape,
@@ -901,7 +1078,7 @@ impl Serve for Api {
                         image,
                         layout.to_vec(),
                         launches,
-                        std::sync::Arc::new(room_pasts),
+                        room_pasts,
                     ),
                 );
                 let (recorded, filled) = recorder.counts();
@@ -1076,6 +1253,13 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 }
 
 fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
+    let t = std::time::Instant::now();
+    let key = keyed_inner(shell, p, reads);
+    engine_gpu::kernel_profile::phase(7, t);
+    key
+}
+
+fn keyed_inner(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
     key.hashed(&reads);
     key.bytes(&p.descriptor.pack());

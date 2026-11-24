@@ -125,7 +125,6 @@ fn profile_text() -> String {
 /// Under `PIE_VK_KERNEL_PROFILE`, the totals at ready, beside the file
 /// (`<file>.ready`): what the arm walk ran, for a reader to take from the
 /// serving totals.
-#[cfg(feature = "vulkan")]
 pub(crate) fn profile_ready() {
     let Some(path) = profile_path() else { return };
     let mut ready = path.as_os_str().to_owned();
@@ -685,9 +684,11 @@ impl Sink<'_> {
         let core = self.frame.core();
         let d = &core.device;
         let cmd = self.frame.cmd();
-        let set = match shared_key {
-            Some(key) => self.frame.shared_set(pipeline.set_layout, key),
-            None => self.frame.descriptor_set(pipeline.set_layout),
+        // A held shared set already binds what its key hashes: its
+        // bindings are written once, when it is made.
+        let (set, write) = match shared_key {
+            Some(key) => self.frame.shared_set_fresh(pipeline.set_layout, key),
+            None => self.frame.descriptor_set(pipeline.set_layout).map(|set| (set, true)),
         }
         .map_err(|fault| Sink::refuse(fire, fault))?;
         // The fire block's set (set 1), the dispatch's place its dynamic
@@ -738,7 +739,7 @@ impl Sink<'_> {
         }
         scratch.sets.clear();
         for (at, info) in infos.iter().enumerate().take(declared) {
-            if !pipeline.used[at] || Some(at) == params_at {
+            if !write || !pipeline.used[at] || Some(at) == params_at {
                 continue;
             }
 
