@@ -316,13 +316,59 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     }
     let mapped = info.pti_virtual_size;
     let free = (MAX_ADDRESS - PAGE_ZERO).saturating_sub(mapped);
+    // What the process maps does not lie in one place (the shared region,
+    // the GPU's ranges, the weights), so the range free in one piece is
+    // found, not reckoned: three quarters of it, for what the process maps
+    // into it before the pool reserves.
     Ok(AddressSpace {
-        largest_free: free,
+        largest_free: largest_reservation(free) / 4 * 3,
         free,
         mapped,
         limit: address_space_limit(),
         maps: None,
     })
+}
+
+/// The largest range, to the GiB and at most `upper`, an address-only
+/// reservation takes now: each try reserved without access or backing and
+/// let go at once.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn largest_reservation(upper: u64) -> u64 {
+    const GIB: u64 = 1 << 30;
+    let reserves = |bytes: u64| -> bool {
+        let Ok(len) = usize::try_from(bytes) else {
+            return false;
+        };
+        // SAFETY: an anonymous mapping with no access at an address the
+        // kernel picks; nothing reads it, and it is unmapped at once.
+        unsafe {
+            let at = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+                -1,
+                0,
+            );
+            if at == libc::MAP_FAILED {
+                return false;
+            }
+            libc::munmap(at, len);
+        }
+        true
+    };
+    let (mut fits, mut over) = (0u64, upper.saturating_add(GIB));
+    while over - fits > GIB {
+        let mid = fits + (over - fits) / 2 / GIB * GIB;
+        let mid = mid.max(fits + GIB);
+        if reserves(mid) {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    fits
 }
 
 /// Windows states a process's user address space and what of it is free.
