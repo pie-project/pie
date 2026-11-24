@@ -254,6 +254,12 @@ pub struct Fill {
 }
 
 impl Frame {
+    pub fn is_dry(&self) -> bool {
+        false
+    }
+}
+
+impl Frame {
     #[must_use]
     pub fn room_pasts(&self) -> Vec<u64> {
         match self.never {}

@@ -463,7 +463,9 @@ impl Serve for Api {
             }
             None => None,
         };
-        if let Some((rows, launches)) = replayable {
+        // The arm walk runs nothing: a fire it filled walks into a frame that
+        // records nothing (`Shell::arm_filled`) and lands empty.
+        if let Some((rows, launches)) = replayable.filter(|_| !shell.arming) {
             let key = key.expect("a fill was found under a key");
             let pixels = shell.pixel_spans(prepared)?;
             shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
@@ -739,6 +741,13 @@ impl Serve for Api {
                 }
                 counts.leave();
             });
+        if frame.is_dry() {
+            // An arm walk that filled a held family: nothing recorded, nothing
+            // run.
+            drop(frame);
+            shell.kept_none();
+            return shell.device.frame()?.commit_async(Some(on_done));
+        }
         match keep {
             Some(shape) => {
                 let room_pasts = frame.room_pasts();

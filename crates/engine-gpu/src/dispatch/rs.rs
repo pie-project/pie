@@ -169,10 +169,10 @@ impl<B: Backend> Run<'_, B> {
                 a,
                 seat.pool,
                 &runs,
-                seat.run_dispatches,
+                seat.run_most,
             );
         }
-        kernels_slang::gather::rows::copy_runs(self.ctx, a, b, seat.pool, runs, seat.run_dispatches)
+        kernels_slang::gather::rows::copy_runs(self.ctx, a, b, seat.pool, runs, seat.run_most)
     }
 
     fn kernel(fault: crate::error::Fault, op: &'static str) -> Error {

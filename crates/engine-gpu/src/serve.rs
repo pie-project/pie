@@ -1206,6 +1206,10 @@ pub struct Shell<B: Serve> {
     pub step: Option<engine::StepComposition>,
     /// The load records its bodies: a kept walk is recorded and not run.
     pub arming: bool,
+    /// The arm walk's fire filled a family the load already holds
+    /// ([`Shell::fill_once`] before its plan): its walk lays into a frame
+    /// that records nothing, and nothing runs.
+    pub arm_filled: bool,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
@@ -3080,6 +3084,7 @@ impl<B: Serve> Shell<B> {
             steps: None,
             step: None,
             arming: false,
+            arm_filled: false,
             eager: 0,
             eager_next: false,
             armed: false,
@@ -8338,6 +8343,7 @@ impl<B: Serve> Shell<B> {
                     }),
                     fold_lanes,
                     self.budgets.tokens.max_lanes,
+                    self.span.rung_tokens(rung),
                 )?);
                 Some(seat)
             } else {
@@ -8539,6 +8545,8 @@ impl<B: Serve> Shell<B> {
     ) -> Result<Walked<B>> {
         let frame = if bind_only {
             B::bind_frame(&self.device)?
+        } else if self.arm_filled {
+            B::fill_frame(&self.device, p.arm)?
         } else {
             B::walk_frame(&self.device, keep, self.stamps.get(p.arm))?
         };
@@ -9150,6 +9158,13 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 keep: None,
                 split: false,
             }
+        } else if self.arming && B::RECORDS {
+            // An arm walk whose commands a held family's are fills that
+            // family (its fill kept before ready, for the serving fires of
+            // its shape) and records nothing: a body is recorded once, each
+            // composition of it a table of data.
+            self.arm_filled = self.fill_once(&mut prepared)?;
+            B::plan(self, &mut prepared)?
         } else {
             B::plan(self, &mut prepared)?
         };
@@ -10454,14 +10469,18 @@ impl<B: Serve> Shell<B> {
                     .filter(|&(_, &covered)| !covered)
                     .map(|(shape, _)| shape.to_string())
                     .collect();
+                // The walked set is the stated one: a stated shape the walk
+                // lays no composition of would serve a fire unarmed.
                 if !bare.is_empty() {
-                    tracing::warn!(
-                        shapes = bare.len(),
-                        of = steps.len(),
-                        bare = ?bare,
-                        "stated step shapes the arm walk lays no composition of: a fire of one \
-                         is unarmed"
-                    );
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "{} of the {} stated step shapes the arm walk lays no composition \
+                             of: {}",
+                            bare.len(),
+                            steps.len(),
+                            bare.join("; ")
+                        ),
+                    });
                 }
                 tagged
                     .into_iter()
@@ -10587,10 +10606,15 @@ impl<B: Serve> Shell<B> {
             }
         }
         for (at, (lanes, fed, carried, keys_only)) in shapes.iter().enumerate() {
-            // A known lattice arms the shapes that recorded a family, and
-            // states eager what its allowance did.
-            if known.as_ref().is_some_and(|known| !known.shapes.contains(&at)) {
-                continue;
+            // A known lattice states eager what its allowance did; every shape
+            // short of it is walked, the ones whose family an earlier shape
+            // recorded filling it (their fills kept before ready).
+            let rows = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
+            if known.as_ref().and_then(|known| known.eager).is_some_and(|from| match tags[at] {
+                Some(shape) => shape >= from as usize,
+                None => rows >= from,
+            }) {
+                break;
             }
             let used = rss().saturating_sub(before);
             // The next shape's bodies cost what the dearest so far did, on
@@ -10630,6 +10654,15 @@ impl<B: Serve> Shell<B> {
                     None => self.eager_rows = Some(from),
                 }
                 break;
+            }
+            if at % 64 == 0 {
+                tracing::info!(
+                    walked = at,
+                    of = shapes.len(),
+                    families = armed_shapes.len(),
+                    host_bytes = rss().saturating_sub(before),
+                    "the arm walk so far"
+                );
             }
             let families = self.recorded;
             for arm in 0..depth {
@@ -10679,6 +10712,7 @@ impl<B: Serve> Shell<B> {
                     self.arms.take(before);
                 }
                 let fired = self.fire_seated(&seated);
+                self.arm_filled = false;
                 for before in 0..arm {
                     self.arms.give(before);
                 }
