@@ -1094,7 +1094,15 @@ impl KvStore {
     /// whatever its key. Pages the disk tier keeps a copy of settle there
     /// instead, at no cost, and their entries stay.
     pub fn reclaim_cache(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, short, keys)
+        self.reclaim_cache_where(epoch, short, keys, false)
+    }
+
+    /// [`Self::reclaim_cache`] for what is `short` and no more, entry by
+    /// entry: a group the walk reaches gives its entries one at a time
+    /// (oldest first) until `short` is freed, never the whole group. What a
+    /// point measured behind serving takes of idle cache: one point's worth.
+    pub fn reclaim_cache_bounded(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
+        self.reclaim_cache_where(epoch, short, keys, true)
     }
 
     fn reclaim_cache_where(
@@ -1102,6 +1110,7 @@ impl KvStore {
         epoch: u64,
         short: usize,
         keys: impl Keys,
+        bounded: bool,
     ) -> usize {
         // Pages an earlier reclaim freed are on their way back: what they
         // cover is not short.
@@ -1146,7 +1155,16 @@ impl KvStore {
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
                         .collect();
                     tracing::debug!(target: "pie::kv", key, entries = ids.len(), "reclaim drops");
-                    freed += self.drop_entries(ids, By::Host, epoch);
+                    if bounded {
+                        for id in ids {
+                            freed += self.drop_entries(vec![id], By::Host, epoch);
+                            if freed >= short {
+                                break;
+                            }
+                        }
+                    } else {
+                        freed += self.drop_entries(ids, By::Host, epoch);
+                    }
                     reached.push(at);
                 }
                 if freed >= short {

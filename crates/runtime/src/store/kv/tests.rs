@@ -2667,16 +2667,23 @@ fn a_point_behind_serving_takes_idle_cache_for_its_slots_and_no_more() {
     let taken = take_behind(&stores, need);
     assert_eq!(taken.seats.len(), 2, "the point's slots were taken");
     assert!(taken.seats.iter().all(|seat| seat.pages.len() == 1));
-    let cached = stores.kv.lock().cached_working_sets().len();
-    assert_eq!(cached, 3, "one cache entry (two pages) yielded, no more");
+    assert_eq!(
+        stores.kv.lock().available_pages(),
+        0,
+        "what idle cache yielded went to the point"
+    );
     give_behind(&stores, taken);
-    assert_eq!(stores.kv.lock().available_pages(), 2, "the point's slots came back");
+    assert_eq!(
+        stores.kv.lock().available_pages(),
+        2,
+        "one point's worth (two pages) yielded and came back, the rest still cached"
+    );
 
     // A waiter short of a slot comes first: nothing is taken for the point.
     stores.shared.as_ref().unwrap().lock().unwrap().pool_mut().wait(1, 0, 1);
     let taken = take_behind(&stores, need);
     assert!(taken.seats.is_empty(), "a waiter outranks the point");
-    assert_eq!(stores.kv.lock().cached_working_sets().len(), 3, "no cache yielded for it");
+    assert_eq!(stores.kv.lock().available_pages(), 2, "no cache yielded for it");
 }
 
 /// The reports of one process that exits with `prompt` prompt rows and
