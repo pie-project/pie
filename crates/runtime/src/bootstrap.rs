@@ -1,4 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 use anyhow::{Result, ensure};
 
@@ -318,7 +317,17 @@ impl BootstrapHandle {
 /// its engines load: what the sandbox pool leaves the rest of the process
 /// to grow by. Call
 /// it before the engines load; [`bootstrap`] comes after them.
+#[cfg(not(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+)))]
 pub use crate::sandbox_pool::note_maps_before_engines;
+/// No sandbox pool sizes itself by the process's maps on this target.
+#[cfg(any(
+    target_arch = "wasm32",
+    all(target_vendor = "apple", not(target_os = "macos"))
+))]
+pub fn note_maps_before_engines() {}
 
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
     bootstrap_inner(config).await
@@ -1669,6 +1678,7 @@ fn init_tracing(
 /// gateway heartbeat. A filter that names either target keeps its own say,
 /// and one whose base level is already as quiet gets nothing added: a quiet
 /// target is never made louder than the operator's level.
+#[cfg(not(target_arch = "wasm32"))]
 const QUIET: [(&str, tracing_subscriber::filter::LevelFilter); 2] = [
     ("naga", tracing_subscriber::filter::LevelFilter::WARN),
     ("tarpc", tracing_subscriber::filter::LevelFilter::INFO),
@@ -1688,6 +1698,7 @@ pub fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
 /// the last directive with no target (`off` where there is none, as an
 /// `EnvFilter` reads it); a directive's target is what precedes its `[`
 /// span or its `=`.
+#[cfg(not(target_arch = "wasm32"))]
 fn quieted(filter: &str) -> String {
     use tracing_subscriber::filter::LevelFilter;
 
