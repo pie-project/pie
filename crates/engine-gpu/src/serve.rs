@@ -1125,6 +1125,8 @@ pub struct Shell<B: Serve> {
     /// clock by, laid at load where any is left (nothing is laid or
     /// compiled after ready).
     behind_probe: Option<crate::submit::Probe<B>>,
+    /// One served step as the runtime last told it ([`Shell::set_served_step`]).
+    served_step_ns: Option<f64>,
 
     pipelines: B::Pipelines,
 
@@ -2975,6 +2977,7 @@ impl<B: Serve> Shell<B> {
             behind: None,
             rates_behind,
             behind_probe: None,
+            served_step_ns: None,
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -3382,6 +3385,24 @@ impl<B: Serve> Shell<B> {
         self.rates_behind.first().cloned()
     }
 
+    /// The settle left behind serving ends here: its next point runs longer
+    /// than one decode step, which behind serving never runs. What it
+    /// decided stays stored; its other ranges serve the fallback picks
+    /// until the export round or `pie tune` weighs them.
+    pub fn end_behind_settle(&mut self) {
+        if let Some(behind) = self.behind.take() {
+            tracing::info!(
+                pending = behind.pending,
+                stored = behind.stored,
+                "dense settle behind serving: ends with {} of {} ranges weighed; the rest's points \
+                 run longer than one decode step of this load, which behind serving never runs, \
+                 and serve the fallback picks until the export round or `pie tune` weighs them",
+                behind.stored,
+                behind.pending
+            );
+        }
+    }
+
     /// Lays the reference the work behind serving reads the device's clock
     /// by, where any is left: at load, before ready (nothing is laid or
     /// compiled after).
@@ -3417,10 +3438,16 @@ impl<B: Serve> Shell<B> {
     /// where neither is known yet.
     #[must_use]
     pub fn decode_step_ns(&self) -> Option<f64> {
-        self.behind
-            .as_ref()
-            .and_then(|b| b.decode_ns)
+        self.served_step_ns
+            .or_else(|| self.behind.as_ref().and_then(|b| b.decode_ns))
             .or(self.last_landed.map(|ns| ns as f64))
+    }
+
+    /// One served step as the runtime saw it lately
+    /// (`engine::BehindServing::step`): what no fire behind serving may
+    /// outlast.
+    pub fn set_served_step(&mut self, step: Option<std::time::Duration>) {
+        self.served_step_ns = step.map(|s| s.as_nanos() as f64);
     }
 
     /// The rows a curve of this load is timed to: its widest rung.
@@ -3583,7 +3610,7 @@ impl<B: Serve> Shell<B> {
                 .map(|(top, ns)| ns * f64::from(trial.top) / f64::from(top.max(1)))
         });
         let long = matches!(
-            (expected, behind.decode_ns),
+            (expected, self.decode_step_ns()),
             (Some(expected), Some(decode)) if expected > decode
         );
         Some(engine::BehindNeed {

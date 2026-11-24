@@ -1271,7 +1271,7 @@ impl Lane {
             others: &others,
             arrived,
             seats: Some(taken.as_ref().map_or(&[][..], |taken| taken.seats.as_slice())),
-            alone,
+            step: Some(behind_grace()).filter(|step| !step.is_zero()),
         };
         let fired = engine.measure_behind(&behind);
         if let (Some(taken), Some(stores)) = (taken, stores.as_ref()) {

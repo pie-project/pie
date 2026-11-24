@@ -1868,6 +1868,7 @@ where
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
+        shell.set_served_step(behind.step);
         // The settle's ranges first (decode's rows before the large ones),
         // where the runtime took the slots its next fire asks for; else,
         // and after, each rate and curve served by a stale figure (its step
@@ -1879,15 +1880,18 @@ where
         };
         // A point longer than one decode step runs only with no process
         // live, so a live request never waits behind it.
-        let long_held = need.is_some_and(|need| need.long) && !behind.alone;
-        if !shell.measures_behind() || seats_short || long_held {
+        // A point longer than one decode step never runs behind serving
+        // (an arrival landing on it would wait for it): the settle ends
+        // there, what it decided stored, the rest of its ranges serving
+        // the fallback picks until the export round or `pie tune` weighs
+        // them.
+        if need.is_some_and(|need| need.long) {
+            shell.end_behind_settle();
+            return self.rate_behind(behind);
+        }
+        if !shell.measures_behind() || seats_short {
             if shell.rates_behind().is_none() {
-                if long_held {
-                    self.behind_state(
-                        "waiting: the settle's next point runs longer than one decode step, and \
-                         runs only once no process is live",
-                    );
-                } else if seats_short {
+                if seats_short {
                     self.behind_state(
                         "waiting: the pool holds no room for one settle point's slots beyond \
                          live work (the settle runs on a later idle turn; the fallback picks \

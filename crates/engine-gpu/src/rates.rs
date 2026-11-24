@@ -941,6 +941,7 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// operand a rate reads holds (not zeros, which some kernels run faster
     /// over than over a served fire's values).
     fn operand(&mut self, rows: u32, width: u32, dtype: Dtype) -> Result<Tensor> {
+        self.yield_check()?;
         let bytes = (u64::from(rows) * u64::from(width) * dtype.bits()).div_ceil(8);
         let mut buf = B::Buffer::zeroed(self.device, bytes.max(4), crate::books::owners::TUNING)?;
         let pattern = self
@@ -960,7 +961,21 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// `bytes` laid over as few buffers as the device's largest holds,
     /// each a whole number of `stride`s, held: filled with
     /// `engine::rates::operand_pattern` where `filled`, else zeroed.
+    /// Behind serving, an arrival stops the step before its next operand
+    /// is laid, as before its next frame: laying a wide operand's bytes is
+    /// no fire, but it holds the lane as long.
+    fn yield_check(&self) -> Result<()> {
+        if self.yield_to.is_some_and(|arrived| arrived()) {
+            return Err(Fault::Device {
+                call: "measuring behind serving",
+                why: YIELDED.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn slab(&mut self, bytes: u64, stride: u64, filled: bool) -> Result<Vec<B::Buffer>> {
+        self.yield_check()?;
         let largest = (self.device.max_buffer() / stride).max(1) * stride;
         let mut out = Vec::new();
         let mut left = bytes.max(stride);
