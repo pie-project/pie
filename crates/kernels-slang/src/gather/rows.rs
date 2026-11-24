@@ -153,6 +153,16 @@ pub fn copy_runs(
 ) -> Result<(), Error> {
     const OP: &str = "gather.rs_copy_runs";
     let (table, entry, dispatches) = copy_runs_plan(most);
+    // A naming walk names every table width a fire's plan may take, so the
+    // load builds them all: a fire of another rung or lane count picks
+    // another, after ready.
+    if let Some(names) = ctx.naming() {
+        let widths: Vec<Fire> = COPY_RUNS.iter().map(|&(_, entry)| Fire::at(ROWS, entry)).collect();
+        for _ in 0..dispatches {
+            names.either(&widths)?;
+        }
+        return Ok(());
+    }
     if runs.len() > dispatches.saturating_mul(table) {
         return Err(refuse(
             OP,

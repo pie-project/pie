@@ -4349,7 +4349,8 @@ impl Inner {
         if timing.harvested || timing.names.is_empty() {
             return;
         }
-        timing.harvested = true;
+        // A kept frame's timestamps are written again on every replay.
+        timing.harvested = self.one_time;
         let n = timing.names.len() as u32;
         let mut ticks = vec![0u64; (n * 2) as usize];
         // SAFETY: the caller waited on the fence, so every written query is
@@ -4378,6 +4379,7 @@ impl Inner {
             let ns = (span as f64 * period) as u64;
             crate::encode::credit(name, ns);
         }
+        crate::encode::dump_profile();
     }
 }
 
