@@ -603,6 +603,7 @@ pub fn at_load(
         Ok(engine::rates::Measured {
             rates: measure(device, measure_chip, &mut |_| {})?,
             unsettled: false,
+            throttled: None,
         })
     })
 }

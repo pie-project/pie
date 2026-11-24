@@ -918,6 +918,12 @@ pub struct Shell<B: Serve> {
     /// the user's stored one's key does not match and its own does
     /// (`profile::fire::Tuned::committed_settle`).
     committed_settle: Vec<profile::fire::DenseSettled>,
+    /// The key the settle looked its stored entries up by, once it ran:
+    /// `(of, code)` ([`Shell::settle_key`]).
+    settle_keyed: Option<(u32, u32)>,
+    /// What the shell timed at load beside its profile's
+    /// (`profile::fire::Tuned::timed`): the bound probe, the settle.
+    timed: Vec<String>,
     /// Whether the load times what no stored or committed profile states
     /// (`[engine] measure`): skipped, the settle fires nothing.
     measuring: engine::rates::Measuring,
@@ -2114,6 +2120,7 @@ impl<B: Serve> Shell<B> {
         // for_bound`, single fires, milliseconds), said by name, kept in the
         // bound alone (no other choice reads it) and stored nowhere.
         let mut bound_prefixed: Option<Vec<(u32, Vec<(u32, f64)>)>> = None;
+        let mut bound_timed = false;
         if unweighed
             && B::LANDS
             && let Some(bound) = B::submit_bound(boot.device)
@@ -2175,6 +2182,7 @@ impl<B: Serve> Shell<B> {
             );
             fire_estimate = Some(estimate);
             bound_prefixed = rates.attn_tflops_by_rows_keys;
+            bound_timed = true;
         }
         // Where the platform states a bound on one submission, every serving
         // step is held to it by the estimate (`crate::submit`), which must
@@ -2750,6 +2758,12 @@ impl<B: Serve> Shell<B> {
             dense_planes: dense_planes.clone(),
             dense_rates: device_profile.rates(),
             committed_settle: device_profile.tuned().committed_settle.clone(),
+            settle_keyed: None,
+            timed: if bound_timed {
+                vec!["bound probe".to_string()]
+            } else {
+                Vec::new()
+            },
             measuring: B::measuring(boot.device),
             settled: Vec::new(),
             to_store: None,
@@ -2873,6 +2887,7 @@ impl<B: Serve> Shell<B> {
         // the device is the user's file's, `crate::stored`) are taken again
         // without firing; the rest are settled (again) this load.
         let (of, code) = self.settle_key(lanes)?;
+        self.settle_keyed = Some((of, code));
         // The user's stored settle first, then a committed profile's: the
         // first whose key matches is taken, each other said and why.
         let why_not = |stored: &profile::fire::DenseSettled| {
@@ -2984,7 +2999,27 @@ impl<B: Serve> Shell<B> {
                 .map(|_| B::lay_stamps(&self.device, 1))
                 .collect::<Result<Vec<_>>>()?;
         }
+        // The device's clock before and after the weighing: a settle
+        // weighed below its nominal clock serves this load alone.
+        let reference = {
+            use crate::backend::Tactics as _;
+            self.tuning.gemm(self.tier, crate::submit::PROBE.0)
+        };
+        let clock_before = crate::rates::clock_read::<B>(&self.device, reference)?;
         let settled = self.settle_dense_to(lanes, &decided);
+        let throttle = crate::rates::throttled(
+            clock_before,
+            crate::rates::clock_read::<B>(&self.device, reference)?,
+        );
+        if let Some(ratio) = throttle {
+            tracing::warn!(
+                ratio,
+                "dense settle: weighed with the device {ratio:.2}x slower than its nominal clock: \
+                 served this load, not stored"
+            );
+            self.timed
+                .push(format!("settle (device {ratio:.2}x below its nominal clock: not stored)"));
+        }
         if laid {
             self.stamps.clear();
         }
@@ -3072,10 +3107,19 @@ impl<B: Serve> Shell<B> {
                 of,
                 code,
                 ranges,
+                planes: {
+                    let mut planes: Vec<(u32, u32)> =
+                        self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
+                    planes.sort_unstable();
+                    planes.dedup();
+                    planes
+                },
             };
             self.dense_rates.dense_settled.retain(|s| s.of != of);
             self.dense_rates.dense_settled.push(keep.clone());
-            self.to_store = Some(keep);
+            if throttle.is_none() {
+                self.to_store = Some(keep);
+            }
         }
         let weighed = self.settled.iter().any(|range| range.checked);
         self.say_served(
@@ -3196,34 +3240,41 @@ impl<B: Serve> Shell<B> {
             (n, k),
             top,
         )?;
+        // Rounds again, twice more at most, while no kernel separates from
+        // every other by their spreads.
+        let mut samples = samples;
+        for _ in 0..2 {
+            if samples[0].is_empty() || crate::dense::settle_pick(&samples).is_some() {
+                break;
+            }
+            let more = B::time_kernels(
+                &self.device,
+                &self.tuning,
+                self.tier,
+                max_submit,
+                launch,
+                &kernels,
+                &pieces,
+                (n, k),
+                top,
+            )?;
+            for (s, m) in samples.iter_mut().zip(more) {
+                s.extend(m);
+            }
+        }
         for (&t, s) in kernels.iter().zip(&samples) {
             if !s.is_empty() {
                 let (ns, _) = crate::rates::median_spread(s);
                 self.alone.push(((t, n, k), top, ns));
             }
         }
-        let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
-        let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
-        let kept_best = fastest(&samples[0]);
-        let mut taken = 0;
-        let mut best = f64::INFINITY;
-        for (i, s) in samples.iter().enumerate().skip(1) {
-            if s.is_empty() {
-                continue;
-            }
-            let (ns, _) = crate::rates::median_spread(s);
-            if slowest(s) < kept_best && ns < best {
-                taken = i;
-                best = ns;
-            }
-        }
-        let decided = !samples[0].is_empty()
-            && (taken == 0
-                || samples
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, s)| i != taken && !s.is_empty())
-                    .all(|(_, s)| slowest(&samples[taken]) < fastest(s)));
+        let pick = if samples[0].is_empty() {
+            None
+        } else {
+            crate::dense::settle_pick(&samples)
+        };
+        let taken = pick.unwrap_or(0);
+        let decided = pick.is_some();
         let weighed: Vec<String> = kernels
             .iter()
             .zip(&samples)
@@ -3241,7 +3292,11 @@ impl<B: Serve> Shell<B> {
         tracing::info!(
             "dense matmul in the served step, {bottom}-{top} rows: weighed on its widest plane \
              {n}x{k} alone at {top} rows (no whole step timed): {} ({})",
-            if taken == 0 { "kept" } else { "replaced" },
+            match pick {
+                None => "tied inside the spreads, kept",
+                Some(0) => "kept",
+                Some(_) => "replaced",
+            },
             weighed.join(" vs ")
         );
         if taken != 0 {
@@ -3276,9 +3331,15 @@ impl<B: Serve> Shell<B> {
         );
         let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
             self.asks.kernels.iter().copied().collect();
-        let code = crate::dense::settle_code(
-            crate::stored::code_of_all(B::TARGET, &kernels)?,
-            &self.dense,
+        let all = crate::stored::code_of_all(B::TARGET, &kernels)?;
+        let code = crate::dense::settle_code(all, &self.dense);
+        tracing::debug!(
+            of = format_args!("{of:#010x}"),
+            code = format_args!("{code:#010x}"),
+            kernels_code = format_args!("{all:#010x}"),
+            kernels = ?kernels.iter().map(|k| k.key).collect::<Vec<_>>(),
+            picks = %self.dense.canonical(),
+            "dense settle: what its key reads"
         );
         Ok((of, code))
     }
@@ -3362,6 +3423,38 @@ impl<B: Serve> Shell<B> {
                     })
             })
             .collect()
+    }
+
+    /// What this load timed, each by name: its profile's (`rates`, the
+    /// dense curves, `resident_workgroups`) and the shell's (the bound
+    /// probe, the settle where it weighed a range). Empty: it measured
+    /// nothing.
+    #[must_use]
+    pub fn measured_at_load(&self) -> Vec<String> {
+        use crate::backend::Tactics as _;
+        let mut all = self.tuning.profile().tuned().timed.clone();
+        all.extend(self.timed.iter().cloned());
+        if self.settled.iter().any(|range| range.checked) {
+            all.push("settle".to_string());
+        }
+        all
+    }
+
+    /// The key the dense settle looked its stored entries up by, `(of,
+    /// code)`, once it ran.
+    #[must_use]
+    pub fn settle_keyed(&self) -> Option<(u32, u32)> {
+        self.settle_keyed
+    }
+
+    /// Every kernel a fire of this load can ask for, by key, sorted: what
+    /// the settle's code is keyed by.
+    #[must_use]
+    pub fn asked_kernels(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self.asks.kernels.iter().map(|k| k.key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 
     /// Every kernel whose pipeline is built, in the order built.
@@ -3449,7 +3542,10 @@ impl<B: Serve> Shell<B> {
                     // weighed whatever they pad to: every matmul kernel
                     // guards the rows it is given, so a tile past a fire's
                     // rows reads and writes none of them.
-                    if !kernels.contains(&t) && (tile(t) <= widest || paths.contains(&t)) {
+                    // Every kernel the plane supports is offered at every
+                    // range: what a neighbouring range took removes none.
+                    let _ = widest;
+                    if !kernels.contains(&t) {
                         kernels.push(t);
                     }
                 }
@@ -3592,8 +3688,27 @@ impl<B: Serve> Shell<B> {
                     let host_clock = std::cell::Cell::new(false);
                     // The GPU's clock at the range's first fire.
                     let mut clock: Option<u64> = None;
-                    // A first round warms each option, untimed.
-                    for round in 0..=ROUNDS {
+                    // A first round warms each option, untimed. Rounds go
+                    // on, as many again at most twice, while no option's
+                    // times separate from every other's by their spreads
+                    // (`crate::dense::settle_pick`).
+                    let mut limit = ROUNDS;
+                    let mut round = 0;
+                    let mut last_spread = f64::INFINITY;
+                    let widest_spread = |samples: &[Vec<f64>]| {
+                        samples
+                            .iter()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| crate::rates::median_spread(s).1)
+                            .fold(0.0, f64::max)
+                    };
+                    // What else is in flight as the trial times: the
+                    // pipelines built meanwhile and whether the device sat
+                    // idle at its start (a trial timed beside other work
+                    // reads that work's noise).
+                    let built_before = B::compiled(&self.pipelines);
+                    let idle_before = crate::backend::Context::idle(&self.device);
+                    while round <= limit {
                         for (i, option) in options.iter().enumerate() {
                             self.dense = option.clone();
                             let fired = (|| -> Result<f64> {
@@ -3674,23 +3789,25 @@ impl<B: Serve> Shell<B> {
                                 }
                             }
                         }
-                    }
-                    // An option replaces the choice where every fire of it ran
-                    // faster than every fire of the choice (their ranges
-                    // apart: no repeat's noise could turn them around); of
-                    // those, the fastest by its median.
-                    let fastest = |s: &[f64]| s.iter().copied().fold(f64::INFINITY, f64::min);
-                    let slowest = |s: &[f64]| s.iter().copied().fold(0.0, f64::max);
-                    let kept_best = fastest(&samples[0]);
-                    let mut taken = 0;
-                    let mut best = f64::INFINITY;
-                    for (i, s) in samples.iter().enumerate().skip(1) {
-                        let (ns, _) = crate::rates::median_spread(s);
-                        if slowest(s) < kept_best && ns < best {
-                            taken = i;
-                            best = ns;
+                        round += 1;
+                        // Tied: rounds go on while each further set of them
+                        // still narrows the widest spread (the noise is
+                        // averaging out), stopping once one does not.
+                        if round > limit && crate::dense::settle_pick(&samples).is_none() {
+                            let spread = widest_spread(&samples);
+                            if spread < last_spread {
+                                last_spread = spread;
+                                limit += ROUNDS;
+                            }
                         }
                     }
+                    // The option whose times, widened by their spread, lie
+                    // under every other's widened by theirs replaces the
+                    // choice; where none separates (a tie inside the
+                    // spreads, after the further rounds) the choice stands,
+                    // recorded as tied (`crate::dense::settle_pick`).
+                    let pick = crate::dense::settle_pick(&samples);
+                    let taken = pick.unwrap_or(0);
                     let weighed: Vec<String> = options
                         .iter()
                         .zip(&samples)
@@ -3705,9 +3822,16 @@ impl<B: Serve> Shell<B> {
                         })
                         .collect();
                     tracing::info!(
+                        rounds = round.saturating_sub(1),
+                        built_during = B::compiled(&self.pipelines).saturating_sub(built_before),
+                        idle_at_start = idle_before,
                         "dense matmul in the served step, {bottom}-{top} rows: {} ({}; timed by \
                          the {})",
-                        if taken == 0 { "kept" } else { "replaced" },
+                        match pick {
+                            None => "tied inside the spreads, kept",
+                            Some(0) => "kept",
+                            Some(_) => "replaced",
+                        },
                         weighed.join(" vs "),
                         if host_clock.get() {
                             "host's clock (the device stated no span)"
@@ -3719,12 +3843,7 @@ impl<B: Serve> Shell<B> {
                     // it, so the options tie with it or lose), or where the
                     // kernel taken ran apart from every other option too;
                     // undecided where it beat the choice but ties another.
-                    let decided = taken == 0
-                        || samples
-                            .iter()
-                            .enumerate()
-                            .filter(|&(i, _)| i != taken)
-                            .all(|(_, s)| slowest(&samples[taken]) < fastest(s));
+                    let decided = pick.is_some();
                     if let Some(range) = self.settled.last_mut() {
                         range.replaced = taken != 0;
                         range.kernel = taking.get(taken).copied().flatten();

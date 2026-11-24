@@ -687,6 +687,12 @@ impl Engine for Rank {
         &[]
     }
 
+    /// Not tracked for a lockstep rank: its ranks measure at every boot (`measure =
+    /// false` is refused for one), said so by name.
+    fn measured_at_load(&self) -> Vec<String> {
+        vec!["cuda (a lockstep rank): what it measured is not tracked".to_string()]
+    }
+
     fn skips_measuring(&self) -> bool {
         false
     }

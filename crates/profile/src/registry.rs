@@ -1196,7 +1196,7 @@ impl<'a> Walk<'a> {
             let before = self.diags.len();
             let (key, rates) = (k.get_ref().to_string(), &mut rates);
             self.rate_entry(k, v, rates, &positive);
-            if self.strict == Strict::User && self.diags.len() > before {
+            if matches!(self.strict, Strict::User | Strict::Measured) && self.diags.len() > before {
                 let why: Vec<String> = self
                     .diags
                     .drain(before..)
@@ -1484,10 +1484,10 @@ impl<'a> Walk<'a> {
     /// key (`of`), no key twice.
     fn dense_settled(&mut self, v: &Spanned<DeValue<'_>>) -> Vec<crate::fire::DenseSettled> {
         let what = "`rates.dense_settled_keyed` is a list of [method, of, code, [[bottom, top, \
-                    replaced, vector, wide, tier], ...]], whole numbers, one per key";
+                    replaced, vector, wide, tier], ...], [[n, k], ...]], whole numbers, one per key";
         let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
         let one = |v: &DeValue<'_>| match v {
-            DeValue::Array(f) if f.len() == 4 => {
+            DeValue::Array(f) if f.len() == 5 => {
                 let head = whole(f[0].get_ref())
                     .zip(whole(f[1].get_ref()))
                     .zip(whole(f[2].get_ref()));
@@ -1507,41 +1507,57 @@ impl<'a> Walk<'a> {
                         .collect::<Option<Vec<[u32; 6]>>>(),
                     _ => None,
                 };
-                head.zip(ranges)
-                    .map(|(((method, of), code), ranges)| crate::fire::DenseSettled {
+                let planes = match f[4].get_ref() {
+                    DeValue::Array(ps) => ps
+                        .iter()
+                        .map(|p| match p.get_ref() {
+                            DeValue::Array(x) if x.len() == 2 => {
+                                Some((whole(x[0].get_ref())?, whole(x[1].get_ref())?))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<(u32, u32)>>>(),
+                    _ => None,
+                };
+                head.zip(ranges).zip(planes).map(|((((method, of), code), ranges), planes)| {
+                    crate::fire::DenseSettled {
                         method,
                         of,
                         code,
                         ranges,
-                    })
+                        planes,
+                    }
+                })
             }
             _ => None,
         };
-        let parsed = match v.get_ref() {
-            DeValue::Array(all) => all
-                .iter()
-                .map(|e| one(e.get_ref()))
-                .collect::<Option<Vec<crate::fire::DenseSettled>>>(),
-            _ => None,
+        let DeValue::Array(all) = v.get_ref() else {
+            self.err(
+                v.span().start,
+                format!("{what}, not {}", found(v.get_ref())),
+            );
+            return Vec::new();
         };
-        match parsed {
-            Some(all) => {
-                let mut keys: Vec<u32> = all.iter().map(|d| d.of).collect();
-                keys.sort_unstable();
-                if keys.windows(2).any(|w| w[0] == w[1]) {
-                    self.err(v.span().start, format!("{what}: a key stated twice"));
-                    return Vec::new();
-                }
-                all
-            }
-            None => {
-                self.err(
-                    v.span().start,
-                    format!("{what}, not {}", found(v.get_ref())),
-                );
-                Vec::new()
+        // One entry in another form (another pie's) or of a key stated
+        // before is skipped alone, by name, and that model settles again;
+        // the list's others are read. No older form is read in its place.
+        let mut out: Vec<crate::fire::DenseSettled> = Vec::with_capacity(all.len());
+        for (at, entry) in all.iter().enumerate() {
+            match one(entry.get_ref()) {
+                Some(settled) if out.iter().all(|d| d.of != settled.of) => out.push(settled),
+                Some(settled) => self.skipped_rates.push(format!(
+                    "{}[{at}] (its key {:#010x} stated twice; settled again)",
+                    crate::fire::DENSE_SETTLED,
+                    settled.of
+                )),
+                None => self.skipped_rates.push(format!(
+                    "{}[{at}] ({what}, not {}; settled again)",
+                    crate::fire::DENSE_SETTLED,
+                    found(entry.get_ref())
+                )),
             }
         }
+        out
     }
 
     /// `rates.kernel_tflops_by_shape_keyed`: a list of `[kind, key, n, k,
@@ -1564,7 +1580,34 @@ impl<'a> Walk<'a> {
             return None;
         };
         let mut out: Vec<crate::fire::KernelCurve> = Vec::with_capacity(entries.len());
-        for entry in entries.iter() {
+        for (at, entry) in entries.iter().enumerate() {
+            // One entry in another form (another pie's) is skipped alone, by
+            // name, and measured again; the list's others are read.
+            let before = self.diags.len();
+            if let Some(curve) = self.kernel_curve(entry, &out, what) {
+                out.push(curve);
+            } else if self.diags.len() > before {
+                let why: Vec<String> = self.diags.drain(before..).map(|d| d.message).collect();
+                self.skipped_rates.push(format!(
+                    "{}[{at}] ({}; measured again)",
+                    crate::fire::KERNEL_CURVES,
+                    why.join("; ")
+                ));
+            }
+        }
+        Some(out)
+    }
+
+    /// One entry of `rates.kernel_tflops_by_shape_keyed`, beside `out` (the
+    /// list's entries read before it): `None` with its complaint where it
+    /// does not read.
+    fn kernel_curve(
+        &mut self,
+        entry: &Spanned<DeValue<'_>>,
+        out: &[crate::fire::KernelCurve],
+        what: &str,
+    ) -> Option<crate::fire::KernelCurve> {
+        {
             let fields = match entry.get_ref() {
                 DeValue::Array(f) if f.len() == 10 => {
                     let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
@@ -1656,7 +1699,7 @@ impl<'a> Walk<'a> {
                     return None;
                 }
             };
-            out.push(crate::fire::KernelCurve {
+            Some(crate::fire::KernelCurve {
                 kind,
                 key,
                 n,
@@ -1665,9 +1708,8 @@ impl<'a> Walk<'a> {
                 stop,
                 spread,
                 by,
-            });
+            })
         }
-        Some(out)
     }
 
     /// `rates.<key>` (`gemm_tflops_by_rows`, `attn_tflops_by_rows_keys`): `[outer, curve]`

@@ -88,6 +88,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.knobs.measuring,
     )
     .map_err(Fault::Card)?;
+    // What the rates step timed (none where every rate was stated).
+    let timed_at_open = chip.tuned().timed.clone();
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
@@ -632,6 +634,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         asked,
         ceiling,
         weighed,
+        timed_at_open,
     })
 }
 
@@ -1026,6 +1029,7 @@ impl Shell {
             asked,
             ceiling,
             weighed,
+            timed_at_open,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -1702,6 +1706,7 @@ impl Shell {
             keys,
             products,
             routes_measuring: boot.knobs.measuring,
+            measured: std::cell::RefCell::new(timed_at_open.clone()),
             forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
@@ -2386,6 +2391,9 @@ impl Shell {
             );
             return Ok(());
         }
+        self.measured
+            .borrow_mut()
+            .push(format!("decode products ({})", measured.len()));
         let saved = crate::rates::save_product_times(
             profiles,
             self.device.name(),
@@ -2949,6 +2957,8 @@ pub(super) struct Baked {
     pub(super) ceiling: u64,
     /// The rungs the top was weighed of, and the estimate that weighed them.
     pub(super) weighed: Option<crate::top::Weighed>,
+    /// What the rates step timed at open (none where every rate was stated).
+    pub(super) timed_at_open: Vec<String>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

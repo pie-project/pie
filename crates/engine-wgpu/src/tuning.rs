@@ -112,6 +112,20 @@ impl Tuning {
         }
     }
 
+    /// This tuning over `profile` (another resolution of the device's, its
+    /// rates or curves joined): what the load held stays (the decodes whose
+    /// split walk the adapter binds, the workgroup memory it states), so the
+    /// kernels a load names are the same whether its curves were timed this
+    /// load or read from a profile.
+    #[must_use]
+    pub fn with_profile(&self, profile: Profile) -> Tuning {
+        Tuning {
+            splits: self.splits.clone(),
+            workgroup_bytes: self.workgroup_bytes,
+            ..Tuning::new(profile)
+        }
+    }
+
     /// The workgroups the device holds at once, as its profile states them;
     /// `None` before the load's rates step has measured them.
     #[must_use]

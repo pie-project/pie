@@ -485,6 +485,13 @@ impl Engine for Xla {
         crate::chip::COVERS
     }
 
+    /// XLA times nothing at load that it keeps (its compile ledger is
+    /// in-process memory, not a measurement; the host cover is the
+    /// runtime's, said beside this): none.
+    fn measured_at_load(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn skips_measuring(&self) -> bool {
         !self.boot.measure
     }
