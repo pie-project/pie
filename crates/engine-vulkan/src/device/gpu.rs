@@ -86,7 +86,7 @@ impl engine_gpu::backend::Context<Api> for Context {
     /// Only where the device writes a recording's pool segment descriptors
     /// after it binds them (update-after-bind storage buffers).
     fn resizes_pool(&self) -> bool {
-        self.core.update_after_bind
+        Context::rebinds_segments(self)
     }
 
     fn resident(&self) -> Option<u32> {
