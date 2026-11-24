@@ -727,6 +727,31 @@ impl GuestTaken {
     /// The runs of chunks its fresh parts took, `(run, pieces)` summed at
     /// the longest run: what a bind short of room for its tables beside
     /// them asks with its own chunk ([`Roles::bind_short`]).
+    /// [`Self::fresh_runs`] with the pair it joined in place counted too:
+    /// the room the capacity gate asks for the bind. Suspended for this
+    /// room, the pair's other holders may park meanwhile, and the bind,
+    /// restored, lays the pair fresh: asked without it, the bind came back a
+    /// run short and its process went down again for one bind (the
+    /// simulation's Metal mix, seed 43: a run of three asked, two taken
+    /// after the restore). Over, never under: the room a pair joined in
+    /// place leaves goes back with the take.
+    fn asked_runs(&self) -> Option<(u32, u32)> {
+        let parts: Vec<(u32, u32)> = self
+            .scratch
+            .iter()
+            .chain(self.pair.iter().map(|(_, part, ..)| part))
+            .map(Part::chunk_runs)
+            .collect();
+        let longest = parts.iter().map(|&(run, _)| run).max()?;
+        Some((
+            longest,
+            parts
+                .iter()
+                .map(|&(run, pieces)| run.div_ceil(longest).saturating_mul(pieces))
+                .sum(),
+        ))
+    }
+
     fn fresh_runs(&self) -> Option<(u32, u32)> {
         let parts: Vec<(u32, u32)> = self
             .scratch
@@ -4179,6 +4204,16 @@ pub fn take_bind(
     let beside = roles.instance_parts_fresh(binding.program, &binding.channels, &registered, adapter);
     let guest = roles.take_guest(&binding.channels, (pair, state), holder, beside)?;
     let fresh = guest.fresh_runs();
+    // The gate's room ask counts the pair it joined, where the pool could
+    // ever hold that many runs: past it, the exact need is asked, so the
+    // over-ask never turns a bind that fits alone into one refused as never
+    // fitting (the simulation's seed 213).
+    let asked = guest
+        .asked_runs()
+        .filter(|&(run, pieces)| {
+            roles.device.lock().unwrap().pool().runs_most(run) >= pieces
+        })
+        .or(fresh);
     let mut taken = roles
         .take_instance(
             binding.program,
@@ -4215,7 +4250,7 @@ pub fn take_bind(
         // chunks, room was made in chunks that formed no run (the
         // simulation's seed 189: a victim moved for four single chunks, the
         // bind's run of two still short).
-        let room = match fresh {
+        let room = match asked {
             Some((run, pieces)) if run > 1 => GuestRoom::Runs {
                 run,
                 pieces,
@@ -4224,10 +4259,10 @@ pub fn take_bind(
                 committable: 0,
                 singles: beside,
             },
-            fresh => GuestRoom::Slots {
+            asked => GuestRoom::Slots {
                 slots: 0,
                 committable: 0,
-                chunks: added.max(fresh.map_or(0, |(_, pieces)| pieces).saturating_add(beside)),
+                chunks: added.max(asked.map_or(0, |(_, pieces)| pieces).saturating_add(beside)),
             },
         };
         return Err(RolesError::BindShort(Box::new(RolesError::GuestShort {
