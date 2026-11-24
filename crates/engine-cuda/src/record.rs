@@ -29,15 +29,10 @@ pub struct Fire<'a> {
     pub stream: *mut core::ffi::c_void,
     pub lanes: Option<Lanes<'a>>,
     pub conditionals: Option<crate::window::Conditionals<'a>>,
-    pub decoding: &'a poem_ir::ClassSet,
-    pub tiers: &'a Tiers,
-    pub towered: bool,
-    pub lane_ceiling: u32,
     pub ceilings: Ceilings<'a>,
-    /// [`BodyKey::islands`] as prepared for this fire.
-    pub islands: &'a [u8],
-    /// [`BodyKey::rs`] as prepared for this fire.
-    pub rs: RsBody,
+    /// The body's key as the fire was prepared (`serve::prepare`): the
+    /// one derivation of a fire's key.
+    pub key: &'a BodyKey,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -473,6 +468,33 @@ impl BodyKey {
             islands: Box::default(),
             rs: RsBody::Folds,
         }
+    }
+
+    /// The key a fire of `composition` records and replays under: its
+    /// token axis's classes and bucket (and its patch axis's, where the
+    /// load is towered) under the lane ceiling, its lanes' treatment of
+    /// their recurrent rows. Prepare derives it once (`serve::prepare`) and
+    /// hands it down; the body map and arming read that one.
+    #[must_use]
+    pub fn for_fire(
+        composition: &poem_exec::fire::Composition,
+        decoding: &poem_ir::ClassSet,
+        lane_ceiling: u32,
+        tiers: &Tiers,
+        towered: bool,
+        rs: RsBody,
+    ) -> BodyKey {
+        let tokens = composition.axis(poem_ir::RowAxis::Tokens);
+        let patches = composition.axis(poem_ir::RowAxis::Patches);
+        BodyKey::of(
+            &tokens.classes,
+            tokens.bucket,
+            decoding,
+            lane_ceiling,
+            tiers,
+            towered.then_some((&patches.classes, patches.bucket)),
+        )
+        .with_rs(rs)
     }
 
     /// The same key, for a fire whose lanes treat their recurrent rows so.
@@ -961,20 +983,7 @@ impl Bodies {
         prepare.settle()?;
         crate::serve::btrace::mark("settle");
         let shape = run.schedule_shape();
-        let mut key = BodyKey::of(
-            at.descriptor.table(poem_ir::RowAxis::Tokens),
-            at.descriptor.bucket,
-            at.decoding,
-            at.lane_ceiling,
-            at.tiers,
-            at.towered.then_some((
-                at.descriptor.table(poem_ir::RowAxis::Patches),
-                at.descriptor.patch_bucket,
-            )),
-        );
-        key.islands = at.islands.into();
-        key.rs = at.rs;
-
+        let key = at.key.clone();
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
         let (short, moved, empty) = match self.map.bodies.get(&key) {
