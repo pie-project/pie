@@ -299,6 +299,7 @@ fn answers_the_host_path(frames: u8) {
             },
             ordinal: 0,
             frames_in_flight: frames,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     assert_eq!(loaded.caps.geometry, GeometryClass::DeviceGeometry);
