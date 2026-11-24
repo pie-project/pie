@@ -1164,8 +1164,9 @@ impl Plane {
     }
 
     /// `instance`'s beam group at a fire: its state's first pool word, its
-    /// layout, and the parents its ring holds once the pass that put them
-    /// landed (this engine keeps every cell of a ring on the host).
+    /// layout, and its parents: the device cell the last pass kept, which
+    /// the fire copies in behind it, or else the cell the ring holds once
+    /// the pass that put it landed.
     pub fn beam_group(
         &self,
         instance: InstanceId,
@@ -1202,6 +1203,21 @@ impl Plane {
         #[cfg(feature = "wgpu")]
         seat.gate.settle(instance)?;
         let ring = &seat.inst.channels[binding.channel as usize];
+        // The parents the last pass kept on the device: the fire copies the
+        // cell into its step's record behind that pass, with no wait. The
+        // fire reads the ring's oldest cell and the kept one is the newest,
+        // so it is taken only when the ring holds no other.
+        #[cfg(feature = "wgpu")]
+        if ring.size() <= 1
+            && let Some(cell) = seat
+                .half
+                .lock()
+                .expect("half lock poisoned")
+                .session
+                .kept_cell(binding.channel)
+        {
+            return Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Cell(cell))));
+        }
         #[cfg(feature = "wgpu")]
         if ring.is_empty() {
             self.settle_writers(seat.channels[binding.channel as usize])?;
