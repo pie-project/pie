@@ -891,6 +891,16 @@ pub struct PixelSpans {
     pub spans: Vec<(u64, u32)>,
 }
 
+/// An evacuation staged and not committed ([`Shell::stage_evacuation`]):
+/// its copies in a frame not yet submitted, the chunk table it replaced,
+/// and the weight caches' entries under the new one.
+pub struct StagedEvacuation<B: Backend> {
+    frame: B::Frame,
+    was: engine::chunk::ChunkTable,
+    rows: Vec<Vec<u8>>,
+    experts: Vec<Vec<u8>>,
+}
+
 pub struct Shell<B: Serve> {
     /// Each hybrid beam group's set's rs entries its state holds (§11.1),
     /// by instance: the buffer's base slot they count from and how many, as
@@ -4276,20 +4286,72 @@ impl<B: Serve> Shell<B> {
     }
 
     /// Copies each evacuated chunk onto its new physical chunk, on the queue
-    /// before the next fire, and takes the moves into the chunk table.
+    /// before the next fire, and takes the moves into the chunk table:
+    /// [`Self::stage_evacuation`] and [`Self::commit_evacuation`] with
+    /// nothing between, for a caller holding nothing in the pool.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
+        match self.stage_evacuation(evacuation)? {
+            Some(staged) => self.commit_evacuation(staged),
+            None => Ok(()),
+        }
+    }
+
+    /// The first half of an evacuation, nothing committed: each moved
+    /// chunk's copy recorded in a frame not yet submitted, the moves taken
+    /// into the chunk table, and the weight caches' entries resolved
+    /// against it. The caller resolves what else the moves repoint against
+    /// [`Self::pools`] as they now stand, then commits
+    /// ([`Self::commit_evacuation`]) or takes it back
+    /// ([`Self::abort_evacuation`]). Refused with nothing changed; `None`
+    /// where nothing moves.
+    pub fn stage_evacuation(
+        &mut self,
+        evacuation: &engine::chunk::Evacuation,
+    ) -> Result<Option<StagedEvacuation<B>>> {
         if evacuation.moves.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut frame = self.device.frame()?;
-        self.pools.evacuate(&mut frame, evacuation)?;
-        // The weight cache's entries name physical units: those in moved
-        // chunks are rewritten once every fire reading them has landed.
+        let was = self.pools.evacuate(&mut frame, evacuation)?;
+        let entries = self.row_caches.entries(&self.pools).and_then(|rows| {
+            Ok((rows, self.expert_caches.entries(&self.pools)?))
+        });
+        match entries {
+            Ok((rows, experts)) => Ok(Some(StagedEvacuation {
+                frame,
+                was,
+                rows,
+                experts,
+            })),
+            Err(refused) => {
+                self.pools.restore_table(was);
+                Err(refused)
+            }
+        }
+    }
+
+    /// Takes a staged evacuation back: the chunk table as it stood, its
+    /// copies dropped unsubmitted.
+    pub fn abort_evacuation(&mut self, staged: StagedEvacuation<B>) {
+        self.pools.restore_table(staged.was);
+    }
+
+    /// Commits a staged evacuation: its copies go on the queue before the
+    /// next fire, and the weight caches' entries in moved chunks are
+    /// rewritten once every fire reading them has landed. Everything was
+    /// resolved at the stage: a failure here is the device's fault.
+    pub fn commit_evacuation(&mut self, staged: StagedEvacuation<B>) -> Result<()> {
+        let StagedEvacuation {
+            mut frame,
+            rows,
+            experts,
+            ..
+        } = staged;
         if !self.row_caches.is_empty() || !self.expert_caches.is_empty() {
             frame.commit()?;
             self.drain()?;
-            self.row_caches.restage(&self.pools)?;
-            self.expert_caches.restage(&self.pools)?;
+            self.row_caches.write_entries(&rows)?;
+            self.expert_caches.write_entries(&experts)?;
             frame = self.device.frame()?;
         }
         self.grafted = Some(frame.commit_async(None)?);

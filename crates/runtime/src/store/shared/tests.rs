@@ -1750,6 +1750,12 @@ async fn a_refused_evacuation_is_taken_back_whole_and_a_later_one_goes_through()
             PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
             PoolOp::ReleaseSegments(prefix) => engine.release_segments(prefix),
             PoolOp::CommitSegments(prefix) => engine.commit_segments(prefix),
+            PoolOp::CheckTable(runtime) => {
+                match super::programs::table_apart(engine.table.as_slice(), &runtime) {
+                    Some(apart) => Err(::engine::Error::Program(apart)),
+                    None => Ok(()),
+                }
+            }
             other => panic!("no {other:?} in this walk"),
         }
         .map_err(Into::into)

@@ -390,6 +390,11 @@ pub(crate) enum PoolOp {
     /// what an aborted move waits for before it gives back slots a copy may
     /// still be writing.
     SettleCopies,
+    /// The engine's chunk table (`Engine::chunk_table`) checked against the
+    /// runtime's logical to physical map, by logical chunk: refused naming
+    /// the first chunk they place apart. What a refused evacuation is
+    /// checked by, the engine's word that nothing moved not taken on trust.
+    CheckTable(Vec<u32>),
 }
 
 impl PoolOp {
@@ -404,6 +409,7 @@ impl PoolOp {
             Self::Evacuate(_) => "evacuate",
             Self::Rebind(_) => "rebind",
             Self::SettleCopies => "settle copies (waits every copy landed)",
+            Self::CheckTable(_) => "check chunk table",
         }
     }
 }
@@ -3696,6 +3702,10 @@ mod tests {
             "panicking"
         }
 
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
+        }
+
         fn prepare_program(
             &mut self,
             _registration: &::engine::program::ProgramRegistration,
@@ -4413,6 +4423,10 @@ mod tests {
             "exhausted"
         }
 
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
+        }
+
         fn prepare_program(
             &mut self,
             _registration: &::engine::program::ProgramRegistration,
@@ -4542,6 +4556,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "inline"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4703,6 +4721,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "lane-fault"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -4984,6 +5006,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "lane-refusal"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(
@@ -5460,6 +5486,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "holding"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(

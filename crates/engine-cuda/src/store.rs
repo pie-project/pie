@@ -3320,6 +3320,12 @@ impl Pools {
         self.stage_expert_tables(stream)
     }
 
+    /// The chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.chunks.table()
+    }
+
     /// The params of the routed banks streamed an expert at a time.
     #[must_use]
     pub fn expert_params(&self) -> Vec<u32> {

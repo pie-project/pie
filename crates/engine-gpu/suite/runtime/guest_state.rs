@@ -673,6 +673,142 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Logical chunk `chunk`'s bytes as they stand, read through the chunk
+/// table.
+fn read_chunk(engine: &backend::Engine, chunk: u32) -> Vec<u8> {
+    let pools = engine.loaded().expect("loaded").pools();
+    let mut out = vec![0u8; pools.chunk_facts().chunk_bytes as usize];
+    let (buffer, at) = pools.chunk_place(chunk).expect("the chunk's place");
+    buffer.read(at, &mut out).expect("the chunk reads");
+    out
+}
+
+/// `Engine::evacuate` is all or nothing. Instance A's state lies in a run
+/// of two whole chunks, and an evacuation moves the run's head onto the
+/// last chunk of segment 0, the chunk A's tables lie in: the pool takes
+/// the move, and the rebind refuses it by name (the run would cross the
+/// segment's end) after the copies were recorded. Nothing moved: the chunk
+/// table, and the bytes of the run's head and of the tables' chunk, are as
+/// they stood; A fires on from where it lay; and its claim stands (a park
+/// and an unpark onto its own slots lay it again), after which it fires.
+///
+/// Negative control (run once on wgpu, reverted): with
+/// `Shell::abort_evacuation` not restoring the table it replaced, this
+/// failed at the chunk-table check (the refused move's two logical chunks
+/// left swapped).
+#[test]
+fn an_evacuation_refused_at_its_rebind_moves_nothing() {
+    let Some((loaded, program, mut slots, t_input)) = setup("guest-state-evacuate-refused", 4)
+    else {
+        return;
+    };
+    let Loaded {
+        mut engine,
+        trace,
+        planes,
+        dir,
+        ..
+    } = loaded;
+    let state = engine
+        .guest_state(program, &EXTENTS, GeometryClass::Host)
+        .expect("the program's guest state");
+    assert!(state.instance_bytes() > 0, "the epilogue's heap is its instance's");
+    let word = trace.facts.word(&Request::new(ROWS, false));
+    let top = engine
+        .loaded()
+        .expect("loaded")
+        .pools()
+        .chunk_facts()
+        .segment_chunks;
+    assert!(top >= 32, "segment 0 holds the test's chunks: {top}");
+    let per = slots.instance.expect("an Instance shape").per_chunk;
+    // A's tables lie in the slots' own chunk, segment 0's last; its state
+    // in a run of two whole chunks well under every other state's.
+    let tables = top - 1;
+    let head = top - 24;
+
+    let (a, a_channels, a_binding) = bind(&mut engine, &mut slots, program, 1);
+    assert!(
+        a_binding.instance_slots.iter().all(|&slot| slot / per == tables),
+        "A's tables lie in chunk {tables}: {:?}",
+        a_binding.instance_slots
+    );
+    for place in [&a_binding.scratch, &a_binding.pair] {
+        if let ScratchPlace::Chunks { pieces, .. } = place {
+            assert!(pieces[0] > head + 1, "a state's run above chunk {}: {place:?}", head + 1);
+        }
+    }
+    let scratch = ScratchPlace::Chunks {
+        run: 2,
+        pieces: vec![head],
+    };
+    engine
+        .rebind_slots(Rebind::Instance {
+            id: a,
+            instance: a_binding.instance_slots.clone(),
+            rings: Vec::new(),
+            adapter: Vec::new(),
+            scratch: scratch.clone(),
+            pair: a_binding.pair.clone(),
+            pair_generation: a_binding.pair_generation,
+        })
+        .expect("A's state moves to a run of two chunks");
+    let bound = [(a, a_channels.clone())];
+    let ids = fire(&mut engine, word, t_input, &bound, &[5]);
+    assert_eq!(ids, [argmax(&planes, 5)], "A reads its row from its run");
+
+    let table = engine.chunk_table().expect("the engine's chunk table");
+    let head_bytes = read_chunk(&engine, head);
+    let table_bytes = read_chunk(&engine, tables);
+    let onto = table.physical(tables).expect("the tables' chunk lies somewhere");
+    let refused = engine
+        .evacuate(&Evacuation {
+            moves: vec![(head, onto)],
+        })
+        .expect_err("A's run would cross segment 0's end");
+    eprintln!("refused: {refused}");
+    assert!(
+        matches!(&refused, engine::Error::Program(why) if why.contains("one segment")),
+        "refused at the rebind, by the run's place: {refused}"
+    );
+    assert_eq!(
+        engine.chunk_table().expect("the engine's chunk table"),
+        table,
+        "a refused evacuation leaves the chunk table as it stood"
+    );
+    assert!(
+        read_chunk(&engine, tables) == table_bytes,
+        "a refused evacuation copies nothing over A's tables"
+    );
+    assert!(
+        read_chunk(&engine, head) == head_bytes,
+        "a refused evacuation leaves A's run as it stood"
+    );
+    let ids = fire(&mut engine, word, t_input, &bound, &[2]);
+    assert_eq!(ids, [argmax(&planes, 2)], "A fires on from where it lay");
+
+    // A's claim stood: a park and an unpark onto its own slots lay it
+    // again.
+    engine
+        .rebind_slots(Rebind::Parked { id: a, kept: true })
+        .expect("A parks, its tables kept in place");
+    engine
+        .rebind_slots(Rebind::Instance {
+            id: a,
+            instance: a_binding.instance_slots.clone(),
+            rings: Vec::new(),
+            adapter: Vec::new(),
+            scratch,
+            pair: a_binding.pair.clone(),
+            pair_generation: a_binding.pair_generation,
+        })
+        .expect("A unparks onto its own slots");
+    let ids = fire(&mut engine, word, t_input, &bound, &[3]);
+    assert_eq!(ids, [argmax(&planes, 3)], "A fires on after the refused evacuation");
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The miniature whose pair keeps state: Qwen3's, its fires capturing
 /// attention scores into the score room of the pair a lane's program reads
 /// them through (`guest::state`).

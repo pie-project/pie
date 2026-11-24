@@ -861,12 +861,12 @@ fn a_refused_evacuation_moves_nothing() {
             .commit_segments(kept + held.div_ceil(segment))
             .expect("the segments commit");
         let scattered = serve(&mut shell, &fixture.trace, &place(first), STEPS, STEPS / 2, &mut |shell| {
-            let before = shell.chunk_table();
+            let before = shell.chunk_table().clone();
             let moves = (0..held).map(|at| (first + at, low + at)).collect();
             engine_metal::serve::fail_next_repoint();
             let refused = shell.evacuate(&Evacuation { moves });
             assert!(refused.is_err(), "{model}: the injected refusal is answered");
-            assert_eq!(shell.chunk_table(), before, "{model}: a refused evacuation moves nothing");
+            assert_eq!(shell.chunk_table(), &before, "{model}: a refused evacuation moves nothing");
         });
         close(
             &format!("{model}: decoding on past a refused evacuation, against the seats' runs"),

@@ -1922,6 +1922,12 @@ impl Pools {
         Ok(())
     }
 
+    /// The chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &ChunkTable {
+        &self.table
+    }
+
     /// Applies an evacuation: each chunk's bytes moved, then the table.
     pub fn evacuate(
         &mut self,

@@ -39,6 +39,14 @@ impl Mover for Lane {
     fn epoch_now(&self) -> u64 {
         0
     }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        let engine = self.0.lock().unwrap();
+        match crate::store::shared::programs::table_apart(engine.table.as_slice(), &runtime) {
+            Some(apart) => Err(apart),
+            None => Ok(()),
+        }
+    }
 }
 
 /// An on-demand pool as it loads: at the smallest rung.

@@ -878,6 +878,10 @@ impl Engine for Metal {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
 
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        Ok(self.loaded()?.chunk_table().clone())
+    }
+
     /// Waits on the last copy's command buffer: every copy submitted so far
     /// has read its sources and written its destinations.
     fn settle_copies(&mut self) -> EngineResult<()> {

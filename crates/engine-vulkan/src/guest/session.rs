@@ -415,6 +415,26 @@ pub struct Tables<'a> {
     pub align: u64,
 }
 
+/// What a stage's set binds: each binding's buffer, offset and range, and
+/// its descriptor type.
+type SetBuffers = [(u32, (vk::Buffer, u64, u64), vk::DescriptorType); 4];
+
+/// Where an evacuation leaves a session ([`Session::resolve`]), to put it
+/// there once the copies are committed ([`Session::install`]).
+pub struct Rebound {
+    status: Held,
+    stages: Vec<([Held; 4], Held)>,
+    instance: Pair,
+    pair: Pair,
+    /// Each stage's set as it binds the session there; none for a parked
+    /// session, whose sets its unpark points.
+    sets: Option<Vec<SetBuffers>>,
+    /// The runs its own state takes there, by its claims' name.
+    pub own: (Holder, Vec<Run>),
+    /// Its pair group's there, where it is bound on one.
+    pub pair_runs: Option<(Holder, Vec<Run>)>,
+}
+
 pub struct Session {
     core: Arc<Core>,
 
@@ -687,20 +707,20 @@ impl Session {
     fn write_sets(&self) -> Result<()> {
         // Claimed before a set is pointed there.
         self.claim_runs()?;
-        self.point_sets()
+        let sets = self.sets()?;
+        self.point_sets(&sets);
+        Ok(())
     }
 
-    /// Points each stage's set at its buffers: the status word, the run of
-    /// slots its tables lie in now, its heap at its exact span, and its
-    /// step's record, claimed already. Nothing on the queue uses the sets:
-    /// at construction none has run, and a rebind settles first.
-    fn point_sets(&self) -> Result<()> {
-        let d = &self.core.device;
+    /// What each stage's set binds where the session lies now, each span
+    /// checked; nothing written.
+    fn sets(&self) -> Result<Vec<SetBuffers>> {
+        let mut sets = Vec::with_capacity(self.stages.len());
         for (at, stage) in self.stages.iter().enumerate() {
             let (heap, base) = self.heap_at(at)?;
             // The run moved with the tables, and their bases in it did not.
             let (_, (_, start, end)) = run_bases(&stage.tables, self.slot_bytes)?;
-            let buffers = [
+            sets.push([
                 (
                     STATUS_BINDING,
                     (
@@ -729,7 +749,16 @@ impl Session {
                     ),
                     vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
                 ),
-            ];
+            ]);
+        }
+        Ok(sets)
+    }
+
+    /// Writes each stage's set as [`Self::sets`] resolved it. Nothing on
+    /// the queue uses the sets (see [`Self::write_sets`]).
+    fn point_sets(&self, sets: &[SetBuffers]) {
+        let d = &self.core.device;
+        for (stage, buffers) in self.stages.iter().zip(sets) {
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
                 .map(|&(_, (buffer, offset, range), _)| {
@@ -759,7 +788,6 @@ impl Session {
             // call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
         }
-        Ok(())
     }
 
     /// Each stage's run of table slots.
@@ -839,46 +867,79 @@ impl Session {
         Ok(())
     }
 
-    /// After an evacuation, the passes on the queue landed, takes where
-    /// its tables' slots and, bound, its state and its pair's sit in now,
-    /// and returns the runs it holds there, to be claimed with every other
-    /// holder's in one step ([`Library::claim_moved`]) before
-    /// [`Self::repoint`] points its sets there. A park that kept its
-    /// tables in place (`parked`) holds them alone: its state and its
-    /// share of its pair went back at its park.
-    pub fn relocate(
-        &mut self,
-        pools: &Pools<crate::device::Api>,
-        parked: bool,
-    ) -> Result<Vec<(Holder, Vec<Run>)>> {
-        self.settle()?;
-        for stage in &mut self.stages {
-            for table in stage
-                .tables
-                .iter_mut()
-                .chain(std::iter::once(&mut stage.args))
-            {
+    /// Where the stages' tables and records, the status and, bound, the
+    /// guest's state lie under `pools`' chunk table, an evacuation's not yet
+    /// committed, each set's spans checked as [`Self::write_sets`] checks
+    /// them, with the runs the session and its pair would hold there;
+    /// nothing changed. A park that kept its tables in place (`parked`)
+    /// holds them alone: its state and its share of its pair went back at
+    /// its park, and its sets are pointed at its unpark. The caller has
+    /// settled the session's passes ([`Self::settle`]), claims every
+    /// holder's runs in one step ([`Library::claim_moved`]), then installs
+    /// each ([`Self::install`]).
+    pub fn resolve(&mut self, pools: &Pools<crate::device::Api>, parked: bool) -> Result<Rebound> {
+        let mut rebound = Rebound {
+            status: self.status.clone(),
+            stages: self
+                .stages
+                .iter()
+                .map(|stage| (stage.tables.clone(), stage.args.clone()))
+                .collect(),
+            instance: self.instance.clone(),
+            pair: self.pair.clone(),
+            sets: None,
+            own: (Holder::Instance(self.claim), Vec::new()),
+            pair_runs: None,
+        };
+        for (tables, args) in &mut rebound.stages {
+            for table in tables.iter_mut().chain(std::iter::once(args)) {
                 table.rebind(pools)?;
             }
         }
-        self.status.rebind(pools)?;
-        if parked {
-            return Ok(vec![(Holder::Instance(self.claim), self.table_runs()?)]);
+        rebound.status.rebind(pools)?;
+        if !parked {
+            rebound.instance.rebind(pools)?;
+            rebound.pair.rebind(pools)?;
         }
-        self.instance.rebind(pools)?;
-        self.pair.rebind(pools)?;
-        let mut moved = vec![(Holder::Instance(self.claim), self.own_runs()?)];
+        // Checked as the session would lie there, then put back.
+        self.swap(&mut rebound);
+        let sets = (!parked).then(|| self.sets()).transpose();
+        let own = if parked {
+            self.table_runs()
+        } else {
+            self.own_runs()
+        };
+        let pair = self.pair_runs();
+        self.swap(&mut rebound);
+        rebound.sets = sets?;
+        rebound.own.1 = own?;
         // The pair's state moved for every instance on it: the group's.
-        if let Some((pair, _)) = self.pair_group {
-            moved.push((Holder::Pair(pair), self.pair_runs()));
+        if !parked {
+            rebound.pair_runs = self.pair_group.map(|(group, _)| (Holder::Pair(group), pair));
         }
-        Ok(moved)
+        Ok(rebound)
     }
 
-    /// Points the stages' sets where [`Self::relocate`] found its slots
-    /// and state, claimed there.
-    pub fn repoint(&self) -> Result<()> {
-        self.point_sets()
+    /// Puts the session where [`Self::resolve`] resolved it, the
+    /// evacuation's copies committed and its runs claimed: its sets point
+    /// there, where it is bound. Its passes were settled before the
+    /// resolve, and none was queued since.
+    pub fn install(&mut self, mut rebound: Rebound) {
+        self.swap(&mut rebound);
+        if let Some(sets) = &rebound.sets {
+            self.point_sets(sets);
+        }
+    }
+
+    /// The session's places and `rebound`'s, each the other's.
+    fn swap(&mut self, rebound: &mut Rebound) {
+        std::mem::swap(&mut self.status, &mut rebound.status);
+        for (stage, (tables, args)) in self.stages.iter_mut().zip(&mut rebound.stages) {
+            std::mem::swap(&mut stage.tables, tables);
+            std::mem::swap(&mut stage.args, args);
+        }
+        std::mem::swap(&mut self.instance, &mut rebound.instance);
+        std::mem::swap(&mut self.pair, &mut rebound.pair);
     }
 
     /// Stage `stage`'s heap: the segment buffer it lies in, and its first

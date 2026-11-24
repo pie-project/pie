@@ -976,6 +976,10 @@ impl Engine for SimEngine {
         "sim"
     }
 
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
+    }
+
     fn prepare_program(
         &mut self,
         _registration: &::engine::program::ProgramRegistration,

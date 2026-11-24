@@ -2257,6 +2257,12 @@ impl Shell {
         unsafe { self.pools.release_segments(segments) }
     }
 
+    /// The state pool's chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.pools.chunk_table()
+    }
+
     /// See `Engine::evacuate`: the moved chunks' bytes land, and the chunk
     /// table changes, before any later fire is encoded.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> Result<()> {
@@ -2264,7 +2270,7 @@ impl Shell {
             return Ok(());
         }
         self.drain()?;
-        let before = self.pools.chunk_table();
+        let before = self.pools.chunk_table().clone();
         let mut frame = self.device.frame()?;
         self.pools.evacuate(&mut frame, evacuation)?;
         frame.commit()?;
@@ -2316,12 +2322,6 @@ impl Shell {
             ));
         }
         Ok(())
-    }
-
-    /// The logical-to-physical chunk table as the engine holds it now.
-    #[must_use]
-    pub fn chunk_table(&self) -> engine::chunk::ChunkTable {
-        self.pools.chunk_table()
     }
 
     /// Whole-slot copies a fire states (`Lane::slot_copies`), each

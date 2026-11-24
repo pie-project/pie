@@ -2484,19 +2484,10 @@ impl Pools {
         unsafe { self.pool.release_segments(segments) }
     }
 
-    /// Moves each evacuated chunk onto its new physical chunk in `frame`
-    /// and takes the moves into the chunk table; the weight cache's address
-    /// tables follow (no frame is in flight: the caller drained them).
-    /// A refusal from the pool's own evacuate moved nothing (its table is
-    /// swapped only once every copy is encoded): the runtime takes the
-    /// evacuation back. Past it the table has moved, so the evacuation is
-    /// done whatever follows: a weight cache that fails to restage is a
-    /// fault of its own ([`Self::weights_ready`]), never a refusal, which
-    /// would have the runtime roll back a move this engine made.
-    /// The chunk table as it stands: what [`Self::evacuate_back`] restores.
+    /// The chunk table as it stands (`Engine::chunk_table`).
     #[must_use]
-    pub fn chunk_table(&self) -> engine::chunk::ChunkTable {
-        self.pool.table().clone()
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.pool.table()
     }
 
     /// Takes back an evacuation whose copies landed ([`Pool::evacuate_back`]),
@@ -2515,6 +2506,15 @@ impl Pools {
         Ok(())
     }
 
+    /// Moves each evacuated chunk onto its new physical chunk in `frame`
+    /// and takes the moves into the chunk table; the weight cache's address
+    /// tables follow (no frame is in flight: the caller drained them).
+    /// A refusal from the pool's own evacuate moved nothing (its table is
+    /// swapped only once every copy is encoded): the runtime takes the
+    /// evacuation back. Past it the table has moved, so the evacuation is
+    /// done whatever follows: a weight cache that fails to restage is a
+    /// fault of its own ([`Self::weights_ready`]), never a refusal, which
+    /// would have the runtime roll back a move this engine made.
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
         if let Err(fault) = self.restage_weights() {
