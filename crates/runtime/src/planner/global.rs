@@ -198,6 +198,8 @@ pub(crate) fn reset() {
     if let Some(held) = ENGINE_OF.get() {
         held.write().unwrap().clear();
     }
+    super::departure::reset();
+    super::lock::reset();
 }
 
 /// Every engine's planner, engine 0's first: for what frees pages or

@@ -67,6 +67,11 @@ static WATCHED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<ProcessId, Watched>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Forgets the boot's watches.
+pub(crate) fn reset() {
+    WATCHED.lock().unwrap().clear();
+}
+
 /// Told when a watched process has fully departed.
 static GONE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 

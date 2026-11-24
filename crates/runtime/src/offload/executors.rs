@@ -24,6 +24,7 @@ static NAMED: LazyLock<Mutex<HashMap<ProcessId, Vec<String>>>> = LazyLock::new(M
 
 pub(crate) fn reset() {
     NAMED.lock().unwrap().clear();
+    *DIALER.write().unwrap() = None;
 }
 
 pub fn set_dialer(dialer: Option<Arc<dyn Dialer>>) {

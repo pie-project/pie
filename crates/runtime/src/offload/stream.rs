@@ -81,6 +81,7 @@ static TOLD: LazyLock<Told> = LazyLock::new(|| {
 /// last one ended with its runtime.
 pub(crate) fn reset() {
     *STREAMS.lock().unwrap() = Streams::default();
+    UNSTREAMED.store(0, std::sync::atomic::Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
     *TOLD.tx.lock().unwrap() = tx;
     *TOLD.rx.lock().unwrap() = Some(rx);

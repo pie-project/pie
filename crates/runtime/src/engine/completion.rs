@@ -289,6 +289,11 @@ impl CompletionBroker {
 #[error("the copy did not land: {0}")]
 pub struct CopyLandingFailed(pub String);
 
+/// Forgets the boot's failed landings no one read.
+pub(crate) fn reset() {
+    failed_landings().lock().unwrap().clear();
+}
+
 /// The landing completions told failed, by wait id, until read.
 fn failed_landings() -> &'static Mutex<std::collections::HashMap<u64, String>> {
     static FAILED: OnceLock<Mutex<std::collections::HashMap<u64, String>>> = OnceLock::new();

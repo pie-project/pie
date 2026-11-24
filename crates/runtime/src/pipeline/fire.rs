@@ -1022,6 +1022,8 @@ fn beam_common_of(instance: ::engine::InstanceId) -> u32 {
 pub(crate) fn reset() {
     KV_WRITES.lock().unwrap().clear();
     BEAM_COMMON.lock().unwrap().clear();
+    host_geometry::reset();
+    promote::reset();
 }
 
 pub(crate) fn record_kv_writes(writes: Vec<::engine::KvWrites>) {

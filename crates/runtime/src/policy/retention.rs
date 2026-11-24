@@ -183,6 +183,7 @@ const fn own_tiers() -> u8 {
 
 /// Forgets the policy's table, for [`crate::bootstrap::reset`].
 pub(crate) fn reset() {
+    IDLE_CACHE_NEW.store(false, std::sync::atomic::Ordering::Release);
     *CURRENT.write() = None;
     REVISION.fetch_add(1, Ordering::AcqRel);
 }

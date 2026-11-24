@@ -36,6 +36,13 @@ pub trait Remote: Send + Sync {
 static DIRECTORY: RwLock<Option<Arc<dyn Directory>>> = RwLock::new(None);
 static REMOTE: RwLock<Option<Arc<dyn Remote>>> = RwLock::new(None);
 
+/// Forgets the boot's directory and remote: the next boot's worker sets
+/// its own, or none.
+pub(crate) fn reset() {
+    *DIRECTORY.write().unwrap() = None;
+    *REMOTE.write().unwrap() = None;
+}
+
 pub fn set_directory(directory: Option<Arc<dyn Directory>>) {
     *DIRECTORY.write().unwrap() = directory;
 }

@@ -329,6 +329,7 @@ pub fn take_engine_backend(engine_id: usize) -> Result<EngineBox> {
 /// Forgets the boot's engines, so the next boot's first is 0 again.
 pub(crate) fn reset() {
     registry().lock().unwrap().clear();
+    crate::engine::completion::reset();
 }
 
 pub fn unregister_engine(engine_id: usize) -> Result<()> {

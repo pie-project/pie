@@ -210,6 +210,7 @@ pub(crate) fn reset() {
     *GAUGES.lock().unwrap() = [Gauge::new(), Gauge::new()];
     *METER.write().unwrap() = None;
     SCALES.write().unwrap().clear();
+    LEDGERS.write().unwrap().clear();
 }
 
 /// Says that waiters on `tier` from `from` (an engine's planner) are short

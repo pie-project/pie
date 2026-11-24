@@ -18,6 +18,19 @@ static LOCK_CENSUS: LockCensus = LockCensus {
     wait_max_ns: AtomicU64::new(0),
     hold_max_ns: AtomicU64::new(0),
 };
+/// The census counts the boot's locks alone.
+pub(crate) fn reset() {
+    for count in [
+        &LOCK_CENSUS.n,
+        &LOCK_CENSUS.wait_ns,
+        &LOCK_CENSUS.hold_ns,
+        &LOCK_CENSUS.wait_max_ns,
+        &LOCK_CENSUS.hold_max_ns,
+    ] {
+        count.store(0, Ordering::Relaxed);
+    }
+}
+
 fn lock_trace_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {

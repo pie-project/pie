@@ -391,6 +391,13 @@ pub(crate) fn reset() {
     handle_registry().write().unwrap().clear();
     LAYOUTS.lock().unwrap().clear();
     GROUPS.lock().unwrap().clear();
+    FRAME_SIZE.store(0, Ordering::Relaxed);
+    HOST_COVER.store(0, Ordering::Relaxed);
+    FRAME_CEILING.store(0, Ordering::Relaxed);
+    frame::reset();
+    probe::host_submit().reset();
+    lane::reset();
+    worker::BACKSTOP_RETIREMENTS.store(0, Ordering::Relaxed);
 }
 
 pub fn configured_frame_size() -> usize {

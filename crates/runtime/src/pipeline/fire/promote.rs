@@ -77,6 +77,21 @@ pub(super) struct SupplyCounts {
     pub(super) mapped: std::sync::atomic::AtomicU64,
 }
 
+/// Every count back to none, for the next boot.
+pub(super) fn reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    for count in [
+        &SEALED_PAGES,
+        &SUPPLIED.passes,
+        &SUPPLIED.tokens,
+        &SUPPLIED.held,
+        &SUPPLIED.found,
+        &SUPPLIED.mapped,
+    ] {
+        count.store(0, Relaxed);
+    }
+}
+
 pub(super) static SUPPLIED: SupplyCounts = SupplyCounts {
     passes: std::sync::atomic::AtomicU64::new(0),
     tokens: std::sync::atomic::AtomicU64::new(0),

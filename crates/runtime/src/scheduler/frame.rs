@@ -23,6 +23,11 @@ pub(crate) fn set_dispatch_depth(depth: usize) {
 
 static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// The next boot states its own depth.
+pub(crate) fn reset() {
+    DISPATCH_DEPTH.store(0, Ordering::Relaxed);
+}
+
 /// How long a frame held for lanes that have not submitted waits before it
 /// says which, and again after each such span.
 const HOLD_SAYS_AFTER: Duration = Duration::from_secs(5);

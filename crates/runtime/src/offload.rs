@@ -64,6 +64,7 @@ pub(crate) fn reset() {
     *HOME_KV_HANDLE.write().unwrap() = None;
     SWEEPING.store(false, Ordering::Release);
     prefill::reset();
+    directory::reset();
     executors::reset();
     stream::reset();
 }

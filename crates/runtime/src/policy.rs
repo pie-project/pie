@@ -30,6 +30,12 @@ pub(crate) fn reset() {
     port::reset();
     pressure::reset();
     schedule::reset();
+    for count in ROWS_ENACTED.iter().chain(&ROWS_PASSED_OVER) {
+        count.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    withdraw_published();
+    *STARTS.lock().unwrap() = Starts::default();
+    STOPS.lock().unwrap().clear();
 }
 
 use client_api::Props;

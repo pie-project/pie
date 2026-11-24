@@ -966,6 +966,23 @@ pub(crate) fn open_behind() {
 /// not parked since.
 pub(crate) static LANE_AWAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Forgets the boot's lanes, their calls, counts and behind-serving state,
+/// for [`crate::bootstrap::reset`]: the next boot is not ready until it
+/// says so.
+pub(crate) fn reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    LANE_NOW.lock().unwrap().clear();
+    LANES.lock().unwrap().clear();
+    STEPS_SEEN.lock().unwrap().clear();
+    SUBMITTED_AT.lock().unwrap().clear();
+    for count in [&LANE_SLEEPS, &BEHIND_WAITS, &SUBMITS, &LANE_AWAITS] {
+        count.store(0, Relaxed);
+    }
+    for flag in [&BEHIND_OPEN, &BEHIND_SAID_LIVE, &BEHIND_PENDING, &BEHIND_SAID_EARLY] {
+        flag.store(false, Relaxed);
+    }
+}
+
 pub(super) struct Lane {
     launch_tx: crate::rt::channel::Sender<LaneRequest>,
     control_tx: crate::rt::channel::Sender<LaneRequest>,

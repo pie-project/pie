@@ -516,6 +516,7 @@ fn global() -> MutexGuard<'static, Registry> {
 
 /// Forgets the programs registered against the boot's model.
 pub(crate) fn reset() {
+    *PLAN_FORMS.lock().unwrap() = LibraryForms::ALL;
     *global() = Registry::new(NonZeroUsize::new(DEFAULT_CAPACITY).expect("nonzero capacity"));
 }
 

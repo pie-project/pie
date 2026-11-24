@@ -588,6 +588,22 @@ pub(crate) fn reset() {
     RESTARTABLE.write().unwrap().clear();
     RESTART_REQUESTED.write().unwrap().clear();
     RESTART_ALIAS.write().unwrap().clear();
+    RESTART_TOTAL.store(0, Relaxed);
+    PARKED.lock().unwrap().clear();
+    for count in [
+        &PROCESS_COMPLETED,
+        &PROCESS_ADMISSION_WAIT_US,
+        &PROCESS_INSTANTIATE_US,
+        &PROCESS_CONTEXT_REGISTER_US,
+        &PROCESS_WASM_RUN_US,
+        &PROCESS_LAST_ADMISSION_WAIT_US,
+        &PROCESS_LAST_INSTANTIATE_US,
+        &PROCESS_LAST_CONTEXT_REGISTER_US,
+        &PROCESS_LAST_WASM_RUN_US,
+    ] {
+        count.store(0, Relaxed);
+    }
+    crate::inferlet::host::frames::reset();
     residency::reset();
 }
 

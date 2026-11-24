@@ -58,6 +58,7 @@ pub(crate) fn reset() {
     coalesce::reset();
     fire::reset();
     ACTIVE.store(0, std::sync::atomic::Ordering::Release);
+    OPENED.store(0, std::sync::atomic::Ordering::Release);
     *IDLE_AT.lock().unwrap() = None;
 }
 
