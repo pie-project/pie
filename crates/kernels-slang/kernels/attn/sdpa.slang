@@ -263,14 +263,22 @@ struct Params {
 PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
 
+// The window's first rows, read from the fire block once at the top of
+// `main` (`HOIST_FIRE`), ahead of the address math they feed.
+static uint fired_row0;
+static uint fired_table0;
+#define HOIST_FIRE() \
+    fired_row0 = uint(PIE_FIRE(row0)); \
+    fired_table0 = uint(PIE_FIRE(table0))
+
 // The fire row a window's row `row` is.
 uint fire_row(uint row) {
-    return uint(PIE_FIRE(row0)) + row;
+    return fired_row0 + row;
 }
 
 // The tables' row a window's row `row` is.
 uint table_row(uint row) {
-    return uint(PIE_FIRE(table0)) + row;
+    return fired_table0 + row;
 }
 
 // The bf16 element key `kp` of request `req` starts at in its plane: its
@@ -458,6 +466,7 @@ groupshared int sdpa_first;
 [shader("compute")]
 [numthreads(PIE_TILE_LANES, PIE_TILE_ROWS, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint lane = local.x;
     uint slot_y = local.y;
@@ -821,6 +830,7 @@ float decode_fold(uint d, float merged_max, uint subgroups) {
 [shader("compute")]
 [numthreads(PIE_DECODE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint row = group.y;
     uint tid = local.x;
@@ -1058,6 +1068,7 @@ float2 folded_pair(uint d, float merged_max, float merged_sum, uint walkers) {
 [shader("compute")]
 [numthreads(PIE_DECODE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint row = group.y;
     uint tid = local.x;

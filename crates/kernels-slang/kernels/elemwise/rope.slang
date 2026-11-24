@@ -33,14 +33,15 @@ PIE_PARAMS_FIRED(2, Params, params);
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
+    uint row = PIE_FIRE(row0) + gid.z;
+    uint p = PIE_FIRE(pos0) + gid.z;
     uint i = 2u * gid.x;
     if (i >= uint(max(params.pair_half, 0))) {
         return;
     }
     uint head_dim = uint(max(params.head_dim, 1));
     uint span = uint(max(params.span, 1));
-    uint row = PIE_FIRE(row0) + gid.z;
-    float pos = float(position[PIE_FIRE(pos0) + gid.z]);
+    float pos = float(position[p]);
     float t0 = pos * exp2(-float(i) / float(span) * params.base);
     float t1 = pos * exp2(-float(i + 1u) / float(span) * params.base);
     uint i1 = (row * uint(max(params.heads, 0)) + gid.y) * head_dim + i;

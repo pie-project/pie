@@ -38,11 +38,12 @@ PIE_POOL_VIEW(v_pages, uint, params.v_origin)
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
+    // The fire block's reads first, ahead of the address math they feed.
+    uint i = PIE_FIRE(row0) + gid.z;
+    uint w = PIE_FIRE(w0) + gid.z;
     uint head_dim = uint(params.head_dim);
     uint d = 2u * gid.x;
     uint h = gid.y;
-    uint i = PIE_FIRE(row0) + gid.z;
-    uint w = PIE_FIRE(w0) + gid.z;
     // A padding row's write entry is -1: it writes nothing.
     if (d >= head_dim || w_page[w] == 0xFFFFFFFFu) {
         return;
