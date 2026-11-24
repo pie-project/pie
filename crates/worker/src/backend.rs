@@ -129,14 +129,8 @@ fn device_index(devices: &[String], families: &[&str]) -> Result<u32> {
         .map_err(|_| anyhow!("[engine] device {device:?}: {index:?} is not a device number"))
 }
 
-/// The tokens a kv page holds on the cuda shell: the planner's page.
 #[cfg(any(feature = "engine-cuda", test))]
-const CUDA_PAGE_SIZE: u32 = 16;
-
-/// The lanes one fire may carry on the cuda shell; the tokens are the
-/// largest rung its card holds, derived at load.
-#[cfg(any(feature = "engine-cuda", test))]
-const CUDA_FIRE_LANES: u32 = 512;
+use engine::load::{CUDA_FIRE_LANES, CUDA_PAGE_SIZE};
 
 #[cfg(any(feature = "engine-cuda", test))]
 fn cuda_budgets(

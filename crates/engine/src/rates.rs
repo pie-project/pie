@@ -83,6 +83,10 @@ pub fn step_bytes() -> u64 {
         .max(copy)
 }
 
+/// Timed bursts of each kind a rates step measures: the median kept, an
+/// odd count so it is one burst's.
+pub const ROUNDS: usize = 5;
+
 /// The columns and depth the matmul curves are timed at: the catalog's
 /// hidden widths from a small model's 1024 to an 8B-class model's 4096 (a
 /// plane is read at its square width between them, clamped past them).

@@ -400,7 +400,7 @@ pub const LAUNCH: u32 = 16;
 const VIEW_ALIGN: u64 = 256;
 
 /// Timed frames of each kind; the median is kept.
-pub const ROUNDS: usize = 5;
+pub const ROUNDS: usize = engine::rates::ROUNDS;
 
 /// The most single-fire frames a queued rates frame keeps in flight
 /// (`Rig::queue`): as many as the frames of all but the tiniest fires hold

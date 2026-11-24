@@ -2807,8 +2807,9 @@ fn timing_target<'a, R: Copy>(
 }
 
 /// Rounds a decode body is timed in (`Shell::routes_by_body`): the median
-/// kept, the interquartile range the spread a choice must clear.
-const BODY_ROUNDS: usize = if cfg!(feature = "rocm") { 9 } else { 5 };
+/// kept, the interquartile range the spread a choice must clear. A rates
+/// step's on CUDA; ROCm's own.
+const BODY_ROUNDS: usize = if cfg!(feature = "rocm") { 9 } else { engine::rates::ROUNDS };
 
 /// Fires a round of a decode body's timing: each replayed and waited on, as
 /// a serving step is.

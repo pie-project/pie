@@ -281,7 +281,7 @@ pub fn save_landing(
 pub const FEW_ROWS: u32 = kernels_cuda::linear::gemm::FEW_ROWS;
 
 /// The kv cache's page, as a served load pages it.
-pub const PAGE: u32 = 16;
+pub const PAGE: u32 = engine::load::CUDA_PAGE_SIZE;
 
 /// The copy's bytes: past every last-level cache, so it moves device memory.
 pub const COPY_BYTES: usize = 256 << 20;
@@ -294,7 +294,7 @@ pub const CACHED_SETS: usize = 64;
 pub const CACHED_BLOCKS: u32 = 16384;
 
 /// Timed bursts of each kind; the median is kept.
-pub const ROUNDS: usize = 5;
+pub const ROUNDS: usize = engine::rates::ROUNDS;
 
 /// Timed bursts of the launch's graph: a dispatch's cost moves more burst to
 /// burst than a kernel's work (an MI300X VF's 1610 to 1719 ns over 5).

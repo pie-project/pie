@@ -88,8 +88,9 @@ pub struct Carry {
 
 const _: () = assert!(size_of::<Carry>() == 120);
 
-/// The carried rows a decode step stages at once: a lane carrying more
-/// spans chunks, which a split shares out.
+/// The carried rows a decode step stages at once (`gdn_recurrent.cu`'s
+/// `kStageTile`): a lane carrying more spans chunks, which a split shares
+/// out.
 pub const CARRY_CHUNK: u32 = 16;
 
 /// The bytes a gated-delta decode step's split takes a block of its grid:
