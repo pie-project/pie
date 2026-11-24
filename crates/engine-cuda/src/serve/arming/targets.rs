@@ -374,11 +374,7 @@ impl Shell {
                 .filter(|class| textual(*class) && switched(*class))
                 .collect(),
             drafting: (0..classes)
-                .filter(|class| {
-                    !self.landing[*class]
-                        .iter()
-                        .any(crate::exports::plain_or_adapted)
-                })
+                .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
                 .collect(),
             decoding: self.decoding.clone(),
             seats,
