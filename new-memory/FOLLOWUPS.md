@@ -1509,11 +1509,3 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **Idea.** Let the settle fire on chunks the runtime lends for the slice (a reservation by refs), or let the quiet check ignore holders whose chunks lie outside the seat runs a settle fire writes. The rates and curve slices write no pool chunk at all and could run beside a `Weights` holder today.
 
 **Why later.** Accepted for the new-memory PR (coordinator, 2026-11-24): the boot is fast either way, and only the picks stay on the fallback.
-
-## F?? Metal parks a windowed lane's kv and record, not its ring (owner: Mac / M1 Max, 2026-11-23)
-
-**What.** Metal serves windowed layers only as ring + buffer (CONTRACT-BC 19, 21) since the window-list path went (`sc/mac-ring`). A ring is `pieces` whole chunks (`layout::RING`, `Layout::with_ring`), outside `Layout::shapes`, so `Shell::copy_slots` can't move it to a host or disk tier. `a_parked_windowed_lane_serves_the_never_parked_logits` parks the kv pages and the record of a lane that states no ring and no fold. That lane runs the fold-less scratch path, so the test checks no windowed rows (the window-list version, gone now, did).
-
-**Idea.** Make the ring a copyable shape (one slot a chunk, id RING) in `Pools::shape` / tier copies, give the parked test a ring and a `WindowFold`, and park the ring's pieces with the record.
-
-**Why later.** The runtime's tier moves of rings are their own contract step. Nothing serves a parked windowed lane on Metal until the runtime parks rings.
