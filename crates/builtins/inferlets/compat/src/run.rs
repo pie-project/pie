@@ -212,15 +212,13 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
             }
         }
     };
-    // A request with no stop sequences states its decode rows final
-    // (CONTRACT-BC 25): it ends at a stop token or its budget and releases
-    // its set. One with stop sequences keeps the lagged fold, and a stop
-    // takes back what ran past it.
+    // Its passes state their rows final (CONTRACT-BC 25), stop sequences or
+    // none: a stop sequence only cuts the output (`Output::deliver`), the
+    // set ends with the request, and nothing is taken back.
     let ran = generate(
         &prompt,
         req.sampling,
         req.max_tokens.saturating_sub(continued.len()),
-        req.stop.is_empty(),
         guide.as_mut().map(|g| g.as_mut() as &mut dyn Guide),
         &mut on_prompt,
         &mut on_token,
@@ -294,5 +292,32 @@ mod tests {
             paired,
             vec![(10, None), (11, Some(score(-1.0))), (12, Some(score(-2.0)))]
         );
+    }
+
+    /// A stop sequence only cuts the output: the content ends before it,
+    /// the request finishes on it, and generation breaks. Nothing here
+    /// reaches the working set, whose passes state their rows final.
+    #[test]
+    fn a_stop_sequence_cuts_the_output_and_breaks() {
+        let mut out = Output {
+            stops: HoldBack::new(vec!["STOP".to_string()]),
+            content: String::new(),
+            finish: None,
+            stop_hit: None,
+        };
+        let mut sent = Vec::new();
+        let mut sink = |event: Event| {
+            if let Event::Text(text) = event {
+                sent.push(text);
+            }
+        };
+        let flow = out.deliver(vec![Event::Text("hello ST".into())], &mut sink);
+        assert!(flow.is_continue());
+        let flow = out.deliver(vec![Event::Text("OP world".into())], &mut sink);
+        assert!(flow.is_break(), "the stop sequence ends generation");
+        assert_eq!(out.content, "hello ");
+        assert_eq!(sent.concat(), "hello ");
+        assert_eq!(out.finish, Some(Finish::StopSequence));
+        assert_eq!(out.stop_hit, Some(0));
     }
 }

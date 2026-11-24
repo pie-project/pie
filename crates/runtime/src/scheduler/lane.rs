@@ -1780,6 +1780,15 @@ impl Lane {
             let fired = ticket.as_ref().map_or(0, |ticket| ticket.steps.len());
             let mut rest = submitted.steps;
             let ran: Vec<::engine::Step> = rest.drain(..fired.min(rest.len())).collect();
+            // The served census: each step the engine took, by the
+            // treatment its stated shape names (`fires_folds`,
+            // `fires_buffers` in the model status).
+            if !ran.is_empty() {
+                let live = engine.live();
+                for step in &ran {
+                    live.fired(step.shape);
+                }
+            }
             let ran_at = at..at + ran.len();
             let unfired = reads.split_off(ran.len().min(reads.len()));
             let_go(&unfired);

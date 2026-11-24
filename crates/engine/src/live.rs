@@ -1,6 +1,7 @@
 //! What an engine counts while it serves, read by the runtime's model
 //! status: the fires served some way other than a captured body the load
-//! prepared ([`Tally`]).
+//! prepared ([`Tally`]), and the steps fired by their stated treatment
+//! ([`Tally::FiresFolds`], [`Tally::FiresBuffers`]).
 //!
 //! The engine keeps a [`Live`] and counts into it from wherever the event
 //! happens; the runtime holds a clone from load on
@@ -91,10 +92,20 @@ pub enum Tally {
     /// load from disk, never a build, so neither [`Tally::Compiled`] nor
     /// [`Tally::BuiltInFire`]; counted so the stall it costs is seen.
     LoadedInFire,
+    /// A step fired whose stated shape folds ([`crate::shapes::Treatment::Folds`],
+    /// the fire's [`crate::shapes::FireShape`]): the plain fused step. Counted
+    /// by the runtime as the engine takes the step, on every backend alike;
+    /// no fault, read beside [`Tally::FiresBuffers`].
+    FiresFolds,
+    /// A step fired whose stated shape buffers
+    /// ([`crate::shapes::Treatment::Buffers`]): some lane carried rows in
+    /// and the step ran the buffered body. What a served run read this
+    /// against [`Tally::FiresFolds`] says without a trace; no fault.
+    FiresBuffers,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 12] = [
+    pub const ALL: [Tally; 14] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -107,6 +118,8 @@ impl Tally {
         Tally::Drained,
         Tally::Probed,
         Tally::LoadedInFire,
+        Tally::FiresFolds,
+        Tally::FiresBuffers,
     ];
 
     /// Its name in the model status.
@@ -125,6 +138,8 @@ impl Tally {
             Tally::Drained => "drained",
             Tally::Probed => "probed",
             Tally::LoadedInFire => "loaded_in_fire",
+            Tally::FiresFolds => "fires_folds",
+            Tally::FiresBuffers => "fires_buffers",
         }
     }
 }
@@ -141,6 +156,20 @@ impl Live {
     /// `n` more `tally` events.
     pub fn tally(&self, tally: Tally, n: u64) {
         self.0.tallies[tally as usize].fetch_add(n, Ordering::AcqRel);
+    }
+
+    /// One more step fired of `shape`'s treatment ([`Tally::FiresFolds`],
+    /// [`Tally::FiresBuffers`]); a step that carries no stated shape (a
+    /// fire built by hand) counts under neither.
+    pub fn fired(&self, shape: Option<crate::shapes::FireShape>) {
+        let Some(shape) = shape else { return };
+        self.tally(
+            match shape.treatment {
+                crate::shapes::Treatment::Folds => Tally::FiresFolds,
+                crate::shapes::Treatment::Buffers => Tally::FiresBuffers,
+            },
+            1,
+        );
     }
 
     /// The `tally` events since load.

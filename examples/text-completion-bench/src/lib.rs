@@ -80,7 +80,7 @@ struct Input {
     /// replay at a steady lag). 0 folds all it writes.
     #[serde(default)]
     fold_lag: u32,
-    /// Whether the decode states its sampled rows final
+    /// Whether the prefill and the decode state their rows final
     /// (`ForwardPass::final_rows`): the bench never takes a row back, so it
     /// does unless asked not to (`false`: the lagged fold, for an A/B
     /// against it) or a `fold_lag` holds rows unfolded on purpose.
@@ -417,6 +417,15 @@ async fn run_one(
     fwd_p
         .state(&[&ws], geometry(lag, &prefill_fold))
         .context("bind prefill state")?;
+    // The bench never takes a row back, the prompt's included: a prefill
+    // stated final as its decodes are leaves no row for the first decode to
+    // carry, so no steady step catches one buffered (CONTRACT-BC 25).
+    let final_rows = input.final_rows && lag == 0;
+    if final_rows {
+        fwd_p
+            .final_rows()
+            .context("state the prefill's rows final")?;
+    }
     if input.checkpoint_prompt_end {
         let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
         fwd_p.checkpoints(&[end]).context("ask the prompt end's checkpoint")?;
@@ -435,7 +444,6 @@ async fn run_one(
 
     // Built before the prefill submits, so its `tok_in` claim precedes the prefill's build.
     let ws_ref = &ws;
-    let final_rows = input.final_rows && lag == 0;
     let build_decode = move |tok_in: Channel| -> std::result::Result<Option<ForwardPass>, String> {
         Ok(if budget > 0 {
             let fwd = ForwardPass::new();
