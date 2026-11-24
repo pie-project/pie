@@ -17,7 +17,6 @@ const GROUPS: i32 = BLOCK as i32 / 32;
 /// Elements of a head one lane holds (`kMaxPer`): heads up to 512 wide.
 const MAX_PER: i32 = 16;
 
-
 /// The matrix-core walk's block (`kSelThreads`) and the keys its LDS lists
 /// a window at a time (`kSelTable`): a block of keys wider than that takes
 /// the vector walk.

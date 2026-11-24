@@ -1609,3 +1609,19 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 **What.** The corrected planes of a gated-delta row may keep its per-head scalars (`poem_compiler::rs::gdn_scalars_bytes`: each value head's log-gate, then its key norm's inverse, f32), as `ChunkProfile::rs_scalars` states. Metal's decode reads them. CUDA's kernels recompute them from the row's `[b | a]` and keys, so CUDA's profile lays none (the cleanup dropped `Corrected::scalars`). engine-gpu's profile still lays the plane and, by its own `rs::Plane::Scalars` doc, neither writes nor reads it.
 
 **Why later.** engine-gpu is GPU's to flip (`rs_scalars: false` in `chunks::profile`). On CUDA, lay them again (`rs_scalars: true` and a plane in `store::rs`) only if a decode kernel comes to read them in place of recomputing.
+
+## F93. Shared host crate, phase 2: the kernels-rocm / kernels-cuda host files that differ by 10–30%
+
+**What.** After phase 1 moves the byte-identical and comment-only host files into the shared crate, 15 same-path files (~4.7k lines a side) remain near-copies: attn/plan.rs, elemwise/rope.rs, linear/affine/tiled.rs, jit/ctx.rs, synth.rs, elemwise/pointwise.rs, jit/kernel.rs, conv/conv3d.rs and others, plus the attention schedulers (kernels-rocm attn/sched_{decode,prefill,mla}.rs against kernels-cuda attn/plan/{decode,prefill,mla}.rs: 70 / 277 / 80 diff lines).
+
+**Idea.** Move each into the shared crate with its backend differences as parameters (wave 64 vs warp 32, unit names `.hip` / `.cuh`, `-ffp-contract=off` vs `fmad=false`, the device facts each reads), one file a commit, each verified by both backends' kernel tests.
+
+**Why later.** Too large this close to the PR (coordinator, 2026-11-24); phase 1 is pure moves, this is not.
+
+## F94. ROCm: one carried GDN step for 128-wide heads, the conv fused or not
+
+**What.** kernels-rocm has three carried GDN decode steps: `ssm_gdn_step_carried<BV>` (any head width), `ssm_gdn_rows_carried<128, 128, 256>` (128-wide heads, the conv run apart) and `ssm_gdn_step_fused_carried` (128-wide heads, the conv fused). The last two share a layout, but 356 of their ~860 lines differ: the fused step stages carried rows into LDS a chunk at a time, resolves their page slots once, and reads a lane that writes no state wholly as linear attention.
+
+**Idea.** One kernel with a `FUSED` flag: rows_carried's body replaced by the fused step's with its conv half compiled out. It changes rows_carried's arithmetic order, so it needs the per-shape rocprofv3 microbench (rows 1 / 8 / 64, carried 0 / 1, commit 1 / 8) and bit-identical outputs and states before it lands.
+
+**Why later.** Not a mechanical merge (the cleanup round took only moves); `ssm_gdn_step_carried` stays the fallback for other head widths either way.

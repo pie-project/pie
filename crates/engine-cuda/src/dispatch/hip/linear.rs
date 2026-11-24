@@ -417,6 +417,25 @@ impl Run<'_> {
             }
         }
         match op {
+            Linear::Matmul { .. } | Linear::RelBias { .. } | Linear::LoraCorrect { .. } => {
+                self.linear_matmul(op)
+            }
+            Linear::Glu { .. } | Linear::GeluTanh { .. } | Linear::Relu2 { .. } => {
+                self.linear_activation(op)
+            }
+            Linear::MoeRoute { .. } | Linear::GroupRoutes { .. } => self.linear_moe_route(op),
+            Linear::MoeSelect { .. } => self.linear_moe_select(op),
+            Linear::MatmulGrouped { .. } => self.linear_moe_grouped(op),
+            Linear::MoeCombine { .. }
+            | Linear::MoeBiasSum { .. }
+            | Linear::MoeSigmoidGateAdd { .. } => self.linear_moe_combine(op),
+        }
+    }
+
+    /// A dense product: a matmul (its logits, quantized and tiled forms), the
+    /// relative-position bias, the adapters' correction.
+    fn linear_matmul(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
             Linear::Matmul {
                 act,
                 w,
@@ -498,6 +517,58 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
+            Linear::Matmul {
+                act,
+                w,
+                quant: Some(quant),
+                input_scales: _,
+                scales,
+                y,
+                logits: false,
+                ..
+            } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
+            // The forms no builder makes.
+            Linear::Matmul { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Linear::RelBias {
+                x,
+                w,
+                heads,
+                d_rel,
+                extent,
+                y,
+            } => kernels_cuda::elemwise::posenc::rel_bias(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*w),
+                *heads,
+                *d_rel,
+                *extent,
+                &mut self.tensor(*y),
+            ),
+            Linear::LoraCorrect {
+                x,
+                bank_a,
+                bank_b,
+                routes,
+                y: _,
+                y_out,
+            } => linear::lora::correct(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*bank_a),
+                self.tensor(*bank_b),
+                self.tensor(*routes),
+                &mut self.tensor(*y_out),
+                self.segments(),
+            ),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// A gated or plain activation over a product: the GLU forms, GELU-tanh,
+    /// squared ReLU.
+    fn linear_activation(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
@@ -602,71 +673,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MoeCombine {
-                routed,
-                shared: Some(shared),
-                y,
-                weights: None,
-                ..
-            } => linear::moe::sum_add(
-                self.ctx(),
-                self.tensor(*routed),
-                self.tensor(*shared),
-                &mut self.tensor(*y),
-            ),
-            Linear::Matmul {
-                act,
-                w,
-                quant: Some(quant),
-                input_scales: _,
-                scales,
-                y,
-                logits: false,
-                ..
-            } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
-            // The forms no builder makes.
-            Linear::Matmul { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Linear::MoeSelect {
-                x,
-                bank,
-                routes,
-                quant: Some(quant),
-                input_scales: _,
-                y,
-                bias: None,
-                quantized: true,
-                ..
-            } => {
-                const OP: &str = "linear.moe_select";
-                // The routes' rows read x's rows, so x's rows are what quantize.
-                // An fp8 bank (f32 factors) reads e4m3 rows under f32 scales
-                // a 1x128 block; any other bank, ue8m0 ones.
-                let (codes, scales, biases) = self.planes(*bank);
-                let fp8_bank = biases.is_none()
-                    && linear::moe::fp8_tiles(self.tensor(*x), codes, scales, &self.tensor(*y));
-                match *quant {
-                    poem_ir::ActQuant::E4m3 { gran: 128 } if fp8_bank => {
-                        self.select_fp8(*x, *bank, *routes, *y)
-                    }
-                    poem_ir::ActQuant::E4m3 { gran } if fp8_bank => {
-                        Err(kernels_cuda::Error::Backend {
-                            op: OP,
-                            detail: format!(
-                                "an fp8 bank folds f32 activation scales over its 128-wide blocks, not {gran}-wide ones"
-                            ),
-                        })
-                    }
-                    poem_ir::ActQuant::E4m3 { gran } => {
-                        let fan = self.plane_fan(*x);
-                        let x = self.tensor(*x);
-                        let x = linear::act_quant::quantized(self.ctx(), OP, x, gran, fan)?;
-                        self.select_quant(x, *bank, *routes, *y)
-                    }
-                    poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
-                }
-            }
-            // Legs the pack left apart: the packed forms over a gate and an
-            // up plane, an unclamped SwiGLU clamped at the largest finite f32.
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
@@ -800,6 +806,13 @@ impl Run<'_> {
             }
             // The forms no builder makes.
             Linear::Glu { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// A MoE router: the routes and their weights, and the routes grouped.
+    fn linear_moe_route(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
             Linear::MoeRoute {
                 logits,
                 experts,
@@ -883,22 +896,6 @@ impl Run<'_> {
                 &mut self.tensor(*routes),
                 &mut self.tensor(*weights),
             ),
-            Linear::RelBias {
-                x,
-                w,
-                heads,
-                d_rel,
-                extent,
-                y,
-            } => kernels_cuda::elemwise::posenc::rel_bias(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*w),
-                *heads,
-                *d_rel,
-                *extent,
-                &mut self.tensor(*y),
-            ),
             Linear::MoeRoute {
                 logits,
                 bias: Some(bias),
@@ -978,6 +975,126 @@ impl Run<'_> {
             Linear::GroupRoutes { groups, routes } => {
                 linear::moe_route::group_routes(self.ctx(), *groups, &mut self.tensor(*routes))
             }
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// The selected experts' product over their routes.
+    fn linear_moe_select(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                quant: Some(quant),
+                input_scales: _,
+                y,
+                bias: None,
+                quantized: true,
+                ..
+            } => {
+                const OP: &str = "linear.moe_select";
+                // The routes' rows read x's rows, so x's rows are what quantize.
+                // An fp8 bank (f32 factors) reads e4m3 rows under f32 scales
+                // a 1x128 block; any other bank, ue8m0 ones.
+                let (codes, scales, biases) = self.planes(*bank);
+                let fp8_bank = biases.is_none()
+                    && linear::moe::fp8_tiles(self.tensor(*x), codes, scales, &self.tensor(*y));
+                match *quant {
+                    poem_ir::ActQuant::E4m3 { gran: 128 } if fp8_bank => {
+                        self.select_fp8(*x, *bank, *routes, *y)
+                    }
+                    poem_ir::ActQuant::E4m3 { gran } if fp8_bank => {
+                        Err(kernels_cuda::Error::Backend {
+                            op: OP,
+                            detail: format!(
+                                "an fp8 bank folds f32 activation scales over its 128-wide blocks, not {gran}-wide ones"
+                            ),
+                        })
+                    }
+                    poem_ir::ActQuant::E4m3 { gran } => {
+                        let fan = self.plane_fan(*x);
+                        let x = self.tensor(*x);
+                        let x = linear::act_quant::quantized(self.ctx(), OP, x, gran, fan)?;
+                        self.select_quant(x, *bank, *routes, *y)
+                    }
+                    poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
+                }
+            }
+            // Legs the pack left apart: the packed forms over a gate and an
+            // up plane, an unclamped SwiGLU clamped at the largest finite f32.
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: false,
+                quant: None,
+                ..
+            } => {
+                let (bank, experts) = self.expert_bank(*bank);
+                linear::moe::matmul_select(
+                    self.ctx(),
+                    self.tensor(*x),
+                    bank,
+                    self.tensor(*routes),
+                    &mut self.tensor(*y),
+                    experts,
+                )
+            }
+            Linear::MoeSelect {
+                x,
+                bank,
+                bias: Some(bias),
+                routes,
+                y,
+                quantized: false,
+                quant: None,
+                ..
+            } => {
+                let (codes, scales, affine) = self.planes(*bank);
+                debug_assert!(
+                    affine.is_none(),
+                    "the biased select is the mxfp4 gate/up leg's; an affine bank's \
+                     zero points ride the quant twin"
+                );
+                // A bank the weight cache streams reads its experts (codes,
+                // exponents and bias) through the cache's table.
+                let experts = self.bank_table(*bank);
+                linear::moe::matmul_select_bias(
+                    self.ctx(),
+                    self.tensor(*x),
+                    codes,
+                    scales,
+                    self.tensor(*bias),
+                    self.tensor(*routes),
+                    &mut self.tensor(*y),
+                    experts,
+                )
+            }
+            Linear::MoeSelect {
+                x,
+                bank,
+                routes,
+                y,
+                bias: None,
+                quantized: true,
+                quant: None,
+                ..
+            } => {
+                let x = self.tensor(*x);
+                self.select_quant(x, *bank, *routes, *y)
+            }
+            // The forms no builder makes.
+            Linear::MoeSelect { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// A product over expert groups.
+    fn linear_moe_grouped(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
             Linear::MatmulGrouped {
                 x,
                 w,
@@ -1046,71 +1163,26 @@ impl Run<'_> {
                     identity,
                 )
             }
-            Linear::MoeSelect {
-                x,
-                bank,
-                routes,
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// The routed rows combined: weighted sums, the bias sum, the shared
+    /// expert's sigmoid gate.
+    fn linear_moe_combine(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
+            Linear::MoeCombine {
+                routed,
+                shared: Some(shared),
                 y,
-                bias: None,
-                quantized: false,
-                quant: None,
+                weights: None,
                 ..
-            } => {
-                let (bank, experts) = self.expert_bank(*bank);
-                linear::moe::matmul_select(
-                    self.ctx(),
-                    self.tensor(*x),
-                    bank,
-                    self.tensor(*routes),
-                    &mut self.tensor(*y),
-                    experts,
-                )
-            }
-            Linear::MoeSelect {
-                x,
-                bank,
-                bias: Some(bias),
-                routes,
-                y,
-                quantized: false,
-                quant: None,
-                ..
-            } => {
-                let (codes, scales, affine) = self.planes(*bank);
-                debug_assert!(
-                    affine.is_none(),
-                    "the biased select is the mxfp4 gate/up leg's; an affine bank's \
-                     zero points ride the quant twin"
-                );
-                // A bank the weight cache streams reads its experts (codes,
-                // exponents and bias) through the cache's table.
-                let experts = self.bank_table(*bank);
-                linear::moe::matmul_select_bias(
-                    self.ctx(),
-                    self.tensor(*x),
-                    codes,
-                    scales,
-                    self.tensor(*bias),
-                    self.tensor(*routes),
-                    &mut self.tensor(*y),
-                    experts,
-                )
-            }
-            Linear::MoeSelect {
-                x,
-                bank,
-                routes,
-                y,
-                bias: None,
-                quantized: true,
-                quant: None,
-                ..
-            } => {
-                let x = self.tensor(*x);
-                self.select_quant(x, *bank, *routes, *y)
-            }
-            // The forms no builder makes.
-            Linear::MoeSelect { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            } => linear::moe::sum_add(
+                self.ctx(),
+                self.tensor(*routed),
+                self.tensor(*shared),
+                &mut self.tensor(*y),
+            ),
             Linear::MoeCombine {
                 routed,
                 weights: Some(weights),
@@ -1142,22 +1214,6 @@ impl Run<'_> {
                 // through its table.
                 self.bank_table(*bias),
             ),
-            Linear::LoraCorrect {
-                x,
-                bank_a,
-                bank_b,
-                routes,
-                y: _,
-                y_out,
-            } => linear::lora::correct(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*bank_a),
-                self.tensor(*bank_b),
-                self.tensor(*routes),
-                &mut self.tensor(*y_out),
-                self.segments(),
-            ),
             Linear::MoeSigmoidGateAdd {
                 routed,
                 shared,
@@ -1170,6 +1226,7 @@ impl Run<'_> {
                 self.tensor(*gate),
                 &mut self.tensor(*y),
             ),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
     }
 
