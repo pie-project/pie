@@ -49,3 +49,19 @@ impl Default for KernelProfile {
         KernelProfile::new()
     }
 }
+
+/// Diagnostic: where `PIE_VK_FAMILY_LOG` names a file, the arm walk's
+/// compositions and the family each landed in, a line each, appended.
+pub fn family_log(line: &str) {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("PIE_VK_FAMILY_LOG").map(std::path::PathBuf::from))
+        .as_deref()
+    else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}

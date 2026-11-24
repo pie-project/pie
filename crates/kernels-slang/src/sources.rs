@@ -11,13 +11,26 @@ mod generated {
 
 pub use generated::{CENSUS, SPIRV, WGSL};
 
-/// The key `name` is built under at `tier`, if it is instantiated there.
+/// The key `name` is built under at `tier`, if it is instantiated there:
+/// looked up in an index of the census built once (every dispatch an
+/// encode lays asks, the arm walk's millions of them too).
 #[must_use]
 pub fn key(name: &str, tier: Tier) -> Option<&'static str> {
-    CENSUS
+    type Index = std::collections::HashMap<&'static str, Vec<(&'static str, &'static str)>>;
+    static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
+    let tier = tier.name();
+    INDEX
+        .get_or_init(|| {
+            let mut index = Index::with_capacity(CENSUS.len());
+            for &(key, name, tier, _) in CENSUS {
+                index.entry(name).or_default().push((tier, key));
+            }
+            index
+        })
+        .get(name)?
         .iter()
-        .find(|(_, n, t, _)| *n == name && *t == tier.name())
-        .map(|(key, ..)| *key)
+        .find(|(at, _)| *at == tier)
+        .map(|&(_, key)| key)
 }
 
 /// The SPIR-V module built under `key`, if this build carries it.

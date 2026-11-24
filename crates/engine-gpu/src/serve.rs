@@ -10888,6 +10888,9 @@ impl<B: Serve> Shell<B> {
                 for before in 0..arm {
                     self.arms.take(before);
                 }
+                crate::kernel_profile::family_log(&format!(
+                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} keys_only {keys_only}"
+                ));
                 let fired = self.fire_seated(&seated);
                 self.arm_filled = false;
                 for before in 0..arm {

@@ -424,6 +424,13 @@ impl Serve for Api {
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
         crate::encode::profile_ready();
+        if crate::encode::profiling() {
+            tracing::info!(
+                encode_ms = crate::encode::host_encode_ns() / 1_000_000,
+                between_ms = crate::encode::between_fires_ns() / 1_000_000,
+                "vulkan host encode before ready (the arm walk's dispatches)"
+            );
+        }
         shell.device().name_descriptor_sets();
         shell
             .device()
@@ -640,6 +647,11 @@ impl Serve for Api {
         if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
             nearest(shell, &fill.trail, prepared);
         }
+        engine_gpu::kernel_profile::family_log(&format!(
+            "family {family:?} held {} rung {}",
+            shell.shelf.recorder.family(family).is_some(),
+            prepared.rung
+        ));
         let Some(held) = shell.shelf.recorder.family(family) else {
             tracing::debug!(
                 arm = prepared.arm,
@@ -783,6 +795,13 @@ impl Serve for Api {
                 );
                 let groups = std::sync::Arc::new(kept.groups().to_vec());
                 let fresh = shell.shelf.recorder.family(family).is_none();
+                if shell.arming {
+                    engine_gpu::kernel_profile::family_log(&format!(
+                        "family {family:?} held {} rung {}",
+                        !fresh,
+                        prepared.rung
+                    ));
+                }
                 enum Act {
                     Fill,
                     Record(std::sync::Arc<Vec<bool>>),
