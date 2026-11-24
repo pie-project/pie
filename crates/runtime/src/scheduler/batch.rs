@@ -696,7 +696,11 @@ mod tests {
         let cells: Vec<_> = frame.terminal_cells().collect();
         assert_eq!(cells.len(), flattened.len());
         assert_eq!(
-            cells.iter().collect::<std::collections::HashSet<_>>().len(),
+            cells
+                .iter()
+                .map(|cell| std::sync::Arc::as_ptr(&cell.0))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
             cells.len(),
             "no cell is owned by two members"
         );

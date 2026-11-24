@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/builtins",
     "crates/runtime",
+    "crates/runtime-sys",
     "crates/controller",
     "crates/units",
     "crates/gateway",
@@ -71,6 +72,7 @@ members = [
 default-members = [
     "crates/builtins",
     "crates/runtime",
+    "crates/runtime-sys",
     "crates/controller",
     "crates/units",
     "crates/gateway",

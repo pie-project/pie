@@ -108,30 +108,18 @@ mod links {
     }
 
     #[cfg(windows)]
-    #[allow(unsafe_code)]
-    fn info(
-        path: &Path,
-    ) -> io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
-        let file = std::fs::File::open(path)?;
-        // SAFETY: the handle is the open file's own, and `info` is a plain struct the call fills.
-        let mut info = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(info)
+    fn info(path: &Path) -> io::Result<winapi_util::file::Information> {
+        winapi_util::file::information(std::fs::File::open(path)?)
     }
 
     #[cfg(windows)]
     pub fn count(path: &Path, _: &Metadata) -> io::Result<u64> {
-        Ok(u64::from(info(path)?.nNumberOfLinks))
+        Ok(info(path)?.number_of_links())
     }
 
     #[cfg(windows)]
     pub fn id(path: &Path, _: &Metadata) -> io::Result<u64> {
-        let info = info(path)?;
-        Ok(u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow))
+        Ok(info(path)?.file_index())
     }
 }
 

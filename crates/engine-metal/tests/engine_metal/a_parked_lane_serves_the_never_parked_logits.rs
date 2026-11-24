@@ -12,7 +12,7 @@
 //! (`write_tier_slots`), as a shared-pool snapshot restores.
 
 use engine::chunk::{ShapeId, SlotCopy, SlotKind};
-use engine::transfer::MemoryDomain;
+use engine::transfer::{DeviceReach, MemoryDomain};
 use engine_metal::serve::Seated;
 use engine_metal::store::layout::{FIXED, LIST, WINDOWS};
 use engine_metal::{Lane, Shell};
@@ -77,7 +77,10 @@ fn park(
     shell
         .copy_slots(&SlotCopy {
             shape,
-            src: MemoryDomain::MetalShared,
+            src: MemoryDomain::Device {
+                ordinal: 0,
+                reach: DeviceReach::HostShared,
+            },
             dst: tier,
             slots: out.clone(),
             runs: Vec::new(),
@@ -141,7 +144,10 @@ fn park(
         .copy_slots(&SlotCopy {
             shape,
             src: tier,
-            dst: MemoryDomain::MetalShared,
+            dst: MemoryDomain::Device {
+                ordinal: 0,
+                reach: DeviceReach::HostShared,
+            },
             slots: back,
             runs: Vec::new(),
         })

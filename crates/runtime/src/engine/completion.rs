@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
@@ -42,16 +40,10 @@ impl TerminalCell {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A terminal cell, alive for as long as any holder of it is.
+#[derive(Debug, Clone)]
 #[repr(transparent)]
-pub struct CellPtr(pub *mut TerminalCell);
-
-// SAFETY: a `CellPtr` is an address; reading through it takes `unsafe` at the
-// use site (`settle`), where the owning completion is held alive. The pointee
-// is a `TerminalCell`, a lone `AtomicU32`, so any thread may touch it.
-unsafe impl Send for CellPtr {}
-// SAFETY: as `Send` — sharing the address shares only access to an atomic.
-unsafe impl Sync for CellPtr {}
+pub struct CellPtr(pub Arc<TerminalCell>);
 
 pub trait CompletionLease: Send + Sync {
     fn is_closed(&self) -> bool;
@@ -78,21 +70,18 @@ enum TerminalOutcome {
 }
 
 #[derive(Debug)]
-struct TerminalCellStorage(TerminalCell);
-
-#[derive(Debug)]
 struct OwnedTerminalCell {
-    raw: Option<Box<TerminalCellStorage>>,
+    raw: Option<Arc<TerminalCell>>,
     recyclable: bool,
 }
 
-fn terminal_cell_pool() -> &'static SegQueue<Box<TerminalCellStorage>> {
-    static POOL: OnceLock<SegQueue<Box<TerminalCellStorage>>> = OnceLock::new();
+fn terminal_cell_pool() -> &'static SegQueue<Arc<TerminalCell>> {
+    static POOL: OnceLock<SegQueue<Arc<TerminalCell>>> = OnceLock::new();
     POOL.get_or_init(SegQueue::new)
 }
 
-fn terminal_cell_quarantine() -> &'static SegQueue<Box<TerminalCellStorage>> {
-    static QUARANTINE: OnceLock<SegQueue<Box<TerminalCellStorage>>> = OnceLock::new();
+fn terminal_cell_quarantine() -> &'static SegQueue<Arc<TerminalCell>> {
+    static QUARANTINE: OnceLock<SegQueue<Arc<TerminalCell>>> = OnceLock::new();
     QUARANTINE.get_or_init(SegQueue::new)
 }
 
@@ -100,7 +89,7 @@ impl OwnedTerminalCell {
     fn new() -> Self {
         let raw = terminal_cell_pool()
             .pop()
-            .unwrap_or_else(|| Box::new(TerminalCellStorage(TerminalCell::pending())));
+            .unwrap_or_else(|| Arc::new(TerminalCell::pending()));
         let cell = Self {
             raw: Some(raw),
             recyclable: false,
@@ -109,16 +98,12 @@ impl OwnedTerminalCell {
         cell
     }
 
-    fn cell(&self) -> &TerminalCell {
-        &self
-            .raw
-            .as_deref()
-            .expect("owned terminal cell is present")
-            .0
+    fn cell(&self) -> &Arc<TerminalCell> {
+        self.raw.as_ref().expect("owned terminal cell is present")
     }
 
     fn as_mut_ptr(&self) -> CellPtr {
-        CellPtr(ptr::from_ref(self.cell()).cast_mut())
+        CellPtr(Arc::clone(self.cell()))
     }
 
     fn load(&self) -> TerminalOutcome {
@@ -786,16 +771,8 @@ impl Drop for WorkItemCompletion {
 }
 
 pub fn settle(cells: &[CellPtr], outcome: TerminalOutcomeCode) {
-    for &CellPtr(cell) in cells {
-        if cell.is_null() {
-            continue;
-        }
-        // SAFETY: the cell belongs to a `WorkItemCompletion` this submission
-        // holds a clone of for the whole of the call, and `publish` is a
-        // release store into an `AtomicU32`.
-        unsafe {
-            (*cell).publish(outcome);
-        }
+    for CellPtr(cell) in cells {
+        cell.publish(outcome);
     }
 }
 
@@ -823,11 +800,8 @@ impl PendingFrame {
             .iter_mut()
             .filter_map(Option::take)
             .collect();
-        let frame = (failed || self.steps.iter().all(Option::is_none)).then_some((
-            self.frame_cell,
-            self.wait_id,
-            self.epoch,
-        ));
+        let frame = (failed || self.steps.iter().all(Option::is_none))
+            .then(|| (self.frame_cell.clone(), self.wait_id, self.epoch));
         Landed {
             steps,
             failed,

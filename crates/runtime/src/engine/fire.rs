@@ -107,7 +107,7 @@ impl FrameFire {
     pub fn terminal_cells(&self) -> impl Iterator<Item = CellPtr> + '_ {
         self.steps
             .iter()
-            .flat_map(|step| step.terminal_cells.iter().copied())
+            .flat_map(|step| step.terminal_cells.iter().cloned())
     }
 }
 

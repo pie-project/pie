@@ -224,10 +224,7 @@ pub trait Engine: Send {
         let _ = sink;
     }
 
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> Result<()> {
-        let _ = ticket;
-        Ok(())
-    }
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> Result<()>;
 
     /// Publishes what the guests' programs of the steps already landed put
     /// on their channels, without waiting on a step still in flight. An

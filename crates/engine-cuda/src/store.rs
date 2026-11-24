@@ -3241,7 +3241,10 @@ impl Pools {
                 base: self.chunks.base() + plane.offset,
                 len: self.chunks.bytes().saturating_sub(plane.offset),
                 page_stride: grain,
-                domain: engine::MemoryDomain::CudaDevice(ordinal),
+                domain: engine::MemoryDomain::Device {
+                    ordinal,
+                    reach: engine::DeviceReach::Peer,
+                },
             });
         }
         let (layers, heads, head_dim, dtype) = self
