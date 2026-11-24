@@ -1942,16 +1942,25 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
     // cell or a carried row's input; null for the own row. Every tap's and
     // every stored cell's source is placed first and all of them read at
     // once, never one dependent load a tap.
-    auto src = [&](int u, int t) -> const bf16* {
+    // `table`: t is one of the run's last K - 1 rows, which the slot table
+    // always holds (`base` keeps the last RCH >= K - 1), so its row is one
+    // shared load, not the lane's page walk inlined at each of the taps.
+    auto src = [&](int u, int t, bool table) -> const bf16* {
         if (t < 0) return &cst[u][(K + t) * ccs + cc[u]];
         if (t < n) {
             u64 slot;
             u32 pos;
-            where(conv, xl, t, slot, pos);
+            if (table) {
+                slot = t_slot[t - base];
+                pos = t_pos[t - base];
+            } else {
+                where(conv, xl, t, slot, pos);
+            }
             return conv.plane_at<const bf16>(slot, pos, 0) + ch[u];
         }
         return nullptr;
     };
+    static_assert(RCH >= KMAX - 1, "the slot table holds every window tap's row");
     float hv[CPT][KMAX], wv[CPT][KMAX];
     {
         const bf16* hp[CPT][KMAX];
@@ -1960,8 +1969,10 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
         for (int u = 0; u < CPT; ++u) {
 #pragma unroll
             for (int k = 0; k < KMAX; ++k) {
-                hp[u][k] = k < K ? src(u, n - (K - 1 - k)) : nullptr;
-                wp[u][k] = cfold && k < K ? src(u, commit - K + k) : nullptr;
+                hp[u][k] = k < K ? src(u, n - (K - 1 - k), true) : nullptr;
+                // The committed cells may lie below the table (a run past RCH
+                // rows committing few): the lane's page walk.
+                wp[u][k] = cfold && k < K ? src(u, commit - K + k, false) : nullptr;
             }
         }
 #pragma unroll
