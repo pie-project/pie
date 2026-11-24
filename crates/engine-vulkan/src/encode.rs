@@ -132,10 +132,6 @@ pub(crate) fn profile_ready() {
     let _ = std::fs::write(ready, profile_text());
 }
 
-/// No device, no profile.
-#[cfg(not(feature = "vulkan"))]
-pub(crate) fn profile_ready() {}
-
 #[must_use]
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     KERNEL_PROFILE.rows()
