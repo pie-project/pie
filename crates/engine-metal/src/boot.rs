@@ -5,12 +5,14 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         .map_err(|error| format!("the metal boot config is not utf-8: {error}"))?
         .parse()
         .map_err(|error| format!("the metal boot config is not TOML: {error}"))?;
-    let profiles = profiles(&doc)?;
+    let profiles = dir(&doc, "profiles")?;
+    let cache = dir(&doc, "cache")?;
     crate::diag::publish(&diagnostics(&doc)?);
     Ok(Metal::new(
         DeviceBoot {
             adapter_dir: adapter_dir(&doc),
             profiles,
+            cache,
             measure: measure(&doc)?,
             ..DeviceBoot::default()
         },
@@ -58,15 +60,16 @@ fn measure(doc: &toml::Table) -> Result<engine::rates::Measuring, String> {
     }
 }
 
-fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
+/// `[metal] <key>`, a directory path; unstated or empty is `None`.
+fn dir(doc: &toml::Table, key: &str) -> Result<Option<std::path::PathBuf>, String> {
     let Some(metal) = doc.get("metal").and_then(toml::Value::as_table) else {
         return Ok(None);
     };
-    match metal.get("profiles") {
+    match metal.get(key) {
         None => Ok(None),
         Some(toml::Value::String(dir)) if dir.trim().is_empty() => Ok(None),
         Some(toml::Value::String(dir)) => Ok(Some(std::path::PathBuf::from(dir))),
-        Some(other) => Err(format!("[metal] profiles is a directory path, not {other}")),
+        Some(other) => Err(format!("[metal] {key} is a directory path, not {other}")),
     }
 }
 
@@ -129,7 +132,7 @@ mod tests {
     }
 
     fn the_profiles_directory_is_read_or_refused_by_name() {
-        let of = |src: &str| super::profiles(&src.parse::<toml::Table>().unwrap());
+        let of = |src: &str| super::dir(&src.parse::<toml::Table>().unwrap(), "profiles");
         assert_eq!(of(""), Ok(None));
         assert_eq!(
             of("[metal]\nprofiles = \"/home/p/.pie/profiles\"\n"),

@@ -45,9 +45,9 @@ pub fn available() -> Result<(), String> {
     }
 }
 
-/// Where compiled programs are kept between runs.
+/// Where compiled programs are kept between runs, under the cache
+/// directory the caller names (pie's engine cache).
 #[must_use]
-pub fn cache_directory() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".cache/pie/ane-programs")
+pub fn cache_directory(under: &std::path::Path) -> PathBuf {
+    under.join("ane-programs")
 }

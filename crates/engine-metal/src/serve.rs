@@ -733,6 +733,7 @@ impl Shell {
             profile,
             placed: None,
             ruled: None,
+            ane_cache: None,
         })
     }
 }
@@ -764,6 +765,9 @@ pub struct PreparedLoad<'a> {
     placed: Option<Placed>,
     /// The top rung the ruling picked, once this load is laid at it.
     ruled: Option<engine::load::TopRung>,
+    /// Where the Neural Engine keeps its compiled programs
+    /// ([`DeviceBoot::cache`](crate::DeviceBoot::cache)).
+    ane_cache: Option<std::path::PathBuf>,
 }
 
 impl PreparedLoad<'_> {
@@ -779,6 +783,12 @@ impl PreparedLoad<'_> {
         self.boot.residency = residency;
     }
 
+    /// Where the Neural Engine keeps its compiled programs: pie's engine
+    /// cache ([`DeviceBoot::cache`](crate::DeviceBoot::cache)).
+    pub fn set_ane_cache(&mut self, cache: Option<std::path::PathBuf>) {
+        self.ane_cache = cache;
+    }
+
     pub fn load(self) -> Result<Shell> {
         let PreparedLoad {
             boot,
@@ -792,6 +802,7 @@ impl PreparedLoad<'_> {
             profile,
             placed,
             ruled,
+            ane_cache,
         } = self;
         let mut boot = boot;
 
@@ -916,7 +927,14 @@ impl PreparedLoad<'_> {
                     &boot.trace,
                     *chip.get::<crate::chip::WeightsLayout>(),
                 )?;
-                let ane = crate::ane::load(&device, &handles, &boot.trace, &weights, &chip)
+                let ane = crate::ane::load(
+                    &device,
+                    &handles,
+                    &boot.trace,
+                    &weights,
+                    &chip,
+                    ane_cache.as_deref(),
+                )
                     .unwrap_or_else(|why| {
                         tracing::info!("the Neural Engine stays out of this load: {why}");
                         None
@@ -1475,6 +1493,7 @@ impl PreparedLoad<'_> {
                         weight_caches,
                     }),
                     ruled: Some(pick),
+                    ane_cache,
                 }
                 .load();
             }
