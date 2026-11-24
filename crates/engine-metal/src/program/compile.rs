@@ -126,6 +126,7 @@ pub fn step_pipelines_built() -> u64 {
 }
 
 pub struct Module {
+    /// Held for the life of the pipelines made from it, never read.
     #[cfg(target_vendor = "apple")]
     #[allow(dead_code)]
     library: Retained<ProtocolObject<dyn MTLLibrary>>,

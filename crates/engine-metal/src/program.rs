@@ -276,8 +276,8 @@ impl Plane {
         let state = guest::guest_state(&pair, &instance, self.resident_of(program), room_of(pools)?);
         // A place lies in one run of a segment's chunks: a run past a segment
         // can never be opened, compaction or not, so it is refused here by
-        // name rather than asked of the pool (where a restore waited on it
-        // for good: Mac Pro's w32 on the M5, a run of 57 past a segment's 35).
+        // name rather than asked of the pool (where a restore would wait on
+        // it for good: a beam of 32 on an M5, a run of 57 past a segment's 35).
         let segment = pools.chunk_facts().segment_chunks;
         if state.run > segment {
             let chunk = pools.chunk_bytes();
@@ -288,8 +288,8 @@ impl Plane {
                 state.run, state.scratch, state.resident
             );
             // A beam group's width is named, not a width it would fit at: its
-            // scratch a beam moves with the bind's extents (Mac Pro: 6.7 MB a
-            // beam at w32, 3.4 MB at w20), so no one figure bounds it.
+            // scratch a beam moves with the bind's extents (6.7 MB a beam at
+            // w32, 3.4 MB at w20 on an M5), so no one figure bounds it.
             if let Some(layout) = self.beam_of(program) {
                 why.push_str(&format!("; a beam group of {} beams", layout.lanes));
             }
@@ -1223,13 +1223,12 @@ impl Plane {
             .iter()
             // A parked instance that shed its state holds nothing here
             // (`engine::Rebind::Parked`): repointed, claimed and laid at its
-            // rebind, never here over what another owner holds (Mac Pro: a
-            // shed pair laid at its stale place after every evacuation). One
+            // rebind, never here over what another owner holds (a shed pair
+            // would be laid at its stale place after every evacuation). One
             // whose park kept its tables and rings in place holds them where
             // the evacuation moved them, its scratch not (given back at the
-            // park): left on the old bytes, its claim let another instance
-            // bind over its tables at its own refs (the L40S's kept park,
-            // 743e8a54e on engine-cuda).
+            // park): left on the old bytes, its claim would let another
+            // instance bind over its tables at its own refs.
             .filter(|(_, bound)| !bound.parked || bound.kept)
             .map(|(id, bound)| {
                 let scratch = if bound.parked {
@@ -2606,8 +2605,8 @@ mod tests {
     /// Top-k and top-p over short vectors, under what a streamed select
     /// (`select_count` x 51,200 B) or a streamed top-k (`rows` x (2,072 +
     /// 12 x 1,024) B) keeps in its temporaries: the whole-value rule alone
-    /// sized those areas at 16 B an element, so the kernel wrote past its
-    /// lane's temporary into what lay next. The stage's temporary now takes
+    /// sizes those areas at 16 B an element, and the kernel would write past
+    /// its lane's temporary into what lies next. The stage's temporary takes
     /// what each region's emitter publishes it needs
     /// (`eta_exec::stage_temporaries`), and every form cuts as its rule
     /// names.
@@ -3265,11 +3264,11 @@ mod tests {
     /// interpreter answers at every mask size: each beam inherits its
     /// parent's row (`gather(mask, parent)`) and marks its own new cell
     /// (`or` with `iota == cell`), over `[beams, cells]` bools from below to
-    /// past one 1,024-thread block. (On the tiny-region merge of 3ee539f31
-    /// the step's put shared a streamed step with the `or` writing its
-    /// value, and packing eight bools a byte read cells the other
-    /// threadgroup had not yet written: past cell 512 the mask came back
-    /// zero, and a beam of 7 read the wrong ancestry.)
+    /// past one 1,024-thread block. (Where a tiny-region merge puts the
+    /// step's put in one streamed step with the `or` writing its value,
+    /// packing eight bools a byte reads cells the other threadgroup has not
+    /// yet written: past cell 512 the mask comes back zero, and a beam of 7
+    /// reads the wrong ancestry.)
     #[test]
     fn a_beam_mask_step_answers_what_the_interpreter_answers_at_every_size() {
         use eta_compiler::contract::wire;
@@ -4808,9 +4807,8 @@ mod tests {
     /// an evacuation that moves their chunks moves the claim with them: an
     /// instance bound at the parked one's refs is refused by name (it would
     /// lie on the kept tables), and the parked instance, rebound at the same
-    /// refs, fires as it did before the move. Before, the rebind skipped
-    /// every parked instance and the overlapping bind was accepted (the
-    /// L40S's kept park on engine-cuda, 743e8a54e).
+    /// refs, fires as it did before the move. A rebind that skipped every
+    /// parked instance would accept the overlapping bind.
     #[test]
     fn an_evacuation_moves_a_kept_park_s_claim_with_its_tables() {
         use crate::store::Pools;
@@ -4922,8 +4920,8 @@ mod tests {
     /// A guest state whose place needs a run past a segment is refused by
     /// name at guest_state, naming the run, the segment and (for a beam
     /// group) its beams, never asked of the pool,
-    /// where a restore waited on a run that can never open (Mac Pro's w32
-    /// on the M5). The same program over a pool whose segment holds its run
+    /// where a restore would wait on a run that can never open (a beam of 32
+    /// on an M5). The same program over a pool whose segment holds its run
     /// is stated as before.
     #[test]
     fn a_place_past_a_segment_is_refused_by_name() {
