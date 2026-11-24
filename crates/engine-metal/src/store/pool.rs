@@ -674,8 +674,12 @@ impl Pool {
         if segments <= self.span {
             return Ok(());
         }
+        // Refused, the span stands as it was: a refusal says nothing was
+        // backed, and a span counted backed past what is mapped had a later
+        // admission take an unmapped chunk as the bottom's.
+        let was = self.span;
         self.span = segments;
-        self.back_top()
+        self.back_top().inspect_err(|_| self.span = was)
     }
 
     /// Gives back the span's segments past the top `segments`, down to what
