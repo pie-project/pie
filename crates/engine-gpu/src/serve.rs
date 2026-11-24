@@ -3174,8 +3174,8 @@ impl<B: Serve> Shell<B> {
             .filter(|range| !decided.contains(range))
             .collect();
         // No settle of this key: the nearest one's picks serve meanwhile,
-        // each where it is a kernel this load weighs at that range (built
-        // at load, as every candidate is).
+        // range by range, each where its kernel is built for every plane of
+        // this load (a pick is served only by a kernel built before ready).
         let mut served_by = if stored.is_empty() {
             "the curves' picks".to_string()
         } else {
@@ -3191,9 +3191,7 @@ impl<B: Serve> Shell<B> {
                     continue;
                 };
                 let (bottom, top) = (row[0], row[1]);
-                if left.contains(&(bottom, top))
-                    && self.range_kernels(&self.dense, bottom, top).contains(&tactic)
-                {
+                if left.contains(&(bottom, top)) && self.tactic_built(tactic) {
                     self.dense = self.dense.with_rows(bottom, top, tactic);
                     took += 1;
                 }
@@ -3386,6 +3384,16 @@ impl<B: Serve> Shell<B> {
     pub fn rate_timed(&mut self, key: &str) -> usize {
         self.rates_behind.retain(|k| k != key);
         self.rates_behind.len()
+    }
+
+    /// Whether `tactic`'s entry at every dense plane of this load is built:
+    /// a pick this load may serve without building after ready.
+    fn tactic_built(&self, tactic: kernels_slang::linear::gemm::Tactic) -> bool {
+        let built = B::built_since(&self.pipelines, 0);
+        self.dense_planes.iter().all(|&(n, k, ..)| {
+            kernels_slang::linear::gemm::entry(B::TARGET, tactic, n, k)
+                .is_ok_and(|fire| built.iter().any(|kernel| kernel.starts_with(fire.entrypoint)))
+        })
     }
 
     /// Whether a dense settle is left to weigh behind serving
