@@ -2,6 +2,54 @@
 
 use super::*;
 
+/// Whether the pass's program binds `port`.
+fn binds_port<C: FireContext>(
+    ctx: &mut C,
+    fwd: &Resource<ForwardPass>,
+    port: Port,
+) -> Anyhow<bool> {
+    Ok(ctx
+        .resources()
+        .get(fwd)?
+        .instance
+        .program
+        .bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| binding.port == port))
+}
+
+/// Each group's pages a device-placed fire may write, and where they end:
+/// its first lane's from its folded rows to its reserve. `Err` refuses a
+/// lane past a media span that states no positions, or one with nothing
+/// reserved past its folded rows.
+fn device_write_ranges(
+    groups: &LaneGroups,
+    pass_lanes: &PassLanes,
+    page: u64,
+    states_positions: bool,
+) -> Result<(Vec<Vec<u64>>, Vec<u32>), String> {
+    let mut write_indexes: Vec<Vec<u64>> = Vec::with_capacity(groups.len());
+    let mut write_ends: Vec<u32> = Vec::with_capacity(groups.len());
+    for (_, lanes) in groups {
+        let lane = lanes[0];
+        let place = &pass_lanes.places[lane];
+        // Past an M-RoPE span a row rotates behind its slot, which the device picks.
+        if !states_positions && !place.spans.is_empty() {
+            return Err(format!(
+                "pipeline: lane {lane}'s rows land where the device says, past a media span \
+                 whose rotation runs behind its slots; state its positions"
+            ));
+        }
+        let reserved = pass_lanes.cursors[lane].lock().unwrap().reserved;
+        let writable = device_writable(lane, place.folded, reserved)?;
+        write_indexes.push(writable_pages(&writable, page).collect());
+        write_ends.push(writable.end);
+    }
+    Ok((write_indexes, write_ends))
+}
+
 pub(super) async fn fire_device_geometry<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -67,48 +115,15 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
     // Every page from the frozen prefix up to what `reserve` granted is backed
     // before the fire.
     let page = u64::from(stores.kv_page_size.max(1));
-    let states_positions = ctx
-        .resources()
-        .get(&fwd)?
-        .instance
-        .program
-        .bound
-        .container
-        .ports
-        .iter()
-        .any(|binding| binding.port == Port::Positions);
+    let states_positions = binds_port(ctx, &fwd, Port::Positions)?;
     // A beam group's pass (`parents`): its beams' recurrent rows are each
     // their own list's (`BEAM-PAGE-LISTS.md` §11).
-    let states_parents = ctx
-        .resources()
-        .get(&fwd)?
-        .instance
-        .program
-        .bound
-        .container
-        .ports
-        .iter()
-        .any(|binding| binding.port == Port::Parents);
-    let mut write_indexes: Vec<Vec<u64>> = Vec::with_capacity(groups.len());
-    let mut write_ends: Vec<u32> = Vec::with_capacity(groups.len());
-    for (_, lanes) in &groups {
-        let lane = lanes[0];
-        let place = &pass_lanes.places[lane];
-        // Past an M-RoPE span a row rotates behind its slot, which the device picks.
-        if !states_positions && !place.spans.is_empty() {
-            return Ok(Err(format!(
-                "pipeline: lane {lane}'s rows land where the device says, past a media span \
-                 whose rotation runs behind its slots; state its positions"
-            )));
-        }
-        let reserved = pass_lanes.cursors[lane].lock().unwrap().reserved;
-        let writable = match device_writable(lane, place.folded, reserved) {
-            Ok(writable) => writable,
+    let states_parents = binds_port(ctx, &fwd, Port::Parents)?;
+    let (write_indexes, write_ends) =
+        match device_write_ranges(&groups, &pass_lanes, page, states_positions) {
+            Ok(ranges) => ranges,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        write_indexes.push(writable_pages(&writable, page).collect());
-        write_ends.push(writable.end);
-    }
 
     let split = ctx
         .resources()

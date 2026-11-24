@@ -566,6 +566,154 @@ pub(super) fn advance_shadow<C: FireContext>(ctx: &mut C, fwd: &Resource<Forward
     Ok(())
 }
 
+/// A pass whose rows the device places (a device-geometry or a float
+/// lane's): fired whole, its writes recorded once it is submitted.
+async fn submit_placed_by_device<C: FireContext>(
+    ctx: &mut C,
+    this: Resource<Pipeline>,
+    fwd: Resource<ForwardPass>,
+    frame: Option<crate::scheduler::FrameStamp>,
+) -> Anyhow<Result<(), String>> {
+    let pipeline = this.rep();
+    let final_rows = ctx.resources().get(&fwd)?.bindings.final_rows;
+    let submitted = if ctx.resources().get(&fwd)?.devgeo.is_some() {
+        fire_device_geometry(ctx, this, fwd, frame).await?
+    } else {
+        float::fire_float_lane(ctx, this, fwd, frame).await?
+    };
+    if submitted.is_ok() {
+        record_writes(ctx, pipeline, None, final_rows)?;
+    }
+    Ok(submitted)
+}
+
+/// The host-placed pass's geometry and attention mask, evaluated from what
+/// its shadow knows; the ports in `device_resolved` are the engine's.
+/// `Err` refuses the fire by name.
+fn host_geometry_of(
+    p: &ForwardPass,
+    device_resolved: PortMask,
+) -> Result<(geometry::ReqGeometry, geometry::FireAttnMask), String> {
+    let bound = &p.instance.program.bound;
+    let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
+    let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
+    let (geometry, evaluated) =
+        geometry::map_geometry_evaluated_with(bound, &mut known, device_resolved)
+            .map_err(|error| format!("pipeline: fire geometry: {error}"))?;
+    if device_resolved.is_empty() && geometry.token_ids.contains(&u32::MAX) {
+        return Err("pipeline: fire geometry: in-band -1 skip tokens require a \
+                    device-resolved geometry class; this fire resolved on the \
+                    host wire"
+            .to_string());
+    }
+    // A mask the program computes on the device is the engine's to resolve,
+    // even on a fire whose seeds let the host evaluate it: one source a port.
+    let attn_mask = if device_resolved.contains(Port::AttnMask) {
+        geometry::FireAttnMask::Device
+    } else {
+        geometry::lower_attn_mask_evaluated(&bound.container, &geometry.qo_indptr, &evaluated)
+            .map_err(|error| format!("pipeline: fire attention mask: {error}"))?
+    };
+    Ok((geometry, attn_mask))
+}
+
+/// What a beam pass reserves of its pool before its fire.
+struct BeamReserve {
+    /// Each group's pages from its folded pages to its column's end;
+    /// `None` where the pass's lanes do not state their own page lists.
+    paged: Option<Vec<Vec<u64>>>,
+    /// Each beam group's pool end (a slot), which its rs buffer is backed
+    /// to as well (`BEAM-PAGE-LISTS.md` §11).
+    ends: Vec<u32>,
+    /// Each beam group's common slot, as its last harvested steps left it
+    /// (§11.3): one pass, one group, one instance.
+    commons: Vec<u32>,
+}
+
+/// Reserves each beam group's pool up to the column this fire opens and
+/// backs the pages the column adds; `Err` refuses the pass by name.
+#[allow(clippy::too_many_arguments)]
+fn reserve_beam_columns(
+    binds_pages: bool,
+    beam_common: u32,
+    page_size: u32,
+    groups: &LaneGroups,
+    pass_lanes: &PassLanes,
+    landings: &[geometry::Landing],
+    stores: &crate::store::registry::Stores,
+) -> Anyhow<Result<BeamReserve, String>> {
+    let mut beam_ends: Vec<u32> = Vec::new();
+    let mut beam_commons: Vec<u32> = Vec::new();
+    if !binds_pages {
+        return Ok(Ok(BeamReserve {
+            paged: None,
+            ends: beam_ends,
+            commons: beam_commons,
+        }));
+    }
+    let page = u64::from(page_size.max(1));
+    let mut reserves = Vec::with_capacity(groups.len());
+    for (_, lanes) in groups {
+        let lane = lanes[0];
+        let folded = pass_lanes.places[lane].folded;
+        // The beams' pool grows a column at a time (BEAM-PAGE-LISTS.md
+        // §3): before the fire that opens a column the set reserves
+        // what its column needs, waiting like any reservation. The
+        // step hands out the lowest free pages, so every page named or
+        // pending lies below `B (c + 2) + B F + 1`, `c` this fire's
+        // column and `F` the engine's frames in flight.
+        let f0 = u64::from(folded) / page;
+        let last = lanes
+            .iter()
+            .map(|&lane| u64::from(landings[lane].start) + u64::from(landings[lane].rows.max(1)) - 1)
+            .max()
+            .unwrap_or(u64::from(folded));
+        let beams = lanes.len() as u64;
+        let frames = crate::scheduler::configured_dispatch_depth().max(1) as u64;
+        let column = (last / page).saturating_sub(f0);
+        let named = beams * (column + 2) + beams * frames + 1;
+        let end = f0 + named;
+        let end_slot = u32::try_from(end * page).unwrap_or(u32::MAX);
+        let capacity = crate::store::registry::with_kv_lock(
+            &stores.kv,
+            "host-other",
+            |kv| kv.capacity_pages(),
+        );
+        if let Err(refusal) = beam_pool_fits(lane, end, named, capacity) {
+            return Ok(Err(refusal));
+        }
+        if let Err(refusal) = crate::inferlet::host::working_set::grow_pages(
+            &pass_lanes.kv[lane],
+            end_slot,
+        ) {
+            return Ok(Err(format!(
+                "pipeline: lane {lane}'s beams' pool cannot grow to its column's {named} \
+                 page(s): {refusal}"
+            )));
+        }
+        {
+            let mut cursor = pass_lanes.cursors[lane].lock().unwrap();
+            cursor.reserved = cursor.reserved.max(end_slot);
+        }
+        beam_ends.push(end_slot);
+        beam_commons.push(beam_common);
+        // Only the pages the column adds are backed here: the pool's
+        // pages are the group's alone and the device keeps what they
+        // hold, so a page an earlier fire still in flight writes is
+        // not copied before this one writes it.
+        let mapped = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+            kv.mapped_len(pass_lanes.kv[lane].id)
+        })
+        .map_err(|error| anyhow::anyhow!("pipeline: KV rows: {error}"))?;
+        reserves.push((mapped.max(f0)..end).collect());
+    }
+    Ok(Ok(BeamReserve {
+        paged: Some(reserves),
+        ends: beam_ends,
+        commons: beam_commons,
+    }))
+}
+
 pub async fn submit_pass_stamped<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -584,17 +732,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             pass.devgeo.is_some() || pass.float.is_some()
         };
         if placed_by_device {
-            let pipeline = this.rep();
-            let final_rows = ctx.resources().get(&fwd)?.bindings.final_rows;
-            let submitted = if ctx.resources().get(&fwd)?.devgeo.is_some() {
-                fire_device_geometry(ctx, this, fwd, frame).await?
-            } else {
-                float::fire_float_lane(ctx, this, fwd, frame).await?
-            };
-            if submitted.is_ok() {
-                record_writes(ctx, pipeline, None, final_rows)?;
-            }
-            return Ok(submitted);
+            return submit_placed_by_device(ctx, this, fwd, frame).await;
         }
         let began = crate::scheduler::probe::ProbeClock::start();
         let opened = open_pipeline(ctx, &this, &fwd).await?;
@@ -622,43 +760,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             let device_resolved = p.decode_envelope.unwrap_or(PortMask::NONE);
             let geometry_clock = crate::scheduler::probe::ProbeClock::start();
-            let (geometry, attn_mask) = {
-                let bound = &p.instance.program.bound;
-                let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
-                let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-                match geometry::map_geometry_evaluated_with(bound, &mut known, device_resolved) {
-                    Ok((geometry, evaluated)) => {
-                        if device_resolved.is_empty() && geometry.token_ids.contains(&u32::MAX) {
-                            return Ok(Err(
-                                "pipeline: fire geometry: in-band -1 skip tokens require a \
-                                 device-resolved geometry class; this fire resolved on the \
-                                 host wire"
-                                    .to_string(),
-                            ));
-                        }
-                        // A mask the program computes on the device is the
-                        // engine's to resolve, even on a fire whose seeds let
-                        // the host evaluate it: one source a port.
-                        let attn_mask = match if device_resolved.contains(Port::AttnMask) {
-                            Ok(geometry::FireAttnMask::Device)
-                        } else {
-                            geometry::lower_attn_mask_evaluated(
-                                &bound.container,
-                                &geometry.qo_indptr,
-                                &evaluated,
-                            )
-                        } {
-                            Ok(mask) => mask,
-                            Err(error) => {
-                                return Ok(Err(format!("pipeline: fire attention mask: {error}")));
-                            }
-                        };
-                        (geometry, attn_mask)
-                    }
-                    Err(error) => {
-                        return Ok(Err(format!("pipeline: fire geometry: {error}")));
-                    }
-                }
+            let (geometry, attn_mask) = match host_geometry_of(p, device_resolved) {
+                Ok(mapped) => mapped,
+                Err(refusal) => return Ok(Err(refusal)),
             };
             crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
             if let Some(fires) = &p.host_geometry {
@@ -760,73 +864,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // their sets' reserve the device names: every page from the frozen
         // full pages to what `reserve` granted is backed, and the engine is
         // handed each set's whole table to resolve them in.
-        // Each beam group's pool end (a slot), which its rs buffer is backed
-        // to as well (`BEAM-PAGE-LISTS.md` §11).
-        let mut beam_ends: Vec<u32> = Vec::new();
-        // Each beam group's common slot, as its last harvested steps left it
-        // (§11.3): one pass, one group, one instance.
-        let beam_common = beam_common_of(instance_id);
-        let mut beam_commons: Vec<u32> = Vec::new();
-        let paged_reserve: Option<Vec<Vec<u64>>> = if binds_pages(ctx, &fwd)? {
-            let page = u64::from(page_size.max(1));
-            let mut reserves = Vec::with_capacity(groups.len());
-            for (_, lanes) in &groups {
-                let lane = lanes[0];
-                let folded = pass_lanes.places[lane].folded;
-                // The beams' pool grows a column at a time (BEAM-PAGE-LISTS.md
-                // §3): before the fire that opens a column the set reserves
-                // what its column needs, waiting like any reservation. The
-                // step hands out the lowest free pages, so every page named or
-                // pending lies below `B (c + 2) + B F + 1`, `c` this fire's
-                // column and `F` the engine's frames in flight.
-                let f0 = u64::from(folded) / page;
-                let last = lanes
-                    .iter()
-                    .map(|&lane| u64::from(landings[lane].start) + u64::from(landings[lane].rows.max(1)) - 1)
-                    .max()
-                    .unwrap_or(u64::from(folded));
-                let beams = lanes.len() as u64;
-                let frames = crate::scheduler::configured_dispatch_depth().max(1) as u64;
-                let column = (last / page).saturating_sub(f0);
-                let named = beams * (column + 2) + beams * frames + 1;
-                let end = f0 + named;
-                let end_slot = u32::try_from(end * page).unwrap_or(u32::MAX);
-                let capacity = crate::store::registry::with_kv_lock(
-                    &stores.kv,
-                    "host-other",
-                    |kv| kv.capacity_pages(),
-                );
-                if let Err(refusal) = beam_pool_fits(lane, end, named, capacity) {
-                    return Ok(Err(refusal));
-                }
-                if let Err(refusal) = crate::inferlet::host::working_set::grow_pages(
-                    &pass_lanes.kv[lane],
-                    end_slot,
-                ) {
-                    return Ok(Err(format!(
-                        "pipeline: lane {lane}'s beams' pool cannot grow to its column's {named} \
-                         page(s): {refusal}"
-                    )));
-                }
-                {
-                    let mut cursor = pass_lanes.cursors[lane].lock().unwrap();
-                    cursor.reserved = cursor.reserved.max(end_slot);
-                }
-                beam_ends.push(end_slot);
-                beam_commons.push(beam_common);
-                // Only the pages the column adds are backed here: the pool's
-                // pages are the group's alone and the device keeps what they
-                // hold, so a page an earlier fire still in flight writes is
-                // not copied before this one writes it.
-                let mapped = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
-                    kv.mapped_len(pass_lanes.kv[lane].id)
-                })
-                .map_err(|error| anyhow::anyhow!("pipeline: KV rows: {error}"))?;
-                reserves.push((mapped.max(f0)..end).collect());
-            }
-            Some(reserves)
-        } else {
-            None
+        let BeamReserve {
+            paged: paged_reserve,
+            ends: beam_ends,
+            commons: beam_commons,
+        } = match reserve_beam_columns(
+            binds_pages(ctx, &fwd)?,
+            beam_common_of(instance_id),
+            page_size,
+            &groups,
+            &pass_lanes,
+            &landings,
+            &stores,
+        )? {
+            Ok(reserve) => reserve,
+            Err(refusal) => return Ok(Err(refusal)),
         };
         if let Err(refusal) = crate::inferlet::process::said(
             "seat the lanes",
