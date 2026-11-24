@@ -648,6 +648,7 @@ mod on_device {
         Ok(Measured {
             rates: Rates {
                 landing: None,
+                stale: None,
                 load_width: None,
                 launch_ns: Some(launch),
                 gemm_tflops_by_rows: Some(
