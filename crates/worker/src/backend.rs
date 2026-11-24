@@ -622,7 +622,10 @@ pub(crate) fn create_engine_backend(
                 Ok,
             )?;
             let page_size = METAL_PAGE_SIZE;
-            let max_context = max_context.unwrap_or_else(|| engine::Budgets::default().max_context);
+            let max_context = max_context
+                .filter(|&len| len > 0)
+                .unwrap_or_else(|| engine::Budgets::default().max_context)
+                .max(page_size);
             let (max_lanes, max_tokens) = METAL_FIRE.of();
             (
                 backend,
@@ -674,7 +677,10 @@ pub(crate) fn create_engine_backend(
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
-                    max_context: max_context.unwrap_or(defaults.max_context),
+                    max_context: max_context
+                        .filter(|&len| len > 0)
+                        .unwrap_or(defaults.max_context)
+                        .max(defaults.page_size),
                     context_declared: false,
                     slots: 0,
                     max_patches: None,
@@ -716,7 +722,10 @@ pub(crate) fn create_engine_backend(
                     buckets: Vec::new(),
                     max_adapters: adapters.seats(),
                     page_size: defaults.page_size,
-                    max_context: max_context.unwrap_or(defaults.max_context),
+                    max_context: max_context
+                        .filter(|&len| len > 0)
+                        .unwrap_or(defaults.max_context)
+                        .max(defaults.page_size),
                     context_declared: false,
                     slots: 0,
                     max_patches: None,
