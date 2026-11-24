@@ -23,6 +23,7 @@ mod shared;
 mod slots;
 mod bounded_measuring;
 mod measured_none;
+mod split_rows;
 mod settle_bound;
 mod settle_key;
 mod submit_bound;
@@ -31,5 +32,4 @@ mod unplaced;
 mod rs_layout;
 mod buffered_fold;
 mod lagged;
-
 mod switched;
