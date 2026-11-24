@@ -1226,9 +1226,12 @@ struct Workload {
     /// its sources left as they were. `None`: every copy lands.
     landing_fails: Option<u64>,
     /// The built-in `default` worker policy's seat-to-end holds are
-    /// enacted ([`SeatHolds`]); `false` runs as `noop`, no rows. Set for
-    /// every seed by `PIE_SIM_DEFAULT`.
+    /// enacted ([`SeatHolds`]); `false` runs as `noop`, no rows.
     default_policy: bool,
+    /// The engine refuses an evacuation after its table took the moves, one
+    /// time in four, and puts its table back: the runtime takes the move
+    /// back too.
+    late_refuse: bool,
 }
 
 impl Workload {
@@ -1393,7 +1396,8 @@ impl Workload {
             target,
             ring,
             landing_fails,
-            default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+            default_policy: false,
+            late_refuse: false,
         }
     }
 
@@ -1526,7 +1530,8 @@ impl Workload {
             target,
             ring: None,
             landing_fails: None,
-            default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+            default_policy: false,
+            late_refuse: false,
         }
     }
 
@@ -3192,6 +3197,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         let ops = lane_ops.clone();
         let view = engine_view.clone();
         let lane_shared = stores.shared.clone();
+        let late_refuse = workload.late_refuse;
         crate::store::shared::SharedGrow::new(model, 0, shared)
             .with_lane(move |op| {
                 if let Some(view) = &view {
@@ -3211,18 +3217,19 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                         anyhow::bail!(fault);
                     }
                     if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = &op {
+                        let before = view.table.clone();
                         if let Err(error) = view.table.apply(evacuation) {
                             let fault =
                                 format!("the engine's table refused {:?}: {error}", evacuation.moves);
                             view.faults.push(fault.clone());
                             anyhow::bail!(fault);
                         }
-                        // `PIE_SIM_LATE_REFUSE`: the engine refuses an
-                        // evacuation after its table took the moves, one
-                        // time in a few (Metal before 6b69c5978's next: a
-                        // rebind failing past the swap). The runtime takes
-                        // the move back; the tables part.
-                        if std::env::var_os("PIE_SIM_LATE_REFUSE").is_some() && view.rng.chance(1, 4) {
+                        // The engine refuses an evacuation after its table
+                        // took the moves ([`Workload::late_refuse`]) and
+                        // puts its table back: the runtime takes the move
+                        // back too, and the two tables agree.
+                        if late_refuse && view.rng.chance(1, 4) {
+                            view.table = before;
                             anyhow::bail!("an evacuation refused past its table swap (simulated)");
                         }
                     }
@@ -3642,10 +3649,19 @@ fn shrink(workload: &Workload, shape: &str) -> (Vec<usize>, Failure) {
 
 /// Runs seeds `seeds`: the failures (seed, failure) and the coverage.
 fn sweep(seeds: std::ops::Range<u64>) -> (Vec<(u64, Failure)>, Coverage) {
+    sweep_with(seeds, |_| {})
+}
+
+/// [`sweep`] with each seed's workload changed by `tweak`.
+fn sweep_with(
+    seeds: std::ops::Range<u64>,
+    tweak: impl Fn(&mut Workload),
+) -> (Vec<(u64, Failure)>, Coverage) {
     let mut failures = Vec::new();
     let mut coverage = Coverage::default();
     for seed in seeds {
-        let workload = Workload::of(seed);
+        let mut workload = Workload::of(seed);
+        tweak(&mut workload);
         let (found, covered) = run(&workload, None);
         coverage.add(&covered);
         for failure in found {
@@ -3846,6 +3862,25 @@ fn the_simulated_fleet_settles_every_step_on_200_seeds() {
         coverage.evictions > 0 && coverage.restores > 0,
         "{coverage:?}"
     );
+}
+
+/// The fast sweep's seeds under the built-in `default` policy's seat-to-end
+/// holds ([`Workload::default_policy`]).
+#[test]
+fn the_simulated_fleet_settles_every_step_under_the_default_policy() {
+    let (failures, coverage) = sweep_with(0..48, |workload| workload.default_policy = true);
+    let report = report(&failures, &coverage, false);
+    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
+}
+
+/// The fast sweep's seeds with the engine refusing evacuations past its
+/// table swap and putting its table back ([`Workload::late_refuse`]): the
+/// runtime takes each move back, and the tables agree.
+#[test]
+fn the_simulated_fleet_settles_every_step_with_evacuations_refused_late() {
+    let (failures, coverage) = sweep_with(0..48, |workload| workload.late_refuse = true);
+    let report = report(&failures, &coverage, false);
+    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
 }
 
 /// Seed `seed` runs clean of the shape `prefix` ([`FIXED`]).
@@ -4261,7 +4296,8 @@ fn run_pieces_workload(
         target: Vec::new(),
         ring: None,
         landing_fails: None,
-        default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+        default_policy: false,
+        late_refuse: false,
     }
 }
 
@@ -4410,7 +4446,8 @@ fn raise_beside_own_workload(scripts: Vec<Script>) -> Workload {
         target: Vec::new(),
         ring: None,
         landing_fails: None,
-        default_policy: std::env::var_os("PIE_SIM_DEFAULT").is_some(),
+        default_policy: false,
+        late_refuse: false,
     }
 }
 
