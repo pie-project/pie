@@ -468,6 +468,17 @@ impl Engine for Xla {
         "xla"
     }
 
+    /// The widest fire XLA's warm ladder compiles: every shape it serves is
+    /// a program compiled before ready, so the ceiling bounds the ladder.
+    fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
+        Some(engine::load::FireCeiling {
+            lanes: 64,
+            tokens: 2608,
+            page_size: None,
+            context_binds: false,
+        })
+    }
+
     fn live(&self) -> engine::live::Live {
         self.live.clone()
     }

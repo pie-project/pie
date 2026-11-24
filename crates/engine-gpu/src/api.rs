@@ -927,6 +927,17 @@ where
         B::KIND
     }
 
+    /// The widest fire the Vulkan and wgpu shells lay their rungs to: the
+    /// CUDA shell's lanes, and the top of their timed rows.
+    fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
+        Some(engine::load::FireCeiling {
+            lanes: 512,
+            tokens: 10240,
+            page_size: None,
+            context_binds: false,
+        })
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }

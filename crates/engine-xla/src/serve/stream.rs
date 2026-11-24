@@ -110,7 +110,7 @@ pub(super) fn stream_fire(
                         })?,
                     );
                 }
-                if run && !staged.is_empty() {
+                if run && !staged.is_empty() && !device.is_dry() {
                     let fills: Vec<(u32, Vec<u8>)> = staged
                         .iter()
                         .map(|(&b, &slot)| Ok((slot, streamed.atom_bytes(at, b)?)))
@@ -243,6 +243,10 @@ pub(super) fn fill(
     at: usize,
     atoms: &[(u32, u32)],
 ) -> Result<()> {
+    // a dry device holds no weights: it plans the slots and fills none
+    if device.is_dry() {
+        return Ok(());
+    }
     let shape = &streamed.shapes[at];
     match &shape.form {
         Form::Experts { experts, layers } => {

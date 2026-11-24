@@ -249,6 +249,14 @@ pub trait Engine: Send {
         true
     }
 
+    /// The widest fire this shell serves, where it has no planner to
+    /// derive its rungs from the device: asked of the opened engine before
+    /// its load, which the worker budgets by it. `None`, the default: the
+    /// load derives its fires from the device.
+    fn fire_ceiling(&self) -> Option<crate::load::FireCeiling> {
+        None
+    }
+
     /// What the runtime's host cover depends on in this engine (`runtime`'s
     /// `measure_host_cover`): its device and driver, and the kernels and
     /// guest code a sampler's fire runs on it, as one fingerprint. A boot
