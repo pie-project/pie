@@ -10571,12 +10571,22 @@ impl<B: Serve> Shell<B> {
         // Each shape carrying decode lanes is recorded so too.
         let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
         let capturing: Vec<bool> = (0..decoding.len()).map(|class| self.captures(class)).collect();
+        // Each class's outputs a lane of it may read out, captures apart.
+        let readable: Vec<Vec<String>> = (0..decoding.len())
+            .map(|class| {
+                self.readouts
+                    .iter()
+                    .filter(|plane| plane.captured.is_none() && plane.classes.contains(class))
+                    .map(|plane| plane.output.clone())
+                    .collect()
+            })
+            .collect();
         // Where the trace buffers a recurrence, a decode lane carries the
         // rows it has not folded (the lagged fold): its scans are the
         // carried forms, another body. Each shape carrying decode lanes is
         // recorded so too.
         let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
-        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, bool)> = shapes
+        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, u8)> = shapes
             .into_iter()
             .flat_map(|lanes| {
                 let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
@@ -10602,6 +10612,11 @@ impl<B: Serve> Shell<B> {
                 // form of commands).
                 let pageless = [false, true];
                 let captures = lanes.iter().any(|&(class, _)| capturing[class]);
+                // Its lanes reading out nothing, or every output their class
+                // reads out (a sampler on the host reads its logits): what a
+                // lane reads lays its fire's readout data, so a serving fire
+                // finds a fill laid for its reads.
+                let reading = lanes.iter().any(|&(class, _)| !readable[class].is_empty());
                 forms
                     .into_iter()
                     .flat_map(move |form| {
@@ -10611,8 +10626,16 @@ impl<B: Serve> Shell<B> {
                             .filter(move |&keys_only| !keys_only || captures)
                             .flat_map(move |keys_only| {
                                 let lanes = lanes.clone();
-                                std::iter::once((lanes.clone(), false, form, keys_only))
-                                    .chain(fed.then_some((lanes, true, form, keys_only)))
+                                [false, true]
+                                    .into_iter()
+                                    .filter(move |&reads| !reads || reading)
+                                    .flat_map(move |reads| {
+                                        let lanes = lanes.clone();
+                                        let flags = u8::from(keys_only) | u8::from(reads) << 1;
+                                        std::iter::once((lanes.clone(), false, form, flags))
+                                            .chain(fed.then_some((lanes, true, form, flags)))
+                                    })
+                                    .collect::<Vec<_>>()
                             })
                             .collect::<Vec<_>>()
                     })
@@ -10636,21 +10659,21 @@ impl<B: Serve> Shell<B> {
                 };
                 let attachments: Vec<engine::Attachments> =
                     (0..decoding.len()).map(carries).collect();
-                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, bool), usize)> = shapes
+                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, u8), usize)> = shapes
                     .into_iter()
                     .filter_map(|entry| {
                         let step = step_of(&entry.0, entry.2 != Buffering::None, &attachments);
                         steps.shape_of(&step).map(|at| (entry, at))
                     })
                     .collect();
-                tagged.sort_by_key(|((lanes, fed, carried, keys_only), at)| {
+                tagged.sort_by_key(|((lanes, fed, carried, flags), at)| {
                     (
                         *at,
                         lanes.iter().map(|&(_, rows)| rows).sum::<u32>(),
                         std::cmp::Reverse(lanes.len()),
                         *fed,
                         *carried as u8,
-                        *keys_only,
+                        *flags,
                     )
                 });
                 let mut covered = vec![false; steps.len()];
@@ -10818,7 +10841,9 @@ impl<B: Serve> Shell<B> {
                 None => self.eager_rows = known.eager,
             }
         }
-        for (at, (lanes, fed, carried, keys_only)) in shapes.iter().enumerate() {
+        // `flags`: 1 a capturing lane of the pageless form (its key rows
+        // alone), 2 every lane reading out its class's outputs.
+        for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
             // A known lattice states eager what its allowance did; every shape
             // short of it is walked, the ones whose family an earlier shape
             // recorded filling it (their fills kept before ready).
@@ -10915,8 +10940,11 @@ impl<B: Serve> Shell<B> {
                         let mut lane = self.naming_lane(class, rows)?;
                         // A capturing lane of a pageless form reads its key
                         // rows alone: its fire lays no page row.
-                        if *keys_only {
+                        if *flags & 1 != 0 {
                             lane.reads.retain(|read| read != SCORE_PAGES);
+                        }
+                        if *flags & 2 != 0 {
+                            lane.reads.extend(readable[class].iter().cloned());
                         }
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                         if *carried != Buffering::None {
@@ -10953,7 +10981,7 @@ impl<B: Serve> Shell<B> {
                     self.arms.take(before);
                 }
                 crate::kernel_profile::family_log(&format!(
-                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} keys_only {keys_only}"
+                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} flags {flags}"
                 ));
                 self.walk_at = Some(at);
                 let fired = self.fire_seated(&seated);
