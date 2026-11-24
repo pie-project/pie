@@ -581,15 +581,6 @@ impl Arena {
             // `unwritten-nan`: nothing has written any of it yet.
             if crate::serve::diag::on().unwritten_nan {
                 crate::device::fill_span(self.base, self.virtual_bytes as usize, 0xFF)?;
-                let mut head = [0u8; 4];
-                let mut tail = [0u8; 4];
-                crate::device::copy_d2h(self.base, &mut head)?;
-                crate::device::copy_d2h(self.base + self.virtual_bytes - 4, &mut tail)?;
-                eprintln!(
-                    "engine-cuda: unwritten-nan: the flat range's {} bytes filled (reads {head:02x?} \
-                     at its start, {tail:02x?} at its end)",
-                    self.virtual_bytes
-                );
             }
             self.units.fill(Some(FLAT));
             self.mapped = self.units.len() as u64;

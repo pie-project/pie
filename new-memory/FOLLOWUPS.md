@@ -1570,3 +1570,9 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F??. CUDA: Muse's joined projection apart
+
+**What.** `muse-glimmer-30b-mini-l8-bf16-kv-bf16`'s projection legs served apart answer 0.17 off over a spread of 3.2 against the joined projection, as its joined trace does with its qkv write unfused: its unit-RMS q and k heads, unscaled, score keys 3.9 apart under its softmax scale, and its eight layers carry a last-place rounding 5% of the spread. The apart form serves only where the compiler cannot join the legs, so no served load reaches it. The ignored check (`the_open_rows_answer_apart_what_they_answer_joined` in engine-cuda's `a_joined_projection_answers_what_its_legs_answer`) was removed in the cleanup; add the row back to that test's `ROWS` once the apart form agrees.
+
+**Why later.** No served path takes it.

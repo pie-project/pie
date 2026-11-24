@@ -322,10 +322,7 @@ pub fn measure(
         // The step's buffers (laid apart from the device heap, whose chunks
         // the process keeps) went to the idle store as they dropped; the
         // load reads the card's room next (the top rung's fit), so they go
-        // back to the driver first. Kept, an L40S's first boot fit beside
-        // 7.5 GiB the step no longer held (4.6 GiB idle, 2.5 GiB of heap
-        // chunks): at a 40960 context every rung lacked room for one
-        // sequence, while the next boot, reading the saved rates, served.
+        // back to the driver first, or the fit would count them as held.
         crate::device::held::release_idle();
         measured
     }
@@ -1277,9 +1274,9 @@ mod attention_tests {
 
     #[test]
     fn the_attention_sets_and_keys_are_the_shared_rule_at_cudas_page() {
-        // CUDA path unchanged: 63876a684 sized its sets in place, the q rows
-        // and the kv pages as laid whole against ATTN_SET_BYTES, at least 2;
-        // the shared function at its PAGE gives the same.
+        // The sets sized in place: the q rows and the kv pages as laid whole
+        // against ATTN_SET_BYTES, at least 2; the shared function at its
+        // PAGE gives the same.
         for (keys, d) in [(1, 64), (17, 128), (2234, 128), (4467, 256)] {
             let at = engine::rates::ATTN_SHAPE.at(keys).with_dim(d);
             let pages = at.rows.div_ceil(PAGE);
