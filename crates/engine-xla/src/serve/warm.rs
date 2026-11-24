@@ -645,8 +645,10 @@ impl Shell {
         }
         let device = std::sync::Arc::clone(&self.device);
         let stated = self.host_programs;
-        // two compiles' room kept free beside them, as at the ladder
-        let floor = 2 * queue.iter().map(|q| q.1.need()).max().unwrap_or(0);
+        // after ready, nothing compiles but guest stages: their room (by
+        // their measured needs, `guest::run::guest_reserve`) is what the
+        // loader leaves free, read as it loads
+        let floor = 0;
         let scope = self.trace_scope.clone();
         let stop = std::sync::Arc::clone(&self.behind.stop);
         let width = self.load_width.clone();
@@ -666,6 +668,8 @@ impl Shell {
                         return None;
                     }
                     let (key, code, sig, _) = queue.get(next.fetch_add(1, SeqCst))?;
+                    // no load beside a guest stage compile measuring its need
+                    let _beside = crate::guest::run::load_beside();
                     let Some(reserved) = room.take(code.len()) else {
                         full.store(true, SeqCst);
                         return None;
@@ -962,68 +966,14 @@ impl Shell {
         for (at, slot) in slots.into_iter().enumerate() {
             programs[at] = slot.into_inner().ok().flatten();
         }
-        // A parked program the host's free memory holds once the compiles are
-        // done (two compiles' room kept) loads from the disk cache here, at
-        // load, not in the first fire that takes its shape (v5e Qwen3-0.6B
-        // c256: 13 parked loads stalled a 43 s round 3-5 s), side by side in
-        // ladder order, each admitted while the free memory holds it beside
-        // those still loading (one at a time a v6e reloaded Qwen3.6-35B-A3B's
-        // freshly compiled ladder in 150 s).
-        let mut parked = parked.load(SeqCst);
-        if parked > 0 {
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let full = std::sync::atomic::AtomicBool::new(false);
-            let loads: Vec<
-                std::sync::Mutex<Option<Result<std::sync::Arc<crate::device::Program>>>>,
-            > = (0..texts.len())
-                .map(|_| std::sync::Mutex::new(None))
-                .collect();
-            let held = &programs;
-            std::thread::scope(|scope| {
-                for _ in 0..threads {
-                    scope.spawn(|| {
-                        loop {
-                            let at = next.fetch_add(1, SeqCst);
-                            let Some((text, sig)) = texts.get(at) else {
-                                break;
-                            };
-                            if full.load(SeqCst) {
-                                break;
-                            }
-                            // a record's program loads behind serving
-                            if held[at].is_some()
-                                || text.text().is_none()
-                                || !device.code_on_disk(text)
-                            {
-                                continue;
-                            }
-                            let Some(reserved) = host_room.take(text.len()) else {
-                                full.store(true, SeqCst);
-                                break;
-                            };
-                            let program = device.prepare_code(text, (*sig).clone());
-                            host_room.done(reserved, matches!(program, Ok(Some(_))));
-                            // gone since: it stays parked, its first fire loads
-                            // or builds it
-                            let program = match program {
-                                Ok(Some(program)) => Ok(program),
-                                Ok(None) => continue,
-                                Err(fault) => Err(fault),
-                            };
-                            if let Ok(mut slot) = loads[at].lock() {
-                                *slot = Some(program);
-                            }
-                        }
-                    });
-                }
-            });
-            for (at, slot) in loads.into_iter().enumerate() {
-                if let Some(program) = slot.into_inner().ok().flatten() {
-                    programs[at] = Some(program);
-                    parked -= 1;
-                }
-            }
-        }
+        // A parked program loads behind serving (`load_behind`), not here:
+        // a load here filled the host before the guest programs registered
+        // (v6e Qwen3.5 fresh cache: 115 GiB held, then a sampler stage's
+        // compile OOM-killed the server at its cgroup's cap), and the loader
+        // behind serving leaves the guest compiles' room
+        // (`guest::run::guest_reserve`) and loads nothing beside one
+        // measuring its need.
+        let parked = parked.load(SeqCst);
         if parked > 0 {
             tracing::warn!(
                 parked,
@@ -1169,6 +1119,15 @@ impl Shell {
             })
             .collect();
         self.scratch_fire = true;
+        // a buffered want fires as its stated shape does: at its rung
+        if shape.iter().any(|w| w.buffers)
+            && let Some(steps) = &self.steps
+        {
+            let stated = steps
+                .fire_shape(&composition(shape, engine::Treatment::Buffers))
+                .ok();
+            self.shape_next(stated);
+        }
         let fired = self.fire_full(&seated).map(|_| ());
         self.scratch_fire = false;
         fired

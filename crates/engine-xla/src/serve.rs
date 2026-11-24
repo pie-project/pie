@@ -403,6 +403,9 @@ pub struct Shell {
     gathers_readout: bool,
     /// Set for one `fire_kept`: the readout stays on the device.
     keep_readout: bool,
+    /// The stated shape of the fire about to run (`engine::fire::Step::shape`),
+    /// for that fire alone: a buffered one pads up to its shape's rung.
+    fire_shape: Option<engine::FireShape>,
     /// For the next fire: lanes whose tokens the device supplies.
     token_feeds: Vec<TokenFeed>,
     /// Values a debugging reader asked for (`Shell::probe`), and per traced
@@ -1285,6 +1288,7 @@ impl Shell {
             drops_patch_rows,
             gathers_readout,
             keep_readout: false,
+            fire_shape: None,
             token_feeds: Vec::new(),
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
@@ -1938,6 +1942,7 @@ impl Shell {
     /// One fire whose lanes may carry clips on the voxel axis.
     pub fn fire_full_with(&mut self, lanes: &[Seated<'_>], clips: &[Clips<'_>]) -> Result<Fired> {
         let result = self.fire_inner(lanes, clips);
+        self.fire_shape = None;
         self.handles.rewind();
         result
     }
@@ -1959,6 +1964,29 @@ impl Shell {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// States the shape of the next fire (`engine::fire::Step::shape`).
+    pub fn shape_next(&mut self, shape: Option<engine::FireShape>) {
+        self.fire_shape = shape;
+    }
+
+    /// The rung a buffered fire pads up to: its stated shape's
+    /// (`engine::StepFacts::buffered_rungs`, coarser than the folded rungs,
+    /// so the buffered programs are laid at those alone). `None` for a
+    /// folded fire or one stating no shape.
+    fn buffered_rung(&self) -> Option<u32> {
+        let shape = self.fire_shape?;
+        if shape.treatment != engine::Treatment::Buffers {
+            return None;
+        }
+        let stated = self.steps.as_ref()?.shapes.get(shape.id as usize)?;
+        debug_assert!(
+            self.budgets.tokens.buckets.contains(&stated.rung),
+            "a stated rung {} is a bucket of the load's",
+            stated.rung
+        );
+        Some(stated.rung)
+    }
+
     fn fire_inner(&mut self, lanes: &[Seated<'_>], clips: &[Clips<'_>]) -> Result<Fired> {
         if lanes.is_empty() {
             return Ok(Fired::default());
@@ -1987,7 +2015,8 @@ impl Shell {
         {
             return self.fire_padded(lanes, clips, &pads, true);
         }
-        let bucket = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, real_rows);
+        let bucket = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, real_rows)
+            .max(self.buffered_rung().unwrap_or(0));
         let pad = bucket.saturating_sub(real_rows);
         let pad_word = lanes[lanes.len() - 1].lane.word;
         let pad_lanes: Vec<(u32, u64)> = if pad == 0 {
@@ -2187,9 +2216,11 @@ impl Shell {
                 })
                 .collect();
             let exact = real_rows + ones.len() as u32;
+            // (a buffered fire fills its stated rung, not a folded bucket)
             if !mixed
                 && exact >= pad.prefill_floor
                 && buckets.contains(&exact)
+                && self.buffered_rung().is_none_or(|rung| rung == exact)
                 && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize
             {
                 return Some(ones);
@@ -2257,6 +2288,8 @@ impl Shell {
         } else {
             bucket
         };
+        // a buffered fire at its stated rung
+        let bucket = bucket.max(self.buffered_rung().unwrap_or(0));
         pads.push((bucket - real_rows - ones, by[host].1));
         if lanes.len() + pads.len() > self.budgets.tokens.max_lanes as usize {
             return None;
@@ -3702,6 +3735,7 @@ impl Shell {
         }
         tracing::debug!(
             rows,
+            buffered = rs_active,
             stage_ms = (t1 - t0).as_secs_f64() * 1e3,
             trace_ms = (t2 - t1).as_secs_f64() * 1e3,
             enqueue_ms = (t3 - t2).as_secs_f64() * 1e3,

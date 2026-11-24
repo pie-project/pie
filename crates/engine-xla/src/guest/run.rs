@@ -181,37 +181,55 @@ pub fn compile_wanted(
     tracing::info!(
         programs = wanted.len(),
         seconds = started.elapsed().as_secs_f32(),
-        need_mib = guest_compile_need() >> 20,
+        reserve_mib = guest_reserve() >> 20,
         "guest stages compiled"
     );
     Ok(staged)
 }
 
-/// The process's ledger of guest stage compiles, every registration's:
-/// the host memory the running ones may take (each at the learned need),
-/// how many run, and the need learned, the largest peak a stage compile
-/// running alone grew the process by. A guest stage's compile takes host
-/// memory its text does not tell (v6e: 0.1-1 GB a 45 KB sampler stage), so
-/// the need is measured, not read off the text; concurrent registrations
-/// each sizing their own room from the free memory OOM-killed a server at
-/// its cgroup cap.
+/// The process's ledger of guest stage compiles, every registration's, and
+/// of the programs loading beside serving. A guest stage's compile takes
+/// host memory its text does not tell (v6e Qwen3.5: 5 MB for a 4.5 KB stage,
+/// 1.3 GB for a 130 KB full-vocabulary sampler stage), so each stage's need
+/// is its own compile's peak, measured alone (nothing compiling or loading
+/// beside it) and kept beside its compiled form ([`Device::compile_peak`]).
+/// One need learned for every stage refused stages that fit and admitted
+/// big ones side by side into an OOM kill at the cgroup's cap.
 struct GuestLedger {
-    state: std::sync::Mutex<(u64, u32, u64)>,
+    state: std::sync::Mutex<Ledger>,
     ended: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Ledger {
+    /// The measured needs of the compiles running, and how many run.
+    running: u64,
+    count: u32,
+    /// A stage compiling alone to measure its need.
+    measuring: bool,
+    /// Stages waiting to compile: their measured needs, and how many have
+    /// none yet (each runs alone).
+    waiting: u64,
+    unmeasured: u32,
+    /// Programs loading beside serving ([`LoadBeside`]).
+    loads: u32,
+    /// The largest need any stage was measured at ([`note_peak`]): the room
+    /// a registration still to come finds free beside the programs held.
+    largest: u64,
 }
 
 static GUEST_LEDGER: std::sync::OnceLock<GuestLedger> = std::sync::OnceLock::new();
 
-/// A guest stage compile the ledger let in. Calibrating (none learned
-/// yet): it runs alone and its peak growth becomes the need.
+/// A guest stage compile the ledger let in: its measured need, or, measuring
+/// (none measured yet), the peak it started from.
 struct GuestAdmitted {
     need: u64,
-    calibrating: Option<u64>,
+    measuring: Option<u64>,
 }
 
 fn guest_ledger() -> &'static GuestLedger {
     GUEST_LEDGER.get_or_init(|| GuestLedger {
-        state: std::sync::Mutex::new((0, 0, 0)),
+        state: std::sync::Mutex::new(Ledger::default()),
         ended: std::sync::Condvar::new(),
     })
 }
@@ -224,78 +242,131 @@ fn peak_rss() -> Option<u64> {
     Some(kib << 10)
 }
 
-/// Waits until a guest stage compile fits; refuses by name one that does
-/// not fit even alone.
-fn guest_admit() -> Result<GuestAdmitted, String> {
+/// Waits until a guest stage compile of measured `need` fits beside those
+/// running (refusing one that fits beside none), or, unmeasured, until
+/// nothing compiles or loads beside it.
+fn guest_admit(need: Option<u64>) -> Result<GuestAdmitted, String> {
     let ledger = guest_ledger();
-    let mut state = ledger
-        .state
-        .lock()
-        .map_err(|_| "the guest compile ledger poisoned")?;
+    let poisoned = |_| "the guest compile ledger poisoned".to_string();
+    let mut st = ledger.state.lock().map_err(poisoned)?;
+    match need {
+        Some(n) => st.waiting += n,
+        None => st.unmeasured += 1,
+    }
     loop {
-        let (running, count, learned) = *state;
-        if learned == 0 {
-            if count > 0 {
-                state = ledger
-                    .ended
-                    .wait(state)
-                    .map_err(|_| "the guest compile ledger poisoned")?;
-                continue;
+        let admitted = match need {
+            None if st.count == 0 && st.loads == 0 => {
+                st.unmeasured -= 1;
+                st.measuring = true;
+                st.count = 1;
+                // its peak growth from here is its need (the peak reset to
+                // the resident set first)
+                let _ = std::fs::write("/proc/self/clear_refs", "5");
+                Some(GuestAdmitted {
+                    need: 0,
+                    measuring: peak_rss(),
+                })
             }
-            // the first compile runs alone; its peak growth is the need
-            // (the peak reset to the resident set first)
-            let _ = std::fs::write("/proc/self/clear_refs", "5");
-            *state = (running, 1, learned);
-            return Ok(GuestAdmitted {
-                need: 0,
-                calibrating: peak_rss(),
-            });
+            None => None,
+            Some(n) if !st.measuring => {
+                let room = available_memory().unwrap_or(u64::MAX);
+                if st.count == 0 && n > room {
+                    st.waiting -= n;
+                    drop(st);
+                    ledger.ended.notify_all();
+                    return Err(format!(
+                        "a guest stage compile takes ~{} MiB of host memory (measured) and {} MiB \
+                         is free under the host's and its cgroups' caps: the program is refused, \
+                         not compiled",
+                        n >> 20,
+                        room >> 20
+                    ));
+                }
+                (st.count == 0 || st.running + n <= room).then(|| {
+                    st.waiting -= n;
+                    st.running += n;
+                    st.count += 1;
+                    GuestAdmitted {
+                        need: n,
+                        measuring: None,
+                    }
+                })
+            }
+            Some(_) => None,
+        };
+        if let Some(admitted) = admitted {
+            return Ok(admitted);
         }
-        let room = available_memory().unwrap_or(u64::MAX);
-        if count == 0 && learned > room {
-            return Err(format!(
-                "a guest stage compile takes ~{} MiB of host memory and {} MiB is free under the \
-                 host's and its cgroups' caps: the program is refused, not compiled",
-                learned >> 20,
-                room >> 20
-            ));
-        }
-        if count == 0 || running + learned <= room {
-            *state = (running + learned, count + 1, learned);
-            return Ok(GuestAdmitted {
-                need: learned,
-                calibrating: None,
-            });
-        }
-        state = ledger
-            .ended
-            .wait(state)
-            .map_err(|_| "the guest compile ledger poisoned")?;
+        st = ledger.ended.wait(st).map_err(poisoned)?;
     }
 }
 
-impl Drop for GuestAdmitted {
+impl GuestAdmitted {
+    /// The compile ended: its measured need where it was measuring.
+    fn end(self) -> Option<u64> {
+        let measured = self
+            .measuring
+            .zip(peak_rss())
+            .map(|(before, after)| after.saturating_sub(before).max(1));
+        let ledger = guest_ledger();
+        if let Ok(mut st) = ledger.state.lock() {
+            st.running = st.running.saturating_sub(self.need);
+            st.count = st.count.saturating_sub(1);
+            if self.measuring.is_some() {
+                st.measuring = false;
+            }
+        }
+        ledger.ended.notify_all();
+        measured
+    }
+}
+
+/// The host memory the guest stage compiles running and waiting take, by
+/// their measured needs: what a program loader leaves free beside them.
+pub fn guest_reserve() -> u64 {
+    guest_ledger().state.lock().map_or(0, |st| {
+        st.running.saturating_add(st.waiting).max(st.largest)
+    })
+}
+
+/// A stage's compile measured at `peak` (now, or kept from a run before):
+/// the largest is what the program loaders always leave free.
+pub fn note_peak(peak: u64) {
+    if let Ok(mut st) = guest_ledger().state.lock() {
+        st.largest = st.largest.max(peak);
+    }
+}
+
+/// A program loading beside serving, let in by [`load_beside`]; ends its
+/// load when dropped.
+pub struct LoadBeside(());
+
+/// Lets a program load beside serving once no guest stage compile measures
+/// its need or waits to: that compile's peak is the process's growth, which
+/// a load beside it would add to.
+#[must_use]
+pub fn load_beside() -> LoadBeside {
+    let ledger = guest_ledger();
+    if let Ok(mut st) = ledger.state.lock() {
+        while st.measuring || st.unmeasured > 0 {
+            match ledger.ended.wait(st) {
+                Ok(next) => st = next,
+                Err(_) => return LoadBeside(()),
+            }
+        }
+        st.loads += 1;
+    }
+    LoadBeside(())
+}
+
+impl Drop for LoadBeside {
     fn drop(&mut self) {
         let ledger = guest_ledger();
-        if let Ok(mut state) = ledger.state.lock() {
-            let (running, count, learned) = *state;
-            let learned = match (self.calibrating, peak_rss()) {
-                (Some(before), Some(after)) => learned.max(after.saturating_sub(before).max(1)),
-                _ => learned,
-            };
-            *state = (
-                running.saturating_sub(self.need),
-                count.saturating_sub(1),
-                learned,
-            );
+        if let Ok(mut st) = ledger.state.lock() {
+            st.loads = st.loads.saturating_sub(1);
         }
         ledger.ended.notify_all();
     }
-}
-
-/// The need the guest ledger has learned, bytes (0: none yet).
-pub fn guest_compile_need() -> u64 {
-    guest_ledger().state.lock().map_or(0, |s| s.2)
 }
 
 /// Stage `at` of `package` lowered for `batch` and compiled.
@@ -337,12 +408,18 @@ fn stage(
                 // A compile (not a held or cached program) is admitted on
                 // the process's guest ledger: one learned need a stage,
                 // against the memory the host and its cgroups leave.
-                let _guest = if device.has_without_compile(&lowered.text) {
-                    None
+                if device.has_without_compile(&lowered.text) {
+                    device.prepare(&lowered.text, sig)
                 } else {
-                    Some(guest_admit()?)
-                };
-                device.prepare(&lowered.text, sig)
+                    let admitted = guest_admit(device.compile_peak(&lowered.text))?;
+                    let program = device.prepare(&lowered.text, sig);
+                    if let Some(peak) = admitted.end()
+                        && program.is_ok()
+                    {
+                        device.keep_compile_peak(&lowered.text, peak);
+                    }
+                    program
+                }
             }
             None => device.program(&lowered.text, sig),
         };

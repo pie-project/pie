@@ -712,7 +712,7 @@ impl Engine for Xla {
             "the set computed before the ladder is the one the caps state"
         );
         tracing::info!(
-            "engine-xla: step set: {}; the warm ladder laid its buffered treatment",
+            "engine-xla: step set: {}; the warm ladder lays each shape at the treatments it states",
             caps.steps.shapes.census(),
         );
         self.programs.seat(budgets.max_lanes);
@@ -2405,6 +2405,7 @@ impl Xla {
             head_faults.push((*group, shell.run_beam_head(*layout, head).map_err(fault)?));
         }
         shell.feed_tokens(token_feeds);
+        shell.shape_next(submission.shape);
         let fired = shell.fire_kept_with(&seated, &clips).map_err(fault)?;
         let kept = fired.kept.clone();
         // The step waits on its fire too, so a fault on the device reaches it.

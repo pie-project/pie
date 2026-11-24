@@ -27,6 +27,10 @@ pub struct Program {
 /// owns them.
 pub struct Device {
     cache: Mutex<HashMap<[u8; 32], Arc<Program>>>,
+    /// The host memory compiling a text took, measured with the compile
+    /// alone (`guest::run`): by the text's hash, persisted beside its
+    /// compiled form in the disk cache ([`Device::keep_compile_peak`]).
+    peaks: Mutex<HashMap<[u8; 32], u64>>,
     /// A gate a program's disk load holds ([`Device::load_named`]).
     loading: Mutex<HashMap<[u8; 32], Arc<Mutex<()>>>>,
     /// Records dropped because their program did not load ([`Device::mend_record`]).
@@ -118,6 +122,7 @@ impl Device {
             limit,
             held,
             cache: Mutex::new(HashMap::new()),
+            peaks: Mutex::new(HashMap::new()),
             loading: Mutex::new(HashMap::new()),
             mended: std::sync::atomic::AtomicU64::new(0),
             demand: Mutex::new(0),
@@ -167,6 +172,7 @@ impl Device {
             limit: None,
             held: 0,
             cache: Mutex::new(HashMap::new()),
+            peaks: Mutex::new(HashMap::new()),
             loading: Mutex::new(HashMap::new()),
             mended: std::sync::atomic::AtomicU64::new(0),
             demand: Mutex::new(0),
@@ -837,6 +843,43 @@ impl Device {
         self.holds(text) || self.on_disk(text)
     }
 
+    /// The host memory compiling `text` took, measured alone
+    /// ([`Self::keep_compile_peak`]): this process's, else the disk cache's
+    /// beside its compiled form. `None`: never measured.
+    #[must_use]
+    pub fn compile_peak(&self, text: &str) -> Option<u64> {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        if let Some(&peak) = self.peaks.lock().expect("peaks lock poisoned").get(&key) {
+            return Some(peak);
+        }
+        let file = self
+            .cache_file(self.client().ok()?, text)?
+            .with_extension("peak");
+        let peak = std::fs::read_to_string(file).ok()?.trim().parse().ok()?;
+        self.peaks
+            .lock()
+            .expect("peaks lock poisoned")
+            .insert(key, peak);
+        crate::guest::run::note_peak(peak);
+        Some(peak)
+    }
+
+    /// Keeps the host memory compiling `text` took, measured alone: for this
+    /// process and beside its compiled form in the disk cache.
+    pub fn keep_compile_peak(&self, text: &str, peak: u64) {
+        let key = *blake3::hash(text.as_bytes()).as_bytes();
+        self.peaks
+            .lock()
+            .expect("peaks lock poisoned")
+            .insert(key, peak);
+        crate::guest::run::note_peak(peak);
+        if let Ok(client) = self.client()
+            && let Some(file) = self.cache_file(client, text)
+        {
+            let _ = std::fs::write(file.with_extension("peak"), peak.to_string());
+        }
+    }
+
     /// Whether the disk cache holds the program compiled from `text`.
     #[must_use]
     /// The program the load compiled from `text` and parked in the disk
@@ -1192,6 +1235,28 @@ pub fn element_type(elem: kernels_xla::hlo::Elem) -> ElementType {
 pub(crate) const COMPILER_ENV: [&str; 2] = ["LIBTPU_INIT_ARGS", "XLA_FLAGS"];
 
 fn disk_cache() -> Option<PathBuf> {
+    let dir = disk_dir();
+    // the stage compiles measured in runs before: the largest is the room
+    // the program loaders leave free from the start, before a registration
+    // states its own
+    if let Some(dir) = &dir
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "peak")
+                && let Some(peak) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u64>().ok())
+            {
+                crate::guest::run::note_peak(peak);
+            }
+        }
+    }
+    dir
+}
+
+fn disk_dir() -> Option<PathBuf> {
     match std::env::var_os("PIE_XLA_CACHE") {
         Some(v) if v == "0" || v.is_empty() => None,
         Some(v) => Some(PathBuf::from(v)),
@@ -1343,8 +1408,14 @@ impl HostRoom {
     fn room(&self, reserved: u64, hold: u64) -> bool {
         match self.stated {
             Some(stated) => self.held().saturating_add(reserved).saturating_add(hold) <= stated,
+            // the floor, and the room the guest stage compiles running and
+            // waiting take (a loader beside serving held the host to 14.5 GB
+            // free and a registration's sampler stages were refused)
             None => available_memory().is_none_or(|free| {
-                free.saturating_sub(reserved).saturating_sub(hold) >= self.floor
+                free.saturating_sub(reserved).saturating_sub(hold)
+                    >= self
+                        .floor
+                        .saturating_add(crate::guest::run::guest_reserve())
             }),
         }
     }
