@@ -15,8 +15,9 @@
 //! A dense product's kernel is chosen by its shape alone (a streaming
 //! skeleton for few rows, else cuBLASLt's first heuristic); nothing is timed
 //! at load, so every run sums each product in the same order. The cache is
-//! shared across runs (`PIE_GOLDEN_CACHE`, by default `pie-golden-cache`
-//! under the system's temp dir). Each model is served twice in its process,
+//! shared across runs (`PIE_GOLDEN_CACHE`, which must be set: a run without
+//! it is refused rather than rebuilding every fixture), each fixture named by
+//! its model and a hash of the planes it holds. Each model is served twice in its process,
 //! and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
@@ -355,11 +356,15 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     });
     let serving = serving || encoded;
     let suffix = if serving { "serving.zt" } else { "zt" };
-    let container = dir.join(format!("{model}.{suffix}"));
+    // Named by the planes it holds as well as the model: a fixture seeded
+    // for another trace (a plane renamed or reshaped, another drafter, a
+    // seeding changed) is another file, never served for this one.
+    let key = fixture_key(&trace, serving);
+    let container = dir.join(format!("{model}-{key:016x}.{suffix}"));
     if !container.exists() {
         let partial = dir.join(format!("{model}.{suffix}.{}", std::process::id()));
         if encoded {
-            let floats = dir.join(format!("{model}.floats.zt"));
+            let floats = dir.join(format!("{model}-{key:016x}.floats.zt"));
             if !floats.exists() {
                 let seeded = dir.join(format!("{model}.floats.zt.{}", std::process::id()));
                 write_checkpoint(&seeded, &trace);
@@ -391,6 +396,11 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
         }
         std::fs::rename(&partial, &container)
             .unwrap_or_else(|why| panic!("{}: {why}", container.display()));
+        if encoded {
+            // The seeded floats are the import's input alone: the artifact
+            // is what every later run reads.
+            let _ = std::fs::remove_file(dir.join(format!("{model}-{key:016x}.floats.zt")));
+        }
     }
     let source = ztensor::Source::open(&container).expect("the fixture opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
@@ -404,9 +414,41 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     }
 }
 
+/// The version of the bytes a fixture is seeded with: bumped whenever
+/// [`seeded_planes`], [`write_checkpoint`], [`write_serving`] or the
+/// artifact import write other bytes for the same planes, so no fixture of
+/// the old seeding is read again.
+const SEEDING: u32 = 1;
+
+/// The name a fixture is cached under past its model's: the seeding's
+/// version, the form (serving or not) and each checkpoint plane's name,
+/// shape, dtype and layout, hashed.
+fn fixture_key(trace: &Trace, serving: bool) -> u64 {
+    let mut key = fnv_bytes(FNV, &SEEDING.to_le_bytes());
+    key = fnv_bytes(key, &[u8::from(serving)]);
+    for param in trace
+        .params
+        .iter()
+        .filter(|p| p.source == ParamSource::Checkpoint)
+    {
+        key = fnv_bytes(key, param.name.as_bytes());
+        key = fnv_bytes(key, &[0]);
+        for &extent in &param.shape {
+            key = fnv_bytes(key, &extent.to_le_bytes());
+        }
+        key = fnv_bytes(
+            key,
+            format!("{:?} {:?};", param.dtype, param.layout).as_bytes(),
+        );
+    }
+    key
+}
+
+/// The fixture cache, `PIE_GOLDEN_CACHE`: refused unset, since a default
+/// in a run's own temp dir rebuilds every fixture (tens of GB) each run.
 fn cache_dir() -> PathBuf {
     std::env::var_os("PIE_GOLDEN_CACHE").map_or_else(
-        || std::env::temp_dir().join("pie-golden-cache"),
+        || panic!("set PIE_GOLDEN_CACHE to the fixture cache; unset would rebuild every fixture"),
         PathBuf::from,
     )
 }
@@ -549,7 +591,10 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
             }
         }
     }
-    assert!(served > 0, "no budget served the declared context cut to its room");
+    assert!(
+        served > 0,
+        "no budget served the declared context cut to its room"
+    );
 }
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
@@ -1274,8 +1319,15 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
     facts.validate().expect("the engine's chunk facts hold");
     // The budget divides into disk chunks of a pool chunk each, on the
     // direct I/O boundary, laid out as the device's.
-    assert_eq!(facts.disk_chunks, chunks, "{model}: the facts state the disk chunks");
-    assert_eq!(u64::from(chunks), budget / disk_chunk, "{model}: disk chunks of the budget");
+    assert_eq!(
+        facts.disk_chunks, chunks,
+        "{model}: the facts state the disk chunks"
+    );
+    assert_eq!(
+        u64::from(chunks),
+        budget / disk_chunk,
+        "{model}: disk chunks of the budget"
+    );
     let parked: Vec<engine::chunk::SlotShape> = facts
         .shapes
         .iter()
@@ -1438,7 +1490,12 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
         }
         println!("{}: every round trip bit-exact", what("parks"));
         let held = match (shape.role, &shape.kind) {
-            (_, engine::chunk::SlotKind::List { window: Some(_), .. }) => "window".to_string(),
+            (
+                _,
+                engine::chunk::SlotKind::List {
+                    window: Some(_), ..
+                },
+            ) => "window".to_string(),
             (engine::chunk::SlotRole::State, engine::chunk::SlotKind::List { .. }) => {
                 "kv".to_string()
             }
@@ -3193,7 +3250,10 @@ fn golden_measuring_refit() {
         };
         let recorded = {
             let mut shell = load_with(&fixture, &own, told());
-            shell.chunk_facts().expect("the pool states its chunks").total_chunks
+            shell
+                .chunk_facts()
+                .expect("the pool states its chunks")
+                .total_chunks
         };
         let _ = std::fs::remove_dir_all(&own);
         let slack = u32::try_from(took.div_ceil(chunk.max(1))).unwrap_or(u32::MAX);
