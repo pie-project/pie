@@ -416,6 +416,10 @@ pub struct Shell {
     /// The scope this load's traced fires' records lie in (`trace_scope`),
     /// set as the warm ladder starts; `None`: none kept or read.
     trace_scope: Option<String>,
+    /// The step compositions the runtime's builder forms over this load
+    /// (`engine::StepShapes`, CONTRACT-BC 24), set before the warm ladder:
+    /// it lays a fire's buffered treatment where the set states it.
+    steps: Option<engine::StepShapes>,
     /// Whether this load's first record was checked against its trace (a
     /// record traced again and its text's hash compared), and whether the
     /// records still hold: a parted one stops their use for the load.
@@ -1294,6 +1298,7 @@ impl Shell {
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
             trace_scope: None,
+            steps: None,
             load_width,
             record_checked: false,
             records_hold: true,
@@ -1427,6 +1432,12 @@ impl Shell {
     #[must_use]
     pub fn input_seat(&self, id: u32) -> Option<poem_exec::feeds::Seat> {
         self.dit.seat(id)
+    }
+
+    /// The step compositions the runtime's builder forms over this load,
+    /// for the warm ladder (`Shell::prewarm`).
+    pub fn set_steps(&mut self, steps: engine::StepShapes) {
+        self.steps = Some(steps);
     }
 
     #[must_use]
@@ -2370,9 +2381,6 @@ impl Shell {
         // Each lane's own rows and the buffered rows it replays ahead of them
         // (a decode lane's included).
         let mut replays: Vec<(u32, u32)> = Vec::with_capacity(lanes.len());
-        // Whether any lane holds rows before the fire: only such a lane may
-        // carry buffered rows into it.
-        let mut any_held = false;
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         // The windowed state (CONTRACT-BC 19, 21): each windowed lane's
@@ -2489,7 +2497,6 @@ impl Shell {
                     .copied()
                     .unwrap_or(0),
             };
-            any_held |= have > 0;
             let is_fresh = match seated.rs_reset {
                 engine::fire::RsReset::Inferred => have == 0,
                 engine::fire::RsReset::Fresh => true,
@@ -3265,26 +3272,17 @@ impl Shell {
         }
         let caches = self.pools.table(&table_seats, &record_rows_t)?;
 
-        // A fire that may carry buffered rows takes the buffered path whatever
-        // verbs its lanes send this time (a folding lane's plan replays
-        // nothing and commits its rows): whether a lane buffers is the
-        // runtime's fold timing (its lagged fold), so the program is the one
-        // the warm ladder lays for the same held rows.
-        let rs_active = rs_active || (any_held && self.pools.buffers_rs());
         let rs_seat = match (&self.rs_layout, rs_active) {
             (Some(layout), true) => {
                 let replay: Vec<i32> = rs_plans.iter().map(|p| p.replay as i32).collect();
                 let commit: Vec<i32> = rs_plans.iter().map(|p| p.commit as i32).collect();
-                // A fire that may carry buffered rows (a lane of it holds rows
-                // already, on a load that buffers them: under the runtime's
-                // lagged fold a decode carries what its run-ahead left) lays
-                // each window's scratch for the rung's own rows and its stated
-                // carried room (`crate::rs::rung_replay`), whether it carries
-                // any this time or not: one program a shape, the one the warm
-                // ladder lays with the same held rows. A fire of fresh lanes
-                // alone (a first prefill) carries nothing and lays its own rows.
-                debug_assert!(any_held || replays.iter().all(|&(_, replayed)| replayed == 0));
-                let replays = any_held;
+                // A buffered fire (a lane of it buffers: the step's stated
+                // treatment, `engine::Treatment::Buffers`) lays each window's
+                // scratch for the rung's own rows and its stated carried room
+                // (`crate::rs::rung_replay`), whether it carries any this time
+                // or not: one program a shape, the one the warm ladder lays
+                // for a shape the step set states buffered.
+                let replays = true;
                 let mut maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {

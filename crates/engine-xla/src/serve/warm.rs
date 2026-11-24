@@ -39,6 +39,42 @@ struct Want {
     /// The lane states a mask (every key allowed): its fire stages the
     /// load's mask plane, a program of its own.
     masked: bool,
+    /// The lane buffers its recurrent rows (`RsVerb::Buffer`): its fire is
+    /// the buffered treatment of its shape (`engine::Treatment::Buffers`).
+    buffers: bool,
+}
+
+/// The step composition (`engine::StepComposition`) a fire of `shape`'s lanes
+/// forms, under `treatment`.
+fn composition(shape: &[Want], treatment: engine::Treatment) -> engine::StepComposition {
+    let mut step = engine::StepComposition {
+        treatment,
+        ..engine::StepComposition::default()
+    };
+    for want in shape {
+        if want.rows <= 1 {
+            step.decode_lanes += 1;
+            step.rows += 1;
+        } else {
+            step.lane_rows = if step.prompt_lanes == 0 {
+                engine::shapes::Span {
+                    lo: want.rows,
+                    hi: want.rows,
+                }
+            } else {
+                engine::shapes::Span {
+                    lo: step.lane_rows.lo.min(want.rows),
+                    hi: step.lane_rows.hi.max(want.rows),
+                }
+            };
+            step.prompt_lanes += 1;
+            step.prompt_rows += want.rows;
+            step.rows += want.rows;
+        }
+        step.readout_rows += if want.all_rows { want.rows } else { 1 };
+        step.attachments.mask |= want.masked;
+    }
+    step
 }
 
 impl Shell {
@@ -87,6 +123,7 @@ impl Shell {
             held_pages: 0,
             all_rows: false,
             masked: false,
+            buffers: false,
         };
         // A decode lane beside prompts holds its own prompt, a page of it:
         // its fire is the one a served decode lane's is (on a load that
@@ -98,6 +135,7 @@ impl Shell {
             held_pages: 1,
             all_rows: false,
             masked: false,
+            buffers: false,
         };
         let hybrid = self.has_state();
         let mut shapes: Vec<Vec<Want>> = Vec::new();
@@ -125,6 +163,7 @@ impl Shell {
                     held_pages: pages,
                     all_rows: false,
                     masked: false,
+                    buffers: false,
                 };
                 shapes.push(vec![lane; n as usize]);
                 // the same decodes beside a lane stating a mask (a beam): the
@@ -373,6 +412,7 @@ impl Shell {
                                 held_pages: pages,
                                 all_rows: true,
                                 masked: false,
+                                buffers: false,
                             };
                             shapes.push(vec![lane; n as usize]);
                             pages = pad.next(pages);
@@ -403,6 +443,34 @@ impl Shell {
                     }
                 }
             }
+        }
+        // The buffered treatment of every shape the step set states buffered
+        // (a lane of it buffers its recurrent rows: a stop string's, a beam's
+        // or a draft's, or a decode's run-ahead under the lagged fold): its
+        // fire lays the replaying scratch, a program of its own, laid here
+        // and nowhere the set does not state it.
+        if self.pools.buffers_rs()
+            && let Some(steps) = self.steps.clone()
+        {
+            let buffered: Vec<Vec<Want>> = shapes
+                .iter()
+                .filter(|shape| {
+                    steps
+                        .shape_of(&composition(shape, engine::Treatment::Buffers))
+                        .is_some()
+                })
+                .map(|shape| {
+                    shape
+                        .iter()
+                        .map(|w| Want {
+                            buffers: true,
+                            ..*w
+                        })
+                        .collect()
+                })
+                .collect();
+            parts.push(("buffered", shapes.len()));
+            shapes.extend(buffered);
         }
         let mut added: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         let started = std::time::Instant::now();
@@ -1023,11 +1091,27 @@ impl Shell {
             self.open(slot)?;
         }
         let windowed_state = self.pools.layout().ring().is_some();
+        // A buffered lane buffers what it lands, carrying nothing in: the
+        // buffered program is one a shape whatever a fire carries.
+        let verbs: Vec<Option<engine::fire::RsVerb>> = shape
+            .iter()
+            .zip(&owned)
+            .map(|(want, (_, scratch, _, _))| {
+                want.buffers.then(|| engine::fire::RsVerb::Buffer {
+                    pages: scratch.rs.clone(),
+                    base: 0,
+                    folded: held_of(want, page_size),
+                    fold: engine::fire::FoldLen::Host(0),
+                    lineage: engine::fire::Lineage::Set,
+                })
+            })
+            .collect();
         let seated: Vec<Seated<'_>> = shape
             .iter()
             .zip(&owned)
+            .zip(&verbs)
             .enumerate()
-            .map(|(at, (want, (tokens, scratch, every, mask)))| {
+            .map(|(at, ((want, (tokens, scratch, every, mask)), verb))| {
                 let mut seated = Seated::of(Lane {
                     slot: at as u32 % slots,
                     word: want.word,
@@ -1043,6 +1127,9 @@ impl Shell {
                     seated.readout = Some(every);
                 }
                 seated.mask = mask.as_ref();
+                if let Some(verb) = verb {
+                    seated.rs = verb;
+                }
                 seated
             })
             .collect();
