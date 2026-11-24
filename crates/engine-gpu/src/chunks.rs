@@ -38,6 +38,7 @@ pub fn profile(page_size: u32, context: u32, binding: u64, target: Option<u64>) 
         // attention over their keys and corrected values
         // (`kernels/ssm/gdn_carried.slang`).
         rs_corrected: true,
+        rs_scalars: true,
         token_slot: Some(page_size),
         one_window: false,
         // A window as wide as the context keeps every token: a list row.

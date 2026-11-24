@@ -1576,3 +1576,9 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** `muse-glimmer-30b-mini-l8-bf16-kv-bf16`'s projection legs served apart answer 0.17 off over a spread of 3.2 against the joined projection, as its joined trace does with its qkv write unfused: its unit-RMS q and k heads, unscaled, score keys 3.9 apart under its softmax scale, and its eight layers carry a last-place rounding 5% of the spread. The apart form serves only where the compiler cannot join the legs, so no served load reaches it. The ignored check (`the_open_rows_answer_apart_what_they_answer_joined` in engine-cuda's `a_joined_projection_answers_what_its_legs_answer`) was removed in the cleanup; add the row back to that test's `ROWS` once the apart form agrees.
 
 **Why later.** No served path takes it.
+
+## F??. Gated-delta per-head scalars in the rs row
+
+**What.** The corrected planes of a gated-delta row may keep its per-head scalars (`poem_compiler::rs::gdn_scalars_bytes`: each value head's log-gate, then its key norm's inverse, f32), as `ChunkProfile::rs_scalars` states. Metal's decode reads them. CUDA's kernels recompute them from the row's `[b | a]` and keys, so CUDA's profile lays none (the cleanup dropped `Corrected::scalars`). engine-gpu's profile still lays the plane and, by its own `rs::Plane::Scalars` doc, neither writes nor reads it.
+
+**Why later.** engine-gpu is GPU's to flip (`rs_scalars: false` in `chunks::profile`). On CUDA, lay them again (`rs_scalars: true` and a plane in `store::rs`) only if a decode kernel comes to read them in place of recomputing.

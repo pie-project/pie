@@ -145,6 +145,7 @@ pub fn census(
     state_f32: bool,
     rs_mamba2: bool,
     rs_corrected: bool,
+    rs_scalars: bool,
 ) -> Result<Census, ChunkError> {
     let readers = readers(trace);
     let mut out = Census::default();
@@ -198,7 +199,7 @@ pub fn census(
             }
         }
     }
-    for (row, rs) in rs_rows(trace, &readers, rs_mamba2, rs_corrected)? {
+    for (row, rs) in rs_rows(trace, &readers, rs_mamba2, rs_corrected, rs_scalars)? {
         out.rs.insert(row.id, rs);
         out.rs_rows.push(row);
     }
@@ -452,6 +453,7 @@ fn rs_rows(
     readers: &[Read],
     rs_mamba2: bool,
     rs_corrected: bool,
+    rs_scalars: bool,
 ) -> Result<Vec<(TokenRow, RsRow)>, ChunkError> {
     let mut defined: HashMap<u32, usize> = HashMap::new();
     let mut outs = Vec::new();
@@ -492,9 +494,10 @@ fn rs_rows(
             // key heads, bf16) and its corrected values (`u`, the value
             // its delta rule writes, f32): a decode step reads the buffered
             // rows as a linear attention over them and never re-steps one.
-            // Then its per-head scalars (`crate::rs::gdn_scalars_bytes`),
-            // keyed by the gate prep's output: the `[b | a]` plane stays for
-            // a reader that recomputes them.
+            // Then, with `rs_scalars`, its per-head scalars
+            // (`crate::rs::gdn_scalars_bytes`), keyed by the gate prep's
+            // output: the `[b | a]` plane stays for a reader that recomputes
+            // them.
             Operation::Ssm(Ssm::GatedDeltaChunked {
                 qkv,
                 gates,
@@ -515,7 +518,9 @@ fn rs_rows(
                     if rs_corrected {
                         planes.push((*qkv, Some(u64::from(k_heads * k_dim) * RS_ELEMENT)));
                         planes.push((*y, Some(u64::from(v_heads * v_dim) * 4)));
-                        planes.push((*gates, Some(crate::rs::gdn_scalars_bytes(*v_heads))));
+                        if rs_scalars {
+                            planes.push((*gates, Some(crate::rs::gdn_scalars_bytes(*v_heads))));
+                        }
                     }
                     recurrences.push((planes, *state, node.layer));
                 }
