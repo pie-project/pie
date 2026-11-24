@@ -503,20 +503,34 @@ impl Engine for Metal {
         let device = shell.device();
         let submitted = (behind.others)();
         let began = std::time::Instant::now();
+        // A `curve <n>x<k>` entry: that shape's dense curves, timed by the
+        // step a load times them by (`tune::dense::curves_behind`); else
+        // one `[rates]` key.
         let timed = crate::rates::clock_rate(device, profile.clone(), true).and_then(|before| {
-            let rates = crate::rates::measure_keys(
-                device,
-                profile.clone(),
-                &[key.as_str()],
-                Some(behind.arrived),
-                &mut |_| {},
-            )?;
+            let rates = match key.strip_prefix(crate::tune::dense::CURVE_BEHIND) {
+                Some(shape) => profile::fire::Rates {
+                    kernel_tflops_by_shape: Some(crate::tune::dense::curves_behind(
+                        device,
+                        &profile,
+                        shape,
+                        behind.arrived,
+                    )?),
+                    ..profile::fire::Rates::default()
+                },
+                None => crate::rates::measure_keys(
+                    device,
+                    profile.clone(),
+                    &[key.as_str()],
+                    Some(behind.arrived),
+                    &mut |_| {},
+                )?,
+            };
             Ok((before, rates))
         });
         let ms = began.elapsed().as_secs_f64() * 1e3;
         let (before, rates) = match timed {
             Ok(timed) => timed,
-            Err(why) if crate::rates::yielded(&why) => {
+            Err(why) if crate::rates::yielded(&why) || why == crate::tune::dense::YIELDED => {
                 tracing::info!(
                     key = %key,
                     ms,
