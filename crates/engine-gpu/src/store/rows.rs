@@ -44,8 +44,10 @@ pub const WEIGHTS: u32 = 9;
 /// Bytes one fill moves through its host-visible upload at most.
 const UPLOAD: u64 = 64 << 20;
 
-/// The threads that lay a fill's rows.
-const FILL_THREADS: usize = 16;
+/// The threads that lay a fill's rows: the cores this process may run on.
+fn fill_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
 
 /// The tables a plain token-id gather alone reads: bf16, two axes, from
 /// the checkpoint, every reader a `Gather::Embed` with no weights, scales or
@@ -543,7 +545,7 @@ impl<B: Backend> RowCaches<B> {
 
     /// Fills the slots `fills` names (virtual byte, cache, block) with their
     /// blocks' rows from the host, in uploads of [`UPLOAD`] bytes at most,
-    /// the rows laid by [`FILL_THREADS`] threads. Where the API maps host
+    /// the rows laid by [`fill_threads`] threads. Where the API maps host
     /// memory, two uploads made once, the rows laid in one while the other's
     /// copy runs; else an upload a batch, written through the queue.
     #[allow(unsafe_code)]
@@ -668,7 +670,7 @@ impl<B: Backend> RowCaches<B> {
 
     /// Lays the rows of `fills`' blocks side by side in `image` (each slot
     /// whole: rows past the table's last and any gap between tables zero),
-    /// split over [`FILL_THREADS`] threads.
+    /// split over [`fill_threads`] threads.
     fn lay(
         &self,
         image: &mut [u8],
@@ -684,7 +686,7 @@ impl<B: Backend> RowCaches<B> {
             seats.push((seat, cache, block));
             rest = after;
         }
-        let threads = FILL_THREADS.min(seats.len()).max(1);
+        let threads = fill_threads().min(seats.len()).max(1);
         let chunk = seats.len().div_ceil(threads);
         let map = host.map();
         let laid: Vec<Result<()>> = std::thread::scope(|scope| {

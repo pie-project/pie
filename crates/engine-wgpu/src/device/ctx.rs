@@ -56,13 +56,19 @@ pub fn present() -> bool {
     wgpu::Instance::enabled_backend_features().contains(wgpu::Backends::BROWSER_WEBGPU)
 }
 
+/// The buffer bound where a binding has nothing: one binding's alignment.
 pub(crate) const DUMMY_BYTES: u64 = 256;
 
+/// One frame's dispatch uniforms: 4096 dispatches at the 256-byte
+/// uniform-offset alignment; a frame past it is refused by name.
 const UNIFORM_CHUNK: u64 = 1 << 20;
 
+/// The scratch chunk the ring keeps between frames: a fire's transient
+/// buffers in one, beside the pool, at most a reservation's bound.
 const SCRATCH_CHUNK: u64 = 8 << 20;
 
-const TIMING_QUERIES: u32 = 4096;
+/// The timestamps a frame's query set holds: the most wgpu allows a set.
+const TIMING_QUERIES: u32 = wgpu::QUERY_SET_MAX_QUERIES;
 
 const SPAN_AT: u64 = (TIMING_QUERIES as u64) * 8;
 

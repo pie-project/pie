@@ -204,13 +204,14 @@ fn forcing(q: &Qmm) -> String {
 
 /// The kernel `kernels_slang::linear::qmm::ran` names for `q`.
 #[cfg(feature = "vulkan")]
-fn kernel(q: &Qmm) -> &'static str {
+fn kernel(q: &Qmm) -> kernels_slang::linear::qmm::Rung {
+    use kernels_slang::linear::qmm::Rung;
     match q {
-        Qmm::Coopmat => "coopmat",
-        Qmm::RegisterTiled { .. } => "register_tiled",
-        Qmm::Tiled { .. } => "tiled",
-        Qmm::OneRow { .. } => "one_row",
-        Qmm::Qmv { .. } => "qmv",
+        Qmm::Coopmat => Rung::Coopmat,
+        Qmm::RegisterTiled { .. } => Rung::RegisterTiled,
+        Qmm::Tiled { .. } => Rung::Tiled,
+        Qmm::OneRow { .. } => Rung::OneRow,
+        Qmm::Qmv { .. } => Rung::Qmv,
     }
 }
 
@@ -758,7 +759,11 @@ pub(super) mod device {
         live: &[usize],
         launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
     ) -> Result<Vec<(f64, f64)>, String> {
+        /// Timed frames a candidate takes; its median is kept (odd, so one
+        /// frame is the median).
         const ROUNDS: usize = 7;
+        /// A timed frame's span: launches enough that one launch's spread
+        /// averages out, short of a phone's 2 s submit bound by far.
         const FRAME_S: f64 = 0.002;
         /// A candidate this much slower than the fastest is timed once.
         const SLOWER: f64 = 3.0;

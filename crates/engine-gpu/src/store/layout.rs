@@ -56,7 +56,8 @@ pub const INSTANCE_SLOT: u64 = 4 << 10;
 /// A `Channel` slot's bytes.
 pub const CHANNEL_SLOT: u64 = 1 << 10;
 
-/// The chunk a GPU recipe aims at.
+/// The chunk a GPU recipe aims at, absent a profile's: a few KV pages of a
+/// wide model in one, and a pool of thousands of chunks on any device served.
 pub const TARGET_CHUNK: u64 = 4 << 20;
 
 #[must_use]

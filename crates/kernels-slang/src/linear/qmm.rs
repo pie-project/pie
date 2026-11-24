@@ -349,20 +349,31 @@ fn register(op: &'static str, b: &Bounds, bm: u32, k16: bool) -> Result<Fire, Er
         .group([REGISTER_COLS / 4, bm / 4, 1]))
 }
 
+/// A `kernel.qmm` rung's kernel, whatever its parameters: what a fired
+/// module key tells of the rung that ran it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rung {
+    Coopmat,
+    RegisterTiled,
+    Tiled,
+    OneRow,
+    Qmv,
+}
+
 /// The `kernel.qmm` rung a fired module key belongs to, for a tuner that
 /// watches what a forced ladder ran.
 #[must_use]
-pub fn ran(key: &str) -> Option<&'static str> {
+pub fn ran(key: &str) -> Option<Rung> {
     if key.starts_with("linear_qmm_tiled_") && key.ends_with(".coopmat") {
-        Some("coopmat")
+        Some(Rung::Coopmat)
     } else if key.starts_with("linear_qmm_register_") {
-        Some("register_tiled")
+        Some(Rung::RegisterTiled)
     } else if key.starts_with("linear_qmm_tiled_") || key.starts_with("linear_qmm_quad_") {
-        Some("tiled")
+        Some(Rung::Tiled)
     } else if key.starts_with("linear_qmv_row_") {
-        Some("one_row")
+        Some(Rung::OneRow)
     } else if key.starts_with("linear_qmv_") {
-        Some("qmv")
+        Some(Rung::Qmv)
     } else {
         None
     }

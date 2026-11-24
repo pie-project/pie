@@ -1199,43 +1199,6 @@ fn a_fresh_joiner_of_a_pair_parked_shed_lays_it_where_a_move_left_it() {
     a_fresh_joiner_of_an_all_parked_pair_lays_it_where_a_move_left_it(false);
 }
 
-/// What binding and closing a guest costs, its state cleared at each bind:
-/// `PIE_GUEST_BIND_ROUNDS` rounds (default 200) of one bind and one close.
-#[test]
-#[ignore = "a measurement: run on its own"]
-fn guest_bind_close_rounds_timed() {
-    let Some((loaded, program, mut slots, _)) = setup("guest-state-binds", 4) else {
-        return;
-    };
-    let Loaded {
-        mut engine, dir, ..
-    } = loaded;
-    let rounds: u64 = std::env::var("PIE_GUEST_BIND_ROUNDS")
-        .ok()
-        .and_then(|rounds| rounds.parse().ok())
-        .unwrap_or(200);
-    let state = engine
-        .guest_state(program, &EXTENTS, GeometryClass::Host)
-        .expect("the program's guest state");
-    let (first, _, room) = bind(&mut engine, &mut slots, program, 1);
-    engine.close_instance(first).expect("closes");
-    let started = std::time::Instant::now();
-    for round in 0..rounds {
-        let (instance, _, _) =
-            bind_in(&mut engine, &mut slots, program, 4 + 3 * round, Some(&room));
-        engine.close_instance(instance).expect("closes");
-    }
-    let took = started.elapsed();
-    eprintln!(
-        "guest bind+close: {rounds} rounds, {:.1} us a round, state {} B an instance + {} B its pair",
-        took.as_secs_f64() * 1e6 / rounds as f64,
-        state.instance_bytes(),
-        state.per_pair
-    );
-    drop(engine);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A beam group's state (`engine_gpu::beam::Resident`, first in the
 /// instance's one place, `GuestState::resident`, its heaps past it) follows
 /// a park into fresh room: laid and cleared at the bind, a search's lists

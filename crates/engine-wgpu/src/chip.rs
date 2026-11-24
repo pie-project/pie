@@ -95,16 +95,15 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
 /// again ([`profile::rates::Rates::sift`]), each said in the load log.
 #[must_use]
 pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Profile, Report) {
-    let keys = engine_gpu::stored::Keys::new(
-        on.to_string(),
+    engine_gpu::stored::resolve(
+        &SHELF,
+        registry(),
+        &device.name,
+        &device.facts(),
+        profiles,
+        on,
         <crate::device::Api as engine_gpu::serve::Serve>::TARGET,
-    );
-    let (profile, report) =
-        SHELF.resolve_keyed(registry(), &device.name, &device.facts(), profiles, &keys);
-    for line in &report.stored {
-        tracing::info!("{line}");
-    }
-    (profile, report)
+    )
 }
 
 /// The adapter this machine would serve, by name, with its facts.
