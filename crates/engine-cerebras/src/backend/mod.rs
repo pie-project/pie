@@ -174,6 +174,17 @@ impl Engine for CerebrasEngine {
         "cerebras-spatial"
     }
 
+    /// The fire the wafer program is built for; a stated context is its
+    /// positions, built into the program.
+    fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
+        Some(engine::load::FireCeiling {
+            lanes: 4,
+            tokens: 64,
+            page_size: None,
+            context_binds: true,
+        })
+    }
+
     fn live(&self) -> engine::live::Live {
         self.programs.live()
     }

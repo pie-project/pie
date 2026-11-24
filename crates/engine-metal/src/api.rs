@@ -509,6 +509,18 @@ impl Engine for Metal {
         "metal"
     }
 
+    /// The widest fire the Metal shell asks of its load, which narrows it to
+    /// what the device's resident weights leave room for; its kv page is
+    /// its own (no planner derives one).
+    fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
+        Some(engine::load::FireCeiling {
+            lanes: 512,
+            tokens: 10240,
+            page_size: Some(32),
+            context_binds: false,
+        })
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }
