@@ -606,27 +606,15 @@ impl Serve for Api {
                 Plan::Fill
             }
         };
-        // The walk lays in its arm's fire block, and its capturing lanes'
-        // rows in the fire's score room, which a recording binds by place.
-        shell
-            .device
-            .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
-        shell.device.room_next(
-            prepared
-                .score_room
-                .as_ref()
-                .map(|(buffer, at)| (buffer, *at)),
-        );
-        // A decode (padded to its bucket) or a fire no wider than the vector
-        // GEMM's widest row tile carries its rows in its commands; a wider
-        // one reads them from the fire block, one body for every row count
-        // of its rung.
-        let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
-            .last()
-            .expect("the vector GEMM states its row tiles");
-        let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
-        shell.device.fixed_next(decode || rows <= tile);
+        next_frame(shell, prepared);
         Ok(plan)
+    }
+
+    /// The arm walk fills a held family before it plans: its fill frame is
+    /// laid as a serving fill's is.
+    fn ready_fill(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) {
+        shell.device.indirect_next(None);
+        next_frame(shell, prepared);
     }
 
     fn fill_frame(device: &Context, _arm: usize) -> Result<Frame> {
@@ -1129,4 +1117,29 @@ impl Seats for Shell<Api> {
     fn forget_seat(&mut self, landed: &Landed) {
         self.shelf.landed_seats.remove(&landed.seq);
     }
+}
+
+/// What the next frame of `prepared`'s fire lays in: its arm's fire block,
+/// its capturing lanes' score room (a recording binds it by place), and
+/// whether its rows are its commands' own.
+fn next_frame(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) {
+    shell
+        .device
+        .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
+    shell.device.room_next(
+        prepared
+            .score_room
+            .as_ref()
+            .map(|(buffer, at)| (buffer, *at)),
+    );
+    // A decode (padded to its bucket) or a fire no wider than the vector
+    // GEMM's widest row tile carries its rows in its commands; a wider
+    // one reads them from the fire block, one body for every row count
+    // of its rung.
+    let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
+        .last()
+        .expect("the vector GEMM states its row tiles");
+    let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
+    let rows: u32 = prepared.seats.iter().map(|seat| seat.rows).sum();
+    shell.device.fixed_next(decode || rows <= tile);
 }
