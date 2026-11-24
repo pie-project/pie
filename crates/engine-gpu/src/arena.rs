@@ -464,13 +464,17 @@ impl<B: Backend> Span<B> {
         for value in 0..at.map.placements.len() {
             let value = ValueId(value as u32);
             // A fire that captures nothing lays no row: a capture's value
-            // has no rectangle, so it binds none.
-            let grain = captured.and_then(|_| grain(&at.map, value));
-            slots.push(match (grain, captured) {
-                (Some(Grain::Keys), Some((keys, _))) => Some(keys),
-                (Some(Grain::Pages), Some((_, pages))) => pages,
-                (Some(_), None) => None,
-                (None, _) => match rect(&at.map, value, rows) {
+            // binds no rows (its kernels launch none), the absent buffer
+            // in their place.
+            let grain = self.capture.and_then(|_| grain(&at.map, value));
+            let none = |width: u32| Some(Tensor::new(crate::NIL, 0, width, Dtype::F32));
+            slots.push(match (grain, captured, self.capture) {
+                (Some(Grain::Keys), Some((keys, _)), _) => Some(keys),
+                (Some(Grain::Pages), Some((_, Some(pages))), _) => Some(pages),
+                (Some(Grain::Keys), _, Some(capture)) => none(capture.keys),
+                (Some(Grain::Pages), _, Some(capture)) => none(capture.pages),
+                (Some(_), _, None) => None,
+                (None, _, _) => match rect(&at.map, value, rows) {
                     // Bound at its room, what the rung's map lays for it, not
                     // at the rows this fire brings: a view then depends on
                     // where the value lies, so what a dispatch binds over it
