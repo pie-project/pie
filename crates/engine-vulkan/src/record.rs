@@ -160,9 +160,6 @@ impl KeyBuilder {
 }
 
 
-/// Fills kept: one a fire shape, each a few bytes a dispatch.
-const FILLS_KEPT: usize = 256;
-
 /// Entries under keys, the stalest dropped past a count.
 struct Held<T> {
     by_key: HashMap<Key, T>,
@@ -221,7 +218,11 @@ impl Recorder {
             // Every family stands: the load records its bodies before it
             // serves, a fixed set, and none leaves for a later one.
             families: Held::new(usize::MAX),
-            fills: Held::new(FILLS_KEPT),
+            // Every fill stands too: a serving fire whose fill left would
+            // walk for it again, after ready. A fill keeps its block's
+            // non-zero runs (`device::block::Image`), and the arm walk holds
+            // its fills to the host room it measures.
+            fills: Held::new(usize::MAX),
             recorded: std::cell::Cell::new(0),
             filled: std::cell::Cell::new(0),
             clock: std::cell::Cell::new(0),

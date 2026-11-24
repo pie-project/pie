@@ -1259,6 +1259,8 @@ pub struct Shell<B: Serve> {
     /// ([`Shell::fill_once`] before its plan): its walk lays into a frame
     /// that records nothing, and nothing runs.
     pub arm_filled: bool,
+    /// Serving fires that walked for their fill, since the last count.
+    filled_in_fire: u64,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
@@ -3146,6 +3148,7 @@ impl<B: Serve> Shell<B> {
             arming: false,
             walk_at: None,
             arm_filled: false,
+            filled_in_fire: 0,
             eager: 0,
             eager_next: false,
             armed: false,
@@ -5191,6 +5194,12 @@ impl<B: Serve> Shell<B> {
     /// fire waited on, recorded at its first fire and replayed after.
     pub fn recorded_serving(&mut self) -> u64 {
         std::mem::take(&mut self.recorded)
+    }
+
+    /// The serving fires since the last count that walked for their fill
+    /// ([`engine::live::Tally::FilledInFire`]).
+    pub fn filled_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.filled_in_fire)
     }
 
     /// A step walked to be kept made no recording: its commands were a held
@@ -9280,6 +9289,21 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // that records nothing, then replays.
         let plan = match plan {
             Plan::Fill => {
+                self.filled_in_fire += 1;
+                if self.serving {
+                    let kind = format!(
+                        "{:?} rung {} rows {:?}",
+                        prepared.descriptor.classes,
+                        prepared.rung,
+                        prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>()
+                    );
+                    if self.unarmed_named.insert(kind.clone()) {
+                        tracing::warn!(
+                            shape = %kind,
+                            "a serving fire walked for its fill, which the arm walk laid for                              none of its shape (counted filled_in_fire)"
+                        );
+                    }
+                }
                 if self.fill_once(&mut prepared)? {
                     match B::plan(self, &mut prepared)? {
                         Plan::Fill => self.unarmed(&prepared, "its fill replays no body")?,
