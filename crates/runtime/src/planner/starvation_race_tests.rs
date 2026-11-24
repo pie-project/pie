@@ -7450,129 +7450,6 @@ async fn a_bind_suspended_restore_that_cannot_fire_holds_the_next_no_longer() {
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "the second is restored");
 }
 
-/// One plan pass with ~250 residents, a queued restore head short of its
-/// roles and a queue of waiters behind it, nothing to do: timed. Run with
-/// `--ignored --nocapture`.
-#[test]
-#[ignore]
-fn bench_a_plan_pass_with_nothing_to_do() {
-    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(4096, 64))));
-    let residents: Vec<ProcessId> = (0..250).map(|_| ProcessId::new_v4()).collect();
-    for &pid in &residents {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    let head = ProcessId::new_v4();
-    planner.register(head);
-    planner.note_admitted(head);
-    planner.with_inner(|inner| {
-        let proc = inner.procs.get_mut(&head).unwrap();
-        proc.state = Residency::Evicted;
-        proc.roles_short = Some(PendingBind {
-            singles: 0,
-            run: 4,
-            pieces: 2,
-            pages: 8,
-        });
-        inner.enqueue(
-            head,
-            WaitKind::Restore {
-                demand: Demand::default(),
-            },
-        );
-        for &pid in residents.iter().take(100) {
-            inner.enqueue(
-                pid,
-                allocation(Demand {
-                    kv_pages: 1,
-                    rs: RsUnits::default(),
-                }),
-            );
-        }
-    });
-    planner.plan();
-    let rounds = 2_000u32;
-    let began = std::time::Instant::now();
-    for _ in 0..rounds {
-        planner.plan();
-    }
-    eprintln!(
-        "BENCH plan pass: {} us",
-        began.elapsed().as_micros() / u128::from(rounds)
-    );
-}
-
-/// The pieces of a plan pass, each timed alone in the same state as
-/// `bench_a_plan_pass_with_nothing_to_do`. Run with `--ignored --nocapture`.
-#[test]
-#[ignore]
-fn bench_the_pieces_of_a_plan_pass() {
-    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(4096, 64))));
-    let residents: Vec<ProcessId> = (0..250).map(|_| ProcessId::new_v4()).collect();
-    for &pid in &residents {
-        planner.register(pid);
-        planner.note_admitted(pid);
-    }
-    let head = ProcessId::new_v4();
-    planner.register(head);
-    planner.note_admitted(head);
-    let key = planner.with_inner(|inner| {
-        let proc = inner.procs.get_mut(&head).unwrap();
-        proc.state = Residency::Evicted;
-        proc.roles_short = Some(PendingBind {
-            singles: 0,
-            run: 4,
-            pieces: 2,
-            pages: 8,
-        });
-        let key = inner.enqueue(
-            head,
-            WaitKind::Restore {
-                demand: Demand::default(),
-            },
-        );
-        for &pid in residents.iter().take(100) {
-            inner.enqueue(
-                pid,
-                allocation(Demand {
-                    kv_pages: 1,
-                    rs: RsUnits::default(),
-                }),
-            );
-        }
-        key
-    });
-    planner.plan();
-    let rounds = 2_000u32;
-    let time = |name: &str, f: &dyn Fn()| {
-        let began = std::time::Instant::now();
-        for _ in 0..rounds {
-            f();
-        }
-        eprintln!("BENCH {name}: {} us", began.elapsed().as_micros() / u128::from(rounds));
-    };
-    time("unmet_head", &|| {
-        planner.with_inner(|inner| {
-            let _ = inner.unmet_head().map(|(key, _)| key);
-        })
-    });
-    time("head_room", &|| {
-        let _ = planner.head_room(key);
-    });
-    time("publish_wants", &|| planner.publish_wants());
-    time("wants_met_now", &|| {
-        let _ = planner.wants_met_now();
-    });
-    time("dump_stall", &|| planner.dump_stall());
-    time("report_short", &|| planner.report_short());
-    time("plan_once", &|| {
-        let _ = planner.plan_once();
-    });
-    time("victim_set", &|| {
-        let _ = planner.victim_set();
-    });
-}
-
 /// A real shared store for [`bench_a_plan_pass_on_a_shared_store`]: 480
 /// chunks of 1 MiB, a kv list (16 slots a chunk), a one-piece state record
 /// and the role shapes (instance, channel, adapter), 64 host chunks.
@@ -10374,9 +10251,6 @@ struct SnapProc {
     /// in flight (`roles_short_quiet`).
     refused_free: Option<u32>,
     quiet: bool,
-    /// Restoring, waiting on its rebinds (`rebind_waiting`): waiting, not
-    /// in flight.
-    rebind_waiting: Option<&'static str>,
 }
 
 impl SnapProc {
@@ -10387,7 +10261,6 @@ impl SnapProc {
             refused: None,
             refused_free: None,
             quiet: false,
-            rebind_waiting: None,
         }
     }
 
@@ -10425,9 +10298,6 @@ struct StallSnapshot {
     /// The chunks the head's own restore retakes, single chunks (its
     /// unpark need, `RunNeed([(1, own.len())])`): those free it takes first.
     own: Vec<u32>,
-    /// The store refuses a restore the planner's map stands (the placement
-    /// and the takes differ).
-    store_refuses: bool,
 }
 
 /// Rebuilds `snap` as a pool and a planner and runs the planner's passes to
@@ -10444,7 +10314,6 @@ async fn replay(snap: &StallSnapshot) -> Result<(), String> {
     pool.disk_free.store(snap.disk_free, Ordering::Relaxed);
     pool.sweeps_shared.store(snap.sweeps_shared, Ordering::Relaxed);
     pool.own.lock().extend(snap.own.iter().copied());
-    pool.store_refuses.store(snap.store_refuses, Ordering::Relaxed);
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
     let pids: Vec<ProcessId> = snap.procs.iter().map(|_| ProcessId::new_v4()).collect();
     for &pid in &pids {
@@ -10481,7 +10350,6 @@ async fn replay(snap: &StallSnapshot) -> Result<(), String> {
                 proc.bind_room = proc.roles_short;
                 proc.roles_short_free = snap_proc.refused_free;
                 proc.roles_short_quiet = snap_proc.quiet;
-                proc.rebind_waiting = snap_proc.rebind_waiting.map(str::to_owned);
                 snap_proc.queued.map(|wait| {
                     inner.enqueue(
                         pid,
@@ -10556,7 +10424,6 @@ fn stall_d41e15f24() -> StallSnapshot {
         head: 0,
         sweeps_shared: true,
         own: (5..17).chain([4]).collect(),
-        store_refuses: false,
     }
 }
 
@@ -10608,7 +10475,6 @@ fn stall_c201812ea() -> StallSnapshot {
         head: 1,
         sweeps_shared: true,
         own: Vec::new(),
-        store_refuses: false,
     }
 }
 
@@ -10782,7 +10648,6 @@ fn stall_macpro_c2018_g2(quiet: bool) -> StallSnapshot {
         head: 0,
         sweeps_shared: true,
         own: vec![0, 1, 2, 3],
-        store_refuses: false,
     }
 }
 
@@ -10832,7 +10697,6 @@ fn stall_macpro_c2018_mx(quiet: bool) -> StallSnapshot {
         head: 0,
         sweeps_shared: true,
         own: vec![4, 5, 8, 9],
-        store_refuses: false,
     }
 }
 
@@ -10920,7 +10784,6 @@ fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
         head: 0,
         sweeps_shared: true,
         own: Vec::new(),
-        store_refuses: false,
     }
 }
 
@@ -10928,50 +10791,4 @@ fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
 async fn replay_bd4f4ffe7_quiet_refusal_standing_in_its_placement() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     replay(&stall_bd4f4ffe7_quiet_mismatch()).await.unwrap();
-}
-
-/// The L40S at 3 GiB disk-only on bd4f4ffe7 under CUDA_LAUNCH_BLOCKING=1
-/// (serve-B4_3b-1): a restore head refused PendingBindShort (five single
-/// chunks beside its own one) needing six singles with eight free and
-/// need_moves 0, the policy asked, while another process waits restoring on
-/// an instance rebind (InstanceId(19541)): nothing in flight.
-fn stall_bd4f4ffe7_rebind_waiting() -> StallSnapshot {
-    StallSnapshot {
-        name: "bd4f4ffe7 serve-B4_3b-1",
-        chunks: 22,
-        free: vec![2, 3, 5, 9, 11, 14, 18, 20],
-        headroom: Some(8),
-        host: 0,
-        disk_free: 4014,
-        procs: vec![
-            SnapProc {
-                refused: Some((1, 6)),
-                refused_free: Some(8),
-                ..SnapProc::evicted_restore()
-            },
-            SnapProc {
-                state: Residency::Restoring,
-                rebind_waiting: Some("InstanceId(19541)"),
-                ..SnapProc::resident()
-            },
-        ],
-        held: Vec::new(),
-        head: 0,
-        sweeps_shared: true,
-        own: vec![2],
-        store_refuses: true,
-    }
-}
-
-// Ignored: it models the store refusing for good what the map stands
-// (`store_refuses`), which the fake pool cannot lift; in the real store the
-// refusal was the pending-bind count leaving out the restore's own
-// reservation, which `Roles::place_claimed` removes (tested in
-// `a_restore_whose_bind_runs_are_held_for_it_finds_them`). The head is
-// sent once on the room; the fake refuses again. Kept for the simulation.
-#[tokio::test(flavor = "current_thread")]
-#[ignore]
-async fn replay_bd4f4ffe7_head_beside_a_rebind_waiting_restore() {
-    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_bd4f4ffe7_rebind_waiting()).await.unwrap();
 }
