@@ -23,6 +23,31 @@ pub use conv1d::{
     short_conv_chunked,
 };
 pub use dyn_conv::dyn_conv;
+
+/// The kernel of a beam group's fold (`BEAM-PAGE-LISTS.md` §11.3) by the step it folds
+/// for: launched eagerly ahead of a fire's body, so no arming fire reaches
+/// it, and a load makes its kernel beforehand ([`FoldKernel::load`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldKernel {
+    Conv1d,
+    GatedDelta,
+    Mamba2,
+    Kda { head_dim: u32 },
+}
+
+impl FoldKernel {
+    /// Compiles (or reads from the disk cache) and loads this fold's kernel
+    /// on the current device, so that no serving fire does.
+    pub fn load(self) -> Result<(), Error> {
+        match self {
+            FoldKernel::Conv1d => conv1d::fold_kernel(),
+            FoldKernel::GatedDelta => gdn_recurrent::fold_kernel(),
+            FoldKernel::Mamba2 => mamba2::fold_kernel(),
+            FoldKernel::Kda { head_dim } => kda::fold_kernel(head_dim),
+        }
+        .load()
+    }
+}
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_gates;
 pub use gdn_recurrent::{

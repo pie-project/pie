@@ -451,7 +451,7 @@ pub fn gated_delta_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_fold"))
+        Fire::at(fold_kernel())
             .apply(Launch::grid([v_heads, 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
@@ -474,4 +474,9 @@ pub fn gated_delta_fold(
 #[must_use]
 pub fn carry_split_bytes(sms: u32) -> u64 {
     u64::from(sms) * 8 * CARRY_SPLIT_BYTES_PER_BLOCK
+}
+
+/// The gated delta's group fold kernel ([`gdn_fold`]).
+pub(super) fn fold_kernel() -> &'static crate::jit::Kernel {
+    kernel(GDN_RECURRENT, "::pie::ssm::gdn_fold")
 }

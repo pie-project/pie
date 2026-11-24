@@ -148,6 +148,7 @@ pub fn load(
         world: crate::World::default(),
         expert: crate::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .map_err(|e| e.to_string())?;
     Ok((shell, trace))

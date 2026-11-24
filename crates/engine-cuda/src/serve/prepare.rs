@@ -774,17 +774,7 @@ impl Shell {
                 ),
             })
             .collect();
-        // A buffering fire, or one of a drafter's class, pads to a bucket the
-        // lattice records it at (`Shell::rs_rungs`).
-        let buffering = lanes.iter().any(|seated| {
-            matches!(seated.rs, RsVerb::Buffer { .. }) || self.drafts_only(seated.lane.word)
-        });
-        let at = self.forced_bucket.take().or_else(|| {
-            let rows: u32 = lane_rows.iter().sum();
-            buffering
-                .then(|| self.rs_rungs().into_iter().find(|&bucket| bucket >= rows))
-                .flatten()
-        });
+        let at = self.forced_bucket.take();
         let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
         let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut readout_first = vec![0u32; lanes.len()];

@@ -69,17 +69,23 @@ struct SyntheticMedia {
 /// A synthetic lane's class and row count.
 type LaneRows = (usize, u32);
 /// What a body is armed for beyond its composition: how its lanes treat
-/// their recurrent rows. (A lane's attention mask, a group's too, is data
-/// one body reads: no treatment.)
+/// their recurrent rows (a lane's attention mask, a group's too, is data
+/// one body reads: no treatment), and the stated step shape it records (its
+/// index in `Shell::steps`, the set's order: what the allowance keeps by).
 #[derive(Debug, Clone, Copy)]
 struct Treatment {
     rs: record::RsBody,
+    shape: usize,
 }
+
+/// Where the allowance ranks a composition (`Shell::rule_rank`), the least
+/// kept first.
+type Rank = (usize, u32, core::cmp::Reverse<Option<u64>>, core::cmp::Reverse<usize>, u8);
 
 /// A composition captured during arming and held: its rank by the user's
 /// rule, its key, where it came from, and what it weighed.
 struct Held {
-    rank: (u32, core::cmp::Reverse<Option<u64>>, core::cmp::Reverse<usize>, u8),
+    rank: Rank,
     key: record::BodyKey,
     bucket: u32,
     target: BodySynth,
@@ -91,6 +97,9 @@ struct Held {
 /// A lattice being armed: the targets left, and what arming has counted.
 pub(super) struct Arming {
     targets: std::collections::VecDeque<(u32, BodySynth, Treatment)>,
+    /// Every target the walk began with, for what it recorded of each
+    /// stated step (`Shell::walked`).
+    planned: Vec<(u32, BodySynth, Treatment)>,
     top: Option<u32>,
     unfireable: Vec<String>,
     verify: bool,
@@ -264,23 +273,18 @@ impl core::fmt::Display for Kind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LatticePoint {
-    pub bucket: u32,
-    pub lanes: u32,
-}
-
 struct Deployment {
-    points: Vec<LatticePoint>,
-    buckets: Vec<u32>,
+    /// The most lanes a decode step at any bucket carries.
+    ceiling: u32,
+    /// The widest bucket a step of decoding lanes alone composes at: its
+    /// lanes' rows padded.
+    decode_top: u32,
     patch_points: Vec<u32>,
     decoders: Vec<usize>,
     prefilling: Vec<usize>,
     /// The classes keyed only for a speculative decoder's fires (plain but
     /// for reading the drafts): armed alone, never beside another class.
     drafting: Vec<usize>,
-    /// The buckets a drafter's class is armed at (`Shell::rs_rungs`).
-    rs_rungs: Vec<u32>,
     media: Vec<usize>,
     wide: Vec<usize>,
     decoding: poem_ir::ClassSet,
@@ -312,35 +316,64 @@ fn unfireable_line(deployment: &Deployment, what: &str, at: &str, note: Option<&
     )
 }
 
-fn decode_keys(deployment: &Deployment, into: &mut Targets) {
-    for LatticePoint { bucket, lanes } in deployment.points.iter().copied() {
-        for class in deployment.decoders.iter().copied() {
-            into.targets
-                .push((bucket, BodySynth::Decode { lanes, class }));
+fn decode_keys(deployment: &Deployment, bucket: u32, into: &mut Targets) {
+    if bucket > deployment.decode_top {
+        return;
+    }
+    let lanes = bucket.min(deployment.ceiling);
+    for class in deployment.decoders.iter().copied() {
+        into.targets.push((bucket, BodySynth::Decode { lanes, class }));
+    }
+}
+
+fn prefill_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
+    for class in deployment.prefilling.iter().copied() {
+        match Shell::spread(
+            point,
+            deployment.seats.min(match deployment.prefill_lanes {
+                0 => deployment.max_lanes,
+                cap => deployment.max_lanes.min(cap),
+            }),
+            deployment.context,
+        ) {
+            Some(rows) => into
+                .targets
+                .push((point, BodySynth::Prefill { class, rows })),
+            None => into.unfireable.push(unfireable_line(
+                deployment,
+                &format!("prefill c{class}"),
+                &format!("bucket {point}"),
+                None,
+            )),
         }
     }
 }
 
-fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
-    for point in deployment.buckets.iter().copied() {
-        for class in deployment.prefilling.iter().copied() {
-            if deployment.drafting.contains(&class) && !deployment.rs_rungs.contains(&point) {
-                continue;
-            }
-            match Shell::spread(
-                point,
-                deployment.seats.min(match deployment.prefill_lanes {
-                    0 => deployment.max_lanes,
-                    cap => deployment.max_lanes.min(cap),
-                }),
-                deployment.context,
-            ) {
-                Some(rows) => into
-                    .targets
-                    .push((point, BodySynth::Prefill { class, rows })),
+fn mixed_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
+    let alone = |class: &usize| !deployment.drafting.contains(class);
+    for decode in deployment.decoders.iter().copied().filter(alone) {
+        for class in deployment.prefilling.iter().copied().filter(alone) {
+            let rows = (point >= 2 && deployment.seats >= 2)
+                .then(|| {
+                    Shell::spread(
+                        point - 1,
+                        (deployment.seats - 1).min(deployment.max_lanes.saturating_sub(1)),
+                        deployment.context,
+                    )
+                })
+                .flatten();
+            match rows {
+                Some(rows) => into.targets.push((
+                    point,
+                    BodySynth::Mixed {
+                        decode,
+                        class,
+                        rows,
+                    },
+                )),
                 None => into.unfireable.push(unfireable_line(
                     deployment,
-                    &format!("prefill c{class}"),
+                    &format!("mixed c{decode}+c{class}"),
                     &format!("bucket {point}"),
                     None,
                 )),
@@ -349,129 +382,97 @@ fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
     }
 }
 
-fn mixed_keys(deployment: &Deployment, into: &mut Targets) {
-    let alone = |class: &usize| !deployment.drafting.contains(class);
-    for point in deployment.buckets.iter().copied() {
-        for decode in deployment.decoders.iter().copied().filter(alone) {
-            for class in deployment.prefilling.iter().copied().filter(alone) {
-                let rows = (point >= 2 && deployment.seats >= 2)
-                    .then(|| {
-                        Shell::spread(
-                            point - 1,
-                            (deployment.seats - 1).min(deployment.max_lanes.saturating_sub(1)),
-                            deployment.context,
-                        )
-                    })
-                    .flatten();
-                match rows {
-                    Some(rows) => into.targets.push((
-                        point,
-                        BodySynth::Mixed {
-                            decode,
-                            class,
-                            rows,
-                        },
-                    )),
-                    None => into.unfireable.push(unfireable_line(
-                        deployment,
-                        &format!("mixed c{decode}+c{class}"),
-                        &format!("bucket {point}"),
-                        None,
-                    )),
-                }
-            }
-        }
-    }
-}
-
-fn tower_keys(deployment: &Deployment, into: &mut Targets) {
+fn tower_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
     for patches in deployment.patch_points.iter().copied() {
         for class in deployment.media.iter().copied() {
-            for point in deployment.buckets.iter().copied() {
-                let fold = deployment.patch_fold.max(1);
-                let owed = patches.div_ceil(fold).max(1);
-                if owed > point || point > deployment.context || deployment.seats == 0 {
-                    into.unfireable.push(unfireable_line(
-                        deployment,
-                        &format!("tower c{class}"),
-                        &format!("bucket {point} + patch rung {patches}"),
-                        Some(&format!("{owed} placeholder row(s) owed")),
-                    ));
-                    continue;
-                }
-                into.targets.push((
-                    point,
-                    BodySynth::Tower {
-                        class,
-                        rows: point,
-                        images: 1,
-                        patches,
-                    },
+            let fold = deployment.patch_fold.max(1);
+            let owed = patches.div_ceil(fold).max(1);
+            if owed > point || point > deployment.context || deployment.seats == 0 {
+                into.unfireable.push(unfireable_line(
+                    deployment,
+                    &format!("tower c{class}"),
+                    &format!("bucket {point} + patch rung {patches}"),
+                    Some(&format!("{owed} placeholder row(s) owed")),
                 ));
+                continue;
             }
+            into.targets.push((
+                point,
+                BodySynth::Tower {
+                    class,
+                    rows: point,
+                    images: 1,
+                    patches,
+                },
+            ));
         }
     }
 }
 
-fn wide_keys(deployment: &Deployment, into: &mut Targets) {
-    for point in deployment.buckets.iter().copied() {
-        let seats = deployment.seats.min(deployment.max_lanes).min(point) as usize;
-        let decoders: Vec<usize> = deployment
-            .wide
-            .iter()
-            .copied()
-            .filter(|class| !deployment.drafting.contains(class))
-            .filter(|class| deployment.decoding.contains(*class))
-            .take(seats)
-            .collect();
-        let prefilling: Vec<usize> = deployment
-            .wide
-            .iter()
-            .copied()
-            .filter(|class| !deployment.drafting.contains(class))
-            .filter(|class| !deployment.decoding.contains(*class))
-            .take(seats.saturating_sub(decoders.len()))
-            .collect();
-        let rows_left = point - decoders.len() as u32;
-        let spread = if prefilling.is_empty() {
-            Some(Vec::new())
-        } else {
-            Shell::spread(rows_left, prefilling.len() as u32, deployment.context)
-        };
-        match spread {
-            Some(rows) if decoders.len() + prefilling.len() > 1 => {
-                let mut lanes: Vec<(usize, u32)> =
-                    decoders.iter().map(|class| (*class, 1u32)).collect();
-                lanes.extend(
-                    prefilling
-                        .iter()
-                        .zip(rows)
-                        .map(|(class, rows)| (*class, rows)),
-                );
-                into.targets.push((point, BodySynth::Wide { lanes }));
-            }
-            _ => into.unfireable.push(unfireable_line(
-                deployment,
-                "wide",
-                &format!("bucket {point}"),
-                None,
-            )),
+fn wide_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
+    let seats = deployment.seats.min(deployment.max_lanes).min(point) as usize;
+    let decoders: Vec<usize> = deployment
+        .wide
+        .iter()
+        .copied()
+        .filter(|class| !deployment.drafting.contains(class))
+        .filter(|class| deployment.decoding.contains(*class))
+        .take(seats)
+        .collect();
+    let prefilling: Vec<usize> = deployment
+        .wide
+        .iter()
+        .copied()
+        .filter(|class| !deployment.drafting.contains(class))
+        .filter(|class| !deployment.decoding.contains(*class))
+        .take(seats.saturating_sub(decoders.len()))
+        .collect();
+    let rows_left = point - decoders.len() as u32;
+    let spread = if prefilling.is_empty() {
+        Some(Vec::new())
+    } else {
+        Shell::spread(rows_left, prefilling.len() as u32, deployment.context)
+    };
+    match spread {
+        Some(rows) if decoders.len() + prefilling.len() > 1 => {
+            let mut lanes: Vec<(usize, u32)> =
+                decoders.iter().map(|class| (*class, 1u32)).collect();
+            lanes.extend(
+                prefilling
+                    .iter()
+                    .zip(rows)
+                    .map(|(class, rows)| (*class, rows)),
+            );
+            into.targets.push((point, BodySynth::Wide { lanes }));
         }
+        _ => into.unfireable.push(unfireable_line(
+            deployment,
+            "wide",
+            &format!("bucket {point}"),
+            None,
+        )),
     }
 }
 
 /// An expert-parallel rank idles through its peers' steps at every bucket
 /// (`Shell::fire_idle`): armed like any composition, an idle step replays
 /// what a busy one's peers replay, and never walks eagerly beside them.
-fn idle_keys(deployment: &Deployment, into: &mut Targets) {
+fn idle_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
     if deployment.idle {
-        for point in deployment.buckets.iter().copied() {
-            into.targets.push((point, BodySynth::Idle));
-        }
+        into.targets.push((point, BodySynth::Idle));
     }
 }
 
-const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] = [
+/// The compositions a step at a bucket is recorded by: the engine's classes
+/// crossed with it, whatever the stated step's kind. A body's key is its
+/// bucket, the classes its lanes are of and their treatment
+/// (`record::BodyKey`), never how many rows a lane takes, so a step of any
+/// kind keys one of these: each decoding class's lanes alone, each
+/// prompting class's (a one-row piece of a prompt among them; an image's
+/// tower too), a decoding class's beside a prompting class's, and every
+/// class at once (a wide composition). An expert-parallel rank's idle step
+/// rides each bucket.
+const ARMS: [fn(&Deployment, u32, &mut Targets); Kind::COUNT] = [
     decode_keys,
     prefill_keys,
     mixed_keys,
@@ -1168,6 +1169,13 @@ impl Shell {
     }
 
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
+        // A beam group's folds launch ahead of a fire's body, eagerly, and
+        // no arming fire carries one: their kernels are made here.
+        if self.buffers.is_some() {
+            for fold in crate::dispatch::ssm::group_folds(&self.trace) {
+                fold.load().map_err(|error| Fault::from(crate::error::kernel(error)))?;
+            }
+        }
         let armed = self.arm_lattice(false);
         self.pools.forget_weight_uses(self.device.stream())?;
         armed
@@ -1199,39 +1207,19 @@ impl Shell {
 
     /// Every composition the lattice arms, in arming's order (the top
     /// bucket's first, then by kind and bucket), each with its recurrent
-    /// rows' treatment; `None` where there is nothing to arm.
+    /// rows' treatment and the stated step it records; `None` where there
+    /// is nothing to arm.
+    ///
+    /// The compositions are the load's stated step set's (`Shell::steps`,
+    /// CONTRACT-BC 24), walked in its order: each shape at each bucket its
+    /// rows pad to, by the engine's classes crossed with it ([`ARMS`]),
+    /// recorded for its treatment ([`Shell::rs_bodies`]). A bucket an
+    /// earlier shape of the same treatment walked is not walked again.
     fn lattice_targets(&self) -> Option<LatticeTargets> {
         let ceiling = self.lane_ceiling();
         if ceiling == 0 {
             return None;
         }
-        let points: Vec<LatticePoint> = if self.budget.buckets.is_empty() {
-            (1..=ceiling)
-                .map(|n| LatticePoint {
-                    bucket: n,
-                    lanes: n,
-                })
-                .collect()
-        } else {
-            let mut points = Vec::new();
-            for point in self.budget.buckets.iter().copied() {
-                if point <= ceiling {
-                    points.push(LatticePoint {
-                        bucket: point,
-                        lanes: point,
-                    });
-                } else {
-                    if ceiling > points.last().map_or(0, |point| point.bucket) {
-                        points.push(LatticePoint {
-                            bucket: point,
-                            lanes: ceiling,
-                        });
-                    }
-                    break;
-                }
-            }
-            points
-        };
         let seats = self.held.len() as u32;
         let context = if self.page_tables == 0 {
             self.budget.max_tokens
@@ -1251,8 +1239,8 @@ impl Shell {
             _ => Vec::new(),
         };
         let deployment = Deployment {
-            points,
-            buckets: self.budget.buckets.clone(),
+            ceiling,
+            decode_top: self.bucket_for(ceiling).unwrap_or(ceiling),
             patch_points,
             decoders: self
                 .decoding
@@ -1284,7 +1272,6 @@ impl Shell {
             drafting: (0..classes)
                 .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
                 .collect(),
-            rs_rungs: self.rs_rungs(),
             decoding: self.decoding.clone(),
             seats,
             context,
@@ -1293,23 +1280,39 @@ impl Shell {
             patch_fold: self.patch_fold,
             idle: self.ep.is_some(),
         };
-        let mut found = Targets::default();
-        for enumerate in ARMS {
-            enumerate(&deployment, &mut found);
+        let mut walked = std::collections::HashSet::new();
+        let mut targets: Vec<(u32, BodySynth, Treatment)> = Vec::new();
+        let mut unfireable = Vec::new();
+        for (at, shape) in self.steps.shapes.iter().enumerate() {
+            for bucket in self.buckets_of(shape) {
+                if !walked.insert((shape.treatment, bucket)) {
+                    continue;
+                }
+                let mut found = Targets::default();
+                for enumerate in ARMS {
+                    enumerate(&deployment, bucket, &mut found);
+                }
+                unfireable.extend(found.unfireable);
+                for (bucket, target) in found.targets {
+                    for rs in self.rs_bodies(&target, shape.treatment) {
+                        targets.push((bucket, target.clone(), Treatment { rs, shape: at }));
+                    }
+                }
+            }
         }
-        let Targets {
-            mut targets,
-            unfireable,
-        } = found;
-        let top = targets.iter().map(|(bucket, _)| *bucket).max();
+        unfireable.sort();
+        unfireable.dedup();
+        let top = targets.iter().map(|(bucket, ..)| *bucket).max();
         // Captured in this order (the top bucket's compositions first, then
-        // by kind and bucket): the order bodies are captured in leaves
-        // process-wide state behind that every later graph's kernel-to-kernel
-        // transitions pay for (an L40S decode at one lane ran 3.4% slower
-        // after a capture across kinds by rows), so it is kept apart from
-        // which compositions the allowance keeps: that is the user's rule
-        // (`Shell::rule_rank`), applied by giving back the worst-ranked
-        // capture whenever the bodies pass their allowance (`arm_target`).
+        // by kind and bucket; a bucket's folding body before those that
+        // buffer, as the set orders them): the order bodies are captured in
+        // leaves process-wide state behind that every later graph's
+        // kernel-to-kernel transitions pay for (an L40S decode at one lane
+        // ran 3.4% slower after a capture across kinds by rows), so it is
+        // kept apart from which compositions the allowance keeps: that is
+        // the set's order (`Shell::rule_rank`), applied by giving back the
+        // worst-ranked capture whenever the bodies pass their allowance
+        // (`arm_target`).
         let rank = |kind: Kind| match kind {
             Kind::Decode => 0u8,
             Kind::Mixed => 1,
@@ -1318,61 +1321,12 @@ impl Shell {
             Kind::Tower => 4,
             Kind::Idle => 5,
         };
-        targets
-            .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
+        targets.sort_by_key(|(bucket, target, _)| {
+            (Some(*bucket) != top, rank(target.kind()), *bucket)
+        });
         if targets.is_empty() {
             return None;
         }
-        // A load that buffers recurrent rows serves a spec-decoding fire
-        // from a body too: each one-class composition (a verify's lanes, the
-        // prompts beside them) at the rs rungs is recorded once more for
-        // lanes that buffer rows, and, a class that is not decoding's, once
-        // more for lanes that replay them (`record::RsBody`), right after its
-        // folding body. Every class takes
-        // them, not only a drafter's: a guest that drafts for itself (MTP,
-        // with no drafts output the load can see) verifies on the plain
-        // classes, and it registers after the load arms.
-        let buffering = self.buffers.is_some();
-        let splits = self
-            .buffers
-            .as_ref()
-            .is_some_and(|buffers| buffers.split_room() != 0);
-        let rungs = self.rs_rungs();
-        let targets: Vec<(u32, BodySynth, Treatment)> = targets
-            .into_iter()
-            .flat_map(|(bucket, target)| {
-                let class = match &target {
-                    BodySynth::Decode { class, .. } | BodySynth::Prefill { class, .. } => {
-                        Some(*class)
-                    }
-                    _ => None,
-                };
-                let buffers = buffering && rungs.contains(&bucket) && class.is_some();
-                // A decoding class replays its carried rows in the body that
-                // buffers (`dispatch::ssm`): it records no replaying body.
-                let decodes = class.is_some_and(|class| self.decoding.contains(class as usize));
-                // One that can split a long carry records the splitting
-                // body too: a beam lane's carry runs past a chunk.
-                let treatments: &[record::RsBody] = match (buffers, decodes) {
-                    (true, true) if splits => &[
-                        record::RsBody::Folds,
-                        record::RsBody::Buffers,
-                        record::RsBody::Splits,
-                    ],
-                    (true, true) => &[record::RsBody::Folds, record::RsBody::Buffers],
-                    (true, false) => &[
-                        record::RsBody::Folds,
-                        record::RsBody::Buffers,
-                        record::RsBody::Replays,
-                    ],
-                    (false, _) => &[record::RsBody::Folds],
-                };
-                treatments
-                    .iter()
-                    .map(move |&rs| (bucket, target.clone(), Treatment { rs }))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
         Some(LatticeTargets {
             targets,
             top,
@@ -1380,64 +1334,131 @@ impl Shell {
         })
     }
 
-    /// The shapes of the load's stated step set (`engine::StepShapes`) the
-    /// lattice walk records no body for, each named with the buckets it
-    /// leaves unwalked: for every shape, each bucket its rows pad to needs a
-    /// target of its kind (a wide target counted by its lanes' rows) and
-    /// treatment (folds, or any treatment that buffers). The interim stub
-    /// of CONTRACT-BC 24: the walk does not take its targets from the set
-    /// yet, so a gap here is a composition serving would fire eager.
-    pub(crate) fn walk_gaps(&self, shapes: &engine::StepShapes) -> Vec<String> {
-        use engine::{StepKind, Treatment as Rs};
-        let Some(lattice) = self.lattice_targets() else {
-            return shapes
-                .shapes
-                .iter()
-                .map(|shape| format!("{shape}: the load walks no lattice"))
-                .collect();
-        };
-        let kind_of = |target: &BodySynth| match target {
-            BodySynth::Decode { .. } => Some(StepKind::Decode),
-            BodySynth::Prefill { .. } => Some(StepKind::Prefill),
-            BodySynth::Mixed { .. } => Some(StepKind::Mixed),
-            BodySynth::Wide { lanes } => {
-                let decodes = lanes.iter().any(|&(_, rows)| rows <= 1);
-                let prompts = lanes.iter().any(|&(_, rows)| rows > 1);
-                Some(match (decodes, prompts) {
-                    (true, true) => StepKind::Mixed,
-                    (false, true) => StepKind::Prefill,
-                    _ => StepKind::Decode,
-                })
-            }
-            BodySynth::Tower { .. } | BodySynth::Idle => None,
-        };
-        let walked: std::collections::HashSet<(StepKind, bool, u32)> = lattice
-            .targets
-            .iter()
-            .filter_map(|(bucket, target, treatment)| {
-                Some((kind_of(target)?, treatment.rs.buffers(), *bucket))
-            })
-            .collect();
+    /// The buckets a stated shape's steps compose at: each its rows pad to
+    /// (`Shell::bucket_for`), its rows themselves on a load with no buckets.
+    fn buckets_of(&self, shape: &engine::StepShape) -> Vec<u32> {
         let buckets = &self.budget.buckets;
-        let padded = |rows: u32| self.bucket_for(rows).unwrap_or_else(|| buckets.last().copied().unwrap_or(rows));
-        shapes
-            .shapes
+        if buckets.is_empty() {
+            return (shape.rows.lo..=shape.rows.hi).collect();
+        }
+        let top = buckets.last().copied().unwrap_or(shape.rows.hi);
+        let padded = |rows: u32| self.bucket_for(rows).unwrap_or(top);
+        let (from, to) = (padded(shape.rows.lo), padded(shape.rows.hi));
+        buckets
             .iter()
-            .filter_map(|shape| {
-                let buffers = shape.treatment == Rs::Buffers;
-                let (from, to) = (padded(shape.rows.lo), padded(shape.rows.hi));
-                let needed: Vec<u32> = if buckets.is_empty() {
-                    (from..=to).collect()
-                } else {
-                    buckets.iter().copied().filter(|&b| from <= b && b <= to).collect()
-                };
-                let missing: Vec<u32> = needed
-                    .into_iter()
-                    .filter(|&bucket| !walked.contains(&(shape.kind, buffers, bucket)))
-                    .collect();
-                (!missing.is_empty()).then(|| format!("[{shape}] buckets {missing:?} unwalked"))
-            })
+            .copied()
+            .filter(|&bucket| from <= bucket && bucket <= to)
             .collect()
+    }
+
+    /// The bodies a composition is recorded as for a step of `treatment`
+    /// (`record::RsBody`, the key a serving fire's lanes pick): a folding
+    /// step's one; a buffering step's, one where its lanes buffer rows, one
+    /// more where a decoding lane's carry may run past a chunk (a beam
+    /// lane's: split over the device's spare blocks), and one more where a
+    /// prompting lane may replay buffered rows ahead of its own (a decoding
+    /// lane replays its carried rows in its decode step's own kernels,
+    /// `dispatch::ssm`). A tower's and an idle step's buffer none.
+    fn rs_bodies(&self, target: &BodySynth, treatment: engine::Treatment) -> Vec<record::RsBody> {
+        if treatment == engine::Treatment::Folds {
+            return vec![record::RsBody::Folds];
+        }
+        if matches!(target, BodySynth::Tower { .. } | BodySynth::Idle) {
+            return Vec::new();
+        }
+        let (lanes, _) = target.lanes();
+        let decodes = lanes
+            .iter()
+            .any(|&(class, _)| self.decoding.contains(class));
+        let prompts = lanes
+            .iter()
+            .any(|&(class, _)| !self.decoding.contains(class));
+        let splits = self
+            .buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.split_room() != 0);
+        let mut bodies = vec![record::RsBody::Buffers];
+        if decodes && splits {
+            bodies.push(record::RsBody::Splits);
+        }
+        if prompts {
+            bodies.push(record::RsBody::Replays);
+        }
+        bodies
+    }
+
+    /// The step compositions this load's builder forms (CONTRACT-BC 24),
+    /// over `rules` and the load's facts as they stand before arming: what
+    /// the arm walk takes its targets from. The rungs are the arena's
+    /// (every one a fire can carve, up to one fire's tokens).
+    pub(crate) fn walk_steps(&mut self, rules: &engine::StepRules) {
+        let max_tokens = self.budget.max_tokens;
+        let mut rungs: Vec<u32> = self
+            .arena
+            .rungs(self.compiled.arena_forked.as_ref())
+            .into_iter()
+            .map(|(tokens, _)| tokens)
+            .filter(|&tokens| tokens < max_tokens)
+            .collect();
+        rungs.push(max_tokens);
+        let state_rows = self
+            .trace
+            .caches
+            .iter()
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+        let facts = engine::StepFacts {
+            rungs,
+            max_lanes: self.fire_lanes(),
+            max_tokens,
+            max_readouts: crate::api::readout_facts().fire_rows(
+                u32::try_from(poem_compiler::arena::readouts_ceiling(&self.budget))
+                    .unwrap_or(u32::MAX),
+            ),
+            buffers: self.buffers.is_some(),
+            attachments: engine::Attachments::served(
+                true,
+                !self.inputs().is_empty(),
+                state_rows && self.lands_snapshots(),
+            ),
+        };
+        self.steps = engine::StepShapes::of(rules, &facts);
+    }
+
+    /// The set the arm walk takes its targets from ([`Shell::walk_steps`]).
+    pub(crate) fn steps(&self) -> &engine::StepShapes {
+        &self.steps
+    }
+
+    /// The set the load states (`shapes`, from its stated facts) with
+    /// those of it its arm walk left eager: each whose steps compose at a
+    /// bucket where the last whole arming recorded no body of its treatment
+    /// for some composition it walked, or walked none. Each is named.
+    pub(crate) fn stated_steps(&self, shapes: engine::StepShapes) -> engine::StatedSteps {
+        let mut eager = Vec::new();
+        if self.arm_deferred {
+            eprintln!(
+                "engine-cuda: the arm walk runs at the starting weight residency: what it \
+                 leaves eager is named then"
+            );
+            return engine::StatedSteps { shapes, eager };
+        }
+        for (at, shape) in shapes.shapes.iter().enumerate() {
+            let missing: Vec<u32> = self
+                .buckets_of(shape)
+                .into_iter()
+                .filter(|&bucket| {
+                    self.walked.get(&(shape.treatment, bucket)) != Some(&true)
+                })
+                .collect();
+            if !missing.is_empty() {
+                eprintln!(
+                    "engine-cuda: step shape {at} [{shape}] runs eager: no body recorded at \
+                     bucket(s) {missing:?}"
+                );
+                eager.push(u32::try_from(at).unwrap_or(u32::MAX));
+            }
+        }
+        engine::StatedSteps { shapes, eager }
     }
 
     /// The scratch slabs this load's fires take: each composition of the
@@ -1599,6 +1620,7 @@ impl Shell {
         // By rows, every kind's fewest first (`lattice_targets`): the
         // allowance running out leaves the largest rungs, stated eager.
         Some(Arming {
+            planned: targets.clone(),
             targets: targets.into(),
             top,
             unfireable,
@@ -1663,7 +1685,7 @@ impl Shell {
         // By the user's rule, best first: each priced by what it backs past
         // the compositions already selected.
         let mut order: Vec<usize> = (0..targets.len()).collect();
-        order.sort_by_key(|&at| self.rule_rank(targets[at].0, &targets[at].1));
+        order.sort_by_key(|&at| self.rule_rank(targets[at].0, &targets[at].1, targets[at].2));
         let mut selected = vec![false; targets.len()];
         let mut backed = 0u64;
         for at in order {
@@ -1727,16 +1749,13 @@ impl Shell {
     }
 
     /// Where the user's rule ranks a composition for the bodies' allowance,
-    /// the least kept first: by rows across every kind, the fewest first
-    /// (what goes eager is always the largest rungs); within one row count
-    /// the one that launches more kernels first (more launches, more an
-    /// eager fire of it costs), as the size-only walk counted them
+    /// the least kept first: by the stated step it records, in the set's
+    /// order (by rung across every kind, the smallest first, so what goes
+    /// eager is always the tail of the set); within one, by rows; within one
+    /// row count the one that launches more kernels first (more launches,
+    /// more an eager fire of it costs), as the size-only walk counted them
     /// (`walked_launches`), else by its classes; then by kind.
-    fn rule_rank(
-        &self,
-        bucket: u32,
-        target: &BodySynth,
-    ) -> (u32, core::cmp::Reverse<Option<u64>>, core::cmp::Reverse<usize>, u8) {
+    fn rule_rank(&self, bucket: u32, target: &BodySynth, treatment: Treatment) -> Rank {
         let (lanes, _) = target.lanes();
         let mut classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).collect();
         classes.sort_unstable();
@@ -1750,6 +1769,7 @@ impl Shell {
             Kind::Idle => 5,
         };
         (
+            treatment.shape,
             bucket,
             core::cmp::Reverse(self.walked_launches.get(&(bucket, target.to_string())).copied()),
             core::cmp::Reverse(classes.len()),
@@ -1779,7 +1799,7 @@ impl Shell {
         // the loop) and arming goes on: a composition later in capture order
         // may rank above what is held.
         if !st.verify && !st.group && self.ep.is_none() {
-            let rank = self.rule_rank(bucket, &target);
+            let rank = self.rule_rank(bucket, &target, treatment);
             loop {
                 // The room a capture has is the allowance net of what is
                 // held: a body given back frees its bytes for the next one.
@@ -1968,7 +1988,7 @@ impl Shell {
             st.tally[at].0 += 1;
             if let Some(key) = key.as_ref() {
                 st.held.push(Held {
-                    rank: self.rule_rank(bucket, &target),
+                    rank: self.rule_rank(bucket, &target, treatment),
                     key: key.clone(),
                     bucket,
                     target: target.clone(),
@@ -2139,6 +2159,24 @@ impl Shell {
 
     fn arm_end(&mut self, mut st: Arming) -> Result<()> {
         self.arm_rs = record::RsBody::Folds;
+        // What the walk recorded of each stated step, by treatment and
+        // bucket: every composition it walked there held.
+        if !st.verify && self.arm_only.is_none() {
+            let held: std::collections::HashSet<(u32, String, record::RsBody)> = st
+                .held
+                .iter()
+                .map(|held| (held.bucket, held.target.to_string(), held.treatment.rs))
+                .collect();
+            self.walked.clear();
+            for (bucket, target, treatment) in &st.planned {
+                let shape = &self.steps.shapes[treatment.shape];
+                let recorded = held.contains(&(*bucket, target.to_string(), treatment.rs));
+                *self
+                    .walked
+                    .entry((shape.treatment, *bucket))
+                    .or_insert(true) &= recorded;
+            }
+        }
         let stats = self.cache.body_stats();
         // An expert-parallel rank never captures past arming, whatever armed:
         // its peers fire other steps beside its, and an instantiation (a
