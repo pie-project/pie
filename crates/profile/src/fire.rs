@@ -110,6 +110,10 @@ pub struct Rates {
     /// only where the platform states such a bound (Android); not one of
     /// [`KEYS`], which the estimate weighs a fire by.
     pub submit_worst_ratio: Option<f64>,
+    /// How many programs a load reads from its disk cache at once behind
+    /// serving (XLA): the width past which the load rate stops rising,
+    /// measured where none is stated.
+    pub load_width: Option<u32>,
     /// The workgroups the device holds at once for a kernel's full rate,
     /// the whole device's, as its rates step measured them: one workgroup
     /// of a compute-bound kernel runs at `1 / S` of the kernel's full rate.
@@ -152,6 +156,10 @@ pub struct Rates {
     /// without walking a fire. A new model's settle joins the others, never
     /// replaces them. Measured; empty where none is stored.
     pub dense_settled: Vec<DenseSettled>,
+    /// How this machine lands a checkpoint's weights on the device
+    /// ([`LANDING`], [`Landing`]): its link's and its reader's rates, as a
+    /// load first measures them. Measured; not one of [`KEYS`].
+    pub landing: Option<Landing>,
     /// The device a user's file's measurements were taken on
     /// ([`MEASURED_ON`]): its vendor, device id and driver, as the backend
     /// states them ([`Now::on`]). A file measured on another device (or
@@ -391,7 +399,7 @@ pub const MEASURED_BY: &str = "measured_by";
 /// The rates a stored key covers ([`Rates::measured_by`]): every `[rates]`
 /// key of one value a load measures. The curves and the settle carry their
 /// own keys.
-pub const KEYED: [&str; 13] = [
+pub const KEYED: [&str; 15] = [
     "launch_ns",
     "gemm_tflops_by_rows",
     "attn_tflops_by_keys",
@@ -405,12 +413,77 @@ pub const KEYED: [&str; 13] = [
     RESIDENT_WORKGROUPS,
     ATTN_BY_ROWS_KEYS,
     "product_ns",
+    LANDING,
+    LOAD_WIDTH,
 ];
+
+/// The `[rates]` key of [`Rates::landing`]: `[copy_latency_ns, copy_gbps,
+/// copy_full_bytes, fill_gbps, read_spawn_ns, read_thread_gbps,
+/// read_whole_gbps]`.
+pub const LANDING: &str = "landing";
+
+/// How this machine lands weights ([`Rates::landing`]): a copy to the
+/// device's fixed cost, its rate, and the smallest copy that reaches it; the
+/// rate a pinned slot is filled at; one reading thread's spawn and join, one
+/// thread's read rate, and the most the threads read at together.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Landing {
+    pub copy_latency_ns: f64,
+    pub copy_gbps: f64,
+    pub copy_full_bytes: f64,
+    pub fill_gbps: f64,
+    pub read_spawn_ns: f64,
+    pub read_thread_gbps: f64,
+    pub read_whole_gbps: f64,
+}
+
+impl Landing {
+    /// The values in [`LANDING`]'s order.
+    #[must_use]
+    pub fn values(&self) -> [f64; 7] {
+        [
+            self.copy_latency_ns,
+            self.copy_gbps,
+            self.copy_full_bytes,
+            self.fill_gbps,
+            self.read_spawn_ns,
+            self.read_thread_gbps,
+            self.read_whole_gbps,
+        ]
+    }
+
+    /// The landing of `values` in [`LANDING`]'s order.
+    #[must_use]
+    pub fn of(values: [f64; 7]) -> Landing {
+        let [
+            copy_latency_ns,
+            copy_gbps,
+            copy_full_bytes,
+            fill_gbps,
+            read_spawn_ns,
+            read_thread_gbps,
+            read_whole_gbps,
+        ] = values;
+        Landing {
+            copy_latency_ns,
+            copy_gbps,
+            copy_full_bytes,
+            fill_gbps,
+            read_spawn_ns,
+            read_thread_gbps,
+            read_whole_gbps,
+        }
+    }
+}
 
 /// The `[rates]` key of [`Rates::submit_worst_ratio`]: what a load on a
 /// platform that states a bound on one submission measures beside the
 /// estimate's [`KEYS`].
 pub const SUBMIT_WORST_RATIO: &str = "submit_worst_ratio";
+
+/// The `[rates]` key of [`Rates::load_width`]: what an XLA load measures as
+/// it loads its cached programs behind serving.
+pub const LOAD_WIDTH: &str = "load_width";
 
 /// The `[rates]` key of [`Rates::attn_tflops_by_rows_keys`]: measured beside
 /// [`SUBMIT_WORST_RATIO`] where the platform states a submit bound.
@@ -435,6 +508,7 @@ impl Rates {
             few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
             workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
             submit_worst_ratio: self.submit_worst_ratio.or(below.submit_worst_ratio),
+            load_width: self.load_width.or(below.load_width),
             resident_workgroups: self.resident_workgroups.or(below.resident_workgroups),
             attn_tflops_by_rows_keys: self
                 .attn_tflops_by_rows_keys
@@ -472,6 +546,7 @@ impl Rates {
             },
             // Entry by entry, by its key: a load's settle joins the others
             // (another model's), its own replacing one of the same key.
+            landing: self.landing.or(below.landing),
             dense_settled: {
                 let mut all: Vec<DenseSettled> = below
                     .dense_settled
@@ -517,9 +592,11 @@ impl Rates {
             "few_row_tflops" => self.few_row_tflops.is_none(),
             "workgroups_per_core" => self.workgroups_per_core.is_none(),
             SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
+            LOAD_WIDTH => self.load_width.is_none(),
             RESIDENT_WORKGROUPS => self.resident_workgroups.is_none(),
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
             "product_ns" => self.product_ns.is_none(),
+            LANDING => self.landing.is_none(),
             KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
             DENSE_SETTLED => self.dense_settled.is_empty(),
             _ => true,
@@ -539,6 +616,7 @@ impl Rates {
             "few_row_tflops" => self.few_row_tflops = None,
             "workgroups_per_core" => self.workgroups_per_core = None,
             SUBMIT_WORST_RATIO => self.submit_worst_ratio = None,
+            LOAD_WIDTH => self.load_width = None,
             RESIDENT_WORKGROUPS => self.resident_workgroups = None,
             ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys = None,
             "product_ns" => self.product_ns = None,
@@ -546,6 +624,7 @@ impl Rates {
             DENSE_SETTLED => self.dense_settled = Vec::new(),
             MEASURED_ON => self.measured_on = None,
             MEASURED_BY => self.measured_by = None,
+            LANDING => self.landing = None,
             _ => {}
         }
         if let Some(by) = &mut self.measured_by {
@@ -756,6 +835,7 @@ impl Rates {
                 .workgroups_per_core
                 .filter(|_| has("workgroups_per_core")),
             submit_worst_ratio: self.submit_worst_ratio.filter(|_| has(SUBMIT_WORST_RATIO)),
+            load_width: self.load_width.filter(|_| has(LOAD_WIDTH)),
             resident_workgroups: self
                 .resident_workgroups
                 .filter(|_| has(RESIDENT_WORKGROUPS)),
@@ -768,6 +848,7 @@ impl Rates {
                 .kernel_tflops_by_shape
                 .clone()
                 .filter(|_| has(KERNEL_CURVES)),
+            landing: self.landing.filter(|_| has(LANDING)),
             dense_settled: if has(DENSE_SETTLED) {
                 self.dense_settled.clone()
             } else {
@@ -804,6 +885,9 @@ impl Rates {
         let mut out = String::from("[rates]\n");
         if let Some(v) = self.launch_ns {
             let _ = writeln!(out, "launch_ns = {v}");
+        }
+        if let Some(v) = self.load_width {
+            let _ = writeln!(out, "{LOAD_WIDTH} = {v}");
         }
         let keyed = |out: &mut String, key: &str, v: &Option<Vec<(u32, Vec<(u32, f64)>)>>| {
             if let Some(keyed) = v {
@@ -853,6 +937,10 @@ impl Rates {
                 })
                 .collect();
             let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
+        }
+        if let Some(landing) = &self.landing {
+            let values: Vec<String> = landing.values().iter().map(|v| format!("{v:?}")).collect();
+            let _ = writeln!(out, "{LANDING} = [{}]", values.join(", "));
         }
         keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
         if let Some(curves) = &self.kernel_tflops_by_shape {
@@ -1113,6 +1201,7 @@ mod tests {
     #[test]
     fn the_block_is_a_few_lines() {
         let rates = Rates {
+            landing: None,
             launch_ns: Some(904),
             gemm_tflops_by_rows: Some(vec![
                 (1024, vec![(256, 40.0), (8192, 150.0)]),
@@ -1126,6 +1215,7 @@ mod tests {
             few_row_tflops: Some(4.2),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
@@ -1618,6 +1708,7 @@ mod tests {
         let measured = Rates {
             launch_ns: Some(904),
             submit_worst_ratio: Some(1.83),
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: Some(vec![(512, vec![(1024, 0.35), (4096, 0.3)])]),
             ..Rates::default()

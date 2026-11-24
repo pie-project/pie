@@ -177,3 +177,40 @@ fn div_mod_and_sqrt_answer_the_reference_in_f32() {
         close(got[2][at], a.abs().sqrt(), "sqrt", at);
     }
 }
+
+/// A plane of more than 2^31 elements (2^21 + 2 rows of 1024 bf16, 4 GiB):
+/// the element count and every index past 2^31 are 64-bit, so an op lands
+/// the elements past it where they lie rather than wrapping or refusing.
+#[test]
+#[ignore = "lays a 4 GiB plane"]
+fn an_activation_lands_a_plane_past_two_to_the_31_elements() {
+    const WIDTH: usize = 1024;
+    const ROWS: usize = (1 << 21) + 2;
+    let n = ROWS * WIDTH;
+    assert!(n > 1 << 31);
+    let mut gpu = Gpu::open();
+    let at = gpu.zeros(n * 2);
+    // 0x3f3f (0.746...) over a span straddling element 2^31, and the plane's
+    // last 1024 elements.
+    let straddle = (1usize << 31) - 512;
+    gpu.fill(at + (straddle * 2) as u64, 0x3f, 1024 * 2);
+    gpu.fill(at + ((n - WIDTH) * 2) as u64, 0x3f, WIDTH * 2);
+    let ctx = gpu.ctx();
+    let plane = Tensor::new(at, ROWS as u32, WIDTH as u32, Dtype::Bf16);
+    let mut out = plane;
+    pointwise::tanh(&ctx, plane, &mut out).expect("fires");
+    gpu.sync();
+    let want = from_bf16(to_bf16(from_bf16(0x3f3f).tanh()));
+    for (from, what) in [(straddle, "about 2^31"), (n - WIDTH, "the last row")] {
+        let got: Vec<u16> = gpu.down(at + (from * 2) as u64, 1024);
+        for (i, &v) in got.iter().enumerate() {
+            close(from_bf16(v), want, what, from + i);
+        }
+    }
+    // Untouched zeros stay zero (tanh 0), so no index wrapped onto them.
+    let before: Vec<u16> = gpu.down(at + ((straddle - 1024) * 2) as u64, 1024);
+    assert!(
+        before.iter().all(|&v| v == 0),
+        "a zero before the straddle moved"
+    );
+}

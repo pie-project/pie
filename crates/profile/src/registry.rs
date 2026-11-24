@@ -1235,6 +1235,33 @@ impl<'a> Walk<'a> {
                     rates.product_ns = self.product_times(v);
                     return;
                 }
+                crate::fire::LANDING => {
+                    let values: Option<Vec<f64>> = match v.get_ref() {
+                        DeValue::Array(items) => items
+                            .iter()
+                            .map(|item| match item.get_ref() {
+                                DeValue::Float(f) => f.to_string().parse::<f64>().ok(),
+                                DeValue::Integer(i) => i.to_string().parse::<f64>().ok(),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => None,
+                    };
+                    match values
+                        .filter(|values| values.iter().all(|v| v.is_finite() && *v > 0.0))
+                        .and_then(|values| <[f64; 7]>::try_from(values).ok())
+                    {
+                        Some(values) => rates.landing = Some(crate::fire::Landing::of(values)),
+                        None => self.err(
+                            v.span().start,
+                            "`rates.landing` is a list of seven positive numbers: [copy_latency_ns, \
+                             copy_gbps, copy_full_bytes, fill_gbps, read_spawn_ns, read_thread_gbps, \
+                             read_whole_gbps]"
+                                .to_string(),
+                        ),
+                    }
+                    return;
+                }
                 crate::fire::KERNEL_CURVES => {
                     rates.kernel_tflops_by_shape = self.kernel_curves(v);
                     return;
@@ -1282,6 +1309,19 @@ impl<'a> Walk<'a> {
                 "workgroups_per_core" => &mut rates.workgroups_per_core,
                 crate::fire::SUBMIT_WORST_RATIO => &mut rates.submit_worst_ratio,
                 crate::fire::RESIDENT_WORKGROUPS => &mut rates.resident_workgroups,
+                crate::fire::LOAD_WIDTH => {
+                    match int(v.get_ref()).and_then(|i| u32::try_from(i).ok()).filter(|w| *w > 0) {
+                        Some(width) => rates.load_width = Some(width),
+                        None => self.err(
+                            v.span().start,
+                            format!(
+                                "`rates.load_width` is a whole number of loads, at least one, not {}",
+                                found(v.get_ref())
+                            ),
+                        ),
+                    }
+                    return;
+                }
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                         Some(ns) => rates.launch_ns = Some(ns),
@@ -1314,7 +1354,7 @@ impl<'a> Walk<'a> {
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `product_ns`, `submit_worst_ratio`, `attn_tflops_by_rows_keys`, \
-                             `resident_workgroups`, `kernel_tflops_by_shape_keyed`, \
+                             `resident_workgroups`, `load_width`, `kernel_tflops_by_shape_keyed`, \
                              `dense_settled_keyed`, `measured_on` and `measured_by`, not `{other}`"
                         ),
                     );

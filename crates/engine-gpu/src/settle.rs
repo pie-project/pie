@@ -81,12 +81,43 @@ impl Done {
     #[must_use]
     pub fn settled(&self) -> engine::StepOutcome {
         let outcome = engine::StepOutcome {
+            beam_common: Vec::new(),
             wrote: self.wrote.clone(),
             faulted: self.faulted.clone(),
         };
         match &self.fed {
-            Some(fed) => merged(outcome, fed.faults()),
+            Some(fed) => engine::StepOutcome {
+                beam_common: fed.commons(),
+                ..merged(outcome, fed.faults())
+            },
             None => outcome,
+        }
+    }
+
+    /// Hands `then` the step and its settled outcome once the forward's
+    /// device-fed ids are checked: at once where it has none or they were,
+    /// else from the forward's landing. Unlike [`Done::settled`] it never
+    /// waits, so a landing that may run before the forward's (a deferred
+    /// guest frame's, on the thread that polls the device) asks this.
+    pub fn when_settled(self, then: impl FnOnce(Done, engine::StepOutcome) + Send + 'static) {
+        let outcome = engine::StepOutcome {
+            beam_common: Vec::new(),
+            wrote: self.wrote.clone(),
+            faulted: self.faulted.clone(),
+        };
+        match self.fed.clone() {
+            None => then(self, outcome),
+            Some(fed) => {
+                // Told once the landing read the groups' common slots too.
+                let read = fed.clone();
+                fed.then(move |faults| {
+                    let outcome = engine::StepOutcome {
+                        beam_common: read.commons(),
+                        ..merged(outcome, faults)
+                    };
+                    then(self, outcome);
+                });
+            }
         }
     }
 
@@ -193,13 +224,43 @@ pub struct FedLane {
 /// Reads the id at token seat row `row`.
 pub type ReadRow = Box<dyn Fn(u32) -> Option<u32> + Send + Sync>;
 
+/// A beam's fault word (`crate::beam`): its u32 word in the fire's input
+/// store, the lane it faults and its instance.
+#[derive(Debug, Clone)]
+pub struct BeamWord {
+    pub word: u32,
+    pub lane: u32,
+    pub instance: engine::InstanceId,
+}
+
 struct Fed {
     read: ReadRow,
     lanes: Vec<FedLane>,
     vocab: u32,
-    faults: std::sync::Mutex<Option<Vec<engine::LaneFault>>>,
+    /// Reads the store's u32 word, and each beam's fault word.
+    read_word: Option<ReadRow>,
+    beams: Vec<BeamWord>,
+    /// Each beam group's common slot word (§11.3) and its instance.
+    commons: Vec<(u32, engine::InstanceId)>,
+    /// The store's words from a first one as the fire's readout brought
+    /// them back ([`FedCheck::supply`]): read in place of the store.
+    supplied: std::sync::Mutex<Option<(u32, Vec<u32>)>>,
+    /// The groups' common slots the landing read.
+    read_commons: std::sync::Mutex<Vec<(engine::InstanceId, u32)>>,
+    faults: std::sync::Mutex<FedState>,
     ready: std::sync::Condvar,
 }
+
+/// What a fed check knows: the lanes it faulted once the forward landed,
+/// and, until then, who is told them when it does.
+#[derive(Default)]
+struct FedState {
+    faults: Option<Vec<engine::LaneFault>>,
+    told: Vec<Told>,
+}
+
+/// One told the fed check's faults once the forward landed.
+type Told = Box<dyn FnOnce(Vec<engine::LaneFault>) + Send>;
 
 impl FedCheck {
     #[must_use]
@@ -209,7 +270,40 @@ impl FedCheck {
                 read,
                 lanes,
                 vocab,
-                faults: std::sync::Mutex::new(None),
+                read_word: None,
+                beams: Vec::new(),
+                commons: Vec::new(),
+                supplied: std::sync::Mutex::new(None),
+                read_commons: std::sync::Mutex::new(Vec::new()),
+                faults: std::sync::Mutex::new(FedState::default()),
+                ready: std::sync::Condvar::new(),
+            }),
+        }
+    }
+
+    /// A check of `lanes`' fed ids, as [`FedCheck::new`], and of each of
+    /// `beams`' fault words, read by `read_word`: a nonzero word faults its
+    /// lane by name (`crate::beam::fault_reason`).
+    #[must_use]
+    pub fn with_beams(
+        read: ReadRow,
+        lanes: Vec<FedLane>,
+        vocab: u32,
+        read_word: ReadRow,
+        beams: Vec<BeamWord>,
+        commons: Vec<(u32, engine::InstanceId)>,
+    ) -> FedCheck {
+        FedCheck {
+            inner: Arc::new(Fed {
+                read,
+                lanes,
+                vocab,
+                read_word: Some(read_word),
+                beams,
+                commons,
+                supplied: std::sync::Mutex::new(None),
+                read_commons: std::sync::Mutex::new(Vec::new()),
+                faults: std::sync::Mutex::new(FedState::default()),
                 ready: std::sync::Condvar::new(),
             }),
         }
@@ -230,8 +324,8 @@ impl FedCheck {
     /// once. A lost step faults every lane by its own loss, not here.
     pub fn landed(&self, whole: bool) {
         let fed = &*self.inner;
-        let mut faults = fed.faults.lock().expect("fed lock poisoned");
-        if faults.is_some() {
+        let mut state = fed.faults.lock().expect("fed lock poisoned");
+        if state.faults.is_some() {
             return;
         }
         let mut outcome = engine::StepOutcome::committed();
@@ -254,19 +348,87 @@ impl FedCheck {
                 outcome.fault_lanes(lane.lanes.clone(), lane.instance, &why);
             }
         }
-        *faults = Some(outcome.faulted);
+        let supplied = fed.supplied.lock().expect("fed lock poisoned").take();
+        if let Some(read_word) = fed.read_word.as_ref().filter(|_| whole) {
+            let word = |at: u32| match &supplied {
+                Some((first, words)) => at
+                    .checked_sub(*first)
+                    .and_then(|k| words.get(k as usize).copied()),
+                None => read_word(at),
+            };
+            *fed.read_commons.lock().expect("fed lock poisoned") = fed
+                .commons
+                .iter()
+                .filter_map(|&(at, instance)| Some((instance, word(at)?)))
+                .collect();
+            for beam in &fed.beams {
+                let code = word(beam.word).unwrap_or(0);
+                if code == 0 {
+                    continue;
+                }
+                let why = crate::beam::fault_reason(code, beam.lane as usize);
+                tracing::warn!(lane = beam.lane, instance = beam.instance.0, %why, "a beam lane faults");
+                outcome.fault_lanes(beam.lane..beam.lane + 1, Some(beam.instance), &why);
+            }
+        }
+        state.faults = Some(outcome.faulted.clone());
+        let told = std::mem::take(&mut state.told);
+        drop(state);
         fed.ready.notify_all();
+        for tell in told {
+            tell(outcome.faulted.clone());
+        }
+    }
+
+    /// Tells `then` the lanes the fed ids faulted: now where the forward
+    /// landed, else from its landing. Nothing waits here, so a landing
+    /// callback (a guest frame's, on the thread that polls the device) may
+    /// ask it without parking the thread the forward's own landing needs.
+    pub fn then(&self, then: impl FnOnce(Vec<engine::LaneFault>) + Send + 'static) {
+        let mut state = self.inner.faults.lock().expect("fed lock poisoned");
+        match state.faults.clone() {
+            Some(faults) => {
+                drop(state);
+                then(faults);
+            }
+            None => state.told.push(Box::new(then)),
+        }
+    }
+
+    /// The store's words from `first` as the fire's readout brought them
+    /// back: [`FedCheck::landed`] reads the beams' words there in place of
+    /// the store.
+    pub fn supply(&self, first: u32, words: Vec<u32>) {
+        *self.inner.supplied.lock().expect("fed lock poisoned") = Some((first, words));
+    }
+
+    /// Each beam group's common slot (§11.3) as the landing read it, once
+    /// the forward landed.
+    #[must_use]
+    pub fn commons(&self) -> Vec<(engine::InstanceId, u32)> {
+        let _ = self.faults();
+        self.inner
+            .read_commons
+            .lock()
+            .expect("fed lock poisoned")
+            .clone()
+    }
+
+    /// Whether the check reads beams' fault words.
+    #[must_use]
+    pub fn reads_beams(&self) -> bool {
+        !self.inner.beams.is_empty()
     }
 
     /// The lanes the fed ids faulted, once the forward landed.
     #[must_use]
     pub fn faults(&self) -> Vec<engine::LaneFault> {
         let fed = &*self.inner;
-        let mut faults = fed.faults.lock().expect("fed lock poisoned");
-        while faults.is_none() {
-            faults = fed.ready.wait(faults).expect("fed lock poisoned");
+        let mut state = fed.faults.lock().expect("fed lock poisoned");
+        while state.faults.is_none() {
+            state = fed.ready.wait(state).expect("fed lock poisoned");
         }
-        faults.clone().unwrap_or_default()
+        state.faults.clone().unwrap_or_default()
     }
 
     /// Waits until the forward's landing read the fed ids back: the arm's
@@ -444,6 +606,51 @@ mod tests {
             "instance 102: token 151954 is out of range for a vocabulary of 151936"
         );
         assert_eq!(heard[0].wrote.len(), 1, "the other lanes' reports stand");
+    }
+
+    /// A step told from a landing that may come before its forward's (a
+    /// deferred guest frame's, on the thread that polls the device) is told
+    /// once the forward's fed ids are read, by that read, never by parking
+    /// for it: the thread asking is the one the read needs. Asked after the
+    /// read, it is told at once.
+    #[test]
+    fn a_step_waits_for_its_fed_ids_without_parking_the_asker() {
+        use super::{FedCheck, FedLane};
+        for fed_first in [false, true] {
+            let fed = FedCheck::new(
+                Box::new(|row| Some(if row == 1 { 99 } else { 3 })),
+                (0..2u32)
+                    .map(|row| FedLane {
+                        row,
+                        lanes: row..row + 1,
+                        instance: None,
+                    })
+                    .collect(),
+                16,
+            );
+            let heard = Heard::default();
+            let meet = Meet::new();
+            let mut done = done(&meet, &heard);
+            done.meet = None;
+            done.fed = Some(fed.clone());
+            if fed_first {
+                fed.landed(true);
+            }
+            let into = Arc::clone(&heard);
+            done.when_settled(move |done, outcome| {
+                assert_eq!(done.at.step, 0);
+                into.lock().unwrap().push(outcome);
+            });
+            if !fed_first {
+                assert!(heard.lock().unwrap().is_empty(), "the fed ids are unread");
+                fed.landed(true);
+            }
+            let heard = heard.lock().unwrap();
+            assert_eq!(heard.len(), 1, "told once");
+            let lanes: Vec<u32> = heard[0].faulted.iter().map(|fault| fault.lane).collect();
+            assert_eq!(lanes, [1], "the out-of-range id faults its lane");
+            assert_eq!(heard[0].wrote.len(), 1, "the step's reports stand");
+        }
     }
 
     /// A forward the queue refused loses the whole step: every lane

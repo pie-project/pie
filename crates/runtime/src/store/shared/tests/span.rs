@@ -39,6 +39,14 @@ impl Mover for Lane {
     fn epoch_now(&self) -> u64 {
         0
     }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        let engine = self.0.lock().unwrap();
+        match crate::store::shared::programs::table_apart(engine.table.as_slice(), &runtime) {
+            Some(apart) => Err(apart),
+            None => Ok(()),
+        }
+    }
 }
 
 /// An on-demand pool as it loads: at the smallest rung.
@@ -589,9 +597,9 @@ async fn the_walk_never_lowers_under_the_live_lanes_decode() {
 }
 
 /// A refused commit_span is not asked again on the walk's next wake, only
-/// once room is freed lifts the block.
+/// once an event that can change the device's answer lifts the block.
 #[test]
-fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
+fn a_refused_commit_span_is_asked_again_only_once_lifted() {
     let (mut pool, mut engine) = on_demand_pool();
     assert_eq!(
         walk_segments(&mut pool, 6, 0, &mut engine),
@@ -603,13 +611,13 @@ fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
         Some(SegmentMove::CommitSpan { n: 1 })
     ));
     // The engine refused it: blocked.
-    pool.block_span_commit(true);
+    pool.block_commit(7);
     assert!(
         !matches!(pool.next_move(7, 2), Some(SegmentMove::CommitSpan { .. })),
         "not asked again on the next wake"
     );
-    // Room freed lifts it.
-    pool.block_span_commit(false);
+    // Lifted (the target moved, or device memory came back).
+    pool.lift_commit();
     assert!(matches!(
         pool.next_move(7, 3),
         Some(SegmentMove::CommitSpan { n: 1 })
@@ -623,7 +631,7 @@ fn a_refused_commit_span_is_asked_again_only_once_room_is_freed() {
 /// and a waiter short of kv, of state, or none. Spelled out apart from the
 /// code: a live waiter grows into the prefix, then into the span the rung
 /// lends (span lending), under a target above what is mapped, never while
-/// a refused span commit waits for room.
+/// a refused commit waits for an event that can change the device's answer.
 #[test]
 fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
     const ENGINE: usize = 46;
@@ -640,7 +648,6 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
                         );
                         let mut pool = grow_pool(prefix_whole, lent);
                         assert_eq!(pool.pool().span_to_commit().is_some(), lent, "{case}");
-                        pool.block_span_commit(blocked);
                         if let Some(short) = waiter {
                             wait_short(&mut pool, short);
                         }
@@ -649,6 +656,10 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
                         let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
                         let target = if below { u32::MAX } else { mapped };
                         let _ = grow.retarget(u64::from(target));
+                        // A commit refused at this target.
+                        if blocked {
+                            shared.lock().unwrap().block_commit(target);
+                        }
                         let can = grow.can_grow();
                         let goal = grow.goal_for_test();
                         let step = shared.lock().unwrap().next_move(goal, 1);
@@ -661,7 +672,7 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
                         if waiter.is_some() {
                             assert_eq!(
                                 can,
-                                below && (!prefix_whole || (lent && !blocked)),
+                                below && !blocked && (!prefix_whole || lent),
                                 "{case}"
                             );
                             assert_eq!(
@@ -748,7 +759,7 @@ fn a_rising_rung_reclaims_the_lent_span() {
     let short = pool.pool().rung_short(top);
     assert!(short > 0, "no free chunk below: the raise is short");
     assert!(matches!(
-        pool.rise_room(top),
+        pool.rise_room(top, 0),
         crate::planner::RiseRoom::Short { .. }
     ));
     // The planner frees room below (here: records that lay below go, as

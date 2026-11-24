@@ -232,6 +232,7 @@ impl Set {
             kv,
             window: self.seq.window.clone(),
             record,
+            ..Seq::default()
         };
         let landed = ((held - PROMPT) / rs_tokens) as usize;
         let mut rs = self.rs.clone();

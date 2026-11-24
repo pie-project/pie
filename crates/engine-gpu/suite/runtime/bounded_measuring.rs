@@ -60,6 +60,7 @@ fn a_load_with_no_measurement_under_a_stated_bound_runs_no_frame_past_it() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the model loads under the bound");
     let longest = backend::longest_frame_ns();

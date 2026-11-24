@@ -135,6 +135,11 @@ fn packed_fixture_kv(model: &'static str, kv: Dtype) -> Fixture {
 fn fixture_of(model: &'static str, trace: Trace) -> Fixture {
     let dir = std::env::temp_dir().join(format!("pie-synth-{model}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    // Owned from before its first byte is written: a checkpoint write that
+    // panics (a full disk) or a contract that does not read unwinds through
+    // this guard and takes the directory, ~10 GB for the largest models,
+    // with it.
+    let scratch = Scratch(dir.clone());
     std::fs::create_dir_all(&dir).unwrap_or_else(|why| panic!("{}: {why}", dir.display()));
     let container = dir.join("model.zt");
     write_checkpoint(&container, &trace);
@@ -147,7 +152,7 @@ fn fixture_of(model: &'static str, trace: Trace) -> Fixture {
         trace,
         contract,
         container,
-        _dir: Scratch(dir),
+        _dir: scratch,
     }
 }
 

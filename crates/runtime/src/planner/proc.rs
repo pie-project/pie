@@ -47,7 +47,7 @@ pub(super) struct Proc {
     pub(super) rebind_waiting: Option<String>,
     /// What an idle eviction freed; it asks for it back only once it wakes.
     pub(super) parked: Option<Demand>,
-    /// Parked below the floor, it gave its execution seat back: it takes
+    /// Held (`schedule/hold`) and parked, it gave its execution seat back: it takes
     /// one again before its restore is queued.
     pub(super) seatless: bool,
     pub(super) reseating: bool,
@@ -169,21 +169,40 @@ pub(super) struct Proc {
     /// The head this one was evicted for, its restore served ahead of it
     /// while that head stood passed over with no move to make
     /// ([`super::ResidencyPlanner::stuck_head`]): no victim for that
-    /// head until it has fired. Moved back first, it went round with the
+    /// head until the head arrives ([`super::inner::Inner::arrived`]).
+    /// Moved back first, it went round with the
     /// head, restored past it and evicted for it again, its waits never
     /// served (seed 3392: queued for a page behind the head, so the mark
     /// alone did not hold it).
     pub(super) restored_past: Option<ProcessId>,
+    /// The head the last resort last moved it for, until that head arrives
+    /// ([`super::inner::Inner::arrived`]): it moves no victim twice for one
+    /// head ([`super::ResidencyPlanner::last_resort_evict`]).
+    pub(super) last_resort_for: Option<ProcessId>,
 }
 
 /// The guest-state room a suspended process's pending bind asks:
-/// `pieces` free runs of `run` adjacent chunks, `pages` the kv pages that,
+/// `pieces` free runs of `run` adjacent chunks and `singles` single chunks
+/// beside them (its tables, rings and adapter), `pages` the kv pages that,
 /// moved out whole, free them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PendingBind {
     pub(super) run: u32,
     pub(super) pieces: u32,
+    pub(super) singles: u32,
     pub(super) pages: u32,
+}
+
+impl PendingBind {
+    /// The runs it asks, each length apart.
+    pub(super) fn runs(&self) -> super::pool::RunNeed {
+        super::pool::RunNeed::of([(self.run, self.pieces), (1, self.singles)])
+    }
+
+    /// The runs it asks as `(run, pieces)` entries, the longest first.
+    pub(super) fn entries(&self) -> Vec<(u32, u32)> {
+        self.runs().entries().to_vec()
+    }
 }
 
 impl Proc {
@@ -268,6 +287,7 @@ impl Proc {
             unfired: false,
             evicted_for: None,
             restored_past: None,
+            last_resort_for: None,
         }
     }
 }

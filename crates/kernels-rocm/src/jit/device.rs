@@ -187,7 +187,11 @@ fn per_device(
 #[must_use]
 pub(crate) fn multiprocessors() -> Option<u32> {
     static COUNT: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
-    per_device(&COUNT, |o| attribute(sys::ATTR_MULTIPROCESSOR_COUNT, o).filter(|&n| n > 0))
+    let units =
+        per_device(&COUNT, |o| attribute(sys::ATTR_MULTIPROCESSOR_COUNT, o).filter(|&n| n > 0))?;
+    // The units this process's queues run on, where a CU mask was stated
+    // (`hip::hold_queue_units`).
+    Some(crate::hip::held_units(current()?.unsigned_abs(), units))
 }
 
 /// The gfx major: 9 on CDNA (gfx90a, gfx942, gfx950), 11/12 on RDNA.

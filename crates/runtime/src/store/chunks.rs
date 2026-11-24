@@ -313,8 +313,31 @@ impl<I: PoolId> ShapePool<I> {
     /// `ids` go back once the fire at `epoch` retires.
     pub fn recycle_after_epoch(&mut self, ids: Vec<I>, epoch: u64) {
         if !ids.is_empty() {
+            tracing::debug!(
+                target: "runtime::store::kv",
+                epoch,
+                ids = ?ids.iter().map(|id| id.index()).collect::<Vec<_>>(),
+                "pool ids let go behind an epoch"
+            );
             self.pending.push((epoch, ids));
         }
+    }
+
+    /// Keeps of `ids` those let go and still waiting on a fire's
+    /// retirement.
+    pub fn retain_pending(&self, ids: &mut std::collections::HashSet<I>)
+    where
+        I: std::hash::Hash + Eq,
+    {
+        if ids.is_empty() {
+            return;
+        }
+        let pending: std::collections::HashSet<I> = self
+            .pending
+            .iter()
+            .flat_map(|(_, batch)| batch.iter().copied())
+            .collect();
+        ids.retain(|id| pending.contains(id));
     }
 
     /// `ids`, which no fire has touched, go back now.
@@ -338,6 +361,12 @@ impl<I: PoolId> ShapePool<I> {
         if ids.is_empty() {
             return;
         }
+        tracing::debug!(
+            target: "runtime::store::kv",
+            base = self.base,
+            ids = ?ids.iter().map(|id| id.index()).collect::<Vec<_>>(),
+            "pool ids given back"
+        );
         match &mut self.slots {
             Backing::Own(pool) => {
                 let slots: Vec<Slot> = ids
@@ -784,8 +813,21 @@ impl StorePools {
             match shape.kind {
                 // The rs buffer's list (CONTRACT-BC 18): its tokens are
                 // the rs store's, not the kv page size.
+                // The window buffer (CONTRACT-BC 21) is the rs store's
+                // buffer as the rs list is: a load states one of them.
                 SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::RsBuffer => {
                     pools.buffer = run;
+                }
+                // A hybrid's window buffer is a pool beside its rs list,
+                // which stays the buffer here.
+                SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::WindowBuffer => {
+                    if !facts
+                        .shapes
+                        .iter()
+                        .any(|s| s.role == ::engine::chunk::SlotRole::RsBuffer)
+                    {
+                        pools.buffer = run;
+                    }
                 }
                 SlotKind::List {
                     tokens,
@@ -795,6 +837,8 @@ impl StorePools {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
+                // Window lists: removed by the windowed-state change (the
+                // integration commit deletes this arm).
                 SlotKind::List {
                     tokens,
                     window: Some(window),

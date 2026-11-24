@@ -37,7 +37,7 @@ fn reaches(case: &str, value: u32) -> bool {
 
 /// Each `case N:` block of a streamed kernel's switch, in step order.
 fn cases(source: &str) -> Vec<String> {
-    let Some(switch) = source.find("switch (step.index)") else {
+    let Some(switch) = source.find("switch (m4_step_index(step.index))") else {
         return Vec::new();
     };
     let body = &source[switch..];

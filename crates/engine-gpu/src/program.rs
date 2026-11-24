@@ -292,9 +292,23 @@ pub trait Programs<B: Serve>: Default {
         Ok(())
     }
 
-    /// Points every table and cell the plane holds in the pool at the
-    /// chunk its slot ref sits in now, after an evacuation moved chunks.
-    fn rebind(&mut self, pools: &Pools<B>) -> Result<(), Refusal>;
+    /// Where an evacuation leaves the plane's tables and cells
+    /// ([`Programs::resolve_rebind`]), to point them at once its copies
+    /// are committed ([`Programs::install_rebind`]).
+    type Rebound;
+
+    /// Resolves where every table and cell the plane holds in the pool lies
+    /// under `pools`' chunk table: an evacuation's, in place, its copies
+    /// not yet committed (`Engine::evacuate` is all or nothing). Every
+    /// moved run is claimed as one ([`engine::guest_claims::Claims::claim_all`]),
+    /// the last step. Refused with nothing changed: no table or cell
+    /// pointed anew, no claim moved.
+    fn resolve_rebind(&mut self, pools: &Pools<B>) -> Result<Self::Rebound, Refusal>;
+
+    /// Points every table and cell at where [`Programs::resolve_rebind`]
+    /// resolved it, the evacuation's copies committed. Nothing is left to
+    /// refuse: an `Err` is a fault.
+    fn install_rebind(&mut self, rebound: Self::Rebound) -> Result<(), Refusal>;
 
     /// Moves an instance's or a channel's tables and cells to the slot
     /// refs `rebind` names, whose bytes the runtime copied there
@@ -302,6 +316,27 @@ pub trait Programs<B: Serve>: Default {
     fn rebind_slots(&mut self, pools: &Pools<B>, rebind: &Rebind) -> Result<(), Refusal>;
 
     fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal>;
+
+    /// `instance`'s beam group at a fire (`crate::beam`): its resident
+    /// state's first pool word, its layout, and where the parents its last
+    /// pass put come from; `None` for an instance whose program states no
+    /// parents.
+    fn beam_group(
+        &self,
+        instance: InstanceId,
+        pools: &Pools<B>,
+    ) -> Result<Option<(u32, crate::guest::state::BeamLayout, crate::beam::Parents<B>)>, Refusal>
+    {
+        let _ = (instance, pools);
+        Ok(None)
+    }
+
+    /// `instance`'s beam group's resident state, where its program states
+    /// each beam's parent.
+    fn beam_state(&self, instance: InstanceId) -> Option<&crate::beam::Resident<B>> {
+        let _ = instance;
+        None
+    }
 
     /// The ring ends `instance`'s stages move, as (channel, whether the end
     /// is the tail), each once; none for an instance the plane holds no
@@ -313,6 +348,18 @@ pub trait Programs<B: Serve>: Default {
 
     /// The rows a lane of `instance` folds, where the instance states them.
     fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal>;
+
+    /// The class `instance` is bound in; `None` for one the plane holds no
+    /// longer.
+    fn geometry(&self, instance: InstanceId) -> Option<eta_ir::registry::GeometryClass>;
+
+    /// What `instance`'s descriptor ports hold at this fire, each cell the
+    /// last pass put waited for until it landed ([`descriptor_ports`]);
+    /// `None` where its class resolves none on the device.
+    fn descriptor_ports(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<engine::ports::Envelope>, Refusal>;
 
     fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8])
     -> Result<bool, Refusal>;
@@ -522,4 +569,373 @@ pub fn decode(
         ),
         _ => return None,
     })
+}
+
+/// The ports the host reads off an instance's rings at a fire, so a pass
+/// recorded to land later lands their puts rather than keeping them on the
+/// device: a `fold` count and an `attn_mask` for every class, and the
+/// descriptor ports the engine resolves ([`engine::ports::engine_resolves`])
+/// past a decode envelope's tokens, which stay on the device for the next
+/// forward to copy in.
+#[must_use]
+pub fn read_at_fire(
+    geometry: eta_ir::registry::GeometryClass,
+    device: eta_ir::registry::PortMask,
+) -> eta_ir::registry::PortMask {
+    use eta_ir::registry::{GeometryClass, Port, PortMask};
+    Port::ALL
+        .iter()
+        .copied()
+        .filter(|&port| {
+            matches!(port, Port::Fold | Port::AttnMask)
+                || (engine::ports::engine_resolves(geometry, device, port)
+                    && !(geometry == GeometryClass::DecodeEnvelope && port == Port::EmbedTokens))
+        })
+        .fold(PortMask::NONE, PortMask::with)
+}
+
+/// The channels of `plan` bound to the ports [`descriptor_ports`] reads for
+/// an instance of `geometry` computing `device` on the device: the cells a
+/// fire waits to land before it resolves them.
+#[must_use]
+pub fn descriptor_channels(
+    plan: &eta_exec::ExecPlan,
+    geometry: eta_ir::registry::GeometryClass,
+    device: eta_ir::registry::PortMask,
+) -> Vec<u32> {
+    plan.package
+        .ports
+        .iter()
+        .filter(|binding| !binding.is_const && descriptor_port(geometry, device, binding.port))
+        .map(|binding| binding.channel)
+        .collect()
+}
+
+/// Whether [`descriptor_ports`] reads `port`: every port device geometry
+/// resolves, and a decode envelope's positions where its program computes
+/// them; a decode envelope's tokens and mask resolve at the lane, and a
+/// `fold` count through its own read.
+fn descriptor_port(
+    geometry: eta_ir::registry::GeometryClass,
+    device: eta_ir::registry::PortMask,
+    port: eta_ir::registry::Port,
+) -> bool {
+    use eta_ir::registry::{GeometryClass, Port};
+    port != Port::Fold
+        && engine::ports::engine_resolves(geometry, device, port)
+        && match geometry {
+            GeometryClass::DeviceGeometry => true,
+            GeometryClass::DecodeEnvelope => port == Port::Positions,
+            GeometryClass::Host => false,
+        }
+}
+
+/// What `instance`'s descriptor ports hold at the fire, off its host rings
+/// (each landed before this reads it, [`descriptor_channels`]) or folded
+/// constants: `None` where its class resolves none on the device.
+pub fn descriptor_ports(
+    plan: &eta_exec::ExecPlan,
+    inst: &eta_exec::InterpInstance,
+    geometry: eta_ir::registry::GeometryClass,
+    device: eta_ir::registry::PortMask,
+    instance: InstanceId,
+) -> Result<Option<engine::ports::Envelope>, Refusal> {
+    use eta_ir::registry::Port;
+    let mut out = engine::ports::Envelope::default();
+    let mut read = false;
+    for binding in &plan.package.ports {
+        if !descriptor_port(geometry, device, binding.port) {
+            continue;
+        }
+        let port = binding.port.name();
+        let value = if binding.is_const {
+            plan.const_ports
+                .iter()
+                .find(|folded| folded.port == binding.port)
+                .map(|folded| folded.value.clone())
+                .ok_or_else(|| {
+                    Refusal::Program(format!(
+                        "instance {instance}: port `{port}` is declared const and no folded \
+                         value was kept for it"
+                    ))
+                })?
+        } else {
+            let ring = inst
+                .channels
+                .get(binding.channel as usize)
+                .ok_or_else(|| {
+                    Refusal::Program(format!(
+                        "instance {instance}: port `{port}` names channel {}, which the \
+                         instance does not carry",
+                        binding.channel
+                    ))
+                })?;
+            if ring.is_empty() {
+                return Err(Refusal::Program(format!(
+                    "instance {instance}: the `{port}` ring is empty at the fire; the port's \
+                     value is the cell the guest's own pass takes, and no pass has put one"
+                )));
+            }
+            ring.front()
+        };
+        read = true;
+        if binding.port == Port::AttnMask {
+            let eta_exec::Value::Bool(cells) = value else {
+                return Err(Refusal::Program(format!(
+                    "instance {instance}: `attn_mask` holds {:?}, and an attention mask is a \
+                     rectangle of bools",
+                    value.dtype()
+                )));
+            };
+            out.mask = Some(cells);
+            continue;
+        }
+        let words = match value {
+            eta_exec::Value::U32(words) => words,
+            eta_exec::Value::I32(words) => words.into_iter().map(|word| word as u32).collect(),
+            other => {
+                return Err(Refusal::Program(format!(
+                    "instance {instance}: `{port}` holds {:?}, and a geometry index is not \
+                     an activation",
+                    other.dtype()
+                )));
+            }
+        };
+        let slot = match binding.port {
+            Port::EmbedIndptr => &mut out.qo_indptr,
+            Port::EmbedTokens => &mut out.tokens,
+            Port::Positions => &mut out.positions,
+            Port::Slots => &mut out.slots,
+            Port::KvLen => &mut out.kv_len,
+            _ => continue,
+        };
+        *slot = Some(words);
+    }
+    Ok(read.then_some(out))
+}
+
+/// A lane's geometry as its instance's descriptor ports resolve it: what the
+/// fire stages for it in place of what the runtime stated.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceLane {
+    /// Its token ids, where the ports carry them.
+    pub tokens: Option<Vec<u32>>,
+    /// Its rows' RoPE positions.
+    pub positions: Option<Vec<u32>>,
+    /// The keys it holds before this fire's rows: its extent less its rows.
+    pub have: Option<u32>,
+    /// The working-set slot each row lands at, where it is not the run
+    /// `have..have + rows`.
+    pub slots: Option<Vec<u32>>,
+    pub mask: Option<engine::fire::Masking>,
+}
+
+/// Each of `envelope`'s lanes, as the lanes `stated` (from lane `first` of
+/// the step) carry them: its rows, and where it holds kv, its extent and
+/// the slots its rows land at. A working set's slots are its own numbering;
+/// the lane's table names its pages.
+pub fn device_lanes(
+    envelope: &mut engine::ports::Envelope,
+    stated: &[engine::fire::Lane],
+    first: usize,
+    instance: InstanceId,
+) -> Result<Vec<DeviceLane>, Refusal> {
+    let port = |error: engine::ports::PortError| {
+        Refusal::Program(format!("instance {instance}: {error}"))
+    };
+    envelope.host_rows = stated
+        .iter()
+        .map(|lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX))
+        .collect();
+    let carried = envelope.lanes();
+    if carried > stated.len() {
+        return Err(Refusal::Program(format!(
+            "instance {instance} is attached over {} lane(s) at lane {first} and its \
+             `embed_indptr` port describes {carried}: a program's ports state its own \
+             lanes' geometry, never the next request's",
+            stated.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(carried);
+    for (at, lane) in stated.iter().enumerate().take(carried) {
+        let source = first + at;
+        let ports = envelope.lane(at, source).map_err(port)?;
+        let rows = if ports.owns_slots() {
+            ports.rows() as usize
+        } else {
+            lane.tokens.len()
+        };
+        if rows != lane.tokens.len() {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: lane {source}'s ports place {rows} row(s), and the \
+                 runtime staged {} for it; the composition is carved from the second",
+                lane.tokens.len()
+            )));
+        }
+        let slots = ports.slots(rows).map_err(port)?;
+        let have = match () {
+            () if lane.kv_less => None,
+            () if ports.owns_slots() => {
+                let reach = ports.reach(rows).map_err(port)?.ok_or_else(|| {
+                    Refusal::Program(format!(
+                        "instance {instance}: lane {source} states where its rows land and \
+                         reaches no slot; the page count and the attention extent are \
+                         carved from what it reads"
+                    ))
+                })?;
+                if (reach as usize) < rows {
+                    return Err(Refusal::Program(format!(
+                        "instance {instance}: lane {source} reads a KV extent of {reach} and \
+                         this fire writes {rows} row(s) into it; the extent is after the \
+                         append, so it is never shorter than what the append adds"
+                    )));
+                }
+                Some(reach - rows as u32)
+            }
+            () => None,
+        };
+        if let Some(have) = have {
+            let end = have.saturating_add(rows as u32);
+            ports.check_extent(end).map_err(port)?;
+            // Every row lands in what the runtime made the lane's own,
+            // `[folded, write_end)` (`KvDelta::writable`), and within the
+            // extent it states; a lane stating no slots appends the run.
+            let run: Vec<u32> = (have..end).collect();
+            let placed = slots.unwrap_or(&run);
+            let why = engine::fire::misplaced_write(lane.kv.writable(), placed).or_else(|| {
+                placed.iter().find(|&&slot| slot >= end).map(|slot| {
+                    format!(
+                        "its program places a row at kv slot {slot}, past the extent of \
+                         {end} its ports state"
+                    )
+                })
+            });
+            if let Some(why) = why {
+                return Err(Refusal::Program(format!(
+                    "instance {instance}: lane {source}: {why}"
+                )));
+            }
+        }
+        // A row's causal bound is its place in the run the fire appends; a
+        // lane of rows written elsewhere has no such order to bound by.
+        let tail = |slots: &[u32]| {
+            have.is_some_and(|have| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .all(|(row, &slot)| u64::from(slot) == u64::from(have) + row as u64)
+            })
+        };
+        let slots = match slots {
+            _ if lane.kv_less => None,
+            Some(slots) if tail(slots) => None,
+            Some(slots) if rows > 1 => {
+                return Err(Refusal::Program(format!(
+                    "instance {instance}: lane {source}'s {rows} rows land at slots {slots:?}, \
+                     not the run the fire appends; each row's causal bound is its place in \
+                     that run, so rows written elsewhere would attend in an order the cache \
+                     does not hold"
+                )));
+            }
+            Some(slots) => Some(slots.to_vec()),
+            None => None,
+        };
+        let mask = match ports.mask(rows).map_err(port)? {
+            Some((cells, stride)) => {
+                let masks: Vec<engine::fire::Mask> = cells
+                    .chunks_exact(stride)
+                    .map(|row| engine::fire::Mask::new(mask_runs(row), stride as u64))
+                    .collect();
+                Some(match masks.as_slice() {
+                    [only] => engine::fire::Masking::Extent(only.clone()),
+                    _ => engine::fire::Masking::Rows(masks),
+                })
+            }
+            None => None,
+        };
+        let tokens = match &envelope.tokens {
+            Some(_) => Some(ports.tokens_for(rows).map_err(port)?.to_vec()),
+            None => None,
+        };
+        // A lane that places its own rows states its positions as they
+        // are; one the runtime placed may only state the natural run.
+        let positions = ports
+            .positions_for(have.unwrap_or(lane.kv.held), rows)
+            .map_err(port)?
+            .map(<[u32]>::to_vec);
+        out.push(DeviceLane {
+            tokens,
+            positions,
+            have,
+            slots,
+            mask,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One one-row lane over a working set folded at 16, its program placing
+    /// its row at `slot` with the extent `slot + 1`.
+    fn placed(slot: u32) -> Result<Vec<DeviceLane>, Refusal> {
+        let mut envelope = engine::ports::Envelope {
+            qo_indptr: Some(vec![0, 1]),
+            slots: Some(vec![slot]),
+            kv_len: Some(vec![slot + 1]),
+            ..engine::ports::Envelope::default()
+        };
+        let lane = engine::fire::Lane {
+            tokens: vec![0],
+            list: engine::fire::ListKind::Translation,
+            kv: engine::fire::KvDelta {
+                folded: 16,
+                write_end: 32,
+                ..engine::fire::KvDelta::default()
+            },
+            ..engine::fire::Lane::default()
+        };
+        device_lanes(&mut envelope, &[lane], 0, InstanceId(7))
+    }
+
+    #[test]
+    fn a_row_placed_past_the_fold_lands_where_it_is_placed() {
+        let lanes = placed(17).expect("a slot past the fold");
+        assert_eq!(lanes[0].have, Some(17));
+        assert_eq!(lanes[0].slots, None, "slot 17 is the run the fire appends");
+    }
+
+    #[test]
+    fn ports_describing_more_lanes_than_the_attachment_owns_are_refused_by_name() {
+        let mut envelope = engine::ports::Envelope {
+            qo_indptr: Some(vec![0, 1, 2]),
+            slots: Some(vec![17, 17]),
+            kv_len: Some(vec![18, 18]),
+            ..engine::ports::Envelope::default()
+        };
+        let lane = engine::fire::Lane {
+            tokens: vec![0],
+            list: engine::fire::ListKind::Translation,
+            ..engine::fire::Lane::default()
+        };
+        let why = device_lanes(&mut envelope, &[lane], 3, InstanceId(7))
+            .expect_err("two lanes described over one owned")
+            .to_string();
+        assert!(why.contains("describes 2") && why.contains("lane 3"), "{why}");
+    }
+
+    #[test]
+    fn a_row_placed_past_what_the_lane_may_write_is_refused_by_name() {
+        let why = placed(40).expect_err("slot 40 is past write_end 32").to_string();
+        assert!(why.contains("kv slot 40") && why.contains("16..32"), "{why}");
+    }
+
+    #[test]
+    fn a_row_placed_in_the_frozen_prefix_is_refused_by_name() {
+        let refused = placed(3).expect_err("slot 3 is below the fold");
+        let why = refused.to_string();
+        assert!(why.contains("kv slot 3") && why.contains("frozen prefix"), "{why}");
+    }
 }

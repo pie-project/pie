@@ -68,9 +68,25 @@ struct Input {
     /// turnaround.
     #[serde(default)]
     run_ahead_frames: Option<usize>,
+    /// Decode fires each lane keeps submitted past the last token it took,
+    /// one a frame: a cap on run-ahead counted in fires, not frames (a
+    /// sweep of a hybrid model's cost of a short window). Overrides
+    /// `run_ahead_frames`.
+    #[serde(default)]
+    run_ahead_fires: Option<usize>,
+    /// Rows the working set leaves unfolded behind each lane's last row:
+    /// the prompt folds all but this many and each decode folds one, so
+    /// every decode carries this many buffered rows (a hybrid model's
+    /// replay at a steady lag). 0 folds all it writes.
+    #[serde(default)]
+    fold_lag: u32,
     /// For a plane whose channel rings belong to the pass instance, not the channel.
     #[serde(default)]
     host_first_token: bool,
+    /// Ask the runtime to keep the prompt's state at its end (`checkpoints`),
+    /// so a later pass sharing the prompt resumes there.
+    #[serde(default)]
+    checkpoint_prompt_end: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -334,7 +350,8 @@ async fn run_one(
     let prefill_rng = Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]);
     let (temperature, top_p, top_k) = (input.temperature, input.top_p, input.top_k);
 
-    let ws = WorkingSet::new();
+    // A bench's prompts share their prefixes across its requests.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
     let n = prompt_vec.len() as u32;
     step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
     // Nothing to reserve; the empty step keeps `prologue_us`'s shape.
@@ -346,7 +363,7 @@ async fn run_one(
     let embed_indptr_p = Channel::from([0u32, n]);
     // Decode fires: the prefill sample already spends one of the
     // `max_tokens` sampler activations.
-    let budget = input.max_tokens - 1;
+    let budget = decode_budget(input.max_tokens)?;
     // A host-visible channel cannot attach to two passes, so this one is device-only.
     let tok_in = (!input.host_first_token).then(|| Channel::new([1], dtype::i32));
     let g0_ch = Channel::new([1], dtype::i32);
@@ -358,6 +375,10 @@ async fn run_one(
     // deeper window (`16` frames) so 256-lane high-concurrency waves do not
     // serialize on host-side frame-seal wakes between fast 2-step GPU batches.
     let (window_fires, out_capacity) = match input.run_ahead_frames {
+        _ if let Some(f) = input.run_ahead_fires => {
+            let w = f.max(1);
+            (w, w + 1 + 7 * live_slots)
+        }
         Some(r) => {
             let w = r.max(1) * live_slots;
             (w, w + 1 + 7 * live_slots)
@@ -375,9 +396,25 @@ async fn run_one(
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    let lag = input.fold_lag.min(u32::try_from(num_prompt_tokens).unwrap_or(0));
+    let prefill_fold = Channel::from([u32::try_from(num_prompt_tokens).unwrap_or(0) - lag]);
+    let decode_fold = Channel::from([1u32]);
+    fn geometry(lag: u32, fold: &Channel) -> StateGeometry<'_> {
+        match lag {
+            0 => StateGeometry::folding(),
+            _ => StateGeometry {
+                fold: Fold::Count(fold),
+                ..StateGeometry::default()
+            },
+        }
+    }
     fwd_p
-        .state(&[&ws], StateGeometry::folding())
+        .state(&[&ws], geometry(lag, &prefill_fold))
         .context("bind prefill state")?;
+    if input.checkpoint_prompt_end {
+        let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
+        fwd_p.checkpoints(&[end]).context("ask the prompt end's checkpoint")?;
+    }
     let prefill_knobs = SampleKnobs::new(temperature, top_p, top_k);
     fwd_p.epilogue(move || {
         let carried_on = tok_in.map(|tok_in| (tok_in.traced(), None));
@@ -397,7 +434,7 @@ async fn run_one(
             let fwd = ForwardPass::new();
             let embed_indptr = Channel::from([0u32, 1u32]);
             fwd.embed(&tok_in, &embed_indptr)?;
-            fwd.state(&[ws_ref], StateGeometry::folding())
+            fwd.state(&[ws_ref], geometry(lag, &decode_fold))
                 .context("bind decode state")?;
             let knobs = SampleKnobs::new(temperature, top_p, top_k);
             fwd.epilogue(move || {
@@ -440,7 +477,7 @@ async fn run_one(
         && !input.host_first_token
         && fwd_d.is_some()
     {
-        live_slots.saturating_sub(1).min(budget)
+        live_slots.saturating_sub(1).min(budget).min(window_fires)
     } else {
         0
     };
@@ -479,7 +516,7 @@ async fn run_one(
         };
         let mut burst = 0usize;
         while submitted < budget && burst < burst_limit {
-            let s = (budget - submitted).min(live_slots);
+            let s = (budget - submitted).min(live_slots).min(window_fires);
             if submitted - drained + s > window_fires {
                 break;
             }
@@ -588,7 +625,7 @@ async fn run_one(
         }
         // Refill the window after draining an accepted token. A stopped lane
         // `continue`s above and never reaches here, so it never submits more.
-        if submitted < budget && submitted - taken + live_slots <= window_fires {
+        if submitted < budget && submitted - taken + live_slots.min(window_fires) <= window_fires {
             submitted = submit_ahead(
                 fwd_d.as_ref().expect("decode pass exists while budget > 0"),
                 submitted,
@@ -618,9 +655,18 @@ async fn run_one(
     })
 }
 
+/// The decode fires after the prefill's sample, which is the first token:
+/// a request for no tokens has nothing to sample and is refused.
+fn decode_budget(max_tokens: usize) -> Result<usize> {
+    max_tokens
+        .checked_sub(1)
+        .ok_or_else(|| "max_tokens must be at least 1: the prefill samples the first token".into())
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     let main_start = std::time::Instant::now();
+    decode_budget(input.max_tokens)?;
 
     // This program is pure: it reads its input, generates, and returns the
     // token counts in one envelope. Nothing is streamed and nothing outside
@@ -811,4 +857,18 @@ async fn main(input: Input) -> Result<Output> {
         token_monotonic_ns: result.token_monotonic_ns,
         prologue_us: result.prologue_us,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `max_tokens: 0` is refused by name, not wrapped to a run past `usize::MAX`.
+    #[test]
+    fn no_tokens_is_refused() {
+        let err = decode_budget(0).unwrap_err();
+        assert!(err.contains("max_tokens must be at least 1"), "{err}");
+        assert_eq!(decode_budget(1), Ok(0));
+        assert_eq!(decode_budget(256), Ok(255));
+    }
 }

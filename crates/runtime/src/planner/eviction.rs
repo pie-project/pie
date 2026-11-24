@@ -22,7 +22,7 @@ use super::{ProcessId, ResidencyPlanner};
 const WAITS_ON_FLIGHT: &[&str] = &[
     "something in flight",
     "kv on its way",
-    "once more chunks stand free",
+    "once room is given back",
     "waits for the restored one's bind to fire",
 ];
 
@@ -179,8 +179,10 @@ impl ResidencyPlanner {
     }
 
     /// Free and total slots suspended kv can go to: host, then disk. The
-    /// slots only idle cache holds there count as free: a suspend makes its
-    /// room by dropping them (`KvStore::make_swap_room`). Counted as full,
+    /// slots only idle cache its keys let go holds there count as free: a
+    /// suspend makes its room by dropping it (`KvStore::make_swap_room`);
+    /// what a key keeps above the floor is full, and asked for with tier
+    /// pressure. Counted as full,
     /// a disk tier holding idle cache made every victim unhostable, and a
     /// head the pool fits alone waited with nothing issued.
     pub(super) fn swap_stats(&self) -> (u32, u32) {
@@ -218,7 +220,16 @@ impl ResidencyPlanner {
             return false;
         }
         let before = self.port.free_chunks();
-        let gathered = self.with_inner(|inner| std::mem::take(inner.accum.lend()));
+        // Packed once with nothing landed since, the head gathered its pages
+        // again from the chunks the packing freed and packed them again,
+        // pass after pass (the simulation's seed 2477): packed again only
+        // once something has landed.
+        let landed = self.landed();
+        let gathered = if self.repacked_at.load(Ordering::Acquire) == landed {
+            Vec::new()
+        } else {
+            self.with_inner(|inner| std::mem::take(inner.accum.lend()))
+        };
         let wanted = if gathered.is_empty() {
             wanted
         } else {
@@ -226,6 +237,7 @@ impl ResidencyPlanner {
             self.with_inner(|inner| inner.accum.lend().extend(packed));
             let freed = self.port.free_chunks().saturating_sub(before);
             if freed > 0 {
+                self.repacked_at.store(landed, Ordering::Release);
                 tracing::debug!(
                     %head,
                     freed,
@@ -664,6 +676,7 @@ impl ResidencyPlanner {
         if let Some(need) = shape.as_ref() {
             let (run, pieces) = need.longest().unwrap_or((1, 0));
             tracing::debug!(
+                head = %victims.head_pid,
                 ?need,
                 picks = ?picks.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
                 chunks = ?map.as_ref().map(|map| (map.held.len(), map.free.len())),
@@ -783,7 +796,7 @@ impl ResidencyPlanner {
             // policy's to make room for (the M1 on ca5c710a7: need_moves 0,
             // "no pick: the policy is asked" among 111 candidates): either
             // the store's placement stands it, and it is sent again once
-            // more chunks stand free than its refusal left, or its own
+            // room is given back since its refusal, or its own
             // check refuses what the map stands, and that is said.
             let fits = match (placement.as_ref(), shape.as_ref(), map.as_ref()) {
                 (Some(placement), Some(need), Some(map)) => map
@@ -798,7 +811,7 @@ impl ResidencyPlanner {
                 // Its own check's refusal is the line's `why`
                 // (`roles_short_why`); a free chunk's event pokes the plan.
                 let end = if stands {
-                    "the head's placement stands: sent again once more chunks stand free than its refusal left"
+                    "the head's placement stands: sent again once room is given back since its refusal"
                 } else {
                     "the map stands the head and its own check refuses it (why=)"
                 };
@@ -829,9 +842,23 @@ impl ResidencyPlanner {
                 host_short,
                 &unhostable,
             );
-            self.note_short(victims.head, deficit, host);
-            // The policy asked with nothing in flight while the map of every
-            // process names moves for the head: a quiet wait too, said with
+            // Asked once for a head and room: asked again on the same room,
+            // the ask's answer (none) planned at once, a pass that spun
+            // (the simulation's Metal mix, seed 183: the policy asked
+            // hundreds of thousands of times a minute, nothing moving). The
+            // rest of the pass still reads the fleet (a hog, a starvation:
+            // what changes beside the room); only the ask is not sent again.
+            let gives = self.port.room_gives();
+            let asked_again = self.with_inner(|inner| {
+                let again = inner.policy_asked == Some((victims.head, gives));
+                inner.policy_asked = Some((victims.head, gives));
+                again
+            });
+            if !asked_again {
+                self.note_short(victims.head, deficit, host);
+            }
+            // The policy asked with nothing in flight while the map of what
+            // a step moves names moves for the head: a quiet wait too, said with
             // who those moves name and why this pass moved none of them
             // (the L40S at 3 GiB on f623134fc: kv resident 0, need_moves 7,
             // "no pick: the policy is asked", 185 s with no serve).
@@ -840,16 +867,16 @@ impl ResidencyPlanner {
                 && let Some(need) = shape.as_ref()
                 && self.with_inner(|inner| inner.nothing_in_flight())
             {
-                // Every process but the head: its own parts are no move
-                // made for it.
-                let everyone: Vec<ProcessId> = self.with_inner(|inner| {
-                    inner
-                        .procs
-                        .keys()
-                        .copied()
-                        .filter(|pid| *pid != victims.head_pid)
-                        .collect()
-                });
+                // Only moves a step can make: the victim set's members (the
+                // head's own parts, a process in a fire, one the finisher's
+                // gate or its request keeps, are no move made for it) and
+                // parked state's moves down. Read over every process, the
+                // map named residents no step moves (the M1 at beam x40:
+                // guest channels packed in one chunk beside firing
+                // processes'; the simulation's Metal mix, residents kept in
+                // their requests), and a wait on them was said as a bug.
+                let everyone: Vec<ProcessId> =
+                    victims.members.iter().map(|victim| victim.pid).collect();
                 let mut all = self.occupants(&everyone);
                 all.merge(self.parked_map(victims.head_pid));
                 // A named one whose move found no room below (or nothing to
@@ -963,11 +990,21 @@ impl ResidencyPlanner {
     /// the moves it plans read the store's placement, [`Self::head_placement`]).
     pub(super) fn no_more_room_than_refused(&self, pid: ProcessId) -> bool {
         let free = self.port.free_chunks();
+        let gives = self.port.room_gives();
         self.with_inner(|inner| {
             let Some(proc) = inner.procs.get(&pid) else {
                 return false;
             };
-            if !proc.roles_short_free.is_some_and(|left| free <= left) {
+            // The room moved where more chunks stand free, or where any was
+            // given back since (a compaction's run opened, a release): read
+            // as a count alone, a compaction that opened the second run of
+            // thirty while takes elsewhere left fewer chunks free stood the
+            // placement, and the restore held for good on "no more room"
+            // (the M1's run 4b: 110 free at the refusal, 104 with both runs
+            // standing, 196 s of stalls).
+            if !proc.roles_short_free.is_some_and(|left| free <= left)
+                || proc.roles_short_gives != Some(gives)
+            {
                 return false;
             }
             // Refused while another's take could race it, and nothing in
@@ -1211,6 +1248,15 @@ impl ResidencyPlanner {
                         && inner.settled_resident(**pid)
                         // The finisher is no victim ([`super::inner::CapacityGate`]).
                         && !inner.is_finisher(**pid)
+                        // Served its bind's room, it takes it as it wakes.
+                        && !inner.bind_served(**pid)
+                        // The head is a restore of one evicted for this
+                        // process: moved for it, the two went round, each
+                        // evicted for the other's ask (the simulation's
+                        // seed 4255: a bind's victim, restored as the head,
+                        // evicted the bind it was moved for, and was moved
+                        // for it again).
+                        && !inner.evicted_for_by(waiter.pid, **pid)
                         // In its request, it runs to its end but for room
                         // something ranked above it asks
                         // ([`Inner::keeps_room`]).
@@ -1306,6 +1352,8 @@ impl ResidencyPlanner {
                 // gate). The policy picks among the others.
                 if proc.state != Residency::Resident
                     || inner.is_finisher(pid)
+                    || inner.bind_served(pid)
+                    || inner.evicted_for_by(head_pid, pid)
                     || inner.unfired_protects(pid)
                     || proc.restored_past == Some(head_pid)
                     || (proc.rank() <= head_rank && !yields)
@@ -1463,7 +1511,14 @@ impl ResidencyPlanner {
                         .zip(&rs_quotes)
                         .filter_map(|((pid, quote), &rs)| {
                             let proc = inner.procs.get(pid)?;
-                            if (proc.rank() <= head_rank && !proc.idle && !proc.held)
+                            // Restored past this head while it stood passed
+                            // over: the last resort keeps that rule too, or
+                            // it went round with the head, restored past it
+                            // and moved for it again (the simulation's seed
+                            // 361).
+                            if proc.restored_past == Some(waiter.pid)
+                                || proc.last_resort_for == Some(waiter.pid)
+                                || (proc.rank() <= head_rank && !proc.idle && !proc.held)
                                 || (proc.holder && !proc.idle)
                                 || proc.state != Residency::Resident
                                 || inner.host_swap_blocked.contains(pid)
@@ -1498,6 +1553,23 @@ impl ResidencyPlanner {
         let (Some(head), false) = (head, picks.is_empty()) else {
             return false;
         };
+        tracing::debug!(
+            ?head,
+            picks = ?picks.iter().map(|&(pid, _)| pid).collect::<Vec<_>>(),
+            "planner: the last resort moves residents the victim set found no fresh one among"
+        );
+        // Moved for this head once by the last resort, a victim is not
+        // again until the head arrives: moved for pages, it formed the
+        // head nothing, was restored and moved again (the simulation's
+        // seed 361).
+        self.with_inner(|inner| {
+            let head_pid = inner.queue.get(&head).map(|waiter| waiter.pid);
+            for &(pid, _) in &picks {
+                if let Some(proc) = inner.procs.get_mut(&pid) {
+                    proc.last_resort_for = head_pid;
+                }
+            }
+        });
         if !self.commit_evictions(head, picks, true) {
             return false;
         }

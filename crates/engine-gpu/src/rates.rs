@@ -2603,6 +2603,8 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         curve.into_iter().map(|(x, r)| (x, r / 1e3)).collect()
     };
     let mut rates = Rates {
+        landing: None,
+        load_width: None,
         launch_ns: want.launch.then_some(launch_ns),
         // A curve with no point measured is stated as none: the load is
         // refused by its key (`rates_at_load`), never weighed by nothing.
@@ -4024,6 +4026,8 @@ mod wanted_tests {
     #[test]
     fn a_step_times_only_what_the_profile_lacks() {
         let all = Rates {
+            landing: None,
+            load_width: None,
             launch_ns: Some(3000),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 5.0)]),

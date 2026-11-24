@@ -166,6 +166,7 @@ fn a_refused_lane_is_refused_alone() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     // The activation at its widest, as the other shell tests take it: a
@@ -232,6 +233,7 @@ fn a_refused_lane_is_refused_alone() {
         .iter()
         .enumerate()
         .map(|(slot, tokens)| Seated {
+            replay_stated: None,
             kv_less: true,
             ..Seated::of(engine_metal::Lane {
                 slot: slot as u32,

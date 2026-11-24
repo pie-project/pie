@@ -36,15 +36,18 @@ seeded!(
     // Committed measured profiles (`pie tune export --engine vulkan`).
     "nvidia-rtx-pro-4500-blackwell.measured.toml",
     "adreno-tm-840.measured.toml",
+    "nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.measured.toml",
 );
 
 /// The host covers committed for this backend's devices
 /// (`profiles/<device>.covers.json`, `pie tune export --engine vulkan`),
 /// each listed here: the runtime takes a cover whose key matches where the
 /// home's own cache holds none (`engine::Engine::committed_covers`).
-pub const COVERS: &[&str] = &[include_str!(
-    "../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"
-)];
+pub const COVERS: &[&str] = &[
+    include_str!("../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"),
+    include_str!("../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"),
+    include_str!("../profiles/adreno-tm-840.covers.json"),
+];
 
 /// What a device no family file applies to runs.
 pub const DERIVED: &str = include_str!("derived.toml");

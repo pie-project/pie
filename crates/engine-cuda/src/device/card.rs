@@ -94,24 +94,50 @@ fn runtime() -> Result<(u64, u64)> {
     Ok((free as u64, total as u64))
 }
 
+/// Whose memory device `ordinal`'s is: the host's where the runtime states
+/// it integrated (`cudaDevAttrIntegrated`: the Spark, Jetson-class parts, an
+/// APU under ROCm), else its own. Where it is the host's, the load states no
+/// host tier ([`engine::DeviceMemory::host_tier`]).
+pub fn whose_memory(ordinal: i32) -> Result<engine::DeviceMemory> {
+    #[cfg(feature = "device")]
+    {
+        use crate::device::rt;
+
+        let mut flag = 0i32;
+        // SAFETY: a live out-parameter; the call only writes it.
+        let asked = unsafe {
+            rt::cudaDeviceGetAttribute(
+                &raw mut flag,
+                rt::cudaDeviceAttr::cudaDevAttrIntegrated,
+                ordinal,
+            )
+        };
+        crate::device::ctx::check("cudaDeviceGetAttribute(Integrated)", asked)?;
+        Ok(integrated_memory(flag))
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = ordinal;
+        Err(crate::error::Fault::Runtimeless)
+    }
+}
+
+/// Whose memory a device's is, of its `cudaDevAttrIntegrated` flag.
+#[must_use]
+pub fn integrated_memory(flag: i32) -> engine::DeviceMemory {
+    if flag == 0 {
+        engine::DeviceMemory::Own
+    } else {
+        engine::DeviceMemory::Hosts
+    }
+}
+
 /// The bound device's capacity terms where it is an integrated device on
 /// Windows; `None` for any other device.
 #[cfg(all(feature = "device", windows, feature = "cuda"))]
 pub fn integrated() -> Result<Option<Integrated>> {
-    use crate::device::rt;
-
     let device = crate::device::ctx::current()?;
-    let mut flag = 0i32;
-    // SAFETY: a live out-parameter; `device` is the bound ordinal.
-    let asked = unsafe {
-        rt::cudaDeviceGetAttribute(
-            &raw mut flag,
-            rt::cudaDeviceAttr::cudaDevAttrIntegrated,
-            device,
-        )
-    };
-    crate::device::ctx::check("cudaDeviceGetAttribute(Integrated)", asked)?;
-    if flag == 0 {
+    if !whose_memory(device)?.unified() {
         return Ok(None);
     }
     let (dedicated, held) = nvml::memory(device)?;
@@ -245,9 +271,28 @@ mod nvml {
 
 #[cfg(test)]
 mod tests {
-    use super::Integrated;
+    use super::{Integrated, integrated_memory};
 
     const MIB: u64 = 1 << 20;
+
+    /// The Spark (sm_121) and a Jetson state `cudaDevAttrIntegrated` = 1:
+    /// no host tier there, and a stated one is refused by name. A discrete
+    /// card (0) seats what is stated, or its default, as before.
+    #[test]
+    fn an_integrated_device_states_no_host_tier_and_refuses_a_stated_one() {
+        let integrated = integrated_memory(1);
+        assert_eq!(integrated, engine::DeviceMemory::Hosts);
+        assert_eq!(integrated.host_tier(None), Ok(engine::HostTier::Absent));
+        let refused = integrated.host_tier(Some(32 << 30)).unwrap_err();
+        assert!(refused.contains("`[engine.memory] budget_host`"), "{refused}");
+        let discrete = integrated_memory(0);
+        assert_eq!(discrete, engine::DeviceMemory::Own);
+        assert_eq!(discrete.host_tier(None), Ok(engine::HostTier::Seated(None)));
+        assert_eq!(
+            discrete.host_tier(Some(32 << 30)),
+            Ok(engine::HostTier::Seated(Some(32 << 30)))
+        );
+    }
 
     #[test]
     fn an_integrated_device_takes_its_carve_out_less_what_is_held() {

@@ -6,13 +6,18 @@
 //! from a checkpoint seeded by plane name over a fixed script of prefills
 //! and greedy decodes, and each step's logits hashed bit for bit. A change
 //! that must not move a logit (a memory layout, an address) is proven by
-//! the same hashes before and after it.
+//! the same hashes before and after it. Every model is served once first,
+//! so the cache's profile holds every product shape the set meets before
+//! any logit is hashed; the hashes are then taken under that profile held
+//! fixed, and the output names its md5 (`golden profile md5 <md5>`): a run
+//! under another profile may pick other kernels, which a check says.
 //!
 //! A dense product's kernel is chosen by its shape alone (a streaming
 //! skeleton for few rows, else cuBLASLt's first heuristic); nothing is timed
 //! at load, so every run sums each product in the same order. The cache is
-//! shared across runs (`PIE_GOLDEN_CACHE`, by default `pie-golden-cache`
-//! under the system's temp dir). Each model is served twice in its process,
+//! shared across runs (`PIE_GOLDEN_CACHE`, which must be set: a run without
+//! it is refused rather than rebuilding every fixture), each fixture named by
+//! its model and a hash of the planes it holds. Each model is served twice in its process,
 //! and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
@@ -351,11 +356,15 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     });
     let serving = serving || encoded;
     let suffix = if serving { "serving.zt" } else { "zt" };
-    let container = dir.join(format!("{model}.{suffix}"));
+    // Named by the planes it holds as well as the model: a fixture seeded
+    // for another trace (a plane renamed or reshaped, another drafter, a
+    // seeding changed) is another file, never served for this one.
+    let key = fixture_key(&trace, serving);
+    let container = dir.join(format!("{model}-{key:016x}.{suffix}"));
     if !container.exists() {
         let partial = dir.join(format!("{model}.{suffix}.{}", std::process::id()));
         if encoded {
-            let floats = dir.join(format!("{model}.floats.zt"));
+            let floats = dir.join(format!("{model}-{key:016x}.floats.zt"));
             if !floats.exists() {
                 let seeded = dir.join(format!("{model}.floats.zt.{}", std::process::id()));
                 write_checkpoint(&seeded, &trace);
@@ -387,6 +396,11 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
         }
         std::fs::rename(&partial, &container)
             .unwrap_or_else(|why| panic!("{}: {why}", container.display()));
+        if encoded {
+            // The seeded floats are the import's input alone: the artifact
+            // is what every later run reads.
+            let _ = std::fs::remove_file(dir.join(format!("{model}-{key:016x}.floats.zt")));
+        }
     }
     let source = ztensor::Source::open(&container).expect("the fixture opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
@@ -400,9 +414,41 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     }
 }
 
+/// The version of the bytes a fixture is seeded with: bumped whenever
+/// [`seeded_planes`], [`write_checkpoint`], [`write_serving`] or the
+/// artifact import write other bytes for the same planes, so no fixture of
+/// the old seeding is read again.
+const SEEDING: u32 = 1;
+
+/// The name a fixture is cached under past its model's: the seeding's
+/// version, the form (serving or not) and each checkpoint plane's name,
+/// shape, dtype and layout, hashed.
+fn fixture_key(trace: &Trace, serving: bool) -> u64 {
+    let mut key = fnv_bytes(FNV, &SEEDING.to_le_bytes());
+    key = fnv_bytes(key, &[u8::from(serving)]);
+    for param in trace
+        .params
+        .iter()
+        .filter(|p| p.source == ParamSource::Checkpoint)
+    {
+        key = fnv_bytes(key, param.name.as_bytes());
+        key = fnv_bytes(key, &[0]);
+        for &extent in &param.shape {
+            key = fnv_bytes(key, &extent.to_le_bytes());
+        }
+        key = fnv_bytes(
+            key,
+            format!("{:?} {:?};", param.dtype, param.layout).as_bytes(),
+        );
+    }
+    key
+}
+
+/// The fixture cache, `PIE_GOLDEN_CACHE`: refused unset, since a default
+/// in a run's own temp dir rebuilds every fixture (tens of GB) each run.
 pub(super) fn cache_dir() -> PathBuf {
     std::env::var_os("PIE_GOLDEN_CACHE").map_or_else(
-        || std::env::temp_dir().join("pie-golden-cache"),
+        || panic!("set PIE_GOLDEN_CACHE to the fixture cache; unset would rebuild every fixture"),
         PathBuf::from,
     )
 }
@@ -545,7 +591,10 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
             }
         }
     }
-    assert!(served > 0, "no budget served the declared context cut to its room");
+    assert!(
+        served > 0,
+        "no budget served the declared context cut to its room"
+    );
 }
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
@@ -564,6 +613,7 @@ pub(super) fn knobs() -> engine_cuda::Knobs {
     }
     // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
     knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
+    knobs.diagnostics.windowed_state = std::env::var_os("PIE_GOLDEN_WINDOWED_STATE").is_some();
     knobs.diagnostics.arm_trace = std::env::var_os("PIE_GOLDEN_ARM_TRACE").is_some();
     // `PIE_GOLDEN_TIER_INLINE`: tier copies ride the compute stream.
     knobs.diagnostics.tier_inline = std::env::var_os("PIE_GOLDEN_TIER_INLINE").is_some();
@@ -615,6 +665,19 @@ fn fire(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> Vec<f32> {
 /// The model served over [`SCRIPT`]: each step's logits' hash and top token.
 fn served(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let mut shell = load(fixture, cache);
+    if std::env::var_os("PIE_GOLDEN_FACTS").is_some() {
+        let facts = shell.chunk_facts().expect("the pool states its chunks");
+        eprintln!(
+            "golden-facts {} chunk {} shapes {:?}",
+            fixture.model,
+            facts.chunk_bytes,
+            facts
+                .shapes
+                .iter()
+                .map(|s| (s.id.0, s.role, s.slot_bytes, s.slots_per_chunk, s.kind.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
     shell.open(0).expect("slot 0 opens");
     let mut fed = 0u32;
     let mut last = None;
@@ -1030,8 +1093,6 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
             Some(256 << 20),
             Some(dir.path()),
             false,
-            1,
-            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -1250,8 +1311,6 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
             Some(budget),
             Some(dir.path()),
             false,
-            1,
-            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -1260,8 +1319,15 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
     facts.validate().expect("the engine's chunk facts hold");
     // The budget divides into disk chunks of a pool chunk each, on the
     // direct I/O boundary, laid out as the device's.
-    assert_eq!(facts.disk_chunks, chunks, "{model}: the facts state the disk chunks");
-    assert_eq!(u64::from(chunks), budget / disk_chunk, "{model}: disk chunks of the budget");
+    assert_eq!(
+        facts.disk_chunks, chunks,
+        "{model}: the facts state the disk chunks"
+    );
+    assert_eq!(
+        u64::from(chunks),
+        budget / disk_chunk,
+        "{model}: disk chunks of the budget"
+    );
     let parked: Vec<engine::chunk::SlotShape> = facts
         .shapes
         .iter()
@@ -1424,7 +1490,12 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
         }
         println!("{}: every round trip bit-exact", what("parks"));
         let held = match (shape.role, &shape.kind) {
-            (_, engine::chunk::SlotKind::List { window: Some(_), .. }) => "window".to_string(),
+            (
+                _,
+                engine::chunk::SlotKind::List {
+                    window: Some(_), ..
+                },
+            ) => "window".to_string(),
             (engine::chunk::SlotRole::State, engine::chunk::SlotKind::List { .. }) => {
                 "kv".to_string()
             }
@@ -1476,7 +1547,20 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
         return;
     }
     let cache = cache_dir();
-    let mut lines = Vec::new();
+    // The measuring pass: every model served once, so each product shape any
+    // of them meets is measured and kept in the cache's profile before a
+    // logit is hashed. A model hashed while a later model still measured
+    // shapes it shares would hash picks the next run no longer makes.
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        let _ = served(&fixture, &cache);
+    }
+    // The profile the hashes are taken under, held fixed from here: its
+    // md5 names the picks, so a change of them shows as a new profile, not
+    // as a moved logit.
+    let profile = profile_md5(&cache);
+    let mut lines = vec![format!("golden profile md5 {profile}")];
+    println!("{}", lines[0]);
     for model in models() {
         let fixture = fixture(&model, &cache);
         // The warming serving: every product's algorithm picked and kept.
@@ -1510,7 +1594,17 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
             })
             .collect();
         let mut moved = Vec::new();
-        for line in &lines {
+        let wanted_profile = text
+            .lines()
+            .find_map(|line| line.strip_prefix("golden profile md5 "))
+            .unwrap_or("not stated");
+        if wanted_profile != profile {
+            eprintln!(
+                "golden: the profile the hashes were taken under is {profile}, the file's \
+                 {wanted_profile}: the picks may differ, and with them the logits"
+            );
+        }
+        for line in lines.iter().filter(|line| !line.starts_with("golden profile ")) {
             let words: Vec<&str> = line.split_whitespace().collect();
             let key = (words[1].to_string(), words[2].to_string());
             match want.get(&key) {
@@ -1523,6 +1617,52 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
         }
         assert!(moved.is_empty(), "logits moved:\n  {}", moved.join("\n  "));
     }
+}
+
+/// The md5 of every stored input a load selects its kernels and bodies by:
+/// the profile its measurements are kept in (`knobs`: the cache's
+/// `profiles`), the bodies records and the host covers, every file in path
+/// order, by `md5sum`; "none" where there is no file. A cold cache reads as
+/// another configuration.
+fn profile_md5(cache: &Path) -> String {
+    let mut files = Vec::new();
+    let mut dirs = vec![cache.join("profiles"), cache.join("bodies"), cache.join("cover")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return "none".to_string();
+    }
+    let mut bytes = Vec::new();
+    for file in &files {
+        bytes.extend(std::fs::read(file).unwrap_or_default());
+    }
+    let mut child = std::process::Command::new("md5sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("md5sum runs");
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .expect("md5sum's stdin")
+        .write_all(&bytes)
+        .expect("the profile reaches md5sum");
+    let out = child.wait_with_output().expect("md5sum answers");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("none")
+        .to_string()
 }
 
 /// The rows a page of the load's rs buffer holds: the rs list's tokens.
@@ -1843,6 +1983,363 @@ fn golden_buffered_carrying() {
     );
 }
 
+/// Decode steps a lagged lane takes: a fold behind its rows by the lag.
+const LAGGED_STEPS: u32 = 30;
+
+/// A prefill folded as it lands, then [`LAGGED_STEPS`] decodes of a fixed
+/// script, each buffering its row and folding so that `lag` rows stay
+/// unfolded behind it (a run-ahead decode whose rows are folded once they
+/// are accepted): from the lag on, each decode carries `lag` rows into its
+/// step and commits the oldest of them, every `max(7, lag + 3)`-th step
+/// committing them all (so a lag of 20 is reached) and every fifth one
+/// none. `lag` 0 folds each row as it lands. Each step's logits, and the
+/// fires of the decodes walked with no body.
+fn served_lagged(fixture: &Fixture, cache: &Path, lag: u32) -> (Vec<Vec<f32>>, u64) {
+    served_lagged_over(fixture, cache, lag, TOKENS, LAGGED_STEPS)
+}
+
+/// [`served_lagged`] on a load whose fires take `tokens` rows, over
+/// `decodes` decodes.
+fn served_lagged_over(
+    fixture: &Fixture,
+    cache: &Path,
+    lag: u32,
+    tokens: u32,
+    decodes: u32,
+) -> (Vec<Vec<f32>>, u64) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, tokens),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    shell.open(0).expect("slot 0 opens");
+    let mut steps = Vec::new();
+    let mut step = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = engine_cuda::Seated {
+            rs,
+            ..engine_cuda::Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        steps.push(rows.swap_remove(0));
+    };
+    let prompt: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+    let mut fed = prompt.len() as u32;
+    // A lagged lane's prompt leaves its last rows unfolded too, so its
+    // chunked fire lands what a decode reads them by.
+    let mut folded = fed - lag.min(4);
+    let rs = if lag == 0 {
+        RsVerb::Fold
+    } else {
+        RsVerb::Buffer {
+            pages: (0..fed.div_ceil(page)).collect(),
+            base: 0,
+            folded: 0,
+            fold: FoldLen::Host(folded),
+            lineage: engine::fire::Lineage::Set,
+        }
+    };
+    step(&mut shell, &prompt, rs);
+    let before = shell.body_stats().tally;
+    for at in 0..decodes {
+        let token = (fed * 7 + 11) % 1000;
+        if lag == 0 {
+            step(&mut shell, &[token], RsVerb::Fold);
+            fed += 1;
+            folded += 1;
+            continue;
+        }
+        let end = fed + 1;
+        let base = folded / page * page;
+        let whole = 7.max(lag + 3);
+        let fold = match at {
+            _ if at % whole == whole - 1 => end - folded,
+            _ if at % 5 == 4 => 0,
+            _ => (end - folded).saturating_sub(lag),
+        };
+        step(
+            &mut shell,
+            &[token],
+            RsVerb::Buffer {
+                pages: (base / page..end.div_ceil(page)).collect(),
+                base,
+                folded,
+                fold: FoldLen::Host(fold),
+                lineage: engine::fire::Lineage::Set,
+            },
+        );
+        fed = end;
+        folded += fold;
+    }
+    let after = shell.body_stats().tally;
+    (steps, after.eager_unbodied - before.eager_unbodied)
+}
+
+/// A lane folding `lag` rows behind its decodes answers, step for step,
+/// what the lane folding each row as it lands answers, to the tolerance of
+/// the two forms of the recurrence: its decode step reads the buffered rows
+/// as a linear attention over their stored keys and corrected values from
+/// the committed state (rounded to bf16 only as a fold stores it), where
+/// the folding lane re-steps and stores the state a row. Its greedy tokens
+/// are the folding lane's but where the two lie within that tolerance.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _) = served_lagged(&fixture, &cache, 0);
+    let lags: Vec<u32> = std::env::var("PIE_GOLDEN_LAGS").map_or_else(
+        |_| vec![1, 2, 3, 9],
+        |lags| lags.split(',').map(|lag| lag.parse().expect("a lag")).collect(),
+    );
+    for lag in lags {
+        let (lagged, unbodied) = served_lagged(&fixture, &cache, lag);
+        assert_eq!(lagged.len(), folded.len());
+        let mut worst = 0f32;
+        let mut moved = 0usize;
+        let mut flips = 0usize;
+        for (lagged, folded) in lagged.iter().zip(&folded) {
+            let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+            let apart = lagged
+                .iter()
+                .zip(folded)
+                .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+            worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+            moved += usize::from(lagged != folded);
+            let (a, b) = (argmax(lagged), argmax(folded));
+            if a != b {
+                let mut sorted = folded.clone();
+                sorted.sort_by(|x, y| y.total_cmp(x));
+                let gap = (sorted[0] - sorted[1]) / scale.max(f32::MIN_POSITIVE);
+                if gap > 0.02 {
+                    flips += 1;
+                }
+            }
+            if std::env::var_os("PIE_GOLDEN_LAG_STEPS").is_some() {
+                println!("lag {lag} step: apart {:e}", apart / scale.max(f32::MIN_POSITIVE));
+            }
+        }
+        println!(
+            "golden {model}-lagged lag {lag}: {} steps, {moved} differ, logits apart by \
+             {worst:e} of their scale, {flips} greedy token(s) flipped off a near tie, \
+             {unbodied} decode(s) walked with no body",
+            lagged.len()
+        );
+        // The two forms round apart: the folding lane's step rounds the
+        // decayed state to bf16 before its update and stores it a row, the
+        // lagged lane's sums in f32 and rounds as a fold stores. On this
+        // miniature they lie 0.012 to 0.023 of their scale apart, the own
+        // row's step alone as much as a lag of eleven (the chunked replay's
+        // band beside the scan's is 0.013 to 0.035, `golden_buffered_carrying`).
+        assert!(
+            worst < 0.05 && flips == 0,
+            "at a lag of {lag} the lagged lane's logits lie {worst:e} of their scale from the \
+             folded lane's, {flips} greedy token(s) flipped"
+        );
+        assert_eq!(unbodied, 0, "a lagged decode walked with no body");
+    }
+}
+
+/// A lane alone on its set carrying more rows unfolded than nine of its
+/// fires' widths (the most a per-fire page table held) answers what the
+/// folding lane answers, to the tolerance of [`golden_lagged`]: its rows
+/// resolve through its own pages on the device, whatever it carries.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged_past_the_fire() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const FIRE: u32 = 64;
+    const STEPS: u32 = 9 * FIRE + 40;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _) = served_lagged_over(&fixture, &cache, 0, FIRE, STEPS);
+    let (lagged, unbodied) = served_lagged_over(&fixture, &cache, STEPS + 8, FIRE, STEPS);
+    assert_eq!(lagged.len(), folded.len());
+    let mut worst = 0f32;
+    let mut flips = 0usize;
+    for (lagged, folded) in lagged.iter().zip(&folded) {
+        let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+        let apart = lagged
+            .iter()
+            .zip(folded)
+            .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+        worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+        if argmax(lagged) != argmax(folded) {
+            let mut sorted = folded.clone();
+            sorted.sort_by(|x, y| y.total_cmp(x));
+            if (sorted[0] - sorted[1]) / scale.max(f32::MIN_POSITIVE) > 0.02 {
+                flips += 1;
+            }
+        }
+    }
+    println!(
+        "golden {model}-lagged past the fire: {} steps carrying up to {} rows on {FIRE}-row \
+         fires, logits apart by {worst:e} of their scale, {flips} flipped, {unbodied} unbodied",
+        lagged.len(),
+        STEPS + 4
+    );
+    assert!(
+        worst < 0.05 && flips == 0,
+        "carrying past the fire the lane's logits lie {worst:e} of their scale from the folded \
+         lane's, {flips} greedy token(s) flipped"
+    );
+}
+
+/// Decode steps the pace probe times a schedule.
+const PACE_STEPS: u32 = 240;
+
+/// The median wall time of a one-lane decode step on `fixture` under each
+/// schedule of `PIE_GOLDEN_PACE` (a comma list; by default `0,1,11,w10`):
+/// a number keeps that many rows unfolded behind each decode, `w<n>` folds
+/// the accepted rows whole once they fill a window of `n` (the runtime's
+/// run-ahead lag), 0 folds each row as it lands. Each schedule is served by
+/// its own load after a warm pass.
+fn served_pace(fixture: &Fixture, cache: &Path, schedule: &str) -> f64 {
+    use engine::fire::{FoldLen, RsVerb};
+    let (lag, window) = match schedule.strip_prefix('w') {
+        Some(w) => (0, w.parse::<u32>().expect("a window")),
+        None => (schedule.parse::<u32>().expect("a lag"), 0),
+    };
+    let mut shell = Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(1, TOKENS),
+        patches: None,
+        voxels: None,
+        page_size: PAGE,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: None,
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
+        ordinal: 0,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    let mut times = Vec::new();
+    for pass in 0..2 {
+        shell.open(pass).expect("the pass's slot opens");
+        let prompt: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+        let fire = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+            let word = fixture.trace.facts.word(&Request::new(
+                u32::try_from(tokens.len()).expect("a count"),
+                false,
+            ));
+            let seated = engine_cuda::Seated {
+                rs,
+                ..engine_cuda::Seated::of(Lane {
+                    slot: pass,
+                    word,
+                    tokens,
+                })
+            };
+            let at = std::time::Instant::now();
+            let rows = shell.fire_media(&[seated], &[], &[]).expect("the step fires");
+            (argmax(&rows[0]), at.elapsed().as_secs_f64())
+        };
+        let (mut last, _) = fire(&mut shell, &prompt, RsVerb::Fold);
+        let mut fed = prompt.len() as u32;
+        let mut folded = fed;
+        for _ in 0..PACE_STEPS {
+            let end = fed + 1;
+            let (top, secs) = if lag == 0 && window == 0 {
+                fire(&mut shell, &[last], RsVerb::Fold)
+            } else {
+                let unfolded = end - folded;
+                let fold = if window > 0 {
+                    if unfolded > window { unfolded - 1 } else { 0 }
+                } else {
+                    unfolded.saturating_sub(lag)
+                };
+                let base = folded / page * page;
+                let rs = RsVerb::Buffer {
+                    pages: (base / page..end.div_ceil(page)).collect(),
+                    base,
+                    folded,
+                    fold: FoldLen::Host(fold),
+                    lineage: engine::fire::Lineage::Set,
+                };
+                let out = fire(&mut shell, &[last], rs);
+                folded += fold;
+                out
+            };
+            last = top;
+            fed = end;
+            if pass == 1 {
+                times.push(secs);
+            }
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// The pace probe ([`served_pace`]): `pace <model> <schedule> <ms>` lines.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged_pace() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let schedules = std::env::var("PIE_GOLDEN_PACE").unwrap_or_else(|_| "0,1,11,w10".to_string());
+    for schedule in schedules.split(',') {
+        let secs = served_pace(&fixture, &cache, schedule);
+        println!("pace {model} {schedule} {:.4} ms", secs * 1e3);
+    }
+}
+
 /// Two lanes of two seats that buffer their rows past the state in one fire
 /// a step: a 12-row prefill each folded as it lands, then decodes folded
 /// late (none, two, or all a step), the lanes out of step with each other.
@@ -2140,6 +2637,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             residency: load::Residency::default(),
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     let facts = loaded.caps.chunks.clone();
@@ -2752,7 +3250,10 @@ fn golden_measuring_refit() {
         };
         let recorded = {
             let mut shell = load_with(&fixture, &own, told());
-            shell.chunk_facts().expect("the pool states its chunks").total_chunks
+            shell
+                .chunk_facts()
+                .expect("the pool states its chunks")
+                .total_chunks
         };
         let _ = std::fs::remove_dir_all(&own);
         let slack = u32::try_from(took.div_ceil(chunk.max(1))).unwrap_or(u32::MAX);
@@ -3622,5 +4123,46 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
         for model in models() {
             println!("reads {model} {:?}", read_set(&model, &cache));
         }
+    }
+}
+
+/// CONTRACT-BC 19: a load serving its windowed rows as ring + buffer arms
+/// every composition it fires, as its window lists do (the arming pass's
+/// synthetic lanes fold on records of their own): `PIE_GOLDEN_MODELS`
+/// (default the mini Gemma and MiMo, windowed beside full attention, MiMo's
+/// routed), many seats.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_windowed_arms() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
+        |_| vec!["gemma4-e4b-mini-l6".to_string(), "mimo26-flash-mini".to_string()],
+        |_| models(),
+    );
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        let mut knobs = knobs();
+        knobs.diagnostics.windowed_state = true;
+        let shell = load_lanes(&fixture, &cache, knobs, 16, None);
+        assert!(
+            !shell.windowed_layers().is_empty(),
+            "{model}: the load keeps rings"
+        );
+        let armed = shell.armed().expect("the load armed its lattice");
+        println!(
+            "windowed arms {model}: {} of {} compositions",
+            armed.armed, armed.wanted
+        );
+        assert!(
+            armed.wanted > 0 && armed.armed == armed.wanted,
+            "{model}: {} of {} compositions armed ({:?})",
+            armed.armed,
+            armed.wanted,
+            armed.last_refusal
+        );
     }
 }

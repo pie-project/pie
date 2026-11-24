@@ -307,12 +307,36 @@ pub struct WindowMap {
 pub const DROP: i32 = i32::MAX;
 
 /// The carried rows a fire of a `rung`-token rung replays at most, summed
-/// over its lanes (`engine::fire::rung_rows`): its rung's tokens. The one
+/// over its lanes (`engine::fire::rung_holds`): its rung's tokens. The one
 /// place the bound is read: a fire past it is refused at prepare, and a
 /// fire that replays lays each window's scratch for it.
 #[must_use]
 pub fn carried_room(rung: u32) -> u32 {
     rung
+}
+
+/// What a `rung`-token rung holds of a fire's replay, as the load states it
+/// (`ChunkFacts::act_replay`) and prepare checks it, both by
+/// `engine::fire::rung_holds`: its own rows at most the rung's tokens, and
+/// its window scratch, one row each of every lane's replayed rows (a decode
+/// lane's included: the scratch lays them, so the load is not compact) and
+/// of its own, at most the rung's own rows and its carried room
+/// ([`carried_room`]), the room [`WindowMap::of`] lays. The scratch is
+/// stated as one byte a row, so the bytes bound is that row bound.
+#[must_use]
+pub fn rung_replay(rung: u32) -> engine::RungReplay {
+    let mut scratch = engine::ScratchBytes {
+        slot_bytes: vec![1],
+        lane_bytes: 0,
+        room_bytes: 0,
+        pad: 1,
+    };
+    scratch.room_bytes = scratch.bytes(rung.saturating_add(carried_room(rung)), 1);
+    engine::RungReplay {
+        own_max: Some(rung),
+        carried_max: None,
+        scratch,
+    }
 }
 
 impl WindowMap {

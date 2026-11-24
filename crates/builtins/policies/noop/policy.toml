@@ -1,5 +1,0 @@
-# Installs nothing, so the worker keeps its default order: the baseline arm
-# every other policy is compared against.
-plane = "worker"
-subscribe = []
-grants = []

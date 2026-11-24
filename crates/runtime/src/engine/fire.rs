@@ -16,9 +16,22 @@ pub struct FireRequest {
     pub media: Vec<engine::fire::StepMedia>,
     /// The recurrent rows its lanes carry unfolded into the fire, which it
     /// replays ahead of its own, summed over them
-    /// ([`engine::fire::rung_rows`]): their count where the host places
+    /// ([`engine::fire::rung_holds`]): their count where the host places
     /// its rows, a bound on it where the device does.
     pub carried: u32,
+    /// The buffered recurrent rows its lanes replay ahead of their own,
+    /// summed over every lane, a decode lane's included: what the engine's
+    /// stated [`::engine::FireLimits::replayed_rows`] bounds a step by.
+    pub replayed: u32,
+    /// Its rs scratch is compact ([`::engine::fire::scratch_compact`], as
+    /// the runtime evaluated it from what it puts in the fire).
+    pub scratch_compact: bool,
+    /// The load's stated rungs ([`::engine::RungReplay`], by tokens), on a
+    /// fire carrying recurrent state: a step of several such fires runs at
+    /// the rung its members' rows together pick, and takes no more of them
+    /// than that rung's replay scratch holds together. `None` on a fire
+    /// carrying none.
+    pub replay_rungs: Option<crate::store::shared::Replays>,
     /// The ring ends this fire moves. Two fires moving one end never share
     /// a step; the engine picks each move's cell from its ring's cursor.
     pub ring_moves: Vec<RingMove>,
@@ -54,7 +67,7 @@ impl FireRequest {
     }
 
     /// What the fire asks its activation rung for: its own rows, or the
-    /// rows it carries where they are more ([`engine::fire::rung_rows`]).
+    /// rows it carries where they are more ([`engine::fire::rung_holds`]).
     #[must_use]
     pub fn rung_rows(&self) -> usize {
         self.tokens().max(self.carried as usize)
@@ -142,6 +155,11 @@ pub struct StepFire {
     /// its own fire alone.
     pub member_lanes: Vec<u32>,
     pub instances: Vec<::engine::InstanceId>,
+    /// Each fire's logical id and when its request was handed to the
+    /// scheduler, where known (a debug check names a stale request by them).
+    pub fire_stamps: Vec<(u64, std::time::Instant)>,
+    /// Each lane's kv set, in lane order, where known.
+    pub lane_sets: Vec<Option<crate::store::kv::page_table::WorkingSetId>>,
 }
 
 #[derive(Default)]
@@ -218,6 +236,10 @@ mod lane {
         /// Where stated, the slot each of `pages` stands in (a shared
         /// prefix's), in its place.
         pub translation: Vec<u32>,
+        /// The kv set its pages, translation and reserve were read from, as
+        /// they were stamped: a debug check at the engine reads them against
+        /// that set's table as it stands then.
+        pub ws: Option<crate::store::kv::page_table::WorkingSetId>,
     }
 
     impl From<Lane> for FireLane {

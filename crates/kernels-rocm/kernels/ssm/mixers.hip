@@ -12,6 +12,7 @@
 #include "prim/device.hip"
 #include "prim/mfma.hip"
 #include "prim/state_rows.hip"
+#include "ssm/carry.hip"
 
 namespace pie::attn {
 
@@ -129,6 +130,101 @@ __global__ void ssm_conv1d_update(const T* __restrict__ x, const T* __restrict__
     if (fold) {
         for (int k = 0; k < span; ++k) state[k * cs + ci] = state[(k + 1) * cs + ci];
         state[span * cs + ci] = from_f32<T>(xn);
+    }
+}
+
+// A decode step over a lane's carried rows then its own (`Carry`). Row t of
+// the lane's run is a carried row (t < n, its input read from the lane's rs
+// buffer pages, plane 0) or its own (t = n); positions below 0 are the
+// committed window's cells. The own row's output sums its window as
+// `ssm_conv1d_update` does, from at most `K - 1` carried rows; where a
+// recurrence re-steps the carried rows (`carry.scratch`), their outputs land
+// there too. The window is stored as it stands after `commit` rows of the
+// run, never past a row the lane has not committed. The own row's input
+// lands in its buffer (plane 0), and the channels `[k_off, k_off + k_len)` of
+// its output in plane 1 (a gated-delta layer's keys). A thread a channel.
+template <class T, bool SILU = true, bool RESIDUAL = false>
+__global__ void ssm_conv1d_carried(const T* __restrict__ x, const T* __restrict__ weight,
+                                   const T* __restrict__ bias, StateRows rows, T* __restrict__ y, int R,
+                                   int C, int K, int dil, bool write_state, const u8* __restrict__ mask,
+                                   Carry carry, int k_off, int k_len, const u32* __restrict__ win) {
+    constexpr int KMAX = 8;
+    const int r = blockIdx.y;
+    if (r >= R || (win != nullptr && r >= static_cast<int>(win[0]))) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const CarryLane lane_ = carry.lane(rl);
+    const T x_own = x[row * C + c];
+    if (T* dst = carry.own_row<T>(lane_, 0, 0)) dst[c] = x_own;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int cs = rows.atoms;
+    const int ci = c % cs;
+    T* state = rows.piece<T>(rid, c / cs);
+    const int n = carry.carried(lane_);
+    const int span = (K - 1) * dil + 1;
+    auto at = [&](int t) -> float {
+        if (t < 0) return to_f32(state[(span + t) * cs + ci]);
+        if (t < n) return to_f32(carry.carried_row<T>(lane_, t, 0)[c]);
+        return to_f32(x_own);
+    };
+    const float bias_v = bias != nullptr ? to_f32(bias[c]) : 0.f;
+    float wk[KMAX];
+#pragma unroll
+    for (int k = 0; k < KMAX; ++k) wk[k] = k < K ? to_f32(weight[c * K + k]) : 0.f;
+    float acc = bias_v;
+#pragma unroll
+    for (int k = 0; k < KMAX; ++k) {
+        if (k >= K) break;
+        acc += wk[k] * at(n - (K - 1 - k) * dil);
+    }
+    const T out = from_f32<T>(conv_out<SILU, RESIDUAL>(acc, at(n)));
+    y[row * C + c] = out;
+    if (c >= k_off && c < k_off + k_len) {
+        if (T* dst = carry.own_row<T>(lane_, 0, 1)) dst[c - k_off] = out;
+    }
+    const int commit = carry.commit(rl, n + 1);
+    if (!folds(write_state, mask, rl) || commit <= 0) return;
+    // Ascending, each cell reads one above it or a row: the old window is
+    // read before it is overwritten.
+    for (int s = 0; s < span; ++s) state[s * cs + ci] = from_f32<T>(at(commit - span + s));
+}
+
+// A beam group's fold of its conv window (BEAM-PAGE-LISTS §11.3): the window
+// stored as it stands after the group's fold rows (the committed cells, then
+// the rows' inputs, plane 0, through the representative lane's pages), so the
+// committed point moves with the set's recurrent state. A thread a channel;
+// grid ⌈C / block⌉; a block folds each group in turn.
+template <class T>
+__global__ void ssm_conv1d_fold(StateRows rows, int C, int K, int dil, Carry carry,
+                                const GroupFold* __restrict__ folds, int groups) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int cs = rows.atoms;
+        const int ci = c % cs;
+        T* state = rows.piece<T>(rid, c / cs);
+        const int span = (K - 1) * dil + 1;
+        auto at = [&](int t) -> T {
+            if (t < 0) return state[(span + t) * cs + ci];
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, t, slot, pos);
+            return carry.plane_at<const T>(slot, pos, 0)[c];
+        };
+        T cells[8];
+        for (int k = 0; k < span && k < 8; ++k) cells[k] = at(n - span + k);
+        for (int k = 0; k < span && k < 8; ++k) state[k * cs + ci] = cells[k];
     }
 }
 
@@ -493,6 +589,474 @@ __global__ __launch_bounds__(256) void ssm_gdn_decode_step(
     }
 }
 
+// ------------------------------------------------- decode over carried rows --
+
+// A buffered row's log-gate from its `[b | a]`, as `ssm_gdn_prep_ba_gates`
+// forms it.
+__device__ __forceinline__ float gdn_log_gate(const bf16* __restrict__ ba, int h, int V_h,
+                                              const bf16* __restrict__ dt_bias, const float* __restrict__ a_log) {
+    const float z = to_f32(ba[V_h + h]) + to_f32(dt_bias[h]);
+    const float softplus = z > 20.f ? z : log1pf(__expf(z));
+    return -__expf(a_log[h]) * softplus;
+}
+
+// One state row's eight columns folded as `ssm_gdn_decode_step` folds a token
+// and stores it: S' = bf16(bf16(S·g) + k̂·u).
+__device__ __forceinline__ void gdn_fold8(float (&s)[8], float g, float ki, const float* __restrict__ u) {
+#pragma unroll
+    for (int c = 0; c < 8; ++c) s[c] = to_f32(from_f32<bf16>(to_f32(from_f32<bf16>(s[c] * g)) + ki * u[c]));
+}
+
+// `ssm_gdn_decode_step` over a lane's buffered rows then its own (`Carry`:
+// planes `[b | a]`, keys, corrected values `u = β(v − g·Sᵀk̂)`, each written
+// once, when the row was a fire's own). The rows the lane commits among its
+// carried ones fold first, in order and rounded as a step a token rounds
+// them; the rest read as a linear attention over that state,
+//   S_t = G S_c + Σ_s G_s k̂_s u_sᵀ,   G_s = Π_{s<i≤t} g_i,
+// so the own row's u and output take each such row as two dots, its decay
+// formed from the log-gates after it chunk by chunk from the end (never as a
+// difference of sums). Where none is left past the commit, the own row is
+// `ssm_gdn_decode_step`'s arithmetic. The state is stored as it stands after
+// the lane's commit; the own row's `[b | a]` and u land in its buffer (its
+// keys land with the conv's output). Grid (V_d / BV, rows, V_h), block 256.
+template <int BV>
+__global__ __launch_bounds__(256) void ssm_gdn_step_carried(
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, const bf16* __restrict__ ba,
+    const bf16* __restrict__ dt_bias, const float* __restrict__ a_log, StateRows rows, float* __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask,
+    Carry carry, const u32* __restrict__ win) {
+    constexpr int BLOCK = 256, VEC = 8, TPR = BV / VEC, WAVES = BLOCK / kWave, NI = BLOCK / TPR, CH = kWave;
+    static_assert(BV % VEC == 0 && kWave % TPR == 0 && CH <= NI, "a tile row is whole 8-wide packs");
+    __shared__ float sq[NI], sk[NI];
+    __shared__ float red[WAVES][BV];
+    __shared__ float part[3][WAVES];
+    // A chunk of buffered rows: each row's log-gate, key norm and dots with
+    // the own row's q̂ and k̂, then its weights into u and into the output.
+    __shared__ float c_glog[CH], c_nj[CH], c_dq[CH], c_dk[CH], c_wa[CH], c_wo[CH];
+    __shared__ float g_all;
+
+    const int r = blockIdx.y, h = blockIdx.z;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const CarryLane cl = carry.lane(rl);
+    const int n = carry.carried(cl);
+    const int commit = carry.commit(rl, n + 1);
+    const bool fold = folds(write_state, mask, rl) && commit > 0;
+    // The carried rows folded first: those the lane commits.
+    const int c = min(commit, n);
+
+    const int tid = threadIdx.x, wave = tid / kWave, ln = lane();
+    const int h_k = h / (V_h / K_h);
+    const bf16* qkv_row = qkv + row * conv_dim;
+    const int i = tid / TPR;
+    const int j0 = blockIdx.x * BV + (tid % TPR) * VEC;
+    const bool live = i < K_d;
+
+    bf16* cell = rows.atom<bf16>(rid, h, static_cast<long long>(K_d) * V_d) + static_cast<long long>(i) * V_d + j0;
+    Pack8<bf16> sp{};
+    if (live) sp = *reinterpret_cast<const Pack8<bf16>*>(cell);
+    const Pack8<bf16> vp =
+        *reinterpret_cast<const Pack8<bf16>*>(qkv_row + 2LL * K_h * K_d + static_cast<long long>(h) * V_d + j0);
+    const float g_log = gates[row * 2 * V_h + h];
+    const float beta = gates[row * 2 * V_h + V_h + h];
+
+    // The own row's q̂ and k̂ over the key head, and k̂·q̂.
+    const float qv = tid < K_d ? to_f32(qkv_row[h_k * K_d + tid]) : 0.f;
+    const float kv = tid < K_d ? to_f32(qkv_row[K_h * K_d + h_k * K_d + tid]) : 0.f;
+    const float qw = wave_sum(qv * qv), kw = wave_sum(kv * kv), qkw = wave_sum(qv * kv);
+    if (ln == 0) {
+        part[0][wave] = qw;
+        part[1][wave] = kw;
+        part[2][wave] = qkw;
+    }
+    lds_barrier();
+    float qn = 0.f, kn = 0.f, qk = 0.f;
+#pragma unroll
+    for (int w = 0; w < WAVES; ++w) {
+        qn += part[0][w];
+        kn += part[1][w];
+        qk += part[2][w];
+    }
+    const float nq = rsqrtf(qn + 1e-6f) * q_scale, nk = rsqrtf(kn + 1e-6f);
+    if (tid < K_d) {
+        sq[tid] = qv * nq;
+        sk[tid] = kv * nk;
+    }
+    lds_barrier();
+    const float qi = live ? sq[i] : 0.f, ki = live ? sk[i] : 0.f;
+
+    auto column_sum = [&](float (&x)[VEC]) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+#pragma unroll
+            for (int off = TPR; off < kWave; off <<= 1) x[u] += __shfl_xor(x[u], off, kWave);
+        }
+        if (ln < TPR) {
+#pragma unroll
+            for (int u = 0; u < VEC; ++u) red[wave][ln * VEC + u] = x[u];
+        }
+        lds_barrier();
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            float total = 0.f;
+#pragma unroll
+            for (int w = 0; w < WAVES; ++w) total += red[w][(tid % TPR) * VEC + u];
+            x[u] = total;
+        }
+        lds_barrier();
+    };
+    // Rows [lo, lo + m) of the lane's buffered rows into the chunk tables, a
+    // wavefront a row: each one's log-gate, key norm and raw dots.
+    auto chunk = [&](int lo, int m) {
+        for (int e = wave; e < m; e += WAVES) {
+            u64 slot;
+            u32 at;
+            carry.carried_at(cl, lo + e, slot, at);
+            const bf16* krow = carry.plane_at<const bf16>(slot, at, 1) + static_cast<long long>(h_k) * K_d;
+            float kk = 0.f, dq = 0.f, dk = 0.f;
+            for (int x = ln; x < K_d; x += kWave) {
+                const float k = to_f32(krow[x]);
+                kk += k * k;
+                dq += k * sq[x];
+                dk += k * sk[x];
+            }
+            kk = wave_sum(kk);
+            dq = wave_sum(dq);
+            dk = wave_sum(dk);
+            if (ln == 0) {
+                const float nj = rsqrtf(kk + 1e-6f);
+                c_nj[e] = nj;
+                c_dq[e] = dq * nj;
+                c_dk[e] = dk * nj;
+                c_glog[e] = gdn_log_gate(carry.plane_at<const bf16>(slot, at, 0), h, V_h, dt_bias, a_log);
+            }
+        }
+        lds_barrier();
+    };
+    auto u_of = [&](int j, float (&uu)[VEC]) {
+        const float* u = carry.carried_row<float>(cl, j, 2) + static_cast<long long>(h) * V_d + j0;
+        const f32x4 a = reinterpret_cast<const f32x4*>(u)[0];
+        const f32x4 b = reinterpret_cast<const f32x4*>(u)[1];
+        uu[0] = a[0]; uu[1] = a[1]; uu[2] = a[2]; uu[3] = a[3];
+        uu[4] = b[0]; uu[5] = b[1]; uu[6] = b[2]; uu[7] = b[3];
+    };
+
+    float s[VEC];
+#pragma unroll
+    for (int u = 0; u < VEC; ++u) s[u] = to_f32(sp.v[u]);
+
+    // The committed carried rows, folded in order.
+    for (int lo = 0; lo < c; lo += CH) {
+        const int m = min(CH, c - lo);
+        chunk(lo, m);
+        for (int e = 0; e < m; ++e) {
+            float uu[VEC];
+            u_of(lo + e, uu);
+            const float kj = live ? to_f32((carry.carried_row<bf16>(cl, lo + e, 1) + static_cast<long long>(h_k) * K_d)[i]) * c_nj[e] : 0.f;
+            gdn_fold8(s, __expf(c_glog[e]), kj, uu);
+        }
+        lds_barrier();
+    }
+    auto store = [&]() {
+        if (!live) return;
+        Pack8<bf16> st;
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) st.v[u] = from_f32<bf16>(s[u]);
+        *reinterpret_cast<Pack8<bf16>*>(cell) = st;
+    };
+    if (fold && commit <= n) store();
+
+    float delta[VEC], x[VEC];
+    if (c == n) {
+        // Nothing carried past the commit: a token's step.
+        const float g = __expf(g_log);
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = s[u] * g * ki;
+        column_sum(x);
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            delta[u] = (to_f32(vp.v[u]) - x[u]) * beta;
+            s[u] = to_f32(from_f32<bf16>(s[u] * g)) + ki * delta[u];
+            x[u] = s[u] * qi;
+        }
+        if (fold && commit == n + 1) store();
+        column_sum(x);
+    } else {
+        // The rows past the commit as a linear attention, last chunk first.
+        float acc_a[VEC], acc_o[VEC];
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            acc_a[u] = 0.f;
+            acc_o[u] = 0.f;
+        }
+        float after = g_log;
+        for (int hi = n; hi > c;) {
+            const int lo = max(c, hi - CH);
+            const int m = hi - lo;
+            chunk(lo, m);
+            if (wave == 0) {
+                const float gl = ln < m ? c_glog[ln] : 0.f;
+                float later = gl;
+#pragma unroll
+                for (int off = 1; off < kWave; off <<= 1) {
+                    const float down = __shfl_down(later, off, kWave);
+                    if (ln + off < kWave) later += down;
+                }
+                const float past = __shfl_down(later, 1, kWave);
+                const float excl = ln + 1 < m ? past : 0.f;
+                if (ln < m) {
+                    const float w = __expf(after + excl);
+                    c_wa[ln] = w * c_dk[ln];
+                    c_wo[ln] = w * c_dq[ln];
+                }
+                after += __shfl(later, 0, kWave);
+            }
+            lds_barrier();
+            if (i < m) {
+                float uu[VEC];
+                u_of(lo + i, uu);
+                const float wa = c_wa[i], wo = c_wo[i];
+#pragma unroll
+                for (int u = 0; u < VEC; ++u) {
+                    acc_a[u] += wa * uu[u];
+                    acc_o[u] += wo * uu[u];
+                }
+            }
+            lds_barrier();
+            hi = lo;
+        }
+        if (tid == 0) g_all = __expf(after);
+        lds_barrier();
+        const float g0 = g_all;
+        float xq[VEC];
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            x[u] = g0 * s[u] * ki + acc_a[u];
+            xq[u] = g0 * s[u] * qi + acc_o[u];
+        }
+        column_sum(x);
+        column_sum(xq);
+        const float kq = qk * nq * nk;
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            delta[u] = (to_f32(vp.v[u]) - x[u]) * beta;
+            x[u] = xq[u] + kq * delta[u];
+        }
+    }
+    if (tid < TPR) {
+        float* o = out + (row * V_h + h) * V_d + j0;
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) o[u] = x[u];
+        if (float* dst = carry.own_row<float>(cl, 0, 2)) {
+            float* d = dst + static_cast<long long>(h) * V_d + j0;
+#pragma unroll
+            for (int u = 0; u < VEC; ++u) d[u] = delta[u];
+        }
+    }
+    // The head's first tile lands the own row's `[b | a]` pair.
+    if (blockIdx.x == 0 && tid < 2) {
+        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+            const int at = tid * V_h + h;
+            dst[at] = ba[row * 2 * V_h + at];
+        }
+    }
+}
+
+// The buffered rows a chunked fire's lanes land past their commit, made
+// ready for a later decode's linear attention: each row's u (plane 2) and
+// keys (plane 1), from the state as the fire left it (folded through the
+// lane's commit, or as it stood where the lane folds nothing), stepping the
+// rows past the commit in order (a carried one by its stored u, an own one
+// forming its u as `ssm_gdn_decode_step` does). The state stays as it was.
+// The own rows' `q k v` rows and gates are read where the fire lays them:
+// the lane's extended rows (`ext`: row `RsLane::ext + j`) or its own rows
+// (`qo_indptr`, the window's row offset `win[1]`). Grid (V_d / BV, lanes,
+// V_h), block 256.
+template <int BV>
+__global__ __launch_bounds__(256) void ssm_gdn_tail_corrected(
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, const bf16* __restrict__ dt_bias,
+    const float* __restrict__ a_log, StateRows rows, const u32* __restrict__ qo_indptr, bool ext, int K_h, int V_h,
+    int K_d, int V_d, int conv_dim, bool write_state, const u8* __restrict__ mask, int lanes_stated, Carry carry,
+    const u32* __restrict__ win) {
+    constexpr int BLOCK = 256, VEC = 8, TPR = BV / VEC, WAVES = BLOCK / kWave, NI = BLOCK / TPR;
+    __shared__ float sk[NI];
+    __shared__ float red[WAVES][BV];
+    __shared__ float part[WAVES];
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int r = blockIdx.y, h = blockIdx.z;
+    if (r >= lanes) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const CarryLane cl = carry.lane(rl);
+    if (cl.at == CARRY_NONE) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int n = carry.carried(cl);
+    const int own = static_cast<int>(qo_indptr[r + 1] - qo_indptr[r]);
+    const int run = n + own;
+    const int start = folds(write_state, mask, rl) ? carry.commit(rl, run) : 0;
+    if (start >= run) return;
+
+    const int tid = threadIdx.x, wave = tid / kWave, ln = lane();
+    const int group = V_h / K_h;
+    const int h_k = h / group;
+    const int K_dim = K_h * K_d;
+    const int i = tid / TPR;
+    const int j0 = blockIdx.x * BV + (tid % TPR) * VEC;
+    const bool live = i < K_d;
+    const bf16* cell = rows.atom<bf16>(rid, h, static_cast<long long>(K_d) * V_d) + static_cast<long long>(i) * V_d + j0;
+    float s[VEC];
+    {
+        Pack8<bf16> sp{};
+        if (live) sp = *reinterpret_cast<const Pack8<bf16>*>(cell);
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) s[u] = to_f32(sp.v[u]);
+    }
+    auto column_sum = [&](float (&x)[VEC]) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+#pragma unroll
+            for (int off = TPR; off < kWave; off <<= 1) x[u] += __shfl_xor(x[u], off, kWave);
+        }
+        if (ln < TPR) {
+#pragma unroll
+            for (int u = 0; u < VEC; ++u) red[wave][ln * VEC + u] = x[u];
+        }
+        lds_barrier();
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            float total = 0.f;
+#pragma unroll
+            for (int w = 0; w < WAVES; ++w) total += red[w][(tid % TPR) * VEC + u];
+            x[u] = total;
+        }
+        lds_barrier();
+    };
+    // k̂ of a key row into `sk`, its element `i` returned.
+    auto keys = [&](const bf16* krow) {
+        const float kv = tid < K_d ? to_f32(krow[tid]) : 0.f;
+        const float kw = wave_sum(kv * kv);
+        if (ln == 0) part[wave] = kw;
+        lds_barrier();
+        float kn = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) kn += part[w];
+        if (tid < K_d) sk[tid] = kv * rsqrtf(kn + 1e-6f);
+        lds_barrier();
+        const float k = live ? sk[i] : 0.f;
+        lds_barrier();
+        return k;
+    };
+    for (int j = start; j < run; ++j) {
+        float uu[VEC], g, ki;
+        if (j < n) {
+            ki = keys(carry.carried_row<bf16>(cl, j, 1) + static_cast<long long>(h_k) * K_d);
+            const float* u = carry.carried_row<float>(cl, j, 2) + static_cast<long long>(h) * V_d + j0;
+#pragma unroll
+            for (int x = 0; x < VEC; ++x) uu[x] = u[x];
+            g = __expf(gdn_log_gate(carry.carried_row<bf16>(cl, j, 0), h, V_h, dt_bias, a_log));
+        } else {
+            const int e = j - n;
+            const long long at = ext ? static_cast<long long>(cl.ext) + j : row0 + qo_indptr[r] + e;
+            const bf16* qrow = qkv + at * conv_dim;
+            const bf16* krow = qrow + K_dim + static_cast<long long>(h_k) * K_d;
+            ki = keys(krow);
+            // The key head's first tile lands the row's keys.
+            if (blockIdx.x == 0 && h % group == 0 && tid < K_d) {
+                if (bf16* dst = carry.own_row<bf16>(cl, e, 1)) dst[static_cast<long long>(h_k) * K_d + tid] = krow[tid];
+            }
+            const float glog = gates[at * 2 * V_h + h];
+            const float beta = gates[at * 2 * V_h + V_h + h];
+            g = __expf(glog);
+            const Pack8<bf16> vp =
+                *reinterpret_cast<const Pack8<bf16>*>(qrow + 2LL * K_dim + static_cast<long long>(h) * V_d + j0);
+            float x[VEC];
+#pragma unroll
+            for (int u = 0; u < VEC; ++u) x[u] = s[u] * g * ki;
+            column_sum(x);
+#pragma unroll
+            for (int u = 0; u < VEC; ++u) uu[u] = (to_f32(vp.v[u]) - x[u]) * beta;
+            if (tid < TPR) {
+                if (float* dst = carry.own_row<float>(cl, e, 2)) {
+                    float* d = dst + static_cast<long long>(h) * V_d + j0;
+#pragma unroll
+                    for (int u = 0; u < VEC; ++u) d[u] = uu[u];
+                }
+            }
+        }
+        gdn_fold8(s, g, ki, uu);
+    }
+}
+
+// A beam group's fold of its gated-delta state (BEAM-PAGE-LISTS §11.3): its
+// fold rows (keys, corrected values and gates from the kept planes `[b | a]`,
+// keys, u, through the representative lane's pages) folded in order, rounded
+// as a token's step stores them, and the state stored once. Grid (V_d / BV,
+// V_h), block 256; a block folds each group in turn.
+template <int BV>
+__global__ __launch_bounds__(256) void ssm_gdn_fold(
+    StateRows rows, const bf16* __restrict__ dt_bias, const float* __restrict__ a_log, int K_h, int V_h, int K_d,
+    int V_d, Carry carry, const GroupFold* __restrict__ folds, int groups) {
+    constexpr int BLOCK = 256, VEC = 8, TPR = BV / VEC, WAVES = BLOCK / kWave, NI = BLOCK / TPR;
+    __shared__ float sk[NI];
+    __shared__ float part[WAVES];
+    const int h = blockIdx.y;
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int tid = threadIdx.x, wave = tid / kWave, ln = lane();
+        const int h_k = h / (V_h / K_h);
+        const int i = tid / TPR;
+        const int j0 = blockIdx.x * BV + (tid % TPR) * VEC;
+        const bool live = i < K_d;
+        bf16* cell = rows.atom<bf16>(rid, h, static_cast<long long>(K_d) * V_d) + static_cast<long long>(i) * V_d + j0;
+        float s[VEC];
+        {
+            Pack8<bf16> sp{};
+            if (live) sp = *reinterpret_cast<const Pack8<bf16>*>(cell);
+    #pragma unroll
+            for (int u = 0; u < VEC; ++u) s[u] = to_f32(sp.v[u]);
+        }
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, j, slot, pos);
+            const bf16* krow = carry.plane_at<const bf16>(slot, pos, 1) + static_cast<long long>(h_k) * K_d;
+            lds_barrier();
+            const float kv = tid < K_d ? to_f32(krow[tid]) : 0.f;
+            const float kw = wave_sum(kv * kv);
+            if (ln == 0) part[wave] = kw;
+            lds_barrier();
+            float kn = 0.f;
+    #pragma unroll
+            for (int w = 0; w < WAVES; ++w) kn += part[w];
+            if (tid < K_d) sk[tid] = kv * rsqrtf(kn + 1e-6f);
+            lds_barrier();
+            const float ki = live ? sk[i] : 0.f;
+            const float gj = __expf(gdn_log_gate(carry.plane_at<const bf16>(slot, pos, 0), h, V_h, dt_bias, a_log));
+            const float* u = carry.plane_at<const float>(slot, pos, 2) + static_cast<long long>(h) * V_d + j0;
+            float uu[VEC];
+    #pragma unroll
+            for (int x = 0; x < VEC; ++x) uu[x] = u[x];
+            gdn_fold8(s, gj, ki, uu);
+        }
+        if (!live) continue;
+        Pack8<bf16> st;
+    #pragma unroll
+        for (int u = 0; u < VEC; ++u) st.v[u] = from_f32<bf16>(s[u]);
+        *reinterpret_cast<Pack8<bf16>*>(cell) = st;
+    }
+}
+
 // The decode steps' state traffic: read once and written once a step, and
 // not again until the next step, past every other layer's. Non-temporal, so
 // it streams past the caches it would only evict from.
@@ -675,6 +1239,343 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
         float* o = out + (row * V_h + h) * VD + j0;
         *reinterpret_cast<f32x4*>(o) = f32x4{x[0] * rq, x[1] * rq, x[2] * rq, x[3] * rq};
         *reinterpret_cast<f32x4*>(o + 4) = f32x4{x[4] * rq, x[5] * rq, x[6] * rq, x[7] * rq};
+    }
+}
+
+// `ssm_gdn_step_carried` in `ssm_gdn_decode_rows`' layout: a block a (head,
+// row) holds the head's whole state, a thread Q = KD / RG state rows of
+// eight columns. The committed carried rows fold first, in order and rounded
+// as a token's step stores them; the rest read as a linear attention over
+// that state, each row's dots formed once a block, a wavefront a row. Where
+// none is left past the commit, the own row is `ssm_gdn_decode_rows`'
+// arithmetic, bit for bit. The state is stored at the lane's commit; the own
+// row's `[b | a]` and u land in its buffer.
+template <int KD, int VD, int BLOCK>
+__global__ __launch_bounds__(BLOCK) void ssm_gdn_rows_carried(
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, const bf16* __restrict__ ba,
+    const bf16* __restrict__ dt_bias, const float* __restrict__ a_log, StateRows rows, float* __restrict__ out,
+    int K_h, int V_h, int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask, Carry carry,
+    const u32* __restrict__ win) {
+    constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG, CH = kWave;
+    static_assert(VD % VEC == 0 && BLOCK % CG == 0 && KD % RG == 0 && kWave % CG == 0 && KD <= 2 * kWave,
+                  "whole packs, whole row groups, a key row two elements a lane");
+    __shared__ alignas(16) float red[2][WAVES][VD];
+    __shared__ float norms[WAVES][3];
+    __shared__ float sq[KD], sk[KD];
+    __shared__ float c_glog[CH], c_nj[CH], c_dq[CH], c_dk[CH], c_wa[CH], c_wo[CH];
+    __shared__ float g_all;
+
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const int h_k = h / (V_h / K_h);
+    const bf16* qkv_row = qkv + row * conv_dim;
+    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
+    const CarryLane cl = carry.lane(rl);
+    const int n = carry.carried(cl);
+    const int commit = carry.commit(rl, n + 1);
+    const bool fold = folds_uniform(write_state, mask, rl) && commit > 0;
+    const int c = min(commit, n);
+
+    float qi[Q], ki[Q];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        qi[q] = to_f32(qkv_row[h_k * KD + rg + RG * q]);
+        ki[q] = to_f32(qkv_row[K_h * KD + h_k * KD + rg + RG * q]);
+    }
+    const Pack8<bf16> vp = *reinterpret_cast<const Pack8<bf16>*>(qkv_row + 2LL * K_h * KD + static_cast<long long>(h) * VD + j0);
+    const float g_log = gates[row * 2 * V_h + h];
+    const float beta = gates[row * 2 * V_h + V_h + h];
+    bf16* head = rows.atom<bf16>(rid, h, static_cast<long long>(KD) * VD);
+    u32x4 sp[Q];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
+
+    auto lanes = [](float v) {
+#pragma unroll
+        for (int off = CG; off < kWave; off <<= 1) v += __shfl_xor(v, off, kWave);
+        return v;
+    };
+    auto column_sums = [&](float (&x)[VEC], int buf) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = lanes(x[u]);
+        if (l < CG) {
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0]) = f32x4{x[0], x[1], x[2], x[3]};
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0 + 4]) = f32x4{x[4], x[5], x[6], x[7]};
+        }
+    };
+    auto column_totals = [&](float (&x)[VEC], int buf) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) {
+            const f32x4 a = *reinterpret_cast<const f32x4*>(&red[buf][w][j0]);
+            const f32x4 b = *reinterpret_cast<const f32x4*>(&red[buf][w][j0 + 4]);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                x[u] += a[u];
+                x[4 + u] += b[u];
+            }
+        }
+    };
+
+    // The own row's norms (and its raw q·k), as `ssm_gdn_decode_rows` sums them.
+    float qq = 0.f, kk = 0.f, qk = 0.f;
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        qq += qi[q] * qi[q];
+        kk += ki[q] * ki[q];
+        qk += qi[q] * ki[q];
+    }
+    qq = lanes(qq);
+    kk = lanes(kk);
+    qk = lanes(qk);
+    if (l == 0) {
+        norms[wave][0] = qq;
+        norms[wave][1] = kk;
+        norms[wave][2] = qk;
+    }
+    lds_barrier();
+    float qn = 0.f, kn = 0.f, qkn = 0.f;
+#pragma unroll
+    for (int w = 0; w < WAVES; ++w) {
+        qn += norms[w][0];
+        kn += norms[w][1];
+        qkn += norms[w][2];
+    }
+    const float rk = rsqrtf(kn + 1e-6f), rq = rsqrtf(qn + 1e-6f) * q_scale;
+
+    // The own row's q̂ and k̂ for the buffered rows' dots.
+    if (n > 0 && cg == 0) {
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            sq[rg + RG * q] = qi[q] * rq;
+            sk[rg + RG * q] = ki[q] * rk;
+        }
+    }
+    // Rows [lo, lo + m) of the lane's buffered rows into the chunk tables, a
+    // wavefront a row.
+    auto chunk = [&](int lo, int m) {
+        lds_barrier();
+        for (int e = wave; e < m; e += WAVES) {
+            u64 slot;
+            u32 at;
+            carry.carried_at(cl, lo + e, slot, at);
+            const bf16* krow = carry.plane_at<const bf16>(slot, at, 1) + static_cast<long long>(h_k) * KD;
+            float a2 = 0.f, dq = 0.f, dk = 0.f;
+#pragma unroll
+            for (int x = l; x < KD; x += kWave) {
+                const float k = to_f32(krow[x]);
+                a2 += k * k;
+                dq += k * sq[x];
+                dk += k * sk[x];
+            }
+            a2 = wave_sum(a2);
+            dq = wave_sum(dq);
+            dk = wave_sum(dk);
+            if (l == 0) {
+                const float nj = rsqrtf(a2 + 1e-6f);
+                c_nj[e] = nj;
+                c_dq[e] = dq * nj;
+                c_dk[e] = dk * nj;
+                c_glog[e] = gdn_log_gate(carry.plane_at<const bf16>(slot, at, 0), h, V_h, dt_bias, a_log);
+            }
+        }
+        lds_barrier();
+    };
+    auto u_of = [&](int j, float (&uu)[VEC]) {
+        const float* u = carry.carried_row<float>(cl, j, 2) + static_cast<long long>(h) * VD + j0;
+        const f32x4 a = reinterpret_cast<const f32x4*>(u)[0];
+        const f32x4 b = reinterpret_cast<const f32x4*>(u)[1];
+        uu[0] = a[0]; uu[1] = a[1]; uu[2] = a[2]; uu[3] = a[3];
+        uu[4] = b[0]; uu[5] = b[1]; uu[6] = b[2]; uu[7] = b[3];
+    };
+
+    // The committed carried rows, folded in order: S' = bf16(bf16(S·g) + k̂·u).
+    for (int lo = 0; lo < c; lo += CH) {
+        const int m = min(CH, c - lo);
+        chunk(lo, m);
+        for (int e = 0; e < m; ++e) {
+            float uu[VEC];
+            u_of(lo + e, uu);
+            const bf16* krow = carry.carried_row<bf16>(cl, lo + e, 1) + static_cast<long long>(h_k) * KD;
+            const float g = __expf(c_glog[e]), nj = c_nj[e];
+#pragma unroll
+            for (int q = 0; q < Q; ++q) {
+                const float kj = to_f32(krow[rg + RG * q]) * nj;
+                u32x4 st;
+#pragma unroll
+                for (int w = 0; w < VEC / 2; ++w) {
+                    const float lo2 = bf16_round(bf16_round(bf16_lo(sp[q][w]) * g) + kj * uu[2 * w]);
+                    const float hi2 = bf16_round(bf16_round(bf16_hi(sp[q][w]) * g) + kj * uu[2 * w + 1]);
+                    st[w] = bf16_pack_rne(lo2, hi2);
+                }
+                sp[q] = st;
+            }
+        }
+    }
+    if (fold && commit <= n) {
+#pragma unroll
+        for (int q = 0; q < Q; ++q) state_store(head + (rg + RG * q) * VD + j0, sp[q]);
+    }
+
+    float x[VEC];
+    f32x2 d2[VEC / 2];
+    if (c == n) {
+        // `ssm_gdn_decode_rows`' step, as it orders it.
+        f32x2 x2[VEC / 2];
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) x2[w] = f32x2{0.f, 0.f};
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            const f32x2 k2 = {ki[q], ki[q]};
+#pragma unroll
+            for (int w = 0; w < VEC / 2; ++w)
+                x2[w] = __builtin_elementwise_fma(f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])}, k2, x2[w]);
+        }
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            x[2 * w] = x2[w].x;
+            x[2 * w + 1] = x2[w].y;
+        }
+        column_sums(x, 0);
+        lds_barrier();
+        column_totals(x, 0);
+        const float g = __expf(g_log);
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            d2[w] = f32x2{(to_f32(vp.v[2 * w]) - x[2 * w] * (g * rk)) * beta,
+                          (to_f32(vp.v[2 * w + 1]) - x[2 * w + 1] * (g * rk)) * beta};
+            x2[w] = f32x2{0.f, 0.f};
+        }
+        const f32x2 g2 = {g, g};
+        const bool own = fold && commit == n + 1;
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            const float kh = ki[q] * rk;
+            const f32x2 k2 = {kh, kh}, q2 = {qi[q], qi[q]};
+            u32x4 st;
+#pragma unroll
+            for (int w = 0; w < VEC / 2; ++w) {
+                const f32x2 dec = f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])} * g2;
+                const f32x2 next = __builtin_elementwise_fma(k2, d2[w], f32x2{bf16_round(dec.x), bf16_round(dec.y)});
+                st[w] = bf16_pack_rne(next.x, next.y);
+                x2[w] = __builtin_elementwise_fma(next, q2, x2[w]);
+            }
+            if (own) state_store(head + (rg + RG * q) * VD + j0, st);
+        }
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            x[2 * w] = x2[w].x;
+            x[2 * w + 1] = x2[w].y;
+        }
+        column_sums(x, 1);
+        lds_barrier();
+        column_totals(x, 1);
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] *= rq;
+    } else {
+        // The rows past the commit as a linear attention, last chunk first;
+        // row e of a chunk accumulates in row group e mod RG.
+        float acc_a[VEC], acc_o[VEC];
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            acc_a[u] = 0.f;
+            acc_o[u] = 0.f;
+        }
+        float after = g_log;
+        for (int hi = n; hi > c; ) {
+            const int lo = max(c, hi - CH);
+            const int m = hi - lo;
+            chunk(lo, m);
+            if (wave == 0) {
+                const float gl = l < m ? c_glog[l] : 0.f;
+                float later = gl;
+#pragma unroll
+                for (int off = 1; off < kWave; off <<= 1) {
+                    const float down = __shfl_down(later, off, kWave);
+                    if (l + off < kWave) later += down;
+                }
+                const float past = __shfl_down(later, 1, kWave);
+                const float excl = l + 1 < m ? past : 0.f;
+                if (l < m) {
+                    const float w = __expf(after + excl);
+                    c_wa[l] = w * c_dk[l];
+                    c_wo[l] = w * c_dq[l];
+                }
+                after += __shfl(later, 0, kWave);
+            }
+            lds_barrier();
+            for (int e = rg; e < m; e += RG) {
+                float uu[VEC];
+                u_of(lo + e, uu);
+                const float wa = c_wa[e], wo = c_wo[e];
+#pragma unroll
+                for (int u = 0; u < VEC; ++u) {
+                    acc_a[u] += wa * uu[u];
+                    acc_o[u] += wo * uu[u];
+                }
+            }
+            hi = lo;
+        }
+        if (tid == 0) g_all = __expf(after);
+        lds_barrier();
+        const float g0 = g_all;
+        // The state's part over this thread's rows, then the column totals.
+        float xq[VEC];
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            x[u] = 0.f;
+            xq[u] = 0.f;
+        }
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+#pragma unroll
+            for (int w = 0; w < VEC / 2; ++w) {
+                const float s0 = bf16_lo(sp[q][w]), s1 = bf16_hi(sp[q][w]);
+                x[2 * w] += s0 * ki[q];
+                x[2 * w + 1] += s1 * ki[q];
+                xq[2 * w] += s0 * qi[q];
+                xq[2 * w + 1] += s1 * qi[q];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            x[u] = g0 * rk * x[u] + acc_a[u];
+            xq[u] = g0 * rq * xq[u] + acc_o[u];
+        }
+        column_sums(x, 0);
+        column_sums(xq, 1);
+        lds_barrier();
+        column_totals(x, 0);
+        column_totals(xq, 1);
+        const float kq = qkn * rk * rq;
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            d2[w] = f32x2{(to_f32(vp.v[2 * w]) - x[2 * w]) * beta, (to_f32(vp.v[2 * w + 1]) - x[2 * w + 1]) * beta};
+            x[2 * w] = xq[2 * w] + kq * d2[w].x;
+            x[2 * w + 1] = xq[2 * w + 1] + kq * d2[w].y;
+        }
+    }
+    if (tid < CG) {
+        float* o = out + (row * V_h + h) * VD + j0;
+        *reinterpret_cast<f32x4*>(o) = f32x4{x[0], x[1], x[2], x[3]};
+        *reinterpret_cast<f32x4*>(o + 4) = f32x4{x[4], x[5], x[6], x[7]};
+        if (float* dst = carry.own_row<float>(cl, 0, 2)) {
+            float* d = dst + static_cast<long long>(h) * VD + j0;
+            *reinterpret_cast<f32x4*>(d) = f32x4{d2[0].x, d2[0].y, d2[1].x, d2[1].y};
+            *reinterpret_cast<f32x4*>(d + 4) = f32x4{d2[2].x, d2[2].y, d2[3].x, d2[3].y};
+        }
+    }
+    if (tid < 2) {
+        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+            const int at = tid * V_h + h;
+            dst[at] = ba[row * 2 * V_h + at];
+        }
     }
 }
 
@@ -906,6 +1807,521 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused(
         float* o = out + (row * V_h + h) * VD + j0;
         *reinterpret_cast<f32x4*>(o) = f32x4{x[0] * rq, x[1] * rq, x[2] * rq, x[3] * rq};
         *reinterpret_cast<f32x4*>(o + 4) = f32x4{x[4] * rq, x[5] * rq, x[6] * rq, x[7] * rq};
+    }
+}
+
+// `ssm_gdn_step_fused` over a lane's carried rows then its own: the conv's
+// window positions before the own row read the committed cells, then the
+// lane's carried rows' inputs (`conv`: plane 0 the conv's input rows, plane
+// 1 its output's keys), and the window is stored as it stands after the
+// lane's commit; the recurrence is `ssm_gdn_rows_carried`'s over `step`'s
+// planes (`[b | a]`, keys, corrected values). Where the lane carries nothing
+// and commits its row, it is `ssm_gdn_step_fused`, bit for bit. The own
+// row's conv input, keys, `[b | a]` and u land in its buffer.
+template <int KD, int VD, int BLOCK, int KMAX>
+__global__ __launch_bounds__(BLOCK) void ssm_gdn_step_fused_carried(
+    const bf16* __restrict__ qkvz, const bf16* __restrict__ conv_w, StateRows conv_rows, bool conv_write,
+    const u8* __restrict__ conv_mask, const bf16* __restrict__ ba, const float* __restrict__ a_log,
+    const bf16* __restrict__ dt_bias, StateRows rows, bool write_state,
+    const u8* __restrict__ mask, bf16* __restrict__ qkv_out, bf16* __restrict__ z_out, float* __restrict__ out,
+    int* __restrict__ tickets, int K_h, int V_h, int K, float q_scale, Carry conv, Carry step, const u32* __restrict__ win) {
+    constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG;
+    constexpr int CH = 2 * KD + VD, CPT = (CH + BLOCK - 1) / BLOCK, RCH = kWave;
+    static_assert(VD % VEC == 0 && BLOCK % CG == 0 && KD % RG == 0 && kWave % CG == 0 && KD <= 2 * kWave,
+                  "whole packs, whole row groups, a key row two elements a lane");
+    __shared__ alignas(16) float red[2][WAVES][VD];
+    __shared__ float norms[WAVES][3];
+    __shared__ float cv[CH];
+    __shared__ float sq[KD], sk[KD];
+    __shared__ float c_glog[RCH], c_nj[RCH], c_dq[RCH], c_dk[RCH], c_wa[RCH], c_wo[RCH];
+    __shared__ float g_all;
+    __shared__ int last_s;
+    // The page slot and row of the lane's carried rows [base, n), resolved
+    // once: every later read of a carried row is one load.
+    __shared__ u64 t_slot[RCH];
+    __shared__ u32 t_pos[RCH];
+    // A chunk of carried rows staged whole: keys (bf16), corrected values
+    // (this head's columns, f32) and `a` gate words, one load a chunk.
+    constexpr int SCH = 16;
+    __shared__ alignas(16) bf16 s_k[SCH][KD];
+    __shared__ alignas(16) float s_u[SCH][VD];
+    __shared__ float s_a[SCH];
+
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const i32* rid = rows.row(rl);
+    const i32* crid = conv_rows.row(rl);
+    if (rid[0] < 0 || crid[0] < 0) return;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const int G = V_h / K_h;
+    const int h_k = h / G;
+    const int C = 2 * K_h * KD + V_h * VD;
+    const long long QW = static_cast<long long>(C) + static_cast<long long>(V_h) * VD;
+    const bf16* in_row = qkvz + row * QW;
+    const CarryLane cl = step.lane(rl);
+    const CarryLane xl = conv.lane(rl);
+    const int n = step.carried(cl);
+    // A lane that writes no state (a beam lane, its write masked off)
+    // commits none of its carried rows: it reads them all as the linear
+    // attention from its state, as CUDA's carried step does, not as folds
+    // into registers it then drops. A lane that writes folds its committed
+    // rows as the reference does.
+    const int commit = folds_uniform(write_state, mask, rl) ? step.commit(rl, n + 1) : 0;
+    const int c = min(commit, n);
+
+    const int base = max(0, n - RCH);
+    if (tid < n - base) {
+        u64 slot;
+        u32 pos;
+        step.carried_at(cl, base + tid, slot, pos);
+        t_slot[tid] = slot;
+        t_pos[tid] = pos;
+    }
+    // Carried row t's page slot and row: from the table, or resolved where
+    // it lies below it (a search deeper than the table).
+    auto where = [&](const Carry& cr, const CarryLane& lane_, int t, u64& slot, u32& pos) {
+        if (t >= base) {
+            slot = t_slot[t - base];
+            pos = t_pos[t - base];
+        } else {
+            cr.carried_at(lane_, t, slot, pos);
+        }
+    };
+    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
+    bf16* head = rows.atom<bf16>(rid, h, static_cast<long long>(KD) * VD);
+    u32x4 sp[Q];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
+
+    const float bb = to_f32(ba[row * 2 * V_h + h]);
+    const float za = to_f32(ba[row * 2 * V_h + V_h + h]) + to_f32(dt_bias[h]);
+    const float softplus = za > 20.f ? za : log1pf(__expf(za));
+    const float g_log = -__expf(a_log[h]) * softplus;
+    const float beta = 1.f / (1.f + __expf(-bb));
+
+    // The conv over this block's channels, its window from the committed
+    // cells and the carried rows' inputs.
+    int ch[CPT], cc[CPT];
+    bf16* cst[CPT];
+    float xn[CPT], wk[CPT][KMAX];
+    const int ccs = conv_rows.atoms;
+#pragma unroll
+    for (int u = 0; u < CPT; ++u) {
+        const int ii = min(tid + u * BLOCK, CH - 1);
+        ch[u] = ii < KD       ? h_k * KD + ii
+                : ii < 2 * KD ? K_h * KD + h_k * KD + (ii - KD)
+                              : 2 * K_h * KD + h * VD + (ii - 2 * KD);
+        cc[u] = ch[u] % ccs;
+        cst[u] = conv_rows.piece<bf16>(crid, ch[u] / ccs);
+        xn[u] = to_f32(in_row[ch[u]]);
+#pragma unroll
+        for (int k = 0; k < KMAX; ++k) wk[u][k] = k < K ? to_f32(conv_w[ch[u] * K + k]) : 0.f;
+    }
+    __syncthreads();
+    // Every carried row fits one stage at a natural lag: its keys, values
+    // and gates are read now, under the conv and the ticket.
+    const bool whole = n <= SCH;
+    if (n > 0 && whole) {
+        constexpr int KP = KD / 8, UP = VD / 4;
+        for (int x = tid; x < n * KP; x += BLOCK) {
+            const int e = x / KP, p8 = x % KP;
+            *reinterpret_cast<u32x4*>(&s_k[e][p8 * 8]) = *reinterpret_cast<const u32x4*>(
+                step.plane_at<const bf16>(t_slot[e], t_pos[e], 1) + static_cast<long long>(h_k) * KD + p8 * 8);
+        }
+        for (int x = tid; x < n * UP; x += BLOCK) {
+            const int e = x / UP, p4 = x % UP;
+            *reinterpret_cast<f32x4*>(&s_u[e][p4 * 4]) = *reinterpret_cast<const f32x4*>(
+                step.plane_at<const float>(t_slot[e], t_pos[e], 2) + static_cast<long long>(h) * VD + p4 * 4);
+        }
+        if (tid < n) s_a[tid] = gdn_log_gate(step.plane_at<const bf16>(t_slot[tid], t_pos[tid], 0), h, V_h, dt_bias, a_log);
+    }
+    const bool cfold = folds_uniform(conv_write, conv_mask, rl) && commit > 0;
+    // Where run position t's input of channel slot u lies: a committed
+    // cell or a carried row's input; null for the own row. Every tap's and
+    // every stored cell's source is placed first and all of them read at
+    // once, never one dependent load a tap.
+    auto src = [&](int u, int t) -> const bf16* {
+        if (t < 0) return &cst[u][(K + t) * ccs + cc[u]];
+        if (t < n) {
+            u64 slot;
+            u32 pos;
+            where(conv, xl, t, slot, pos);
+            return conv.plane_at<const bf16>(slot, pos, 0) + ch[u];
+        }
+        return nullptr;
+    };
+    float hv[CPT][KMAX], wv[CPT][KMAX];
+    {
+        const bf16* hp[CPT][KMAX];
+        const bf16* wp[CPT][KMAX];
+#pragma unroll
+        for (int u = 0; u < CPT; ++u) {
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k) {
+                hp[u][k] = k < K ? src(u, n - (K - 1 - k)) : nullptr;
+                wp[u][k] = cfold && k < K ? src(u, commit - K + k) : nullptr;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < CPT; ++u) {
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k) {
+                hv[u][k] = hp[u][k] != nullptr ? to_f32(*hp[u][k]) : xn[u];
+                wv[u][k] = wp[u][k] != nullptr ? to_f32(*wp[u][k]) : xn[u];
+            }
+        }
+    }
+    bf16* own_x = conv.own_row<bf16>(xl, 0, 0);
+    bf16* own_k = conv.own_row<bf16>(xl, 0, 1);
+#pragma unroll
+    for (int u = 0; u < CPT; ++u) {
+        const int i = tid + u * BLOCK;
+        if (i >= CH) continue;
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < KMAX; ++k)
+            if (k < K) acc += wk[u][k] * hv[u][k];
+        const bf16 out_c = from_f32<bf16>(silu(acc));
+        cv[i] = to_f32(out_c);
+        const bool own = i >= 2 * KD;
+        if (own || h % G == 0) {
+            qkv_out[row * C + ch[u]] = from_f32<bf16>(xn[u]);
+            if (own_x != nullptr) own_x[ch[u]] = from_f32<bf16>(xn[u]);
+        }
+        // The row's keys, as the conv's output lands them.
+        if (own_k != nullptr && h % G == 0 && i >= KD && i < 2 * KD) own_k[h_k * KD + (i - KD)] = out_c;
+    }
+    if (tid < VD) z_out[row * (V_h * VD) + h * VD + tid] = in_row[C + h * VD + tid];
+    // Every block has read the shared window before any writes it: the
+    // ticket's last block writes the key head's q and k channels.
+    __syncthreads();
+    if (tid == 0) {
+        const int tk = r * K_h + h_k;
+        const bool last = atomicAdd(&tickets[tk], 1) == G - 1;
+        if (last) atomicExch(&tickets[tk], 0);
+        last_s = last;
+    }
+    __syncthreads();
+    if (cfold) {
+#pragma unroll
+        for (int u = 0; u < CPT; ++u) {
+            const int i = tid + u * BLOCK;
+            if (i >= CH || (i < 2 * KD && !last_s)) continue;
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k)
+                if (k < K) cst[u][k * ccs + cc[u]] = from_f32<bf16>(wv[u][k]);
+        }
+    }
+
+    const bool fold = folds_uniform(write_state, mask, rl) && commit > 0;
+    float qi[Q], ki[Q], vv[VEC];
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        qi[q] = cv[rg + RG * q];
+        ki[q] = cv[KD + rg + RG * q];
+    }
+#pragma unroll
+    for (int u = 0; u < VEC; ++u) vv[u] = cv[2 * KD + j0 + u];
+
+    auto lanes = [](float v) {
+#pragma unroll
+        for (int off = CG; off < kWave; off <<= 1) v += __shfl_xor(v, off, kWave);
+        return v;
+    };
+    auto column_sums = [&](float (&x)[VEC], int buf) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = lanes(x[u]);
+        if (l < CG) {
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0]) = f32x4{x[0], x[1], x[2], x[3]};
+            *reinterpret_cast<f32x4*>(&red[buf][wave][j0 + 4]) = f32x4{x[4], x[5], x[6], x[7]};
+        }
+    };
+    auto column_totals = [&](float (&x)[VEC], int buf) {
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) {
+            const f32x4 a = *reinterpret_cast<const f32x4*>(&red[buf][w][j0]);
+            const f32x4 b = *reinterpret_cast<const f32x4*>(&red[buf][w][j0 + 4]);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                x[u] += a[u];
+                x[4 + u] += b[u];
+            }
+        }
+    };
+    float qq = 0.f, kk = 0.f, qk = 0.f;
+#pragma unroll
+    for (int q = 0; q < Q; ++q) {
+        qq += qi[q] * qi[q];
+        kk += ki[q] * ki[q];
+        qk += qi[q] * ki[q];
+    }
+    qq = lanes(qq);
+    kk = lanes(kk);
+    qk = lanes(qk);
+    if (l == 0) {
+        norms[wave][0] = qq;
+        norms[wave][1] = kk;
+        norms[wave][2] = qk;
+    }
+    lds_barrier();
+    float qn = 0.f, kn = 0.f, qkn = 0.f;
+#pragma unroll
+    for (int w = 0; w < WAVES; ++w) {
+        qn += norms[w][0];
+        kn += norms[w][1];
+        qkn += norms[w][2];
+    }
+    const float rk = rsqrtf(kn + 1e-6f), rq = rsqrtf(qn + 1e-6f) * q_scale;
+    if (n > 0 && cg == 0) {
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            sq[rg + RG * q] = qi[q] * rq;
+            sk[rg + RG * q] = ki[q] * rk;
+        }
+    }
+    // Rows [lo, lo + m) staged (m <= SCH): each thread a 16-byte piece of
+    // the keys and two of the values, then a wavefront a row forms its dots,
+    // norm and log-gate from the stage.
+    // Rows [lo, lo + m) into the stage (m <= SCH): each thread a 16-byte
+    // piece of the keys and two of the values. Their gates and dots wait for
+    // the own row ([`dots`]).
+    auto stage_load = [&](int lo, int m) {
+        constexpr int KP = KD / 8, UP = VD / 4;
+        for (int x = tid; x < m * KP; x += BLOCK) {
+            const int e = x / KP, p8 = x % KP;
+            u64 slot;
+            u32 pos;
+            where(step, cl, lo + e, slot, pos);
+            *reinterpret_cast<u32x4*>(&s_k[e][p8 * 8]) = *reinterpret_cast<const u32x4*>(
+                step.plane_at<const bf16>(slot, pos, 1) + static_cast<long long>(h_k) * KD + p8 * 8);
+        }
+        for (int x = tid; x < m * UP; x += BLOCK) {
+            const int e = x / UP, p4 = x % UP;
+            u64 slot;
+            u32 pos;
+            where(step, cl, lo + e, slot, pos);
+            *reinterpret_cast<f32x4*>(&s_u[e][p4 * 4]) = *reinterpret_cast<const f32x4*>(
+                step.plane_at<const float>(slot, pos, 2) + static_cast<long long>(h) * VD + p4 * 4);
+        }
+        if (tid < m) {
+            u64 slot;
+            u32 pos;
+            where(step, cl, lo + tid, slot, pos);
+            s_a[tid] = gdn_log_gate(step.plane_at<const bf16>(slot, pos, 0), h, V_h, dt_bias, a_log);
+        }
+    };
+    // The staged rows' dots with the own row's q̂ and k̂, their norms and
+    // gates: a wavefront a row, every row at once.
+    auto dots = [&](int m) {
+        lds_barrier();
+        for (int e = wave; e < m; e += WAVES) {
+            float a2 = 0.f, dq = 0.f, dk = 0.f;
+#pragma unroll
+            for (int x = l; x < KD; x += kWave) {
+                const float k = to_f32(s_k[e][x]);
+                a2 += k * k;
+                dq += k * sq[x];
+                dk += k * sk[x];
+            }
+            a2 = wave_sum(a2);
+            dq = wave_sum(dq);
+            dk = wave_sum(dk);
+            if (l == 0) {
+                const float nj = rsqrtf(a2 + 1e-6f);
+                c_nj[e] = nj;
+                c_dq[e] = dq * nj;
+                c_dk[e] = dk * nj;
+                c_glog[e] = s_a[e];
+            }
+        }
+        lds_barrier();
+    };
+    auto stage = [&](int lo, int m) {
+        lds_barrier();
+        stage_load(lo, m);
+        dots(m);
+    };
+    // Staged row e folded into this thread's rows: S' = bf16(bf16(S·g) + k̂·u).
+    auto fold_row = [&](int e) {
+        const float g = __expf(c_glog[e]), nj = c_nj[e];
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            const float kj = to_f32(s_k[e][rg + RG * q]) * nj;
+            u32x4 st;
+#pragma unroll
+            for (int w = 0; w < VEC / 2; ++w) {
+                const float lo2 = bf16_round(bf16_round(bf16_lo(sp[q][w]) * g) + kj * s_u[e][j0 + 2 * w]);
+                const float hi2 = bf16_round(bf16_round(bf16_hi(sp[q][w]) * g) + kj * s_u[e][j0 + 2 * w + 1]);
+                st[w] = bf16_pack_rne(lo2, hi2);
+            }
+            sp[q] = st;
+        }
+    };
+    // Where every carried row fits one stage, it is staged once for the
+    // fold and the linear attention both.
+    if (n > 0 && whole) dots(n);
+    for (int lo = 0; lo < c; lo += SCH) {
+        const int m = min(SCH, c - lo);
+        if (!whole) stage(lo, m);
+        for (int e = 0; e < m; ++e) fold_row(whole ? lo + e : e);
+    }
+    if (fold && commit <= n) {
+#pragma unroll
+        for (int q = 0; q < Q; ++q) state_store(head + (rg + RG * q) * VD + j0, sp[q]);
+    }
+    float x[VEC];
+    f32x2 d2[VEC / 2];
+    if (c == n) {
+        f32x2 x2[VEC / 2];
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) x2[w] = f32x2{0.f, 0.f};
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            const f32x2 k2 = {ki[q], ki[q]};
+#pragma unroll
+            for (int w = 0; w < VEC / 2; ++w)
+                x2[w] = __builtin_elementwise_fma(f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])}, k2, x2[w]);
+        }
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            x[2 * w] = x2[w].x;
+            x[2 * w + 1] = x2[w].y;
+        }
+        column_sums(x, 0);
+        lds_barrier();
+        column_totals(x, 0);
+        const float g = __expf(g_log);
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            d2[w] = f32x2{(vv[2 * w] - x[2 * w] * (g * rk)) * beta, (vv[2 * w + 1] - x[2 * w + 1] * (g * rk)) * beta};
+            x2[w] = f32x2{0.f, 0.f};
+        }
+        const f32x2 g2 = {g, g};
+        const bool own = fold && commit == n + 1;
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+            const float kh = ki[q] * rk;
+            const f32x2 k2 = {kh, kh}, q2 = {qi[q], qi[q]};
+            u32x4 st;
+#pragma unroll
+            for (int w = 0; w < VEC / 2; ++w) {
+                const f32x2 dec = f32x2{bf16_lo(sp[q][w]), bf16_hi(sp[q][w])} * g2;
+                const f32x2 next = __builtin_elementwise_fma(k2, d2[w], f32x2{bf16_round(dec.x), bf16_round(dec.y)});
+                st[w] = bf16_pack_rne(next.x, next.y);
+                x2[w] = __builtin_elementwise_fma(next, q2, x2[w]);
+            }
+            if (own) state_store(head + (rg + RG * q) * VD + j0, st);
+        }
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            x[2 * w] = x2[w].x;
+            x[2 * w + 1] = x2[w].y;
+        }
+        column_sums(x, 1);
+        lds_barrier();
+        column_totals(x, 1);
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) x[u] *= rq;
+    } else {
+        float acc_a[VEC], acc_o[VEC];
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            acc_a[u] = 0.f;
+            acc_o[u] = 0.f;
+        }
+        float after = g_log;
+        for (int hi = n; hi > c; ) {
+            const int lo = whole ? c : max(c, hi - SCH);
+            const int m = hi - lo;
+            // The staged index of row lo.
+            const int off = whole ? lo : 0;
+            if (!whole) stage(lo, m);
+            if (wave == 0) {
+                const float gl = l < m ? c_glog[off + l] : 0.f;
+                float later = gl;
+#pragma unroll
+                for (int off = 1; off < kWave; off <<= 1) {
+                    const float down = __shfl_down(later, off, kWave);
+                    if (l + off < kWave) later += down;
+                }
+                const float past = __shfl_down(later, 1, kWave);
+                const float excl = l + 1 < m ? past : 0.f;
+                if (l < m) {
+                    const float w = __expf(after + excl);
+                    c_wa[l] = w * c_dk[off + l];
+                    c_wo[l] = w * c_dq[off + l];
+                }
+                after += __shfl(later, 0, kWave);
+            }
+            lds_barrier();
+            for (int e = rg; e < m; e += RG) {
+                const float wa = c_wa[e], wo = c_wo[e];
+#pragma unroll
+                for (int u = 0; u < VEC; ++u) {
+                    acc_a[u] += wa * s_u[off + e][j0 + u];
+                    acc_o[u] += wo * s_u[off + e][j0 + u];
+                }
+            }
+            lds_barrier();
+            hi = lo;
+        }
+        if (tid == 0) g_all = __expf(after);
+        lds_barrier();
+        const float g0 = g_all;
+        float xq[VEC];
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            x[u] = 0.f;
+            xq[u] = 0.f;
+        }
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
+#pragma unroll
+            for (int w = 0; w < VEC / 2; ++w) {
+                const float s0 = bf16_lo(sp[q][w]), s1 = bf16_hi(sp[q][w]);
+                x[2 * w] += s0 * ki[q];
+                x[2 * w + 1] += s1 * ki[q];
+                xq[2 * w] += s0 * qi[q];
+                xq[2 * w + 1] += s1 * qi[q];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            x[u] = g0 * rk * x[u] + acc_a[u];
+            xq[u] = g0 * rq * xq[u] + acc_o[u];
+        }
+        column_sums(x, 0);
+        column_sums(xq, 1);
+        lds_barrier();
+        column_totals(x, 0);
+        column_totals(xq, 1);
+        const float kq = qkn * rk * rq;
+#pragma unroll
+        for (int w = 0; w < VEC / 2; ++w) {
+            d2[w] = f32x2{(vv[2 * w] - x[2 * w]) * beta, (vv[2 * w + 1] - x[2 * w + 1]) * beta};
+            x[2 * w] = xq[2 * w] + kq * d2[w].x;
+            x[2 * w + 1] = xq[2 * w + 1] + kq * d2[w].y;
+        }
+    }
+    if (tid < CG) {
+        float* o = out + (row * V_h + h) * VD + j0;
+        *reinterpret_cast<f32x4*>(o) = f32x4{x[0], x[1], x[2], x[3]};
+        *reinterpret_cast<f32x4*>(o + 4) = f32x4{x[4], x[5], x[6], x[7]};
+        if (float* dst = step.own_row<float>(cl, 0, 2)) {
+            float* d = dst + static_cast<long long>(h) * VD + j0;
+            *reinterpret_cast<f32x4*>(d) = f32x4{d2[0].x, d2[0].y, d2[1].x, d2[1].y};
+            *reinterpret_cast<f32x4*>(d + 4) = f32x4{d2[2].x, d2[2].y, d2[3].x, d2[3].y};
+        }
+    }
+    if (tid < 2) {
+        if (bf16* dst = step.own_row<bf16>(cl, 0, 0)) {
+            const int at2 = tid * V_h + h;
+            dst[at2] = ba[row * 2 * V_h + at2];
+        }
     }
 }
 
@@ -1877,6 +3293,416 @@ __global__ __launch_bounds__(256) void ssm_kda_step_batched(
     }
 }
 
+// `ssm_kda_step_batched` over a lane's buffered rows then its own, the
+// buffered rows read as a linear attention over the committed state (each
+// keeps its forget and beta rows, convolved keys and corrected value u:
+// planes 0 to 3): M_t diag(a_{t+1}) = M0 diag(G_{0,t+1}) + sum_s u_s
+// (k_s . G_{s,t+1})^T, so the own row's u and output read the state once,
+// its q and k decayed to it, and each buffered row as two decay-weighted
+// dots. The per-channel decays are suffix sums of f32 log-gates down the
+// buffered rows, a thread a channel, a chunk of rows staged at a time. A
+// fold applies M <- M diag(a) + u k^T a committed row, then the own row's
+// where it commits that too; the rows are stored once. The own row's forget
+// and beta rows and its u land in its buffer.
+template <int D, int ROWS>
+__global__ __launch_bounds__(256) void ssm_kda_step_carried(
+    const bf16* __restrict__ mixed, const bf16* __restrict__ f, const bf16* __restrict__ b,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, StateRows rows,
+    float* __restrict__ out, int H, float eps, float floor,
+    bool write_state, const u8* __restrict__ mask, Carry carry, const u32* __restrict__ win) {
+    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave, CH = 16;
+    static_assert(D % 32 == 0 && D <= 2 * kWave && ROWS % RPP == 0 && D % ROWS == 0,
+                  "whole pieces, two channels a lane, whole passes");
+    __shared__ alignas(16) float sq[D], sk[D], sgl[D], sg0[D];
+    __shared__ alignas(16) float ck[CH][D], cg[CH][D];
+    __shared__ float cdq[CH], cdk[CH];
+    __shared__ float part[3][WAVES];
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const long long width = static_cast<long long>(H) * D;
+    const CarryLane cl = carry.lane(rl);
+    if (blockIdx.z == 0) {
+        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) {
+            for (int d = tid; d < D; d += 256) dst[static_cast<long long>(h) * D + d] = f[row * width + static_cast<long long>(h) * D + d];
+        }
+        if (tid == 0) {
+            if (bf16* dst = carry.own_row<bf16>(cl, 0, 1)) dst[h] = b[row * H + h];
+        }
+    }
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int c = tid % kKdaRowLanes;
+    const int v0 = blockIdx.z * ROWS + tid / kKdaRowLanes;
+    float* head = rows.atom<float>(rid, h, static_cast<long long>(D) * D);
+    f32x4 s[R][E];
+#pragma unroll
+    for (int p = 0; p < R; ++p)
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+            s[p][e] = state_load(reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e));
+    const bf16* q = mixed + row * 3 * width + static_cast<long long>(h) * D;
+    float vv[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) vv[p] = to_f32(q[2 * width + v0 + RPP * p]);
+    const float a = __expf(a_log[h]);
+    const float beta = sigmoid(to_f32(b[row * H + h]));
+    // The own row's q̂, k̂ and log-gates, and k̂·q̂.
+    const float qv = tid < D ? to_f32(q[tid]) : 0.f, kv = tid < D ? to_f32(q[width + tid]) : 0.f;
+    const float w0 = wave_sum(qv * qv), w1 = wave_sum(kv * kv), w2 = wave_sum(qv * kv);
+    if (l == 0) {
+        part[0][wave] = w0;
+        part[1][wave] = w1;
+        part[2][wave] = w2;
+    }
+    lds_barrier();
+    float qn = 0.f, kn = 0.f, qkn = 0.f;
+#pragma unroll
+    for (int w = 0; w < WAVES; ++w) {
+        qn += part[0][w];
+        kn += part[1][w];
+        qkn += part[2][w];
+    }
+    const float rq = rsqrtf(qn + eps) * rsqrtf(static_cast<float>(D)), rk = rsqrtf(kn + eps);
+    if (tid < D) {
+        sq[tid] = qv * rq;
+        sk[tid] = kv * rk;
+        sgl[tid] = kda_gate(to_f32(f[row * width + static_cast<long long>(h) * D + tid]) + dt_bias[h * D + tid], a, floor);
+    }
+    lds_barrier();
+    float after = tid < D ? sgl[tid] : 0.f;
+    float pq[R], pk[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        pq[p] = 0.f;
+        pk[p] = 0.f;
+    }
+    const int n = carry.carried(cl);
+    for (int cb = ((n + CH - 1) / CH - 1) * CH; cb >= 0; cb -= CH) {
+        const int m = min(CH, n - cb);
+        // The chunk's keys and log-gates staged, then each row's keys normed.
+        for (int x = tid; x < m * D; x += 256) {
+            const int e = x / D, d = x % D;
+            u64 slot;
+            u32 pos;
+            carry.carried_at(cl, cb + e, slot, pos);
+            ck[e][d] = to_f32(carry.plane_at<const bf16>(slot, pos, 2)[static_cast<long long>(h) * D + d]);
+            cg[e][d] = kda_gate(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[static_cast<long long>(h) * D + d]) +
+                                    dt_bias[h * D + d], a, floor);
+        }
+        lds_barrier();
+        for (int e = wave; e < m; e += WAVES) {
+            float ss = 0.f;
+            for (int d = l; d < D; d += kWave) ss += ck[e][d] * ck[e][d];
+            const float inv = rsqrtf(wave_sum(ss) + eps);
+            for (int d = l; d < D; d += kWave) ck[e][d] *= inv;
+        }
+        lds_barrier();
+        // A thread a channel decays each row's key to the own row.
+        if (tid < D) {
+            float run = after;
+            for (int e = m - 1; e >= 0; --e) {
+                ck[e][tid] *= __expf(run);
+                run += cg[e][tid];
+            }
+            after = run;
+        }
+        lds_barrier();
+        // A wavefront a row: its decayed keys' dots with the own q̂ and k̂.
+        for (int e = wave; e < m; e += WAVES) {
+            float dq = 0.f, dk = 0.f;
+            for (int d = l; d < D; d += kWave) {
+                dq += ck[e][d] * sq[d];
+                dk += ck[e][d] * sk[d];
+            }
+            dq = wave_sum(dq);
+            dk = wave_sum(dk);
+            if (l == 0) {
+                cdq[e] = dq;
+                cdk[e] = dk;
+            }
+        }
+        lds_barrier();
+        // A row's lane 0 weighs each buffered row's u on its value rows.
+        if (c == 0) {
+            for (int e = 0; e < m; ++e) {
+                u64 slot;
+                u32 pos;
+                carry.carried_at(cl, cb + e, slot, pos);
+                const float* ur = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+                const float dq = cdq[e], dk = cdk[e];
+#pragma unroll
+                for (int p = 0; p < R; ++p) {
+                    const float u = ur[v0 + RPP * p];
+                    pq[p] += dq * u;
+                    pk[p] += dk * u;
+                }
+            }
+        }
+        lds_barrier();
+    }
+    if (tid < D) sg0[tid] = __expf(after);
+    lds_barrier();
+    // The committed state's part, decayed to the own row.
+    float mem[R], acc[R];
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        float km = 0.f, qm = 0.f;
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const int at = 4 * c + 32 * e;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float sd = s[p][e][u] * sg0[at + u];
+                km += sd * sk[at + u];
+                qm += sd * sq[at + u];
+            }
+        }
+        mem[p] = row8_sum(km + pk[p]);
+        acc[p] = row8_sum(qm + pq[p]);
+    }
+    const float kq = qkn * rq * rk;
+    float un[R];
+    float* o = out + (row * H + h) * D;
+    float* own_u = carry.own_row<float>(cl, 0, 3);
+#pragma unroll
+    for (int p = 0; p < R; ++p) {
+        un[p] = (vv[p] - mem[p]) * beta;
+        if (c == 0) {
+            o[v0 + RPP * p] = acc[p] + kq * un[p];
+            if (own_u != nullptr) own_u[static_cast<long long>(h) * D + v0 + RPP * p] = un[p];
+        }
+    }
+    const int commit = carry.commit(rl, n + 1);
+    if (!folds_uniform(write_state, mask, rl) || commit <= 0) return;
+    // The rows the lane commits fold into the state: its buffered ones, then
+    // its own where it commits that too.
+    const int folded = min(commit, n);
+    for (int t = 0; t < folded; ++t) {
+        u64 slot;
+        u32 pos;
+        carry.carried_at(cl, t, slot, pos);
+        lds_barrier();
+        const float kx = tid < D ? to_f32(carry.plane_at<const bf16>(slot, pos, 2)[static_cast<long long>(h) * D + tid]) : 0.f;
+        const float ws = wave_sum(kx * kx);
+        if (l == 0) part[0][wave] = ws;
+        if (tid < D)
+            cg[0][tid] = __expf(kda_gate(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[static_cast<long long>(h) * D + tid]) +
+                                             dt_bias[h * D + tid], a, floor));
+        lds_barrier();
+        float kn2 = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) kn2 += part[0][w];
+        if (tid < D) ck[0][tid] = kx * rsqrtf(kn2 + eps);
+        lds_barrier();
+        const float* ur = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+#pragma unroll
+        for (int p = 0; p < R; ++p) {
+            const float u = ur[v0 + RPP * p];
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) s[p][e][x] = s[p][e][x] * cg[0][at + x] + u * ck[0][at + x];
+            }
+        }
+    }
+    if (commit == n + 1) {
+#pragma unroll
+        for (int p = 0; p < R; ++p) {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) s[p][e][x] = s[p][e][x] * __expf(sgl[at + x]) + un[p] * sk[at + x];
+            }
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < R; ++p)
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+            state_store(reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e), s[p][e]);
+}
+
+// The buffered rows a chunked KDA fire's lanes land past their commit,
+// made ready for a later decode's linear attention: each row's convolved
+// keys (plane 2) and corrected value u (plane 3), from the state as the
+// fire left it (folded through the lane's commit, or as it stood where the
+// lane folds nothing), stepping the lane's rows past the commit in order (a
+// buffered one by its stored keys and u, an own one forming its u). The
+// state stays as it was. The own rows' [q | k | v], forget and beta rows are
+// read where the fire lays them: the lane's extended rows (`ext`: row
+// `RsLane::ext + j`) or its own (`qo_indptr`, the window's row offset
+// `win[1]`). Grid (H, lanes, D / ROWS), block 256.
+template <int D, int ROWS>
+__global__ __launch_bounds__(256) void ssm_kda_tail_corrected(
+    const bf16* __restrict__ mixed, const bf16* __restrict__ f, const bf16* __restrict__ b,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, StateRows rows,
+    const u32* __restrict__ qo_indptr, bool ext, int H, float eps, float floor,
+    bool write_state, const u8* __restrict__ mask, int lanes_stated, Carry carry, const u32* __restrict__ win) {
+    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave;
+    __shared__ alignas(16) float sk[D], sa[D];
+    __shared__ float part[WAVES];
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (r >= lanes) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const CarryLane cl = carry.lane(rl);
+    if (cl.at == CARRY_NONE) return;
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int n = carry.carried(cl);
+    const int own = static_cast<int>(qo_indptr[r + 1] - qo_indptr[r]);
+    const int run = n + own;
+    const int start = folds(write_state, mask, rl) ? carry.commit(rl, run) : 0;
+    if (start >= run) return;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const int c = tid % kKdaRowLanes;
+    const int v0 = blockIdx.z * ROWS + tid / kKdaRowLanes;
+    const long long width = static_cast<long long>(H) * D;
+    const float* head = rows.atom<float>(rid, h, static_cast<long long>(D) * D);
+    f32x4 s[R][E];
+#pragma unroll
+    for (int p = 0; p < R; ++p)
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+            s[p][e] = *reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e);
+    const float a = __expf(a_log[h]);
+    for (int j = start; j < run; ++j) {
+        const bool carried = j < n;
+        const int e_own = j - n;
+        const long long at = ext ? static_cast<long long>(cl.ext) + j : row0 + qo_indptr[r] + e_own;
+        const bf16* krow;
+        const bf16* frow;
+        const float* urow = nullptr;
+        const bf16* qrow = nullptr;
+        if (carried) {
+            u64 slot;
+            u32 pos;
+            carry.carried_at(cl, j, slot, pos);
+            krow = carry.plane_at<const bf16>(slot, pos, 2) + static_cast<long long>(h) * D;
+            frow = carry.plane_at<const bf16>(slot, pos, 0) + static_cast<long long>(h) * D;
+            urow = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+        } else {
+            qrow = mixed + at * 3 * width + static_cast<long long>(h) * D;
+            krow = qrow + width;
+            frow = f + at * width + static_cast<long long>(h) * D;
+        }
+        lds_barrier();
+        const float kx = tid < D ? to_f32(krow[tid]) : 0.f;
+        const float ws = wave_sum(kx * kx);
+        if (l == 0) part[wave] = ws;
+        if (tid < D) sa[tid] = __expf(kda_gate(to_f32(frow[tid]) + dt_bias[h * D + tid], a, floor));
+        // The own row's keys land in its buffer, a head's from its first slice.
+        if (!carried && blockIdx.z == 0 && tid < D) {
+            if (bf16* dst = carry.own_row<bf16>(cl, e_own, 2)) dst[static_cast<long long>(h) * D + tid] = krow[tid];
+        }
+        lds_barrier();
+        float kn = 0.f;
+#pragma unroll
+        for (int w = 0; w < WAVES; ++w) kn += part[w];
+        if (tid < D) sk[tid] = kx * rsqrtf(kn + eps);
+        lds_barrier();
+        const float beta = carried ? 0.f : sigmoid(to_f32(b[at * H + h]));
+        float* own_u = carried ? nullptr : carry.own_row<float>(cl, e_own, 3);
+#pragma unroll
+        for (int p = 0; p < R; ++p) {
+            float km = 0.f;
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at4 = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) {
+                    s[p][e][x] *= sa[at4 + x];
+                    km += s[p][e][x] * sk[at4 + x];
+                }
+            }
+            const int v = v0 + RPP * p;
+            const float u = carried ? urow[v] : (to_f32(qrow[2 * width + v]) - row8_sum(km)) * beta;
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int at4 = 4 * c + 32 * e;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) s[p][e][x] += sk[at4 + x] * u;
+            }
+            if (c == 0 && own_u != nullptr) own_u[static_cast<long long>(h) * D + v] = u;
+        }
+    }
+}
+
+// A beam group's fold of its KDA state (BEAM-PAGE-LISTS §11.3): its fold rows
+// (forget rows, keys and u from the kept planes 0, 2 and 3) folded in order,
+// M <- M diag(a) + u k̂^T, and the rows stored once. Grid (H,
+// D / ROWS), block 256.
+template <int D, int ROWS>
+__global__ __launch_bounds__(256) void ssm_kda_fold(
+    StateRows rows, const float* __restrict__ a_log, const float* __restrict__ dt_bias, int H, float eps, float floor,
+    Carry carry, const GroupFold* __restrict__ folds, int groups) {
+    constexpr int E = D / 32, RPP = 256 / kKdaRowLanes, R = ROWS / RPP, WAVES = 256 / kWave;
+    __shared__ alignas(16) float sk[D], sa[D];
+    __shared__ float part[WAVES];
+    const int h = blockIdx.x;
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+        const int c = tid % kKdaRowLanes;
+        const int v0 = blockIdx.y * ROWS + tid / kKdaRowLanes;
+        float* head = rows.atom<float>(rid, h, static_cast<long long>(D) * D);
+        f32x4 s[R][E];
+    #pragma unroll
+        for (int p = 0; p < R; ++p)
+    #pragma unroll
+            for (int e = 0; e < E; ++e)
+                s[p][e] = state_load(reinterpret_cast<const f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e));
+        const float a = __expf(a_log[h]);
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, j, slot, pos);
+            lds_barrier();
+            const float kx = tid < D ? to_f32(carry.plane_at<const bf16>(slot, pos, 2)[static_cast<long long>(h) * D + tid]) : 0.f;
+            const float ws = wave_sum(kx * kx);
+            if (l == 0) part[wave] = ws;
+            if (tid < D)
+                sa[tid] = __expf(kda_gate(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[static_cast<long long>(h) * D + tid]) +
+                                              dt_bias[h * D + tid], a, floor));
+            lds_barrier();
+            float kn = 0.f;
+    #pragma unroll
+            for (int w = 0; w < WAVES; ++w) kn += part[w];
+            if (tid < D) sk[tid] = kx * rsqrtf(kn + eps);
+            lds_barrier();
+            const float* ur = carry.plane_at<const float>(slot, pos, 3) + static_cast<long long>(h) * D;
+    #pragma unroll
+            for (int p = 0; p < R; ++p) {
+                const float u = ur[v0 + RPP * p];
+    #pragma unroll
+                for (int e = 0; e < E; ++e) {
+                    const int at = 4 * c + 32 * e;
+    #pragma unroll
+                    for (int x = 0; x < 4; ++x) s[p][e][x] = s[p][e][x] * sa[at + x] + u * sk[at + x];
+                }
+            }
+        }
+    #pragma unroll
+        for (int p = 0; p < R; ++p)
+    #pragma unroll
+            for (int e = 0; e < E; ++e)
+                state_store(reinterpret_cast<f32x4*>(head + static_cast<long long>(v0 + RPP * p) * D + 4 * c + 32 * e), s[p][e]);
+    }
+}
+
 // Prefill, token by token: grid (lanes, H), block 8·D, the head's state in
 // registers a value row to eight lanes, the next token's operands loaded
 // while this one folds. The fallback for heads the chunk passes are not
@@ -2520,6 +4346,177 @@ __global__ __launch_bounds__(256) void ssm_mamba2_step(
     if (!folds(write_state, mask, rl)) return;
 #pragma unroll
     for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+}
+
+// `ssm_mamba2_step` over a lane's buffered rows then its own, the buffered
+// rows read as a linear attention over the committed state (a row keeps its
+// step size and its convolved x | B: planes 0 and 1):
+//   y_t = A_{0,t} C_t S + sum_s A_{s,t} dt_s (B_s . C_t) x_s + D x_t,
+// A_{s,t} = prod_{s<i<=t} a_i, so a buffered row is one dot B_s . C_t (every
+// half-wave forms it over its 128 columns, no barrier) and its x_s, weighed
+// by the decays after it as the rows are walked from the last. A fold
+// applies S <- a S + (dt x) B^T a committed row, then the own row's where it
+// commits that too; the state is stored once. The own row's step size lands
+// in its buffer (its x | B lands with the conv's output).
+__global__ __launch_bounds__(256) void ssm_mamba2_step_carried(
+    const bf16* __restrict__ xbc, const bf16* __restrict__ dt, const bf16* __restrict__ z,
+    const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* __restrict__ D,
+    StateRows rows, bf16* __restrict__ y, int H, int G, bool write_state, const u8* __restrict__ mask, Carry carry,
+    const u32* __restrict__ win) {
+    const int r = blockIdx.x, h = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const CarryLane cl = carry.lane(rl);
+    if (threadIdx.x == 0) {
+        if (bf16* dst = carry.own_row<bf16>(cl, 0, 0)) dst[h] = dt[row * H + h];
+    }
+    const i32* rid = rows.row(rl);
+    if (rid[0] < 0) return;
+    const int inner = H * M2_P;
+    const int width = inner + 2 * G * M2_N;
+    const int g = h / (H / G);
+    f32x4* st = reinterpret_cast<f32x4*>(rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N));
+    f32x4 s[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
+    const int cc = 4 * (lane() & 31);
+    auto half = [](float v) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, kWave);
+        return v;
+    };
+    auto four = [](const bf16* p) { return f32x4{to_f32(p[0]), to_f32(p[1]), to_f32(p[2]), to_f32(p[3])}; };
+    const bf16* at = xbc + row * width;
+    const f32x4 bo = four(at + inner + g * M2_N + cc), co = four(at + inner + (G + g) * M2_N + cc);
+    float xo[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) xo[q] = to_f32(at[h * M2_P + m2_row(q)]);
+    const float a = __expf(a_log[h]), bias = dt_bias[h];
+    const float step = m2_dt(to_f32(dt[row * H + h]), bias);
+    const float la_n = -a * step;
+    const float bc_n = half(bo[0] * co[0] + bo[1] * co[1] + bo[2] * co[2] + bo[3] * co[3]);
+    const int n = carry.carried(cl);
+    float ya[M2_Q];
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) ya[q] = 0.f;
+    float after = la_n;
+    for (int j = n - 1; j >= 0; --j) {
+        u64 slot;
+        u32 pos;
+        carry.carried_at(cl, j, slot, pos);
+        const bf16* xb = carry.plane_at<const bf16>(slot, pos, 1);
+        const f32x4 bj = four(xb + inner + g * M2_N + cc);
+        const float dot = half(bj[0] * co[0] + bj[1] * co[1] + bj[2] * co[2] + bj[3] * co[3]);
+        const float sj = m2_dt(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[h]), bias);
+        const float w = __expf(after) * sj * dot;
+#pragma unroll
+        for (int q = 0; q < M2_Q; ++q) ya[q] += w * to_f32(xb[h * M2_P + m2_row(q)]);
+        after += -a * sj;
+    }
+    const float g0 = __expf(after);
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) {
+        const float acc = half(s[q][0] * co[0] + s[q][1] * co[1] + s[q][2] * co[2] + s[q][3] * co[3]);
+        if ((lane() & 31) == 0) {
+            const long long o = row * inner + h * M2_P + m2_row(q);
+            const float yo = g0 * acc + ya[q] + step * bc_n * xo[q] + D[h] * xo[q];
+            y[o] = from_f32<bf16>(yo * silu(to_f32(z[o])));
+        }
+    }
+    const int commit = carry.commit(rl, n + 1);
+    if (!folds(write_state, mask, rl) || commit <= 0) return;
+    const int folded = min(commit, n);
+    for (int j = 0; j < folded; ++j) {
+        u64 slot;
+        u32 pos;
+        carry.carried_at(cl, j, slot, pos);
+        const bf16* xb = carry.plane_at<const bf16>(slot, pos, 1);
+        const f32x4 bj = four(xb + inner + g * M2_N + cc);
+        const float sj = m2_dt(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[h]), bias);
+        const float decay = __expf(-a * sj);
+#pragma unroll
+        for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (sj * to_f32(xb[h * M2_P + m2_row(q)])) * bj;
+    }
+    if (commit == n + 1) {
+        const float decay = __expf(la_n);
+#pragma unroll
+        for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (step * xo[q]) * bo;
+    }
+#pragma unroll
+    for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+}
+
+// The rows a chunked Mamba-2 fire's lanes land past their commit, made
+// ready for a later decode's linear attention: each row's convolved x | B
+// (the first `xb` channels of its xbc row) into plane 1 of the lane's
+// buffer (its step size, plane 0, the fire lands). A block a lane; the rows
+// read where the fire lays them: the lane's extended rows (`ext`: row
+// `RsLane::ext + j`) or its own (`qo_indptr`, the window's row offset
+// `win[1]`).
+__global__ void ssm_mamba2_tail_rows(const bf16* __restrict__ xbc, const u32* __restrict__ qo_indptr, bool ext,
+                                     int width, int xb, bool write_state, const u8* __restrict__ mask,
+                                     int lanes_stated, Carry carry, const u32* __restrict__ win) {
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int r = blockIdx.x;
+    if (r >= lanes) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const CarryLane cl = carry.lane(rl);
+    if (cl.at == CARRY_NONE) return;
+    const int n = carry.carried(cl);
+    const int own = static_cast<int>(qo_indptr[r + 1] - qo_indptr[r]);
+    const int run = n + own;
+    const int start = folds(write_state, mask, rl) ? carry.commit(rl, run) : 0;
+    for (int e = max(start - n, 0); e < own; ++e) {
+        const long long at = ext ? static_cast<long long>(cl.ext) + n + e : row0 + qo_indptr[r] + e;
+        const bf16* src = xbc + at * width;
+        bf16* dst = carry.own_row<bf16>(cl, e, 1);
+        if (dst == nullptr) continue;
+        for (int i = threadIdx.x; i < xb; i += blockDim.x) dst[i] = src[i];
+    }
+}
+
+// A beam group's fold of its Mamba-2 state (BEAM-PAGE-LISTS §11.3): its fold
+// rows (step sizes and convolved x | B from the kept planes 0 and 1) folded in
+// order, S <- a S + (dt x) B^T, and the state stored once. Grid H, a block folding each group in turn,
+// block 256.
+__global__ __launch_bounds__(256) void ssm_mamba2_fold(StateRows rows, const float* __restrict__ a_log,
+                                                       const float* __restrict__ dt_bias, int H, int G, Carry carry,
+                                                       const GroupFold* __restrict__ folds, int groups) {
+    const int h = blockIdx.x;
+    // The groups that fold lead the table; the first that folds none ends it.
+    for (int g = 0; g < groups; ++g) {
+        const GroupFold f = folds[g];
+        const int n = static_cast<int>(f.rows);
+        if (n <= 0) break;
+        const int rl = static_cast<int>(f.lane);
+        const i32* rid = rows.row(rl);
+        if (rid[0] < 0) continue;
+        const CarryLane cl = carry.lane(rl);
+        const int inner = H * M2_P;
+        const int gg = h / (H / G);
+        f32x4* st = reinterpret_cast<f32x4*>(rows.atom<float>(rid, h, static_cast<long long>(M2_P) * M2_N));
+        f32x4 s[M2_Q];
+    #pragma unroll
+        for (int q = 0; q < M2_Q; ++q) s[q] = st[m2_run(q)];
+        const float a = __expf(a_log[h]), bias = dt_bias[h];
+        const int cc = 4 * (lane() & 31);
+        for (int j = 0; j < n; ++j) {
+            u64 slot;
+            u32 pos;
+            carry.fold_at(cl, f.fold_off, j, slot, pos);
+            const bf16* xb = carry.plane_at<const bf16>(slot, pos, 1);
+            const bf16* bp = xb + inner + gg * M2_N + cc;
+            const f32x4 bj = {to_f32(bp[0]), to_f32(bp[1]), to_f32(bp[2]), to_f32(bp[3])};
+            const float sj = m2_dt(to_f32(carry.plane_at<const bf16>(slot, pos, 0)[h]), bias);
+            const float decay = __expf(-a * sj);
+    #pragma unroll
+            for (int q = 0; q < M2_Q; ++q) s[q] = s[q] * decay + (sj * to_f32(xb[h * M2_P + m2_row(q)])) * bj;
+        }
+    #pragma unroll
+        for (int q = 0; q < M2_Q; ++q) st[m2_run(q)] = s[q];
+    }
 }
 
 // Prefill, token by token: grid (lanes, H), the head's state in registers

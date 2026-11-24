@@ -453,6 +453,7 @@ fn a_top_k_by_select_answers_what_the_sort_answers() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     for case in top_k_cases() {
@@ -517,6 +518,7 @@ fn a_beam_step_answers_what_the_interpreter_answers() {
             },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the miniature loads");
     for case in beam_stage() {

@@ -441,6 +441,7 @@ impl Kv {
                 slots: Some(&slots),
                 kv_len: Some(&kv_len),
                 fold: Fold::All,
+                ..StateGeometry::default()
             },
         )?;
         let next = sample.then(|| Channel::new([1], dtype::i32));

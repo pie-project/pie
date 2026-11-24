@@ -103,6 +103,26 @@ pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the kernel's int")))
 }
 
+/// A flat launch of `n` elements, a thread an element: its grid as wide as
+/// the grid's x extent lets (2^31 - 1 blocks), so an element count past 32
+/// bits launches whole; a kernel launched so takes `n` and indexes it as
+/// `i64` (an `i32` count wraps on a fire of 2^31 elements of one plane).
+pub(crate) fn flat_wide(op: &'static str, n: u64, block: u32) -> Result<Launch, Error> {
+    let blocks = n.div_ceil(u64::from(block.max(1)));
+    let blocks = u32::try_from(blocks)
+        .ok()
+        .filter(|&b| b <= i32::MAX as u32)
+        .ok_or_else(|| {
+            refuse(
+                op,
+                format!("{n} elements take more blocks than a grid holds"),
+            )
+        })?;
+    let mut launch = Launch::flat(0, block);
+    launch.grid = [blocks, 1, 1];
+    Ok(launch)
+}
+
 pub(crate) fn count(op: &'static str, axis: &'static str, v: u32) -> Result<i32, Error> {
     stated(op, nonzero(op, axis, v)?)
 }

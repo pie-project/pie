@@ -76,21 +76,35 @@ pub fn state_of(sets: &[u64], room: Room) -> (u64, u32) {
 /// A pair's and an instance's state, each by [`state_of`]: what the engine
 /// states for a (program, extents) pair (`engine::Engine::guest_state`).
 #[must_use]
-pub fn guest_state(pair_sets: &[u64], instance_sets: &[u64], room: Room) -> GuestState {
+pub fn guest_state(
+    pair_sets: &[u64],
+    instance_sets: &[u64],
+    resident: u64,
+    room: Room,
+) -> GuestState {
     let (per_pair, pair_run) = state_of(pair_sets, room);
-    let (per_instance, instance_run) = state_of(instance_sets, room);
+    let (per_instance, instance_run) = state_of(&with_resident(resident, instance_sets), room);
     GuestState {
-        // The instance's value scratch, dead between fires: a park gives it
-        // back and an unpark takes fresh room. Today's arms are folded into
-        // it: one arm. What a later fire reads (a beam group's lists, the
-        // score rows) lies in the instance's tables, which the runtime
-        // copies with the instance, so no resident part is stated apart.
-        resident: 0,
-        scratch: per_instance,
+        // What a later fire reads as a fire left it (a beam group's state,
+        // BEAM-PAGE-LISTS §4): laid first in the instance's place, copied
+        // down a tier at a park and back byte for byte. A group's state
+        // grows with its beams squared, past an Instance slot's chunk, so it
+        // lies in the place's run of whole chunks rather than the tables.
+        resident,
+        // The instance's value scratch after it, dead between fires: one
+        // arm (today's arms folded in), the place's packing slack with it.
+        scratch: per_instance - resident,
         scratch_arms: 1,
         per_pair,
         run: pair_run.max(instance_run),
     }
+}
+
+/// An instance's sets as its place lays them: its resident state first
+/// (where it holds one), then its scratch sets.
+#[must_use]
+pub fn with_resident(resident: u64, scratch_sets: &[u64]) -> Vec<u64> {
+    (resident > 0).then_some(resident).into_iter().chain(scratch_sets.iter().copied()).collect()
 }
 
 /// Where each of `sets` lies in pieces of `pieces` bytes (the place the

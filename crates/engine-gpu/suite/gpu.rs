@@ -429,6 +429,31 @@ impl Gpu {
             .map(|c| widen(u16::from_le_bytes(*c)))
             .collect()
     }
+    /// Overwrites the buffer behind `handle` with `values`, raw 32-bit
+    /// words from its first byte.
+    pub fn write_u32(&self, handle: u32, values: &[u32]) {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let binding = self.handles.get(handle).expect("a bound handle");
+        let mut buffer = binding.buffer().clone();
+        let at = binding.offset();
+        drop(binding);
+        buffer.write(at, &bytes).expect("written");
+    }
+
+    /// `n` raw 32-bit words.
+    pub fn down_u32(&self, handle: u32, n: usize) -> Vec<u32> {
+        let bytes = self
+            .handles
+            .read(handle, (n * 4) as u64)
+            .expect("read back");
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect()
+    }
+
     pub fn down_f32(&self, handle: u32, n: usize) -> Vec<f32> {
         let bytes = self
             .handles

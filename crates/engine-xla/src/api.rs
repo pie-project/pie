@@ -509,6 +509,7 @@ impl Engine for Xla {
             residency,
             ordinal,
             frames_in_flight,
+            steps,
         } = request;
         let mut boot = self.boot.clone();
         // A fire's inputs wait in the staging ring until it runs: one slot
@@ -559,6 +560,9 @@ impl Engine for Xla {
         // ready: none is built after it (a fire outside it is a ladder miss,
         // named with its shape).
         shell.prewarm().map_err(fault)?;
+        // A beam group's head program a width rung (BEAM-PAGE-LISTS): a
+        // group's bind, after ready, builds none.
+        shell.lay_beam_heads().map_err(fault)?;
         // The program a bind or a host pass lands guest cells with.
         let (rows, _) = shell.pool_geometry();
         crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;
@@ -622,6 +626,8 @@ impl Engine for Xla {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -630,11 +636,13 @@ impl Engine for Xla {
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(eta_ir::registry::Port::AttnMask)
+                .with(eta_ir::registry::Port::Parents)
                 .with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
+            windowed_state: shell.serves_windowed_state(),
             rs_snapshots: shell.snapshots(),
             bidirectional_attention: true,
             adapter_attachments: true,
@@ -643,12 +651,35 @@ impl Engine for Xla {
             classes: shell.classes(),
             // XLA states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
-            mixed_lanes: shell.mixed_lanes(),
+            // A beam group's finish reads its chosen beam's list
+            // (`Engine::beam_list`, BEAM-PAGE-LISTS §6.6).
+            host_ops: engine::HostOps { beam_list: true },
             // the staging ring's slots less the one being written
             frames_in_flight: engine::stated_frames(
                 (shell.staging_facts().ring_slots as usize).saturating_sub(1),
             )?,
+            mixed_lanes: shell.mixed_lanes(),
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the warm ladder keys
+        // on it in its own branch (its laid mixed rungs, `mixed_lanes`, are
+        // narrower than the set's mixed shapes).
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts {
+                landing: engine::ReadoutLanding::InSpan,
+                store_rows: Shell::readout_store_rows(&shell),
+            }),
+        );
+        tracing::info!(
+            "engine-xla: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
         let (rows, sink_row) = shell.pool_geometry();
@@ -948,14 +979,63 @@ impl Engine for Xla {
         Ok(self.programs.fire_facts(program, load_temp))
     }
 
+    /// A beam group's state (BEAM-PAGE-LISTS §4) is the instance's resident
+    /// state: one run of `Instance` slots the runtime takes at the bind,
+    /// live to the close, moved whole by a park (`Rebind::Instance::resident`),
+    /// laid from the load's paging and frames in flight.
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+        class: eta_ir::registry::GeometryClass,
+    ) -> EngineResult<engine::program::GuestState> {
+        let _ = (extents, class);
+        let resident = match (
+            self.programs
+                .package(program)
+                .and_then(crate::beam::group_of),
+            self.shell.as_ref(),
+        ) {
+            (Some(group), Some(shell)) => {
+                let paging = shell.paging();
+                let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
+                let layout =
+                    crate::beam::layout(group, paging.page_size, paging.pages_per_slot, frames);
+                crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT).0
+            }
+            _ => 0,
+        };
+        Ok(engine::program::GuestState {
+            resident,
+            ..engine::program::GuestState::default()
+        })
+    }
+
     /// An instance's carried rings, or a registered channel's ring, moved to
     /// fresh `Channel` slots (a park and its return): the cells are read and
     /// written there from now on, by every instance bound to them.
     fn rebind_slots(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
         match rebind {
             engine::program::Rebind::Instance {
-                id, rings, adapter, ..
+                id,
+                rings,
+                adapter,
+                scratch: resident,
+                ..
             } => {
+                // a beam group's state: the runtime copied the resident run
+                // to the slots `resident` names
+                if let (Some(_), engine::ScratchPlace::Run { first, .. }, Some(shell)) =
+                    (self.programs.beam_seat(id), resident, self.shell.as_ref())
+                {
+                    let row = shell.pools().instance_row(first).ok_or_else(|| {
+                        Error::Program(format!(
+                            "instance {id:?}'s beam state moved to Instance slot {first}, past \
+                             the pool"
+                        ))
+                    })?;
+                    self.programs.rebind_beam(id, row);
+                }
                 if let (Some(held), Some(shell)) = (self.adapters.get_mut(&id), self.shell.as_mut())
                     && !adapter.is_empty()
                 {
@@ -997,7 +1077,66 @@ impl Engine for Xla {
         }
         let shell = self.shell.as_ref();
         let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
-        let bound = self.programs.bind(binding, &cell_row).map_err(refusal)?;
+        // A beam group's state (BEAM-PAGE-LISTS §4) in the resident run the
+        // runtime took for it, zeroed so its first fire primes it.
+        let beam = match (
+            self.programs
+                .package(binding.program)
+                .and_then(crate::beam::group_of),
+            shell,
+        ) {
+            (Some(group), Some(shell)) => {
+                let paging = shell.paging();
+                let layout = crate::beam::layout(
+                    group,
+                    paging.page_size,
+                    paging.pages_per_slot,
+                    caps.frames_in_flight,
+                );
+                let (_, slots) = crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT);
+                let first = match &binding.scratch {
+                    &engine::ScratchPlace::Run { first, slots: held } if held >= slots => first,
+                    other => {
+                        return Err(Error::Program(format!(
+                            "a beam group of {} lanes keeps its state in a resident run of \
+                             {slots} Instance slot(s); the bind names {other:?}",
+                            group.lanes
+                        )));
+                    }
+                };
+                let row = shell.pools().instance_row(first).ok_or_else(|| {
+                    Error::Program(format!("Instance slot {first} lies past the pool"))
+                })?;
+                Some(crate::beam::Seat {
+                    group,
+                    layout,
+                    row,
+                    fires: 0,
+                })
+            }
+            (Some(_), None) => {
+                return Err(Error::Program("a beam group bound before load".to_string()));
+            }
+            (None, _) => None,
+        };
+        let bound = self
+            .programs
+            .bind(binding, &cell_row, beam)
+            .map_err(refusal)?;
+        // the resident run cleared once, at the bind (§4)
+        if beam.is_some()
+            && let Some(shell) = self.shell.as_mut()
+            && let &engine::ScratchPlace::Run { first, slots } = &binding.scratch
+        {
+            let slots: Vec<(engine::chunk::ShapeId, u32)> = (first..first + slots)
+                .map(|slot| (crate::store::layout::INSTANCE, slot))
+                .collect();
+            let zeros = vec![0u8; slots.len() * crate::guest::CHANNEL_SLOT as usize];
+            if let Err(why) = shell.write_slot_bytes(&slots, &zeros) {
+                let _ = self.programs.close_instance(bound.id);
+                return Err(fault(why));
+            }
+        }
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds
             .iter()
@@ -1061,6 +1200,41 @@ impl Engine for Xla {
         self.programs
             .publish(instance, channel, cell)
             .map_err(refusal)
+    }
+
+    /// Beam `beam`'s page list as the group's last fire left it
+    /// (`BEAM-PAGE-LISTS.md` §6.6): row `beam` of the state's `map` (one
+    /// copy, words `2 + beam · cap`, `cap` columns), read out of the pool,
+    /// which every fire that wrote it lands before.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        let seat = self.programs.beam_seat(instance).ok_or_else(|| {
+            Error::Program(format!("instance {instance} binds no beam group (parents)"))
+        })?;
+        let (lanes, cap) = (seat.layout.lanes, seat.layout.cap);
+        if i64::from(beam) >= lanes {
+            return Err(Error::Program(format!("beam {beam} of a group of {lanes}")));
+        }
+        let shell = self.loaded_mut()?;
+        let pool = shell.pools().buffer().ok_or_else(|| {
+            Error::Program("a beam group's state on an unbacked pool".to_string())
+        })?;
+        // the plugin reads from 32-byte-aligned offsets: the row's start (a
+        // pool row is 512 bytes) through the beam's list, sliced here
+        let at = i64::from(seat.row) * crate::store::layout::ROW_BYTES as i64;
+        let end = (2 + (i64::from(beam) + 1) * cap) * 4;
+        let state = pool
+            .read_raw(at, (end + 31) / 32 * 32)
+            .map_err(|e| Error::Program(e.to_string()))?;
+        if u32::from_le_bytes([state[0], state[1], state[2], state[3]]) == 0 {
+            return Err(Error::Program(format!(
+                "instance {instance}'s beam group has fired no step yet"
+            )));
+        }
+        let from = ((2 + i64::from(beam) * cap) * 4) as usize;
+        Ok(state[from..from + cap as usize * 4]
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect())
     }
 
     fn take_channel(
@@ -1128,6 +1302,14 @@ impl Engine for Xla {
     /// `Growth::Fixed` pool; served for a defragmenting caller).
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let shell = self
+            .shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?;
+        Ok(shell.pools().chunk_table().clone())
     }
 
     fn read_tier_slots(
@@ -1829,6 +2011,95 @@ impl Xla {
                 }
             }
         }
+        // Beam groups (BEAM-PAGE-LISTS): an instance stating parents, its
+        // lanes its beams; each group's head runs before the fire.
+        let mut beam_lanes: Vec<Option<crate::beam::BeamLane>> = vec![None; submission.lanes.len()];
+        let mut heads: Vec<(kernels_xla::beam::Layout, crate::store::beam::Head)> = Vec::new();
+        let mut groups: Vec<(InstanceId, u32, u32)> = Vec::new();
+        for attachment in &submission.attachments {
+            let Some(seat) = self.programs.beam_seat(attachment.instance) else {
+                continue;
+            };
+            let shell = self
+                .shell
+                .as_ref()
+                .ok_or_else(|| Error::Program("a beam fire before load".to_string()))?;
+            let kv = shell.pools().kv_shape().ok_or_else(|| {
+                Error::Program("a beam group on a load that keeps no kv".to_string())
+            })?;
+            let live = self
+                .programs
+                .lane_count(attachment.instance)
+                .map_err(refusal)?;
+            let first = attachment.lane as usize;
+            let beams = submission.lanes.get(first..first + live).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "instance {}'s beams run past the fire's lanes",
+                    attachment.instance
+                ))
+            })?;
+            if live as i64 > seat.layout.lanes {
+                return Err(Error::Program(format!(
+                    "instance {}'s beam group runs {live} beams on a rung of {}",
+                    attachment.instance, seat.layout.lanes
+                )));
+            }
+            let lane0 = &beams[0];
+            let slot = lane0.kv.held;
+            if beams
+                .iter()
+                .any(|lane| lane.kv.held != slot || lane.rows() != 1)
+            {
+                return Err(Error::Program(format!(
+                    "instance {}'s beams write different slots or more than one row; every \
+                     beam writes its depth, one row a fire",
+                    attachment.instance
+                )));
+            }
+            let page = shell.paging().page_size.max(1);
+            let folded = lane0.kv.folded;
+            let f0 = folded / page;
+            let column = (slot / page).saturating_sub(f0);
+            let pool_refs = lane0.reserve.get(f0 as usize..).unwrap_or(&[]);
+            // the pages the beams can name this fire (the lowest-free rule
+            // bounds them: §3), as engine-cuda stages them
+            let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
+            let live32 = live as u32;
+            let backed = (live32 * (column + 2) + live32 * frames + 1).min(pool_refs.len() as u32);
+            let pool = shell
+                .pools()
+                .grains(kv, &pool_refs[..backed as usize])
+                .map_err(fault)?;
+            let parents_row = self
+                .programs
+                .parents_row(attachment.instance)
+                .map_err(refusal)?;
+            let results_row =
+                seat.row + u32::try_from((seat.layout.words() + 127) / 128).unwrap_or(u32::MAX);
+            for (b, slot_of) in beam_lanes[first..first + live].iter_mut().enumerate() {
+                *slot_of = Some(crate::beam::BeamLane {
+                    results_row,
+                    beam: b as u32,
+                    lanes: seat.layout.lanes as u32,
+                    cap: seat.layout.cap as u32,
+                    first_page: f0,
+                    column,
+                });
+            }
+            heads.push((
+                seat.layout,
+                crate::store::beam::Head {
+                    state_row: seat.row,
+                    parents_row,
+                    folded,
+                    slot,
+                    live: live32,
+                    pool,
+                },
+            ));
+            self.programs.beam_fired(attachment.instance);
+            groups.push((attachment.instance, first as u32, live32));
+        }
         let mut verbs: Vec<engine::fire::RsVerb> = submission
             .lanes
             .iter()
@@ -1915,7 +2186,7 @@ impl Xla {
         }
         // What each reported lane wrote, told when the step lands: one past
         // the last slot its rows landed at (the runtime bounds what a
-        // device-placed lane carries by it, `engine::fire::rung_rows`), and
+        // device-placed lane carries by it, `engine::fire::rung_holds`), and
         // where its fold length was the device's, the slots this fire's fold
         // froze, clamped to its rows' end as the plan clamps it
         // (`engine::rs::LanePlan::of`).
@@ -1979,6 +2250,20 @@ impl Xla {
             return Err(Error::Invalid(format!(
                 "lane in slot {} states no record, and this load holds recurrent state: the \
                  runtime states every lane's record, or that it has none",
+                lane.slot
+            )));
+        }
+        // A load serving windowed layers as ring + buffer: every lane the
+        // runtime seats states its fold (CONTRACT-BC 21), a kv-less one none.
+        if shell.serves_windowed_state()
+            && let Some(lane) = submission
+                .lanes
+                .iter()
+                .find(|lane| !lane.kv_less && lane.window.is_none())
+        {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} states no window fold, and this load serves its windowed layers \
+                 as ring + buffer: the runtime states every seated lane's",
                 lane.slot
             )));
         }
@@ -2061,7 +2346,10 @@ impl Xla {
                         .unwrap_or(&[]),
                 },
                 fixed: lane.record.pieces(),
+                window_fold: lane.window,
                 copies: &lane.slot_copies,
+                beam: beam_lanes[at],
+                replay_stated: lane.replay_stated,
             })
             .collect();
         let clips: Vec<crate::serve::Clips<'_>> = submission
@@ -2076,6 +2364,11 @@ impl Xla {
             .collect();
         // The readout stays on the device: guest passes read it there, and
         // the host copy is made only for a row something on the host reads.
+        // each beam group's head, on the pool before the fire (stream order)
+        let mut head_faults = Vec::with_capacity(heads.len());
+        for ((layout, head), group) in heads.iter().zip(&groups) {
+            head_faults.push((*group, shell.run_beam_head(*layout, head).map_err(fault)?));
+        }
         shell.feed_tokens(token_feeds);
         let fired = shell.fire_kept_with(&seated, &clips).map_err(fault)?;
         let kept = fired.kept.clone();
@@ -2096,6 +2389,31 @@ impl Xla {
             }
         }
 
+        // Each beam group's fault words (§7), read once its head lands: a
+        // faulted beam fails by name, the rest of the step commits.
+        for ((instance, first, live), words) in head_faults {
+            latch.hold();
+            let hold = std::sync::Arc::clone(latch);
+            std::thread::spawn(move || {
+                let outcome = words.download().map_err(|e| e.to_string()).map(|bytes| {
+                    let words: Vec<u32> = bytes
+                        .chunks_exact(4)
+                        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                        .collect();
+                    for (b, &code) in words.iter().take(live as usize).enumerate() {
+                        if code != 0 {
+                            let lane = first + b as u32;
+                            hold.fault_lane(lane, instance, &crate::beam::fault_reason(code, lane));
+                        }
+                    }
+                    // the group's common slot, after the lanes' faults (§11.3)
+                    if let Some(&common) = words.last() {
+                        hold.beam_common(instance, common);
+                    }
+                });
+                hold.release(outcome);
+            });
+        }
         let attached: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()

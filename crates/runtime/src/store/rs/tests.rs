@@ -33,6 +33,7 @@ fn tests_every_case() {
     run_ahead_successor_after_fork_cows_exactly_once();
     publish_batch_rejects_an_aliased_working_set();
     a_fold_drops_the_buffer_pages_behind_it();
+    a_truncate_takes_back_the_buffer_past_its_cut();
     a_state_others_read_is_folded_into_a_copy();
     a_checkpoint_is_cache_and_goes_when_idle();
     idle_snapshots_go_in_retention_order();
@@ -66,13 +67,11 @@ fn idle_snapshots_go_in_retention_order() {
         "the lower-ranked, though newer"
     );
     assert!(s.has_checkpoint(&[1; 32]), "the higher-ranked stays");
-    assert_eq!(
-        s.reclaim_droppable(rank),
-        0,
-        "the runtime leaves what a policy keyed above 0"
-    );
-    assert!(s.has_checkpoint(&[1; 32]));
-    assert_eq!(s.discard_cache(high), 1);
+    // No lower tier for a checkpoint: cached state yields to the next
+    // demand, whatever its key.
+    assert_eq!(s.reclaim_droppable(rank), 1);
+    assert!(!s.has_checkpoint(&[1; 32]));
+    assert_eq!(s.discard_cache(high), 0);
     assert_eq!(s.reclaim_cache(rank), 0);
 }
 
@@ -126,14 +125,8 @@ fn a_checkpoint_is_cache_and_goes_when_idle() {
     write_state(&mut s, other);
     assert!(s.checkpoint(other, o, None).unwrap());
     assert_eq!(s.group_demand(other, true, false, None), Ok(slots(1)));
-    let kept = |_: Option<crate::inferlet::process::ProcessId>| 1;
-    assert_eq!(
-        s.reclaim_sharing(&[other], kept),
-        0,
-        "a checkpoint a policy keeps is not the runtime's to drop"
-    );
-    assert!(s.has_checkpoint(&o));
-    assert_eq!(s.reclaim_sharing(&[other], |_| 0), 1);
+    // Cached state yields to running work, whatever its key.
+    assert_eq!(s.reclaim_sharing(&[other]), 1);
     assert_eq!(
         s.group_demand(other, true, false, None),
         Ok(slots(0)),
@@ -265,6 +258,38 @@ fn a_fold_drops_the_buffer_pages_behind_it() {
         (s.frozen(ws), s.base(ws), s.buffer_size(ws)),
         (Ok(8), Ok(8), Ok(0))
     );
+}
+
+// A stop's take-back on a set with a recurrent state: the buffer pages
+// wholly past the cut go back, the page the cut falls in stays; a cut below
+// what the state holds is refused, the buffer untouched.
+fn a_truncate_takes_back_the_buffer_past_its_cut() {
+    let mut s = store();
+    let ws = store_with_state(&mut s);
+    let prepared = s
+        .prepare_group(ws, false, false, None, Some(0..12), None)
+        .unwrap();
+    settled(&mut s, prepared);
+    s.fold(ws, 2);
+    let held = s.held([ws]);
+    assert_eq!(s.buffer_size(ws), Ok(3));
+    s.truncate(ws, 5).unwrap();
+    assert_eq!(s.buffer_size(ws), Ok(2), "slots 8..12 went, 4..8 holds row 4");
+    assert_eq!(s.held([ws]).pages + 1, held.pages, "and its page went back");
+    assert_eq!(
+        s.truncate(ws, 1),
+        Err(RsError::FoldedPastCut {
+            committed: 2,
+            cut: 1
+        })
+    );
+    assert_eq!(s.buffer_size(ws), Ok(2));
+    s.truncate(ws, 2).unwrap();
+    assert_eq!(s.buffer_size(ws), Ok(1), "the page the state ends in stays");
+    // A state that buffers no row (no rs list) is refused by name.
+    let mut bare = RsStore::new(4, 0);
+    let ws = bare.create_working_set(geom());
+    assert_eq!(bare.truncate(ws, 0), Err(RsError::Unbuffered));
 }
 
 fn a_state_others_read_is_folded_into_a_copy() {

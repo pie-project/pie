@@ -24,6 +24,7 @@ fn fold_one_plan(ids: &[crate::store::rs::RsWorkingSetId]) -> rs::RsPlan {
                 writes: None,
                 fold: rs::GroupFold::Host(1),
                 snapshots: Vec::new(),
+                beams: false,
             }),
         }
     }
@@ -394,6 +395,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             cells,
             failure: pipeline_failure,
             retired: None,
+            lane: Some(quorum_pipeline_id),
         },
     );
     Ok(Ok(()))

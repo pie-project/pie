@@ -338,6 +338,18 @@ impl RsScratch {
     }
 }
 
+/// A fire's fold gate as its body reads it: each lane's commit word's
+/// address (`commits`, staged with the fire's tables), the lanes' mask rows
+/// (`indptr`) and the mask the folds read (`mask`), over `lanes` lanes, the
+/// most the fire's body carries, so one body serves every fire of its key.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate {
+    pub commits: u64,
+    pub indptr: u64,
+    pub mask: u64,
+    pub lanes: u32,
+}
+
 /// A buffering fire's recurrent rows: the staged tables its kernels address
 /// them through, and whether its recurrences run extended (a lane of it
 /// replays buffered rows).
@@ -346,7 +358,13 @@ pub struct RsSeat<'a> {
     pub buffers: &'a crate::store::rs::Buffers,
     pub tables: kernels_cuda::runtime::channel::RsTables,
     pub extended: bool,
+    /// Whether its decode steps split their carried rows over the spare
+    /// blocks (`record::RsBody::Splits`).
+    pub splits: bool,
     pub scratch: Option<&'a RsScratch>,
+    /// The beam groups' fold table and its entries, where the fire stages
+    /// folds (§11.3): every recurrent layer folds them ahead of the body.
+    pub folds: Option<(u64, u32)>,
 }
 
 /// A recurrent pool as a one-token arm reads it: a lane of one row folds it
@@ -624,6 +642,11 @@ pub struct Run<'c> {
 
     rs: Option<RsSeat<'c>>,
 
+    /// The fire's fold gate, when its lanes' commits gate their folds: the
+    /// body lays its mask ahead of every kernel that reads it
+    /// ([`Run::lay_gate`]).
+    gate: Option<Gate>,
+
     windows: &'c Windows,
 
     place: &'c At,
@@ -742,6 +765,7 @@ impl<'c> Run<'c> {
             values_wide: values.len(),
             fire,
             rs: None,
+            gate: None,
             windows,
             place,
             side: &[],
@@ -963,6 +987,34 @@ impl<'c> Run<'c> {
         self
     }
 
+    /// The fire's lanes' commits gate their folds through `gate`.
+    pub fn gated(mut self, gate: Gate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Lays the fold gate's mask from the lanes' commit words, on the fire's
+    /// stream ahead of anything that reads it: the first thing the body
+    /// records (`record::Bodies::fire_body`), and what an eager walk runs
+    /// first. Nothing where the fire gates no fold.
+    pub(crate) fn lay_gate(&self) -> Result<(), kernels_cuda::Error> {
+        let Some(gate) = self.gate else {
+            return Ok(());
+        };
+        kernels_cuda::runtime::channel::mask_from_commit(
+            self.ctx,
+            gate.commits,
+            gate.indptr,
+            gate.mask,
+            gate.lanes,
+        )
+    }
+
+    /// Whether the fire's lanes' commits gate their folds.
+    pub(crate) fn gates(&self) -> bool {
+        self.gate.is_some()
+    }
+
     fn rs_fault(op: &'static str, fault: crate::error::Fault) -> kernels_cuda::Error {
         kernels_cuda::Error::Backend {
             op,
@@ -1059,6 +1111,12 @@ impl<'c> Run<'c> {
             tables,
             place,
         )
+    }
+
+    /// Whether this fire buffers recurrent rows (its lanes carry rows past
+    /// their states).
+    pub(crate) fn rs_buffering(&self) -> bool {
+        self.rs.is_some()
     }
 
     /// Whether the fire's recurrences run over extended rows: a lane of it
@@ -1316,6 +1374,123 @@ impl<'c> Run<'c> {
         if let Some(scratch) = self.rs.as_ref().and_then(|seat| seat.scratch) {
             scratch.layer_done(self.window().span().lane_offset);
         }
+    }
+
+    /// Whether `id` is a buffered plane of this buffering fire: a decode
+    /// step reading it carries each lane's buffered rows ahead of its own
+    /// and lands its own row in the buffer itself.
+    pub(crate) fn rs_buffered(&self, id: ValueId) -> bool {
+        self.rs
+            .as_ref()
+            .is_some_and(|seat| seat.buffers.planes().of(id).is_some())
+    }
+
+    /// Whether `gates` is a decode step's gate prep output in a buffering
+    /// fire, whose `[b | a]` its recurrence lands.
+    pub(crate) fn rs_step_gates(&self, gates: ValueId) -> bool {
+        self.rs
+                .as_ref()
+                .is_some_and(|seat| seat.buffers.planes().step_gates(gates).is_some())
+    }
+
+    /// Value `id`'s buffered plane.
+    pub(crate) fn rs_plane(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<crate::store::rs::Plane, kernels_cuda::Error> {
+        self.rs
+            .as_ref()
+            .and_then(|seat| seat.buffers.planes().of(id))
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: format!(
+                    "value {} is no plane this load buffers, so a lane's carried rows have \
+                     nowhere to be read from",
+                    id.0
+                ),
+            })
+    }
+
+    /// The window's qo boundaries as its recurrent kernels read them.
+    pub(crate) fn rs_qo_indptr(&self) -> Tensor {
+        self.rs_indptr().0
+    }
+
+    /// This load's buffered planes, where the fire buffers.
+    pub(crate) fn rs_planes(&self) -> Option<&'c crate::store::rs::Planes> {
+        self.rs.as_ref().map(|seat| seat.buffers.planes())
+    }
+
+    /// The carried rows a decode step of this window reads: the staged
+    /// tables, the commit lengths of `pool` and the places of the step's
+    /// buffered `planes` (in the order its kernel reads them).
+    /// The beam groups' folds a recurrent layer runs before its step
+    /// (`BEAM-PAGE-LISTS.md` §11.3): a carry over the fire's whole lane table
+    /// (a fold names its representative by its fire lane) placing `planes`,
+    /// the fold table, and its entries. `None`: the fire's body folds none.
+    pub(crate) fn rs_group_folds(
+        &self,
+        op: &'static str,
+        planes: &[crate::store::rs::Plane],
+    ) -> Result<Option<(kernels_cuda::ssm::Carry, Tensor, u32)>, kernels_cuda::Error> {
+        let Some(seat) = self.rs.as_ref() else {
+            return Ok(None);
+        };
+        let Some((folds, entries)) = seat.folds else {
+            return Ok(None);
+        };
+        let tables = seat.tables;
+        let mut carry = kernels_cuda::ssm::Carry {
+            lanes: tables.lanes,
+            pages: tables.pages,
+            lane_rows: tables.lane_rows,
+            replay_spans: tables.replay_spans,
+            page_tokens: tables.page_tokens.max(1),
+            ..kernels_cuda::ssm::Carry::NONE
+        };
+        for (at, &plane) in planes.iter().enumerate() {
+            let place = seat
+                .buffers
+                .place(plane)
+                .map_err(|fault| Self::rs_fault(op, fault))?;
+            carry.plane_off[at] = place.off;
+            carry.plane_stride[at] = place.stride;
+        }
+        let table = Tensor::new(folds, entries, 3, poem_ir::Dtype::U32);
+        Ok(Some((carry, table, entries)))
+    }
+
+    pub(crate) fn rs_carry(
+        &self,
+        op: &'static str,
+        planes: &[crate::store::rs::Plane],
+        pool: &RecurrentPool,
+    ) -> Result<kernels_cuda::ssm::Carry, kernels_cuda::Error> {
+        let Some(seat) = self.rs.as_ref() else {
+            return Ok(kernels_cuda::ssm::Carry::NONE);
+        };
+        let tables = self.rs_tables(seat);
+        let mut carry = kernels_cuda::ssm::Carry {
+            lanes: tables.lanes,
+            pages: tables.pages,
+            lane_rows: tables.lane_rows,
+            replay_spans: tables.replay_spans,
+            commit_len: pool.commit_len.ptr,
+            page_tokens: tables.page_tokens.max(1),
+            #[cfg(not(feature = "rocm"))]
+            split: if seat.splits { seat.buffers.split_room() } else { 0 },
+            ..kernels_cuda::ssm::Carry::NONE
+        };
+        for (at, &plane) in planes.iter().enumerate() {
+            let place = seat
+                .buffers
+                .place(plane)
+                .map_err(|fault| Self::rs_fault(op, fault))?;
+            carry.plane_off[at] = place.off;
+            carry.plane_stride[at] = place.stride;
+        }
+        Ok(carry)
     }
 
     pub(crate) fn values(&self) -> &'c [ValueDecl] {
@@ -2566,7 +2741,11 @@ impl<'c> Run<'c> {
         })
     }
 
-    pub(crate) fn planning(&self, geom: ValueId, plan: ValueId) -> Planning<'_> {
+    pub(crate) fn planning(
+        &self,
+        geom: ValueId,
+        plan: ValueId,
+    ) -> Result<Planning<'_>, kernels_cuda::Error> {
         let at = geom.0 as usize;
         let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def else {
             panic!(
@@ -2636,18 +2815,12 @@ impl<'c> Run<'c> {
                 gathered.page_indptr_host.as_slice(),
                 gathered.kv_len_host.as_slice(),
             ),
-            None => {
-                let first = span.lane_offset as usize;
-                let lanes = ceiling.map_or(span.lanes, |(_, lanes)| lanes) as usize;
-                (
-                    seat.kv_indptr
-                        .get(first..=first + lanes)
-                        .unwrap_or(&seat.kv_indptr),
-                    seat.kv_len
-                        .get(first..first + lanes)
-                        .unwrap_or(&seat.kv_len),
-                )
-            }
+            None => window_tables(
+                &seat.kv_indptr,
+                &seat.kv_len,
+                span.lane_offset as usize,
+                ceiling.map_or(span.lanes, |(_, lanes)| lanes) as usize,
+            )?,
         };
         let shape = Shape {
             num_requests: ceiling.map_or(span.lanes, |(_, lanes)| lanes),
@@ -2682,7 +2855,7 @@ impl<'c> Run<'c> {
             rows >= live.rows,
             "a row carve is never narrower than the fire"
         );
-        Planning {
+        Ok(Planning {
             kv_indptr,
             kv_len,
             shape,
@@ -2690,7 +2863,7 @@ impl<'c> Run<'c> {
             rows,
             window: schedule.window,
             workspace: schedule.workspace,
-        }
+        })
     }
 
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
@@ -2892,9 +3065,52 @@ fn skip(handle: Tensor, skip: u32, keep: u32) -> Tensor {
     )
 }
 
+/// The window's own lanes `first..first + lanes` of the fire's kv tables, or
+/// the fire fails by name: the whole table from lane 0 in their place plans
+/// each lane on another's pages.
+fn window_tables<'a>(
+    kv_indptr: &'a [i32],
+    kv_len: &'a [i32],
+    first: usize,
+    lanes: usize,
+) -> Result<(&'a [i32], &'a [i32]), kernels_cuda::Error> {
+    let short = |table: &str, len: usize, want: usize| kernels_cuda::Error::Backend {
+        op: "run::planning",
+        detail: format!(
+            "the window's lanes {first}..{} need {table} entries through {want}, \
+             and the fire's table holds {len}",
+            first + lanes,
+        ),
+    };
+    Ok((
+        kv_indptr
+            .get(first..=first + lanes)
+            .ok_or_else(|| short("kv_indptr", kv_indptr.len(), first + lanes + 1))?,
+        kv_len
+            .get(first..first + lanes)
+            .ok_or_else(|| short("kv_len", kv_len.len(), first + lanes))?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::RsScratch;
+
+    /// A window's lanes the fire's kv tables do not hold fail by name; the
+    /// whole table from lane 0 is never planned in their place.
+    #[test]
+    fn a_window_past_the_fires_kv_tables_is_refused_not_planned_on_lane_0() {
+        let indptr = [0, 4, 9, 12];
+        let len = [4, 5, 3];
+        let (ip, kl) = super::window_tables(&indptr, &len, 1, 2).unwrap();
+        assert_eq!((ip, kl), (&indptr[1..4], &len[1..3]));
+        for (first, lanes) in [(2, 2), (3, 1), (0, 4)] {
+            let why = super::window_tables(&indptr, &len, first, lanes)
+                .unwrap_err()
+                .to_string();
+            assert!(why.contains("the fire's table holds"), "{why}");
+        }
+    }
 
     #[test]
     fn the_windows_of_a_fire_share_a_layers_planes_and_keep_their_own_layout_words() {

@@ -521,4 +521,13 @@ fn holds_the_contract(mut m: Model, name: &str) {
         }
     }
     eprintln!("{name}: every claim holds over {} state bytes", folded.len());
+    // Every fire above (buffering lanes, replays, folds beside them, the
+    // windows of an MTP verify) took only pipelines the load's walks named:
+    // the committed recurrences and convs and the buffered rows' copies
+    // among them.
+    let built = m.shell.built_serving();
+    assert!(
+        built.is_empty(),
+        "{name}: a buffering fire built pipelines no walk of the load named: {built:?}"
+    );
 }

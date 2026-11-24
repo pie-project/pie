@@ -229,6 +229,37 @@ pub fn save_product_times(
     Ok(Some(save.path.display().to_string()))
 }
 
+/// How this machine lands weights (`measured`, `[rates] landing`), keyed,
+/// saved in the device's user profile under `profiles`: a later load reads
+/// it there and measures none of it.
+pub fn save_landing(
+    profiles: Option<&std::path::Path>,
+    device: &str,
+    keys: &crate::stored::Keys,
+    measured: profile::fire::Landing,
+) -> Result<Option<String>, String> {
+    let Some(profiles) = profiles else {
+        return Ok(None);
+    };
+    let rates = keys.stamp(Rates {
+        landing: Some(measured),
+        ..Rates::default()
+    });
+    let save = engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, device),
+        provenance: (
+            profile::fire::LANDING,
+            format!(
+                "\"measured in place at load, {}\"",
+                engine::rates::build_commit()
+            ),
+        ),
+        registry: crate::chip::registry(),
+    };
+    engine::rates::save_rates(&save, &rates)?;
+    Ok(Some(save.path.display().to_string()))
+}
+
 /// The rows `few_row_tflops` is timed at: the most the backend's few-rows
 /// kernel takes (`linear::gemm::FEW_ROWS`).
 pub const FEW_ROWS: u32 = kernels_cuda::linear::gemm::FEW_ROWS;
@@ -601,6 +632,8 @@ mod on_device {
         };
         Ok(Measured {
             rates: Rates {
+                landing: None,
+                load_width: None,
                 launch_ns: Some(launch),
                 gemm_tflops_by_rows: Some(
                     gemm.into_iter()
@@ -1204,6 +1237,8 @@ mod ensure_tests {
 
     fn measured() -> Rates {
         Rates {
+            landing: None,
+            load_width: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 300.0)]),

@@ -419,12 +419,16 @@ pub struct Tiers {
 /// buffer rows past their state but replay none, and one where a lane
 /// replays buffered rows ahead of its own (every recurrence then runs over
 /// the extended rows). Where a lane's rows land and which it replays are
-/// data the body reads (`inputs::RsHandles`), not part of the key.
+/// data the body reads (`inputs::RsHandles`), not part of the key. A
+/// buffering fire where a decoding lane carries more than one chunk of rows
+/// splits each carried read over the device's spare blocks
+/// (`kernels_cuda::ssm::Carry::split`), a grid only such a fire launches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum RsBody {
     #[default]
     Folds,
     Buffers,
+    Splits,
     Replays,
 }
 
@@ -616,6 +620,7 @@ impl core::fmt::Display for BodyKey {
         match self.rs {
             RsBody::Folds => {}
             RsBody::Buffers => f.write_str("~rs")?,
+            RsBody::Splits => f.write_str("~rss")?,
             RsBody::Replays => f.write_str("~rsx")?,
         }
         Ok(())
@@ -708,6 +713,10 @@ enum Step {
 
 struct Body {
     script: Box<[Step]>,
+    /// The step whose stretch lays the fire's fold gate first
+    /// (`Run::lay_gate`): recorded in its graph, or laid ahead of it where
+    /// it walks. None where the body gates no fold.
+    gate_step: Option<usize>,
     grids: Box<[(u32, u32)]>,
     shape: u64,
     launched_at: u64,
@@ -1036,7 +1045,9 @@ impl Bodies {
             let upto = REPLAY_UPTO.load(std::sync::atomic::Ordering::Relaxed);
             let from = REPLAY_FROM.load(std::sync::atomic::Ordering::Relaxed);
             let mut nth = 0usize;
-            for step in body.script.iter() {
+            for (index, step) in body.script.iter().enumerate() {
+                // The gate a walked step would have recorded, laid ahead of it.
+                let gates = body.gate_step == Some(index);
                 match step {
                     Step::Exec { exec, cut } => {
                         let launch = !at.eager_twin && nth >= from && nth < upto;
@@ -1046,10 +1057,16 @@ impl Bodies {
                             exec.launch(at.stream)?;
                             crate::serve::btrace::mark("launch");
                         } else {
+                            if gates {
+                                lay_gate(run)?;
+                            }
                             walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                         }
                     }
                     Step::Island(cut) => {
+                        if gates {
+                            lay_gate(run)?;
+                        }
                         walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                     }
                 }
@@ -1076,6 +1093,7 @@ impl Bodies {
             && run.capturable()
             && (cold || (!refused && self.map.warmed(&key) + 1 >= WARM_FIRES));
         if !captures {
+            lay_gate(run)?;
             walk_capture(at, run, place, Streams::Warm)?;
         }
 
@@ -1150,9 +1168,30 @@ impl Bodies {
         let mut edges = 0;
         let mut islands = 0usize;
         let mut bytes: Option<usize> = Some(0);
-        for cut in script {
+        // The fold gate is laid by the first stretch that runs a kernel,
+        // recorded in its graph ahead of the stretch's own (or ahead of the
+        // island, where that stretch walks): a stretch of plan builds alone
+        // records nothing the gate's readers follow.
+        let prepare_only = |cut: &Stretch| {
+            (cut.from..cut.upto).all(|at_region| {
+                at.compiled
+                    .template()
+                    .get(at_region as usize)
+                    .is_some_and(|region| region.phase == poem_compiler::Phase::Prepare)
+            })
+        };
+        let gate_cut = run
+            .gates()
+            .then(|| script.iter().position(|cut| cut.island || !prepare_only(cut)))
+            .flatten();
+        let mut gate_step: Option<usize> = None;
+        for (index, cut) in script.into_iter().enumerate() {
+            let gates = gate_cut == Some(index);
             if cut.island {
                 islands += 1;
+                if gates {
+                    gate_step = Some(steps.len());
+                }
                 steps.push(Step::Island(cut));
                 continue;
             }
@@ -1161,6 +1200,9 @@ impl Bodies {
                     PTR_TAG.store(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 let captured = Graph::capture(at.stream, || {
+                    if gates {
+                        lay_gate(run)?;
+                    }
                     walk_capture_cut(at, run, place, Streams::Forked, cut)
                 });
                 PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1191,16 +1233,13 @@ impl Bodies {
                 );
             }
             if graph.nodes() == Some(0) {
-                let prepare_only = (cut.from..cut.upto).all(|at_region| {
-                    at.compiled
-                        .template()
-                        .get(at_region as usize)
-                        .is_some_and(|region| region.phase == poem_compiler::Phase::Prepare)
-                });
-                if prepare_only {
+                if prepare_only(&cut) {
                     continue;
                 }
                 islands += 1;
+                if gates {
+                    gate_step = Some(steps.len());
+                }
                 steps.push(Step::Island(cut));
                 continue;
             }
@@ -1220,6 +1259,9 @@ impl Bodies {
             };
             nodes += took;
             edges += graph.edges().unwrap_or(0);
+            if gates {
+                gate_step = Some(steps.len());
+            }
             steps.push(Step::Exec { exec, cut });
         }
         // Every rank instantiated before any launches what it captured.
@@ -1264,6 +1306,7 @@ impl Bodies {
             key,
             Body {
                 script: steps.into_boxed_slice(),
+                gate_step,
                 grids,
                 shape,
                 bytes,
@@ -1451,6 +1494,13 @@ impl<'a> Fire<'a> {
         }
         Cursor::new(place)
     }
+}
+
+/// The fire's fold gate (`Run::lay_gate`), on its stream: inside a capture,
+/// recorded as the first node of the stretch that lays it.
+fn lay_gate(run: &Run<'_>) -> Result<()> {
+    run.lay_gate()
+        .map_err(|error| crate::error::Fault::from(crate::error::kernel(error)))
 }
 
 fn walk_capture(at: &Fire<'_>, run: &mut Run<'_>, place: &At, streams: Streams) -> Result<()> {
@@ -1659,6 +1709,7 @@ mod tests {
                 island: true,
             })]
             .into_boxed_slice(),
+            gate_step: None,
             grids: Vec::new().into_boxed_slice(),
             shape: 0,
             launched_at: crate::settle::Airborne::NEVER,
@@ -1710,6 +1761,7 @@ mod tests {
         let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers());
         let empty = Body {
             script: Box::new([]),
+            gate_step: None,
             grids: Box::new([]),
             shape: 0,
             launched_at: crate::settle::Airborne::NEVER,

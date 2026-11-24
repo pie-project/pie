@@ -708,6 +708,7 @@ fn a_served_hybrid_load_lays_the_seats_its_own_fires_take() {
             residency,
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .unwrap_or_else(|why| panic!("the served load lays the seats its pool holds: {why}"));
     let shell = engine.loaded().expect("the shell stands");
@@ -1823,6 +1824,7 @@ fn serve_refs(
             .map(|p| refs.page(lane as u32, p))
             .collect()
     };
+    let windowed = shell.pools().rings().is_some();
     let fire = |shell: &mut Shell, lanes: &[(usize, &[u32], u32)]| -> Vec<Vec<f32>> {
         let tables: Vec<Vec<u32>> = lanes
             .iter()
@@ -1836,6 +1838,8 @@ fn serve_refs(
                 held: Some(have),
                 refs: true,
                 record: Some(&records[lane][..]),
+                folded: have,
+                window: folds_all(windowed, have, tokens.len() as u32),
                 ..Seated::of(Lane {
                     slot: lane as u32,
                     word: word(trace, tokens.len() as u32),
@@ -2001,192 +2005,270 @@ fn a_scattered_windowed_pool_serves_the_same_logits() {
     scattered("gemma4-e4b-mini-l1");
 }
 
-/// A window list the runtime trims (CONTRACT-BC 19, 21): slots wholly
-/// behind the window read the null chunk (ref 0). One lane prefills past
-/// the window in pieces of a fire's rows and decodes on; its logits are the
-/// same bits whether every list holds every page (seat-addressed) or only
-/// the window's, scattered over chunks by slot ref and trimmed as the
-/// runtime trims, each step, those chunks evacuated mid-decode below a
-/// segment given back.
-fn trimmed_window(model: &str, layers: Option<u32>, page: u32, context: u32, prompt: u32) {
-    trimmed_window_of(&fixture(model, layers), model, page, context, prompt);
+/// A lane folding every row it brings this fire (`Lane::window` of a
+/// windowed load; `None` elsewhere): its buffer table starts at the folded
+/// index after the fire, and the fire leaves no row in it.
+pub fn folds_all(windowed: bool, have: u32, rows: u32) -> Option<engine::fire::WindowFold> {
+    windowed.then(|| engine::fire::WindowFold {
+        base: (have + rows) / PAGE * PAGE,
+        fold: engine::fire::FoldLen::Host(rows),
+        lineage: engine::fire::Lineage::Set,
+    })
 }
 
-fn trimmed_window_of(fixture: &Fixture, model: &str, page: u32, context: u32, prompt: u32) {
-    use engine::chunk::{ShapeId, SlotKind};
-
-    const STEPS: usize = 16;
-    let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
-    let run = |trimmed: bool| -> Option<Vec<Vec<f32>>> {
-        let mut shell = load_paged(fixture, page, context, None)?;
-        let facts = shell.pool_chunk_facts();
-        facts.validate().expect("the facts hang together");
-        eprintln!(
-            "{model}: {} chunks of {} B, {} a segment, shapes {:?}",
-            facts.total_chunks,
-            facts.chunk_bytes,
-            facts.segment_chunks,
-            facts
-                .shapes
-                .iter()
-                .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
-                .collect::<Vec<_>>()
-        );
-        // What the load holds unservable, and what a bind that reads all
-        // such a class writes is answered.
-        let named = shell.named();
-        if let Some(held) = named.unservable.first() {
-            let classes = shell.classes();
-            let reads: Vec<(String, u32)> = classes.classes[held.class]
-                .outputs
-                .iter()
-                .map(|decl| (decl.name.clone(), 0))
-                .collect();
-            eprintln!(
-                "{model}: lane classes {:?} of {} held unservable; a bind reading {:?}: {:?}",
-                named
-                    .unservable
-                    .iter()
-                    .map(|held| held.class)
-                    .collect::<Vec<_>>(),
-                classes.classes.len(),
-                reads
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>(),
-                engine_gpu::naming::refuses(&named.unservable, &classes, &reads),
-            );
-        }
-        // Each list the lane pages: its shape, tokens a slot, window,
-        // slots a chunk.
-        let lists: Vec<(ShapeId, u32, Option<u32>, u32)> = facts
-            .shapes
+/// Logit rows alike within a bf16-derived bound: every logit within 2^-6
+/// of its row's largest magnitude (a few bf16 ulps of the rows that feed
+/// it), and the same argmax.
+pub fn near(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    assert_eq!(got.len(), want.len(), "{what}: rows");
+    let mut worst = 0f32;
+    for (at, (got, want)) in got.iter().zip(want).enumerate() {
+        assert_eq!(got.len(), want.len(), "{what}: row {at}'s logits");
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let err = got
             .iter()
-            .filter_map(|s| match s.kind {
-                SlotKind::List { tokens, window, .. }
-                    if s.role == engine::chunk::SlotRole::State =>
-                {
-                    Some((s.id, tokens, window, s.slots_per_chunk))
-                }
-                _ => None,
+            .zip(want)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        worst = worst.max(err / scale);
+        assert!(
+            err <= scale / 64.0,
+            "{what}: row {at} differs by {err} of {scale} (argmax {} against {})",
+            argmax(got),
+            argmax(want)
+        );
+        assert_eq!(argmax(got), argmax(want), "{what}: row {at}'s argmax");
+    }
+    eprintln!("{what}: worst {worst:.2e} of a row's largest logit");
+}
+
+/// One seat-addressed lane prefilling `prompt` rows in fires of 256 (past
+/// the model's window) and decoding `steps` on, each step fed `feed`'s
+/// token for its row (the fixture's argmax, [`fixture_feed`]) or else its
+/// own argmax: every logit row.
+fn windowed_rows(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    prompt: u32,
+    steps: usize,
+    feed: Option<&[u32]>,
+) -> Option<Vec<Vec<f32>>> {
+    windowed_rows_in(fixture, page, context, prompt, steps, 256, None, feed)
+}
+
+/// [`windowed_rows`], the prompt in fires of `piece` rows.
+fn windowed_rows_in(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    prompt: u32,
+    steps: usize,
+    piece: usize,
+    budget: Option<u64>,
+    feed: Option<&[u32]>,
+) -> Option<Vec<Vec<f32>>> {
+    let mut shell = load_with(
+        fixture,
+        page,
+        context,
+        None,
+        engine::load::Residency {
+            device: engine::Allowance { budget },
+            ..engine::load::Residency::default()
+        },
+    )?;
+    let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
+    let mut have = 0u32;
+    let mut out = Vec::new();
+    let mut fed = prompt;
+    for _ in 0..=steps {
+        let mut last = Vec::new();
+        for piece in fed.chunks(piece) {
+            let seated = Seated {
+                held: Some(have),
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: word(&fixture.trace, piece.len() as u32),
+                    tokens: piece,
+                })
+            };
+            last = shell.fire_seated(&[seated]).expect("the fire lands");
+            have += piece.len() as u32;
+        }
+        let row = out.len() + last.len() - 1;
+        fed = vec![feed.and_then(|feed| feed.get(row).copied()).unwrap_or_else(|| argmax(&last[0]))];
+        out.extend(last);
+    }
+    Some(out)
+}
+
+/// The committed fixture of the window lists' logits
+/// (`suite/fixtures/window/<backend>-<name>.txt`, written by a build
+/// serving window lists with `$PIE_WINDOW_FIXTURE_WRITE`): each row's
+/// argmax and its top 8 logits, and every 256th logit of the first, middle
+/// and last rows. This build's rows are held to it under a bf16-derived
+/// bound: each logit within 2^-6 of its row's largest top logit, the same
+/// argmax.
+/// The argmax of each row of fixture `name`, which a checked run feeds on
+/// (a near tie the bf16 bound admits would otherwise send it down another
+/// continuation); none where the run writes the fixture.
+fn fixture_feed(name: &str) -> Option<Vec<u32>> {
+    if std::env::var_os("PIE_WINDOW_FIXTURE_WRITE").is_some() {
+        return None;
+    }
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../engine-gpu/suite/fixtures/window")
+        .join(format!("{}-{name}.txt", backend::NAME));
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| line.strip_prefix("top "))
+            .filter_map(|rest| rest.split_whitespace().next()?.parse().ok())
+            .collect(),
+    )
+}
+
+fn fixture_check(name: &str, rows: &[Vec<f32>]) {
+    const TOP: usize = 8;
+    const STRIDE: usize = 256;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../engine-gpu/suite/fixtures/window")
+        .join(format!("{}-{name}.txt", backend::NAME));
+    let sampled = |rows: usize| [0, rows / 2, rows.saturating_sub(1)];
+    if std::env::var_os("PIE_WINDOW_FIXTURE_WRITE").is_some() {
+        let mut text = format!("rows {} width {}\n", rows.len(), rows[0].len());
+        for row in rows {
+            let mut order: Vec<usize> = (0..row.len()).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+            text.push_str(&format!("top {}", argmax(row)));
+            for &at in &order[..TOP] {
+                text.push_str(&format!(" {at}:{:e}", row[at]));
+            }
+            text.push('\n');
+        }
+        for at in sampled(rows.len()) {
+            text.push_str(&format!("sample {at}"));
+            for col in (0..rows[at].len()).step_by(STRIDE) {
+                text.push_str(&format!(" {:e}", rows[at][col]));
+            }
+            text.push('\n');
+        }
+        std::fs::create_dir_all(path.parent().expect("a dir")).expect("the fixture dir");
+        std::fs::write(&path, text).expect("the fixture writes");
+        return;
+    }
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+    let mut lines = text.lines();
+    let head: Vec<usize> = lines
+        .next()
+        .expect("a head")
+        .split_whitespace()
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    assert_eq!(head, [rows.len(), rows[0].len()], "{name}: rows and width");
+    let mut worst = 0f32;
+    let mut scales = Vec::new();
+    for (at, line) in lines.by_ref().take(rows.len()).enumerate() {
+        let mut words = line.split_whitespace().skip(1);
+        let want_argmax: usize = words.next().and_then(|w| w.parse().ok()).expect("an argmax");
+        let tops: Vec<(usize, f32)> = words
+            .map(|w| {
+                let (col, value) = w.split_once(':').expect("col:value");
+                (col.parse().expect("a column"), value.parse().expect("a logit"))
             })
             .collect();
+        let scale = tops.iter().fold(0f32, |m, &(_, v)| m.max(v.abs())).max(1e-3);
+        scales.push(scale);
+        // Another argmax only where it ties the fixture's within the bound.
+        let got = argmax(&rows[at]) as usize;
         assert!(
-            lists.iter().any(|l| l.2.is_some()),
-            "{model}: a window list at context {context}"
+            got == want_argmax || rows[at][got] - rows[at][want_argmax] <= scale / 64.0,
+            "{name}: row {at}'s argmax {got} ({}) against {want_argmax} ({})",
+            rows[at][got],
+            rows[at][want_argmax]
         );
-        let layout = shell.pool_layout();
-        let segment = facts.segment_chunks;
-        let low = 1 + layout.seat_chunks();
-        // Each list's run of chunks, one after another.
-        let mut runs = Vec::new();
-        let mut held = 0u32;
-        for &(_, tokens, _, per) in &lists {
-            runs.push(held);
-            held += context.div_ceil(tokens).div_ceil(per);
+        for &(col, value) in &tops {
+            let err = (rows[at][col] - value).abs();
+            worst = worst.max(err / scale);
+            assert!(err <= scale / 64.0, "{name}: row {at} column {col}: {} against {value}", rows[at][col]);
         }
-        let kept = (low + held).div_ceil(segment);
-        let first = kept * segment;
-        let commit = (first + held).div_ceil(segment);
-        assert!(
-            facts.segments.max >= commit,
-            "{model}: room for the scattered run"
-        );
-        if trimmed {
-            shell.commit_segments(commit).expect("the segments commit");
+    }
+    for line in lines {
+        let mut words = line.split_whitespace().skip(1);
+        let at: usize = words.next().and_then(|w| w.parse().ok()).expect("a row");
+        for (k, w) in words.enumerate() {
+            let value: f32 = w.parse().expect("a logit");
+            let col = k * STRIDE;
+            let err = (rows[at][col] - value).abs();
+            worst = worst.max(err / scales[at]);
+            assert!(err <= scales[at] / 64.0, "{name}: row {at} column {col}: {} against {value}", rows[at][col]);
         }
-        // Slot `k` of list `l`: in its run's chunk `k / per`, strided there
-        // by a step prime to `per`, so each page has a slot of its own.
-        let slot_ref = |l: usize, k: u32| {
-            let per = lists[l].3;
-            let step = [7u32, 11, 13, 17]
-                .into_iter()
-                .find(|step| !per.is_multiple_of(*step))
-                .expect("a step prime to the slots a chunk");
-            (first + runs[l] + k / per) * per + (k * step + 3) % per
-        };
-        let mut rows_out = Vec::new();
-        let mut have = 0u32;
-        let mut fed: Vec<u32> = prompt.clone();
-        for step in 0..=STEPS {
-            if trimmed && step == STEPS / 2 {
-                let moves = (0..held).map(|at| (first + at, low + at)).collect();
-                shell
-                    .evacuate(&Evacuation { moves })
-                    .expect("the evacuation lands");
-                shell
-                    .release_segments(kept)
-                    .expect("the top segments go back");
-            }
-            let pieces: Vec<Vec<u32>> = fed.chunks(256).map(<[u32]>::to_vec).collect();
-            let mut last = Vec::new();
-            for tokens_in in pieces {
-                let n = tokens_in.len() as u32;
-                let after = have + n;
-                // Trimmed as the runtime trims: a slot whose last row lies
-                // below `committed_end - window` is the null chunk.
-                let tables: Vec<(ShapeId, Vec<u32>)> = lists
-                    .iter()
-                    .enumerate()
-                    .map(|(l, &(id, tokens, window, _))| {
-                        let refs = (0..after.div_ceil(tokens))
-                            .map(|k| match window {
-                                Some(w) if (k + 1) * tokens - 1 + w < have => 0,
-                                _ => slot_ref(l, k),
-                            })
-                            .collect();
-                        (id, refs)
-                    })
-                    .collect();
-                let pages: &[u32] = tables
-                    .iter()
-                    .find(|(id, _)| *id == LIST)
-                    .map_or(&[], |(_, refs)| refs.as_slice());
-                let seated = Seated {
-                    held: Some(have),
-                    refs: trimmed,
-                    pages: if trimmed { pages } else { &[] },
-                    windows: if trimmed { &tables } else { &[] },
-                    ..Seated::of(Lane {
-                        slot: 0,
-                        word: word(&fixture.trace, n),
-                        tokens: &tokens_in,
-                    })
-                };
-                last = shell.fire_seated(&[seated]).expect("the fire lands");
-                have = after;
-            }
-            fed = vec![argmax(&last[0])];
-            rows_out.extend(last);
-        }
-        Some(rows_out)
-    };
-    let Some(whole) = run(false) else {
+    }
+    eprintln!("{name}: against the window lists' fixture, worst {worst:.2e} of a row's top logit");
+}
+
+/// The window lists' logits, written by a build serving them
+/// (`$PIE_WINDOW_GOLDEN`, `<name>.bin`, with `$PIE_WINDOW_GOLDEN_WRITE`), and
+/// held against what this build serves where the file is there.
+fn golden(name: &str, rows: &[Vec<f32>]) {
+    let Some(dir) = std::env::var_os("PIE_WINDOW_GOLDEN") else {
+        eprintln!("{name}: no $PIE_WINDOW_GOLDEN, nothing to hold the rows against");
         return;
     };
-    let trimmed = run(true).expect("loaded before");
-    same(&format!("{model}: trimmed against whole"), &trimmed, &whole);
+    let path = PathBuf::from(dir).join(format!("{}-{name}.bin", backend::NAME));
+    let width = rows.first().map_or(0, Vec::len);
+    if std::env::var_os("PIE_WINDOW_GOLDEN_WRITE").is_some() {
+        let bytes: Vec<u8> = rows
+            .iter()
+            .flat_map(|row| row.iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
+        std::fs::write(&path, bytes).expect("the golden writes");
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+    let want: Vec<Vec<f32>> = bytes
+        .as_chunks::<4>()
+        .0
+        .chunks(width.max(1))
+        .map(|row| row.iter().map(|c| f32::from_le_bytes(*c)).collect())
+        .collect();
+    near(&format!("{name}: ring + buffer against the window lists"), rows, &want);
 }
 
-/// A model whose every kv row is windowed: the window list is the All
-/// axis's table.
-#[test]
-fn a_trimmed_window_list_reads_as_the_whole_one() {
-    trimmed_window("gemma4-e4b-mini-l1", None, PAGE, 1024, 700);
+/// A windowed layer as ring + buffer (CONTRACT-BC 19, 21) answers what the
+/// window lists answered: a prefill of 700 rows past the 512-row window in
+/// fires of 256 (each fire's own rows read from its fire slots and folded
+/// into the ring), and 16 decodes reading the ring.
+fn windowed_logits(model: &str, page: u32) {
+    let fixture = fixture(model, None);
+    let window = poem_exec::store::kv::declared_window(&fixture.trace).unwrap_or(0);
+    assert!(window > 0 && window < 700, "{model}: a window of {window} under the prompt");
+    let name = format!("{model}-p{page}");
+    let feed = fixture_feed(&name);
+    let Some(rows) = windowed_rows(&fixture, page, 1024, 700, 16, feed.as_deref()) else {
+        return;
+    };
+    fixture_check(&name, &rows);
+    golden(&format!("{model}-p{page}"), &rows);
 }
 
-/// A window list beside the kv list, its own table second, its slots of
-/// `T_w` tokens beside 32-token kv pages.
 #[test]
-fn a_trimmed_window_list_beside_the_kv_list_reads_as_the_whole_one() {
-    trimmed_window("gemma4-e4b-mini-l6", None, 32, 1024, 700);
+fn a_windowed_layer_answers_what_its_window_list_did() {
+    windowed_logits("gemma4-e4b-mini-l1", PAGE);
 }
 
-/// Two window lists beside the kv list (CONTRACT-BC 21): Gemma's miniature
-/// with every other sliding layer reading back 256 rows instead of 512,
-/// each window its own list, table and trim.
+/// Windowed layers beside the kv list's, the buffer's slot the kv page.
 #[test]
-fn two_trimmed_window_lists_read_as_the_whole_ones() {
+fn windowed_layers_beside_full_ones_answer_what_their_window_lists_did() {
+    windowed_logits("gemma4-e4b-mini-l6", 32);
+}
+
+/// Two windows beside full rows: Gemma's miniature with every other
+/// sliding layer reading back 256 rows instead of 512, each ring its own
+/// rows, the fold dropping what a narrower ring holds no place for.
+#[test]
+fn two_windows_answer_what_their_window_lists_did() {
     const MODEL: &str = "gemma4-e4b-mini-l6";
     let package = poem_compiler::catalog::package_of(MODEL).expect("the model is listed");
     let (_, text) = package
@@ -2207,20 +2289,329 @@ fn two_trimmed_window_lists_read_as_the_whole_ones() {
     let narrowed = poem_compiler::catalog::replacing(MODEL, "forward", &forward)
         .unwrap_or_else(|why| panic!("the narrowed forward loads: {why}"));
     let fixture = fixture_in(&narrowed, MODEL, None, "-two-windows");
-    let windows: Vec<Option<u32>> = fixture
-        .trace
-        .caches
+    let name = format!("{MODEL}-two-windows");
+    let feed = fixture_feed(&name);
+    let Some(rows) = windowed_rows(&fixture, 32, 1024, 700, 16, feed.as_deref()) else {
+        return;
+    };
+    fixture_check(&name, &rows);
+    golden(&format!("{MODEL}-two-windows"), &rows);
+}
+
+/// Slot refs of one shape `id` the runtime would hand out: slot `k` of
+/// the run from chunk `first`, `per` a chunk, strided over each chunk.
+fn slot_of(per: u32, first: u32, k: u32) -> u32 {
+    let step = [7u32, 11, 13, 17]
+        .into_iter()
+        .find(|step| !per.is_multiple_of(*step))
+        .expect("a step prime to the slots a chunk");
+    (first + k / per) * per + (k * step + 3) % per
+}
+
+/// The lanes of the ring tests: refs in a run of chunks past the seats'.
+struct RingRefs {
+    fixed: u32,
+    buffer: u32,
+    first: u32,
+    pieces: u32,
+}
+
+impl RingRefs {
+    fn of(shell: &mut Shell) -> RingRefs {
+        let layout = shell.pool_layout();
+        let first = 1 + layout.seat_chunks();
+        let refs = RingRefs {
+            fixed: layout.fixed.expect("a windowed load holds records").per_chunk,
+            buffer: layout.buffer.expect("a windowed load holds a window buffer").per_chunk,
+            first,
+            pieces: layout.pieces,
+        };
+        let segment = layout.segment_chunks.max(1);
+        let most = shell.pool_chunk_facts().segments.max;
+        shell
+            .commit_segments((first + 16).div_ceil(segment).min(most))
+            .expect("the segments commit");
+        refs
+    }
+
+    /// Record `r`: a piece each from chunks `first ..`.
+    fn record(&self, r: u32) -> Vec<u32> {
+        (0..self.pieces)
+            .map(|p| slot_of(self.fixed, self.first, r * self.pieces + p))
+            .collect()
+    }
+
+    /// Buffer slot `k` of owner `owner`, in the chunks past the records'.
+    fn slot(&self, owner: u32, k: u32) -> u32 {
+        slot_of(self.buffer, self.first + 8, owner * 64 + k)
+    }
+}
+
+/// A lane addressed by slot refs on a windowed load: its record, its
+/// buffer table from `base`, and its fold.
+struct RingLane<'a> {
+    slot: u32,
+    record: &'a [u32],
+    have: u32,
+    folded: u32,
+    base: u32,
+    fold: u32,
+    table: Vec<u32>,
+    /// Its fold counted on the device (`FoldLen::Device`, `fold` the count
+    /// its program holds at the fire).
+    device: bool,
+}
+
+fn fire_rings(shell: &mut Shell, trace: &Trace, lanes: &[(&RingLane<'_>, &[u32])]) -> Vec<Vec<f32>> {
+    let tables: Vec<Vec<(engine::chunk::ShapeId, Vec<u32>)>> = lanes
         .iter()
-        .filter_map(|row| match row {
-            poem_ir::CacheRow::Kv { window, .. } => Some(*window),
-            poem_ir::CacheRow::State { .. } => None,
+        .map(|(lane, _)| vec![(engine_gpu::store::layout::WINDOW, lane.table.clone())])
+        .collect();
+    let seated: Vec<Seated<'_>> = lanes
+        .iter()
+        .zip(&tables)
+        .map(|((lane, tokens), table)| Seated {
+            held: Some(lane.have),
+            refs: true,
+            record: Some(lane.record),
+            folded: lane.folded,
+            windows: table,
+            window: Some(engine::fire::WindowFold {
+                base: lane.base,
+                fold: if lane.device {
+                    engine::fire::FoldLen::Device
+                } else {
+                    engine::fire::FoldLen::Host(lane.fold)
+                },
+                lineage: engine::fire::Lineage::Set,
+            }),
+            ..Seated::of(Lane {
+                slot: lane.slot,
+                word: word(trace, tokens.len() as u32),
+                tokens,
+            })
         })
         .collect();
-    assert!(
-        windows.contains(&Some(256)) && windows.contains(&Some(512)) && windows.contains(&None),
-        "rows of two windows and full rows: {windows:?}"
+    let folds: Vec<engine_gpu::store::frozen::DeviceFold> = lanes
+        .iter()
+        .map(|(lane, _)| engine_gpu::store::frozen::DeviceFold {
+            count: lane.device.then_some(lane.fold),
+            reports: 0,
+        })
+        .collect();
+    shell.fire_folded(&seated, &folds).expect("the fire lands")
+}
+
+/// The logit rows of `tokens` fed one lane alone, folding every row, the
+/// prompt in fires of 200 and then a row a fire.
+fn alone(fixture: &Fixture, prompt: &[u32], tokens: &[u32]) -> Vec<Vec<f32>> {
+    let mut shell = load_paged(fixture, PAGE, 1024, None).expect("loaded before");
+    let mut have = 0u32;
+    let mut out = Vec::new();
+    for piece in prompt.chunks(200).chain(tokens.chunks(1)) {
+        let seated = Seated {
+            held: Some(have),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, piece.len() as u32),
+                tokens: piece,
+            })
+        };
+        let got = shell.fire_seated(&[seated]).expect("the fire lands");
+        have += piece.len() as u32;
+        out.extend(got);
+    }
+    out
+}
+
+/// Beam lanes over one folded ring (CONTRACT-BC 19): a lane prefills 600
+/// rows past the 512-row window and folds them all into its ring; two
+/// forks then decode divergent rows reading that one record, folding
+/// nothing, each its own buffer slots from the folded slot's base; each
+/// answers what a lane fed its rows alone answers. Then the beam keeps one
+/// fork: it folds its buffered rows and its own into the shared ring and
+/// decodes on, answering as alone still.
+#[test]
+fn beam_forks_read_one_folded_ring_through_divergent_buffers() {
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    const STEPS: u32 = 6;
+    let fixture = fixture(MODEL, None);
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let refs = RingRefs::of(&mut shell);
+    let record = refs.record(0);
+    let prompt: Vec<u32> = (0..600u32).map(|at| (at * 37 + 11) % 256).collect();
+    let mut have = 0u32;
+    let mut last = Vec::new();
+    for piece in prompt.chunks(200) {
+        let n = piece.len() as u32;
+        let lane = RingLane {
+            slot: 0,
+            record: &record,
+            have,
+            folded: have,
+            base: (have + n) / PAGE * PAGE,
+            fold: n,
+            table: Vec::new(),
+            device: false,
+        };
+        last = fire_rings(&mut shell, &fixture.trace, &[(&lane, piece)]);
+        have += n;
+    }
+    let folded = have;
+    let base = folded / PAGE * PAGE;
+    // The forks' first rows: the prefill's argmax, and another.
+    let first = argmax(&last[0]);
+    let mut fed = [vec![first], vec![(first + 1) % 256]];
+    let mut taken: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+    let mut rows: [Vec<Vec<f32>>; 2] = [Vec::new(), Vec::new()];
+    for step in 0..STEPS {
+        let lanes: Vec<RingLane<'_>> = (0..2u32)
+            .map(|fork| RingLane {
+                slot: 1 + fork,
+                record: &record,
+                have: folded + step,
+                folded,
+                base,
+                fold: 0,
+                table: (0..(folded + step + 1 - base).div_ceil(PAGE))
+                    .map(|k| refs.slot(fork, k))
+                    .collect(),
+                device: false,
+            })
+            .collect();
+        let got = fire_rings(
+            &mut shell,
+            &fixture.trace,
+            &[(&lanes[0], &fed[0][..]), (&lanes[1], &fed[1][..])],
+        );
+        for fork in 0..2 {
+            taken[fork].push(fed[fork][0]);
+            rows[fork].push(got[fork].clone());
+            fed[fork] = vec![argmax(&got[fork])];
+        }
+    }
+    for fork in 0..2 {
+        let want = alone(&fixture, &prompt, &taken[fork]);
+        near(
+            &format!("{MODEL}: fork {fork} over the shared ring"),
+            &rows[fork],
+            &want[want.len() - STEPS as usize..],
+        );
+    }
+    // Fork 0 kept: its buffered rows and its next one fold into the ring.
+    let mut kept = rows[0].clone();
+    let mut tokens = taken[0].clone();
+    let mut next = fed[0].clone();
+    let mut folded_now = folded;
+    let mut have = folded + STEPS;
+    for _ in 0..4 {
+        let to = have + 1;
+        let lane = RingLane {
+            slot: 1,
+            record: &record,
+            have,
+            folded: folded_now,
+            base: if have > folded_now {
+                folded_now / PAGE * PAGE
+            } else {
+                to / PAGE * PAGE
+            },
+            fold: to - folded_now,
+            table: if have > folded_now {
+                (0..(to - base).div_ceil(PAGE)).map(|k| refs.slot(0, k)).collect()
+            } else {
+                Vec::new()
+            },
+            device: false,
+        };
+        let got = fire_rings(&mut shell, &fixture.trace, &[(&lane, &next[..])]);
+        tokens.push(next[0]);
+        kept.push(got[0].clone());
+        next = vec![argmax(&got[0])];
+        folded_now = to;
+        have = to;
+    }
+    let want = alone(&fixture, &prompt, &tokens);
+    near(
+        &format!("{MODEL}: the kept fork, folded"),
+        &kept,
+        &want[want.len() - kept.len()..],
     );
-    trimmed_window_of(&fixture, MODEL, 32, 1024, 700);
+}
+
+/// A stop-truncate leaves the ring untouched (CONTRACT-BC 19): a lane
+/// prefills 600 rows (all folded), decodes five rows it buffers, folding
+/// none, then drops the last three and decodes other rows from there: it
+/// answers what a lane fed the kept rows alone answers, so the dropped
+/// rows reached no ring place (ring places of rows its window still reads).
+#[test]
+fn a_stop_truncate_leaves_the_ring_untouched() {
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    let fixture = fixture(MODEL, None);
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let refs = RingRefs::of(&mut shell);
+    let record = refs.record(0);
+    let prompt: Vec<u32> = (0..600u32).map(|at| (at * 53 + 5) % 256).collect();
+    let mut have = 0u32;
+    let mut last = Vec::new();
+    for piece in prompt.chunks(200) {
+        let n = piece.len() as u32;
+        let lane = RingLane {
+            slot: 0,
+            record: &record,
+            have,
+            folded: have,
+            base: (have + n) / PAGE * PAGE,
+            fold: n,
+            table: Vec::new(),
+            device: false,
+        };
+        last = fire_rings(&mut shell, &fixture.trace, &[(&lane, piece)]);
+        have += n;
+    }
+    let folded = have;
+    let base = folded / PAGE * PAGE;
+    let buffered = |have: u32| -> RingLane<'_> {
+        RingLane {
+            slot: 0,
+            record: &record,
+            have,
+            folded,
+            base,
+            fold: 0,
+            table: (0..(have + 1 - base).div_ceil(PAGE))
+                .map(|k| refs.slot(0, k))
+                .collect(),
+            device: false,
+        }
+    };
+    let mut next = argmax(&last[0]);
+    let mut tokens = Vec::new();
+    for step in 0..5 {
+        let got = fire_rings(&mut shell, &fixture.trace, &[(&buffered(folded + step), &[next][..])]);
+        tokens.push(next);
+        next = argmax(&got[0]);
+    }
+    // Truncated to its first two buffered rows, then other rows.
+    tokens.truncate(2);
+    let mut rows = Vec::new();
+    let mut fed = (tokens[1] + 7) % 256;
+    for step in 0..4 {
+        let got = fire_rings(&mut shell, &fixture.trace, &[(&buffered(folded + 2 + step), &[fed][..])]);
+        tokens.push(fed);
+        rows.push(got[0].clone());
+        fed = argmax(&got[0]);
+    }
+    let want = alone(&fixture, &prompt, &tokens);
+    near(
+        &format!("{MODEL}: decoding on past a stop-truncate"),
+        &rows,
+        &want[want.len() - rows.len()..],
+    );
 }
 
 /// Every shape a parked set carries comes back bit for bit through the
@@ -2261,7 +2652,7 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
     let (host, disk) = (MemoryDomain::HostPinned, MemoryDomain::LocalDisk);
     const BUDGET: u64 = 64 << 20;
     let chunks = shell
-        .seat_disk_kv(Some(BUDGET), Some(&dir), SEATS, CONTEXT)
+        .seat_disk_kv(Some(BUDGET), Some(&dir))
         .expect("the slot file opens");
     // The budget divides into disk chunks of a pool chunk each (on a direct
     // I/O boundary), laid out as the device's: any shape's slots take any
@@ -2759,3 +3150,161 @@ fn a_windowed_miniature_over_a_poisoned_pool_answers_finite() {
     poisoned("gemma4-e4b-mini-l1");
 }
 
+
+/// Decode time on a windowed miniature past its window: `lanes` seats
+/// prefill 700 rows each, then decode; the best of rounds of 128 steps,
+/// host wall time a step. A proxy for serving's decode, printed.
+fn windowed_decode_time(model: &str, lanes: u32) {
+    let fixture = fixture(model, None);
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let prompt: Vec<u32> = (0..700u32).map(|at| (at * 37 + 11) % 256).collect();
+    let mut have = vec![0u32; lanes as usize];
+    let mut fed: Vec<Vec<u32>> = vec![Vec::new(); lanes as usize];
+    for lane in 0..lanes as usize {
+        let mut last = Vec::new();
+        for piece in prompt.chunks(256) {
+            let seated = Seated {
+                held: Some(have[lane]),
+                ..Seated::of(Lane {
+                    slot: lane as u32,
+                    word: word(&fixture.trace, piece.len() as u32),
+                    tokens: piece,
+                })
+            };
+            last = shell.fire_seated(&[seated]).expect("the prefill lands");
+            have[lane] += piece.len() as u32;
+        }
+        fed[lane] = vec![argmax(&last[0])];
+    }
+    let step = |shell: &mut Shell, have: &mut Vec<u32>, fed: &mut Vec<Vec<u32>>| {
+        let seated: Vec<Seated<'_>> = (0..lanes as usize)
+            .map(|lane| Seated {
+                held: Some(have[lane]),
+                ..Seated::of(Lane {
+                    slot: lane as u32,
+                    word: word(&fixture.trace, 1),
+                    tokens: &fed[lane],
+                })
+            })
+            .collect();
+        let got = shell.fire_seated(&seated).expect("the decode lands");
+        for lane in 0..lanes as usize {
+            have[lane] += 1;
+            fed[lane] = vec![argmax(&got[lane])];
+        }
+    };
+    for _ in 0..16 {
+        step(&mut shell, &mut have, &mut fed);
+    }
+    let mut best = f64::INFINITY;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        for _ in 0..48 {
+            step(&mut shell, &mut have, &mut fed);
+        }
+        best = best.min(started.elapsed().as_secs_f64() / 48.0);
+    }
+    eprintln!("decode time: {model} {lanes} lanes: {:.1} us a step", best * 1e6);
+}
+
+#[test]
+fn windowed_decode_time_one_lane() {
+    windowed_decode_time("gemma4-e4b-mini-l1", 1);
+}
+
+#[test]
+fn windowed_decode_time_four_lanes() {
+    windowed_decode_time("gemma4-e4b-mini-l1", 4);
+}
+
+/// A fold the device counts (`FoldLen::Device`): a lane prefills 600 rows
+/// (all folded), decodes five rows it buffers, then fires a row whose
+/// program's count folds four of its six (600..604), the rest left: the
+/// row it carried at 604 in its buffer, its own at 605 landing there. It
+/// decodes on from the folded index the count left, answering as a lane
+/// fed its rows alone.
+#[test]
+fn a_device_counted_fold_folds_what_its_count_says() {
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    let fixture = fixture(MODEL, None);
+    let Some(mut shell) = load_paged(&fixture, PAGE, 1024, None) else {
+        return;
+    };
+    let refs = RingRefs::of(&mut shell);
+    let record = refs.record(0);
+    let prompt: Vec<u32> = (0..600u32).map(|at| (at * 29 + 3) % 256).collect();
+    let mut have = 0u32;
+    let mut last = Vec::new();
+    for piece in prompt.chunks(200) {
+        let n = piece.len() as u32;
+        let lane = RingLane {
+            slot: 0,
+            record: &record,
+            have,
+            folded: have,
+            base: (have + n) / PAGE * PAGE,
+            fold: n,
+            table: Vec::new(),
+            device: false,
+        };
+        last = fire_rings(&mut shell, &fixture.trace, &[(&lane, piece)]);
+        have += n;
+    }
+    let table = |upto: u32, base: u32| -> Vec<u32> {
+        (0..(upto - base).div_ceil(PAGE)).map(|k| refs.slot(0, k)).collect()
+    };
+    let mut folded = have;
+    let mut next = argmax(&last[0]);
+    let mut tokens = Vec::new();
+    let mut rows = Vec::new();
+    for step in 0..10u32 {
+        let have = 600 + step;
+        // Row 605 folds by the device's count of 4; the rows after fold
+        // nothing until then, every row from 609 on all it carries.
+        let (fold, device) = match have {
+            605 => (4, true),
+            h if h >= 609 => (h + 1 - folded, false),
+            _ => (0, false),
+        };
+        let base = folded / PAGE * PAGE;
+        let lane = RingLane {
+            slot: 0,
+            record: &record,
+            have,
+            folded,
+            base,
+            fold,
+            table: table(have + 1, base),
+            device,
+        };
+        let got = fire_rings(&mut shell, &fixture.trace, &[(&lane, &[next][..])]);
+        tokens.push(next);
+        rows.push(got[0].clone());
+        next = argmax(&got[0]);
+        folded += fold;
+    }
+    let want = alone(&fixture, &prompt, &tokens);
+    near(
+        &format!("{MODEL}: a device-counted fold"),
+        &rows,
+        &want[want.len() - rows.len()..],
+    );
+}
+
+
+
+/// Gemma's shared tail: its layers write no kv and read their owner
+/// layers' rings (a 26-layer cut of the 30-layer miniature: two tail
+/// layers over the trunk's), held to the window-list build's fixture.
+#[test]
+fn a_shared_tail_answers_what_its_window_lists_did() {
+    let fixture = fixture("gemma4-e4b-mini-l30", Some(26));
+    let feed = fixture_feed("gemma4-e4b-mini-l30-26");
+    let Some(rows) = windowed_rows_in(&fixture, PAGE, 1024, 700, 8, 256, Some(20 << 30), feed.as_deref())
+    else {
+        return;
+    };
+    fixture_check("gemma4-e4b-mini-l30-26", &rows);
+}

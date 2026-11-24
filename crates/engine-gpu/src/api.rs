@@ -189,6 +189,13 @@ fn out_of_range_tokens<B: Serve>(
         let Some(&id) = tokens.iter().find(|&&id| id >= vocab) else {
             continue;
         };
+        // A skip row (`engine::ports::SKIP_TOKEN`) is a contract id, not an
+        // out-of-range one; this engine does not carry skip rows yet.
+        let what = if id == engine::ports::SKIP_TOKEN {
+            "a skip row (token -1), which this engine does not carry yet".to_string()
+        } else {
+            format!("token {id}, out of range for a vocabulary of {vocab}")
+        };
         let lane_at = u32::try_from(at).unwrap_or(u32::MAX);
         match step
             .attachments
@@ -196,19 +203,12 @@ fn out_of_range_tokens<B: Serve>(
             .find(|attachment| attachment_lanes(attachment).contains(&lane_at))
         {
             Some(attachment) => {
-                let why = format!(
-                    "instance {}: token {id} is out of range for a vocabulary of {vocab}",
-                    attachment.instance
-                );
+                let why = format!("instance {}: {what}", attachment.instance);
                 envelope.refused(step, attachment, &why, faulted);
             }
             None => {
                 envelope.tokens[at] = Some(vec![0; lane.tokens.len()]);
-                faulted.fault_lanes(
-                    lane_at..lane_at + 1,
-                    None,
-                    &format!("token {id} is out of range for a vocabulary of {vocab}"),
-                );
+                faulted.fault_lanes(lane_at..lane_at + 1, None, &what);
             }
         }
     }
@@ -590,12 +590,31 @@ impl<B: Host> Gpu<B> {
                 .iter()
                 .filter_map(|value| Some((value.output.as_deref()?, value.lane))),
         );
+        // A beam group's state, laid for the search's depth (the bind's
+        // `key_len`, its end slot), the load's kv page and its frames in
+        // flight.
+        let beam = crate::beam::lanes_of(package)
+            .map(|lanes| {
+                crate::guest::state::BeamLayout::of(
+                    lanes,
+                    extents.key_len,
+                    shell.paging().page_size,
+                    u32::try_from(shell.frames_in_flight()).unwrap_or(u32::MAX),
+                )
+                .map(|layout| match shell.pools().rs_rows() {
+                    // On a hybrid its set's rs entries are held with it.
+                    Some(rows) => layout.buffering(shell.paging().page_size, rows.tokens),
+                    None => layout,
+                })
+            })
+            .transpose()
+            .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))?;
         crate::guest::state::GuestLayout::of_plans(
             &package.plans,
             &crate::guest::state::extents_of(extents),
             scores,
         )
-        .map(Some)
+        .map(|layout| Some(layout.with_beam(beam)))
         .map_err(|why| Error::Program(format!("program {program}'s state: {why}")))
     }
 
@@ -614,14 +633,19 @@ impl<B: Host> Gpu<B> {
         };
         for (step, pending) in steps.iter_mut().enumerate() {
             let mut outcome = engine::StepOutcome {
+                beam_common: Vec::new(),
                 wrote: std::mem::take(&mut pending.wrote),
                 faulted: std::mem::take(&mut pending.faulted),
             };
             // The frame settled: every step's forward landed.
             if let Some(fed) = pending.fed.take() {
                 outcome = crate::settle::merged(outcome, fed.faults());
+                outcome.beam_common = fed.commons();
             }
-            if !outcome.wrote.is_empty() || !outcome.faulted.is_empty() {
+            if !outcome.wrote.is_empty()
+                || !outcome.faulted.is_empty()
+                || !outcome.beam_common.is_empty()
+            {
                 let at = engine::StepDone {
                     frame: *frame,
                     step: step as u32,
@@ -929,6 +953,7 @@ where
             residency,
             ordinal,
             frames_in_flight,
+            steps,
         } = request;
 
         if ordinal > 0 {
@@ -956,11 +981,8 @@ where
         // fires of a served load are its own naming walk's, the widest a
         // cut's lanes, and those are the seats it is asked to lay.
         let slots = poem_compiler::state_slots(budgets.slots, &trace, crate::serve::naming_lanes());
-        let (disk_kv_budget, disk_kv_dir, seats) = (
-            residency.disk_kv_budget,
-            residency.disk_kv_dir.clone(),
-            residency.kv_seats.unwrap_or(budgets.max_lanes),
-        );
+        let (disk_kv_budget, disk_kv_dir) =
+            (residency.disk_kv_budget, residency.disk_kv_dir.clone());
         let budget = bake_budgets(&budgets, &trace);
         let mut shell = Shell::load(Boot {
             trace,
@@ -1005,12 +1027,7 @@ where
         let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
             .unwrap_or(u32::MAX);
         shell
-            .seat_disk_kv(
-                disk_kv_budget,
-                disk_kv_dir.as_deref(),
-                seats,
-                budgets.max_context,
-            )
+            .seat_disk_kv(disk_kv_budget, disk_kv_dir.as_deref())
             .map_err(fault)?;
         // The dense kernel at each rung settled on the served step, once the
         // load is whole (its programs placed, its kv seated); what a newly
@@ -1046,13 +1063,22 @@ where
 
         let pools = shell.pool_facts().map_err(fault)?;
         let chunks = shell.chunk_facts().map_err(fault)?;
+        let memory = crate::backend::Context::memory(shell.device());
+        if memory.unified() {
+            tracing::info!(
+                device = crate::backend::Context::name(shell.device()),
+                disk_chunks = chunks.disk_chunks,
+                "{}",
+                engine::DeviceMemory::NO_HOST_TIER
+            );
+        }
 
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: B::KIND.to_string(),
                 domain: B::domain(&self.boot),
                 sms: shell.cores(),
-                unified_memory: false,
+                unified_memory: memory.unified(),
 
                 fp8_native: false,
                 native_mxfp4_moe: false,
@@ -1085,6 +1111,10 @@ where
                     .unwrap_or(0),
                 prefill_lanes: 0,
                 max_readouts,
+                // A fire's staged rs table holds as many carried tokens as
+                // its widest bucket's rows, every lane's summed, a decode
+                // lane's included (`inputs::rs_carry_ints`).
+                replayed_rows: if shell.pools().rs_rows().is_some() { max_tokens } else { 0 },
             },
             has_lora: true,
             has_attn_page_mask: false,
@@ -1093,11 +1123,13 @@ where
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
 
             ports: B::ports(),
-            geometry: GeometryClass::DecodeEnvelope,
+            geometry: GeometryClass::DeviceGeometry,
 
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
+            // Windowed layers are ring + buffer (CONTRACT-BC 19, 21).
+            windowed_state: shell.pools().rings().is_some(),
             // The prompt scans land the state as of rows inside a lane, a
             // record a snapshot in pieces (CONTRACT-BC 16).
             rs_snapshots: crate::rs::snapshots(shell.trace()),
@@ -1134,9 +1166,27 @@ where
                         .or_else(|| held.map(|c| c.elementwise_bytes_per_ns)),
                 }
             },
+            // A beam group's page list (`beam_list`), read at a search's finish.
+            host_ops: engine::HostOps { beam_list: true },
             mixed_lanes: engine::MixedLanes::Any,
             frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the walk's own branch
+        // (sc/gpu-arm-before-ready) consumes it before ready.
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
+        tracing::info!(
+            "engine-gpu: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
 
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
@@ -1172,9 +1222,27 @@ where
         } = self;
         let shell = shell.as_mut().ok_or_else(unloaded::<B>)?;
         programs.quiesce().map_err(refusal)?;
-        shell.evacuate(evacuation).map_err(fault)?;
-        // Guest tables and cells bind their slots' chunks by place.
-        programs.rebind(shell.pools()).map_err(refusal)
+        // All or nothing (`Engine::evacuate`): the copies recorded and the
+        // table moved, nothing committed; guest tables and cells, which
+        // bind their slots' chunks by place, resolved against the moved
+        // table and their runs claimed; only then is a copy committed.
+        let Some(staged) = shell.stage_evacuation(evacuation).map_err(fault)? else {
+            return Ok(());
+        };
+        let rebound = match programs.resolve_rebind(shell.pools()) {
+            Ok(rebound) => rebound,
+            Err(refused) => {
+                shell.abort_evacuation(staged);
+                return Err(refusal(refused));
+            }
+        };
+        shell.commit_evacuation(staged).map_err(fault)?;
+        programs.install_rebind(rebound).map_err(refusal)
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let shell = self.shell.as_ref().ok_or_else(unloaded::<B>)?;
+        Ok(shell.pools().chunk_table().clone())
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
@@ -1482,6 +1550,9 @@ where
         // A guest's tables lie in its slots and its scratch in a buffer of
         // its own: nothing standing in the span.
         self.programs.close_instance(id).map_err(refusal)?;
+        if let Some(shell) = self.shell.as_ref() {
+            shell.beam_forget(id);
+        }
         Ok(0)
     }
 
@@ -1520,6 +1591,18 @@ where
         channel: u32,
     ) -> EngineResult<Option<Vec<u8>>> {
         self.programs.take(instance, channel).map_err(refusal)
+    }
+
+    /// Beam `beam`'s page list of `instance`'s group as its last fire left
+    /// it (`BEAM-PAGE-LISTS.md` §6.6): every fire in flight lands first,
+    /// then the state's last list is read from the pool.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        let shell = self.shell.as_mut().ok_or_else(unloaded::<B>)?;
+        shell.drain().map_err(fault)?;
+        let resident = self.programs.beam_state(instance).ok_or_else(|| {
+            Error::Program(format!("instance {instance} binds no beam group (parents)"))
+        })?;
+        resident.list(shell.pools(), beam).map_err(fault)
     }
 
     fn settles_asynchronously(&self) -> bool {
@@ -1852,6 +1935,7 @@ impl<B: Host> Gpu<B> {
             feeds: vec![None; lanes],
         };
         B::envelope(self, submission, &mut envelope, &mut faulted)?;
+        let device = self.device_lanes(submission, &mut envelope, &mut faulted);
         if let Some(vocab) = self.vocab {
             out_of_range_tokens(submission, &mut envelope, vocab, &mut faulted);
         }
@@ -1878,7 +1962,14 @@ impl<B: Host> Gpu<B> {
         for attachment in &submission.attachments {
             let lane = attachment.lane as usize;
             let stated = &submission.lanes[lane];
-            if crate::store::frozen::reads_count(&stated.rs, stated.reports) {
+            let window_counted = matches!(
+                stated.window,
+                Some(engine::fire::WindowFold {
+                    fold: engine::fire::FoldLen::Device,
+                    ..
+                })
+            );
+            if crate::store::frozen::reads_count(&stated.rs, stated.reports) || window_counted {
                 match self.programs.envelope_fold(attachment.instance) {
                     Ok(count) => folds[lane].count = count,
                     Err(refused) => faulted.fault_lanes(
@@ -1887,6 +1978,59 @@ impl<B: Host> Gpu<B> {
                         &refused.to_string(),
                     ),
                 }
+            }
+        }
+
+        // Each beam group's state, layout and parents
+        // (`crate::beam`): its lanes reorder their page lists on the device
+        // ahead of the forward. An instance that refuses faults its own
+        // lanes, which then read their staged tables (their set's pages).
+        let mut beams: Vec<crate::beam::Group<B>> = Vec::new();
+        for attachment in program_attachments(submission) {
+            let lanes = attachment_lanes(attachment);
+            let group = self
+                .loaded()
+                .map_err(|error| Refusal::Program(error.to_string()))
+                .and_then(|shell| self.programs.beam_group(attachment.instance, shell.pools()));
+            let refused = match group {
+                Ok(None) => None,
+                Ok(Some((state, layout, parents))) => {
+                    let stated: Vec<&engine::fire::Lane> = lanes
+                        .clone()
+                        .filter_map(|at| submission.lanes.get(at as usize))
+                        .collect();
+                    match stated.first() {
+                        Some(first)
+                            if stated.iter().all(|lane| {
+                                lane.reserve == first.reserve && lane.kv.folded == first.kv.folded
+                            }) && !first.reserve.is_empty() =>
+                        {
+                            beams.push(crate::beam::Group {
+                                instance: attachment.instance,
+                                state,
+                                layout,
+                                parents,
+                                lanes: lanes.clone().map(|at| at as usize).collect(),
+                                reserve: first.reserve.clone(),
+                                folded: first.kv.folded,
+                                appended: self
+                                    .loaded()
+                                    .map_or((u32::MAX, Vec::new()), |shell| shell.beam_appended(attachment.instance)),
+                            });
+                            None
+                        }
+                        _ => Some(format!(
+                            "instance {}'s beams state no working set's reserve, or not one \
+                             set's: a beam group's lanes name one set and its whole kv table \
+                             (BEAM-PAGE-LISTS.md §2, §6.5)",
+                            attachment.instance
+                        )),
+                    }
+                }
+                Err(refused) => Some(refused.to_string()),
+            };
+            if let Some(why) = refused {
+                faulted.fault_lanes(lanes, Some(attachment.instance), &why);
             }
         }
 
@@ -2012,14 +2156,18 @@ impl<B: Host> Gpu<B> {
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for (at, lane) in submission.lanes.iter().enumerate() {
-            // This load places every row itself (no `slots` port): a lane
-            // whose table is a working set's whole, for its program to
-            // place rows through, would land them in pages not its own.
-            if lane.list == engine::fire::ListKind::Translation {
+            // A lane whose table is a working set's whole, for its program
+            // to place rows through, is placed by its device-geometry ports
+            // ([`crate::program::device_lanes`], each row in
+            // `KvDelta::writable`), or refused already and sunk; any other
+            // would land rows in pages not its own.
+            let placed = device[at].as_ref().is_some_and(|placed| placed.have.is_some());
+            let refused = faulted.faulted.iter().any(|fault| fault.lane as usize == at);
+            if lane.list == engine::fire::ListKind::Translation && !placed && !refused {
                 return Err(Error::lane(
                     u32::try_from(at).unwrap_or(u32::MAX),
-                    "its kv table is a translation its program places rows through, and this \
-                     load resolves no `slots` port: it places no row a program states",
+                    "its kv table is a translation its program places rows through, and no \
+                     device-geometry port of an attached instance places its rows",
                 ));
             }
             pages_of.push(
@@ -2083,6 +2231,18 @@ impl<B: Host> Gpu<B> {
                 }
             }
         }
+        // A refused lane still fires (token 0) to keep the composition; one
+        // whose program places its rows has no run of its own the host may
+        // append to, so its rows land in the null chunk, never its table.
+        let sunk: Vec<bool> = submission
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(at, lane)| {
+                lane.list == engine::fire::ListKind::Translation
+                    && faulted.faulted.iter().any(|fault| fault.lane as usize == at)
+            })
+            .collect();
         let seated: Vec<Seated<'_, B>> = submission
             .lanes
             .iter()
@@ -2095,14 +2255,27 @@ impl<B: Host> Gpu<B> {
                     tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
                 },
                 pages: pages_of[at].as_deref().unwrap_or(&[]),
-                held: pages_of[at].is_some().then_some(lane.kv.held),
+                held: match device[at].as_ref().and_then(|placed| placed.have) {
+                    _ if sunk[at] => Some(0),
+                    Some(have) => Some(have),
+                    None => pages_of[at].is_some().then_some(lane.kv.held),
+                },
+                sunk: sunk[at],
                 folded: lane.kv.folded,
                 kv_less: lane.kv_less,
 
-                mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
+                mask: if sunk[at] {
+                    None
+                } else {
+                    resolved_masks[at].as_ref().or(lane.mask.as_ref())
+                },
 
                 adapter: lane_adapters[at].or(lane.adapter),
-                positions: &lane.positions,
+                positions: device[at]
+                    .as_ref()
+                    .and_then(|placed| placed.positions.as_deref())
+                    .unwrap_or(&lane.positions),
+                slots: device[at].as_ref().and_then(|placed| placed.slots.as_deref()),
 
                 readout: match &lane.readout {
                     Readout::Rows(rows) => Some(rows.as_slice()),
@@ -2120,6 +2293,7 @@ impl<B: Host> Gpu<B> {
                 rs_snapshots: &lane.rs_snapshots,
                 refs: true,
                 windows: &lane.tables,
+                window: lane.window,
                 record: record_of[at].as_deref(),
                 record_run: run_of[at].as_deref(),
                 feed: feeds[at].as_ref(),
@@ -2152,6 +2326,7 @@ impl<B: Host> Gpu<B> {
                     folds: &folds,
                     done,
                     guests,
+                    beams: &beams,
                 },
                 None,
             )
@@ -2159,9 +2334,9 @@ impl<B: Host> Gpu<B> {
             wrote = std::mem::take(&mut prepared.wrote);
             // A lane fed its token on the device is checked once the
             // forward landed, from what the forward embedded.
-            if let Some(vocab) = vocab
-                && !prepared.fed_lanes.is_empty()
+            if !prepared.beam_faults.is_empty() || (vocab.is_some() && !prepared.fed_lanes.is_empty())
             {
+                let vocab = vocab.unwrap_or(u32::MAX);
                 let lanes = prepared
                     .fed_lanes
                     .iter()
@@ -2177,10 +2352,23 @@ impl<B: Host> Gpu<B> {
                         }
                     })
                     .collect();
-                let check = crate::settle::FedCheck::new(
+                let beams = prepared
+                    .beam_faults
+                    .iter()
+                    .map(|&(word, lane, instance)| crate::settle::BeamWord {
+                        word,
+                        lane: u32::try_from(lane).unwrap_or(u32::MAX),
+                        instance,
+                    })
+                    .collect();
+                let commons = prepared.beam_commons.clone();
+                let check = crate::settle::FedCheck::with_beams(
                     <B as crate::serve::Serve>::token_row_reader(shell, prepared.arm),
                     lanes,
                     vocab,
+                    shell.store_word_reader(prepared.arm),
+                    beams,
+                    commons,
                 );
                 prepared.fed_check = Some(check.clone());
                 match prepared.done.as_mut() {
@@ -2210,6 +2398,72 @@ impl<B: Host> Gpu<B> {
                 fed,
             },
         ))
+    }
+}
+
+impl<B: Host> Gpu<B> {
+    /// Each lane's geometry as its instance's descriptor ports resolve it
+    /// ([`crate::program::device_lanes`]): device geometry's tokens,
+    /// positions, extent, slots and mask, and a decode envelope's positions
+    /// where its program computes them. The tokens and mask land in
+    /// `envelope`; an attachment whose ports refuse faults its own lanes.
+    fn device_lanes(
+        &self,
+        step: &Step,
+        envelope: &mut Envelope<B>,
+        faulted: &mut engine::StepOutcome,
+    ) -> Vec<Option<crate::program::DeviceLane>> {
+        let mut out: Vec<Option<crate::program::DeviceLane>> = vec![None; step.lanes.len()];
+        for attachment in program_attachments(step) {
+            let first = (attachment.lane as usize).min(step.lanes.len());
+            let end = attachment_lanes(attachment).end as usize;
+            let stated = &step.lanes[first..end.min(step.lanes.len())];
+            let resolved = self
+                .programs
+                .descriptor_ports(attachment.instance)
+                .and_then(|ports| match ports {
+                    Some(mut ports) => crate::program::device_lanes(
+                        &mut ports,
+                        stated,
+                        first,
+                        attachment.instance,
+                    )
+                    .map(Some),
+                    None => Ok(None),
+                });
+            match resolved {
+                Ok(None) => {}
+                Ok(Some(lanes)) => {
+                    for (at, placed) in lanes.into_iter().enumerate() {
+                        let at = first + at;
+                        if out[at].is_some() {
+                            envelope.refused(
+                                step,
+                                attachment,
+                                &format!(
+                                    "lane {at} is claimed by two attached instances; a lane's \
+                                     descriptor ports have one author"
+                                ),
+                                faulted,
+                            );
+                            break;
+                        }
+                        if let Some(tokens) = &placed.tokens {
+                            envelope.tokens[at] = Some(tokens.clone());
+                            envelope.feeds[at] = None;
+                        }
+                        if placed.mask.is_some() {
+                            envelope.masks[at].clone_from(&placed.mask);
+                        }
+                        out[at] = Some(placed);
+                    }
+                }
+                Err(refused) => {
+                    envelope.refused(step, attachment, &refused.to_string(), faulted);
+                }
+            }
+        }
+        out
     }
 }
 

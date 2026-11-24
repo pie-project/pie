@@ -1,22 +1,21 @@
-//! Publishes, for every process, the worker another program's committed
-//! placement names, so a test can see one cluster program read another's
-//! decision and answer it under its own name.
+//! A cluster probe of pie's PLEX extension (`pie:plex-ext/share-groups`):
+//! grants the group `team` to the tenants `acme` and `beta`, and the
+//! default (every other group) to `acme` alone, on every call. Unloaded, its
+//! rows are withdrawn and no group crosses tenants.
 
-use policy::{Subject, SubjectKind, Value, attr, candidates, cluster};
+use plex::ext::share_groups;
+use plex::prelude::*;
 
 #[derive(Default)]
 struct Share;
 
-impl cluster::Policy for Share {
-    fn plan(&mut self, _now_ms: u64) {
-        for process in candidates(SubjectKind::Process) {
-            let subject = Subject::Process(process);
-            let placed = attr(&subject, "placement/worker")
-                .text()
-                .map(|worker| Value::Text(worker.to_string()));
-            cluster::publish(&subject, "placed", placed.as_ref());
-        }
+impl Policy for Share {
+    fn plan(&mut self, _now: Mark) {
+        share_groups::set("team", &["acme".to_string(), "beta".to_string()]).ok();
+        share_groups::set_default(&["acme".to_string()]).ok();
+        // An empty name is refused at the write.
+        assert!(share_groups::set("", &[]).is_err());
     }
 }
 
-policy::cluster!(Share);
+plex::export!(Share);

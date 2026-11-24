@@ -226,6 +226,10 @@ impl Engine for FakeEngine {
         "fake-roles"
     }
 
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
+    }
+
     fn prepare_program(
         &mut self,
         _registration: &::engine::program::ProgramRegistration,
@@ -1396,7 +1400,7 @@ fn a_ring_short_of_a_run_waits_for_a_chunk_and_registers_nothing() {
         matches!(short, RolesError::BindShort(inner) if matches!(**inner, RolesError::NoRun { .. })),
         "{error}"
     );
-    assert_eq!(short.room_runs(), Some((1, 1)), "it waits for a chunk");
+    assert_eq!(short.room_runs(), Some((1, 1, 0)), "it waits for a chunk");
     assert!(super::waits_for_room(&error));
     assert!(engine.registrations.is_empty(), "nothing registered");
     assert_eq!(held(&device), before, "nothing taken");
@@ -1606,10 +1610,10 @@ fn a_park_gives_an_instance_s_slots_back_at_once_to_the_next_owner() {
 /// The disk tier's slot file as a fake: whole free chunks taken and given
 /// back.
 #[derive(Default)]
-struct FakeDisk(Mutex<Vec<u32>>, std::sync::atomic::AtomicUsize);
+pub(super) struct FakeDisk(Mutex<Vec<u32>>, std::sync::atomic::AtomicUsize);
 
 impl FakeDisk {
-    fn with(chunks: u32) -> Arc<Self> {
+    pub(super) fn with(chunks: u32) -> Arc<Self> {
         Arc::new(Self(Mutex::new((0..chunks).collect()), Default::default()))
     }
 
@@ -1869,4 +1873,31 @@ fn a_rebind_read_before_a_park_is_cancelled_once_its_item_moved() {
     );
     roles.lock().unwrap().close_instance(instance);
     roles.lock().unwrap().close_channel(channel);
+}
+
+/// An adapter parked with its process is held by its instances alone:
+/// once the last of them closes while the process is away, its host
+/// slots go back then, not at a restore that no longer has it to bring
+/// back (`close_instance` detaches the instance and frees what nothing
+/// holds, on whichever tier it lies).
+#[test]
+fn a_parked_adapter_s_host_slots_go_back_as_its_last_instance_closes_while_away() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = adapting(7);
+    let before = held(&device);
+    let id = bind(&roles, &mut engine, Vec::new(), 1);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    assert!(held(&host) > 0, "the instance and its adapter lie on the host");
+    assert_eq!(held(&device), before);
+    roles.lock().unwrap().close_instance(id);
+    assert_eq!(held(&host), 0, "the adapter's host slots are back with it");
+    assert!(
+        roles.lock().unwrap().prepare_unpark(holder(1)).unwrap().is_none(),
+        "nothing of it is left to bring back"
+    );
 }

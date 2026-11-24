@@ -784,6 +784,8 @@ pub fn measure(
     let fired_blit = crate::encode::record_fired(false);
     say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     Ok(Rates {
+        landing: None,
+        load_width: None,
         launch_ns: Some(launch),
         gemm_tflops_by_rows: Some(gemm),
         attn_tflops_by_keys: Some(attn),

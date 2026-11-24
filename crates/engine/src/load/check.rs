@@ -318,9 +318,11 @@ pub fn check(
     // No cap stands between them: the load's fire top is this pick, one
     // function (`super::fire_top`), and a top set too low shows as a
     // measured best past it.
-    let by_est = super::pick(&rungs, &est, weighed.live).map_err(|e| e.to_string())?;
-    let by_meas = super::pick(&rungs, &meas, weighed.live).map_err(|e| e.to_string())?;
-    let scores = super::scored(&rungs, &meas, weighed.live);
+    let est_effs: Vec<f64> = rungs.iter().map(|r| e.eff(r)).collect();
+    let meas_effs = super::measured_effs(&rungs, &meas);
+    let by_est = super::pick(&rungs, &est_effs, weighed.live).map_err(|e| e.to_string())?;
+    let by_meas = super::pick(&rungs, &meas_effs, weighed.live).map_err(|e| e.to_string())?;
+    let scores = super::scored(&rungs, &meas_effs, weighed.live);
     let score = |tokens: u32| {
         scores
             .iter()

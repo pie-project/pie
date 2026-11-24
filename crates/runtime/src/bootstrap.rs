@@ -121,7 +121,9 @@ pub struct BuiltinProgram {
 pub struct RuntimeConfig {
     pub worker_threads: usize,
 
-    pub wasm_max_instances: u32,
+    /// Instances the wasmtime pool holds; `None` holds what this process's
+    /// address space fits.
+    pub wasm_max_instances: Option<u32>,
     pub wasm_max_memory_mb: usize,
     pub wasm_warm_memory_mb: usize,
     pub wasm_warm_slots: u32,
@@ -162,8 +164,12 @@ pub struct EngineConfig {
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
-    /// The model's window (`PoolFacts::window_tokens`).
+    /// The model's window (`PoolFacts::window_tokens`). The window-list
+    /// path: removed by the windowed-state change.
     pub window_tokens: u32,
+    /// The engine serves windowed layers as ring + buffer
+    /// (`Capabilities::windowed_state`, CONTRACT-BC 19, 21).
+    pub windowed_state: bool,
     /// The disk tier is kept for the next run (`disk_kv_persistent`).
     pub disk_kept: Option<KeptDisk>,
     /// The engine asks the planner to serve a decoding lane's pages before a
@@ -193,7 +199,14 @@ pub struct EngineConfig {
     /// dispatch depth and a beam group's pool's `F`.
     pub frames_in_flight: u32,
     pub device_geometry_port_mask: eta_ir::registry::PortMask,
+    /// The host ops the engine serves ([`::engine::Capabilities::host_ops`]):
+    /// a program needing another is refused at its bind.
+    pub host_ops: ::engine::HostOps,
     pub limits: crate::engine::SchedulerLimits,
+    /// The step compositions the engine computed before its arm walk and
+    /// those it runs eager ([`::engine::Capabilities::steps`]): held to the
+    /// set the runtime's rules form over the load's stated facts.
+    pub steps: ::engine::StatedSteps,
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
     pub inputs: Vec<poem_ir::InputDecl>,
@@ -271,12 +284,6 @@ fn frames_in_flight(engines: &[EngineConfig]) -> Result<u32> {
     Ok(first)
 }
 
-fn seat_cap(cap: usize, has_state: bool, seats: Option<usize>) -> usize {
-    match seats {
-        Some(seats) if !has_state && cap > seats.max(1) => seats.max(1),
-        _ => cap,
-    }
-}
 
 /// A disk tier kept across runs: where its journal is, and whether the
 /// engine found its slot files as the last run left them.
@@ -325,7 +332,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     if !config.skip_tracing {
         init_tracing(config.log_dir.as_deref(), config.verbose, &config.telemetry)?;
     }
-    let wasm_engine = init_wasmtime(&config.runtime);
+    let wasm_engine = init_wasmtime(&config.runtime)?;
 
     program::spawn(
         &wasm_engine,
@@ -418,6 +425,25 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .readout_facts()
                 .map_err(|error| anyhow::anyhow!("engine readout facts: {error}"))?;
             d.limits = d.limits.read_out_by(&facts);
+            // The step compositions the step builder forms (CONTRACT-BC 24):
+            // the runtime's rules over the load's stated facts, the set the
+            // engine walked before ready, or the load is refused by name.
+            let rules = ::engine::StepRules::runtime();
+            let step_facts = d.limits.step_facts(
+                &d.chunks,
+                ::engine::Attachments::served(d.has_lora, !d.inputs.is_empty(), d.rs_snapshots > 0),
+            );
+            d.steps.agrees(&rules, &step_facts).map_err(|why| {
+                anyhow::anyhow!("engine {}: step shapes: {why}", d.engine_backend.kind())
+            })?;
+            tracing::info!(
+                engine = d.engine_backend.kind(),
+                eager = d.steps.eager.len(),
+                "the step builder forms {}; each is armed before ready or stated eager",
+                d.steps.shapes.census()
+            );
+            // One set a load, shared by every step it builds for its life.
+            d.limits.shapes = Some(Box::leak(Box::new(d.steps.shapes.clone())));
             Ok(facts)
         })
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;
@@ -440,55 +466,56 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_frame_ceiling(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(engine_frames as usize);
-    // A model with fixed recurrent state is admitted by its planner, which
-    // charges each process the fixed set its working set holds against the
-    // state pool, beside a copy-on-write set per lane a fire runs
-    // (`ResidencyPlanner::admit`): no cap here.
-    let has_state = engine_configs.iter().any(|d| d.chunks.record_bytes > 0);
-    let admission_cap = config
-        .max_concurrent_processes
-        .or_else(|| {
-            engine_configs
-                .iter()
-                .map(|d| d.limits.max_forward_requests)
-                .min()
-                .filter(|&r| r > 0)
-        })
-        .map(|cap| {
-            // A seated-first pool of kv pages alone seats no more than five
-            // sequences a sequence at the declared context holds: past that,
-            // admitted prompts seat lanes the pool then suspends for each
-            // other's growth (Gemma-4-26B on an A100, c512: 2.9k tok/s
-            // admitting all 512, 4.7k at 224; its 5791 pages seat 45 at 2048).
-            // A pool that spreads its starts holds them to what it seats itself.
-            let seats = engine_configs
-                .iter()
-                .filter(|d| d.seated_first && !d.seat_spread && d.limits.max_context > 0)
-                .map(|d| {
-                    5 * usize::try_from(d.chunks.kv_device_pages()).unwrap_or(usize::MAX)
-                        * kv_page_size
-                        / d.limits.max_context
-                })
-                .min();
-            let capped = seat_cap(cap, has_state, seats);
-            if capped < cap {
-                tracing::info!(
-                    requested = cap,
-                    seated = capped,
-                    "admission: capped at five sequences a sequence at the declared context \
-                     holds in the kv pool"
-                );
-            }
-            capped
-        });
+    // No count stands for memory: a newcomer is admitted once its first
+    // ask, what it holds at its first step, passes the planner's capacity
+    // gate at the order's last place (`ResidencyPlanner::admits`). A
+    // count of sequences at the declared context seated too few where
+    // prompts are short (gpt-oss-20b c64: 62 of 64) and stood for no
+    // model's mix. What stays is a count stated as one: the operator's, or
+    // the most requests an engine takes into one fire.
+    let admission_cap = config.max_concurrent_processes.or_else(|| {
+        engine_configs
+            .iter()
+            .map(|d| d.limits.max_forward_requests)
+            .min()
+            .filter(|&r| r > 0)
+    });
     process::init_admission(admission_cap);
 
+    // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): stated only by
+    // an engine that serves them so, and the same way by every engine of
+    // the model; such a load is a recurrent-state load whose record holds
+    // the rings, no window list.
+    for (at, d) in engine_configs.iter().enumerate() {
+        anyhow::ensure!(
+            d.chunks.windowed.is_empty() || d.windowed_state,
+            "engine {at} states windowed layers served as ring + buffer \
+             (ChunkFacts::windowed) but not Capabilities::windowed_state"
+        );
+    }
+    let window_state = engine_configs
+        .first()
+        .is_some_and(|d| d.chunks.window_buffer().is_some());
+    if let Some(at) = engine_configs
+        .iter()
+        .position(|d| d.chunks.window_buffer().is_some() != window_state)
+    {
+        anyhow::bail!(
+            "engine {at} serves the model's windowed layers otherwise than engine 0 (ring + \
+             buffer on one, window lists on the other); the engines of one model hold one state"
+        );
+    }
     let rs_caps = {
         let d0 = engine_configs.first();
         let mut caps = model::RsCaps {
             state_size: d0.map_or(0, |d| d.chunks.record_bytes),
             buffer_page_size: 0,
-            window_tokens: d0.map_or(0, |d| d.window_tokens),
+            window_tokens: if window_state {
+                0
+            } else {
+                d0.map_or(0, |d| d.window_tokens)
+            },
+            window_state,
         };
         if caps.has_state() {
             caps.buffer_page_size = kv_page_size as u32;
@@ -604,8 +631,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|(d, readouts)| {
             let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
-            // A window the engine holds no pages for is still a window.
-            if pools.window_tokens == 0 {
+            // A window the engine holds no pages for is still a window (the
+            // window-list path: removed by the windowed-state change; a
+            // ring + buffer load holds no window list).
+            if pools.window_tokens == 0 && !rs_caps.window_state {
                 pools.window_tokens = d.window_tokens;
             }
             // An engine that states a shared pool: the stores draw from one
@@ -703,7 +732,24 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                  pool's ceiling take the difference"
             );
         }
-        if kv_swap_capable && crate::store::shared::SharedPool::states_shared(&d.chunks) {
+        let unified = d
+            .engine_backend
+            .device_facts()
+            .is_some_and(|facts| facts.unified_memory);
+        if kv_swap_capable && unified && d.chunks.host_chunks == 0 {
+            // No host tier: on a device whose memory is the host's a move to
+            // the host frees nothing, so the engine states none.
+            tracing::info!(
+                device_pages = d.chunks.kv_device_pages(),
+                planner_pages,
+                lent_chunks,
+                host = "none",
+                disk_chunks = d.chunks.disk_chunks,
+                chunk_bytes = d.chunks.chunk_bytes,
+                "kv tiers: no host tier (the device's memory is the host's); suspended kv \
+                 goes to the disk"
+            );
+        } else if kv_swap_capable && crate::store::shared::SharedPool::states_shared(&d.chunks) {
             // A shared pool states its tiers in chunks, not in the page
             // fields its engine leaves at 0.
             tracing::info!(
@@ -714,11 +760,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 disk_chunks = d.chunks.disk_chunks,
                 chunk_bytes = d.chunks.chunk_bytes,
                 "kv tiers: suspended kv goes to {}",
-                if d.chunks.host_chunks == 0 {
-                    "the disk (no host tier)"
-                } else {
-                    "the host, then the disk"
-                }
+                below_device(d.chunks.host_chunks > 0, d.chunks.disk_chunks > 0)
             );
         } else if kv_swap_capable {
             tracing::info!(
@@ -726,7 +768,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 planner_pages,
                 host_pages = d.chunks.kv_host_pages(),
                 disk_pages = d.chunks.kv_disk_pages(),
-                "kv tiers: suspended kv goes to the host, then the disk"
+                "kv tiers: suspended kv goes to {}",
+                below_device(d.chunks.kv_host_pages() > 0, d.chunks.kv_disk_pages() > 0)
             );
         } else {
             tracing::warn!(
@@ -808,6 +851,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     device_domain: ::engine::MemoryDomain::HostPinned,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
+                    host_ops: d.host_ops,
                     kind: "",
                     codegen_backend: None,
                 },
@@ -1480,8 +1524,8 @@ fn verify_config(config: &Config) -> Result<()> {
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
 #[cfg(target_arch = "wasm32")]
-fn init_wasmtime(_runtime: &RuntimeConfig) -> wasmtime::Engine {
-    browser_wasm_engine()
+fn init_wasmtime(_runtime: &RuntimeConfig) -> Result<wasmtime::Engine> {
+    Ok(browser_wasm_engine())
 }
 
 /// The engine inferlets run on in a browser tab. A component precompiled for
@@ -1496,8 +1540,9 @@ pub fn browser_wasm_engine() -> wasmtime::Engine {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
+fn init_wasmtime(runtime: &RuntimeConfig) -> Result<wasmtime::Engine> {
     let mut wasm_config = wasmtime::Config::default();
+    configure_execution(&mut wasm_config, runtime)?;
 
     if let Some(dir) = &runtime.compile_cache_dir {
         let mut cache_config = wasmtime::CacheConfig::new();
@@ -1513,53 +1558,86 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
         }
     }
 
-    configure_execution(&mut wasm_config, runtime);
-    wasmtime::Engine::new(&wasm_config).unwrap()
+    wasmtime::Engine::new(&wasm_config)
+        .map_err(|error| anyhow::anyhow!("the inferlet sandbox's wasmtime engine: {error:#}"))
 }
 
 /// Apple's platforms other than macOS (iOS, visionOS, tvOS, watchOS) give an
 /// app no executable memory: inferlets run as Pulley bytecode, with memories
 /// allocated on demand.
 #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
-fn configure_execution(wasm_config: &mut wasmtime::Config, _runtime: &RuntimeConfig) {
-    wasm_config
-        .target("pulley64")
-        .expect("pulley64 is compiled in where an app may not JIT");
+fn configure_execution(wasm_config: &mut wasmtime::Config, _runtime: &RuntimeConfig) -> Result<()> {
+    wasm_config.target("pulley64").map_err(|error| {
+        anyhow::anyhow!("pulley64 is compiled in where an app may not JIT: {error:#}")
+    })?;
     wasm_config.signals_based_traps(false);
     wasm_config.memory_reservation(0);
     wasm_config.memory_guard_size(0);
     wasm_config.memory_init_cow(false);
+    Ok(())
 }
 
+/// The pooling allocator, its instance count held to what this process's
+/// address space fits (`sandbox_pool`).
 #[cfg(not(any(
     target_arch = "wasm32",
     all(target_vendor = "apple", not(target_os = "macos"))
 )))]
-fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConfig) {
+fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConfig) -> Result<()> {
+    use crate::sandbox_pool;
+
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-    pooling_config.total_component_instances(runtime.wasm_max_instances);
-    pooling_config.total_memories(runtime.wasm_max_instances);
-    pooling_config.total_stacks(runtime.wasm_max_instances);
     pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
     pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
-    pooling_config.total_core_instances(
-        runtime
-            .wasm_max_instances
-            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
-    );
-    pooling_config.total_tables(
-        runtime
-            .wasm_max_instances
-            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
-    );
     pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
     pooling_config
         .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));
     pooling_config.max_unused_warm_slots(runtime.wasm_warm_slots);
 
+    // What an instance reserves, read off an engine of this configuration
+    // that allocates on demand (it reserves nothing): its memory
+    // reservation, guard and stack, as wasmtime resolves them.
+    let probe = wasmtime::Engine::new(wasm_config)
+        .map_err(|error| anyhow::anyhow!("the inferlet sandbox's wasmtime engine: {error:#}"))?;
+    let layout = sandbox_pool::PoolLayout {
+        page_bytes: sandbox_pool::page_bytes(),
+        memory_reservation: probe.get_memory_reservation(),
+        max_memory: pooling_config.get_max_memory_size() as u64,
+        memory_guard: probe.get_memory_guard_size(),
+        guard_before: probe.get_guard_before_linear_memory(),
+        stack_bytes: probe.get_async_stack_size() as u64,
+        tables_per_instance: u64::from(CORE_RESOURCES_PER_COMPONENT),
+        table_elements: pooling_config.get_table_elements() as u64,
+        table_element_bytes: std::mem::size_of::<usize>() as u64,
+    };
+    drop(probe);
+    let cost = layout.cost();
+    let instances = sandbox_pool::size_pool(
+        runtime.wasm_max_instances,
+        sandbox_pool::read_address_space(),
+        &cost,
+    )?;
+    tracing::info!(
+        "sandbox pool: {instances} instances{}, {} of address space ({} each)",
+        if runtime.wasm_max_instances.is_some() {
+            " as configured"
+        } else {
+            " (what this process's address space fits)"
+        },
+        sandbox_pool::show(cost.bytes(u64::from(instances))),
+        sandbox_pool::show(cost.instance_bytes),
+    );
+
+    pooling_config.total_component_instances(instances);
+    pooling_config.total_memories(instances);
+    pooling_config.total_stacks(instances);
+    pooling_config.total_core_instances(instances.saturating_mul(CORE_RESOURCES_PER_COMPONENT));
+    pooling_config.total_tables(instances.saturating_mul(CORE_RESOURCES_PER_COMPONENT));
+
     wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
         pooling_config,
     ));
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1676,7 +1754,7 @@ fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::{quieted, seat_cap};
+    use super::quieted;
     use crate::model::RsCaps;
 
     #[test]
@@ -1729,15 +1807,16 @@ mod tests {
                 state_size: facts.record_bytes,
                 buffer_page_size: 0,
                 window_tokens: 0,
+                window_state: false,
             },
         )
     }
 
     /// A pool that lays a state shape for a dense model (records of some
     /// size beside its kv) still says the model holds no state: its RsCaps
-    /// state nothing (no rs working set, no rs count a fire is held to) and
-    /// it keeps the seat cap. A hybrid's record bytes are its RsCaps' state
-    /// size, a record's and not a slot's, and it skips the cap.
+    /// state nothing (no rs working set, no rs count a fire is held to). A
+    /// hybrid's record bytes are its RsCaps' state size, a record's and not
+    /// a slot's.
     #[test]
     fn the_model_s_record_bytes_say_whether_it_holds_state() {
         let mut facts =
@@ -1752,28 +1831,20 @@ mod tests {
         facts.record_bytes = 0;
         let (dense, caps) = read(&facts);
         assert!(!dense && !caps.has_state(), "dense: no rs work");
-        assert_eq!(seat_cap(512, dense, Some(45)), 45, "dense: the seat cap");
 
         facts.record_bytes = 3000;
         let (hybrid, caps) = read(&facts);
         assert!(hybrid && caps.has_state());
         assert_eq!(caps.state_size, 3000, "a record's bytes, not the slot's");
-        assert_eq!(
-            seat_cap(512, hybrid, Some(45)),
-            512,
-            "hybrid: admitted by its planner"
-        );
+    }
+}
 
-        assert_eq!(
-            seat_cap(512, false, None),
-            512,
-            "no seated-first pool, no cap"
-        );
-        assert_eq!(
-            seat_cap(16, false, Some(45)),
-            16,
-            "a cap under the seats stands"
-        );
-        assert_eq!(seat_cap(512, false, Some(0)), 1, "one sequence at least");
+/// The tiers below the device suspended kv goes to, as a load stated them.
+fn below_device(host: bool, disk: bool) -> &'static str {
+    match (host, disk) {
+        (true, true) => "the host, then the disk",
+        (true, false) => "the host (no disk tier)",
+        (false, true) => "the disk (no host tier)",
+        (false, false) => "nowhere: no tier below the device",
     }
 }

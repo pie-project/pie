@@ -3,6 +3,7 @@
 pub const SOURCE_FINGERPRINT: &str = env!("KERNELS_XLA_SOURCE_FINGERPRINT");
 
 pub mod attn;
+pub mod beam;
 pub mod blocks;
 pub mod check;
 pub mod collective;

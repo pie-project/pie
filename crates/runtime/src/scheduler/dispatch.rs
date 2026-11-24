@@ -58,6 +58,9 @@ pub(crate) async fn register_channels_bind_classified(
     BoundInstance,
     super::worker::SchedulerHandle,
 )> {
+    // A program needing a host op the engine does not serve is refused here,
+    // before anything is registered or any step submitted.
+    crate::engine::backend::refuse_unserved_host_ops(engine_idx, &program.launch)?;
     let handle = scheduler_handle(engine_idx)?;
     let table = waker::WakerTable::global();
     let pacing_wait_id = table.alloc();
@@ -145,10 +148,13 @@ impl TierKind {
 
 impl TierMove {
     pub(crate) fn label(&self) -> String {
+        // A shared pool's move names its shape: a park's and a restore's
+        // groups of role slots read apart by it, not by their order.
         let kind = match self.kind {
-            TierKind::Kv | TierKind::KvSlots(_) => "kv",
-            TierKind::RsSlots(_) => "rs-slots",
-            TierKind::RoleSlots(_) => "role-slots",
+            TierKind::Kv => "kv".to_string(),
+            TierKind::KvSlots(shape) => format!("kv shape {}", shape.0),
+            TierKind::RsSlots(shape) => format!("rs-slots shape {}", shape.0),
+            TierKind::RoleSlots(shape) => format!("role-slots shape {}", shape.0),
         };
         let way = if self.out { "to" } else { "from" };
         match self.source {
@@ -221,4 +227,182 @@ pub(crate) fn copy_tier_tracked(
         }
     };
     scheduler_handle(engine_idx)?.copy_tracked(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use eta_compiler::codegen::launch::{LaunchPackage, LaunchPort};
+    use eta_ir::registry::{GeometryClass, Port, PortMask};
+
+    use crate::engine::{EngineSpec, SchedulerLimits};
+
+    /// An engine whose load serves no `beam_list`: it counts every program
+    /// registered, instance bound and frame submitted.
+    struct NoBeamList {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ::engine::Engine for NoBeamList {
+        fn settle_copies(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        fn copy_slots_landing(
+            &mut self,
+            _copy: &::engine::chunk::SlotCopy,
+            _token: u64,
+        ) -> ::engine::Result<bool> {
+            Ok(true)
+        }
+
+        fn kind(&self) -> &'static str {
+            "no-beam-list"
+        }
+
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
+        fn measured_at_load(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+        }
+
+        fn prepare_program(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish_program(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
+        fn bind_instance(
+            &mut self,
+            _binding: &::engine::program::InstanceBinding,
+        ) -> ::engine::Result<::engine::program::BoundInstance> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+        }
+
+        fn load(&mut self, _request: ::engine::LoadRequest) -> ::engine::Result<::engine::Loaded> {
+            Err(::engine::Error::Load("no model".into()))
+        }
+
+        fn submit(
+            &mut self,
+            _frame: &::engine::FrameSubmission,
+        ) -> ::engine::Result<::engine::FrameTicket> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(::engine::Error::unsupported(self.kind(), "submit"))
+        }
+    }
+
+    fn spec(host_ops: ::engine::HostOps) -> EngineSpec {
+        EngineSpec {
+            limits: SchedulerLimits {
+                max_forward_requests: 1,
+                max_forward_tokens: 1,
+                max_page_refs: 1,
+                max_context: 1,
+                prefill_rows: 0,
+                prefill_lanes: 0,
+                max_readouts: 0,
+                readout_store: 0,
+                max_replayed_rows: 0,
+                shapes: None,
+            },
+            device_geometry_port_mask: PortMask::NONE,
+            device_domain: ::engine::MemoryDomain::HostPinned,
+            host_ops,
+            kind: "",
+            codegen_backend: None,
+        }
+    }
+
+    /// A beam group's program: its parents read from a channel.
+    fn beam_program() -> ::engine::ProgramRegistration {
+        ::engine::ProgramRegistration {
+            launch: LaunchPackage {
+                ports: vec![LaunchPort {
+                    port: Port::Parents,
+                    is_const: false,
+                    ..LaunchPort::default()
+                }],
+                ..LaunchPackage::default()
+            },
+            ..::engine::ProgramRegistration::default()
+        }
+    }
+
+    /// A beam group's bind on an engine whose load states no `beam_list` is
+    /// refused by name, the engine and the op, before the engine is asked
+    /// for anything: no program registered, no instance bound, no step
+    /// submitted. A program without parents passes the check, and an engine
+    /// stating `beam_list` binds the beam group past it.
+    #[test]
+    fn a_beam_group_on_an_engine_without_beam_list_is_refused_at_its_bind() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = crate::engine::backend::register_engine_backend(
+            spec(::engine::HostOps::NONE),
+            Box::new(NoBeamList {
+                calls: Arc::clone(&calls),
+            }),
+            Vec::new(),
+        );
+        let refused = crate::rt::block_on(super::register_channels_bind_classified(
+            engine,
+            None,
+            Vec::new(),
+            beam_program(),
+            Vec::new(),
+            Vec::new(),
+            GeometryClass::Host,
+            ::engine::program::BindExtents::default(),
+            PortMask::NONE,
+            false,
+        ))
+        .map(|_| ())
+        .expect_err("a beam group binds on no engine without `beam_list`");
+        let why = format!("{refused:#}");
+        assert!(why.contains("no-beam-list engine"), "names the engine: {why}");
+        assert!(why.contains("`beam_list`"), "names the op: {why}");
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the engine was asked for nothing");
+
+        let plain = ::engine::ProgramRegistration::default();
+        crate::engine::backend::refuse_unserved_host_ops(engine, &plain.launch)
+            .expect("a program without parents needs no host op");
+        let serving = crate::engine::backend::register_engine_backend(
+            spec(::engine::HostOps { beam_list: true }),
+            Box::new(NoBeamList {
+                calls: Arc::clone(&calls),
+            }),
+            Vec::new(),
+        );
+        crate::engine::backend::refuse_unserved_host_ops(serving, &beam_program().launch)
+            .expect("an engine serving `beam_list` binds a beam group");
+        let _ = crate::engine::unregister_engine(serving);
+        let _ = crate::engine::unregister_engine(engine);
+    }
 }

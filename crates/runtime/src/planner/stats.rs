@@ -68,6 +68,9 @@ pub struct PlannerStats {
     /// Allocations held at the capacity gate: past what every tier keeps
     /// for the finisher ([`super::inner::CapacityGate`]).
     pub capacity_waits: AtomicU64,
+    /// Newcomers held before a gate for room at the capacity gate's last
+    /// place ([`super::ResidencyPlanner::admitted_to_ask`]).
+    pub admission_waits: AtomicU64,
     /// Steps a pass forced by the simulation's check took on a settled
     /// step: a wake the planner was never given.
     #[cfg(test)]

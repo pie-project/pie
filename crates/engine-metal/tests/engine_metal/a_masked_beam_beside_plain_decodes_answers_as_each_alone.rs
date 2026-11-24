@@ -110,6 +110,7 @@ fn fire(shell: &mut Shell, trace: &poem::Trace, lanes: &[Row<'_>]) -> Vec<Vec<f3
     let seated: Vec<Seated<'_>> = lanes
         .iter()
         .map(|&(slot, tokens, held, mask)| Seated {
+            replay_stated: None,
             held: Some(held),
             mask,
             ..Seated::of(Lane {

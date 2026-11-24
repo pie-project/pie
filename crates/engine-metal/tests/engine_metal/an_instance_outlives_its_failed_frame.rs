@@ -36,6 +36,7 @@ fn fire(
         let _ = tx.lock().unwrap().send((at, outcome));
     });
     let lanes = [Seated {
+        replay_stated: None,
         held: Some(0),
         reports: 7,
         ..Seated::of(Lane {
@@ -100,6 +101,7 @@ fn an_instance_outlives_its_failed_frame() {
         shell.open(3).expect("slot 3 opens");
         let vocab = shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(0),
                 ..Seated::of(Lane {
                     slot: 3,

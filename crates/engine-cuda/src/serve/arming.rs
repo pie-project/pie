@@ -327,14 +327,21 @@ fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
             if deployment.drafting.contains(&class) && !deployment.rs_rungs.contains(&point) {
                 continue;
             }
-            match Shell::spread(
-                point,
-                deployment.seats.min(match deployment.prefill_lanes {
-                    0 => deployment.max_lanes,
-                    cap => deployment.max_lanes.min(cap),
-                }),
-                deployment.context,
-            ) {
+            // A drafting class fires its rows on one lane (a block draft, a
+            // verify): its body is recorded for that schedule.
+            let spread = if deployment.drafting.contains(&class) {
+                (point <= deployment.context).then(|| vec![point])
+            } else {
+                Shell::spread(
+                    point,
+                    deployment.seats.min(match deployment.prefill_lanes {
+                        0 => deployment.max_lanes,
+                        cap => deployment.max_lanes.min(cap),
+                    }),
+                    deployment.context,
+                )
+            };
+            match spread {
                 Some(rows) => into
                     .targets
                     .push((point, BodySynth::Prefill { class, rows })),
@@ -653,10 +660,19 @@ impl Shell {
 
     fn representative(&self, class: usize, rows: u32, wants_media: bool) -> poem_ir::Request {
         let landing = &self.landing[class];
+        // A bare request first (no adapter, no score capture): a switched
+        // class's lands beside its adapter and scoring twins.
+        let bare = |request: &&poem_ir::Request| !request.has_adapter() && !request.captures_scores();
         landing
             .iter()
+            .filter(bare)
             .find(|request| {
                 request.has_media() == wants_media && (request.query_len() == 1) == (rows == 1)
+            })
+            .or_else(|| {
+                landing.iter().find(|request| {
+                    request.has_media() == wants_media && (request.query_len() == 1) == (rows == 1)
+                })
             })
             .or_else(|| {
                 landing
@@ -689,6 +705,7 @@ impl Shell {
                 translation: &[],
                 write_end: 0,
                 window: &lane.window,
+                window_fold: None,
                 more_windows: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
@@ -1241,6 +1258,17 @@ impl Shell {
         let max_lanes = self.fire_lanes();
         let classes = self.compiled.classes.classes.len();
         let textual = |class: usize| !self.media.contains(class);
+        // A class past the plain tiers whose fires run a kernel arm of their
+        // own (a switch: dflash's block draft) but no adapter, no score
+        // capture and no media: a served program fires it, so the lattice
+        // captures it at load, keyed as its fire keys (by its bucket alone).
+        let switched = |class: usize| {
+            !self.tiers.plain.contains(class)
+                && !self.landing[class].is_empty()
+                && self.landing[class].iter().any(|request| {
+                    !request.has_adapter() && !request.captures_scores() && !request.has_media()
+                })
+        };
         let staged = self
             .towered
             .then_some(self.patch_seat)
@@ -1257,13 +1285,15 @@ impl Shell {
             decoders: self
                 .decoding
                 .iter()
-                .filter(|class| textual(*class) && self.tiers.plain.contains(*class))
+                .filter(|class| {
+                    textual(*class) && (self.tiers.plain.contains(*class) || switched(*class))
+                })
                 .collect(),
             prefilling: (0..classes)
                 .filter(|class| {
                     !self.decoding.contains(*class)
                         && textual(*class)
-                        && self.tiers.plain.contains(*class)
+                        && (self.tiers.plain.contains(*class) || switched(*class))
                 })
                 .collect(),
             media: self
@@ -1326,12 +1356,17 @@ impl Shell {
         // A load that buffers recurrent rows serves a spec-decoding fire
         // from a body too: each one-class composition (a verify's lanes, the
         // prompts beside them) at the rs rungs is recorded once more for
-        // lanes that buffer rows, and once more for lanes that replay them
-        // (`record::RsBody`), right after its folding body. Every class takes
+        // lanes that buffer rows, and, a class that is not decoding's, once
+        // more for lanes that replay them (`record::RsBody`), right after its
+        // folding body. Every class takes
         // them, not only a drafter's: a guest that drafts for itself (MTP,
         // with no drafts output the load can see) verifies on the plain
         // classes, and it registers after the load arms.
         let buffering = self.buffers.is_some();
+        let splits = self
+            .buffers
+            .as_ref()
+            .is_some_and(|buffers| buffers.split_room() != 0);
         let rungs = self.rs_rungs();
         let targets: Vec<(u32, BodySynth, Treatment)> = targets
             .into_iter()
@@ -1342,15 +1377,29 @@ impl Shell {
                     }
                     _ => None,
                 };
-                let buffers = buffering && rungs.contains(&bucket) && class.is_some();
-                let treatments: &[record::RsBody] = if buffers {
-                    &[
+                // A wide composition (a class past the plain tiers, keyed
+                // by its bucket alone: a block drafter's verify) buffers and
+                // replays its rows too.
+                let keyed = class.is_some() || matches!(target, BodySynth::Wide { .. });
+                let buffers = buffering && rungs.contains(&bucket) && keyed;
+                // A decoding class replays its carried rows in the body that
+                // buffers (`dispatch::ssm`): it records no replaying body.
+                let decodes = class.is_some_and(|class| self.decoding.contains(class as usize));
+                // One that can split a long carry records the splitting
+                // body too: a beam lane's carry runs past a chunk.
+                let treatments: &[record::RsBody] = match (buffers, decodes) {
+                    (true, true) if splits => &[
+                        record::RsBody::Folds,
+                        record::RsBody::Buffers,
+                        record::RsBody::Splits,
+                    ],
+                    (true, true) => &[record::RsBody::Folds, record::RsBody::Buffers],
+                    (true, false) => &[
                         record::RsBody::Folds,
                         record::RsBody::Buffers,
                         record::RsBody::Replays,
-                    ]
-                } else {
-                    &[record::RsBody::Folds]
+                    ],
+                    (false, _) => &[record::RsBody::Folds],
                 };
                 treatments
                     .iter()
@@ -1363,6 +1412,66 @@ impl Shell {
             top,
             unfireable,
         })
+    }
+
+    /// The shapes of the load's stated step set (`engine::StepShapes`) the
+    /// lattice walk records no body for, each named with the buckets it
+    /// leaves unwalked: for every shape, each bucket its rows pad to needs a
+    /// target of its kind (a wide target counted by its lanes' rows) and
+    /// treatment (folds, or any treatment that buffers). The interim stub
+    /// of CONTRACT-BC 24: the walk does not take its targets from the set
+    /// yet, so a gap here is a composition serving would fire eager.
+    pub(crate) fn walk_gaps(&self, shapes: &engine::StepShapes) -> Vec<String> {
+        use engine::{StepKind, Treatment as Rs};
+        let Some(lattice) = self.lattice_targets() else {
+            return shapes
+                .shapes
+                .iter()
+                .map(|shape| format!("{shape}: the load walks no lattice"))
+                .collect();
+        };
+        let kind_of = |target: &BodySynth| match target {
+            BodySynth::Decode { .. } => Some(StepKind::Decode),
+            BodySynth::Prefill { .. } => Some(StepKind::Prefill),
+            BodySynth::Mixed { .. } => Some(StepKind::Mixed),
+            BodySynth::Wide { lanes } => {
+                let decodes = lanes.iter().any(|&(_, rows)| rows <= 1);
+                let prompts = lanes.iter().any(|&(_, rows)| rows > 1);
+                Some(match (decodes, prompts) {
+                    (true, true) => StepKind::Mixed,
+                    (false, true) => StepKind::Prefill,
+                    _ => StepKind::Decode,
+                })
+            }
+            BodySynth::Tower { .. } | BodySynth::Idle => None,
+        };
+        let walked: std::collections::HashSet<(StepKind, bool, u32)> = lattice
+            .targets
+            .iter()
+            .filter_map(|(bucket, target, treatment)| {
+                Some((kind_of(target)?, treatment.rs.buffers(), *bucket))
+            })
+            .collect();
+        let buckets = &self.budget.buckets;
+        let padded = |rows: u32| self.bucket_for(rows).unwrap_or_else(|| buckets.last().copied().unwrap_or(rows));
+        shapes
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                let buffers = shape.treatment == Rs::Buffers;
+                let (from, to) = (padded(shape.rows.lo), padded(shape.rows.hi));
+                let needed: Vec<u32> = if buckets.is_empty() {
+                    (from..=to).collect()
+                } else {
+                    buckets.iter().copied().filter(|&b| from <= b && b <= to).collect()
+                };
+                let missing: Vec<u32> = needed
+                    .into_iter()
+                    .filter(|&bucket| !walked.contains(&(shape.kind, buffers, bucket)))
+                    .collect();
+                (!missing.is_empty()).then(|| format!("[{shape}] buckets {missing:?} unwalked"))
+            })
+            .collect()
     }
 
     /// The scratch slabs this load's fires take: each composition of the

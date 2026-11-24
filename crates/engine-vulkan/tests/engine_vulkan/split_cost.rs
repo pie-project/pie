@@ -78,6 +78,7 @@ fn a_split_step_costs_its_submits_alone() {
             residency: engine::load::Residency::default(),
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("qwen3-0.6b loads");
     // Every segment the pool's range holds, backed now: three seats grow by

@@ -17,13 +17,15 @@ pub fn export_bodies(
     measured::export(cache_dir, out)
 }
 pub use load::Staged;
+pub(crate) mod pages;
 mod prepare;
+mod ring;
 mod segments;
 mod settle;
 mod stats;
 
 pub use arming::{Armed, Kind, Seal};
-pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, Recording};
+pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, QueueMasks, Recording};
 pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
@@ -67,10 +69,28 @@ use crate::window::Windows;
 use enqueue::{GuestBatch, GuestFault, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
+/// What a load's windowed fires have done ([`Shell::ring_seen`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingSeen {
+    /// Fires' own pages written on their ring directly.
+    pub direct: u64,
+    /// Own-row pages taken.
+    pub own: u64,
+    /// Ring pages a fire both read and then folded rows onto.
+    pub read_then_folded: u64,
+}
+
 pub struct Shell {
     /// The rungs the load weighed its top by and the estimate it weighed
     /// them with (`None` where the profile states no rates).
     weighed: Option<crate::top::Weighed>,
+    /// A windowed fire's ring-fold runs as the device reads them, grown to
+    /// the most a fire has folded (`serve::ring`).
+    ring_runs: Option<crate::device::alloc::Buffer>,
+    /// What the windowed fires served have done since load: pages they
+    /// wrote on their rings directly, own-row pages they took, and the ring
+    /// pages they folded onto that their own reads had read.
+    ring_seen: RingSeen,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,
@@ -654,7 +674,8 @@ impl Shell {
         self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
-    /// Seats this rank's share of `budget` disk bytes under `dir`: disk
+    /// Seats this rank's share of `budget` disk bytes under `dir`, where a
+    /// positive budget is stated (none, or 0: no disk tier): disk
     /// chunks of a pool chunk each, any state shape's slots in any chunk,
     /// laid out as the device's (CONTRACT-BC 22), the division stated at
     /// load. `persistent` keeps its slot file for the next run. Answers
@@ -664,70 +685,19 @@ impl Shell {
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
         persistent: bool,
-        seats: u32,
-        context: u32,
         world: crate::World,
     ) -> Result<u32> {
         let ranks = u64::from(world.size.max(1));
         let keep =
             persistent.then(|| format!("{} rank {}/{}", self.trace().name, world.rank, ranks));
         let keep = keep.as_deref();
+        // The tier is stated config only: no budget (or 0) is no disk tier.
         let stated = match (budget, dir) {
-            (Some(0), _) | (_, None) => None,
-            (Some(bytes), Some(dir)) => {
+            (Some(bytes), Some(dir)) if bytes > 0 => {
                 self.pools.seat_disk(dir, world.rank, bytes / ranks, keep)?;
                 Some(bytes / ranks)
             }
-            (None, Some(dir)) => {
-                // What kept files take already is theirs again, so a restart
-                // sizes the tier as the run that wrote it did.
-                let kept: u64 = if persistent {
-                    (0..world.size.max(1))
-                        .map(|rank| engine::disk::kept_bytes(dir, &crate::store::disk_file(rank)))
-                        .sum()
-                } else {
-                    0
-                };
-                // Derived on its own ([`engine::disk::derived_budget`]): the
-                // disk chunks `seats` sequences' kv pages at `context` and
-                // their state take, within this rank's share of the free
-                // disk; nothing of the device pool enters it. Never four times the host
-                // tier (a host budget below one chunk seated no disk tier)
-                // nor a quarter of the disk. One that cannot be seated is
-                // refused by name.
-                let free = engine::disk::free_space(dir).saturating_add(kept);
-                let paging = self.pools.paging();
-                let pages = u64::from(seats)
-                    * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
-                let per_chunk = self
-                    .pools
-                    .chunk_layout()
-                    .list
-                    .as_ref()
-                    .map_or(1, |list| u64::from(list.per_chunk.max(1)));
-                let chunk = self.pools.disk_chunk_bytes();
-                let state = (u64::from(seats) * self.state_row_bytes()).div_ceil(chunk.max(1));
-                // The guest state the device can hold live (the room a
-                // guest program binds within): evicted, it has a home.
-                let guest = self.chunk_facts()?.guest_room_bytes();
-                let bytes = engine::disk::derived_budget(
-                    0,
-                    0,
-                    pages.div_ceil(per_chunk) + state,
-                    chunk,
-                    guest,
-                    free / ranks,
-                );
-                // Its inputs, stated at load: what the field rules on.
-                eprintln!(
-                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), and {guest} B of guest state the device holds live, chunks of {chunk} B, within {} bytes free a rank",
-                    pages.div_ceil(per_chunk),
-                    self.state_row_bytes(),
-                    free / ranks,
-                );
-                self.pools.seat_disk(dir, world.rank, bytes, keep)?;
-                Some(bytes)
-            }
+            _ => None,
         };
         let chunks = self.pools.disk_chunks();
         if let (Some(budget), true) = (stated, chunks > 0) {
@@ -809,6 +779,37 @@ impl Shell {
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.pools.state_slot_bytes()
+    }
+
+    /// The bytes a record takes, its rings' among them.
+    #[must_use]
+    pub fn record_bytes(&self) -> u64 {
+        self.pools.record_bytes()
+    }
+
+    /// What this load's windowed fires have done since it loaded.
+    #[must_use]
+    pub fn ring_seen(&self) -> RingSeen {
+        self.ring_seen
+    }
+
+    /// The side streams this load's fires fork regions onto.
+    #[must_use]
+    pub fn side_streams(&self) -> usize {
+        self.device.side_streams().len()
+    }
+
+    /// The record a slot ref names (`Pools::record_key`).
+    #[must_use]
+    pub fn record_key(&self, slot: u32) -> u32 {
+        self.pools.record_key(slot)
+    }
+
+    /// The windowed layers the record holds the rings of; none where the
+    /// load serves its windowed rows by window lists.
+    #[must_use]
+    pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
+        self.pools.windowed_layers()
     }
 
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
@@ -953,6 +954,44 @@ impl Shell {
         self.programs.finish(pending)
     }
 
+    /// Beam `beam`'s page list of instance `id`'s beam group as its last
+    /// fire left it (`BEAM-PAGE-LISTS.md` §6.6): its state's lists are kept
+    /// twice by the fire count's parity (`channel.hip`), the last fire's at
+    /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. Every
+    /// fire in flight lands first.
+    pub fn beam_list(&mut self, id: engine::InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let (at, layout) = self.programs.beam_state(id).ok_or_else(|| {
+            crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id} binds no beam group (parents)"),
+            )
+        })?;
+        if beam >= layout.lanes {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("beam {beam} of a group of {}", layout.lanes),
+            ));
+        }
+        self.device.synchronize()?;
+        let mut header = [0u8; 16];
+        crate::device::copy_d2h(at, &mut header)?;
+        let fired = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if header[0] == 0 {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id}'s beam group has fired no step yet"),
+            ));
+        }
+        let (lanes, cap) = (u64::from(layout.lanes), u64::from(layout.cap));
+        let row = (4 + u64::from(fired & 1) * lanes * cap + u64::from(beam) * cap) * 4;
+        let mut bytes = vec![0u8; cap as usize * 4];
+        crate::device::copy_d2h(at + row, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_program(
         &mut self,
@@ -965,6 +1004,26 @@ impl Shell {
         ids: &[engine::ChannelId],
         slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
+        // A hybrid's beam group pages its beams' recurrent rows by the same
+        // lists as their kv slots, slot by slot (`BEAM-PAGE-LISTS.md` §11):
+        // the rs page's rows must divide the kv page's. A load whose recipe
+        // does not says so at the bind, before any beam fires.
+        if device.contains(eta_ir::registry::Port::Parents)
+            && let Some(buffers) = self.buffers.as_ref()
+        {
+            let (tokens, page) = (buffers.page_tokens().max(1), self.pools.paging().page_size);
+            if page % tokens != 0 {
+                return Err(crate::error::Fault::program(
+                    "serve::bind",
+                    format!(
+                        "a beam group (parents) on this hybrid pages its beams' recurrent rows \
+                         by their kv page lists, and the load's recipe pages them {tokens} rows a \
+                         page against kv pages of {page}: the rs page's rows must divide the kv \
+                         page's (BEAM-PAGE-LISTS.md §11)"
+                    ),
+                ));
+            }
+        }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
         let pools = &self.pools;
@@ -999,8 +1058,8 @@ impl Shell {
         program: engine::ProgramId,
         extents: eta_exec::Extents,
     ) -> Result<engine::GuestState> {
-        let (per_instance, per_pair) = self.programs.state_bytes(program, extents)?;
-        self.pools.guest_state(per_instance, per_pair)
+        let (per_instance, resident, per_pair) = self.programs.state_bytes(program, extents)?;
+        self.pools.guest_state(per_instance, resident, per_pair)
     }
 
     /// What an instance of `program` keeps in the pool's `Instance` and
@@ -1392,6 +1451,8 @@ struct RsFire<'a> {
     truncates: bool,
     /// How its lanes treat their recurrent rows.
     body: record::RsBody,
+    /// Whether its beam groups fold their sets (§11.3): it stages a fold.
+    group_folds: bool,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
 }
@@ -1429,6 +1490,9 @@ pub(crate) struct MergeLand {
 }
 
 pub struct Prepared<'a> {
+    /// The ring work of a fire of windowed lanes: the pages filled before
+    /// it, the rows folded after.
+    ring_work: ring::Work,
     lanes: &'a [Seated<'a>],
     attachments: &'a [Attached],
     composition: Composition,
@@ -1466,6 +1530,10 @@ pub struct Prepared<'a> {
     lengths: crate::inputs::Staged,
     token_injects: Vec<crate::inputs::TokenInject>,
     mask_injects: Vec<crate::inputs::MaskInject>,
+    /// What the fire's pages-bound lanes have the device resolve and copy.
+    page_work: pages::PageWork,
+    /// Where the staged fire's page-list fault words lie, read at settle.
+    page_faults: Option<u64>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
     /// Why not, in a load that records bodies: the key and the reason.

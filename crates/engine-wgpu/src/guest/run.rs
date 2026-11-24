@@ -36,6 +36,9 @@ pub struct Deferral {
     /// What the pass reads back, in its frame's readback buffer.
     pub pass: Option<Pass>,
     pub landings: Vec<Landing>,
+    /// The ports the host reads off the rings at the next fire
+    /// ([`engine_gpu::program::read_at_fire`]): their puts land.
+    pub reads: eta_ir::registry::PortMask,
 }
 
 impl engine_gpu::guest::defer::LandedPass for Pass {
@@ -85,9 +88,14 @@ impl<'a> OnDevice<'a> {
     /// stage to completion: into `frame`, which the step's earlier passes
     /// recorded into, or a frame of its own.
     #[must_use]
-    pub fn deferred(mut self, frame: Option<Frame>) -> OnDevice<'a> {
+    pub fn deferred(
+        mut self,
+        frame: Option<Frame>,
+        reads: eta_ir::registry::PortMask,
+    ) -> OnDevice<'a> {
         self.deferral = Some(Deferral {
             frame,
+            reads,
             ..Deferral::default()
         });
         self
@@ -121,7 +129,7 @@ impl<'a> OnDevice<'a> {
         vals: &mut [Value],
     ) -> Result<()> {
         let plan = &package.plans[at];
-        let deferring = self.deferral.is_some();
+        let deferring = self.deferral.as_ref().map(|deferral| deferral.reads);
         if self
             .deferral
             .as_ref()
@@ -214,10 +222,9 @@ impl<'a> OnDevice<'a> {
             };
             let channel = put.channel;
             let bytes = self.session.span(at, local).map_or(0, |(_, l)| l);
-            let on_device = if deferring {
-                host_reads_not(package, channel)
-            } else {
-                keeps(package, channel, bytes)
+            let on_device = match deferring {
+                Some(reads) => host_reads_not(package, channel, reads),
+                None => keeps(package, channel, bytes),
             };
             if on_device {
                 self.session.keep(&mut frame, at, local, channel)?;

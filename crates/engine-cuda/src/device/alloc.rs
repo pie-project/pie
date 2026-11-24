@@ -1151,6 +1151,13 @@ fn bounce(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<bool
     if bytes.len() < BOUNCED {
         return Ok(false);
     }
+    // A capture records the copy's source, the ring's buffer, which the ring
+    // writes again once the live copy that read it has run: a replay would
+    // read a later copy's bytes. Declined, as HIP's ring declines
+    // (`hip::held::staged_through_ring`): the caller copies its own bytes.
+    if is_capturing(stream) {
+        return Ok(false);
+    }
     let Some(device) = crate::device::held::current_device() else {
         return Ok(false);
     };

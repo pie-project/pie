@@ -119,6 +119,12 @@ impl Engine for Spatial {
         "cerebras-spatial"
     }
 
+    /// Its pool is degenerate and no evacuation moves a chunk of it: it
+    /// states no table.
+    fn chunk_table(&self) -> engine::Result<engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
+    }
+
     fn live(&self) -> engine::live::Live {
         self.programs.live()
     }
@@ -140,6 +146,7 @@ impl Engine for Spatial {
             residency,
             ordinal: _,
             frames_in_flight: _,
+            steps,
         } = request;
         // The program keeps one sequence's cache and every lane's as host
         // tokens: there is no device pool to back with a slot file or to
@@ -265,6 +272,8 @@ impl Engine for Spatial {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: budgets.max_tokens,
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
             },
             has_lora: false,
             has_attn_page_mask: false,
@@ -277,6 +286,7 @@ impl Engine for Spatial {
             kv_handle: None,
             media_encode: false,
             rs_verbs: false,
+            windowed_state: false,
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,
@@ -285,10 +295,28 @@ impl Engine for Spatial {
             classes: facts.classes(),
             // Cerebras states no bound on one submission.
             guest_cost: engine::GuestCost::default(),
+            // No `beam_list`: a beam group's bind is refused by name.
+            host_ops: engine::HostOps::NONE,
             mixed_lanes: engine::MixedLanes::Any,
             // one frame at a time: no run-ahead
             frames_in_flight: 1,
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; Cerebras records
+        // no bodies (degenerate facts, out of scope for this set).
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
+        tracing::info!(
+            "engine-cerebras: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
         self.facts = Some(facts);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -689,6 +717,7 @@ mod tests {
                 residency: Residency::default(),
                 ordinal: 0,
                 frames_in_flight: 1,
+                steps: Default::default(),
             })
             .expect_err("the load is refused");
         assert!(refused.to_string().contains("no float output"), "{refused}");

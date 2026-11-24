@@ -10,7 +10,7 @@ use profile::{Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 const FACTS: &[Var] = &[
     Var::fixed("family", Domain::COUNT),
     Var::fixed("cores", Domain::COUNT),
-    Var::fixed("cores_from", Domain::Enum(&["registry", "model"])),
+    Var::fixed("cores_from", Domain::Enum(&["registry", "model", "probe"])),
     Var::fixed("perf_cores", Domain::COUNT),
     Var::fixed("ane", Domain::Bool),
 ];
@@ -93,16 +93,12 @@ pub enum KeepAliveSpin {
     Idle,
 }
 
-/// The GPU cores the compiler prices a device at that does not say its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "compiler.unreported_cores", constant(range(1..=1024)), default = 32, tune = price)]
-pub struct UnreportedCores(pub u32);
-
-/// The GPU cores the compiler prices at: the device's, or where it does not
-/// say, the profile's stand-in.
+/// The GPU cores the compiler prices at: the device's, stated or measured
+/// as it opened (`device::CoresFrom::Probe`). A device that neither states
+/// nor yields its cores is priced at one, which no Apple GPU has fewer than.
 #[must_use]
-pub fn pricing_cores(profile: &Profile, cores: Option<u32>) -> u32 {
-    cores.unwrap_or_else(|| profile.get::<UnreportedCores>().0)
+pub fn pricing_cores(_profile: &Profile, cores: Option<u32>) -> u32 {
+    cores.unwrap_or(1)
 }
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
@@ -113,8 +109,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<WeightsLayout>()
         .add::<AneMinRows>()
         .add::<AneMinColumns>()
-        .add::<KeepAliveSpin>()
-        .add::<UnreportedCores>();
+        .add::<KeepAliveSpin>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // Metal forks no side streams: one queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
@@ -145,6 +140,7 @@ seeded!(
     "apple10/apple-m5-pro.toml",
     // Committed measured profiles (`pie tune export --engine metal`).
     "apple-m5-pro.measured.toml",
+    "apple-m1-max.measured.toml",
 );
 
 /// The host covers committed for this backend's devices

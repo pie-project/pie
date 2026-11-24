@@ -192,8 +192,17 @@ fn the_hand_body_through_synth_lands_the_skeletons_bits() {
                 refused.to_string().contains("over a parameter"),
                 "{refused}"
             );
+            // Under the hand fire's own schedule (packed): a spread row
+            // reduces over another tree of threads, its sum's last bits its
+            // own, so only one schedule can be held to the skeleton's bits.
             kernel
-                .fire(&gpu.ctx(), &ins, &[plane(out), plane(h)], rows as u32)
+                .fire_laid(
+                    &gpu.ctx(),
+                    &ins,
+                    &[plane(out), plane(h)],
+                    (rows as u32, 1),
+                    skeleton::Schedule::Packed,
+                )
                 .expect("the hand body fires");
             gpu.sync();
             let (y_want, out_want) = residual_norm_by(skeleton::residual_add_rmsnorm, rows, width);

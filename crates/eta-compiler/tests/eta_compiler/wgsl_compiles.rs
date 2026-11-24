@@ -384,3 +384,77 @@ fn a_stepwise_module_compiles() {
 fn alloc_axes(n: u32) -> Vec<Dimension> {
     vec![Dimension::Static(n)]
 }
+
+/// The functions of `source` that return a value and whose body's last
+/// statement is not a `return`, by name. A compiler that cannot see that
+/// a `switch` whose every case returns covers every path (FXC, through
+/// which wgpu compiles naga's HLSL on DX12) refuses such a function ("not
+/// all control paths return a value"), so every one the WGSL emits ends
+/// on a return reached after its switch or if chain.
+fn ends_without_a_return(source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("fn ") {
+        let after = &rest[at + 3..];
+        let Some(open) = after.find('{') else { break };
+        let head = &after[..open];
+        let name = head.split('(').next().unwrap_or("").trim().to_owned();
+        let returns = head.contains("->");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in after[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else { break };
+        if returns {
+            let body = after[open + 1..close].trim_end();
+            let last = body.strip_suffix(';').map(|inner| {
+                let start = inner
+                    .rfind(|c| matches!(c, ';' | '{' | '}'))
+                    .map_or(0, |at| at + 1);
+                inner[start..].trim()
+            });
+            if !last.is_some_and(|statement| statement.starts_with("return")) {
+                found.push(name);
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    found
+}
+
+#[test]
+fn every_value_returning_function_ends_on_a_return() {
+    let mut modules: Vec<String> = step_calls()
+        .iter()
+        .map(|call| step_module("main", call))
+        .collect();
+    modules.push(RUNTIME.to_owned());
+    for module in &modules {
+        let bad = ends_without_a_return(module);
+        assert!(
+            bad.is_empty(),
+            "functions {bad:?} return a value and end on no return statement"
+        );
+    }
+    // The scan itself: a final switch is caught, a final return is not.
+    assert_eq!(
+        ends_without_a_return(
+            "fn a(w : u32) -> u32 { switch (w) { case 0u: { return 1u; } default: { return 2u; } } }\n\
+             fn b(w : u32) -> u32 { switch (w) { case 0u: { return 1u; } default: {} } return 2u; }\n\
+             fn c(y : u32) -> u32 { if (y == 0u) { return 0u; } return 1u / y; }\n\
+             fn d(y : u32) { if (y == 0u) { return; } }"
+        ),
+        ["a"]
+    );
+}

@@ -1559,6 +1559,20 @@ impl Prepared {
     /// readout row. Returns whether the stage reads the seat; one it does
     /// not is let go here, and the session refuses a seat no stage reads.
     #[allow(clippy::too_many_arguments)]
+    /// Whether this stage reads output `name` at `lane` (what
+    /// [`Self::bind_output`] would bind), without binding it.
+    #[must_use]
+    pub fn reads_output(&self, name: &str, lane: u32) -> bool {
+        let Some(named) = self.names.iter().position(|named| named == name) else {
+            return false;
+        };
+        let slot = named + (self.output_slots * lane) as usize;
+        match self.reads.get(slot).copied().flatten() {
+            Some(_) => true,
+            None => matches!(self.reads.get(named).copied().flatten(), Some(_) if lane > 0 && lane < self.read_rows[named]),
+        }
+    }
+
     pub fn bind_output(
         &mut self,
         name: &str,
@@ -1827,7 +1841,7 @@ impl Prepared {
         {
             let encoder = frame.encoder();
             let (dispatches, threads) = self.bind_streamed(&encoder, region)?;
-            dispatch_streamed(&encoder, &dispatches, threads, GROUPED_LANES as usize);
+            dispatch_streamed(&encoder, &dispatches, threads, GROUPED_LANES as usize, region);
             Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -2892,6 +2906,7 @@ impl Batch {
                 ),
                 threads,
                 count as usize,
+                region,
             );
             Ok(())
         }
@@ -3099,8 +3114,9 @@ pub(crate) fn dispatch_streamed_step(
     encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     step: (StepWord, u32),
     threads: usize,
+    region: &Region,
 ) {
-    dispatch_streamed(encoder, &[step], threads, GROUPED_LANES as usize);
+    dispatch_streamed(encoder, &[step], threads, GROUPED_LANES as usize, region);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -3109,9 +3125,23 @@ fn dispatch_streamed(
     dispatches: &[(StepWord, u32)],
     threads: usize,
     lanes: usize,
+    region: &Region,
 ) {
     use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+    // Each step on its own pipeline where the region was built one a step
+    // (only its case compiled in), else every step on the region's.
+    let own = region.module.step_pipelines();
+    let mut bound: Option<usize> = None;
     for (word, groups) in dispatches {
+        let step = word.index as usize;
+        let want = (step < own.len()).then_some(step);
+        if want != bound {
+            match want {
+                Some(at) => encoder.setComputePipelineState(&own[at]),
+                None => encoder.setComputePipelineState(region.pipeline()),
+            }
+            bound = want;
+        }
         // SAFETY: `word` lives for the call; Metal copies the bytes.
         unsafe {
             encoder.setBytes_length_atIndex(

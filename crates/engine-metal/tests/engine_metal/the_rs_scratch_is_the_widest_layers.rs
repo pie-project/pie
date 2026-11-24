@@ -41,6 +41,7 @@ fn the_rs_scratch_is_the_widest_layers() {
     let mut fire = |slot: u32, tokens: &[u32], rs: &RsVerb, held: u32| -> Vec<f32> {
         shell
             .fire_seated(&[Seated {
+                replay_stated: None,
                 held: Some(held),
                 rs,
                 rs_reset: if held == 0 { RsReset::Fresh } else { RsReset::Held },

@@ -48,6 +48,7 @@ fn a_settled_fires_fold_is_told_before_it_returns() {
         lineage: engine::fire::Lineage::Set,
     };
     let lanes = [Seated {
+        replay_stated: None,
         held: Some(0),
         rs: &verb,
         rs_reset: RsReset::Fresh,

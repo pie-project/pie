@@ -29,6 +29,17 @@ pub struct SchedulerLimits {
     /// (`scheduler::batch::AdmissionLimits`); a float lane's rows are not
     /// held to the store (`FireRequest::sequence_readouts`).
     pub readout_store: usize,
+    /// The most buffered recurrent rows the lanes of one step replay,
+    /// summed ([`::engine::FireLimits::replayed_rows`]; 0: no bound past
+    /// each fire's rung).
+    pub max_replayed_rows: usize,
+    /// The step compositions the load stated (CONTRACT-BC 24): the step
+    /// builder forms none outside them, a member whose joining would leave
+    /// the set going in a later step and a lone member outside it refused at
+    /// admission by name. Every served load states one (bootstrap computes
+    /// it from the load's facts and holds the engine's to it); `None` only
+    /// where a test builds limits by hand.
+    pub shapes: Option<&'static ::engine::StepShapes>,
 }
 
 impl SchedulerLimits {
@@ -44,6 +55,26 @@ impl SchedulerLimits {
         self.readout_store = readouts.store_rows.map_or(0, |rows| rows.max(1) as usize);
         self
     }
+
+    /// The facts of a load stating `chunks` under these limits, as the step
+    /// set is computed from them ([`::engine::StepFacts::of`]): the limits
+    /// after [`Self::read_out_by`], so the readout bound is the one fires
+    /// are cut to, its lanes carrying `attachments` ([`::engine::Attachments::served`]).
+    #[must_use]
+    pub fn step_facts(
+        &self,
+        chunks: &::engine::ChunkFacts,
+        attachments: ::engine::Attachments,
+    ) -> ::engine::StepFacts {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        ::engine::StepFacts::of(
+            chunks,
+            count(self.max_forward_requests),
+            count(self.max_forward_tokens),
+            count(self.max_readouts),
+            attachments,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +82,9 @@ pub struct EngineSpec {
     pub limits: SchedulerLimits,
     pub device_geometry_port_mask: PortMask,
     pub device_domain: MemoryDomain,
+    /// The host ops the engine serves, as its load stated them
+    /// ([`::engine::Capabilities::host_ops`]).
+    pub host_ops: ::engine::HostOps,
     /// The engine's kind ([`::engine::Engine::kind`]), as bind names it.
     pub kind: &'static str,
     /// The backend the host emits a guest program's kernels for
@@ -166,7 +200,7 @@ pub mod open {
 #[cfg(feature = "engine-cuda")]
 pub use engine_cuda::comm::Transport;
 #[cfg(feature = "engine-cuda")]
-pub use engine_cuda::{DeviceBoot, Diagnostics, Knobs, World, ordinal_of};
+pub use engine_cuda::{DeviceBoot, Diagnostics, Knobs, QueueMasks, World, ordinal_of};
 
 struct EngineRegistration {
     spec: EngineSpec,
@@ -256,6 +290,31 @@ pub fn get_spec(engine_id: usize) -> Result<EngineSpec> {
         .ok_or_else(|| anyhow!("unknown engine {engine_id}"))
 }
 
+/// Refuses a program of `package` on engine `engine_id` by name where it
+/// needs a host op the engine's load did not state it serves
+/// ([`::engine::HostOps::needed_by`]): asked at the bind, before anything is
+/// registered or any step submitted, so a beam search on an engine without
+/// `beam_list` fails at its start, not at its finish.
+pub fn refuse_unserved_host_ops(
+    engine_id: usize,
+    package: &eta_compiler::codegen::launch::LaunchPackage,
+) -> Result<()> {
+    let needed = ::engine::HostOps::needed_by(package);
+    if needed.is_empty() {
+        return Ok(());
+    }
+    let spec = get_spec(engine_id)?;
+    match spec.host_ops.unserved(&needed) {
+        Some(op) => Err(anyhow!(
+            "the {} engine does not serve `{}`, which this program needs (a beam group reads its \
+             chosen beam's page list at its finish): refused at its bind, before any step",
+            spec.kind,
+            op.name()
+        )),
+        None => Ok(()),
+    }
+}
+
 pub fn take_engine_backend(engine_id: usize) -> Result<EngineBox> {
     let mut engines = registry().lock().unwrap();
     let Some(Some(engine)) = engines.get_mut(engine_id) else {
@@ -291,6 +350,8 @@ mod tests {
             prefill_lanes: 0,
             max_readouts: 0,
             readout_store: 0,
+            max_replayed_rows: 0,
+            shapes: None,
         };
         assert_eq!(smallest_fire(std::iter::empty()), None, "no engine yet");
         assert_eq!(

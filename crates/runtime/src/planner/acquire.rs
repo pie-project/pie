@@ -232,13 +232,24 @@ impl ResidencyPlanner {
             });
             if !rs_free.covers(demand.rs) && resident && !self.port.grow_rs(demand.rs) {
                 // What this frees may be what an older waiter parked on.
-                if self.reclaim_idle_once() {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
-                }
-                if self.reclaim_own_sharing(pid) {
-                    self.pages_freed();
-                    return Ok(Acquired::Requote);
+                let short = super::pool::IdleShort {
+                    kv_pages: self.port.rs_as_pages(demand.rs.sub(rs_free)),
+                    rs: true,
+                };
+                match self.reclaim_idle_once(short) {
+                    super::residency_planner::IdleOutcome::Freed => {
+                        self.pages_freed();
+                        return Ok(Acquired::Requote);
+                    }
+                    // Pages a reclaim freed are on their way back: it parks
+                    // for them, and their retirement wakes it.
+                    super::residency_planner::IdleOutcome::Returning => {}
+                    super::residency_planner::IdleOutcome::Nothing => {
+                        if self.reclaim_own_sharing(pid) {
+                            self.pages_freed();
+                            return Ok(Acquired::Requote);
+                        }
+                    }
                 }
             }
         }
@@ -346,7 +357,10 @@ impl ResidencyPlanner {
                         Collect::Yield => Ok(Acquired::Yield),
                         Collect::Requote => Ok(Acquired::Requote),
                     };
-                    if !matches!(acquired, Err(PlannerError::PastDevice { .. })) {
+                    if !matches!(
+                        acquired,
+                        Err(PlannerError::PastDevice { .. } | PlannerError::RunPastPool { .. })
+                    ) {
                         registration.disarm();
                     }
                     self.poke();
@@ -641,8 +655,11 @@ impl ResidencyPlanner {
         pid: ProcessId,
         run: u32,
         pieces: u32,
+        singles: u32,
     ) -> Result<BindRoomWait, PlannerError> {
-        let pages = self.port.chunks_as_pages(run.max(1).saturating_mul(pieces));
+        let pages = self
+            .port
+            .chunks_as_pages(run.max(1).saturating_mul(pieces).saturating_add(singles));
         // Runs past the whole device pool never stand: refused by name, at
         // once. Any other bind waits for its runs, however long.
         let total = self.device_pages_most();
@@ -653,7 +670,15 @@ impl ResidencyPlanner {
                 runs: Some((run.max(1), pieces)),
             });
         }
-        self.wait_room(pid, run, pieces, pages, None)
+        // A run longer than any segment lays for state: never laid.
+        let longest = self.port.longest_run_most();
+        if pieces > 0 && run.max(1) > longest {
+            return Err(PlannerError::RunPastPool {
+                run: run.max(1),
+                longest,
+            });
+        }
+        self.wait_room(pid, (run, pieces, singles), pages, None)
             .await
             .map(|(wait, _registration)| wait)
     }
@@ -680,21 +705,21 @@ impl ResidencyPlanner {
     where
         F: std::future::Future<Output = T>,
     {
-        let pieces = match self.port.rise_room(rung) {
-            super::pool::RiseRoom::Past { need, total } => {
-                return Err(PlannerError::PastRung { rung, need, total });
+        let pieces = match self.port.rise_room(pid, rung) {
+            super::pool::RiseRoom::Past { need, own, total } => {
+                return Err(PlannerError::PastRung { rung, need, own, total });
             }
             super::pool::RiseRoom::Fits => return Ok(Some(take().await)),
             super::pool::RiseRoom::Short { pieces } => pieces,
         };
         let pages = self.port.chunks_as_pages(pieces);
-        let (wait, registration) = self.wait_room(pid, 1, pieces, pages, Some(rung)).await?;
+        let (wait, registration) = self.wait_room(pid, (1, pieces, 0), pages, Some(rung)).await?;
         if wait == BindRoomWait::Withdrawn {
             return Ok(None);
         }
         // Served: it fits, or (the pool shrank under it) never will.
-        if let super::pool::RiseRoom::Past { need, total } = self.port.rise_room(rung) {
-            return Err(PlannerError::PastRung { rung, need, total });
+        if let super::pool::RiseRoom::Past { need, own, total } = self.port.rise_room(pid, rung) {
+            return Err(PlannerError::PastRung { rung, need, own, total });
         }
         let taken = take().await;
         // Off the queue: the heads behind it are planned again.
@@ -709,8 +734,7 @@ impl ResidencyPlanner {
     async fn wait_room(
         self: &Arc<Self>,
         pid: ProcessId,
-        run: u32,
-        pieces: u32,
+        (run, pieces, singles): (u32, u32, u32),
         pages: u32,
         rise: Option<u32>,
     ) -> Result<(BindRoomWait, Option<WaitRegistration<'_>>), PlannerError> {
@@ -725,12 +749,20 @@ impl ResidencyPlanner {
                 if proc.state != Residency::Resident && !raising {
                     return Some(None);
                 }
+                // Its bind asks its room again: what an eviction it was
+                // withdrawn by left pending is this ask now.
+                if rise.is_none()
+                    && let Some(proc) = inner.procs.get_mut(&pid)
+                {
+                    proc.bind_room = None;
+                }
                 Some(Some({
                     inner.enqueue(
                         pid,
                         WaitKind::BindRoom {
                             run,
                             pieces,
+                            singles,
                             pages,
                             notify: notify.clone(),
                             served: false,

@@ -49,6 +49,9 @@ pub fn window_of(id: ShapeId) -> Option<usize> {
 pub const FIXED: ShapeId = ShapeId(2);
 /// The rs list's.
 pub const RS: ShapeId = ShapeId(3);
+/// The ring shape's: the windowed layers' rings, a record's first pieces
+/// (CONTRACT-BC 21), clear of the weight shapes' and the window lists'.
+pub const RING: ShapeId = ShapeId(MORE_WINDOWS - 1);
 
 /// The guest shapes' ids start here, clear of the weight shapes' and the
 /// window lists'.
@@ -103,6 +106,8 @@ pub enum Kind {
     Instance,
     /// A slot of a ring only the device reads and writes ([`CHANNEL`]).
     Channel,
+    /// A piece of a record's windowed rings, a chunk's one slot ([`RING`]).
+    Ring,
 }
 
 impl Kind {
@@ -117,6 +122,7 @@ impl Kind {
         Kind::Window(3),
         Kind::Instance,
         Kind::Channel,
+        Kind::Ring,
     ];
 
     /// The shape the pages of a kv row of list `list` are slots of: 0 the
@@ -158,11 +164,12 @@ impl Kind {
             Kind::Window(at) => 3 + at as usize,
             Kind::Instance => 3 + MOST_WINDOWS,
             Kind::Channel => 4 + MOST_WINDOWS,
+            Kind::Ring => 5 + MOST_WINDOWS,
         }
     }
 
     /// The kinds [`Kind::index`] numbers.
-    pub const COUNT: usize = 5 + MOST_WINDOWS;
+    pub const COUNT: usize = 6 + MOST_WINDOWS;
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -173,6 +180,7 @@ impl Kind {
             Kind::Rs => "rs buffer page",
             Kind::Instance => "guest instance slot",
             Kind::Channel => "guest channel slot",
+            Kind::Ring => "ring slot",
         }
     }
 }
@@ -236,14 +244,14 @@ impl SlotShape {
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Cache(row) => Some((row, run.offset)),
-                    RowId::Rs(_) | RowId::Pool(_) => None,
+                    RowId::Rs(_) | RowId::Pool(_) | RowId::Ring => None,
                 })
                 .collect(),
             pools: runs
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Pool(row) => Some((row, run.offset)),
-                    RowId::Cache(_) | RowId::Rs(_) => None,
+                    RowId::Cache(_) | RowId::Rs(_) | RowId::Ring => None,
                 })
                 .collect(),
         })
@@ -323,6 +331,9 @@ pub struct Layout {
     /// window page by one table.
     pub windows: Vec<SlotShape>,
     pub fixed: Option<FixedShape>,
+    /// The windowed rings, a record's first pieces, where the load serves
+    /// its windowed rows as ring + buffer.
+    pub ring: Option<RingShape>,
     pub rs: Option<RsShape>,
     /// The guest shapes: an instance's tables, a device ring.
     pub instance: SlotShape,
@@ -923,6 +934,130 @@ pub struct FixedShape {
     pub tables: Vec<Vec<u32>>,
 }
 
+/// The ring shape: a record's windowed rings, `pieces` slots of it, one a
+/// chunk, named first among the record's pieces (CONTRACT-BC 21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingShape {
+    pub slot: SlotShape,
+    /// The slots a record's rings take.
+    pub pieces: u32,
+    pub ring: Ring,
+}
+
+/// The windowed layers' rings in a record: `pages` pages laid exactly as a
+/// window-buffer slot is (every windowed row's `P` rows, layer-major), so a
+/// kernel reads a ring page by a page id of the window buffer's grain: each
+/// record piece starts a chunk (`RingPlacement::ChunkStart`) and holds
+/// `per_piece` pages from `offset`. Row `r` folded lies on ring page
+/// `(r / P) mod pages`; `pages * P` rows are the widest window rounded up to
+/// a page and one page more (the rows a lane's own fire writes past its
+/// window before it folds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ring {
+    /// Ring pages: `ceil(W / P) + 1` of the widest window `W`.
+    pub pages: u32,
+    /// Ring pages a record piece holds.
+    pub per_piece: u32,
+    /// Where a piece's first ring page starts in its slot.
+    pub offset: u64,
+    /// A ring page's bytes: a window-buffer slot's.
+    pub page_bytes: u64,
+    /// Rows a page holds: the window buffer's `P`.
+    pub page_rows: u32,
+    /// Each windowed row's window, by cache row, as its slot lays them.
+    pub windows: Vec<(u32, u32)>,
+    /// Each windowed layer: (layer, window, its share of the ring's bytes),
+    /// as the recipe states them (`WindowedLayer`).
+    pub layers: Vec<(u32, u32, u64)>,
+}
+
+impl Ring {
+    /// The rows the ring holds.
+    #[must_use]
+    pub const fn rows(&self) -> u32 {
+        self.pages * self.page_rows
+    }
+
+    /// Ring page `page`'s record piece and its place in it.
+    #[must_use]
+    pub const fn place(&self, page: u32) -> (u32, u32) {
+        (page / self.per_piece, page % self.per_piece)
+    }
+}
+
+impl RingShape {
+    /// The rings of a load that serves its windowed rows as ring + buffer:
+    /// its ring shape's pieces, each a
+    /// chunk's whole slot, their pages laid as the window buffer's slots
+    /// from the ring run's offset (`CudaRings`, the recipe's ring hook).
+    pub fn of_ring(recipe: &ChunkRecipe, buffer: &SlotShape) -> Result<Option<RingShape>> {
+        let Some(windowed) = recipe.windowed.as_ref() else {
+            return Ok(None);
+        };
+        let (Some(SlotLayout::Fixed {
+            bytes,
+            pieces_per_ws,
+            ..
+        }), Some(run)) = (windowed.ring_shape(recipe), windowed.ring_run(recipe))
+        else {
+            return Err(Fault::program(
+                "store::layout",
+                "a windowed recipe whose rings lie in no shape of their own",
+            ));
+        };
+        let chunk_bytes = recipe.chunk_bytes;
+        let page_rows = buffer.tokens.max(1);
+        let pages = u32::try_from(windowed.region.bytes / buffer.slot_bytes.max(1))
+            .unwrap_or(u32::MAX);
+        let windows = windowed
+            .layers
+            .iter()
+            .flat_map(|layer| {
+                layer.rows.iter().filter_map(move |row| match row {
+                    RowId::Cache(row) => Some((*row, layer.window)),
+                    _ => None,
+                })
+            })
+            .collect();
+        let layers = windowed
+            .layers
+            .iter()
+            .zip(&windowed.region.layer_bytes)
+            .map(|(layer, &bytes)| {
+                let row = layer.rows.iter().find_map(|row| match row {
+                    RowId::Cache(row) => Some(*row),
+                    _ => None,
+                });
+                (layer.layer.or(row).unwrap_or(0), layer.window, bytes)
+            })
+            .collect();
+        Ok(Some(RingShape {
+            slot: SlotShape {
+                id: RING,
+                tokens: 0,
+                slot_bytes: *bytes,
+                per_chunk: u32::try_from(chunk_bytes / (*bytes).max(1))
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+                grain: gcd(chunk_bytes, *bytes),
+                window: None,
+                rows: Vec::new(),
+                pools: Vec::new(),
+            },
+            pieces: (*pieces_per_ws).max(1),
+            ring: Ring {
+                pages,
+                per_piece: u32::try_from(run.atoms_per_piece).unwrap_or(u32::MAX).max(1),
+                offset: run.offset,
+                page_bytes: buffer.slot_bytes,
+                page_rows,
+                windows,
+                layers,
+            },
+        }))
+    }
+}
+
 impl FixedShape {
     fn of(recipe: &ChunkRecipe, layout: &SlotLayout) -> Result<FixedShape> {
         let chunk_bytes = recipe.chunk_bytes;
@@ -976,7 +1111,7 @@ impl FixedShape {
                         "an rs row in the fixed record: the rs buffer is a list shape",
                     ));
                 }
-                RowId::Pool(_) => {}
+                RowId::Pool(_) | RowId::Ring => {}
             }
         }
         Ok(FixedShape {
@@ -1057,6 +1192,15 @@ impl Layout {
             .fixed()
             .map(|layout| FixedShape::of(recipe, layout))
             .transpose()?;
+        // A windowed recipe's one window buffer, stated as the first window
+        // list's shape, and its rings as the record.
+        let mut windows = windows;
+        let mut ring = None;
+        if let Some(buffer) = recipe.window_buffer() {
+            let buffer = SlotShape::of(buffer, chunk_bytes, WINDOW)?;
+            ring = RingShape::of_ring(recipe, &buffer)?;
+            windows = vec![buffer];
+        }
         let rs = recipe
             .rs_list()
             .map(|layout| -> Result<RsShape> {
@@ -1184,6 +1328,7 @@ impl Layout {
             list,
             windows,
             fixed,
+            ring,
             rs,
             instance: SlotShape::guest(INSTANCE, INSTANCE_SLOT, chunk_bytes),
             channel: SlotShape::guest(CHANNEL, CHANNEL_SLOT, chunk_bytes),
@@ -1198,6 +1343,7 @@ impl Layout {
             Kind::List => self.list.as_ref(),
             Kind::Window(at) => self.windows.get(at as usize),
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
+            Kind::Ring => self.ring.as_ref().map(|ring| &ring.slot),
             Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
             Kind::Instance => Some(&self.instance),
             Kind::Channel => Some(&self.channel),
@@ -1211,6 +1357,7 @@ impl Layout {
             .iter()
             .chain(&self.windows)
             .chain(self.rs.as_ref().map(|rs| &rs.slot))
+            .chain(self.ring.as_ref().map(|ring| &ring.slot))
             .chain(self.fixed.as_ref().map(|fixed| &fixed.slot))
             .chain([&self.instance, &self.channel])
     }

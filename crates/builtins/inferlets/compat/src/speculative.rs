@@ -255,7 +255,8 @@ pub async fn generate(
     // and the widest verify a block feeds: the anchor and every proposal.
     let from = draft.proposals_from.min(1) as usize;
     let widest = block + 1 - from as u32;
-    let ws = WorkingSet::new();
+    // Reused across requests within the tenant, as `generate`'s.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
     let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pick = sampled.map(|(temperature, seed)| Pick {
         temperature,

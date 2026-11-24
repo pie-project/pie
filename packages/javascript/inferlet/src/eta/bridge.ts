@@ -302,11 +302,24 @@ export class WorkingSet {
     return this.ws.folded();
   }
 
-  /** A child sharing the frozen part, with a copy of the buffer. */
+  /** A child sharing the frozen part, with a copy of the buffer; it shares as this set does. */
   fork(on: Pipeline): WorkingSet {
     return WorkingSet.wrap(wit('fork', () => this.ws.fork(on.wit)));
   }
+
+  /**
+   * Publishes this set's frozen slots within `scope`, and lets its passes reuse
+   * what that scope holds. Unasked, a set is private. Ask before its first pass.
+   */
+  share(scope: ShareScope): void {
+    const wire: witWs.ShareScope =
+      typeof scope === 'string' ? { tag: scope } : { tag: 'group', val: scope.group };
+    wit('share', () => this.ws.share(wire));
+  }
 }
+
+/** Who a working set shares with: its session, its tenant, or a named group. */
+export type ShareScope = 'session' | 'tenant' | { group: string };
 
 // ---------------------------------------------------------------------------
 // Pipeline
@@ -319,6 +332,13 @@ export class Pipeline {
   /** End the stream; already-submitted fires still drain. */
   close(): void {
     this.wit.close();
+  }
+
+  /** Take back what the last `fires` fires submitted on this closed pipeline
+   * wrote, once every fire on it has landed: the rows a program ran ahead
+   * past its stop. */
+  retract(fires: number): void {
+    wit('retract', () => this.wit.retract(fires));
   }
 
   /** Leave the frame wait-set until this pipeline submits again. */
@@ -379,7 +399,11 @@ export class Pipeline {
     while (consumed < submitted) {
       if (onToken() === false) {
         if (!ended) this.close();
-        return consumed + 1;
+        // The fire whose output broke the loop read a token the program
+        // took, so its rows stay; those past it are taken back.
+        const kept = consumed + 1;
+        if (submitted > kept) this.retract(submitted - kept);
+        return kept;
       }
       consumed += 1;
       if (submitted < budget && submitted - consumed <= (windowFrames - 1) * r) submitOneFrame();

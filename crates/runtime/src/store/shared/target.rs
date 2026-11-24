@@ -290,6 +290,11 @@ impl SharedGrow {
                     // again once room is freed, not on its next wake.
                     self.raise_blocked.store(true, Ordering::Release);
                     tracing::debug!(engine = self.engine, %error, goal, "the activation rung waits");
+                    // Runs in its way with no free run below: the segment
+                    // walk, next, compacts below the raise's activation.
+                    if self.shared.lock().unwrap().compaction_for_raise(goal) {
+                        tracing::debug!(engine = self.engine, goal, "a raise waits on a compaction below its activation");
+                    }
                     self.fund_owed();
                     return;
                 }
@@ -363,12 +368,21 @@ impl SharedGrow {
                     if let Some((from, to)) = notice {
                         // No lane: no engine holds a carve to come down from.
                         let landed = match crate::scheduler::scheduler_handle(self.engine) {
-                            Ok(lane) => lane.pool(PoolOp::Rung { from, to }).await,
+                            Ok(lane) => {
+                                let _awaits = super::walk_awaits(
+                                    self.engine,
+                                    format!("the reply to a lower's notice {from} -> {to}"),
+                                );
+                                lane.pool(PoolOp::Rung { from, to }).await
+                            }
                             Err(_) => Ok(()),
                         };
                         let mut pool = self.shared.lock().unwrap();
                         match landed {
                             Ok(()) => {
+                                // The carve above the rung given back: a
+                                // refused commit may be backed now.
+                                pool.lift_commit();
                                 if let Err(error) = pool.lower_landed(rung) {
                                     tracing::warn!(engine = self.engine, %error, "the activation rung stays");
                                 }
@@ -504,9 +518,23 @@ impl SharedGrow {
                     self.room_freed();
                     return;
                 }
-                // Short again (the pool moved since), or nothing left to
-                // raise: asked again as it stands.
-                Ok(Some(Ok(None))) => {}
+                // Short again (the pool moved since), or not plannable as
+                // the pool stands (a copy still reading the span, chunks
+                // held for a served restore there): asked again once room
+                // moves. Asked again at once, the raise was planned and
+                // refused in a loop that never yielded, every other task
+                // starved (the simulation's field mix, seed 274: a raise
+                // owner's frame, 1.8 M asks in 20 s).
+                Ok(Some(Ok(None))) => {
+                    let given = self.shared.lock().unwrap().pool().room_watch();
+                    let rung = super::rung_watch(engine);
+                    tokio::select! {
+                        // In order, never at random: a seeded run takes the same branch.
+                        biased;
+                        () = given.given() => {}
+                        () = rung => {}
+                    }
+                }
                 Ok(Some(Err(refused))) => {
                     tracing::warn!(engine, rung, %refused, "the engine refused a raise to held frames");
                     return;
@@ -514,6 +542,13 @@ impl SharedGrow {
                 // Its process is being evicted: its frames go with it, and
                 // room freed brings the walk back.
                 Ok(None) => return,
+                // Never fits beside its owner's own state: the frames held
+                // for it are failed by name, never held for good.
+                Err(error @ crate::planner::PlannerError::PastRung { .. }) => {
+                    tracing::warn!(engine, rung, %owner, %error, "a raise to held frames is refused");
+                    super::refuse_owed(engine, owner, error.to_string());
+                    return;
+                }
                 Err(error) => {
                     tracing::warn!(engine, rung, %owner, %error, "a raise to held frames is refused");
                     return;
@@ -561,10 +596,11 @@ impl SharedGrow {
     }
 
     /// Room was freed (a fire retired, a slot let go): a raise refused for
-    /// room may be tried again, and the walk looks now.
+    /// room may be tried again, and the walk looks now. A refused commit
+    /// stays refused: room inside the pool changes nothing the device backs
+    /// ([`SharedPool::block_commit`]).
     pub fn room_freed(&self) {
         self.raise_blocked.store(false, Ordering::Release);
-        self.shared.lock().unwrap().block_span_commit(false);
         self.wake.notify_one();
     }
 
@@ -704,10 +740,23 @@ impl SharedGrow {
                     if self.shared.lock().unwrap().mapped_segments() > goal {
                         self.no_room.store(true, Ordering::Release);
                     }
+                    // A compaction asked and answered no room: the planner
+                    // passes its head again on that answer, never waits on
+                    // the ask.
+                    if self.shared.lock().unwrap().take_compaction_answered()
+                        && let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                    {
+                        planner.pages_freed();
+                    }
                     return;
                 }
                 Some(SegmentMove::NoRoom) => {
                     self.no_room.store(true, Ordering::Release);
+                    if self.shared.lock().unwrap().take_compaction_answered()
+                        && let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                    {
+                        planner.pages_freed();
+                    }
                     return;
                 }
                 Some(SegmentMove::Commit { prefix }) => PoolOp::CommitSegments(prefix),
@@ -731,6 +780,28 @@ impl SharedGrow {
                 Some(SegmentMove::ReleaseSpan { n }) => PoolOp::ReleaseSpan(n),
             };
             self.no_room.store(false, Ordering::Release);
+            // Every chunk an evacuation or compaction moves is held as it is
+            // sent: planned and applied under the pool's lock just now, one
+            // let go since moves as a free chunk the engine still copies.
+            // Said by name (the M1, race5 run 8: logicals 98 and 99 moved as
+            // sources 500 ms after the kv store gave their pages back).
+            if let PoolOp::Evacuate(evacuation) = &op {
+                let pool = self.shared.lock().unwrap();
+                let free: Vec<(u32, u32)> = evacuation
+                    .moves
+                    .iter()
+                    .copied()
+                    .filter(|&(logical, _)| !pool.pool().holds_chunk(logical))
+                    .collect();
+                if !free.is_empty() {
+                    tracing::error!(
+                        engine = self.engine,
+                        ?free,
+                        compaction = compacting.is_some(),
+                        "store: an evacuation sent moves chunks no one holds (logical, to)"
+                    );
+                }
+            }
             tracing::debug!(engine = self.engine, goal, ?op, "a segment move");
             let commit = match &op {
                 PoolOp::CommitSegments(prefix) => Some(*prefix),
@@ -740,8 +811,21 @@ impl SharedGrow {
                 PoolOp::CommitSpan(n) => Some(*n),
                 _ => None,
             };
-            match (self.lane)(self.engine, op).await {
+            let gives_back = matches!(op, PoolOp::ReleaseSegments(_) | PoolOp::ReleaseSpan(_));
+            let moved = matches!(op, PoolOp::Evacuate(_)).then(|| {
+                if compacting.is_some() { "a compaction" } else { "a segment's evacuation" }
+            });
+            let landed = {
+                let _awaits = super::walk_awaits(self.engine, format!("the reply to {}", op.name()));
+                (self.lane)(self.engine, op).await
+            };
+            match landed {
                 Ok(()) => {
+                    // Device memory given back: a refused commit may be
+                    // backed now.
+                    if gives_back {
+                        self.shared.lock().unwrap().lift_commit();
+                    }
                     // A segment mapped: what was promised a waiter is
                     // kept, and `pages_freed` wakes the planner.
                     if commit.is_some() || span.is_some() {
@@ -770,10 +854,12 @@ impl SharedGrow {
                     if commit.is_some() || span.is_some() {
                         self.refused.store(true, Ordering::Release);
                     }
-                    // A refused lend is not asked again on the next wake,
-                    // only once room is freed.
-                    if span.is_some() {
-                        self.shared.lock().unwrap().block_span_commit(true);
+                    // A refused commit is not asked again on the next wake,
+                    // only on an event that can change the device's answer
+                    // (`SharedPool::block_commit`).
+                    if commit.is_some() || span.is_some() {
+                        let target = self.target.load(Ordering::Acquire);
+                        self.shared.lock().unwrap().block_commit(target);
                     }
                     // A refused evacuation copied nothing: the pool takes it
                     // back, and what the segment holds has no room to go to
@@ -791,8 +877,18 @@ impl SharedGrow {
                             planner.pages_freed();
                         }
                     }
+                    // Refused means nothing moved: the map taken back is
+                    // the engine's table still.
+                    if let Some(what) = moved {
+                        super::programs::check_moved(&self.shared, &WalkMover(self), what).await;
+                    }
                     return;
                 }
+            }
+            // Taken: the engine's table is the runtime's map as the move
+            // left it.
+            if let Some(what) = moved {
+                super::programs::check_moved(&self.shared, &WalkMover(self), what).await;
             }
             if evacuating.is_some() {
                 // The engine took the copy and waits it out before it
@@ -867,10 +963,17 @@ impl PoolTarget for SharedGrow {
     /// idle cache for the difference.
     fn retarget(&mut self, segments: u64) -> Retarget {
         let could = self.shared.lock().unwrap().commit_can_come();
-        self.target.store(
-            u32::try_from(segments).unwrap_or(u32::MAX),
-            Ordering::Release,
-        );
+        let target = u32::try_from(segments).unwrap_or(u32::MAX);
+        self.target.store(target, Ordering::Release);
+        // The target moved off the one a commit was refused at: a fresh
+        // read of the system's memory, which may back it now. A tick that
+        // leaves it where it stood asks nothing again.
+        {
+            let mut pool = self.shared.lock().unwrap();
+            if pool.commit_blocked().is_some_and(|at| at != target) {
+                pool.lift_commit();
+            }
+        }
         self.wake.notify_one();
         // Risen past what the pool maps: room the target held back can come.
         // A head that waits on it (short of room no move makes) has no
@@ -895,7 +998,9 @@ impl PoolTarget for SharedGrow {
         self.refused.swap(false, Ordering::AcqRel)
     }
 
-    /// A governor tick: the walk looks again.
+    /// A governor tick: the walk looks again. A refused commit stays
+    /// refused ([`SharedPool::block_commit`]): a tick is no event of the
+    /// device's.
     fn ticked(&mut self) {
         self.wake.notify_one();
     }
@@ -911,12 +1016,14 @@ impl super::programs::Mover for WalkMover<'_> {
     }
 
     async fn evacuate(&self, evacuation: ::engine::chunk::Evacuation) -> Result<(), String> {
+        let _awaits = super::walk_awaits(self.0.engine, "the reply to a raise's evacuate".into());
         (self.0.lane)(self.0.engine, PoolOp::Evacuate(evacuation))
             .await
             .map_err(|error| format!("{error:#}"))
     }
 
     async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
+        let _awaits = super::walk_awaits(self.0.engine, format!("the reply to set rung {from} -> {to}"));
         (self.0.lane)(self.0.engine, PoolOp::Rung { from, to })
             .await
             .map_err(|error| format!("{error:#}"))
@@ -924,6 +1031,12 @@ impl super::programs::Mover for WalkMover<'_> {
 
     fn epoch_now(&self) -> u64 {
         self.0.epochs().0
+    }
+
+    async fn check_table(&self, runtime: Vec<u32>) -> Result<(), String> {
+        (self.0.lane)(self.0.engine, PoolOp::CheckTable(runtime))
+            .await
+            .map_err(|error| format!("{error:#}"))
     }
 }
 
@@ -1188,7 +1301,11 @@ mod tests {
         let moves = Arc::new(std::sync::Mutex::new(Vec::new()));
         let told = moves.clone();
         let mut grow = SharedGrow::new(model, ENGINE, shared.clone()).with_lane(move |op| {
-            told.lock().unwrap().push(format!("{op:?}"));
+            // The walk's own check of the engine's table after a move is no
+            // move the engine is told.
+            if !matches!(op, PoolOp::CheckTable(_)) {
+                told.lock().unwrap().push(format!("{op:?}"));
+            }
             Ok(())
         });
 
@@ -1447,5 +1564,89 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(shared.lock().unwrap().rung(), 2048, "woken: it raises");
+    }
+
+    /// Mac's spin (Metal, the grow-time check refusing a prefix commit,
+    /// about 1,000 asks a minute): a refused commit is asked again on no
+    /// wake that cannot change what the device backs (room freed inside the
+    /// pool, a governor tick, a retarget to the target it was refused at)
+    /// and on no clock, its own walk loop running: only once the governor's
+    /// target moves, or device memory the engine gave back lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_commit_is_asked_again_only_on_an_event_of_the_device_s() {
+        const ENGINE: usize = 9402;
+        let mut pool = super::super::tests::pool();
+        // A waiter short of room: the walk's goal is past what is mapped.
+        pool.pool_mut().wait(1, 0, 1024);
+        let mapped = pool.mapped_segments();
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let asks = Arc::new(AtomicU32::new(0));
+        let released = Arc::new(AtomicU32::new(0));
+        let (counted, gave) = (asks.clone(), released.clone());
+        let mut grow = SharedGrow::new(0, ENGINE, shared.clone()).with_lane(move |op| match op {
+            PoolOp::CommitSegments(_) | PoolOp::CommitSpan(_) => {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::anyhow!("the device backs no more"))
+            }
+            PoolOp::ReleaseSegments(_) | PoolOp::ReleaseSpan(_) => {
+                gave.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Ok(()),
+        });
+        let asked = || asks.load(Ordering::Relaxed);
+        let up = mapped + 2;
+        let _ = grow.retarget(u64::from(up));
+        grow.walk().await;
+        assert_eq!(asked(), 1, "asked once, and refused");
+        assert_eq!(shared.lock().unwrap().commit_blocked(), Some(up));
+        assert!(!grow.can_grow(), "a waiter is not told the pool grows");
+        assert!(!grow.promise_grow(), "nor promised a grow");
+
+        // Nothing the device backs changed: not asked again.
+        for _ in 0..64 {
+            grow.room_freed();
+            grow.walk().await;
+            grow.ticked();
+            grow.walk().await;
+            let _ = grow.retarget(u64::from(up));
+            grow.walk().await;
+        }
+        assert_eq!(asked(), 1, "no wake inside the pool asks the device again");
+        // Its own loop, woken by every one of them, asks nothing either.
+        grow.start();
+        for _ in 0..64 {
+            grow.room_freed();
+            grow.ticked();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(asked(), 1, "the walk's loop neither spins nor retries");
+
+        // The governor's target moved (a fresh read of the system): asked.
+        let _ = grow.retarget(u64::from(up + 1));
+        grow.walk().await;
+        assert!(asked() >= 2, "the target moved: asked again");
+        let after_move = asked();
+        assert_eq!(shared.lock().unwrap().commit_blocked(), Some(up + 1));
+
+        // Device memory given back lands, the target where it stood: the
+        // refused commit may be backed now.
+        {
+            let mut pool = shared.lock().unwrap();
+            pool.lift_commit();
+            let prefix = pool.pool().prefix_segments();
+            pool.committed(prefix + 2);
+        }
+        let high = shared.lock().unwrap().mapped_segments();
+        let _ = grow.retarget(u64::from(high - 1));
+        shared.lock().unwrap().block_commit(high - 1);
+        grow.walk().await;
+        assert!(released.load(Ordering::Relaxed) > 0, "a segment was given back");
+        assert_eq!(
+            shared.lock().unwrap().commit_blocked(),
+            None,
+            "device memory back: the refusal is lifted"
+        );
+        assert_eq!(asked(), after_move, "and nothing past the target is asked");
     }
 }

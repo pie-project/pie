@@ -264,7 +264,16 @@ pub struct RsCaps {
     pub buffer_page_size: u32,
     /// The window the model's state is read through, when it is one:
     /// its bounded half is then its window lists of kv rows, not a slot.
+    /// The window-list path: removed by the windowed-state change; 0 on a
+    /// load whose engine serves windowed layers as ring + buffer.
     pub window_tokens: u32,
+    /// The engine serves the model's windowed layers as ring + buffer
+    /// (CONTRACT-BC 19, 21; `Capabilities::windowed_state`): each ring is
+    /// record bytes (in `state_size`), the unfolded rows sit in the window
+    /// buffer, the rs store's buffer pages. A windowed layer replays no
+    /// buffered row: its buffered K/V are read, not recomputed, so a fire
+    /// carries no recurrent rows for them.
+    pub window_state: bool,
 }
 
 impl RsCaps {

@@ -37,6 +37,17 @@ pub(crate) fn set(pid: ProcessId, workers: Vec<String>) {
     }
 }
 
+/// The cluster names `pid`'s helpers anew (empty: the worker's
+/// configuration decides again).
+pub fn name(pid: ProcessId, workers: Vec<String>) {
+    let mut named = NAMED.lock().unwrap();
+    if workers.is_empty() {
+        named.remove(&pid);
+    } else {
+        named.insert(pid, workers);
+    }
+}
+
 pub(crate) fn forget(pid: ProcessId) {
     NAMED.lock().unwrap().remove(&pid);
 }

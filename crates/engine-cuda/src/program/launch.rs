@@ -308,6 +308,22 @@ pub struct Held {
     /// Where a reader of captured scores keeps a capturing lane's rows in
     /// the instance's item (`crate::scores`); `None` for any other program.
     pub score_at: Option<u64>,
+    /// Where a beam group keeps its page lists in the instance's item
+    /// (`new-memory/designs/BEAM-PAGE-LISTS.md` §4): zeroed with the item at
+    /// bind, so the group's first fire primes it. `None` for any other.
+    pub beam: Option<BeamLayout>,
+}
+
+/// A beam group's resident state in its instance's item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeamLayout {
+    /// Where it starts in the item.
+    pub at: u64,
+    pub lanes: u32,
+    /// The list width and pool pages it is laid for.
+    pub cap: u32,
+    /// Its ring of pending pages.
+    pub frames: u32,
 }
 
 /// What every cell span in an item starts a whole number of.
@@ -336,7 +352,24 @@ impl Held {
             native_at,
             ring_bytes,
             score_at: None,
+            beam: None,
         }
+    }
+
+    /// The same item with a beam group of `lanes` beams' state past it,
+    /// laid for `cap` pages a list and pool and `frames` pending rings.
+    #[must_use]
+    pub fn with_beam(mut self, lanes: u32, cap: u32, frames: u32) -> Held {
+        let at = self.instance_bytes.next_multiple_of(CELL_ALIGN);
+        let words = kernels_cuda::runtime::channel::beam_state_words(lanes, cap, frames);
+        self.beam = Some(BeamLayout {
+            at,
+            lanes,
+            cap,
+            frames,
+        });
+        self.instance_bytes = at + words * 4;
+        self
     }
 
     /// The same item with a capturing lane's rows of `bytes` past it.
@@ -491,6 +524,12 @@ impl Rings {
             place.instance + 2 * words,
             u32::try_from(slots).unwrap_or(u32::MAX),
         );
+    }
+
+    /// Where the instance's item lies now.
+    #[must_use]
+    pub const fn instance_base(&self) -> u64 {
+        self.registry
     }
 
     #[must_use]
@@ -926,9 +965,27 @@ fn block_temporary(
         .max(1);
     match region.kind {
         // A generated region's block keeps its reductions' levels here and
-        // nothing else.
+        // nothing else, laid from the rows its reductions stream (each
+        // reduction's input's row, `stream_width`), not the stage's widest
+        // value: a beam step's flattened candidates are a value of the
+        // stage no reduction of its log-softmax streams.
         RegionKind::Generated => {
-            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest)
+            let streamed = region
+                .nodes
+                .iter()
+                .filter_map(|&node| plan.ops.get(node as usize))
+                .filter(|op| {
+                    matches!(
+                        op.tag,
+                        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+                    )
+                })
+                .filter_map(|op| descriptors.get(*op.args.first()? as usize))
+                .map(|d| u64::from(d.last))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, streamed)
         }
         // A sampler's blocks meet in the engine's lane arenas, not here.
         kind if lane_sampler(kind) => 0,
@@ -1885,6 +1942,47 @@ impl Prepared {
 /// CUDA's MPS the share it is limited to), less those a CU mask keeps its
 /// queues off on ROCm ([`queue_units`]). A sampler's blocks meet at a
 /// barrier, so it never runs on more than these hold at once.
+/// The queue masks the load states ([`crate::serve::Knobs::queue_masks`]),
+/// held for [`device_units`]: the process's, so the first load's.
+static QUEUE_MASKS: std::sync::OnceLock<crate::serve::QueueMasks> =
+    std::sync::OnceLock::new();
+
+/// States the process's queue masks, ahead of any sampler laid
+/// ([`device_units`]). They are the process's start's, so a later load's
+/// are the same words and keep the first's.
+pub fn state_queue_masks(masks: &crate::serve::QueueMasks) {
+    let _ = QUEUE_MASKS.set(masks.clone());
+}
+
+/// Of device `ordinal`'s `units` compute units, those this process's queues
+/// run on under the CU masks the load stated ([`state_queue_masks`]), and
+/// named at load where a mask keeps any off.
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn masked_units(units: u32, ordinal: u32) -> u32 {
+    let masks = QUEUE_MASKS.get().cloned().unwrap_or_default();
+    // The HSA agent HIP's ordinal names: the ordinal's entry of a
+    // visible-devices list, where one is set.
+    let agent = masks
+        .visible_devices
+        .as_deref()
+        .and_then(|list| list.split(',').nth(ordinal as usize)?.trim().parse().ok())
+        .unwrap_or(ordinal);
+    let held = queue_units(
+        units,
+        agent,
+        masks.hsa_cu_mask.as_deref(),
+        masks.global_cu_mask.as_deref(),
+    );
+    if held != units {
+        eprintln!(
+            "engine-cuda: {held} of the device's {units} compute units are this process's \
+             queues' (a CU mask); every grid, arena and sampler is laid over those"
+        );
+    }
+    held
+}
+
 #[must_use]
 pub fn device_units() -> u32 {
     static UNITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1907,30 +2005,12 @@ pub fn device_units() -> u32 {
                 }
             }
             let units = u32::try_from(count).unwrap_or(1).max(1);
+            // On ROCm the count is the one the device context stated from the
+            // process's CU masks (`masked_units`), as every launcher reads it.
             #[cfg(feature = "rocm")]
             {
-                let var = |name: &str| std::env::var(name).ok();
-                let ordinal = u32::try_from(device).unwrap_or(0);
-                // The HSA agent HIP's ordinal names: the ordinal's entry of a
-                // visible-devices list, where one is set.
-                let agent = var("HIP_VISIBLE_DEVICES")
-                    .or_else(|| var("CUDA_VISIBLE_DEVICES"))
-                    .and_then(|list| list.split(',').nth(ordinal as usize)?.trim().parse().ok())
-                    .unwrap_or(ordinal);
-                let held = queue_units(
-                    units,
-                    agent,
-                    var("HSA_CU_MASK").as_deref(),
-                    var("ROC_GLOBAL_CU_MASK").as_deref(),
-                );
-                if held != units {
-                    eprintln!(
-                        "engine-cuda: {held} of the device's {units} compute units are this \
-                         process's queues' (a CU mask); its samplers' blocks are laid over \
-                         those"
-                    );
-                }
-                held
+                let _ = units;
+                kernels_cuda::hip::multiprocessors(device.unsigned_abs()).unwrap_or(1).max(1)
             }
             #[cfg(not(feature = "rocm"))]
             units

@@ -1,8 +1,14 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
 mod a_bank_past_2_gib_reads_its_last_rows;
+mod a_beam_step_follows_the_spec;
 mod a_bound_guest_leaves_the_span_as_it_was;
 mod a_cold_registration_compiles_while_lanes_fire;
+mod a_group_fold_is_the_sequential_fold;
+mod a_carry_past_the_table_is_served;
+mod a_lagged_decode_answers_the_unlagged;
+mod the_resident_probe_counts_the_cores;
+mod the_carried_scan_times_as_the_step;
 mod a_mixed_fires_last_rows_are_each_lanes_own;
 mod a_prefill_reads_no_kv_cell_past_its_keys;
 mod a_prewarmed_program_registers_off_thread_without_compiling;
@@ -16,6 +22,7 @@ mod a_dense_model_reads_no_routed_or_quantized_decision;
 mod a_device_fold_lane_states_its_own_fold;
 mod a_kv_only_lane_reports_its_device_fold;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
+mod a_load_measuring_nothing_admits_its_own_pool;
 mod a_load_walks_its_score_capturing_forms;
 mod a_recurrent_load_walks_its_pipelines;
 mod a_refused_lane_is_refused_alone;
@@ -42,6 +49,7 @@ mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
 mod a_wide_row_reads_no_kv_cell_past_its_keys;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
+mod an_airborne_pass_samples_its_own_row;
 mod an_envelope_keeps_two_passes_in_flight;
 mod an_idle_lane_reports_its_last_landing;
 mod an_instance_outlives_its_failed_frame;
@@ -87,6 +95,7 @@ mod the_staged_rows_match_affine_dots;
 mod the_tower_reads_pixels_as_the_host_cut_them;
 mod the_voxel_axis_answers_its_host_reference;
 mod the_weight_cache_serves_the_dense_logits;
+mod two_models_exported_boot_a_clean_home_measuring_nothing;
 
 /// The `device_kv_budget` a test states for its shell: none, so the chunk
 /// pool spans the room. A sparse pool maps only the segments a fire touches
@@ -111,6 +120,22 @@ pub(crate) fn guest_places(
     program: engine::ProgramId,
     extents: &eta_exec::Extents,
     nth: u32,
+) -> (engine::ScratchPlace, engine::ScratchPlace) {
+    guest_places_of_pair(shell, program, extents, nth, 0)
+}
+
+/// [`guest_places`] for an instance of the `pair`-th pair a test binds: a
+/// pair is a (program, extents), so instances of one program at other
+/// extents are another pair and its state other bytes (the engine refuses
+/// two pairs claiming one run). Pair 0 lies where [`guest_places`] lays it;
+/// each later one past the room 16 instances' own state takes.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn guest_places_of_pair(
+    shell: &mut engine_metal::Shell,
+    program: engine::ProgramId,
+    extents: &eta_exec::Extents,
+    nth: u32,
+    pair: u32,
 ) -> (engine::ScratchPlace, engine::ScratchPlace) {
     let state = shell.guest_state(program, extents).expect("the program's guest state");
     let layout = shell.pool_layout();
@@ -140,10 +165,18 @@ pub(crate) fn guest_places(
             pieces: (0..chunks_of(bytes) / state.run).map(|k| chunk + k * state.run).collect(),
         }
     };
-    let pair_at = layout.free_chunk() + 8;
-    let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
+    let first_pair = layout.free_chunk() + 8;
+    let own_at = first_pair + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
+    let pair_at = if pair == 0 {
+        first_pair
+    } else {
+        first_pair
+            + chunks_of(state.per_pair)
+            + 16 * chunks_of(state.instance_bytes())
+            + (pair - 1) * chunks_of(state.per_pair)
+    };
     let places = (place(state.instance_bytes(), own_at), place(state.per_pair, pair_at));
-    let end = own_at + chunks_of(state.instance_bytes());
+    let end = (own_at + chunks_of(state.instance_bytes())).max(pair_at + chunks_of(state.per_pair));
     shell
         .commit_segments(end.div_ceil(layout.segment_chunks.max(1)))
         .expect("the guest state's segments commit");

@@ -44,6 +44,14 @@ pub struct FireLimits {
     /// 0: as many as `max_tokens`.
     #[serde(default)]
     pub max_readouts: u32,
+    /// The most buffered recurrent rows one fire's lanes replay, summed over
+    /// every lane, a decode lane's (`lane_carried`'s none) included: what
+    /// the engine's staged replay table holds a fire (0: no bound past each
+    /// lane's rung, [`crate::fire::rung_holds`]). The runtime steps no more
+    /// replayed rows than this together, a fire that would carry more
+    /// going in the steps after.
+    #[serde(default)]
+    pub replayed_rows: u32,
 }
 
 /// What a load states beside its chunk pool ([`ChunkFacts`], which holds
@@ -53,7 +61,9 @@ pub struct PoolFacts {
     pub adapter_banks: u32,
     /// The window the model's sliding rows are read through, a fact of the
     /// model: an engine that pages its sliding rows in full states no window
-    /// list for it. Zero when the model declares no windowed row.
+    /// list for it. Zero when the model declares no windowed row. Removed
+    /// by the windowed-state change; do not use in new code (each windowed
+    /// layer's window is [`crate::chunk::WindowedLayer::window`]).
     #[serde(default)]
     pub window_tokens: u32,
     /// The engine would rather a lane already decoding claim its next pages
@@ -89,6 +99,16 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub rs_verbs: bool,
+
+    /// The engine serves windowed (sliding-window attention) layers as
+    /// state + buffer, as a recurrent layer is (CONTRACT-BC 19, 21): each
+    /// windowed layer's ring of its last W folded rows in the lane's record
+    /// ([`ChunkFacts::windowed`]), rows from the lane's folded index on in
+    /// the window buffer ([`crate::SlotRole::WindowBuffer`]), and
+    /// [`crate::Lane::window`] read on every lane. False: no lane states a
+    /// window fold to it.
+    #[serde(default)]
+    pub windowed_state: bool,
 
     /// The rows inside one lane whose recurrent state a fire lands in slots
     /// of their own as it runs (`Lane::rs_snapshots`); 0 where it lands only
@@ -142,6 +162,75 @@ pub struct Capabilities {
     /// serves without building a program: the runtime's cutter composes no
     /// other ([`MixedLanes::fits`]).
     pub mixed_lanes: MixedLanes,
+
+    /// The host ops this load serves ([`HostOps`]): a program that needs
+    /// one it does not is refused at its bind, before any step. Required:
+    /// an engine states what it serves.
+    pub host_ops: HostOps,
+
+    /// The step compositions the load's step builder forms, as the engine
+    /// computed them before its arm walk ([`crate::StepShapes::of`] of the
+    /// request's [`crate::LoadRequest::steps`] over its own
+    /// [`crate::StepFacts`]), and those it runs eager. The runtime computes
+    /// the set again from the stated facts and refuses a load stating
+    /// another, by name (CONTRACT-BC 24).
+    pub steps: crate::StatedSteps,
+}
+
+/// An op the runtime asks an engine for on the host, outside a fire, that
+/// a program's finish relies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostOp {
+    /// A beam group's beam's page list (`crate::Engine::beam_list`), read
+    /// at a beam search's finish.
+    BeamList,
+}
+
+impl HostOp {
+    /// The op's name, as the engine's verb.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            HostOp::BeamList => "beam_list",
+        }
+    }
+}
+
+/// The host ops an engine serves ([`Capabilities::host_ops`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostOps {
+    /// [`HostOp::BeamList`].
+    pub beam_list: bool,
+}
+
+impl HostOps {
+    /// None served.
+    pub const NONE: HostOps = HostOps { beam_list: false };
+
+    #[must_use]
+    pub fn serves(self, op: HostOp) -> bool {
+        match op {
+            HostOp::BeamList => self.beam_list,
+        }
+    }
+
+    /// The host ops a program of `package` needs: a beam group (a
+    /// `Port::Parents` read from a channel) reads its chosen beam's page
+    /// list at its finish.
+    #[must_use]
+    pub fn needed_by(package: &eta_compiler::codegen::launch::LaunchPackage) -> Vec<HostOp> {
+        let beam = package
+            .ports
+            .iter()
+            .any(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const);
+        if beam { vec![HostOp::BeamList] } else { Vec::new() }
+    }
+
+    /// The first op of `needed` this does not serve.
+    #[must_use]
+    pub fn unserved(self, needed: &[HostOp]) -> Option<HostOp> {
+        needed.iter().copied().find(|&op| !self.serves(op))
+    }
 }
 
 /// Which mixed fires a load lays: every one within its fire limits
@@ -243,6 +332,7 @@ mod mixed_lanes {
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: 0,
+                replayed_rows: 0,
             },
         )
     }

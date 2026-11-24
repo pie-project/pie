@@ -9,6 +9,32 @@ pub struct PortError(pub String);
 
 type Result<T> = std::result::Result<T, PortError>;
 
+/// The id a program puts on its `embed_tokens` port for a row it skips: −1
+/// as an `i32` cell, `u32::MAX` as the engine reads it. A beam that has
+/// finished, or a lane the program idles this step, keeps its place in the
+/// fire's geometry without embedding anything. Every engine that resolves
+/// `embed_tokens` on the device carries a skip row the same way:
+///
+/// 1. **No embed.** No token is embedded for it: the engine reads no row of
+///    the token table for it (a skip id is never clamped or wrapped into
+///    the vocabulary, so it never reads row 0 or any other).
+/// 2. **No kv write.** Its key/value write is suppressed: the slot it
+///    names (or would append to) is left exactly as it was.
+/// 3. **Attended by no row.** No row of the fire attends to it, its own
+///    row included: its slot is masked out of every row's attention as if
+///    the mask cell were false.
+/// 4. **No readout.** It produces no readout row. A readout that names a
+///    skip row is refused by name for that lane, never answered with
+///    garbage logits.
+/// 5. **Its position counts.** It still occupies its row in the lane's run:
+///    later rows of the lane keep their positions, slots and causal bounds
+///    as if it were a real row.
+///
+/// Any other id at or past the vocabulary is out of range, and the lane is
+/// refused by name. An engine that cannot yet carry skip rows refuses the
+/// lane by name, naming the skip.
+pub const SKIP_TOKEN: u32 = u32::MAX;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Envelope {
     pub qo_indptr: Option<Vec<u32>>,
@@ -340,7 +366,12 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
         // placed, and so may the mask that says what the rows see: one the
         // device computes (beam ancestry) the runtime cannot resolve, for a
         // fire staged ahead or not.
-        GeometryClass::DecodeEnvelope => matches!(port, Port::Positions | Port::AttnMask),
+        // So may each beam's parent, over which the engine keeps the beams'
+        // own page lists (`new-memory/designs/BEAM-PAGE-LISTS.md`).
+        GeometryClass::DecodeEnvelope => matches!(
+            port,
+            Port::Positions | Port::AttnMask | Port::Parents
+        ),
         GeometryClass::DeviceGeometry => matches!(port, Port::EmbedIndptr | Port::AttnMask),
         GeometryClass::Host => false,
     }

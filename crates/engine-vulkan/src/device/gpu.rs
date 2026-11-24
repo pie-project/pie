@@ -99,6 +99,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::host_room(self)
     }
 
+    fn memory(&self) -> engine::DeviceMemory {
+        Context::whose_memory(self)
+    }
+
     fn left(&self) -> u64 {
         Context::left(self)
     }

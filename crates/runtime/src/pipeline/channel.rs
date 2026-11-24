@@ -35,6 +35,8 @@ pub struct ChannelCell {
     reader: Option<ReaderMirror>,
     poisoned: Option<String>,
     front_override: Option<Vec<u8>>,
+    /// The cells the host has taken.
+    taken: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +115,7 @@ impl ChannelCell {
             reader: None,
             poisoned: None,
             front_override: None,
+            taken: 0,
         }
     }
 
@@ -273,6 +276,24 @@ impl ChannelCell {
     pub fn release_device_moves(&mut self, consume: bool, publish: bool) {
         self.device_reserved_head -= u64::from(consume);
         self.device_reserved_tail -= u64::from(publish);
+    }
+
+    /// The cells the host has taken.
+    #[must_use]
+    pub fn taken(&self) -> u64 {
+        self.taken
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_taken(&mut self, taken: u64) {
+        self.taken = taken;
+    }
+
+    /// The cell the newest fire reserved to publish, counted from the
+    /// ring's first (`None`: none has).
+    #[must_use]
+    pub fn last_published(&self) -> Option<u64> {
+        self.device_reserved_tail.checked_sub(1)
     }
 
     pub fn reader_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
@@ -609,6 +630,7 @@ impl ChannelCell {
             return Err(ChannelError::WrongRole { role, op: "take" });
         }
         let value = self.produced.pop_front().ok_or(ChannelError::Empty)?;
+        self.taken += 1;
         self.front_override = None;
         if let Some(reader) = &self.reader {
             let head = load_word(reader.word_base, reader.head_word_index);
@@ -1112,6 +1134,7 @@ mod tests {
             5i32.to_le_bytes().to_vec(),
             "take consumes"
         );
+        assert_eq!(cells[1].lock().unwrap().taken(), 1, "and counts the take");
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap_err(),
             ChannelError::Empty

@@ -150,6 +150,7 @@ fn build_model(
             runtime::bootstrap::EngineConfig {
                 chunks: g.caps.chunks.clone(),
                 window_tokens: g.caps.pools.window_tokens,
+                windowed_state: g.caps.windowed_state,
                 disk_kept,
                 seated_first: g.caps.pools.seated_first,
                 seat_to_end: g.caps.pools.seat_to_end,
@@ -164,6 +165,7 @@ fn build_model(
                 guest_cost: g.caps.guest_cost,
                 frames_in_flight: g.caps.frames_in_flight,
                 device_geometry_port_mask: g.caps.ports,
+                host_ops: g.caps.host_ops,
                 facts: g.caps.facts.clone(),
                 inputs: g.caps.inputs.clone(),
                 classes: g.caps.classes.clone(),
@@ -175,8 +177,11 @@ fn build_model(
                     prefill_rows: g.caps.limits.prefill_rows as usize,
                     prefill_lanes: g.caps.limits.prefill_lanes as usize,
                     max_readouts: g.caps.limits.max_readouts as usize,
+                    max_replayed_rows: g.caps.limits.replayed_rows as usize,
+                    shapes: None,
                     readout_store: 0,
                 },
+                steps: g.caps.steps.clone(),
                 engine_backend: g.backend,
             }
         })

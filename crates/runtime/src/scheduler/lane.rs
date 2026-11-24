@@ -261,32 +261,144 @@ fn past_rung(held: u32, frame: &crate::engine::FrameFire) -> Option<String> {
 
 fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option<String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()) {
+    // Always in a debug build, and with PIE_CHECK_SLOT_REFS in any: a stale
+    // request (built before its stores let its slots go, fired after) is
+    // named at its source, whatever the path. Ownership exact: a slot the
+    // pool holds for another owner (its chunk reused by another shape, or
+    // the page another set's) is as stale as a free one.
+    if !*ON.get_or_init(|| {
+        cfg!(debug_assertions) || std::env::var_os("PIE_CHECK_SLOT_REFS").is_some()
+    }) {
         return None;
     }
-    let shared = crate::store::registry::try_get(0, engine_idx)?.shared?;
-    let pool = shared.lock().unwrap();
-    frame.steps.iter().find_map(|step| {
-        step.submission
-            .lanes
+    let stores = crate::store::registry::try_get(0, engine_idx)?;
+    let shared = stores.shared.clone()?;
+    // Read off the pool's lock: the kv store and the roles take it
+    // themselves. Each lane's set's pages as its table stands now.
+    let sets: std::collections::HashMap<
+        crate::store::kv::page_table::WorkingSetId,
+        Option<std::collections::HashSet<u32>>,
+    > = crate::store::registry::with_kv_lock(&stores.kv, "slot-ref-check", |kv| {
+        frame
+            .steps
             .iter()
-            .enumerate()
-            .find_map(|(at, lane)| {
-                let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
-                    .record
-                    .pieces()
+            .flat_map(|step| step.lane_sets.iter().flatten().copied())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|ws| (ws, kv.device_refs_of(ws)))
+            .collect()
+    });
+    let instance_slots = |id: ::engine::InstanceId| {
+        stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().fire_slots_of(id))
+            .unwrap_or_default()
+    };
+    let named: Vec<Vec<Vec<(String, crate::store::slots::ShapeId, crate::store::slots::Slot)>>> = frame
+        .steps
+        .iter()
+        .map(|step| {
+            let mut seen = std::collections::BTreeSet::new();
+            step.instances
+                .iter()
+                .map(|&id| if seen.insert(id) { instance_slots(id) } else { Vec::new() })
+                .collect()
+        })
+        .collect();
+    let pool = shared.lock().unwrap();
+    let list = pool.list().map(|list| list.id);
+    frame.steps.iter().enumerate().find_map(|(at, step)| {
+        // The fire a lane is of: its logical id and how long ago its
+        // request was handed to the scheduler.
+        let fire_of = |lane: usize| {
+            let member = step
+                .member_lanes
+                .windows(2)
+                .position(|span| (span[0] as usize..span[1] as usize).contains(&lane));
+            match member.and_then(|member| step.fire_stamps.get(member)) {
+                Some(&(id, queued)) => format!("fire {id}, handed to the scheduler {:?} ago", queued.elapsed()),
+                None => "fire unknown".to_string(),
+            }
+        };
+        let lane_fault = step.submission.lanes.iter().enumerate().find_map(|(lane_at, lane)| {
+            let instance = step.instances.get(lane_at);
+            let set = step.lane_sets.get(lane_at).copied().flatten();
+            let fixed: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = lane
+                .record
+                .pieces()
+                .iter()
+                .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
+                .collect();
+            let reserve: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = list
+                .filter(|_| !lane.reserve.is_empty())
+                .map(|shape| (shape, lane.reserve.clone()))
+                .into_iter()
+                .collect();
+            let held = [
+                ("its tables", pool.unassigned(&lane.tables)),
+                ("its record", pool.unassigned(&fixed)),
+                ("its reserve (its set's page table at submit)", pool.unassigned(&reserve)),
+            ]
+            .into_iter()
+            .find_map(|(what, found)| found.map(|found| (what, found, "which the pool has not handed out to its shape")));
+            if !lane.reserve.is_empty() {
+                tracing::debug!(
+                    lane = lane_at,
+                    ?instance,
+                    ?set,
+                    reserve = lane.reserve.len(),
+                    first = ?lane.reserve.iter().take(8).collect::<Vec<_>>(),
+                    "a beam lane at the engine's door: its stamping set and reserve"
+                );
+            }
+            // A lane whose set's table does not resolve now (its pages below,
+            // or the set gone) names pages its set no longer holds there: it
+            // does not fire (skipped, the check was passed by a fire whose
+            // set had been suspended since its stamp: the M1's run 12).
+            if let Some(ws) = set
+                && sets.get(&ws).is_some_and(Option::is_none)
+            {
+                return Some(format!(
+                    "step {at}'s lane {lane_at} (instance {instance:?}, set {ws:?}, {}) names its \
+                     set's pages, and its set's table does not resolve now (its pages below or \
+                     the set released): a request built before its set moved",
+                    fire_of(lane_at)
+                ));
+            }
+            // Its kv refs (its list's translation or pages, its reserve) are
+            // pages its own set holds now, not merely someone's.
+            let owned = || {
+                let pages = sets.get(&set?)?.as_ref()?;
+                let kv_refs = lane
+                    .tables
                     .iter()
-                    .map(|(shape, pairs)| (*shape, pairs.iter().flatten().copied().collect()))
-                    .collect();
-                pool.unassigned(&lane.tables)
-                    .or_else(|| pool.unassigned(&fixed))
-                    .map(|(shape, slot_ref)| {
-                        format!(
-                            "a fire's lane {at} names slot ref {slot_ref} of shape {shape:?}, \
-                         which the pool has not handed out"
-                        )
-                    })
+                    .filter(|(shape, _)| Some(*shape) == list)
+                    .flat_map(|(_, refs)| refs.iter())
+                    .chain(lane.reserve.iter());
+                kv_refs
+                    .copied()
+                    .find(|slot_ref| !pages.contains(slot_ref))
+                    .map(|slot_ref| ("its kv list or reserve", (list.unwrap_or_default(), slot_ref), "which its set's table no longer holds"))
+            };
+            let (what, (shape, slot_ref), why) = held.or_else(owned)?;
+            Some(format!(
+                "step {at}'s lane {lane_at} (instance {instance:?}, set {set:?}, {}) names slot ref \
+                 {slot_ref} of shape {shape:?} in {what}, {why}: a request built before its \
+                 stores let the slot go",
+                fire_of(lane_at)
+            ))
+        });
+        lane_fault.or_else(|| {
+            named.get(at)?.iter().flatten().find_map(|(what, shape, slot)| {
+                (!pool.pool().is_held(*shape, *slot)).then(|| {
+                    format!(
+                        "step {at} binds {what} on slot {slot:?}, which the pool does not hold for \
+                         its shape: an instance's part named past its release"
+                    )
+                })
             })
+        })
     })
 }
 
@@ -839,6 +951,9 @@ impl Lane {
                         if !writes.is_empty() {
                             crate::pipeline::fire::record_kv_writes(writes);
                         }
+                        crate::pipeline::fire::record_beam_common(std::mem::take(
+                            &mut outcome.beam_common,
+                        ));
                         let _ = landed_tx.send(LaneRequest::Landed {
                             frame: at.frame,
                             step: at.step,
@@ -854,6 +969,7 @@ impl Lane {
                 let faulted = Arc::clone(&inline_faults);
                 engine.on_complete(std::sync::Arc::new(
                     move |at: engine::StepDone, outcome: engine::StepOutcome| {
+                        crate::pipeline::fire::record_beam_common(outcome.beam_common);
                         if !outcome.wrote.is_empty() {
                             crate::pipeline::fire::record_kv_writes(outcome.wrote);
                         }
@@ -922,7 +1038,13 @@ impl Lane {
                             crate::store::shared::engine_rows(engine_idx),
                             &frame,
                         )
-                        .or_else(|| unassigned_ref(engine_idx, &frame));
+                        .or_else(|| {
+                            let stale = unassigned_ref(engine_idx, &frame);
+                            if let Some(why) = &stale {
+                                tracing::error!(engine = engine_idx, %why, "a fire names a slot the pool has not handed out: refused before the engine reads it");
+                            }
+                            stale
+                        });
                         let result = match engine.as_mut() {
                             // A fire wider than the rung the engine holds,
                             // or naming a slot nobody was handed, is refused
@@ -1638,6 +1760,15 @@ impl Lane {
                         PoolOp::ReleaseSpan(segments) => engine.release_span(segments),
                         PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
                         PoolOp::SettleCopies => engine.settle_copies(),
+                        PoolOp::CheckTable(runtime) => engine.chunk_table().and_then(|table| {
+                            match crate::store::shared::programs::table_apart(
+                                table.as_slice(),
+                                &runtime,
+                            ) {
+                                Some(apart) => Err(::engine::Error::Program(apart)),
+                                None => Ok(()),
+                            }
+                        }),
                         PoolOp::Rebind(rebind) => crate::store::roles::rebind(
                             roles_of(engine_idx).as_ref(),
                             &mut **engine,
@@ -1686,6 +1817,10 @@ impl Lane {
                     HostKvOp::WeightUses => engine
                         .weight_uses()
                         .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
+                        .map_err(Into::into),
+                    HostKvOp::BeamList(instance, beam) => engine
+                        .beam_list(instance, beam)
+                        .map(|list| list.iter().flat_map(|page| page.to_le_bytes()).collect())
                         .map_err(Into::into),
                     HostKvOp::Layout => Ok(engine
                         .host_kv_layout()
@@ -1953,6 +2088,10 @@ mod landing_tests {
 
         fn kind(&self) -> &'static str {
             "fake-late-copies"
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(self.unsupported("chunk_table"))
         }
 
         fn prepare_program(

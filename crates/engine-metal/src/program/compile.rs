@@ -116,12 +116,26 @@ impl Target {
     }
 }
 
+/// The step pipelines every region module has built ([`Module::build`]).
+static STEP_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The step pipelines region modules have built so far, process-wide.
+#[must_use]
+pub fn step_pipelines_built() -> u64 {
+    STEP_PIPELINES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Module {
     #[cfg(target_vendor = "apple")]
     #[allow(dead_code)]
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     #[cfg(target_vendor = "apple")]
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// A streamed region's pipeline a step (`m4_fixed_step`): each keeps
+    /// its step's case alone, and with it only that case's registers and
+    /// threadgroup memory. Empty where the region is one dispatch.
+    #[cfg(target_vendor = "apple")]
+    steps: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     entry: String,
 }
 
@@ -149,6 +163,12 @@ impl Module {
         &self.pipeline
     }
 
+    /// Step `step`'s own pipeline, where it was built one.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn step_pipelines(&self) -> &[Retained<ProtocolObject<dyn MTLComputePipelineState>>] {
+        &self.steps
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(crate) fn max_threads(&self) -> usize {
         self.pipeline.maxTotalThreadsPerThreadgroup()
@@ -164,6 +184,7 @@ impl Module {
         device: &ProtocolObject<dyn MTLDevice>,
         source: &str,
         entry: &str,
+        steps: usize,
     ) -> std::result::Result<Module, Failure> {
         let options = crate::device::ctx::compile_options();
         set_safe_math(&options);
@@ -177,21 +198,43 @@ impl Module {
             .newLibraryWithSource_options_error(&text, Some(&options))
             .map_err(|error| classify(entry, &error))?;
         let name = crate::device::ctx::nsstring(entry);
-        let function =
-            library
-                .newFunctionWithName(&name)
-                .ok_or_else(|| Failure::Deterministic {
+        // A streamed kernel declares its step as a function constant: the
+        // pipeline for every step leaves it undefined, a step's states it.
+        let pipeline_for = |step: Option<u32>| {
+            let constants = objc2_metal::MTLFunctionConstantValues::new();
+            if let Some(step) = step {
+                // SAFETY: a uint constant at this index, read from a live u32.
+                unsafe {
+                    constants.setConstantValue_type_atIndex(
+                        std::ptr::NonNull::from(&step).cast(),
+                        objc2_metal::MTLDataType::UInt,
+                        eta_compiler::codegen::metal::M4_STEP_CONSTANT,
+                    );
+                }
+            }
+            let function = library
+                .newFunctionWithName_constantValues_error(&name, &constants)
+                .map_err(|_| Failure::Deterministic {
                     reason: format!(
                         "the library compiled and holds no `{entry}`; the emitter and the \
-                     engine disagree about this region's entry name"
+                         engine disagree about this region's entry name"
                     ),
                 })?;
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|error| classify(entry, &error))?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|error| classify(entry, &error))
+        };
+        let pipeline = pipeline_for(None)?;
+        // Every step's pipeline is built here, with the region's library, as
+        // the registration compiles: none is built where a step fires.
+        let steps = (0..steps)
+            .map(|step| pipeline_for(Some(u32::try_from(step).unwrap_or(u32::MAX))))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        STEP_PIPELINES.fetch_add(steps.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(Module {
             library,
             pipeline,
+            steps,
             entry: entry.to_string(),
         })
     }
@@ -316,6 +359,8 @@ pub struct Built {
     stages: std::result::Result<Vec<Stage>, Failure>,
     compilations: u64,
     memory_hits: u64,
+    /// The wall time its region compiles took, in nanoseconds.
+    compile_nanos: u64,
     /// The region modules the job built, by text, for the cache.
     made: std::collections::HashMap<u64, Arc<Module>>,
 }
@@ -342,6 +387,7 @@ impl Job {
             made: std::collections::HashMap::new(),
             compilations: 0,
             memory_hits: 0,
+            compile_nanos: 0,
         };
         let stages = (|| {
             let index = Emitted::index(&self.kernels).map_err(|duplicate| Failure::Deterministic {
@@ -367,6 +413,7 @@ impl Job {
         let Builder {
             compilations,
             memory_hits,
+            compile_nanos,
             made,
             ..
         } = builder;
@@ -375,6 +422,7 @@ impl Job {
             stages,
             compilations,
             memory_hits,
+            compile_nanos,
             made,
         }
     }
@@ -388,6 +436,7 @@ struct Builder<'a> {
     made: std::collections::HashMap<u64, Arc<Module>>,
     compilations: u64,
     memory_hits: u64,
+    compile_nanos: u64,
 }
 
 enum GroupedAnswer {
@@ -428,6 +477,9 @@ pub struct Cache {
     /// prewarm of its standard samplers counts on (regions keyed by text).
     modules: std::collections::HashMap<u64, Arc<Module>>,
     stats: CacheStats,
+    /// The wall time every region compile since load took, in nanoseconds:
+    /// a compile the OS's shader cache serves reads apart from a cold one.
+    compile_nanos: u64,
 }
 
 impl Default for Cache {
@@ -445,12 +497,19 @@ impl Cache {
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
             modules: std::collections::HashMap::new(),
             stats: CacheStats::default(),
+            compile_nanos: 0,
         }
     }
 
     #[must_use]
     pub const fn stats(&self) -> CacheStats {
         self.stats
+    }
+
+    /// The wall time every region compile since load took, in nanoseconds.
+    #[must_use]
+    pub const fn compile_nanos(&self) -> u64 {
+        self.compile_nanos
     }
 
     pub fn compile(
@@ -537,6 +596,7 @@ impl Cache {
     pub fn finish(&mut self, built: Built) -> std::result::Result<Compiled, Failure> {
         self.stats.compilations += built.compilations;
         self.stats.memory_hits += built.memory_hits;
+        self.compile_nanos = self.compile_nanos.saturating_add(built.compile_nanos);
         self.modules.extend(built.made);
         let job = built.job;
         match built.stages {
@@ -664,7 +724,7 @@ impl Builder<'_> {
                 }
             };
 
-            let module = self.region_module(entry, source)?;
+            let module = self.region_module(entry, source, 0)?;
             regions.push(Region {
                 region_index,
                 steps: Arc::new(Vec::new()),
@@ -766,7 +826,7 @@ impl Builder<'_> {
                 )));
             }
         };
-        let module = self.region_module(entry, source)?;
+        let module = self.region_module(entry, source, 0)?;
         #[cfg(target_vendor = "apple")]
         if library && module.max_threads() < super::launch::LIBRARY_SAMPLER_THREADS {
             return Ok(GroupedAnswer::Declined(format!(
@@ -829,7 +889,7 @@ impl Builder<'_> {
                 input: value,
             });
         }
-        let module = self.region_module(entry, source)?;
+        let module = self.region_module(entry, source, steps.len())?;
         #[cfg(target_vendor = "apple")]
         if module.execution_width() != 32 {
             if region_trace() {
@@ -854,6 +914,7 @@ impl Builder<'_> {
         &mut self,
         entry: &str,
         source: &str,
+        steps: usize,
     ) -> std::result::Result<Arc<Module>, Failure> {
         let expanded = expand(source);
         // Keyed by its text under one symbol (each program names its
@@ -867,14 +928,16 @@ impl Builder<'_> {
         }
         #[cfg(target_vendor = "apple")]
         {
-            let module = Arc::new(Module::build(&self.device.device, &expanded, entry)?);
+            let began = std::time::Instant::now();
+            let module = Arc::new(Module::build(&self.device.device, &expanded, entry, steps)?);
+            self.compile_nanos += u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.compilations += 1;
             self.made.insert(key, module.clone());
             Ok(module)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (entry, expanded);
+            let _ = (entry, expanded, steps);
             Err(Failure::Retryable {
                 reason: "this build has no Metal in it: the target is not an Apple one".into(),
             })
@@ -1006,8 +1069,8 @@ mod tests {
                     "top-p",
                     9_312_512u64,
                     6_930_688u64,
-                    5_107_968u64,
-                    (2_584_064u64, 2_583_552u64),
+                    5_107_456u64,
+                    (2_583_552u64, 2_583_552u64),
                 ),
                 (
                     "top-k + top-p",

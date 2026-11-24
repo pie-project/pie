@@ -11,6 +11,28 @@ const WINDOW_GROWTH: u32 = 2;
 /// The device's chunks by slot shape, each free and in all. In the
 /// degenerate mode a chunk is one slot of a pinned shape: a kv page (the list
 /// shape), a state slot, a buffer or window-ring page.
+/// What a waiter is short of that dropping idle cache may give:
+/// [`PoolPort::reclaim_idle`] frees that, and no more than the last group it
+/// reaches holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdleShort {
+    /// Device pages of kv (on a shared pool, the chunks short state takes
+    /// counted as pages too).
+    pub kv_pages: u32,
+    /// Whether state is short too: one owner's checkpoints at one key go.
+    pub rs: bool,
+}
+
+/// What [`PoolPort::reclaim_idle`] did: pages and slots it freed, and the
+/// device pages reclaims freed that still wait on a fire's retirement
+/// (returning: they count toward the shortfall, and the waiter waits for
+/// the retirement, which wakes the planner).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdleReclaim {
+    pub freed: u32,
+    pub returning: u32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkStats {
     /// The kv pages', `(free, total)`.
@@ -157,7 +179,7 @@ impl RestorePlacement {
     pub fn of(
         own: &[crate::store::slots::OwnPiece],
         placement: &crate::store::slots::Placement,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
         alone: impl Fn(&[crate::store::slots::OwnPiece]) -> u32,
     ) -> Self {
         use crate::store::slots::OwnPiece;
@@ -174,11 +196,16 @@ impl RestorePlacement {
             .copied()
             .collect();
         short.add(1, alone(&singles));
-        let bind_free_runs = bind.map(|(run, _)| placement.free_runs(run));
-        if let Some((run, pieces)) = bind
-            && (!rest.is_empty() || bind_free_runs.is_some_and(|free| free < pieces))
-        {
-            short.add(run, pieces);
+        // Its longest runs, and every chunk it asks among the free single
+        // chunks: the runs of each length stand where both do.
+        let bind_free_runs = bind.first().map(|&(run, _)| placement.free_runs(run));
+        let bind_chunks: u32 = bind.iter().map(|&(run, pieces)| run.saturating_mul(pieces)).sum();
+        let bind_short = bind.first().is_some_and(|&(run, pieces)| placement.free_runs(run) < pieces)
+            || (!bind.is_empty() && placement.free_runs(1) < bind_chunks);
+        if !bind.is_empty() && (!rest.is_empty() || bind_short) {
+            for &(run, pieces) in bind {
+                short.add(run, pieces);
+            }
         }
         Self {
             opened: placement.opened.iter().copied().collect(),
@@ -541,9 +568,11 @@ pub enum RiseRoom {
     /// Short of room: `pieces` free chunks are what it takes, those free
     /// now and those to empty, as a bind's runs of one chunk.
     Short { pieces: u32 },
-    /// The rung's span and the reserved chunks, `need` chunks, past the
-    /// pool's `total`: no move of state ever makes the room.
-    Past { need: u32, total: u32 },
+    /// The rung's span, the reserved chunks and the `own` chunks its
+    /// owner's state takes at that rung, `need` chunks, past the pool's
+    /// `total`: with every other process moved off it, no move of state
+    /// ever makes the room.
+    Past { need: u32, own: u32, total: u32 },
 }
 
 /// Every tier's room and what is held in it, in one unit, kv pages
@@ -593,14 +622,15 @@ pub trait PoolPort: Send + Sync + 'static {
         self.chunk_stats().rs
     }
     fn rs_host_stats(&self) -> (RsUnits, RsUnits);
-    /// Drops idle cache, but only what its retention key lets the runtime
-    /// drop unasked (`pressure::may_drop`); room past that is asked of the
-    /// policy with tier pressure.
-    fn reclaim_idle(&self) -> u32;
+    /// Drops idle cache for what a waiter is `short` of, and no more,
+    /// lowest retention key first, then least recently used: the planner
+    /// runs it once a demote had nothing to move.
+    fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
-    /// The host and disk slots only idle cache holds, `(host, disk)`: below
-    /// the device what the next demand may take by dropping them, so the
+    /// The host and disk slots only idle cache its retention keys let go
+    /// holds, `(host, disk)`: below the device what the next demand may take
+    /// by dropping them (cache keyed above the floor is no such room), so the
     /// pressure report counts them as room, as [`Self::reclaimable_idle`]
     /// is on the device. Every port states it; a pool with no tier below
     /// the device states `(0, 0)`.
@@ -693,20 +723,23 @@ pub trait PoolPort: Send + Sync + 'static {
         need: &RunNeed,
         state: RsUnits,
         kv_pages: u32,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
     ) -> RestorePlacement {
         let _ = (pid, kv_pages);
-        let stands = match bind {
-            Some((run, pieces)) => self.room_beside_own(pid, run, pieces),
-            None => self.guest_need_free(need, state),
+        let stands = if bind.is_empty() {
+            self.guest_need_free(need, state)
+        } else {
+            bind.iter().all(|&(run, pieces)| self.room_beside_own(pid, run, pieces))
         };
         RestorePlacement {
             opened: self.serve_opens(state),
             room: None,
             short: if stands {
                 RunNeed::default()
+            } else if bind.is_empty() {
+                need.clone()
             } else {
-                bind.map_or_else(|| need.clone(), |(run, pieces)| RunNeed::one(run, pieces))
+                RunNeed::of(bind.iter().copied())
             },
             bind_free_runs: None,
         }
@@ -718,7 +751,7 @@ pub trait PoolPort: Send + Sync + 'static {
         need: &RunNeed,
         state: RsUnits,
         kv_pages: u32,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
     ) -> bool {
         self.restore_placement(pid, need, state, kv_pages, bind).stands()
     }
@@ -728,7 +761,7 @@ pub trait PoolPort: Send + Sync + 'static {
     /// other take until its unpark and bind take them or
     /// [`Self::release_restore`]. Whether it was held (its placement
     /// stands). Where the pool keeps no roles, nothing is held.
-    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
         let _ = (pid, bind);
         false
     }
@@ -764,12 +797,13 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = state;
         Vec::new()
     }
-    /// Where a raise of the activation to `rung` (tokens) stands now: what
-    /// a rung raise short of room waits on
-    /// ([`super::ResidencyPlanner::fund_rise`]). `Fits` where the pool has
+    /// Where `pid`'s raise of the activation to `rung` (tokens) stands now:
+    /// what a rung raise short of room waits on
+    /// ([`super::ResidencyPlanner::fund_rise`]), past the pool where the
+    /// rung beside `pid`'s own state never fits. `Fits` where the pool has
     /// no rungs.
-    fn rise_room(&self, rung: u32) -> RiseRoom {
-        let _ = rung;
+    fn rise_room(&self, pid: ProcessId, rung: u32) -> RiseRoom {
+        let _ = (pid, rung);
         RiseRoom::Fits
     }
     /// Whether `pieces` free runs of `run` adjacent chunks stand beside
@@ -898,6 +932,12 @@ pub trait PoolPort: Send + Sync + 'static {
     fn state_chunks_most(&self) -> u32 {
         u32::MAX
     }
+    /// The longest run of adjacent chunks any arrangement of the pool lays
+    /// for state ([`crate::store::slots::SlotPool::longest_run_most`]);
+    /// `u32::MAX` where the pool keeps no chunks.
+    fn longest_run_most(&self) -> u32 {
+        u32::MAX
+    }
     /// Every tier's room and what is held in it, in one unit, kv pages,
     /// read now ([`CapacityCensus`]): what the capacity gate is read from
     /// ([`super::inner::CapacityGate`]). `None` where the pool keeps no
@@ -992,6 +1032,11 @@ pub trait PoolPort: Send + Sync + 'static {
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache a `retention/tiers` row keeps off the device, to move
+    /// down now.
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// Idle cache a `retention/tiers` row allows nowhere it is, dropped now.
+    fn drop_disallowed(&self) -> usize;
     /// [`Self::prepare_sweep`] of the tails past the heads `order` names
     /// alone: those heads stay however few pages move.
     fn prepare_tail_sweep(
@@ -1029,6 +1074,60 @@ pub struct RegistryPool {
 const RECLAIMABLE_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RegistryPool {
+    /// The fewest chunks `pid`'s own state takes on the device, wherever
+    /// it lies: per shape, the slots of its kv pages that leave with it,
+    /// its state's (records, lists, windows) and its guest state's, packed
+    /// whole. No arrangement of the pool lays them in fewer, so a need
+    /// counted beside them is one no move under it ever meets.
+    fn own_chunks(
+        &self,
+        stores: &crate::store::registry::Stores,
+        shared: &crate::store::shared::Shared,
+        pid: ProcessId,
+    ) -> u32 {
+        let sets = crate::inferlet::process::residency::kv_working_sets_for(&[pid], self.model, self.engine);
+        // Read before the pools' locks, as `chunk_occupants` does: the
+        // roles and the state store take the shared pool's lock themselves.
+        let guest = stores
+            .roles
+            .as_ref()
+            .map(|roles| roles.lock().unwrap().guest_chunk_slots(&[pid]))
+            .unwrap_or_default();
+        let state_sets = crate::inferlet::process::residency::rs_working_set_ids(pid, self.model, self.engine);
+        let state = if state_sets.is_empty() {
+            Vec::new()
+        } else {
+            stores.rs.lock().unwrap().private_slot_refs(&state_sets)
+        };
+        crate::store::registry::with_kv_lock(&stores.kv, "planner-own", |kv| {
+            let pool = shared.lock().unwrap();
+            let mut slots: std::collections::BTreeMap<crate::store::slots::ShapeId, u64> = Default::default();
+            if let Some(list) = pool.list() {
+                let groups: Vec<HashSet<_>> = sets.into_iter().flatten().collect();
+                let pages: usize = kv.movable_resident_pages_each(&groups).iter().map(Vec::len).sum();
+                *slots.entry(list.pool).or_default() += pages as u64;
+            }
+            for (engine, refs) in &state {
+                if let Some(shape) = pool.pool_shape(*engine) {
+                    *slots.entry(shape).or_default() += refs.len() as u64;
+                }
+            }
+            for (logical, _, count) in guest {
+                if let Some(shape) = pool.pool().chunk_shape(logical) {
+                    *slots.entry(shape).or_default() += u64::from(count);
+                }
+            }
+            let chunks: u64 = slots
+                .into_iter()
+                .map(|(shape, slots)| {
+                    let per = pool.pool().shape(shape).map_or(1, |shape| shape.slots_per_chunk.max(1));
+                    slots.div_ceil(u64::from(per))
+                })
+                .sum();
+            u32::try_from(chunks).unwrap_or(u32::MAX)
+        })
+    }
+
     pub fn new(model: usize, engine: usize, suspend_capable: bool) -> Self {
         Self {
             model,
@@ -1101,7 +1200,10 @@ impl PoolPort for RegistryPool {
 
     fn disk_stats(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-disk-stats", |kv| {
-            (kv.disk_swap_available() as u32, kv.disk_swap_capacity())
+            (
+                kv.disk_swap_available(crate::policy::retention::Installed) as u32,
+                kv.disk_swap_capacity(),
+            )
         })
     }
 
@@ -1163,7 +1265,7 @@ impl PoolPort for RegistryPool {
         need: &RunNeed,
         state: RsUnits,
         kv_pages: u32,
-        bind: Option<(u32, u32)>,
+        bind: &[(u32, u32)],
     ) -> RestorePlacement {
         use crate::store::slots::OwnPiece;
         let roles_and_shared = crate::store::registry::try_get(self.model, self.engine)
@@ -1193,7 +1295,7 @@ impl PoolPort for RegistryPool {
         RestorePlacement::of(&own, &placement, bind, pool_alone)
     }
 
-    fn reserve_restore(&self, pid: ProcessId, bind: Option<(u32, u32)>) -> bool {
+    fn reserve_restore(&self, pid: ProcessId, bind: &[(u32, u32)]) -> bool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.roles)
             .is_some_and(|roles| roles.lock().unwrap().reserve_restore(pid, bind))
@@ -1256,10 +1358,15 @@ impl PoolPort for RegistryPool {
             .unwrap_or_default()
     }
 
-    fn rise_room(&self, rung: u32) -> RiseRoom {
-        crate::store::registry::try_get(self.model, self.engine)
-            .and_then(|stores| stores.shared)
-            .map_or(RiseRoom::Fits, |shared| shared.lock().unwrap().rise_room(rung))
+    fn rise_room(&self, pid: ProcessId, rung: u32) -> RiseRoom {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return RiseRoom::Fits;
+        };
+        let Some(shared) = stores.shared.clone() else {
+            return RiseRoom::Fits;
+        };
+        let own = self.own_chunks(&stores, &shared, pid);
+        shared.lock().unwrap().rise_room(rung, own)
     }
 
     fn guest_free_runs(&self, run: u32) -> u32 {
@@ -1410,6 +1517,12 @@ impl PoolPort for RegistryPool {
         crate::store::registry::try_get(self.model, self.engine)
             .and_then(|stores| stores.shared)
             .map_or(u32::MAX, |shared| shared.lock().unwrap().state_chunks_most())
+    }
+
+    fn longest_run_most(&self) -> u32 {
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(u32::MAX, |shared| shared.lock().unwrap().pool().longest_run_most())
     }
 
     fn capacity_census(&self) -> Option<CapacityCensus> {
@@ -1688,7 +1801,7 @@ impl PoolPort for RegistryPool {
         let kv_sets: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = pids
             .iter()
             .flat_map(|&pid| {
-                crate::inferlet::process::residency::kv_working_set_ids(pid, self.model, self.engine)
+                crate::inferlet::process::residency::kv_working_set_ids_in_order(pid, self.model, self.engine)
             })
             .map(|ws| (ws, 0))
             .collect();
@@ -1702,7 +1815,13 @@ impl PoolPort for RegistryPool {
                 })
                 .collect();
             let sweep = self.with_kv_tagged("planner-park-down", |kv| {
-                kv.prepare_sweep(&keep, usize::MAX, &kv_sets, usize::MAX)
+                kv.prepare_sweep(
+                    &keep,
+                    usize::MAX,
+                    &kv_sets,
+                    usize::MAX,
+                    crate::policy::retention::Installed,
+                )
             });
             match sweep {
                 Ok(Some(txn)) => {
@@ -1766,7 +1885,7 @@ impl PoolPort for RegistryPool {
             let sets: Vec<crate::store::kv::page_table::WorkingSetId> = order
                 .iter()
                 .flat_map(|&pid| {
-                    crate::inferlet::process::residency::kv_working_set_ids(
+                    crate::inferlet::process::residency::kv_working_set_ids_in_order(
                         pid,
                         self.model,
                         self.engine,
@@ -1824,13 +1943,32 @@ impl PoolPort for RegistryPool {
         u32::try_from(slots).unwrap_or(u32::MAX)
     }
 
-    fn reclaim_idle(&self) -> u32 {
-        let pages = self.with_kv_tagged("planner-reclaim-idle", |kv| {
-            let epoch = kv.current_epoch();
-            kv.reclaim_droppable(epoch, crate::policy::retention::Installed)
-        });
-        let slots = self.with_rs(|rs| rs.reclaim_droppable(crate::policy::retention::Installed));
-        (pages + slots) as u32
+    fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim {
+        let (pages, returning) = if short.kv_pages > 0 {
+            self.with_kv_tagged("planner-reclaim-idle", |kv| {
+                let epoch = kv.current_epoch();
+                let pages = kv.reclaim_droppable(
+                    epoch,
+                    short.kv_pages as usize,
+                    crate::policy::retention::Installed,
+                );
+                (pages, kv.reclaim_returning())
+            })
+        } else {
+            (0, 0)
+        };
+        // On a shared pool state's chunks are kv's too: what kv's cache
+        // left short, its checkpoints may give.
+        let covered = pages.max(returning);
+        let slots = if short.rs || (self.shared.is_some() && covered < short.kv_pages as usize) {
+            self.with_rs(|rs| rs.reclaim_droppable(crate::policy::retention::Installed))
+        } else {
+            0
+        };
+        IdleReclaim {
+            freed: (pages + slots) as u32,
+            returning: returning as u32,
+        }
     }
 
     fn reclaimable_idle(&self) -> u32 {
@@ -1849,7 +1987,7 @@ impl PoolPort for RegistryPool {
 
     fn idle_below_device(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-idle-below-device", |kv| {
-            kv.below_device_cache_pages()
+            kv.droppable_below_device(crate::policy::retention::Installed)
         })
     }
 
@@ -1956,7 +2094,7 @@ impl PoolPort for RegistryPool {
     }
 
     fn reclaim_sharing(&self, working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
-        self.with_rs(|rs| rs.reclaim_sharing(working_sets, crate::policy::retention::Installed))
+        self.with_rs(|rs| rs.reclaim_sharing(working_sets))
     }
 
     fn prepare_sweep(
@@ -1970,7 +2108,7 @@ impl PoolPort for RegistryPool {
             return None;
         }
         self.with_kv_tagged("planner-sweep", |kv| {
-            kv.prepare_sweep(keep, room, order, wanted)
+            kv.prepare_sweep(keep, room, order, wanted, crate::policy::retention::Installed)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
         .ok()
@@ -1988,7 +2126,7 @@ impl PoolPort for RegistryPool {
             return None;
         }
         self.with_kv_tagged("planner-sweep", |kv| {
-            kv.prepare_tail_sweep(keep, room, order, wanted)
+            kv.prepare_tail_sweep(keep, room, order, wanted, crate::policy::retention::Installed)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: sweep prepare failed"))
         .ok()
@@ -2005,6 +2143,27 @@ impl PoolPort for RegistryPool {
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()
         .flatten()
+    }
+
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        if !self.suspend_capable {
+            return None;
+        }
+        self.with_kv_tagged("planner-demote", |kv| {
+            kv.prepare_demote_now(crate::policy::retention::Installed)
+        })
+        .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
+        .ok()
+        .flatten()
+    }
+
+    fn drop_disallowed(&self) -> usize {
+        self.with_kv_tagged("planner-tiers", |kv| {
+            Ok::<_, crate::store::kv::KvStoreError>(
+                kv.drop_disallowed(crate::policy::retention::Installed),
+            )
+        })
+        .unwrap_or(0)
     }
 
     fn prepare_spill(&self, room: usize) -> Option<crate::store::kv::KvSpillTxn> {
