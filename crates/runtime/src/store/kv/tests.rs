@@ -2648,6 +2648,7 @@ fn a_point_behind_serving_takes_idle_cache_for_its_slots_and_no_more() {
     let need = ::engine::BehindNeed {
         lanes: 2,
         tokens: 16,
+        long: false,
     };
     let taken = take_behind(&stores, need);
     assert_eq!(taken.seats.len(), 2, "the point's slots were taken");

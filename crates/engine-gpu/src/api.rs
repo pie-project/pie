@@ -1770,16 +1770,28 @@ where
         // where the runtime took the slots its next fire asks for; else,
         // and after, each rate and curve served by a stale figure (its step
         // writes no pool slot: it runs on any idle turn).
-        let seats_short = match (shell.behind_need(), behind.seats) {
+        let need = shell.behind_need();
+        let seats_short = match (need, behind.seats) {
             (Some(need), Some(seats)) => seats.len() < need.lanes as usize,
             _ => false,
         };
-        if !shell.measures_behind() || seats_short {
-            if seats_short && shell.rates_behind().is_none() {
-                self.behind_state(
-                    "waiting: the pool holds no room for one settle point's slots beyond live \
-                     work (the settle runs on a later idle turn; the fallback picks serve)",
-                );
+        // A point longer than one decode step runs only with no process
+        // live, so a live request never waits behind it.
+        let long_held = need.is_some_and(|need| need.long) && !behind.alone;
+        if !shell.measures_behind() || seats_short || long_held {
+            if shell.rates_behind().is_none() {
+                if long_held {
+                    self.behind_state(
+                        "waiting: the settle's next point runs longer than one decode step, and \
+                         runs only once no process is live",
+                    );
+                } else if seats_short {
+                    self.behind_state(
+                        "waiting: the pool holds no room for one settle point's slots beyond \
+                         live work (the settle runs on a later idle turn; the fallback picks \
+                         serve)",
+                    );
+                }
             }
             return self.rate_behind(behind);
         }

@@ -92,6 +92,7 @@ fn a_settle_point_overlapped_by_a_fire_is_not_stored() {
         others: &busy,
         arrived: &|| false,
         seats: None,
+        alone: true,
     };
     let mut slices = 0;
     while slices < 64 && loaded.engine.measure_behind(&behind).expect("measuring behind") {
@@ -147,6 +148,7 @@ fn a_settle_slice_yields_to_an_arrival_before_it_fires() {
         others: &|| 0,
         arrived: &|| true,
         seats: None,
+        alone: true,
     };
     let mut slices = 0;
     while slices < 32 && loaded.engine.measure_behind(&behind).expect("measuring behind") {

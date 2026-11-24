@@ -708,6 +708,13 @@ struct Behind {
     /// behind.
     slices: u64,
     longest: std::time::Duration,
+    /// One decode step of this load as the settle met it: the first point
+    /// it fired at its fewest rows (ranges go fewest rows first), ns. A
+    /// point expected to run longer waits for no process to be live.
+    decode_ns: Option<f64>,
+    /// The longest fire the last range closed saw, and its top rows: what
+    /// the next range's first point is expected from (scaled by its rows).
+    last_range: Option<(u32, f64)>,
 }
 
 /// Why a point behind serving was discarded, as its count is kept.
@@ -746,6 +753,8 @@ struct Trial {
     host_clock: bool,
     built_before: u64,
     idle_before: bool,
+    /// The longest fire of the range so far, ns (the warm round's too).
+    seen_ns: Option<f64>,
 }
 
 /// What a range's weighing found to open ([`Shell::open_trial`]).
@@ -3230,6 +3239,8 @@ impl<B: Serve> Shell<B> {
             discarded: [0; 4],
             slices: 0,
             longest: std::time::Duration::ZERO,
+            decode_ns: None,
+            last_range: None,
         });
         self.say_served("settle pending behind serving", replaced);
         Ok(())
@@ -3482,10 +3493,24 @@ impl<B: Serve> Shell<B> {
     /// where the next slice opens a range, or nothing is left.
     #[must_use]
     pub fn behind_need(&self) -> Option<engine::BehindNeed> {
-        let trial = self.behind.as_ref()?.trial.as_ref()?;
+        let behind = self.behind.as_ref()?;
+        let trial = behind.trial.as_ref()?;
+        // Its expected time: the longest fire its range has seen, else the
+        // last range's scaled by the rows; longer than one decode step of
+        // the load (the settle's first point, at its fewest rows) is long.
+        let expected = trial.seen_ns.or_else(|| {
+            behind
+                .last_range
+                .map(|(top, ns)| ns * f64::from(trial.top) / f64::from(top.max(1)))
+        });
+        let long = matches!(
+            (expected, behind.decode_ns),
+            (Some(expected), Some(decode)) if expected > decode
+        );
         Some(engine::BehindNeed {
             lanes: trial.fire_lanes,
             tokens: trial.per_lane,
+            long,
         })
     }
 
@@ -3524,6 +3549,10 @@ impl<B: Serve> Shell<B> {
         if trial.round <= trial.limit {
             behind.trial = Some(trial);
             return Ok(true);
+        }
+        if let Some(seen) = trial.seen_ns {
+            behind.decode_ns.get_or_insert(seen);
+            behind.last_range = Some((trial.top, seen));
         }
         let (row, taken) = self.close_trial(trial);
         if let Some(tactic) = taken {
@@ -3691,6 +3720,7 @@ impl<B: Serve> Shell<B> {
             host_clock: false,
             built_before: B::compiled(&self.pipelines),
             idle_before: crate::backend::Context::idle(&self.device),
+            seen_ns: None,
         }))
     }
 
@@ -3906,6 +3936,7 @@ impl<B: Serve> Shell<B> {
             }
             None => ns,
         };
+        trial.seen_ns = Some(trial.seen_ns.map_or(ns, |seen| seen.max(ns)));
         if timed {
             trial.samples[trial.next].push(ns);
         }

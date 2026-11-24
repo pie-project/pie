@@ -1133,14 +1133,27 @@ impl Lane {
         }
         let began = Instant::now();
         let stores = crate::store::registry::try_get(0, engine_idx);
+        // No process live on the engine: no working set or snapshot holds a
+        // slot (idle cache alone does) and no waiter is short of one.
+        let alone = stores
+            .as_ref()
+            .and_then(|stores| stores.shared.as_ref())
+            .is_some_and(|shared| {
+                let pool = shared.lock().unwrap();
+                pool.pool().demand().live == 0 && !pool.pool().waiting()
+            });
+        // A point longer than one decode step waits for no live process:
+        // nothing is taken for it before then.
         let taken = engine
             .behind_need()
+            .filter(|need| alone || !need.long)
             .map(|need| stores.as_ref().map(|stores| take_behind(stores, need)).unwrap_or_default());
         let others = || SUBMITS.load(std::sync::atomic::Ordering::Acquire);
         let behind = ::engine::BehindServing {
             others: &others,
             arrived,
             seats: Some(taken.as_ref().map_or(&[][..], |taken| taken.seats.as_slice())),
+            alone,
         };
         let fired = engine.measure_behind(&behind);
         if let (Some(taken), Some(stores)) = (taken, stores.as_ref()) {

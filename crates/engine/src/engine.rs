@@ -207,6 +207,11 @@ pub struct BehindServing<'a> {
     /// Fewer than asked (the pool had no room beyond live work): a slice
     /// that fires does not run now.
     pub seats: Option<&'a [BehindSeat]>,
+    /// Whether no process is live on the engine at all (none running,
+    /// queued or parked; only idle cache holds the pool): what a slice
+    /// longer than one decode step of the load waits for, so a live
+    /// request never waits behind it.
+    pub alone: bool,
 }
 
 /// One lane's slots the runtime took for a fire behind serving
@@ -226,6 +231,10 @@ pub struct BehindSeat {
 pub struct BehindNeed {
     pub lanes: u32,
     pub tokens: u32,
+    /// Whether the point is expected to run longer than one decode step
+    /// of the load (by the load's own figures): it runs only where
+    /// [`BehindServing::alone`].
+    pub long: bool,
 }
 
 pub trait Engine: Send {
