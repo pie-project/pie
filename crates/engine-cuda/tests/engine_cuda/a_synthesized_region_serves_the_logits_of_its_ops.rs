@@ -310,12 +310,22 @@ fn close_within(
 /// A step's logits within this share of their spread of the reference's.
 const SPREAD: f32 = 2e-2;
 
-/// [`SPREAD`] over an e4m3 cache: each cached element rounds to 3 mantissa
-/// bits, so a bf16 place apart before the cache (the epilogue's own order)
-/// can land a whole e4m3 place apart (2^-3, sixteen of bf16's), the
-/// reference's own append rounding the row it is handed so too.
+/// E4m3's unit roundoff: half a place of its 3 mantissa bits, 2^-4. A
+/// cached element a bf16 place apart before the cache (the epilogue's own
+/// order) can round to the neighbouring e4m3 value, one such roundoff of
+/// its magnitude apart beyond what bf16 kept.
 #[cfg(feature = "cuda")]
-const SPREAD_FP8: f32 = 4e-2;
+const E4M3_ROUNDOFF: f32 = 1.0 / (1 << (3 + 1)) as f32;
+
+/// [`SPREAD`] over an e4m3 cache: the bf16 rule's share, and the cache's
+/// own roundoff carried to the logits. A cached key or value
+/// [`E4M3_ROUNDOFF`] of its magnitude apart moves the attention output it
+/// feeds by at most that share of the output (a convex mix of the values;
+/// a score's move is renormalized by the softmax), and each later norm
+/// rescales what follows, so to first order a step's logits move by at most
+/// that share of their spread.
+#[cfg(feature = "cuda")]
+const SPREAD_FP8: f32 = SPREAD + E4M3_ROUNDOFF;
 
 /// The norms' register forms: the unfused ops summing in another order.
 #[cfg(feature = "cuda")]
