@@ -1660,7 +1660,7 @@ impl Shell {
             keys,
             products,
             routes_measuring: boot.knobs.measuring,
-            measured: std::cell::RefCell::new(timed_at_open.clone()),
+            measured: timed_at_open,
             forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
@@ -1931,6 +1931,11 @@ impl Shell {
             fitted => fitted,
         }
         .map_err(|why| shell.expert_staging.short(why))?;
+        // Arming measures what the bodies take where no record (the home's
+        // or a committed one) held it.
+        if shell.records_bodies() && !shell.bodies_from_record {
+            shell.measured.push("bodies".to_string());
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] claim before arming: {} pages, {} chunks, room {} MiB (fresh {})",
@@ -2346,8 +2351,7 @@ impl Shell {
             return Ok(());
         }
         self.measured
-            .borrow_mut()
-            .push(format!("decode products ({})", measured.len()));
+            .push(format!("product_ns ({} decode product times)", measured.len()));
         let saved = crate::rates::save_product_times(
             profiles,
             self.device.name(),

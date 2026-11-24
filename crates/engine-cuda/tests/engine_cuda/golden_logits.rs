@@ -320,8 +320,8 @@ fn trace_of(model: &str) -> Trace {
     panic!("`{model}` does not trace: {}", first.unwrap_or_default())
 }
 
-struct Fixture {
-    model: String,
+pub(super) struct Fixture {
+    pub(super) model: String,
     trace: Trace,
     contract: ModelContract,
     container: PathBuf,
@@ -329,7 +329,7 @@ struct Fixture {
 
 /// `model`'s trace and its seeded checkpoint, written once into `cache`'s
 /// `fixtures` and read back by every later run.
-fn fixture(model: &str, cache: &Path) -> Fixture {
+pub(super) fn fixture(model: &str, cache: &Path) -> Fixture {
     fixture_as(model, cache, false)
 }
 
@@ -400,7 +400,7 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     }
 }
 
-fn cache_dir() -> PathBuf {
+pub(super) fn cache_dir() -> PathBuf {
     std::env::var_os("PIE_GOLDEN_CACHE").map_or_else(
         || std::env::temp_dir().join("pie-golden-cache"),
         PathBuf::from,
@@ -429,7 +429,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
 }
 
 /// [`load_with`] under `allowance`, its refusal returned.
-fn load_under(
+pub(super) fn load_under(
     fixture: &Fixture,
     cache: &Path,
     knobs: engine_cuda::Knobs,
@@ -551,7 +551,7 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
 /// state pool aims near, so a miniature's records are cut into pieces as a
 /// full model's are. The logits are the same either way.
-fn knobs() -> engine_cuda::Knobs {
+pub(super) fn knobs() -> engine_cuda::Knobs {
     let mut knobs = engine_cuda::Knobs::default();
     knobs.profiles = Some(cache_dir().join("profiles"));
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
