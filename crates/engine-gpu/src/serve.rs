@@ -1020,6 +1020,14 @@ pub struct Shell<B: Serve> {
     /// Fires of at least these rows run eager, as the load stated: the
     /// bodies past the allowance it recorded smallest first.
     eager_rows: Option<u32>,
+    /// The stated step shapes the load runs eager: the set's tail from this
+    /// index on, which its allowance did not hold the bodies of.
+    eager_from: Option<usize>,
+    /// The stated step compositions ([`Shell::record_bodies`]).
+    pub steps: Option<engine::StepShapes>,
+    /// The composition of the step being fired, where its caller states it
+    /// (the engine's fires): what a stated eager shape is told by.
+    pub step: Option<engine::StepComposition>,
     /// The load records its bodies: a kept walk is recorded and not run.
     pub arming: bool,
     /// The fires since the last count that ran eager as stated.
@@ -2865,6 +2873,9 @@ impl<B: Serve> Shell<B> {
             recorded: 0,
             unkept: 0,
             eager_rows: None,
+            eager_from: None,
+            steps: None,
+            step: None,
             arming: false,
             eager: 0,
             eager_next: false,
@@ -4535,7 +4546,23 @@ impl<B: Serve> Shell<B> {
     /// the bodies' allowance, which it armed smallest first.
     #[must_use]
     pub fn eager_by_rows(&self, rows: u32) -> bool {
+        if let (Some(steps), Some(step)) = (&self.steps, &self.step) {
+            return self
+                .eager_from
+                .is_some_and(|from| steps.shape_of(step).is_some_and(|at| at >= from));
+        }
         self.eager_rows.is_some_and(|eager| rows >= eager)
+    }
+
+    /// The stated step shapes the load runs eager, by index, ascending: the
+    /// set's tail its allowance did not hold the bodies of.
+    #[must_use]
+    pub fn eager_shapes_from(&self) -> Vec<u32> {
+        let len = self.steps.as_ref().map_or(0, engine::StepShapes::len);
+        self.eager_from
+            .map_or(0..0, |from| from..len)
+            .map(|at| u32::try_from(at).unwrap_or(u32::MAX))
+            .collect()
     }
 
     /// The fires since the last count that ran eager, as the load stated.
@@ -4830,6 +4857,8 @@ impl<B: Serve> Shell<B> {
 
     pub fn fire_seated(&mut self, lanes: &[Seated<'_, B>]) -> Result<Vec<Vec<f32>>> {
         use engine::frame::Shell as FrameShell;
+        // A direct fire states no step composition of its own.
+        self.step = None;
         // A served load fired before the engine placed its programs hangs
         // the device on what placing them sets up: refused, by name.
         if self.unplaced {
@@ -8418,9 +8447,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // by its rows (past the bodies' allowance), or by its kind (one no
         // recording can hold, as its backend's plan said).
         let stated_eager = std::mem::take(&mut self.eager_next)
-            || self.eager_rows.is_some_and(|eager| {
-                prepared.seats.iter().map(|seat| seat.rows).sum::<u32>() >= eager
-            });
+            || self.eager_by_rows(prepared.seats.iter().map(|seat| seat.rows).sum::<u32>());
         let keep = keep.filter(|_| !stated_eager);
         self.recorded += u64::from(keep.is_some());
         self.eager += u64::from(stated_eager);
@@ -9120,6 +9147,44 @@ fn lane_views<B: Serve>(
     (seated, media, clips)
 }
 
+/// The composition (CONTRACT-BC 24) of an arm walk's fire of `lanes`, each
+/// `(class, rows)` reading its last row, buffering where `buffered` (a decode
+/// lane carrying a row, which a composition counts none of: `lane_carried`),
+/// each class's lanes carrying `attachments[class]`.
+fn step_of(
+    lanes: &[(usize, u32)],
+    buffered: bool,
+    attachments: &[engine::Attachments],
+) -> engine::StepComposition {
+    let mut step = engine::StepComposition::default();
+    for &(class, rows) in lanes {
+        if rows <= 1 {
+            step.decode_lanes += 1;
+            step.rows += 1;
+        } else {
+            step.prompt_lanes += 1;
+            step.prompt_rows += rows;
+            step.rows += rows;
+            step.lane_rows = if step.prompt_lanes == 1 {
+                engine::shapes::Span { lo: rows, hi: rows }
+            } else {
+                engine::shapes::Span {
+                    lo: step.lane_rows.lo.min(rows),
+                    hi: step.lane_rows.hi.max(rows),
+                }
+            };
+        }
+        step.readout_rows += 1;
+        if let Some(carries) = attachments.get(class) {
+            step.attachments = step.attachments.union(*carries);
+        }
+    }
+    if buffered {
+        step.treatment = engine::shapes::Treatment::Buffers;
+    }
+    step
+}
+
 /// A lane of a class, as a load's walks make one: the naming walk over
 /// its named shell, the bind walk over the device's.
 impl<B: Serve> Shell<B> {
@@ -9341,7 +9406,17 @@ impl<B: Serve> Shell<B> {
     /// build, device, model and lattice records only those shapes, measures
     /// no allowance, and states the same rows eager; every other shape of
     /// the lattice fills a body those recorded, at its first fire.
-    pub fn record_bodies(&mut self, records: Option<&std::path::Path>) -> Result<u64> {
+    ///
+    /// `steps`, where the load states them (CONTRACT-BC 24), is the set of
+    /// compositions its step builder forms: the walk arms only compositions
+    /// of a stated shape, in the set's order (smallest first across kinds),
+    /// and what its allowance leaves is the set's tail from a shape on,
+    /// stated eager by its index ([`Shell::eager_shapes_from`]).
+    pub fn record_bodies(
+        &mut self,
+        records: Option<&std::path::Path>,
+        steps: Option<&engine::StepShapes>,
+    ) -> Result<u64> {
         if !B::RECORDS {
             return Ok(0);
         }
@@ -9467,13 +9542,72 @@ impl<B: Serve> Shell<B> {
             .flat_map(|lanes| {
                 let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
                 let fed = fed_too && decodes;
-                let carried = carried_too && decodes;
+                // Every composition buffering its rows too: a decode lane
+                // carrying a row it has not folded, a prompt lane buffering
+                // its own (a buffered step of the stated set).
+                let carried = carried_too;
                 std::iter::once((lanes.clone(), false, false))
                     .chain(fed.then(|| (lanes.clone(), true, false)))
                     .chain(carried.then(|| (lanes.clone(), false, true)))
                     .chain((fed && carried).then_some((lanes, true, true)))
             })
             .collect();
+        // Where the load states its steps, each composition's shape: those of
+        // none are left (the step builder forms none of them), and the rest
+        // go in the set's order, smallest rows first within a shape.
+        let (shapes, tags): (Vec<_>, Vec<Option<usize>>) = match steps {
+            None => shapes.into_iter().map(|entry| (entry, None)).unzip(),
+            Some(steps) => {
+                let carries = |class: usize| -> engine::Attachments {
+                    let lane = self.naming_lane(class, 1).ok();
+                    engine::Attachments {
+                        mask: lane.as_ref().is_some_and(|lane| lane.mask.is_some()),
+                        adapter: lane.as_ref().is_some_and(|lane| lane.adapter.is_some()),
+                        inputs: lane.as_ref().is_some_and(|lane| !lane.inputs.is_empty()),
+                        ..engine::Attachments::default()
+                    }
+                };
+                let attachments: Vec<engine::Attachments> =
+                    (0..decoding.len()).map(carries).collect();
+                let mut tagged: Vec<((Vec<(usize, u32)>, bool, bool), usize)> = shapes
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let step = step_of(&entry.0, entry.2, &attachments);
+                        steps.shape_of(&step).map(|at| (entry, at))
+                    })
+                    .collect();
+                tagged.sort_by_key(|((lanes, fed, carried), at)| {
+                    (
+                        *at,
+                        lanes.iter().map(|&(_, rows)| rows).sum::<u32>(),
+                        std::cmp::Reverse(lanes.len()),
+                        *fed,
+                        *carried,
+                    )
+                });
+                let mut covered = vec![false; steps.len()];
+                for (_, at) in &tagged {
+                    covered[*at] = true;
+                }
+                let bare: Vec<String> = (steps.shapes.iter().zip(&covered))
+                    .filter(|&(_, &covered)| !covered)
+                    .map(|(shape, _)| shape.to_string())
+                    .collect();
+                if !bare.is_empty() {
+                    tracing::warn!(
+                        shapes = bare.len(),
+                        of = steps.len(),
+                        bare = ?bare,
+                        "stated step shapes the arm walk lays no composition of: a fire of one \
+                         is unarmed"
+                    );
+                }
+                tagged
+                    .into_iter()
+                    .map(|(entry, at)| (entry, Some(at)))
+                    .unzip()
+            }
+        };
         let cell = {
             let (store, at) = self.inputs[0].token_seat();
             DeviceCell {
@@ -9512,7 +9646,7 @@ impl<B: Serve> Shell<B> {
                 path = %path.display(),
                 shapes = known.shapes.len(),
                 of = shapes.len(),
-                eager_from_rows = ?known.eager_rows,
+                eager_from = ?known.eager,
                 "the load arms the bodies a load of this build, device, model and lattice \
                  recorded, and measures no allowance"
             );
@@ -9559,7 +9693,10 @@ impl<B: Serve> Shell<B> {
         let before = rss();
         let mut dearest = 0u64;
         if let Some(known) = &known {
-            self.eager_rows = known.eager_rows;
+            match steps {
+                Some(_) => self.eager_from = known.eager.map(|at| at as usize),
+                None => self.eager_rows = known.eager,
+            }
         }
         for (at, (lanes, fed, carried)) in shapes.iter().enumerate() {
             // A known lattice arms the shapes that recorded a family, and
@@ -9588,7 +9725,11 @@ impl<B: Serve> Shell<B> {
                     eager = ?eager,
                     "the bodies past the allowance run eager: every fire of at least these rows"
                 );
-                self.eager_rows = Some(from);
+                match tags[at] {
+                    // The set's tail from this composition's shape on.
+                    Some(shape) => self.eager_from = Some(shape),
+                    None => self.eager_rows = Some(from),
+                }
                 break;
             }
             let families = self.recorded;
@@ -9599,8 +9740,9 @@ impl<B: Serve> Shell<B> {
                     .map(|&(class, rows)| {
                         let mut lane = self.naming_lane(class, rows)?;
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
-                        if *carried && rows == 1 && decoding[class] {
-                            self.rs_walk_lane(&mut lane, rows, 1)?;
+                        if *carried {
+                            let carried = u32::from(rows == 1 && decoding[class]);
+                            self.rs_walk_lane(&mut lane, rows, carried)?;
                         }
                         Ok(lane)
                     })
@@ -9645,7 +9787,10 @@ impl<B: Serve> Shell<B> {
                 path,
                 &crate::armed::Armed {
                     shapes: armed_shapes.clone(),
-                    eager_rows: self.eager_rows,
+                    eager: match steps {
+                        Some(_) => self.eager_from.map(|at| u32::try_from(at).unwrap_or(u32::MAX)),
+                        None => self.eager_rows,
+                    },
                 },
                 build,
             );

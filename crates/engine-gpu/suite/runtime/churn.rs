@@ -71,7 +71,7 @@ fn armed_bodies_replay_across_segment_churn() {
     let Some(mut shell) = load(&fixture, CONTEXT) else {
         return;
     };
-    shell.record_bodies(None).expect("the load arms its bodies");
+    shell.record_bodies(None, None).expect("the load arms its bodies");
     // The load is done: serving counts from here.
     shell.recorded_serving();
     shell.unkept_serving();

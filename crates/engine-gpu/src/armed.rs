@@ -32,8 +32,9 @@ pub struct Armed {
     /// The lattice's shapes, by their place in it, whose walks recorded a
     /// family.
     pub shapes: Vec<usize>,
-    /// The fewest rows a fire stated eager has: past the bodies' allowance.
-    pub eager_rows: Option<u32>,
+    /// The first stated eager: past the bodies' allowance. A shape index
+    /// where the load states its steps, else the fewest rows of a fire.
+    pub eager: Option<u32>,
 }
 
 /// The record's file in `dir` for a load whose bodies `parts` shape under
@@ -79,7 +80,7 @@ fn parse(text: &str, build: u64) -> Option<Armed> {
         return None;
     }
     let eager = lines.next()?.strip_prefix("eager ")?;
-    let eager_rows = match eager.trim() {
+    let eager = match eager.trim() {
         "-" => None,
         rows => Some(rows.parse().ok()?),
     };
@@ -92,7 +93,7 @@ fn parse(text: &str, build: u64) -> Option<Armed> {
             .map(|at| at.parse().ok())
             .collect::<Option<Vec<usize>>>()?
     };
-    Some(Armed { shapes, eager_rows })
+    Some(Armed { shapes, eager })
 }
 
 fn render(armed: &Armed, build: u64) -> String {
@@ -100,7 +101,7 @@ fn render(armed: &Armed, build: u64) -> String {
     format!(
         "{HEADER}\nbuild {build:016x}\neager {}\nshapes {}\n",
         armed
-            .eager_rows
+            .eager
             .map_or_else(|| "-".to_string(), |rows| rows.to_string()),
         shapes.join(",")
     )
@@ -160,11 +161,11 @@ mod tests {
         for armed in [
             Armed {
                 shapes: vec![0, 3, 17],
-                eager_rows: Some(512),
+                eager: Some(512),
             },
             Armed {
                 shapes: Vec::new(),
-                eager_rows: None,
+                eager: None,
             },
         ] {
             assert_eq!(parse(&render(&armed, 7), 7), Some(armed.clone()));
@@ -178,7 +179,7 @@ mod tests {
     fn a_load_takes_the_committed_entry_of_its_key_where_its_own_is_missing() {
         let armed = Armed {
             shapes: vec![2],
-            eager_rows: None,
+            eager: None,
         };
         let text = render(&armed, 5);
         let committed = [("00000000000000aa", text.as_str())];

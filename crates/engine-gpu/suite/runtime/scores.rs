@@ -138,7 +138,7 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<usize>) {
     let first = room(&shell);
     let mut room = first.clone();
     if moved.is_some() {
-        shell.record_bodies(None).expect("the load arms its bodies");
+        shell.record_bodies(None, None).expect("the load arms its bodies");
         shell.recorded_serving();
         shell.unkept_serving();
         shell.eager_serving();
