@@ -118,7 +118,7 @@ impl ResidencyPlanner {
         // ended on reads what that pass read, and plans nothing new. A
         // stuck head is said once and costs no pass until an event.
         let generation = self.generation();
-        ptrace!("plan pass settled={}", *self.settled_at.lock() == Some(generation));
+        tracing::debug!("plan pass settled={}", *self.settled_at.lock() == Some(generation));
         if *self.settled_at.lock() == Some(generation) {
             self.stats.skipped_wakes.fetch_add(1, Ordering::Relaxed);
             self.returns
@@ -765,7 +765,7 @@ impl ResidencyPlanner {
     /// are never planned.
     pub fn target_raised(self: &Arc<Self>) {
         if self.returns.waiters.load(Ordering::Acquire) != 0 {
-            ptrace!("target raised: a commit can come");
+            tracing::debug!("target raised: a commit can come");
             self.poke();
         }
     }
@@ -774,7 +774,7 @@ impl ResidencyPlanner {
     /// on past the grow, to demote, sweep and evict, on this event alone.
     pub fn no_grow(self: &Arc<Self>) {
         self.stats.no_grows.fetch_add(1, Ordering::Relaxed);
-        ptrace!("no grow: the walk mapped nothing it promised");
+        tracing::debug!("no grow: the walk mapped nothing it promised");
         self.no_grow.store(true, Ordering::Release);
         self.poke();
     }
@@ -787,7 +787,7 @@ impl ResidencyPlanner {
             return false;
         }
         self.stats.grow_waits.fetch_add(1, Ordering::Relaxed);
-        ptrace!("plan waits on a grow kv={} rs={:?}", need.kv_pages, need.rs);
+        tracing::debug!("plan waits on a grow kv={} rs={:?}", need.kv_pages, need.rs);
         true
     }
 
@@ -1556,7 +1556,7 @@ impl ResidencyPlanner {
                             .fetch_add(wake.len() as u64, Ordering::Relaxed);
                     }
                     for (key, pages, notify) in wake {
-                        ptrace!("serve key={:?} kv={:?}", key, pages);
+                        tracing::debug!("serve key={:?} kv={:?}", key, pages);
                         notify.notify_waiters();
                     }
                     continue;

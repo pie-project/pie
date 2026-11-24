@@ -132,20 +132,6 @@ impl ControlCompletion {
     }
 }
 
-pub(crate) fn fire_timing_now_us() -> u64 {
-    ledger_monotonic_ns() / 1_000
-}
-
-pub(crate) fn ledger_monotonic_ns() -> u64 {
-    // `Instant` is the monotonic clock on every platform this ships to. The
-    // epoch is the first call rather than boot, which the ledger does not
-    // care about: every consumer reads these as deltas or as trace ordering,
-    // never against a wall clock or a device timestamp.
-    static START: std::sync::OnceLock<crate::rt::Instant> = std::sync::OnceLock::new();
-    let start = *START.get_or_init(crate::rt::Instant::now);
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
 fn handle_registry() -> &'static RwLock<Vec<Option<SchedulerHandle>>> {
     static REGISTRY: std::sync::OnceLock<RwLock<Vec<Option<SchedulerHandle>>>> =
         std::sync::OnceLock::new();
