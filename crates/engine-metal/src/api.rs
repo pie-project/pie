@@ -471,6 +471,95 @@ impl Engine for Metal {
         "metal"
     }
 
+    /// Whether a `[rates]` key the load serves by a stale figure is left to
+    /// time behind serving (`Shell::rates_behind`).
+    fn measures_behind(&self) -> bool {
+        self.shell
+            .as_ref()
+            .is_some_and(|shell| shell.rates_behind().is_some())
+    }
+
+    /// One slice behind serving: the rates step timing the next stale
+    /// `[rates]` key alone (`rates::measure_keys`), each frame reading
+    /// whether a request arrived and stopping where one did, so an arrival
+    /// waits at most the frame in flight; the key is timed again whole at a
+    /// later idle turn. Kept only where it had the device alone at a steady
+    /// clock: no frame of this engine in flight as it starts, no other lane
+    /// submitting while it runs, and the clock read after it no slower than
+    /// the settled one before it (`rates::throttled`). Kept: stored in the
+    /// user's profile for the next load; this load serves on by the stale
+    /// figure. Else discarded and timed again later.
+    fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        let Some(key) = shell.rates_behind().map(str::to_string) else {
+            return Ok(false);
+        };
+        let profile = shell.tuning().profile().clone();
+        let device = shell.device();
+        let submitted = (behind.others)();
+        let began = std::time::Instant::now();
+        let timed = crate::rates::clock_rate(device, profile.clone(), true).and_then(|before| {
+            let rates = crate::rates::measure_keys(
+                device,
+                profile.clone(),
+                &[key.as_str()],
+                Some(behind.arrived),
+                &mut |_| {},
+            )?;
+            Ok((before, rates))
+        });
+        let ms = began.elapsed().as_secs_f64() * 1e3;
+        let (before, rates) = match timed {
+            Ok(timed) => timed,
+            Err(why) if crate::rates::yielded(&why) => {
+                tracing::info!(
+                    key = %key,
+                    ms,
+                    "rates behind serving: `{key}` yielded to an arrival; timed again later"
+                );
+                return Ok(true);
+            }
+            Err(why) => {
+                return Err(Error::Load(format!(
+                    "rates behind serving: `{key}` was not timed: {why}"
+                )));
+            }
+        };
+        let after = crate::rates::clock_rate(device, profile, false).map_err(Error::Load)?;
+        let why = if (behind.others)() != submitted {
+            Some("another lane submitted while it ran".to_string())
+        } else {
+            crate::rates::throttled(before, after).map(|ratio| {
+                format!("the device's clock {ratio:.2}x slower after it than its settled start")
+            })
+        };
+        if let Some(why) = why {
+            tracing::info!(
+                key = %key,
+                ms,
+                "rates behind serving: `{key}` discarded ({why}); timed again later"
+            );
+            return Ok(true);
+        }
+        if let Err(why) = crate::rates::save_rates(device, self.boot.profiles.as_deref(), &rates) {
+            tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
+        }
+        let left = shell.rate_timed(&key);
+        tracing::info!(
+            key = %key,
+            ms,
+            left,
+            "rates behind serving: `{key}` timed and stored for the next load (this load serves \
+             on by its stale figure); {left} left"
+        );
+        Ok(true)
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }

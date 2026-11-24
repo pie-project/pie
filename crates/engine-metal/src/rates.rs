@@ -118,6 +118,19 @@ struct Bench<'a> {
     tuning: &'a Tuning,
     /// `engine::rates::operand_pattern`, made once.
     pattern: Vec<u8>,
+    /// Behind serving: whether a request arrived, read before each frame;
+    /// one did, and the step stops ([`YIELDED`]).
+    yield_to: Option<&'a dyn Fn() -> bool>,
+}
+
+/// Why a step behind serving stopped: a request arrived before a frame of
+/// it ([`yielded`]). The key is timed again whole at a later idle turn.
+const YIELDED: &str = "a request arrived: the rates step behind serving yields to it";
+
+/// Whether `why` is a step behind serving that yielded to an arrival.
+#[must_use]
+pub fn yielded(why: &str) -> bool {
+    why == YIELDED
 }
 
 impl Bench<'_> {
@@ -158,6 +171,9 @@ impl Bench<'_> {
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
         k: u32,
     ) -> Result<f64, String> {
+        if self.yield_to.is_some_and(|arrived| arrived()) {
+            return Err(YIELDED.to_string());
+        }
         let frame = self.device.frame().map_err(|e| e.to_string())?;
         let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
         for _ in 0..k {
@@ -599,15 +615,77 @@ pub fn at_load(
         registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
-    // Nothing is timed behind serving on Metal yet: a stale key is
-    // measured before ready.
-    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, false, |_max_submit, _| {
+    // A key stored under a stale key serves by its old figure and is timed
+    // again behind serving (`Shell::rates_behind`); only what no layer
+    // states is measured here, those keys alone.
+    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, true, |_max_submit, stated| {
+        let lacked = stated.missing(&KEYS);
         Ok(engine::rates::Measured {
-            rates: measure(device, measure_chip, &mut |_| {})?,
+            rates: measure_keys(device, measure_chip, &lacked, None, &mut |_| {})?,
             unsettled: false,
             throttled: None,
         })
     })
+}
+
+/// `rates` kept in the user's profile under `profiles` for `device`, as a
+/// load keeps what it measured (`engine::rates::save_rates`); nothing where
+/// no profiles directory is stated.
+pub fn save_rates(
+    device: &Context,
+    profiles: Option<&std::path::Path>,
+    rates: &Rates,
+) -> Result<(), String> {
+    let Some(profiles) = profiles else {
+        return Ok(());
+    };
+    let name = device.name().to_string();
+    let save = engine::rates::SaveTo {
+        path: crate::chip::SHELF.user_path(profiles, &name),
+        provenance: provenance(&name),
+        registry: crate::chip::registry(),
+    };
+    let rates = Rates {
+        measured_on: Some(crate::stored::measured_on(device.name())),
+        ..rates.clone()
+    };
+    engine::rates::save_rates(&save, &rates).map(drop)
+}
+
+/// The device's clock as a reference matmul's rate (FLOP a ns): a
+/// `1024^3` matmul over one cache-resident plane, compute-bound, so its
+/// rate moves with the clock alone. `settled`: read until two rotations in
+/// a row agree within [`engine::rates::AGREEMENT`] (`engine::rates::warm_up`),
+/// the clock the device holds under load (an idle DVFS clock ramped up, a
+/// brief boost fallen back); else one timed point.
+pub fn clock_rate(device: &Context, profile: profile::Profile, settled: bool) -> Result<f64, String> {
+    const SIDE: u32 = 1024;
+    let tuning = Tuning::new(profile, false, device.cores()).with_family(device.family());
+    let bench = Bench {
+        device,
+        handles: Handles::new(),
+        pipelines: Pipelines::new(),
+        tuning: &tuning,
+        pattern: engine::rates::operand_pattern(),
+        yield_to: None,
+    };
+    let plane = bench.operand(u64::from(SIDE * SIDE) * 2)?;
+    let weight = [bench.tensor(&plane, SIDE, SIDE, Dtype::Bf16)?];
+    let touched = Touched::default();
+    let point = || bench.matmul_flops(SIDE, SIDE, SIDE, &weight, &touched, 0.0);
+    if settled {
+        Ok(engine::rates::warm_up(point)?.rate)
+    } else {
+        point()
+    }
+}
+
+/// How much slower the clock read `after` a step is than the settled one
+/// `before` it, where by more than [`engine::rates::AGREEMENT`]: the step
+/// ran under a clock it did not start at, and is discarded.
+#[must_use]
+pub fn throttled(before: f64, after: f64) -> Option<f64> {
+    (after < before * (1.0 - engine::rates::AGREEMENT)).then(|| before / after.max(f64::MIN_POSITIVE))
 }
 
 /// `device`'s rates under the kernel tuning of `profile` (the profile a
@@ -617,6 +695,21 @@ pub fn measure(
     profile: profile::Profile,
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates, String> {
+    measure_keys(device, profile, &KEYS, None, say)
+}
+
+/// [`measure`] of the keys `wanted` alone (each phase timing none of them
+/// skipped; the launch and the warm-up always run, every rate taking its
+/// launches off), stating only those. `yield_to`, behind serving: read
+/// before each frame, an arrival stopping the step ([`yielded`]).
+pub fn measure_keys(
+    device: &Context,
+    profile: profile::Profile,
+    wanted: &[&str],
+    yield_to: Option<&dyn Fn() -> bool>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Rates, String> {
+    let want = |key: &str| wanted.contains(&key);
     let tuning = Tuning::new(profile, false, device.cores()).with_family(device.family());
     let mut bench = Bench {
         device,
@@ -624,6 +717,7 @@ pub fn measure(
         pipelines: Pipelines::new(),
         tuning: &tuning,
         pattern: engine::rates::operand_pattern(),
+        yield_to,
     };
     // The launch first: every rate below takes its dispatches' launches off
     // (engine::rates::rate_from).
@@ -668,7 +762,13 @@ pub fn measure(
     let mut gemm = Vec::new();
     let mut few_row = None;
     let mut per_core = None;
-    for w in engine::rates::GEMM_WIDTHS {
+    let gemms = ["gemm_tflops_by_rows", "few_row_tflops", "workgroups_per_core"];
+    let widths: &[u32] = if gemms.iter().any(|key| want(key)) {
+        &engine::rates::GEMM_WIDTHS
+    } else {
+        &[]
+    };
+    for &w in widths {
         bench.handles = Handles::new();
         let plane = operand(&bench.pattern, (w * w) as usize * 2);
         let weights = (0..engine::rates::weights_at(w, w))
@@ -753,7 +853,12 @@ pub fn measure(
     // The attention curve at d 128; the other widths at the longest keys.
     let fired_gemm = crate::encode::record_fired(true);
     let mut attn = Vec::new();
-    for keys in engine::rates::ATTN_KEYS {
+    let attn_keys: &[u32] = if want("attn_tflops_by_keys") {
+        &engine::rates::ATTN_KEYS
+    } else {
+        &[]
+    };
+    for &keys in attn_keys {
         bench.handles = Handles::new();
         let rate = bench.attention_flops(engine::rates::ATTN_SHAPE.at(keys), gap)?;
         say(&format!(
@@ -763,7 +868,10 @@ pub fn measure(
         attn.push((keys, rate / 1e3));
     }
     let longest = engine::rates::ATTN_KEYS[engine::rates::ATTN_KEYS.len() - 1];
-    for d in engine::rates::ATTN_DIMS.into_iter().filter(|&d| d != 128) {
+    for d in engine::rates::ATTN_DIMS
+        .into_iter()
+        .filter(|&d| d != 128 && want("attn_tflops_by_keys"))
+    {
         bench.handles = Handles::new();
         let rate = bench.attention_flops(engine::rates::ATTN_SHAPE.at(longest).with_dim(d), gap)?;
         say(&format!(
@@ -773,31 +881,46 @@ pub fn measure(
     }
     let fired_attn = crate::encode::record_fired(true);
     bench.handles = Handles::new();
-    let elementwise = bench.elementwise_bytes(gap)?;
+    let elementwise = if want("elementwise_gbps") {
+        let elementwise = bench.elementwise_bytes(gap)?;
+        say(&format!("  rmsnorm and swiglu: {elementwise:.1} GB/s"));
+        Some(elementwise)
+    } else {
+        None
+    };
     let fired_elementwise = crate::encode::record_fired(true);
-    say(&format!("  rmsnorm and swiglu: {elementwise:.1} GB/s"));
     bench.handles = Handles::new();
-    let scan = bench.scan_elements(SCAN_SHAPE.tokens, gap)?;
+    let scan = if want("scan_gelems") {
+        let scan = bench.scan_elements(SCAN_SHAPE.tokens, gap)?;
+        say(&format!(
+            "  gated-delta scan and its conv: {scan:.1} state elements a ns"
+        ));
+        Some(scan)
+    } else {
+        None
+    };
     let fired_scan = crate::encode::record_fired(true);
-    say(&format!(
-        "  gated-delta scan and its conv: {scan:.1} state elements a ns"
-    ));
-    let bytes = bench.bytes_per_ns(gap)?;
+    let bytes = if want("hbm_gbps") {
+        let bytes = bench.bytes_per_ns(gap)?;
+        say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
+        Some(bytes)
+    } else {
+        None
+    };
     let fired_blit = crate::encode::record_fired(false);
-    say(&format!("  256 MiB blit: {bytes:.1} GB/s read and write"));
     Ok(Rates {
         landing: None,
         load_width: None,
         stale: None,
-        launch_ns: Some(launch),
-        gemm_tflops_by_rows: Some(gemm),
-        attn_tflops_by_keys: Some(attn),
-        hbm_gbps: Some(bytes),
+        launch_ns: want("launch_ns").then_some(launch),
+        gemm_tflops_by_rows: want("gemm_tflops_by_rows").then_some(gemm),
+        attn_tflops_by_keys: want("attn_tflops_by_keys").then_some(attn),
+        hbm_gbps: bytes,
         cached_gbps: None,
-        elementwise_gbps: Some(elementwise),
-        scan_gelems: Some(scan),
-        few_row_tflops: few_row,
-        workgroups_per_core: per_core,
+        elementwise_gbps: elementwise,
+        scan_gelems: scan,
+        few_row_tflops: few_row.filter(|_| want("few_row_tflops")),
+        workgroups_per_core: per_core.filter(|_| want("workgroups_per_core")),
         submit_worst_ratio: None,
         resident_workgroups: None,
         attn_tflops_by_rows_keys: None,
@@ -817,6 +940,7 @@ pub fn measure(
                 ("hbm_gbps", &fired_blit),
             ]
             .into_iter()
+            .filter(|(what, _)| want(what))
             .map(|(what, fired)| (what.to_string(), crate::stored::by(what, fired)))
             .collect(),
         ),
