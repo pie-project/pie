@@ -88,8 +88,12 @@ fn a_settle_point_overlapped_by_a_fire_is_not_stored() {
         submitted.set(submitted.get() + 1);
         submitted.get()
     };
+    let behind = ::engine::BehindServing {
+        others: &busy,
+        arrived: &|| false,
+    };
     let mut slices = 0;
-    while slices < 64 && loaded.engine.measure_behind(&busy).expect("measuring behind") {
+    while slices < 64 && loaded.engine.measure_behind(&behind).expect("measuring behind") {
         slices += 1;
     }
     let shell = loaded.engine.loaded_mut().expect("loaded");

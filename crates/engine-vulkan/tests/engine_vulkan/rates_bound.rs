@@ -90,6 +90,7 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         None,
         TOP,
         say,
+        None,
     )
     .expect("the shapes' step lands under the bound");
     let longest = longest
@@ -178,6 +179,7 @@ fn a_bound_no_cube_fits_stops_the_curves_not_the_load() {
         None,
         TOP,
         &mut |line| eprintln!("{line}"),
+        None,
     )
     .expect("a bound no cube fits stops curves, never the step");
     assert_eq!(curves.len(), wanted.len());
@@ -268,6 +270,7 @@ fn a_head_past_the_bound_is_timed_on_slices_of_its_columns() {
         None,
         top,
         &mut |line| eprintln!("{line}"),
+        None,
     )
     .expect("the head's step lands under the bound");
     let timed = curves
@@ -373,7 +376,7 @@ fn a_later_model_extends_a_shared_curve_and_keeps_its_points() {
         let wanted =
             engine_gpu::rates::lacking(kernels_slang::Target::Spirv, &kernels, stated, &shapes, top);
         let curves = engine_gpu::rates::measure_shapes::<Api, _>(
-            &device, &tuning, tier, &timer, None, None, stated, &wanted, None, top, say,
+            &device, &tuning, tier, &timer, None, None, stated, &wanted, None, top, say, None,
         )
         .expect("the curves are timed");
         Rates {

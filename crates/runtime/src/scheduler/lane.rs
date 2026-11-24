@@ -958,6 +958,7 @@ impl Lane {
     fn measure_behind(
         engine_idx: usize,
         engine: &mut Option<EngineBox>,
+        arrived: &dyn Fn() -> bool,
     ) -> Option<std::time::Duration> {
         if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire) {
             return None;
@@ -977,7 +978,11 @@ impl Lane {
         }
         let began = Instant::now();
         let others = || SUBMITS.load(std::sync::atomic::Ordering::Acquire);
-        match engine.measure_behind(&others) {
+        let behind = ::engine::BehindServing {
+            others: &others,
+            arrived,
+        };
+        match engine.measure_behind(&behind) {
             Ok(true) => Some(began.elapsed()),
             Ok(false) => None,
             Err(error) => {
@@ -1085,7 +1090,8 @@ impl Lane {
                 None => {
                     let owed = !landed_instances.is_empty();
                     let awake = || owed || settled_at == Some(parks.count());
-                    let behind = || Self::measure_behind(engine_idx, &mut engine);
+                    let arrived = || !launch_rx.is_empty() || !control_rx.is_empty();
+                    let behind = || Self::measure_behind(engine_idx, &mut engine, &arrived);
                     match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, awake, behind) {
                         Ok(request) => request,
                         Err(()) => break,
