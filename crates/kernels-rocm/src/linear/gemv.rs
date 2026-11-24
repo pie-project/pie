@@ -53,7 +53,7 @@ pub(crate) fn gemv_bf16(
     // not fill the device a wavefront per row) one row split four ways on K.
     const WAVES: u32 = 4;
     let rows = n.unsigned_abs();
-    let (instantiation, grid) = if rows <= ctx.tuning().gemv_splitk_max_n {
+    let (instantiation, grid) = if rows <= ctx.tuning().gemv_splitk_max_n() {
         ("::pie::linear::gemv_bf16<4, true>", rows)
     } else {
         ("::pie::linear::gemv_bf16<4, false>", rows.div_ceil(WAVES))
@@ -167,7 +167,7 @@ pub(crate) fn skinny_norm_plan(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool) -
         n.unsigned_abs() * if gated { 2 } else { 1 },
         k.unsigned_abs(),
         gated,
-        ctx.tuning().gemm_skinny_quad_from,
+        ctx.tuning().gemm_skinny_quad_from(),
         ctx.multiprocessors("linear.skinny")?,
     );
     let staged = m.unsigned_abs() * k.unsigned_abs() * 2;
@@ -452,7 +452,7 @@ pub(crate) fn skinny(
         rows,
         k.unsigned_abs(),
         swiglu,
-        ctx.tuning().gemm_skinny_quad_from,
+        ctx.tuning().gemm_skinny_quad_from(),
         ctx.multiprocessors("linear.skinny")?,
     );
     skinny_planned(ctx, weight, act, out, m, n, k, epilogue, plan)
@@ -609,7 +609,7 @@ pub(crate) fn skinny_resident_blocks(ctx: &Ctx, m: i32, n: i32, k: i32) -> Resul
         n.unsigned_abs(),
         k.unsigned_abs(),
         false,
-        ctx.tuning().gemm_skinny_quad_from,
+        ctx.tuning().gemm_skinny_quad_from(),
         ctx.multiprocessors(OP)?,
     );
     let (kernel, block_waves, smem) = skinny_kernel(m, k, SkinnyEpilogue::Store, plan, false)?;

@@ -1677,7 +1677,7 @@ fn chunk_parallel(
         state.write_state_mask.arg(),
     ];
     common(&mut args)?;
-    let from = ctx.tuning().ssm_gdn_wide_from;
+    let from = ctx.tuning().ssm_gdn_wide_from();
     let slices = lanes * v_heads * (v_dim / CHUNK_SLICE);
     let bvt = if from > 0 && slices >= from {
         2 * CHUNK_SLICE

@@ -643,7 +643,7 @@ fn fire_fp8_dense(
         FP8_BLOCK
     };
     let decode_until = if sb == 0 {
-        ctx.tuning().fp8_decode_until
+        ctx.tuning().fp8_decode_until()
     } else {
         64
     };
@@ -736,7 +736,7 @@ impl PrefillTile {
 /// `kernel.fp8.narrow_until` rows 64 x 128 at three a SIMD, a wave a strip,
 /// so a short prefill's tiles fill the card.
 fn prefill_tile(ctx: &Ctx, cus: u32, sb: u32, rows: u32, n: u32) -> PrefillTile {
-    if sb == 0 && rows <= ctx.tuning().fp8_narrow_until {
+    if sb == 0 && rows <= ctx.tuning().fp8_narrow_until() {
         return PrefillTile {
             nb: 3,
             wn: 8,
