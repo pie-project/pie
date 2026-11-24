@@ -186,7 +186,7 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, Recording, Seal,
+    Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, QueueMasks, Recording, Seal,
     Seated, Shell,
 };
 

@@ -102,6 +102,19 @@ impl Context {
             // the prior calls produced. cudaSetDevice binds this thread.
             unsafe {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
+                // The units this process's queues run on, from its CU masks,
+                // stated before anything reads the device's count (the
+                // probe below, every grid and arena laid after).
+                #[cfg(feature = "rocm")]
+                {
+                    let at = ordinal.unsigned_abs();
+                    let all = kernels_cuda::hip::all_multiprocessors(at)
+                        .map_err(|error| Fault::Unsupported(error.to_string()))?;
+                    kernels_cuda::hip::hold_queue_units(
+                        at,
+                        crate::program::launch::masked_units(all, at),
+                    );
+                }
                 // What the process keeps idle (an earlier shell's dropped
                 // buffers) goes back first: the load measures the card from
                 // here, and fits as it would in a fresh process.

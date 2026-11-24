@@ -1007,6 +1007,7 @@ impl Shell {
     /// collectives.
     pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
+        crate::program::launch::state_queue_masks(&boot.knobs.queue_masks);
         let Baked {
             mut device,
             engine,
