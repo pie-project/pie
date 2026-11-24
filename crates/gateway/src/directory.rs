@@ -132,6 +132,7 @@ mod tests {
             )],
             pools: vec![WorkerId(9)],
             peers: vec![(WorkerId(1), "a:1".into())],
+            links: Vec::new(),
             published: vec![(WorkerId(1), vec![("load".into(), "7".into())])],
             disk_tiers: vec![(WorkerId(1), (16, true))],
             disk: vec![(WorkerId(1), vec![[1; 32], [2; 32]])],

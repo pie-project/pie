@@ -87,20 +87,10 @@ pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
     let host = host();
     let imports = host.load(name, component).map_err(LoadError)?;
     tracing::info!(policy = name, ?imports, "worker policy loaded (PLEX 1.1)");
-    spawn(host, Some((name.to_string(), component.to_vec())))
+    spawn(host, (name.to_string(), component.to_vec()))
 }
 
-/// Starts the port with no policy: the host keeps its record for one a
-/// reload loads, and the default responder answers tier pressure. One
-/// already running stands.
-pub fn start_default() -> Result<(), LoadError> {
-    if EVENTS.get().is_some() {
-        return Ok(());
-    }
-    spawn(host(), None)
-}
-
-fn spawn(mut host: Host, loaded: Option<(String, Vec<u8>)>) -> Result<(), LoadError> {
+fn spawn(mut host: Host, loaded: (String, Vec<u8>)) -> Result<(), LoadError> {
     let (tx, rx) = channel();
     if EVENTS.set(tx).is_err() {
         return Err(LoadError("this worker already runs a PLEX port".into()));
@@ -113,17 +103,13 @@ fn spawn(mut host: Host, loaded: Option<(String, Vec<u8>)>) -> Result<(), LoadEr
     Ok(())
 }
 
-/// Swaps the worker policy for `next` (name, component), or for none, as a
-/// SIGHUP asks. The old one is unloaded (its rows withdrawn) and the new one
-/// loaded; if it does not load, the old one is loaded again. Blocks while it
-/// loads.
-pub fn reload(next: Option<(&str, &[u8])>) -> Result<(), String> {
-    let next = next.map(|(name, component)| (policy_name(name), component.to_vec()));
+/// Swaps the worker policy for `name`'s `component`, as a SIGHUP asks. The
+/// old one is unloaded (its rows withdrawn) and the new one loaded; if it
+/// does not load, the old one is loaded again. Blocks while it loads.
+pub fn reload(name: &str, component: &[u8]) -> Result<(), String> {
+    let next = (policy_name(name), component.to_vec());
     let Some(events) = EVENTS.get() else {
-        return match next {
-            Some((name, component)) => start(&name, &component).map_err(|e| e.to_string()),
-            None => Ok(()),
-        };
+        return start(&next.0, &next.1).map_err(|e| e.to_string());
     };
     let (answer, answered) = std::sync::mpsc::sync_channel(1);
     events
@@ -324,7 +310,7 @@ struct Port {
     /// Offloaded tokens by process, as `pie/offloaded-tokens`.
     offloaded: HashMap<ProcessId, u64>,
     /// The policy loaded, to load again if its successor does not load.
-    loaded: Option<(String, Vec<u8>)>,
+    loaded: (String, Vec<u8>),
     version: u64,
 }
 
@@ -349,7 +335,7 @@ fn rows<K, V, R, W>(
     (out, delta.default.map(|d| d.map(&value)))
 }
 
-fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
+fn run(host: Host, loaded: (String, Vec<u8>), events: Receiver<Event>) {
     let mut port = Port {
         host,
         cache: STORES,
@@ -394,28 +380,20 @@ fn run(host: Host, loaded: Option<(String, Vec<u8>)>, events: Receiver<Event>) {
 }
 
 impl Port {
-    fn reload(&mut self, next: Option<(String, Vec<u8>)>) -> Result<(), String> {
-        if let Some((name, _)) = &self.loaded {
-            self.host.unload(name);
-            // What it noted for the cluster goes with it.
-            super::withdraw_published();
-        }
-        let Some((name, component)) = next else {
-            tracing::info!("worker policy unloaded");
-            self.loaded = None;
-            return Ok(());
-        };
+    fn reload(&mut self, (name, component): (String, Vec<u8>)) -> Result<(), String> {
+        let (old, old_component) = &self.loaded;
+        self.host.unload(old);
+        // What it noted for the cluster goes with it.
+        super::withdraw_published();
         match self.host.load(&name, &component) {
             Ok(imports) => {
                 tracing::info!(policy = %name, ?imports, "worker policy reloaded (PLEX 1.1)");
-                self.loaded = Some((name, component));
+                self.loaded = (name, component);
                 Ok(())
             }
             Err(error) => {
                 tracing::error!(%error, "worker policy not reloaded; the running one goes on");
-                if let Some((old, component)) = &self.loaded {
-                    let _ = self.host.load(old, component);
-                }
+                let _ = self.host.load(old, old_component);
                 Err(error)
             }
         }
@@ -1021,5 +999,61 @@ impl Port {
             });
         }
         out
+    }
+}
+
+/// A port with no stores behind it, for tests that run a built-in policy
+/// over reports and read what it committed from the installed tables.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    const NO_STORES: Cache = Cache {
+        // What an exited process leaves is held: it is retained.
+        owns: |_| true,
+        list: || (Vec::new(), 1),
+        discard: |_| {},
+        rooms: || [(0, 0); 3],
+        resident: |_| None,
+        scale: || None,
+    };
+
+    /// Runs `component` (as `name`) over `events`, the port's own record
+    /// told the host after each, then enacts what its calls committed into
+    /// the installed tables. Returns once every event was heard.
+    pub(crate) fn enact(name: &str, component: &[u8], events: Vec<Event>) {
+        let mut host = host();
+        host.load(name, component).expect("the policy loads");
+        host.start();
+        let mut port = Port {
+            host,
+            cache: NO_STORES,
+            procs: HashMap::new(),
+            retained: HashMap::new(),
+            handles: HashMap::new(),
+            sessions: HashMap::new(),
+            put: HashSet::new(),
+            pressure: [Reading::default(); 2],
+            pressed: [false; 2],
+            offloaded: HashMap::new(),
+            loaded: (name.to_string(), component.to_vec()),
+            version: 0,
+        };
+        for event in events {
+            port.apply(event);
+            // The host's tree has each live working set once it wrote.
+            port.put_working_sets();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while port.host.heard() < port.host.reported() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the policy heard every report"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let delta = port.host.poll_delta();
+        port.enact(delta);
+        port.host.stop();
     }
 }

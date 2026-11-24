@@ -709,10 +709,19 @@ impl Port {
                 Some(Value::Text(role.into())),
             );
             self.host.attr(
-                Subject::Worker(id),
+                Subject::Worker(id.clone()),
                 "pie/model",
                 Some(Value::Text(worker.model.clone())),
             );
+            // It serves other workers' passes: a helper the default cluster
+            // policy names.
+            let listen = view
+                .links
+                .iter()
+                .find(|(w, _)| *w == worker.id)
+                .map(|(_, link)| Value::Text(link.clone()));
+            self.host
+                .attr(Subject::Worker(id), "pie/prefill-listen", listen);
             now.insert(worker.id);
         }
         // A pool is a worker without a device tier: it keeps what it is sent
