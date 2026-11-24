@@ -130,6 +130,29 @@ fn kv(plan: &Plan, kind: LayerKind) -> (u32, u32) {
     }
 }
 
+/// Code a weight image links to beside its anchor's where a plan's comptime sizes take another
+/// path ([`Anchor::code`]): `bytes` where `on` holds of the plan and not of the anchor's (less
+/// where the anchor's held and the plan's does not).
+pub struct Code {
+    pub what: &'static str,
+    pub on: fn(&Plan) -> bool,
+    /// Whether the anchor's plan takes the path.
+    pub anchor: bool,
+    pub bytes: f64,
+}
+
+impl Code {
+    /// The bytes `plan`'s weight image takes past (or short of) the anchor's for this path.
+    #[must_use]
+    pub fn over(&self, plan: &Plan) -> f64 {
+        match ((self.on)(plan), self.anchor) {
+            (true, false) => self.bytes,
+            (false, true) => -self.bytes,
+            _ => 0.0,
+        }
+    }
+}
+
 /// A kernel set's program as the linker measured it: its weight and head images' bytes, the
 /// least stack room of its other images, and its plan's moving bytes. A kernel change that moves
 /// code or buffers re-measures them.
@@ -142,6 +165,8 @@ pub struct Anchor {
     /// Whether the head's bytes follow [`Moving::head`] (the column head); the grouped and band
     /// heads stay as measured.
     pub head_moves: bool,
+    /// The weight image's code paths that move with the plan.
+    pub code: &'static [Code],
 }
 
 /// The anchor a model's plans are measured off: its kernel set's.
@@ -158,7 +183,8 @@ pub fn anchor(shape: &Shape) -> &'static Anchor {
 #[must_use]
 pub fn room(plan: &Plan, anchor: &Anchor) -> f64 {
     let m = Moving::of(plan);
-    let weight = PE_BYTES - (anchor.weight_used + m.weight - anchor.moving.weight);
+    let code: f64 = anchor.code.iter().map(|c| c.over(plan)).sum();
+    let weight = PE_BYTES - (anchor.weight_used + m.weight - anchor.moving.weight + code);
     let head = if anchor.head_moves {
         PE_BYTES - (anchor.head_used + m.head - anchor.moving.head)
     } else {

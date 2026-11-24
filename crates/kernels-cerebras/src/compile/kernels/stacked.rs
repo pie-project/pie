@@ -242,6 +242,27 @@ fn store_pe(pe: &Pe) -> R<Vec<u32>> {
     Ok(w)
 }
 
+/// The sliding window the weight kernel masks its entries by (`WIN`): 0 where the sliding ring
+/// (its entries over the KV rows) is the window exactly.
+#[must_use]
+pub fn masked_window(plan: &crate::compile::plan::Plan) -> u32 {
+    let p = &plan.partition;
+    let window = plan
+        .shape
+        .layers
+        .iter()
+        .find_map(|l| match *l {
+            LayerKind::Sliding { window } => Some(window),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if p.kv_entries.sliding.unwrap_or(0) * p.kv_rows == window {
+        0
+    } else {
+        window
+    }
+}
+
 /// The units' kernels of a Gemma program, their params from the plan: the KV-owning units' `SH` /
 /// `Ic` (the sharers' are [`shared_kv::SharedKv`]'s overrides).
 pub fn kernels(prog: &Program) -> R<Kernels> {
@@ -256,14 +277,6 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
     let hdg = s.attn.global_head_dim.unwrap_or(hds);
     let (dcs, dcg) = (hds / (p.cols / 2), hdg / (p.cols / 2));
     let ic = s.mlp.intermediate / p.cols;
-    let window = s
-        .layers
-        .iter()
-        .find_map(|l| match *l {
-            LayerKind::Sliding { window } => Some(window),
-            _ => None,
-        })
-        .unwrap_or(0);
     let nes = p.kv_entries.sliding.unwrap_or(0);
     let neg = p.kv_entries.global.unwrap_or(0);
     let mut out = Kernels::new();
@@ -286,7 +299,7 @@ pub fn kernels(prog: &Program) -> R<Kernels> {
                 PYW: p.kv_rows,
                 HDS: hds,
                 HDG: hdg,
-                WIN: if nes * p.kv_rows == window { 0 } else { window },
+                WIN: masked_window(plan),
                 WSPEC: 0,
                 PLOG: 0,
                 DIAG: 0,

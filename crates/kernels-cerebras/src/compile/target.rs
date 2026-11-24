@@ -571,6 +571,25 @@ mod tests {
         assert!(e.contains("the search found no partition"), "{e}");
     }
 
+    /// The shared kernels' weight image links to more code where its KV rows are not a power of
+    /// two and its sliding ring masks the window: Gemma 4 E2B's 96 rows (1280 B of room by the
+    /// tiles alone, 128 B as linked) find no partition, and its search keeps 128 rows.
+    #[test]
+    fn a_shared_weight_image_counts_its_code_paths() {
+        let p = searched("gemma4-e2b-bf16-kv-bf16").plan;
+        assert!(
+            p.partition.kv_rows.is_power_of_two(),
+            "{}",
+            p.partition.kv_rows
+        );
+        let ask = Ask {
+            set: "PY=96,NEG=43".into(),
+            ..Ask::default()
+        };
+        let e = plan(&trace("gemma4-e2b-bf16-kv-bf16"), &ask).unwrap_err();
+        assert!(e.contains("the search found no partition"), "{e}");
+    }
+
     /// A head whose vocabulary groups hold fewer ids than the vocabulary is refused.
     #[test]
     fn a_head_short_of_the_vocabulary_is_refused() {
