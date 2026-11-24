@@ -706,7 +706,15 @@ pub fn save_rates(
 /// a row agree within [`engine::rates::AGREEMENT`] (`engine::rates::warm_up`),
 /// the clock the device holds under load (an idle DVFS clock ramped up, a
 /// brief boost fallen back); else one timed point.
-pub fn clock_rate(device: &Context, profile: profile::Profile, settled: bool) -> Result<f64, String> {
+/// `yield_to`, behind serving: read before each frame of it, an arrival
+/// stopping it with [`YIELDED`] (the settled read's warm-up alone runs
+/// about 120 ms on the M1 Max).
+pub fn clock_rate(
+    device: &Context,
+    profile: profile::Profile,
+    settled: bool,
+    yield_to: Option<&dyn Fn() -> bool>,
+) -> Result<f64, String> {
     const SIDE: u32 = 1024;
     let tuning = Tuning::new(profile, false, device.cores()).with_family(device.family());
     let bench = Bench {
@@ -715,7 +723,7 @@ pub fn clock_rate(device: &Context, profile: profile::Profile, settled: bool) ->
         pipelines: Pipelines::new(),
         tuning: &tuning,
         pattern: engine::rates::operand_pattern(),
-        yield_to: None,
+        yield_to,
         launch: std::cell::Cell::new(None),
         last_fire: std::cell::Cell::new(0.0),
     };
