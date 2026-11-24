@@ -1406,6 +1406,11 @@ pub struct Step {
     pub media: Vec<StepMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub voxels: Vec<StepVoxels>,
+    /// The stated shape the step is of (CONTRACT-BC 24), set by the runtime
+    /// as it forms the step: always one of the load's stated set. `None`
+    /// only on a fire built by hand (a test, a load stating no set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<crate::shapes::FireShape>,
 }
 
 impl Step {
@@ -1557,6 +1562,23 @@ impl FrameSubmission {
             step.validate_for(serves)?;
         }
         Ok(())
+    }
+
+    /// Debug builds: each step's carried shape is the one the load's stated
+    /// set (`stated`) holds its lanes in ([`crate::StepShapes::agrees`]), an
+    /// engine's cheap cross-check of the runtime's stamp; a step carrying
+    /// none (built by hand) is not checked. Release builds check nothing.
+    pub fn debug_check_shapes(&self, stated: &crate::StatedSteps) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        for (at, step) in self.steps.iter().enumerate() {
+            if let Some(shape) = step.shape
+                && let Err(why) = stated.shapes.agrees(shape, &step.lanes)
+            {
+                panic!("step {at} of a frame: {why}");
+            }
+        }
     }
 }
 

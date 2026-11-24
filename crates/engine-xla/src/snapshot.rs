@@ -150,6 +150,7 @@ pub fn pieces(
                     attachments: Vec::new(),
                     media: Vec::new(),
                     voxels: Vec::new(),
+                    shape: None,
                 },
                 copies,
             });

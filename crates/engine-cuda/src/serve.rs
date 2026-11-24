@@ -1,4 +1,5 @@
 mod arming;
+mod behind;
 mod boot;
 pub(crate) mod btrace;
 pub mod diag;
@@ -251,6 +252,9 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
+    /// What this load serves from figures stored under a stale key and
+    /// times again behind serving (`Engine::measure_behind`).
+    behind: behind::Behind,
     /// What this load timed, each by name (`engine::Engine::measured_at_load`):
     /// the device's rates where no layer stated them, the decode products'
     /// times (`[rates] product_ns`) where the profile held none, and the
@@ -440,6 +444,7 @@ impl Shell {
                     attachments: &[],
                     media: &[],
                     voxels: &[],
+                    shape: None,
                 },
                 None,
             )?;
@@ -1296,6 +1301,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels,
+                shape: None,
             },
             None,
         )?;
@@ -1321,6 +1327,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels: &[],
+                shape: None,
             },
             None,
         )?;
@@ -1343,6 +1350,7 @@ impl Shell {
             attachments,
             media,
             voxels: &[],
+            shape: None,
         })
     }
 
@@ -1359,6 +1367,7 @@ impl Shell {
             attachments: &[],
             media,
             voxels,
+            shape: None,
         })
     }
 
@@ -1385,6 +1394,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels: &[],
+                shape: None,
             },
             None,
         )?;
@@ -1436,6 +1446,11 @@ pub struct StepView<'a> {
     pub attachments: &'a [Attached],
     pub media: &'a [Media<'a>],
     pub voxels: &'a [Clips<'a>],
+    /// The stated shape the runtime stamped the step with (CONTRACT-BC 24):
+    /// what treatment its body keys and the bucket a buffering step with a
+    /// prompt's rows composes at are read from. `None` on a fire built by
+    /// hand (arming's, a test's): read from its lanes.
+    pub shape: Option<engine::FireShape>,
 }
 
 #[derive(Debug, Default, Clone)]

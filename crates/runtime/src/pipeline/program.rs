@@ -63,6 +63,15 @@ pub struct RegisteredProgram {
     pub compiled_stages: Vec<CompiledStage>,
     emitted: Mutex<HashMap<Backend, Arc<EmittedProgram>>>,
     pub channel_accesses: Vec<(bool, bool)>,
+    /// The channels declared at [`RegisteredProgram::row_bound`] rather than
+    /// a request's length (`TraceContainer::row_extent_channels`): an
+    /// instance's channel there carries its own rows, which the host
+    /// resolves the ports from; its engine cell is the bound wide
+    /// ([`fit_row_extent`]), and no fire reads it.
+    pub row_extents: Vec<bool>,
+    /// The most rows one fire binds, which a row-extent channel is declared
+    /// at: the served model's `model.max-pass-rows()`.
+    pub row_bound: u32,
     /// The outputs it reads, by name and the lane reading each.
     pub reads: Vec<(String, u32)>,
     launch: std::sync::OnceLock<LaunchPackage>,
@@ -153,6 +162,41 @@ impl std::error::Error for RegisterError {}
 
 pub const DEFAULT_CAPACITY: usize = 256;
 
+/// What a row-extent channel's engine cell holds past an instance's own
+/// rows: every byte set (`-1` as an `i32` token, `u32::MAX` as a position or
+/// slot).
+pub const ROW_PAD: u8 = 0xff;
+
+/// An instance's row-extent channel as its engine cell holds it: `bytes`
+/// of `elem`-byte rows, cut or padded with [`ROW_PAD`] to the `rows` the
+/// program declares it at. The cell is the program's, never read by a fire:
+/// its program's geometry is the host's, resolved from the instance's own
+/// rows (a bind of it in another class is refused by name), so a prompt
+/// longer than the bound loses nothing.
+#[must_use]
+pub fn fit_row_extent(mut bytes: Vec<u8>, elem: usize, rows: u32) -> Vec<u8> {
+    bytes.resize(rows as usize * elem, ROW_PAD);
+    bytes
+}
+
+/// A program's identity: `bytes` with each row-extent channel declared at
+/// `rows` ([`TraceContainer::bind_row_extents`]), so programs that differ
+/// only in a request's length are one; and which channels those are. `None`
+/// keeps every extent (a float pass, which counts its rows from its
+/// channels' lengths).
+fn identity(bytes: Vec<u8>, rows: Option<u32>) -> Result<(Vec<u8>, Vec<bool>), RegisterError> {
+    let Some(rows) = rows else {
+        return Ok((bytes, Vec::new()));
+    };
+    let mut decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
+    let row_extents = decoded.bind_row_extents(rows);
+    if row_extents.contains(&true) {
+        Ok((decoded.encode(), row_extents))
+    } else {
+        Ok((bytes, row_extents))
+    }
+}
+
 /// Who registered a program: a guest process, or the runtime itself
 /// (`None`: the standard samplers).
 pub type Tenant = Option<uuid::Uuid>;
@@ -163,6 +207,10 @@ pub struct Registry {
     /// of the registry one tenant's registrations may churn
     /// ([`Registry::make_room`]).
     owners: HashMap<u64, Tenant>,
+    /// Programs registered anew, and registrations that found one held:
+    /// the model status's `programs.registered` / `programs.found`.
+    registered: u64,
+    found: u64,
 }
 
 impl Registry {
@@ -170,6 +218,8 @@ impl Registry {
         Self {
             inner: LruCache::new(capacity),
             owners: HashMap::new(),
+            registered: 0,
+            found: 0,
         }
     }
 
@@ -224,13 +274,28 @@ impl Registry {
         caps: EngineCaps,
         budget: Budget,
         tenant: Tenant,
+        rows: Option<u32>,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
+        let (bytes, row_extents) = identity(bytes, rows)?;
         let hash = program_hash(&bytes);
         if let Some(hit) = self.hit(hash, &bytes, &lanes)? {
             return Ok(hit);
         }
-        let entry = Arc::new(RegisteredProgram::build(bytes, hash, lanes, caps, budget)?);
+        let entry = Arc::new(RegisteredProgram::build(
+            bytes,
+            hash,
+            lanes,
+            caps,
+            budget,
+            (row_extents, rows.unwrap_or(0)),
+        )?);
         Ok(self.insert(entry, tenant))
+    }
+
+    /// Programs registered anew, and registrations that found one held.
+    #[must_use]
+    pub fn counts(&self) -> (u64, u64) {
+        (self.registered, self.found)
     }
 
     fn hit(
@@ -246,7 +311,9 @@ impl Registry {
             return Err(RegisterError::HashCollision(hash));
         }
         check_outputs(&hit.bound.container, lanes).map_err(RegisterError::Bind)?;
-        Ok(Some(hit.clone()))
+        let hit = hit.clone();
+        self.found += 1;
+        Ok(Some(hit))
     }
 
     /// A program another caller registered meanwhile wins, so every caller
@@ -255,10 +322,26 @@ impl Registry {
     fn insert(&mut self, entry: Arc<RegisteredProgram>, tenant: Tenant) -> Arc<RegisteredProgram> {
         if let Some(raced) = self.inner.get(&entry.hash) {
             if raced.bytes == entry.bytes {
-                return raced.clone();
+                let raced = raced.clone();
+                self.found += 1;
+                return raced;
             }
         }
         self.make_room(tenant);
+        self.registered += 1;
+        tracing::debug!(
+            target: "pie::program",
+            hash = format_args!("0x{:016x}", entry.hash),
+            channels = ?entry
+                .bound
+                .container
+                .channels
+                .iter()
+                .map(|decl| decl.shape)
+                .collect::<Vec<_>>(),
+            row_extents = ?entry.row_extents,
+            "registered a program anew"
+        );
         self.inner.put(entry.hash, entry.clone());
         self.owners.insert(entry.hash, tenant);
         entry
@@ -331,6 +414,7 @@ impl RegisteredProgram {
         lanes: Vec<Vec<OutputDecl>>,
         caps: EngineCaps,
         budget: Budget,
+        (row_extents, row_bound): (Vec<bool>, u32),
     ) -> Result<Self, RegisterError> {
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
         let pricing = price(&decoded)?;
@@ -357,6 +441,8 @@ impl RegisteredProgram {
             bound,
             compiled_stages,
             channel_accesses,
+            row_extents,
+            row_bound,
             reads,
             launch: std::sync::OnceLock::new(),
             geometry_taint: std::sync::OnceLock::new(),
@@ -439,17 +525,28 @@ fn global() -> MutexGuard<'static, Registry> {
     GLOBAL.lock().expect("global lock poisoned")
 }
 
+/// Registers `bytes` for the served model. `rows` is the most rows one of
+/// its fires binds (`model.max-pass-rows()`), which a row-extent channel is
+/// declared at ([`identity`]); `None` for a float pass.
 pub fn register(
     bytes: Vec<u8>,
     lanes: Vec<Vec<OutputDecl>>,
     tenant: Tenant,
+    rows: Option<u32>,
 ) -> Result<Arc<RegisteredProgram>, RegisterError> {
     let eta = crate::model::model().eta_caps();
     let caps = EngineCaps {
         lora: eta.has_lora,
         attn_page_mask: eta.has_attn_page_mask,
     };
-    register_with(bytes, lanes, caps, eta.budget, tenant)
+    register_with(bytes, lanes, caps, eta.budget, tenant, rows)
+}
+
+/// Programs the process registered anew since boot, and registrations that
+/// found one held ([`Registry::counts`]).
+#[must_use]
+pub fn counts() -> (u64, u64) {
+    global().counts()
 }
 
 /// Decode, bind and compile run outside the global lock, so a slow or refused
@@ -460,12 +557,21 @@ fn register_with(
     caps: EngineCaps,
     budget: Budget,
     tenant: Tenant,
+    rows: Option<u32>,
 ) -> Result<Arc<RegisteredProgram>, RegisterError> {
+    let (bytes, row_extents) = identity(bytes, rows)?;
     let hash = program_hash(&bytes);
     if let Some(hit) = global().hit(hash, &bytes, &lanes)? {
         return Ok(hit);
     }
-    let entry = Arc::new(RegisteredProgram::build(bytes, hash, lanes, caps, budget)?);
+    let entry = Arc::new(RegisteredProgram::build(
+        bytes,
+        hash,
+        lanes,
+        caps,
+        budget,
+        (row_extents, rows.unwrap_or(0)),
+    )?);
     Ok(global().insert(entry, tenant))
 }
 
@@ -624,6 +730,7 @@ mod budget_tests {
                 EngineCaps::default(),
                 budget,
                 None,
+                None,
             )
             .unwrap_err();
         assert!(
@@ -641,7 +748,7 @@ mod budget_tests {
         assert_eq!(registry.inner.len(), 0, "a refused program is not held");
 
         let fits = registry
-            .register(broadcast(Shape::vector(4096)), vec![], EngineCaps::default(), budget, None)
+            .register(broadcast(Shape::vector(4096)), vec![], EngineCaps::default(), budget, None, None)
             .expect("a 16 KiB prologue registers");
         assert_eq!(fits.bound.budget, Some(budget));
     }
@@ -693,7 +800,7 @@ mod tenant_tests {
         let (a, b): (Tenant, Tenant) = (Some(uuid::Uuid::from_u128(1)), Some(uuid::Uuid::from_u128(2)));
         let register = |registry: &mut Registry, n: u32, tenant: Tenant| {
             registry
-                .register(program(n), vec![], EngineCaps::default(), ROOM, tenant)
+                .register(program(n), vec![], EngineCaps::default(), ROOM, tenant, None)
                 .expect("registers");
         };
         for n in 1..=4 {
@@ -738,7 +845,7 @@ mod tenant_tests {
             submit: None,
         };
         let refused = registry
-            .register(bytes, vec![], EngineCaps::default(), room, None)
+            .register(bytes, vec![], EngineCaps::default(), room, None, None)
             .unwrap_err();
         assert!(
             matches!(
@@ -772,7 +879,7 @@ mod register_tests {
             }],
             ..TraceContainer::default()
         };
-        let err = register_with(bad.encode(), vec![], EngineCaps::default(), ROOM, None)
+        let err = register_with(bad.encode(), vec![], EngineCaps::default(), ROOM, None, None)
             .unwrap_err();
         assert!(
             matches!(err, RegisterError::Bind(ValidateError::Body { .. })),
@@ -780,9 +887,155 @@ mod register_tests {
         );
         assert!(err.to_string().contains('5'), "{err}");
         let good = TraceContainer::default();
-        let hash = register_with(good.encode(), vec![], EngineCaps::default(), ROOM, None)
+        let hash = register_with(good.encode(), vec![], EngineCaps::default(), ROOM, None, None)
             .expect("a valid program registers after a refused one")
             .hash;
         assert!(super::lookup(hash).is_some());
+    }
+}
+
+#[cfg(test)]
+mod row_extent_tests {
+    use super::{ROW_PAD, Registry, fit_row_extent};
+    use eta_ir::container::{
+        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
+    use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
+    use eta_ir::validate::Budget;
+    use std::num::NonZeroUsize;
+
+    /// The rows one fire binds.
+    const ROWS: u32 = 2048;
+    const ROOM: Budget = Budget {
+        room_bytes: u64::MAX,
+        submit: None,
+    };
+
+    /// A seeded channel a port reads, as the SDK declares it: a host writer
+    /// whose seed is its latest value.
+    fn seeded(n: u32, dtype: Dtype) -> ChannelDecl {
+        ChannelDecl {
+            shape: Shape::vector(n),
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role: HostRole::Writer,
+            seeded: true,
+        }
+    }
+
+    /// A prefill of `len` prompt tokens as the built-in `prefill` program
+    /// channels it (`Channel::from(&tokens[..])`, `Channel::from([0, len])`).
+    fn prefill(len: u32) -> TraceContainer {
+        TraceContainer {
+            channels: vec![seeded(len, Dtype::I32), seeded(2, Dtype::U32)],
+            ports: vec![
+                PortBinding {
+                    port: Port::EmbedTokens,
+                    source: PortSource::Channel(0),
+                },
+                PortBinding {
+                    port: Port::EmbedIndptr,
+                    source: PortSource::Channel(1),
+                },
+            ],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![],
+            }],
+            ..TraceContainer::default()
+        }
+    }
+
+    fn logits() -> Vec<Vec<OutputDecl>> {
+        vec![vec![OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
+            width: 16,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        }]]
+    }
+
+    fn register(
+        registry: &mut Registry,
+        container: &TraceContainer,
+        rows: Option<u32>,
+    ) -> std::sync::Arc<super::RegisteredProgram> {
+        registry
+            .register(container.encode(), logits(), EngineCaps::default(), ROOM, None, rows)
+            .expect("registers")
+    }
+
+    /// One program at every prompt length: the first registration of the
+    /// prefill registers it, with the tokens' channel declared at the row
+    /// bound, and every later length finds it. Nothing else of the program
+    /// moves: the indptr keeps its two words.
+    #[test]
+    fn one_program_registers_once_across_prompt_lengths() {
+        let mut registry = Registry::new(NonZeroUsize::new(8).unwrap());
+        let programs: Vec<_> = [37u32, 300, 1500, 1, ROWS, 3 * ROWS + 5]
+            .into_iter()
+            .map(|len| register(&mut registry, &prefill(len), Some(ROWS)))
+            .collect();
+        assert!(programs.iter().all(|program| program.hash == programs[0].hash));
+        assert_eq!(registry.counts(), (1, 5), "registered once, found five times");
+        let program = &programs[0];
+        assert_eq!(program.row_extents, vec![true, false]);
+        assert_eq!(program.row_bound, ROWS);
+        let channels = &program.bound.container.channels;
+        assert_eq!(channels[0].shape, Shape::vector(ROWS), "the tokens at the bound");
+        assert_eq!(channels[1].shape, Shape::vector(2), "the indptr as declared");
+        // The control: registered keeping every extent, each length is its
+        // own program.
+        let mut keeping = Registry::new(NonZeroUsize::new(8).unwrap());
+        let hashes: std::collections::BTreeSet<u64> = [37u32, 300, 1500]
+            .into_iter()
+            .map(|len| register(&mut keeping, &prefill(len), None).hash)
+            .collect();
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(keeping.counts(), (3, 0));
+    }
+
+    /// A channel an op reads keeps its length: its shape is what the stage
+    /// computes on, part of the program's code. So does an unseeded
+    /// host-written one (a writer's every put is one length for the
+    /// program's life).
+    #[test]
+    fn a_length_the_code_reads_stays_in_the_identity() {
+        let read = |len: u32| {
+            let mut container = prefill(len);
+            container.stages[0].ops.push(eta_ir::op::Op::ChanRead(0));
+            container
+        };
+        assert_eq!(read(3).row_extent_channels(), vec![false, false]);
+        let mut registry = Registry::new(NonZeroUsize::new(8).unwrap());
+        let a = register(&mut registry, &read(3), Some(ROWS)).hash;
+        let b = register(&mut registry, &read(5), Some(ROWS)).hash;
+        assert_ne!(a, b);
+
+        let written = |len: u32| {
+            let mut container = prefill(len);
+            container.channels[0].seeded = false;
+            container
+        };
+        assert_eq!(written(3).row_extent_channels(), vec![false, false]);
+    }
+
+    /// An engine cell is the bound wide: a seed padded with `ROW_PAD` to
+    /// it, one longer cut to it (the host keeps every row).
+    #[test]
+    fn a_seed_fits_the_row_bound() {
+        let seed: Vec<u8> = [5i32, 6, 7].iter().flat_map(|t| t.to_le_bytes()).collect();
+        let rows = |bytes: Vec<u8>| -> Vec<u32> {
+            bytes
+                .chunks(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        };
+        let pad = u32::from_le_bytes([ROW_PAD; 4]);
+        assert_eq!(rows(fit_row_extent(seed.clone(), 4, 5)), vec![5, 6, 7, pad, pad]);
+        assert_eq!(rows(fit_row_extent(seed, 4, 2)), vec![5, 6]);
     }
 }

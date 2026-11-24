@@ -1649,7 +1649,24 @@ impl Pools {
         settled: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
-        self.fit(bodies, programs, settled, false, resident)
+        let whole = self.stated_whole();
+        self.fit(bodies, programs, settled, false, whole, resident)
+    }
+
+    /// [`Pools::fit_the_card`] for a pool then stated whole
+    /// ([`Pools::state_whole`]): the fit leaves the card room to back the
+    /// state's chunks in the segment the activation starts in beside the
+    /// chunks it fits, since the runtime counts that segment committed from
+    /// the load ([`chunks::Chunks::hold_boundary`]).
+    pub fn fit_to_state_whole(
+        &mut self,
+        bodies: u64,
+        programs: u64,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Fitted> {
+        let fitted = self.fit(bodies, programs, false, false, true, resident)?;
+        self.state_whole();
+        Ok(fitted)
     }
 
     /// The load's last fit, once everything it puts on the device is there
@@ -1676,7 +1693,7 @@ impl Pools {
         // back first: the fit reads the card without it.
         self.chunks
             .clear_past_parting(&mut self.pool, self.contiguous)?;
-        let fitted = self.fit(bodies, programs, settled, true, resident)?;
+        let fitted = self.fit(bodies, programs, settled, true, false, resident)?;
         self.chunks
             .state_fitted(self.fitted_chunks(), self.contiguous)?;
         Ok(fitted)
@@ -1690,12 +1707,16 @@ impl Pools {
         self.contiguous = true;
     }
 
+    /// `whole`: the pool is stated whole past this fit, so the state's
+    /// chunks of the segment the activation starts in are backed whatever
+    /// it fits ([`chunks::Chunks::boundary_unbacked_bytes`]).
     fn fit(
         &mut self,
         bodies: u64,
         programs: u64,
         settled: bool,
         placed: bool,
+        whole: bool,
         resident: &dyn core::fmt::Display,
     ) -> Result<Fitted> {
         // What the load dropped and the process keeps for reuse is free
@@ -1858,9 +1879,15 @@ impl Pools {
             let have = growth_room(free, unbacked, held, page);
             let mut fitted = fitted;
             while fitted > least {
+                let boundary = if whole {
+                    self.chunks.boundary_unbacked_bytes(fitted).div_ceil(page)
+                } else {
+                    0
+                };
                 let growth = self
                     .chunks
-                    .growth_for(fitted, placed.then_some(self.contiguous))?;
+                    .growth_for(fitted, placed.then_some(self.contiguous))?
+                    .saturating_add(boundary);
                 if growth <= have {
                     break;
                 }

@@ -67,6 +67,18 @@ pub struct Routes {
     /// Banks answered by one kernel whatever is measured: a probe's table
     /// while it times a body under each choice ([`Routes::forcing`]).
     forced: HashMap<(u32, u32, u32), u32>,
+    /// The entries of `times` that are estimates: figures stored under a
+    /// stale key (`profile::fire::Rates::stale`), served as they stand
+    /// ([`Routes::estimating`]).
+    estimated: std::collections::HashSet<((u32, u32, u32), u32)>,
+    /// The shapes [`Routes::pick`] answered by an estimate since the last
+    /// call of [`Routes::behind`].
+    behind: Mutex<BTreeMap<Shape, Wanted>>,
+    /// Each bank's kernel as [`Routes::pick`] last answered it, shared with
+    /// the tables a load's measuring lays over this one ([`Routes::with`]),
+    /// not with a probe's ([`Routes::forcing`]): what the load's bodies
+    /// were armed under ([`Routes::fingerprint`]).
+    picked: std::sync::Arc<Mutex<BTreeMap<(u32, u32, u32), u32>>>,
 }
 
 impl Routes {
@@ -83,6 +95,31 @@ impl Routes {
         Self { times: table, ..Self::default() }
     }
 
+    /// The table `measured` states, each entry it lacks answered by
+    /// `estimates` (figures stored under a stale key): served as they
+    /// stand, and noted where a pick reads one ([`Routes::behind`]) so the
+    /// load says which banks serve by them.
+    #[must_use]
+    pub fn estimating(
+        measured: &[crate::fire::ProductTime],
+        estimates: &[crate::fire::ProductTime],
+    ) -> Self {
+        let mut routes = Self::of(measured);
+        for (at, time) in Self::of(estimates).times {
+            if let std::collections::hash_map::Entry::Vacant(entry) = routes.times.entry(at) {
+                entry.insert(time);
+                routes.estimated.insert(at);
+            }
+        }
+        routes
+    }
+
+    /// How many entries of the table are estimates.
+    #[must_use]
+    pub fn estimates(&self) -> usize {
+        self.estimated.len()
+    }
+
     /// The table that answers `kernel` for every shape: what a probe (or a
     /// test) runs a product under to time (or check) it on that kernel,
     /// through the path a body takes.
@@ -95,9 +132,21 @@ impl Routes {
     /// the candidate measured fastest where it beats the stated kernel by
     /// more than either measurement's spread, else the stated kernel. Where
     /// a candidate is unmeasured, `weight` is noted for [`Routes::wanted`]
-    /// and the stated kernel serves. A forced or test table answers its
+    /// and the stated kernel serves; unless the bank holds an estimate
+    /// ([`Routes::estimating`]): then the candidates stated serve by the
+    /// same rule, and `weight` is noted for [`Routes::behind`]. A forced or
+    /// test table answers its
     /// kernel where it is a candidate.
     pub fn pick(&self, shape: Shape, weight: u64, candidates: &[u32]) -> u32 {
+        let kernel = self.choose(shape, weight, candidates);
+        self.picked
+            .lock()
+            .expect("routes lock poisoned")
+            .insert((shape.rows, shape.k, shape.m), kernel);
+        kernel
+    }
+
+    fn choose(&self, shape: Shape, weight: u64, candidates: &[u32]) -> u32 {
         let Some(&stated) = candidates.first() else {
             return 0;
         };
@@ -111,54 +160,44 @@ impl Routes {
         {
             return kernel;
         }
-        let time = |kernel| self.times.get(&((shape.rows, shape.k, shape.m), kernel)).copied();
-        let measured: Option<Vec<(u32, f64, f64)>> = candidates
+        let bank = (shape.rows, shape.k, shape.m);
+        let time = |kernel| self.times.get(&(bank, kernel)).copied();
+        let known: Vec<(u32, f64, f64)> = candidates
             .iter()
-            .map(|&kernel| time(kernel).map(|(_, ns, spread)| (kernel, ns, spread)))
+            .filter_map(|&kernel| time(kernel).map(|(_, ns, spread)| (kernel, ns, spread)))
             .collect();
-        let Some(measured) = measured else {
-            let mut wanted = self.wanted.lock().expect("routes lock poisoned");
-            // One note a bank shape, under the kind first met.
-            let at = wanted
-                .keys()
-                .find(|s| (s.rows, s.k, s.m) == (shape.rows, shape.k, shape.m))
-                .copied()
-                .unwrap_or(shape);
-            let noted = wanted.entry(at).or_default();
-            if !noted.weights.contains(&weight) {
-                noted.weights.push(weight);
-            }
-            if noted.candidates.is_empty() {
-                noted.candidates = candidates.to_vec();
-            }
+        let estimated = candidates.iter().any(|&kernel| self.estimated.contains(&(bank, kernel)));
+        if known.len() < candidates.len() && !estimated {
+            note(&self.wanted, shape, weight, candidates);
+            return stated;
+        }
+        // Every candidate measured; or the bank has estimates (figures
+        // stored under a stale key), which serve as they stand, a candidate
+        // none states (its code changed) not taken, and the bank is noted
+        // as served by stale figures.
+        if estimated {
+            note(&self.behind, shape, weight, candidates);
+        }
+        let Some(&(_, stated_ns, stated_spread)) = known.iter().find(|&&(kernel, ..)| kernel == stated)
+        else {
             return stated;
         };
-        let (_, stated_ns, stated_spread) = measured[0];
-        measured
+        known
             .iter()
-            .skip(1)
-            .filter(|&&(_, ns, spread)| stated_ns - ns > spread.max(stated_spread))
+            .filter(|&&(kernel, ns, spread)| kernel != stated && stated_ns - ns > spread.max(stated_spread))
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map_or(stated, |&(kernel, ..)| kernel)
     }
 
-    /// A fingerprint of what every [`Routes::pick`] answers by: each
-    /// measured time (its shape, kernel, kind, time and spread, in a fixed
-    /// order), the one kernel a test's table answers and every forced bank.
-    /// Two tables with the same fingerprint pick alike.
+    /// A fingerprint of the kernel each bank was picked (the last
+    /// [`Routes::pick`] of each, over this table and the tables it was laid
+    /// over by measuring), with the one kernel a test's table answers: two
+    /// loads that armed their bodies under the same picks share it, whatever
+    /// figures (measured or estimated) chose them.
     #[must_use]
     pub fn fingerprint(&self) -> u32 {
-        let mut times: Vec<_> = self
-            .times
-            .iter()
-            .map(|(&(shape, kernel), &(kind, ns, spread))| {
-                (shape, kernel, kind as u32, ns.to_bits(), spread.to_bits())
-            })
-            .collect();
-        times.sort_unstable();
-        let mut forced: Vec<_> = self.forced.iter().map(|(&shape, &k)| (shape, k)).collect();
-        forced.sort_unstable();
-        crate::fire::fingerprint(format!("{times:?}|{:?}|{forced:?}", self.all).as_bytes())
+        let picked = self.picked.lock().expect("routes lock poisoned").clone();
+        crate::fire::fingerprint(format!("{picked:?}|{:?}", self.all).as_bytes())
     }
 
     /// The shapes [`Routes::pick`] met unmeasured since the last call, with
@@ -167,14 +206,25 @@ impl Routes {
         std::mem::take(&mut *self.wanted.lock().expect("routes lock poisoned"))
     }
 
-    /// The table with `measured` laid over it.
+    /// The shapes [`Routes::pick`] answered by an estimate since the last
+    /// call, with their weights and candidates: the banks a load serves by
+    /// stale figures. The notes are cleared.
+    pub fn behind(&self) -> BTreeMap<Shape, Wanted> {
+        std::mem::take(&mut *self.behind.lock().expect("routes lock poisoned"))
+    }
+
+    /// The table with `measured` laid over it (each measured entry no
+    /// longer an estimate).
     #[must_use]
     pub fn with(&self, measured: &[(Shape, u32, f64, f64)]) -> Self {
         let mut times = self.times.clone();
+        let mut estimated = self.estimated.clone();
         for &(shape, kernel, ns, spread) in measured {
-            times.insert(((shape.rows, shape.k, shape.m), kernel), (shape.kind, ns, spread));
+            let at = ((shape.rows, shape.k, shape.m), kernel);
+            times.insert(at, (shape.kind, ns, spread));
+            estimated.remove(&at);
         }
-        Self { times, ..Self::default() }
+        Self { times, estimated, picked: self.picked.clone(), ..Self::default() }
     }
 
     /// The table with `shape`'s bank answered by `kernel`, whatever is
@@ -183,7 +233,30 @@ impl Routes {
     pub fn forcing(&self, shape: Shape, kernel: u32) -> Self {
         let mut forced = self.forced.clone();
         forced.insert((shape.rows, shape.k, shape.m), kernel);
-        Self { times: self.times.clone(), forced, ..Self::default() }
+        Self {
+            times: self.times.clone(),
+            forced,
+            estimated: self.estimated.clone(),
+            ..Self::default()
+        }
+    }
+}
+
+/// `shape` met with `weight` under `candidates`, noted in `notes` once a
+/// bank shape, under the kind first met.
+fn note(notes: &Mutex<BTreeMap<Shape, Wanted>>, shape: Shape, weight: u64, candidates: &[u32]) {
+    let mut notes = notes.lock().expect("routes lock poisoned");
+    let at = notes
+        .keys()
+        .find(|s| (s.rows, s.k, s.m) == (shape.rows, shape.k, shape.m))
+        .copied()
+        .unwrap_or(shape);
+    let noted = notes.entry(at).or_default();
+    if !noted.weights.contains(&weight) {
+        noted.weights.push(weight);
+    }
+    if noted.candidates.is_empty() {
+        noted.candidates = candidates.to_vec();
     }
 }
 
@@ -252,6 +325,47 @@ mod tests {
         assert_eq!(wanted[&GATE_UP].weights, [0x1000, 0x2000]);
         assert_eq!(wanted[&GATE_UP].candidates, [STATED, OTHER]);
         assert!(routes.wanted().is_empty(), "the notes are taken once");
+    }
+
+    /// A shape the measured table lacks is answered by its stale figures
+    /// (the same pick they made), noted as stale, not
+    /// wanted before ready; once timed it is measured, no longer noted.
+    #[test]
+    fn a_stale_figure_answers_and_is_noted_behind() {
+        let time = |kernel, ns| crate::fire::ProductTime {
+            kind: Kind::NormedGated as u32,
+            rows: GATE_UP.rows,
+            k: GATE_UP.k,
+            m: GATE_UP.m,
+            kernel,
+            ns,
+            spread: 10.0,
+        };
+        let routes = Routes::estimating(&[], &[time(STATED, 9500.0), time(OTHER, 9000.0)]);
+        assert_eq!(routes.pick(GATE_UP, 1, &[STATED, OTHER]), OTHER);
+        assert!(routes.wanted().is_empty(), "nothing before ready");
+        assert_eq!(routes.behind()[&GATE_UP].candidates, [STATED, OTHER]);
+        let timed = routes.with(&[(GATE_UP, STATED, 9400.0, 10.0), (GATE_UP, OTHER, 9100.0, 10.0)]);
+        assert_eq!(timed.pick(GATE_UP, 1, &[STATED, OTHER]), OTHER);
+        assert!(timed.behind().is_empty(), "measured now");
+        // A candidate whose code changed (none states it) is not taken; the
+        // bank serves by its estimates, noted behind.
+        assert_eq!(routes.pick(GATE_UP, 1, &[STATED, THIRD, OTHER]), OTHER);
+        assert!(routes.wanted().is_empty());
+        assert_eq!(routes.behind()[&GATE_UP].candidates, [STATED, THIRD, OTHER]);
+    }
+
+    /// Two tables whose figures differ but pick alike share a fingerprint;
+    /// a probe's forced picks never reach the table it was forced off.
+    #[test]
+    fn the_fingerprint_is_the_picks() {
+        let a = Routes::default().with(&[(GATE_UP, OTHER, 9000.0, 10.0), (GATE_UP, STATED, 9500.0, 10.0)]);
+        let b = Routes::default().with(&[(GATE_UP, OTHER, 8000.0, 10.0), (GATE_UP, STATED, 9600.0, 10.0)]);
+        a.pick(GATE_UP, 1, &[STATED, OTHER]);
+        b.pick(GATE_UP, 1, &[STATED, OTHER]);
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        a.forcing(GATE_UP, STATED).pick(GATE_UP, 1, &[STATED, OTHER]);
+        assert_eq!(a.fingerprint(), b.fingerprint(), "a probe's pick is its own");
     }
 
     #[test]

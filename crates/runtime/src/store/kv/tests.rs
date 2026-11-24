@@ -2664,3 +2664,110 @@ fn a_point_behind_serving_takes_idle_cache_for_its_slots_and_no_more() {
     assert!(taken.seats.is_empty(), "a waiter outranks the point");
     assert_eq!(stores.kv.lock().cached_working_sets().len(), 3, "no cache yielded for it");
 }
+
+/// The reports of one process that exits with `prompt` prompt rows and
+/// `decoded` more, and one that stays live.
+fn an_exit_and_a_live_one(
+    exited: ProcessId,
+    live: ProcessId,
+    prompt: u64,
+    decoded: u64,
+) -> Vec<crate::policy::Event> {
+    use crate::policy::{Arrival, Event, Outcome};
+    vec![
+        Event::Arrived(exited, Arrival::default()),
+        Event::Arrived(live, Arrival::default()),
+        Event::Started(exited),
+        Event::Started(live),
+        Event::Fired(exited, prompt, 1),
+        Event::Fired(exited, decoded, decoded),
+        Event::Fired(live, prompt, 1),
+        Event::Exited(exited, Outcome::Completed),
+    ]
+}
+
+/// A built-in policy, run over `events` and enacted.
+fn run_policy(name: &str, events: Vec<crate::policy::Event>) {
+    let policy = builtins::policy(name).expect("a built-in policy");
+    crate::policy::port::testing::enact(name, policy.component, events);
+}
+
+/// Under the shipped `default` policy the cache an exited process left is
+/// kept on the device alone: when the device wants its room it is dropped,
+/// not demoted, while a live process's set still suspends to the host; a
+/// resting handle's rows are the column's own. Its prompt outranks its
+/// decoded tail (A16). Under `noop` the same cache moves down a tier.
+#[test]
+fn the_default_policy_drops_what_an_exit_left_and_noop_demotes_it() {
+    use crate::policy::retention::{DEVICE, Installed, install};
+    let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();
+    install(None);
+    let (exited, live, handle) = (
+        ProcessId::from_u128(0xdef1),
+        ProcessId::from_u128(0xdef2),
+        ProcessId::from_u128(0xdef3),
+    );
+    let mut events = an_exit_and_a_live_one(exited, live, 32, 16);
+    events.push(crate::policy::Event::HandleRested(
+        handle,
+        crate::policy::Resting {
+            client: 0,
+            tenant: "t".into(),
+            session: None,
+            props: client_api::Props::default(),
+            tokens: 32,
+            folded: 0,
+            slots: 0,
+        },
+    ));
+    run_policy("default", events);
+    assert_eq!(Installed.tiers_at(Some(exited), 0), DEVICE, "kept on the device alone");
+    assert_eq!(Installed.key_at(Some(exited), 31), 0, "the prompt");
+    assert_eq!(Installed.key_at(Some(exited), 32), -1, "the decoded tail goes first");
+    // The column's own, as for an owner nothing names.
+    let own = Installed.tiers_at(Some(ProcessId::from_u128(0xdeff)), 0);
+    assert_eq!(Installed.tiers_at(Some(live), 0), own, "a live set: no row");
+    assert_eq!(Installed.key_at(Some(live), 0), 0);
+    assert_eq!(Installed.tiers_at(Some(handle), 0), own, "a resting handle: no row");
+    assert_eq!(Installed.key_at(Some(handle), 0), 0);
+
+    // Device pressure: the exit's cache finds no tier below it and is
+    // dropped; the host is left to the live set, which still suspends.
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdef));
+    let tokens = kept_and_gone(&mut store, 70, 3, exited);
+    assert!(
+        store.prepare_demote(8, Installed).unwrap().is_none(),
+        "nothing moves: its row keeps it off the host"
+    );
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, Installed), 3, "dropped");
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    assert!(store.cached_working_sets().is_empty());
+    assert_eq!(store.host_swap_available(), 8, "nothing went to the host");
+    let ws = store.create_shared_working_set();
+    store.set_owner(ws, live).unwrap();
+    commit_fresh(&mut store, ws, 2, 1);
+    let txn = store
+        .prepare_suspend(&HashSet::from([ws]), Installed)
+        .unwrap()
+        .expect("a live set suspends");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    assert_eq!(store.host_swap_available(), 6, "on the host");
+
+    // `noop` writes no rows: the columns' own defaults demote the same
+    // cache to the host.
+    install(None);
+    let (exited, live) = (ProcessId::from_u128(0xdef4), ProcessId::from_u128(0xdef5));
+    run_policy("noop", an_exit_and_a_live_one(exited, live, 32, 16));
+    assert_eq!(Installed.tiers_at(Some(exited), 0), own, "no row: the column's own");
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdee));
+    let tokens = kept_and_gone(&mut store, 71, 3, exited);
+    let txn = store
+        .prepare_demote(8, Installed)
+        .unwrap()
+        .expect("every tier: it moves down");
+    store.commit_suspend(txn).unwrap();
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    assert_eq!(store.host_swap_available(), 5, "kept on the host");
+    install(None);
+}

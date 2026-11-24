@@ -105,6 +105,8 @@ pub struct Config {
     pub model: ModelConfig,
     pub skip_tracing: bool,
     pub max_concurrent_processes: Option<usize>,
+    /// The worker policy (name, component). Every native worker runs one
+    /// (`noop` writes no rows); the browser runs none.
     pub policy: Option<(String, Cow<'static, [u8]>)>,
 }
 
@@ -595,10 +597,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // registers one of them builds nothing. One that cannot be built fails
     // the load, as a rung that cannot be armed does; a backend that builds
     // no guest code keeps the default, which builds nothing.
+    // Registered as a request's are: a per-row channel declared at the rows
+    // one fire binds, `model.max-pass-rows()` (the first engine's).
+    let rows = engine_configs
+        .first()
+        .map_or(u32::MAX, |engine| {
+            u32::try_from(engine.limits.max_forward_tokens).unwrap_or(u32::MAX)
+        });
     for (at, engine) in engine_configs.iter_mut().enumerate() {
         let backend =
             crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
-        let registrations = crate::pipeline::standard::registrations(backend.as_deref())?;
+        let registrations = crate::pipeline::standard::registrations(backend.as_deref(), rows)?;
         engine
             .engine_backend
             .prewarm_programs(&registrations)
@@ -918,12 +927,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     // After the gates and the planner it orders exist.
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some((name, component)) = &config.policy {
+    {
+        let (name, component) = config
+            .policy
+            .as_ref()
+            .context("a worker names its policy (`noop` writes no rows)")?;
         crate::policy::start(name, component).with_context(|| format!("worker policy {name}"))?;
-    } else {
-        // No policy: the thread still keeps its record, and the default
-        // responder answers tier pressure.
-        crate::policy::start_default().context("the default worker policy thread")?;
     }
     if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
         .ok()

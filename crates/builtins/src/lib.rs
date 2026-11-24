@@ -24,6 +24,12 @@ pub fn find(name: &str) -> Option<&'static Builtin> {
     ALL.iter().find(|b| b.name == name)
 }
 
+/// The worker policy a worker runs when its configuration names none.
+pub const DEFAULT_WORKER_POLICY: &str = "default";
+
+/// The cluster policy a controller runs when its configuration names none.
+pub const DEFAULT_CLUSTER_POLICY: &str = "default-cluster";
+
 pub fn policies() -> &'static [Builtin] {
     POLICIES
 }

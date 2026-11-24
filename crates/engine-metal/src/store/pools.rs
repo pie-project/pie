@@ -1431,39 +1431,38 @@ impl Pools {
             .map_or(0, |window| window.slots.slot_bytes)
     }
 
-    /// A lane's pages of window list `k` as kernels address them, one a
-    /// window slot (`T_w` tokens) in token order: `refs` (window slot refs,
-    /// 0 a slot trimmed behind the window: the null chunk) as page ids
-    /// ([`super::pool::PageIds`]), or, seat-addressed, seat `seat`'s run,
-    /// `pages` of them.
-    pub fn window_pages(
-        &self,
-        k: usize,
-        refs: &[u32],
-        seat: Option<(u32, u32)>,
-    ) -> Result<Vec<u32>> {
+    /// Window table `k`'s slot refs `refs` as kernels address them, page
+    /// ids ([`super::pool::PageIds`]); 0 (a slot trimmed behind the window)
+    /// the null chunk.
+    pub fn window_pages(&self, k: usize, refs: &[u32]) -> Result<Vec<u32>> {
         let id = WINDOWS[k.min(MAX_WINDOWS - 1)];
         let window = *self.shape(id)?;
-        let unit = |slot: u32| -> Result<u32> {
-            if slot == 0 {
-                return Ok(0);
-            }
-            let physical = self.physical(id, slot)?;
-            self.pool.admit(physical / window.per_chunk.max(1))?;
-            Ok(self.pool.slot_page(physical, window.per_chunk))
-        };
-        if let Some((slot, pages)) = seat
-            && refs.is_empty()
-        {
-            let first = u64::from(slot) * u64::from(self.window_paging(k).pages_per_slot);
-            return (0..pages)
-                .map(|page| {
-                    let id = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
-                    unit(window.seat_ref(id)?)
-                })
-                .collect();
+        refs.iter()
+            .map(|&slot| -> Result<u32> {
+                if slot == 0 {
+                    return Ok(0);
+                }
+                let physical = self.physical(id, slot)?;
+                self.pool.admit(physical / window.per_chunk.max(1))?;
+                Ok(self.pool.slot_page(physical, window.per_chunk))
+            })
+            .collect()
+    }
+
+    /// Seat `seat`'s ring on a ring load, `pages` window slots of table `k`
+    /// by slot ref: the first of its seat run (a seat-addressed lane folds
+    /// every fire through it, and holds no buffer).
+    pub fn window_seat_ring(&self, k: usize, seat: u32, pages: u32) -> Result<Vec<u32>> {
+        let window = *self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?;
+        let per_seat = window.seat_slots / self.layout.seats.max(1);
+        if per_seat < pages {
+            return Err(Fault::Ceiling {
+                what: "window slots of a seat's run, for its ring",
+                need: u64::from(pages),
+                have: u64::from(per_seat),
+            });
         }
-        refs.iter().map(|&r| unit(r)).collect()
+        (0..pages).map(|j| window.seat_ref(seat * per_seat + j)).collect()
     }
 
     /// Where window table `k`'s slot ref `slot` lies, in bytes of the range.
@@ -1528,6 +1527,19 @@ impl Pools {
                     values_cell,
                     ..
                 } if *at == paging => Some((*keys, *keys_cell, *values, *values_cell)),
+                // A pool gather's compressor state beside a windowed row:
+                // its projection and score planes, a cell a row each, move
+                // with the rows they were computed from.
+                Row::Compressed {
+                    paging: at,
+                    width,
+                    kv,
+                    score,
+                    ..
+                } if *at == paging => {
+                    let cell = width * u64::from(elem_size(Dtype::Bf16));
+                    Some((*kv, cell, *score, cell))
+                }
                 _ => None,
             })
             .collect();

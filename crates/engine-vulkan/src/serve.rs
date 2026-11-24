@@ -230,6 +230,16 @@ impl Serve for Api {
         crate::rates::stated_submit_bound()
     }
 
+    fn fires_stated(boot: &crate::api::DeviceBoot) -> bool {
+        #[cfg(feature = "test-limits")]
+        return boot.fires_stated;
+        #[cfg(not(feature = "test-limits"))]
+        {
+            let _ = boot;
+            false
+        }
+    }
+
     fn tier(_device: &Context) -> kernels_slang::Tier {
         // Vulkan's tactics read their own tuning, not the tier.
         kernels_slang::Tier::Subgroup

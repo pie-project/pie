@@ -10,6 +10,7 @@ package plex:placement@1.1.0;
 /// gateway. A process already at a worker stays there while the list
 /// names that worker, in any position; a list that leaves it out moves
 /// the process, where the host can move one.
+/// The gate applies while a loaded cluster policy imports placement/workers or terminate; with none, the gate bound is zero.
 @since(version = 1.1.0)
 interface workers {
     use plex:core/types@1.1.0.{process-id, worker-id, error-code};

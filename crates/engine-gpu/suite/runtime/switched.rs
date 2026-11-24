@@ -77,6 +77,7 @@ fn step_of(trace: &poem::Trace, lanes: &Composition) -> Step {
         attachments: Vec::new(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     }
 }
 

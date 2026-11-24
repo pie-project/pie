@@ -479,6 +479,19 @@ fn refuse_lanes(
             }
         }
         strip_members(fire, step, &why);
+        // Its members stripped, the step is of the stated shape its kept
+        // lanes make: stated again, a gap a runtime bug named.
+        if !step.lanes.is_empty() && why.iter().any(Option::is_some) {
+            step.shape = match crate::scheduler::batch::restated_shape(fire.shapes, &step.lanes) {
+                Ok(shape) => shape,
+                Err(gap) => {
+                    debug_assert!(false, "a step stripped of refused members is {gap}");
+                    return Err(format!(
+                        "a step stripped of refused members is {gap} (a runtime bug)"
+                    ));
+                }
+            };
+        }
     }
     let mut kept = Vec::with_capacity(rest.len());
     let mut index = at;

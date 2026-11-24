@@ -22,9 +22,7 @@ use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{Collective, Def, Linear, Operation, Trace};
 
-use crate::micro::{
-    ALLOWANCE, KV, MICRO, Scratch, close, ordinals, prompt, ranks, values, write_checkpoint,
-};
+use crate::micro::{KV, MICRO, Scratch, close, ordinals, prompt, ranks, values, write_checkpoint};
 
 const CEILING: u32 = 256;
 const PAGE: u32 = 16;
@@ -80,6 +78,8 @@ fn stage(
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
+    // Read before the bind: the charge's probe binds a device of its own.
+    let allowance = crate::micro::allowance();
     engine_cuda::device::ctx::bind_thread(ordinal).unwrap();
     let staged = Shell::stage(engine_cuda::Boot {
         trace: trace.clone(),
@@ -92,7 +92,7 @@ fn stage(
         context: CEILING,
         slots: 2,
         kv_budget: Some(engine_cuda::store::KvSize::Bytes(KV)),
-        allowance: ALLOWANCE,
+        allowance,
         context_declared: false,
         ordinal,
         knobs: engine_cuda::Knobs {
@@ -337,25 +337,39 @@ fn routes_return(
     else {
         unreachable!()
     };
-    // The layer's two selects, in order, and the GLU between them.
-    let mut banks = Vec::new();
-    let mut inter = 0;
+    // The layer's selects and the GLU between them: a gate-up select, or
+    // a gate's and an up's, into the GLU; the down select out of it.
+    let mut selects = Vec::new();
+    let mut glu = None;
     for node in &lowered.nodes[at..] {
         match node.op {
-            Operation::Linear(Linear::MoeSelect { bank, routes, .. }) if routes == local => {
+            Operation::Linear(Linear::MoeSelect {
+                x, bank, routes, y, ..
+            }) if routes == local => {
                 let Def::Weight(p) = lowered.values[bank.0 as usize].def else {
                     panic!("a bank is a weight");
                 };
-                banks.push(&lowered.params[p as usize].name);
+                selects.push((x, y, &lowered.params[p as usize].name));
             }
-            Operation::Linear(Linear::Glu { intermediate, .. }) if banks.len() == 1 => {
-                inter = intermediate as usize;
+            Operation::Linear(Linear::Glu {
+                packed,
+                gate,
+                up,
+                intermediate,
+                y,
+                ..
+            }) if glu.is_none() && !selects.is_empty() => {
+                glu = Some((packed, gate, up, intermediate as usize, y));
             }
             _ => {}
         }
     }
-    let [gate_up, down_bank] = banks[..] else {
-        panic!("the last layer's experts are two selects");
+    let (packed, gate, up, inter, glu_out) = glu.expect("the last layer's experts gate");
+    let bank_of = |value: Option<poem_ir::ValueId>, by_input: bool| {
+        let value = value?;
+        (selects.iter())
+            .find(|&&(x, y, _)| if by_input { x == value } else { y == value })
+            .map(|&(.., name)| name)
     };
     let plane = |name: &str| -> Vec<f32> {
         let param = (whole.params.iter())
@@ -364,13 +378,23 @@ fn routes_return(
         let count = param.shape.iter().product::<u64>() as usize;
         values(name, count).into_iter().map(bf16).collect()
     };
-    let (gate_up, down_bank) = (plane(gate_up), plane(down_bank));
+    let banks = |value| bank_of(value, false).map(|name: &String| plane(name));
+    let down_bank = plane(bank_of(Some(glu_out), true).expect("a down select reads the GLU"));
     let width = match &lowered.values[x.0 as usize].ty {
         poem_ir::Ty::Tensor { shape, .. } => match shape.last() {
             Some(poem_ir::Dim::Const(w)) => *w as usize,
             _ => panic!("a token row is of a stated width"),
         },
         poem_ir::Ty::Struct(_) => panic!("a token row is a tensor"),
+    };
+    // Each expert's gate rows then its up rows, as a packed bank lays them.
+    let gate_up: Vec<f32> = match (banks(packed), banks(gate), banks(up)) {
+        (Some(packed), ..) => packed,
+        (None, Some(gate), Some(up)) => (gate.chunks(inter * width))
+            .zip(up.chunks(inter * width))
+            .flat_map(|(g, u)| g.iter().chain(u).copied())
+            .collect(),
+        _ => panic!("the GLU reads a gate-up select, or a gate's and an up's"),
     };
     let expert = |e: usize, row: &[f32]| -> Vec<f32> {
         let gu = &gate_up[e * 2 * inter * width..][..2 * inter * width];

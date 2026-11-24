@@ -165,6 +165,7 @@ fn fire(
             attachments,
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");
@@ -858,7 +859,7 @@ fn scores_rig() -> Option<ScoresRig> {
         )),
         "{SCORES_MODEL} captures scores"
     );
-    let mut engine = backend::Engine::new(boot, super::outputs::contract_for);
+    let mut engine = backend::Engine::new(crate::gpu::fires_stated(boot), super::outputs::contract_for);
     let loaded = engine
         .load(LoadRequest {
             trace: fixture.trace.clone(),
@@ -1035,6 +1036,7 @@ impl ScoresRig {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         self.engine

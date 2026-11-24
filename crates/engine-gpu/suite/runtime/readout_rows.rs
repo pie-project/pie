@@ -47,6 +47,7 @@ fn a_kv_less_lane_reads_out_every_row_it_holds() {
         attachments: Vec::new(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     };
     let mut ticket = engine
         .submit(&FrameSubmission::of(step))

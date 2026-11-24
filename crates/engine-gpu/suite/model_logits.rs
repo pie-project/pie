@@ -381,21 +381,38 @@ pub fn load_capped(
     kv_budget: u64,
     chunk: u64,
 ) -> Option<Shell> {
+    load_capped_with(
+        fixture,
+        PAGE,
+        context,
+        max_buffer,
+        chunk,
+        engine::load::Residency {
+            device_kv_budget: Some(kv_budget),
+            ..engine::load::Residency::default()
+        },
+    )
+}
+
+/// [`load_capped`] with kv pages of `page` tokens, under `residency` (its
+/// pool's budget, and whether the weights start held).
+pub fn load_capped_with(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    max_buffer: u64,
+    chunk: u64,
+    residency: engine::load::Residency,
+) -> Option<Shell> {
     let _alone = loading();
     let device = DeviceBoot {
         max_buffer: Some(max_buffer),
         chunk_bytes: Some(chunk),
         ..crate::gpu::device_boot()
     };
-    let residency = allowed(
-        &device,
-        engine::load::Residency {
-            device_kv_budget: Some(kv_budget),
-            ..engine::load::Residency::default()
-        },
-    )?;
+    let residency = allowed(&device, residency)?;
     Some(
-        Shell::load(boot(fixture, PAGE, context, &device, residency))
+        Shell::load(boot(fixture, page, context, &device, residency))
             .unwrap_or_else(|why| panic!("the shell loads: {why}")),
     )
 }

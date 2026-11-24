@@ -607,7 +607,7 @@ pub fn gated_delta_chunked(
     }
 
     if k_dim <= WARP_TILED_K_MAX {
-        seated(OP, state, "gdn_chunked_warp_tiled", true, false, false)?;
+        seated(OP, state, "gdn_chunked_warp_tiled", true, true, true)?;
         return ctx.fire(
             OP,
             Fire::at(kernel(
@@ -632,7 +632,9 @@ pub fn gated_delta_chunked(
                 stated(OP, k_dim)?.arg(),
                 stated(OP, v_dim)?.arg(),
                 state.write_state.arg(),
+                state.commit_len.arg(),
                 state.write_state_mask.arg(),
+                state.begin_at.arg(),
                 ctx.stage(),
             ],
         );

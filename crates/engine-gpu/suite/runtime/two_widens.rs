@@ -167,6 +167,7 @@ fn a_frame_of_two_readout_widens_serves() {
             }],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");

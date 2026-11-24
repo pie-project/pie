@@ -280,6 +280,17 @@ impl Chunks {
         Ok(outcome)
     }
 
+    /// The bytes [`Chunks::hold_boundary`] backs of a pool stated whole
+    /// past its first `fitted` chunks: the state's chunks of the segment
+    /// the activation starts in that lie past them and are not backed yet.
+    #[must_use]
+    pub fn boundary_unbacked_bytes(&self, fitted: u32) -> u64 {
+        let segment = self.layout.segment_chunks.max(1);
+        let first = (self.total / segment * segment).max(fitted);
+        let unbacked = (first..self.total).filter(|&at| !self.backed(at)).count();
+        u64::try_from(unbacked).unwrap_or(u64::MAX) * self.layout.chunk_bytes
+    }
+
     /// Holds the state's segments to the pool's first `chunks` chunks: what
     /// the fit left the cache rows of a range reserved for more.
     pub fn limit(&mut self, chunks: u32) {
@@ -1094,9 +1105,12 @@ impl Chunks {
                 chunks: 1,
             }],
             shapes,
+            // Every rung below one fire's tokens, one lending nothing among
+            // them: the stated rungs are the arena's, so the step set the
+            // load states is the one its arm walk took (CONTRACT-BC 24).
             act_chunks: rungs
                 .iter()
-                .filter(|&&(tokens, chunks)| tokens < max_tokens && chunks < self.act)
+                .filter(|&&(tokens, _)| tokens < max_tokens)
                 .copied()
                 .chain(std::iter::once((max_tokens, self.act)))
                 .collect(),

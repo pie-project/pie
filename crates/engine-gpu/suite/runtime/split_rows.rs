@@ -210,6 +210,7 @@ fn every_row_of_a_wide_reduction_is_folded_whatever_the_rows() {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");

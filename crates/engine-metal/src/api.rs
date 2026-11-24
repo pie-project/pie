@@ -37,6 +37,24 @@ pub struct DeviceBoot {
     /// `[metal] measure`: whether a load times what no stored or committed
     /// profile states under a matching key.
     pub measure: engine::rates::Measuring,
+    /// Tests only (`test-limits`): the top rung a load serves, `None` the
+    /// ruling's (`Top::Ruled`, as every served load). A test that hand-builds
+    /// frames wider than a miniature's ruled top (which the runtime's step
+    /// builder never forms) loads every rung (`Top::EveryRung`), as the shell
+    /// tests do.
+    #[cfg(feature = "test-limits")]
+    pub top: Option<crate::Top>,
+}
+
+impl DeviceBoot {
+    /// The top rung a load serves: the ruling's, but where a test states one.
+    fn top(&self) -> crate::Top {
+        #[cfg(feature = "test-limits")]
+        if let Some(top) = self.top {
+            return top;
+        }
+        crate::Top::Ruled
+    }
 }
 
 struct PendingStep {
@@ -471,6 +489,109 @@ impl Engine for Metal {
         "metal"
     }
 
+    /// Whether a `[rates]` key the load serves by a stale figure is left to
+    /// time behind serving (`Shell::rates_behind`).
+    fn measures_behind(&self) -> bool {
+        self.shell
+            .as_ref()
+            .is_some_and(|shell| shell.rates_behind().is_some())
+    }
+
+    /// One slice behind serving: the rates step timing the next stale
+    /// `[rates]` key alone (`rates::measure_keys`), each frame reading
+    /// whether a request arrived and stopping where one did, so an arrival
+    /// waits at most the frame in flight; the key is timed again whole at a
+    /// later idle turn. Kept only where it had the device alone at a steady
+    /// clock: no frame of this engine in flight as it starts, no other lane
+    /// submitting while it runs, and the clock read after it no slower than
+    /// the settled one before it (`rates::throttled`). Kept: stored in the
+    /// user's profile for the next load; this load serves on by the stale
+    /// figure. Else discarded and timed again later.
+    fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        let Some(key) = shell.rates_behind().map(str::to_string) else {
+            return Ok(false);
+        };
+        let profile = shell.tuning().profile().clone();
+        let device = shell.device();
+        let submitted = (behind.others)();
+        let began = std::time::Instant::now();
+        // A `curve <n>x<k>` entry: that shape's dense curves, timed by the
+        // step a load times them by (`tune::dense::curves_behind`); else
+        // one `[rates]` key.
+        let timed = crate::rates::clock_rate(device, profile.clone(), true).and_then(|before| {
+            let rates = match key.strip_prefix(crate::tune::dense::CURVE_BEHIND) {
+                Some(shape) => profile::fire::Rates {
+                    kernel_tflops_by_shape: Some(crate::tune::dense::curves_behind(
+                        device,
+                        &profile,
+                        shape,
+                        behind.arrived,
+                    )?),
+                    ..profile::fire::Rates::default()
+                },
+                None => crate::rates::measure_keys(
+                    device,
+                    profile.clone(),
+                    &[key.as_str()],
+                    Some(behind.arrived),
+                    &mut |_| {},
+                )?,
+            };
+            Ok((before, rates))
+        });
+        let ms = began.elapsed().as_secs_f64() * 1e3;
+        let (before, rates) = match timed {
+            Ok(timed) => timed,
+            Err(why) if crate::rates::yielded(&why) || why == crate::tune::dense::YIELDED => {
+                tracing::info!(
+                    key = %key,
+                    ms,
+                    "rates behind serving: `{key}` yielded to an arrival; timed again later"
+                );
+                return Ok(true);
+            }
+            Err(why) => {
+                return Err(Error::Load(format!(
+                    "rates behind serving: `{key}` was not timed: {why}"
+                )));
+            }
+        };
+        let after = crate::rates::clock_rate(device, profile, false).map_err(Error::Load)?;
+        let why = if (behind.others)() != submitted {
+            Some("another lane submitted while it ran".to_string())
+        } else {
+            crate::rates::throttled(before, after).map(|ratio| {
+                format!("the device's clock {ratio:.2}x slower after it than its settled start")
+            })
+        };
+        if let Some(why) = why {
+            tracing::info!(
+                key = %key,
+                ms,
+                "rates behind serving: `{key}` discarded ({why}); timed again later"
+            );
+            return Ok(true);
+        }
+        if let Err(why) = crate::rates::save_rates(device, self.boot.profiles.as_deref(), &rates) {
+            tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
+        }
+        let left = shell.rate_timed(&key);
+        tracing::info!(
+            key = %key,
+            ms,
+            left,
+            "rates behind serving: `{key}` timed and stored for the next load (this load serves \
+             on by its stale figure); {left} left"
+        );
+        Ok(true)
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }
@@ -631,7 +752,7 @@ impl Engine for Metal {
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
-                    top: crate::Top::Ruled,
+                    top: self.boot.top(),
                     measure: self.boot.measure,
                 })
                 .map_err(fault)?;
@@ -768,16 +889,17 @@ impl Engine for Metal {
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the warm walk takes
-        // its readout rows per rung from it in its own branch.
+        // facts (CONTRACT-BC 24), computed before the walk, which fires each.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
             &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
         );
+        // Metal records no bodies (its walk builds pipelines): every shape
+        // is walked, none eager.
+        caps.steps.eager.clear();
         tracing::info!(
-            "engine-metal: step set: {}; its arm walk does not key on the set yet, so none \
-             of the {} is checked against what it records",
+            "engine-metal: step set: {}; the walk fires every one of the {}, none eager",
             caps.steps.shapes.census(),
             caps.steps.shapes.len(),
         );
@@ -804,7 +926,7 @@ impl Engine for Metal {
         let (fires, built) = match listed {
             Some(keys) => (0, shell.build_pipelines(&keys).map_err(fault)?),
             None => {
-                let walked = shell.warm_pipelines().map_err(fault)?;
+                let walked = shell.warm_pipelines_over(&caps.steps.shapes).map_err(fault)?;
                 if let Some((key, keys, _archive)) = cache.as_ref() {
                     write_pipeline_keys(keys, key, &shell.pipeline_keys());
                     #[cfg(target_vendor = "apple")]
@@ -948,6 +1070,11 @@ impl Engine for Metal {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
         if let Some(shell) = self.shell.as_ref() {
             let facts = &shell.trace().facts;
             for step in &frame.steps {
@@ -1511,23 +1638,6 @@ impl Metal {
                 })
                 .collect();
             window_of.push(windows);
-            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
-                let per = shell.pool_layout().list.map_or(1, |list| list.per_chunk.max(1));
-                let mut chunks: Vec<u32> = pages_of
-                    .last()
-                    .and_then(Option::as_ref)
-                    .map(|refs| refs.iter().filter(|&&r| r != 0).map(|&r| r / per).collect())
-                    .unwrap_or_default();
-                chunks.sort_unstable();
-                chunks.dedup();
-                eprintln!(
-                    "ltrace slot {} list chunks {:?} first refs {:?} slot_copies {:?}",
-                    lane.slot,
-                    chunks,
-                    pages_of.last().and_then(Option::as_ref).map(|r| r.iter().take(3).copied().collect::<Vec<_>>()),
-                    lane.slot_copies
-                );
-            }
             ring_of.push(match &lane.record {
                 engine::fire::LaneRecord::Pieces(pieces) => pieces
                     .iter()

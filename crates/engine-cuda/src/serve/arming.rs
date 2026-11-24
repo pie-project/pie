@@ -296,6 +296,9 @@ struct Deployment {
     /// The classes keyed only for a speculative decoder's fires (plain but
     /// for reading the drafts): armed alone, never beside another class.
     drafting: Vec<usize>,
+    /// The classes past the plain tiers a served program fires (a switch):
+    /// keyed by the bucket alone, beside any class.
+    switched: Vec<usize>,
     media: Vec<usize>,
     wide: Vec<usize>,
     decoding: poem_ir::ClassSet,
@@ -428,48 +431,79 @@ fn tower_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
 }
 
 fn wide_keys(deployment: &Deployment, point: u32, into: &mut Targets) {
-    let seats = deployment.seats.min(deployment.max_lanes).min(point) as usize;
-    let decoders: Vec<usize> = deployment
+    let plain: Vec<usize> = deployment
         .wide
         .iter()
         .copied()
         .filter(|class| !deployment.drafting.contains(class))
-        .filter(|class| deployment.decoding.contains(*class))
-        .take(seats)
         .collect();
-    let prefilling: Vec<usize> = deployment
-        .wide
-        .iter()
-        .copied()
-        .filter(|class| !deployment.drafting.contains(class))
-        .filter(|class| !deployment.decoding.contains(*class))
-        .take(seats.saturating_sub(decoders.len()))
-        .collect();
-    let rows_left = point - decoders.len() as u32;
-    let spread = if prefilling.is_empty() {
-        Some(Vec::new())
-    } else {
-        Shell::spread(rows_left, prefilling.len() as u32, deployment.context)
-    };
-    match spread {
-        Some(rows) if decoders.len() + prefilling.len() > 1 => {
-            let mut lanes: Vec<(usize, u32)> =
-                decoders.iter().map(|class| (*class, 1u32)).collect();
-            lanes.extend(
-                prefilling
-                    .iter()
-                    .zip(rows)
-                    .map(|(class, rows)| (*class, rows)),
-            );
-            into.targets.push((point, BodySynth::Wide { lanes }));
-        }
-        _ => into.unfireable.push(unfireable_line(
+    match wide_lanes(deployment, point, &plain) {
+        Some(lanes) => into.targets.push((point, BodySynth::Wide { lanes })),
+        None => into.unfireable.push(unfireable_line(
             deployment,
             "wide",
             &format!("bucket {point}"),
             None,
         )),
     }
+    // Every class a fire may run at once, a switched class among them: a
+    // fire with a class past the plain tiers keys by its bucket alone
+    // (`record::Ladder::of`), whichever classes it mixes, so one such
+    // composition a bucket records it.
+    if !deployment.switched.is_empty() {
+        let every: Vec<usize> = plain
+            .iter()
+            .copied()
+            .chain(deployment.switched.iter().copied())
+            .collect();
+        match wide_lanes(deployment, point, &every) {
+            Some(lanes) => into.targets.push((point, BodySynth::Wide { lanes })),
+            None => into.unfireable.push(unfireable_line(
+                deployment,
+                "wide with a switched class",
+                &format!("bucket {point}"),
+                None,
+            )),
+        }
+    }
+}
+
+/// A wide composition of `classes` at bucket `point`, as many lanes as the
+/// bucket seats (a body's launch grids hold the lanes it recorded, no more):
+/// a lane of each class, the rest of the seats each prompting class's in
+/// turn (each decoding class's where none prompts); a decoding lane takes a
+/// row and the bucket's other rows spread over the prompting lanes. `None`
+/// where fewer than two lanes result.
+fn wide_lanes(deployment: &Deployment, point: u32, classes: &[usize]) -> Option<Vec<LaneRows>> {
+    let seats = deployment.seats.min(deployment.max_lanes).min(point) as usize;
+    let decodes = |class: &usize| deployment.decoding.contains(*class);
+    let mut lanes: Vec<usize> = classes.iter().copied().take(seats).collect();
+    let prompting: Vec<usize> = lanes.iter().copied().filter(|c| !decodes(c)).collect();
+    let fill = if prompting.is_empty() { lanes.clone() } else { prompting };
+    while lanes.len() < seats && !fill.is_empty() {
+        lanes.push(fill[(lanes.len() - classes.len().min(seats)) % fill.len()]);
+    }
+    if lanes.len() < 2 {
+        return None;
+    }
+    let decoders = lanes.iter().filter(|class| decodes(class)).count() as u32;
+    let prompts = lanes.len() as u32 - decoders;
+    let mut spread = if prompts == 0 {
+        Vec::new()
+    } else {
+        Shell::spread(point.checked_sub(decoders)?, prompts, deployment.context)?
+    }
+    .into_iter();
+    lanes
+        .into_iter()
+        .map(|class| {
+            Some(if decodes(&class) {
+                (class, 1)
+            } else {
+                (class, spread.next()?)
+            })
+        })
+        .collect()
 }
 
 /// An expert-parallel rank idles through its peers' steps at every bucket
@@ -570,6 +604,15 @@ impl Shell {
         let mut next_page = 0u64;
         let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes) as usize;
         let fold = (self.patch_fold as usize).max(1);
+        // The voxel seat's patches and clips the lanes feed from, in order.
+        let mut voxel_room = self.voxels.as_ref().map_or((0, 0), |store| {
+            let seat = store.seat();
+            (
+                u32::try_from(seat.rows).unwrap_or(u32::MAX)
+                    / self.token_patch().iter().product::<u32>(),
+                u32::try_from(seat.clips).unwrap_or(u32::MAX),
+            )
+        });
         lanes
             .iter()
             .enumerate()
@@ -594,7 +637,7 @@ impl Shell {
                         table
                     },
                     held: Some(0),
-                    voxels: self.synthetic_voxels(class),
+                    voxels: self.synthetic_voxels(class, rows, &mut voxel_room),
                     media: media
                         .get(at)
                         .copied()
@@ -652,22 +695,75 @@ impl Shell {
             .collect()
     }
 
-    /// The voxel input a synthetic lane of `class` feeds: `None` where its
-    /// class reads none or the load seats no voxel axis.
-    fn synthetic_voxels(&self, class: usize) -> Option<SyntheticVoxels> {
-        let seat = self.voxels.as_ref()?.seat();
+    /// The voxel input a synthetic lane of `class` and `rows` token rows
+    /// feeds, out of `room` (the seat's patches and clips the fire's lanes
+    /// before it left): the most patches its rows bind (a lane's patches are
+    /// at most its token rows), as clips ([`Shell::clips_of`]), at its
+    /// input's width, so the body recorded carries any fire's (a voxel axis
+    /// is not bucketed: a body's grids are its fire's). `None` where its
+    /// class reads none, the load seats no voxel axis or no room is left.
+    fn synthetic_voxels(
+        &self,
+        class: usize,
+        rows: u32,
+        room: &mut (u32, u32),
+    ) -> Option<SyntheticVoxels> {
         let input = self
             .feeds
             .inputs
             .iter()
             .find(|(input, readers)| input.voxel() && readers.contains(class))
             .map(|(input, _)| *input)?;
-        let patch = seat.token_patch.unwrap_or([1, 1, 1]).map(|p| p.max(1));
-        let voxels: u64 = patch.iter().map(|&p| u64::from(p)).product();
+        let (most, _) = self.seat_patches(class)?;
+        let patches = most.min(rows).min(room.0);
+        let (clips, voxels) = self.clips_of(patches, room.1)?;
+        room.0 -= patches;
+        room.1 -= u32::try_from(clips.len()).unwrap_or(room.1);
         Some(SyntheticVoxels {
-            clips: vec![patch],
-            payload: vec![0u8; usize::try_from(voxels * input.row_bytes()).ok()?],
+            clips,
+            payload: vec![0u8; usize::try_from(u64::from(voxels) * input.row_bytes()).ok()?],
         })
+    }
+
+    /// The token patches a fire of `class` feeds at most (the seat's rows its
+    /// class reads, by its voxel growth, in whole patches) and the seat's
+    /// clips; `None` where it reads none.
+    fn seat_patches(&self, class: usize) -> Option<(u32, u32)> {
+        let seat = self.voxels.as_ref()?.seat();
+        let (grown, read) = poem_compiler::arena::voxel_growth(&self.trace, &self.compiled.classes)
+            .get(class)
+            .copied()?;
+        let rows = u32::try_from(seat.rows * u64::from(read) / u64::from(grown.max(1)))
+            .unwrap_or(u32::MAX);
+        let patches = rows / self.token_patch().iter().product::<u32>();
+        let clips = u32::try_from(seat.clips.max(1)).unwrap_or(u32::MAX);
+        (patches > 0).then_some((patches, clips))
+    }
+
+    /// The voxel seat's token patch (`[pt, ph, pw]`, a single voxel without
+    /// one).
+    fn token_patch(&self) -> [u32; 3] {
+        self.voxels
+            .as_ref()
+            .and_then(|store| store.seat().token_patch)
+            .unwrap_or([1, 1, 1])
+            .map(|p| p.max(1))
+    }
+
+    /// `patches` token patches as clips: laid along t over at most `clips`
+    /// clips, the first taking what the even split leaves; the boxes and
+    /// their voxels. `None` where there are none.
+    fn clips_of(&self, patches: u32, clips: u32) -> Option<(Vec<[u32; 3]>, u32)> {
+        let [pt, ph, pw] = self.token_patch();
+        let clips = clips.min(patches);
+        if clips == 0 {
+            return None;
+        }
+        let each = patches / clips;
+        let boxes = (0..clips)
+            .map(|at| [(each + if at == 0 { patches % clips } else { 0 }) * pt, ph, pw])
+            .collect();
+        Some((boxes, patches * pt * ph * pw))
     }
 
     /// The class a lane of `class` lands in once it carries an adapter: the
@@ -1341,6 +1437,9 @@ impl Shell {
                         && self.tiers.plain.contains(*class)
                 })
                 .collect(),
+            switched: (0..classes)
+                .filter(|class| textual(*class) && switched(*class))
+                .collect(),
             drafting: (0..classes)
                 .filter(|class| !self.landing[*class].iter().any(poem_ir::Request::plain))
                 .collect(),
@@ -1519,6 +1618,16 @@ impl Shell {
             .and_then(|rung| self.bucket_for(rung))
     }
 
+    /// The bucket a step stamped `shape` composes at where its shape names
+    /// one: a buffering mixed or prompt step's rung ([`Shell::buffered_rung`]);
+    /// `None` for any other (it composes at its rows' own bucket).
+    pub(super) fn stamped_bucket(&self, shape: engine::FireShape) -> Option<u32> {
+        let stated = self.steps.shapes.get(shape.id as usize)?;
+        (stated.treatment == engine::Treatment::Buffers && stated.kind != engine::StepKind::Decode)
+            .then(|| self.bucket_for(stated.rung))
+            .flatten()
+    }
+
     /// The set the arm walk takes its targets from ([`Shell::walk_steps`]).
     pub(crate) fn steps(&self) -> &engine::StepShapes {
         &self.steps
@@ -1628,34 +1737,17 @@ impl Shell {
         let Some(seat) = self.voxels.as_ref().map(crate::voxels::Store::seat) else {
             return Ok(());
         };
-        let growth = poem_compiler::arena::voxel_growth(&self.trace, &self.compiled.classes);
-        let clips = u32::try_from(seat.clips.max(1)).unwrap_or(u32::MAX);
         let row_bytes = seat.payload_bytes() / seat.rows.max(1);
-        for (class, (grown, read)) in growth.into_iter().enumerate() {
+        for class in 0..self.landing.len() {
             if self.landing[class].is_empty() {
                 continue;
             }
-            let rows = seat.rows * u64::from(read) / u64::from(grown.max(1));
-            let rows = u32::try_from(rows).unwrap_or(u32::MAX);
-            // A clip's box divides by the plan's token patch, as a fire's
-            // clips must: each clip is whole patches (`[pt, ph, pw]`, a
-            // single voxel without one) laid along t, the first taking what
-            // the even split leaves, at most the seat's clips of them.
-            let [pt, ph, pw] = seat.token_patch.unwrap_or([1, 1, 1]).map(|p| p.max(1));
-            let patch = pt.saturating_mul(ph).saturating_mul(pw);
-            let patches = rows / patch;
-            let clips = clips.min(patches);
-            if clips == 0 {
+            let Some((boxes, rows)) = self
+                .seat_patches(class)
+                .and_then(|(patches, clips)| self.clips_of(patches, clips))
+            else {
                 continue;
-            }
-            let each = patches / clips;
-            let boxes: Vec<[u32; 3]> = (0..clips)
-                .map(|at| {
-                    let units = each + if at == 0 { patches % clips } else { 0 };
-                    [units * pt, ph, pw]
-                })
-                .collect();
-            let rows = patches * patch;
+            };
             let payload = vec![0u8; (u64::from(rows) * row_bytes) as usize];
             let owned = self.synthetic_lanes_with(&[(class, 1)], &[]);
             let seated = Self::seated(&owned);
@@ -1671,8 +1763,9 @@ impl Shell {
             self.arming = false;
             fired.map_err(|why| Fault::Unbound {
                 what: format!(
-                    "the size-only walk of a voxel fire, class {class} over {clips} clip(s) of \
-                     {rows} row(s): {why}"
+                    "the size-only walk of a voxel fire, class {class} over {} clip(s) of \
+                     {rows} row(s): {why}",
+                    boxes.len()
                 ),
             })?;
         }

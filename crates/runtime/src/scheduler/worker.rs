@@ -3140,6 +3140,11 @@ impl BatchScheduler {
             .sum::<usize>();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
+        // Every step refused for a shape outside the stated set (a runtime
+        // bug, its fires failed by name): nothing to post.
+        if submission.steps.is_empty() {
+            return (true, false);
+        }
         debug_assert!(
             !submission.steps.is_empty()
                 && submission.steps.iter().all(|step| !step.submission.lanes.is_empty()),
@@ -4186,6 +4191,7 @@ mod tests {
             steps: vec![crate::engine::StepFire {
                 fire_stamps: Vec::new(),
             lane_sets: Vec::new(),
+                shapes: None,
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -4193,6 +4199,7 @@ mod tests {
                     attachments: Vec::new(),
                     media: Vec::new(),
                     voxels: Vec::new(),
+                    shape: None,
                 },
                 terminal_cells: Vec::new(),
                 completions: Vec::new(),
@@ -4367,11 +4374,13 @@ mod tests {
                     steps: vec![crate::engine::StepFire {
                         fire_stamps: Vec::new(),
             lane_sets: Vec::new(),
+                        shapes: None,
                         submission: ::engine::Step {
                             lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                             attachments: Vec::new(),
                             media: Vec::new(),
                             voxels: Vec::new(),
+                            shape: None,
                         },
                         terminal_cells: Vec::new(),
                         completions: Vec::new(),
@@ -4499,11 +4508,13 @@ mod tests {
                 steps: vec![crate::engine::StepFire {
                     fire_stamps: Vec::new(),
             lane_sets: Vec::new(),
+                    shapes: None,
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                         attachments: Vec::new(),
                         media: Vec::new(),
                         voxels: Vec::new(),
+                        shape: None,
                     },
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
@@ -4661,6 +4672,7 @@ mod tests {
                 steps: vec![crate::engine::StepFire {
                     fire_stamps: Vec::new(),
             lane_sets: Vec::new(),
+                    shapes: None,
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane {
                             reports: TAG,
@@ -4669,6 +4681,7 @@ mod tests {
                         attachments: Vec::new(),
                         media: Vec::new(),
                         voxels: Vec::new(),
+                        shape: None,
                     },
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
@@ -4835,6 +4848,7 @@ mod tests {
             steps: vec![crate::engine::StepFire {
                 fire_stamps: Vec::new(),
             lane_sets: Vec::new(),
+                shapes: None,
                 submission: ::engine::Step {
                     lanes: (0..lanes)
                         .map(|lane| ::engine::Lane::decode(lane, 0, 1, 0))
@@ -4850,6 +4864,7 @@ mod tests {
                         .collect(),
                     media: Vec::new(),
                     voxels: Vec::new(),
+                    shape: None,
                 },
                 terminal_cells: completions.iter().map(|c| c.terminal_cell_ptr()).collect(),
                 completions: completions.clone(),
@@ -5179,6 +5194,7 @@ mod tests {
             fire.steps.push(crate::engine::StepFire {
                 fire_stamps: Vec::new(),
             lane_sets: Vec::new(),
+                shapes: None,
                 submission: ::engine::Step {
                     lanes: fires.iter().map(|(_, lane)| lane.clone()).collect(),
                     attachments: (0..lanes)
@@ -5192,6 +5208,7 @@ mod tests {
                         .collect(),
                     media: Vec::new(),
                     voxels: Vec::new(),
+                    shape: None,
                 },
                 terminal_cells: completions.iter().map(|c| c.terminal_cell_ptr()).collect(),
                 completions: completions.clone(),

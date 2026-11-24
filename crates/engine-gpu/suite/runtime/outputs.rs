@@ -325,7 +325,7 @@ pub(super) fn loaded_flight(
     write(&path, &planes);
 
     let trace = poem::trace_hybrid(NAME, model, backend::PLATFORM);
-    let mut engine = backend::Engine::new(boot, contract_for);
+    let mut engine = backend::Engine::new(crate::gpu::fires_stated(boot), contract_for);
     let caps = engine
         .load(LoadRequest {
             trace: trace.clone(),
@@ -511,6 +511,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             }],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");
@@ -595,6 +596,7 @@ fn a_frame_of_many_steps_settles_every_step_one_frame_in_flight() {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         })
         .collect();
     let mut ticket = engine
@@ -669,6 +671,7 @@ fn a_pipeline_built_after_the_load_is_counted() {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");

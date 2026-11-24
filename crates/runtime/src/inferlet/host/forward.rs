@@ -1144,10 +1144,22 @@ impl ProcessCtx {
         };
         {
             let t0 = crate::rt::Instant::now();
+            // A pass over the kv registers one program for every prompt
+            // length: its per-row channels are declared at the rows one fire
+            // binds (`model.max-pass-rows()`). A float pass counts its rows
+            // from its channels' lengths, so keeps them.
+            let rows = match float {
+                Some(_) => None,
+                None => Some(
+                    u32::try_from(crate::engine::get_spec(0)?.limits.max_forward_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+            };
             let prog = match crate::pipeline::program::register(
                 container_bytes,
                 readouts,
                 Some(self.id()),
+                rows,
             ) {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
@@ -1156,6 +1168,29 @@ impl ProcessCtx {
             crate::inferlet::process::ensure_bind_admitted(self).await;
 
             let decls = prog.bound.container.channels.clone();
+            // Each channel as this instance carries it: a row-extent channel
+            // (declared at the program's row bound) at its own rows, which
+            // the host resolves its ports from; the rest as declared. Its
+            // engine cell is the bound wide (`ChannelRegistration` below),
+            // its seed fitted to it (`program::fit_row_extent`).
+            let mut attached = decls.clone();
+            for (dense, ch) in channels.iter().enumerate() {
+                if !prog.row_extents.get(dense).copied().unwrap_or(false) {
+                    continue;
+                }
+                let cell = self.ctx().table.get(ch)?.cell.clone();
+                let shape = cell.lock().unwrap().shape.clone();
+                let [len] = shape[..] else {
+                    return Ok(Err(format!(
+                        "pipeline: channel {dense} binds a per-row port with shape {shape:?}, \
+                         not a vector"
+                    )));
+                };
+                if let Some(decl) = attached.get_mut(dense) {
+                    decl.shape = eta_ir::types::Shape::vector(len);
+                }
+                cell.lock().unwrap().row_extent = true;
+            }
             let extern_bindings = decls
                 .iter()
                 .enumerate()
@@ -1237,7 +1272,8 @@ impl ProcessCtx {
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
-                    if let Err(e) = c.validate_attachment(&decls[i], writes(i), extern_binding) {
+                    if let Err(e) = c.validate_attachment(&attached[i], writes(i), extern_binding)
+                    {
                         return Ok(Err(format!(
                             "pipeline: channel {i} (id {}): {e}",
                             c.global_id
@@ -1331,6 +1367,17 @@ impl ProcessCtx {
                 (None, None, GeometryClass::Host, None)
             };
 
+            // A row-extent channel's engine cell is the program's, the bound
+            // wide: only the host, resolving the geometry from the
+            // instance's own rows, reads them.
+            if geometry_class != GeometryClass::Host && prog.row_extents.contains(&true) {
+                return Ok(Err(format!(
+                    "pipeline: program 0x{:016x} declares its per-row channels at the {} rows \
+                     one fire binds, and binds in {geometry_class:?} geometry, which reads them \
+                     on the device",
+                    prog.hash, prog.row_bound
+                )));
+            }
             let t_geometry = t0.elapsed();
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {
@@ -1339,7 +1386,7 @@ impl ProcessCtx {
                     .map(|(name, dir)| (name.as_str(), *dir));
                 if let Err(error) = cell.lock().unwrap().attach(
                     instance_id,
-                    &decls[dense],
+                    &attached[dense],
                     writes(dense),
                     extern_binding,
                 ) {
@@ -1401,6 +1448,11 @@ impl ProcessCtx {
                     let mut packed = vec![0u8; bytes.len().div_ceil(8)];
                     crate::pipeline::channel::pack_bool_into(&bytes, &mut packed);
                     packed
+                } else if prog.row_extents.get(dense).copied().unwrap_or(false) {
+                    // The instance keeps its own rows; its engine cell is the
+                    // program's row bound wide.
+                    let elem = eta_ir::container::const_elem_size(cell.dtype);
+                    crate::pipeline::program::fit_row_extent(bytes, elem, prog.row_bound)
                 } else {
                     bytes
                 };

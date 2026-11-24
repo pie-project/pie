@@ -135,6 +135,7 @@ impl Bound {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .map_err(|e| e.to_string())?;
         self.engine
@@ -199,7 +200,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         .iter()
         .position(|input| input.name == "t")
         .expect("the plan reads `t`") as u32;
-    let mut engine = backend::Engine::new(boot, contract_for);
+    let mut engine = backend::Engine::new(crate::gpu::fires_stated(boot), contract_for);
     let loaded = engine
         .load(LoadRequest {
             trace,

@@ -40,8 +40,8 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     pub tick_interval: Duration,
     /// The cluster policies: each a built-in policy's name or a `.wasm`
-    /// path, no two granted the same write. None: every gateway goes by its
-    /// defaults.
+    /// path, no two granted the same write. Default: `default-cluster`.
+    /// None: every gateway goes by the columns' own defaults.
     pub cluster_policies: Vec<String>,
 }
 
@@ -51,7 +51,7 @@ impl Default for Config {
             listen: "0.0.0.0:7000".to_string(),
             heartbeat_timeout: Duration::from_secs(8),
             tick_interval: Duration::from_secs(2),
-            cluster_policies: Vec::new(),
+            cluster_policies: vec![builtins::DEFAULT_CLUSTER_POLICY.to_string()],
         }
     }
 }
@@ -278,6 +278,7 @@ impl ControllerHandle {
         let programs = policy_components(specs)?;
         let host = self.cluster.lock().unwrap().clone();
         match host {
+            None if programs.is_empty() => Ok(()),
             Some(host) => host
                 .reload(programs)
                 .await
@@ -505,6 +506,9 @@ mod tests {
         assert_eq!(cfg.listen, d.listen);
         assert_eq!(cfg.heartbeat_timeout, d.heartbeat_timeout);
         assert_eq!(cfg.tick_interval, d.tick_interval);
+        assert_eq!(cfg.cluster_policies, ["default-cluster"]);
+        let none = Config::parse("cluster_policies = []").unwrap();
+        assert!(none.cluster_policies.is_empty(), "[] runs none");
     }
 
     fn parse_overrides_fields() {

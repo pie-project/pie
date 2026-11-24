@@ -1412,6 +1412,78 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+
+/// A device's clock read off a reference kernel (a backend's own: engine-gpu's
+/// smallest shape on the matmul curve, CUDA's point's own body): the fastest
+/// of a few single fires and their spread, `(slowest - fastest) / fastest`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockRead {
+    pub fastest_ns: f64,
+    pub spread: f64,
+}
+
+/// Reads of `read` taken until two in a row agree within their own spread
+/// (either way: a ramp still rising and a boost still falling both move by
+/// more): the settled clock, the median of the settled pair, at the wider
+/// spread. No process-wide fastest is kept: the reference is the clock
+/// measured right around the phase. A clock settles (a ramp has a top, a
+/// boost a sustained floor), so the reads end.
+pub fn warmed<E>(read: impl FnMut() -> Result<ClockRead, E>) -> Result<ClockRead, E> {
+    warmed_until(read, &|| false).map(|read| read.expect("never stopped"))
+}
+
+/// [`warmed`] behind serving, `stop` read before each read (a request
+/// arrived): `None` where it stopped, so an arrival waits at most one read.
+pub fn warmed_until<E>(
+    mut read: impl FnMut() -> Result<ClockRead, E>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>, E> {
+    if stop() {
+        return Ok(None);
+    }
+    let mut last = read()?;
+    loop {
+        if stop() {
+            return Ok(None);
+        }
+        let next = read()?;
+        let noise = last.spread.max(next.spread);
+        let low = last.fastest_ns.min(next.fastest_ns);
+        let high = last.fastest_ns.max(next.fastest_ns);
+        if high <= low * (1.0 + noise) {
+            return Ok(Some(ClockRead {
+                fastest_ns: (low + high) / 2.0,
+                spread: noise,
+            }));
+        }
+        last = next;
+    }
+}
+
+/// Whether a point's clock moved under it: its own warmed `before` read
+/// and its `after` read differ, either way, by more than their own spread
+/// (a boost ending, a ramp still rising, a sag): `Some(after over
+/// before)`. A point timed across a clock transition measures the
+/// transition, not the kernel, and is discarded.
+#[must_use]
+pub fn clock_moved(before: ClockRead, after: ClockRead) -> Option<f64> {
+    let noise = before.spread.max(after.spread);
+    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
+    (ratio > 1.0 + noise || ratio < 1.0 / (1.0 + noise)).then_some(ratio)
+}
+
+/// Whether a measuring phase ran throttled: its reference kernel read
+/// `before` it (warmed, a backend's warmed read, [`warmed`]) and `after` it. Throttling builds
+/// during a phase: throttled where the after read is slower than the
+/// before by more than the reads' own spread (the reference's noise, no
+/// margin chosen): `Some(after over before)`.
+#[must_use]
+pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
+    let noise = before.spread.max(after.spread);
+    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
+    (ratio > 1.0 + noise).then_some(ratio)
+}
+
 #[cfg(test)]
 mod tests {
     /// A point that starts in a slow clock state and leaves it only under

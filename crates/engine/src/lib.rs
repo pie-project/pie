@@ -67,7 +67,7 @@ pub use load::{
 };
 pub use memory::SAFETY_FLOOR_BYTES;
 pub use shapes::{
-    Attachments, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,
+    Attachments, FireShape, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,
     Treatment,
 };
 pub use program::{

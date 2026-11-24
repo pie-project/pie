@@ -400,6 +400,7 @@ impl Layout {
             .chain(&self.fixed)
             .chain(self.window_lists().map(|window| &window.slots))
             .chain(&self.rs)
+            .chain(&self.ring)
             .chain(&self.instance)
             .chain(&self.channel)
             .chain(&self.adapter)

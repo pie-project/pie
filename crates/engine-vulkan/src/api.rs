@@ -59,6 +59,13 @@ pub struct DeviceBoot {
     /// or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub submit_bound: Option<std::time::Duration>,
+
+    /// A test's load whose harness states what the test fires: its fires
+    /// laid to the rows its budgets state, in place of the ruling's fire
+    /// top (`engine_gpu::serve::Serve::fires_stated`). Test builds only
+    /// (`test-limits`): no config or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub fires_stated: bool,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;

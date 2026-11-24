@@ -137,6 +137,14 @@ fn fused_blocks_per_sm(smem_per_sm: Option<u32>, most: u32, warps: u32) -> u32 {
 
 /// The fused step's warps a block and blocks an SM: four-warp blocks, or
 /// one eight-warp block where the SM's shared memory holds just two of them.
+/// The greatest common divisor of `a` and `b`.
+const fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 fn fused_seats(smem_per_sm: Option<u32>, most: u32) -> (u32, u32) {
     let blocks = fused_blocks_per_sm(smem_per_sm, most, FUSED_WARPS);
     let fits_wide = smem_per_sm.is_some_and(|bytes| {
@@ -261,16 +269,19 @@ pub fn gated_delta_carried(
         .n
         .checked_mul(v_heads * (v_dim / FUSED_BV))
         .ok_or_else(|| refuse(OP, format!("{} rows of value tiles overflow a grid", shape.n)))?;
-    let (warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
+    let (seated_warps, per_sm) =
+        fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
     // A block's warps share one (lane, head)'s buffered rows: they are a
-    // whole number of the head's value tiles.
+    // whole number of the head's value tiles, so a head of fewer tiles than
+    // the seated warps (a narrow head) takes a block of as many as it has.
     let head_tiles = v_dim / FUSED_BV;
-    if !head_tiles.is_multiple_of(warps) || v_dim > 128 {
+    let warps = gcd(seated_warps, head_tiles.max(1));
+    if head_tiles == 0 || v_dim > 128 {
         return Err(refuse(
             OP,
             format!(
-                "a block of {warps} warps stages one head's buffered rows, and a {v_dim}-wide \
-                 head's {head_tiles} value tiles do not split into it"
+                "a block stages one head's buffered rows in whole value tiles, and a \
+                 {v_dim}-wide head has {head_tiles} of them (at most 128 wide)"
             ),
         ));
     }

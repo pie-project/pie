@@ -268,6 +268,7 @@ fn submit(model: &mut Model, lane: Lane, attach: Option<InstanceId>) -> engine::
                 .collect(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires")
 }
@@ -391,6 +392,7 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
             }],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect_err("a device-fold lane no program is attached to resolves no fold");
     assert!(

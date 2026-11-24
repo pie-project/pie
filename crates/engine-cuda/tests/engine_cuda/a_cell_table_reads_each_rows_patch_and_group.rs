@@ -310,6 +310,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             attachments,
             media: Vec::new(),
             voxels,
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");

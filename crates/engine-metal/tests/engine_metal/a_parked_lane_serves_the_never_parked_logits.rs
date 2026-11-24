@@ -1,20 +1,22 @@
 #![cfg(target_vendor = "apple")]
 
 //! CONTRACT-BC 22 on device: a lane addressed by slot refs whose every slot
-//! (kv list pages, window list pages, its record's pieces) parks below the
+//! (kv list pages, its record's pieces, a windowed load's ring) parks below the
 //! pool mid-decode and comes back to fresh slots in fresh chunks (the host
 //! tier after step 2; the kv list pages through the slot file, the rest
-//! through the host tier, after step 6) lands the never-parked lane's logits
-//! bit for bit, in one process (as `engine-cuda`'s `golden_offload`). A
-//! negative control parks the record and brings back another lane's. With
+//! through the host tier, after step 6; a ring through the slot file too)
+//! lands the never-parked lane's logits bit for bit, in one process (as
+//! `engine-cuda`'s `golden_offload`). A negative control parks the record
+//! and the ring and brings back another lane's. With
 //! `Offload::Bytes`, every slot parked on the host comes back through its
 //! bytes (`read_tier_slots`), written into other host slots
 //! (`write_tier_slots`), as a shared-pool snapshot restores.
 
 use engine::chunk::{ShapeId, SlotCopy, SlotKind};
+use engine::fire::{FoldLen, Lineage, WindowFold};
 use engine::transfer::MemoryDomain;
 use engine_metal::serve::Seated;
-use engine_metal::store::layout::{FIXED, LIST, WINDOWS};
+use engine_metal::store::layout::{FIXED, LIST, RING, WINDOWS};
 use engine_metal::{Lane, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{
@@ -223,13 +225,26 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
             .map(|_| device.take(FIXED, per))
             .collect()
     });
+    // A windowed load's rings, one slot a chunk: the lane's, and the other
+    // lane's for the negative control. Each lane folds every row each fire
+    // (its buffer based past them, so it holds none).
+    let ring_pieces = shell.pool_ring().map_or(0, |ring| ring.pieces);
+    let mut ring: Vec<u32> = (0..ring_pieces).map(|_| device.take(RING, 1)).collect();
+    let other_ring: Vec<u32> = (0..ring_pieces).map(|_| device.take(RING, 1)).collect();
+    let pairs = |ring: &[u32]| -> Vec<[u32; 2]> { ring.iter().map(|&r| [r, r]).collect() };
+    let buffer_rows = layout.window(0).map_or(1, |w| w.tokens.max(1));
+    let fold = |have: u32, rows: u32| WindowFold {
+        base: (have + rows) / buffer_rows * buffer_rows,
+        fold: FoldLen::Host(rows),
+        lineage: Lineage::Set,
+    };
     let page = shell.paging().page_size;
     let mut pages: Vec<u32> = Vec::new();
     let mut tables: Vec<Vec<u32>> = vec![Vec::new(); windows.len()];
     let mut held = 0u32;
     let mut fed: Vec<u32> = (0..PROMPT).map(|at| (at * 37 + 11) % 256).collect();
     let mut rows = Vec::new();
-    if offload == Offload::Swapped && !other.is_empty() {
+    if offload == Offload::Swapped && (!other.is_empty() || ring_pieces > 0) {
         let tokens: Vec<u32> = (0..40u32).map(|at| (at * 11 + 3) % 256).collect();
         let own_pages: Vec<u32> = match list {
             Some(per) => (0..40u32.div_ceil(page))
@@ -245,13 +260,16 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
                     .collect()
             })
             .collect();
+        let other_pairs = pairs(&other_ring);
         let seated = Seated {
             replay_stated: None,
             held: Some(0),
             refs: true,
             pages: &own_pages,
             windows: &own_windows,
-            record: Some(&other),
+            ring: (ring_pieces > 0).then_some(other_pairs.as_slice()),
+            window: (ring_pieces > 0).then(|| fold(0, 40)),
+            record: (!other.is_empty()).then_some(other.as_slice()),
             ..Seated::of(Lane {
                 slot: 1,
                 word: word(&fixture.trace, 40),
@@ -273,12 +291,16 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
                 table.push(device.take(id, per));
             }
         }
+        let ring_pairs = pairs(&ring);
         let seated = Seated {
             replay_stated: None,
             held: Some(held),
+            folded: held,
             refs: true,
             pages: &pages,
             windows: &tables,
+            ring: (ring_pieces > 0).then_some(ring_pairs.as_slice()),
+            window: (ring_pieces > 0).then(|| fold(held, n)),
             record: (!record.is_empty()).then_some(record.as_slice()),
             ..Seated::of(Lane {
                 slot: 0,
@@ -319,6 +341,24 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
                     id,
                     per,
                     table,
+                    offload == Offload::Bytes,
+                );
+            }
+            if ring_pieces > 0 {
+                let parked = if offload == Offload::Swapped && step == 2 {
+                    &other_ring
+                } else {
+                    &ring
+                };
+                ring = park(
+                    &mut shell,
+                    &mut device,
+                    &mut host,
+                    &mut disk,
+                    kv_tier,
+                    RING,
+                    1,
+                    parked,
                     offload == Offload::Bytes,
                 );
             }
@@ -363,18 +403,23 @@ fn check(model: &str) {
         &kept,
     );
     eprintln!("{model}: parked through tier bytes = kept");
-    if fixture
-        .trace
-        .caches
-        .iter()
-        .any(|row| matches!(row, poem_ir::CacheRow::State { .. }))
+    let windowed = fixture.trace.caches.iter().any(|row| match row {
+        poem_ir::CacheRow::Kv { window, .. } => window.is_some(),
+        _ => false,
+    });
+    if windowed
+        || fixture
+            .trace
+            .caches
+            .iter()
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }))
     {
         let swapped = serve(&fixture, Offload::Swapped);
         assert_ne!(
             swapped, kept,
-            "{model}: another lane's record brought back moves the logits"
+            "{model}: another lane's record and ring brought back move the logits"
         );
-        eprintln!("{model}: a swapped record moves the logits (the control)");
+        eprintln!("{model}: a swapped record and ring move the logits (the control)");
     }
 }
 
