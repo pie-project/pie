@@ -51,12 +51,6 @@ impl std::fmt::Debug for Resume {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Affinity {
-    Ephemeral,
-    Sticky,
-}
-
 #[derive(Debug, Clone)]
 pub enum SessionError {
     Admission(String),
@@ -126,7 +120,6 @@ pub trait TurnRouter: Send + Sync + 'static {
     async fn dispatch(
         &self,
         req: &Request,
-        affinity: Option<u64>,
         pinned: Option<WorkerId>,
     ) -> Result<WorkerId, DispatchFail>;
 
@@ -152,7 +145,6 @@ struct TurnState {
     /// Goes to this worker or nowhere: it holds what the turn names.
     pinned: Option<WorkerId>,
     request: Request,
-    affinity: Option<u64>,
     /// The client has been handed output: a process event (a message, a
     /// return, stdout, stderr, an error) or a file, not just the launch's
     /// answer. From then on the turn is not run again. It is marked as the
@@ -215,7 +207,6 @@ impl Inner {
         tenant: &TenantId,
         user: &str,
         mut input: TurnInput,
-        affinity: Option<u64>,
         pinned: Option<WorkerId>,
         open: &Arc<AtomicBool>,
     ) -> Result<(ReqId, TokenRx, WorkerId), SessionError> {
@@ -267,7 +258,6 @@ impl Inner {
                     worker: None,
                     pinned,
                     request: request.clone(),
-                    affinity,
                     emitted: false,
                     sink: tx,
                     open: open.clone(),
@@ -287,7 +277,7 @@ impl Inner {
         // where the turn landed, and `dispatch` can cancel it there.
         let inner = self.clone();
         let open = open.clone();
-        match tokio::spawn(async move { inner.dispatch(req_id, &request, affinity, &open).await })
+        match tokio::spawn(async move { inner.dispatch(req_id, &request, &open).await })
             .await
         {
             Ok(Ok(worker)) => Ok((req_id, TokenRx { rx, lost }, worker)),
@@ -308,7 +298,6 @@ impl Inner {
         &self,
         req_id: ReqId,
         request: &Request,
-        affinity: Option<u64>,
         open: &AtomicBool,
     ) -> Result<WorkerId, DispatchFail> {
         let pinned = self
@@ -317,7 +306,7 @@ impl Inner {
             .unwrap()
             .get(&req_id)
             .and_then(|turn| turn.pinned);
-        let worker = match self.router.dispatch(request, affinity, pinned).await {
+        let worker = match self.router.dispatch(request, pinned).await {
             Ok(worker) => worker,
             Err(DispatchFail) => {
                 self.end(req_id, Outcome::Failed, By::Host);
@@ -391,16 +380,11 @@ impl Sessions {
         &self,
         ident: Identity,
         first: TurnInput,
-        affinity: Affinity,
     ) -> Result<(SessionHandle, TokenRx), SessionError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionError::Draining);
         }
         let session = SessionId(self.inner.next_session.fetch_add(1, Ordering::Relaxed));
-        let affinity_key = match affinity {
-            Affinity::Ephemeral => None,
-            Affinity::Sticky => Some(session.0),
-        };
         self.inner.live.fetch_add(1, Ordering::Relaxed);
         // Made before the first turn so a create dropped mid-dispatch still
         // releases its count and ends the session.
@@ -409,7 +393,6 @@ impl Sessions {
             session,
             tenant: ident.tenant,
             user: ident.user,
-            affinity_key,
             current: Mutex::new(Vec::new()),
             open: Arc::new(AtomicBool::new(true)),
             holds_handles: Mutex::new(None),
@@ -554,13 +537,13 @@ impl Sessions {
                 Err(turn.request.clone())
             } else if !turn.emitted {
                 relaunch(turn, old);
-                Ok((old, turn.request.clone(), turn.affinity, turn.open.clone()))
+                Ok((old, turn.request.clone(), turn.open.clone()))
             } else if let Some(resumed) = turn.resumed.clone()
                 && let ClientMessage::LaunchProcess { input, .. } = &mut turn.request.message
             {
                 *input = resumed;
                 relaunch(turn, old);
-                Ok((old, turn.request.clone(), turn.affinity, turn.open.clone()))
+                Ok((old, turn.request.clone(), turn.open.clone()))
             } else {
                 Err(turn.request.clone())
             }
@@ -577,10 +560,10 @@ impl Sessions {
                 return false;
             }
         };
-        let (old, request, affinity, open) = entry;
+        let (old, request, open) = entry;
         tracing::info!(req = %req_id, from = %old, to = %target, "moving a turn");
         self.inner.router.cancel(old, req_id).await;
-        match self.inner.dispatch(req_id, &request, affinity, &open).await {
+        match self.inner.dispatch(req_id, &request, &open).await {
             Ok(worker) => {
                 self.inner.router.moved(&request, Some(worker), "");
                 true
@@ -621,16 +604,16 @@ impl Sessions {
             match turns.get_mut(&req_id) {
                 Some(turn) => {
                     turn.worker = None;
-                    Some((turn.request.clone(), turn.affinity, turn.open.clone()))
+                    Some((turn.request.clone(), turn.open.clone()))
                 }
                 None => None,
             }
         };
-        let Some((request, affinity, open)) = entry else {
+        let Some((request, open)) = entry else {
             return;
         };
         tokio::spawn(async move {
-            let _ = inner.dispatch(req_id, &request, affinity, &open).await;
+            let _ = inner.dispatch(req_id, &request, &open).await;
         });
     }
 
@@ -656,7 +639,6 @@ pub struct SessionHandle {
     session: SessionId,
     tenant: TenantId,
     user: String,
-    affinity_key: Option<u64>,
     current: Mutex<Vec<ReqId>>,
     open: Arc<AtomicBool>,
     /// Where this session's handles are, from its first frame that names one.
@@ -678,7 +660,6 @@ impl SessionHandle {
                 &self.tenant,
                 &self.user,
                 next,
-                self.affinity_key,
                 pinned,
                 &self.open,
             )
@@ -743,14 +724,14 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                 turns
                     .iter()
                     .filter(|(_, t)| t.worker.is_some_and(|w| !live.contains(&w)))
-                    .map(|(id, t)| (*id, t.affinity, t.open.clone()))
+                    .map(|(id, t)| (*id, t.open.clone()))
                     .collect()
             };
 
             // A turn that has sent no output is launched again from its own
             // input; one that has is told why it ends, and ends: what it sent
             // cannot be unsent.
-            for (req_id, affinity, open) in affected {
+            for (req_id, open) in affected {
                 enum Next {
                     Again(Box<Request>),
                     Lost(mpsc::Sender<Tokens>, Option<String>),
@@ -780,7 +761,7 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                 };
                 match next {
                     Next::Again(request) => {
-                        let _ = inner.dispatch(req_id, &request, affinity, &open).await;
+                        let _ = inner.dispatch(req_id, &request, &open).await;
                     }
                     Next::Lost(sink, process_id) => {
                         // Ended first, so nothing the lost worker still sends
@@ -819,7 +800,6 @@ mod tests {
         admit_ok: AtomicBool,
         dispatch_worker: Mutex<Option<WorkerId>>,
         dispatched: Mutex<Vec<ReqId>>,
-        affinities: Mutex<Vec<Option<u64>>>,
         pins: Mutex<Vec<Option<WorkerId>>>,
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
         ended: Mutex<Vec<SessionId>>,
@@ -842,7 +822,6 @@ mod tests {
                 admit_ok: AtomicBool::new(true),
                 dispatch_worker: Mutex::new(worker),
                 dispatched: Mutex::new(Vec::new()),
-                affinities: Mutex::new(Vec::new()),
                 pins: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
                 ended: Mutex::new(Vec::new()),
@@ -871,13 +850,11 @@ mod tests {
         async fn dispatch(
             &self,
             req: &Request,
-            affinity: Option<u64>,
             pinned: Option<WorkerId>,
         ) -> Result<WorkerId, DispatchFail> {
             self.pins.lock().unwrap().push(pinned);
             self.dispatched.lock().unwrap().push(req.req_id);
             self.messages.lock().unwrap().push(req.message.clone());
-            self.affinities.lock().unwrap().push(affinity);
             if self.held.load(Ordering::Acquire) {
                 self.entered.notify_one();
                 self.release.notified().await;
@@ -948,7 +925,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let (handle, _rx) = sessions
-            .create(ident(), handles(), Affinity::Sticky)
+            .create(ident(), handles())
             .await
             .unwrap();
         let _ = handle.turn(handles()).await.unwrap();
@@ -977,7 +954,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let (handle, _rx) = sessions
-            .create(ident(), handles(), Affinity::Sticky)
+            .create(ident(), handles())
             .await
             .unwrap();
         let req = router.dispatched.lock().unwrap()[0];
@@ -999,7 +976,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let (handle, mut rx) = sessions
-            .create(ident(), launch(), Affinity::Sticky)
+            .create(ident(), launch())
             .await
             .unwrap();
         let req = router.dispatched.lock().unwrap()[0];
@@ -1070,7 +1047,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let (_h, mut rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
+            .create(ident(), input())
             .await
             .unwrap();
 
@@ -1095,7 +1072,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(1)));
         let sessions = Sessions::new(router.clone());
         let (_h, rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
+            .create(ident(), input())
             .await
             .unwrap();
         let req_id = router.dispatched.lock().unwrap()[0];
@@ -1108,7 +1085,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(3)));
         let sessions = Sessions::new(router.clone());
         let (handle, _rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
+            .create(ident(), input())
             .await
             .unwrap();
         let session = handle.id();
@@ -1120,7 +1097,7 @@ mod tests {
     async fn no_worker_surfaces() {
         let router = MockRouter::new(None);
         let sessions = Sessions::new(router);
-        let res = sessions.create(ident(), input(), Affinity::Sticky).await;
+        let res = sessions.create(ident(), input()).await;
         assert!(matches!(res, Err(SessionError::NoWorker)));
     }
 
@@ -1139,7 +1116,7 @@ mod tests {
             *input = r#"{"prompt":"hi"}"#.into();
         }
         let (_h, mut rx) = sessions
-            .create(ident(), turn, Affinity::Sticky)
+            .create(ident(), turn)
             .await
             .unwrap();
         let req = router.dispatched.lock().unwrap()[0];
@@ -1201,7 +1178,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let (_h, mut rx) = sessions
-            .create(ident(), launch(), Affinity::Sticky)
+            .create(ident(), launch())
             .await
             .unwrap();
         let req = router.dispatched.lock().unwrap()[0];
@@ -1232,7 +1209,7 @@ mod tests {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
         let (_h, _rx) = sessions
-            .create(ident(), launch(), Affinity::Sticky)
+            .create(ident(), launch())
             .await
             .unwrap();
         let req = router.dispatched.lock().unwrap()[0];
@@ -1260,7 +1237,7 @@ mod tests {
             Some(format!("after {value}"))
         })));
         let (_h, mut rx) = sessions
-            .create(ident(), input, Affinity::Sticky)
+            .create(ident(), input)
             .await
             .unwrap();
         let req = router.dispatched.lock().unwrap()[0];
@@ -1321,7 +1298,7 @@ mod tests {
 
         let create = tokio::spawn({
             let sessions = sessions.clone();
-            async move { sessions.create(ident(), input(), Affinity::Sticky).await }
+            async move { sessions.create(ident(), input()).await }
         });
         router.entered.notified().await;
         create.abort();
@@ -1337,7 +1314,7 @@ mod tests {
 
         router.held.store(false, Ordering::Release);
         let (handle, _rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
+            .create(ident(), input())
             .await
             .unwrap();
         router.held.store(true, Ordering::Release);

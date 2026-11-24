@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use client_api::{ClientMessage, ServerMessage};
@@ -19,8 +18,6 @@ use worker_api::{
 };
 
 const LINK_HEADROOM_BYTES: usize = 64 * 1024;
-
-const PUSH_DEADLINE: Duration = Duration::from_secs(300);
 
 const TURN_QUEUE_DEPTH: usize = 64;
 
@@ -675,7 +672,7 @@ async fn run_turn(
             fired = async { start.as_mut().expect("armed").await }, if start.is_some() => {
                 start = None;
                 if fired.is_ok() {
-                    let _ = gateway.started(push_ctx(), req_id).await;
+                    let _ = gateway.started(worker_api::until_link_lost(), req_id).await;
                 }
             }
             _ = cancel.notified() => {
@@ -699,7 +696,7 @@ async fn run_turn(
                     start = Some(rx);
                     armed = true;
                 }
-                match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
+                match gateway.push_tokens(worker_api::until_link_lost(), req_id, Tokens::Chunk(msg)).await {
                     Ok(Control::Continue) => {}
                     Ok(Control::Abort) => {
                         tracing::debug!(%req_id, "gateway piggybacked abort");
@@ -722,7 +719,7 @@ async fn run_turn(
 }
 
 async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {
-    match gateway.push_tokens(push_ctx(), req_id, Tokens::Eos).await {
+    match gateway.push_tokens(worker_api::until_link_lost(), req_id, Tokens::Eos).await {
         Ok(_) => TurnEnd::Done,
         Err(e) => {
             tracing::warn!(%req_id, error = %e, "push Eos transport error");
@@ -757,12 +754,6 @@ fn within_link(msg: ServerMessage, budget: usize) -> ServerMessage {
         },
         other => other,
     }
-}
-
-fn push_ctx() -> tarpc::context::Context {
-    let mut ctx = tarpc::context::current();
-    ctx.deadline = std::time::Instant::now() + PUSH_DEADLINE;
-    ctx
 }
 
 fn turn_terminal(

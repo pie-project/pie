@@ -10,7 +10,7 @@ use futures::{SinkExt, StreamExt};
 
 use crate::GatewayState;
 use crate::ingress::identity;
-use crate::session::{Affinity, Identity, SessionError, TokenRx, TurnInput};
+use crate::session::{Identity, SessionError, TokenRx, TurnInput};
 use crate::worker::{MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_FRAME_RECV_BYTES};
 use client_api::ClientMessage;
 use worker_api::{Priority, Tokens};
@@ -159,7 +159,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         Err(None) => return,
     };
     let corr = first.message.corr_id();
-    let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
+    let (handle, first_rx) = match state.sessions.create(ident, first).await {
         Ok(pair) => pair,
         Err(e) => return end(&mut tx, corr, &e.to_string()).await,
     };
