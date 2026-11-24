@@ -395,17 +395,29 @@ impl Weights {
         self.banks.values().map(|bank| bank.slot).max().unwrap_or(0)
     }
 
+    /// Why a reload cannot write this load's planes in place, as the whole
+    /// refusal: what the load holds and what serves a new checkpoint
+    /// instead. `None` where every plane lies in the weight store.
     #[must_use]
     pub fn unreloadable(&self) -> Option<&'static str> {
         if !self.mapped.is_empty() {
             Some(
-                "reads its planes in place out of the artifact's file mapping, which a \
-                 reload cannot write; serve the checkpoint's own directory to reload it",
+                "this load reads its planes in place from the imported artifact's file \
+                 mapping, which a reload cannot write: restart the server on the new \
+                 checkpoint, or serve the checkpoint's own directory (`[model] source` set \
+                 to its path) to make its weights reloadable",
             )
         } else if !self.hosted.is_empty() || !self.filed.is_empty() {
-            Some("streams embedding rows from a copy of their own")
+            Some(
+                "this load streams embedding rows from a copy of their own, which a reload \
+                 does not rewrite: restart the server on the new checkpoint",
+            )
         } else if !self.decoded.is_empty() {
-            Some("derives planes from the checkpoint's at load (decoded or repacked copies)")
+            Some(
+                "this load derives planes from the checkpoint's at load (decoded or repacked \
+                 copies), which a reload does not redo: restart the server on the new \
+                 checkpoint",
+            )
         } else {
             None
         }
@@ -419,10 +431,7 @@ impl Weights {
         torn: &mut bool,
     ) -> Result<(u32, u64)> {
         if let Some(why) = self.unreloadable() {
-            return Err(Fault::Load(LoadError::Unsupported(format!(
-                "this load {why}, which a reload does not redo: restart the server on the \
-                 new checkpoint instead"
-            ))));
+            return Err(Fault::Load(LoadError::Unsupported(why.to_string())));
         }
         serves_this_deployment(path, trace.platform.backend(), &trace.name)?;
         let held: Vec<Option<Held<'_>>> = trace
