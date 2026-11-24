@@ -434,6 +434,7 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
             kv_budget,
             allowance: engine::Allowance::WHOLE,
             device: &DeviceBoot::default(),
+            steps: None,
         },
         Some(VoxelLadder::new(max_voxels, 4)),
     )
@@ -699,6 +700,7 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
             kv_budget,
             allowance: engine::Allowance::WHOLE,
             device: &DeviceBoot::default(),
+            steps: None,
         },
         Some(VoxelLadder::new(256, 4)),
     )

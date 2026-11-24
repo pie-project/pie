@@ -22,11 +22,12 @@ fn quiet(lane: &mut engine::fire::Lane) {
 
 /// Decode tok/s at `lanes` lanes, each holding `held` prompt rows.
 fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
-    // a lane holds `held` + 103 rows at most
+    // a lane holds `held` + 103 rows at most; fires of up to 512 rows (a
+    // budget the canonical layouts pad within)
     let context = 512;
     set("SLOTS", lanes.max(4));
     set("LANES", lanes.max(8));
-    set("TOKENS", (2 * lanes).max(held).max(128));
+    set("TOKENS", (2 * lanes).max(held).max(512));
     let mut model = load(name, context);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);

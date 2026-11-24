@@ -122,7 +122,18 @@ impl Shell {
         }
         self.sizing = None;
         self.stage_all = false;
-        out.map(|()| sets)
+        out?;
+        // and every fire the warm ladder lays, as it lays it: what its
+        // shapes stage at their buckets (`Shell::ladder_staged`)
+        for (bucket, rows) in self.ladder_staged()? {
+            match sets.iter_mut().find(|(rung, _)| *rung == bucket) {
+                Some(set) => set.1 = set.1.max(rows),
+                None => sets.push((bucket, rows)),
+            }
+        }
+        self.sizing = None;
+        sets.sort_unstable();
+        Ok(sets)
     }
 
     /// The rows the widest fire of `lanes` lanes at `rung` rows stages.
