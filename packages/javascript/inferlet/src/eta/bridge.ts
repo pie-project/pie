@@ -32,12 +32,13 @@ export class InferletError extends Error {
   }
 }
 
-function wit<T>(what: string, f: () => T): T {
+function wit<T>(what: string, f: () => T, hint?: string): T {
   try {
     return f();
   } catch (e: unknown) {
     const payload = (e as { payload?: unknown })?.payload;
-    const msg = typeof payload === 'string' ? payload : e instanceof Error ? e.message : String(e);
+    let msg = typeof payload === 'string' ? payload : e instanceof Error ? e.message : String(e);
+    if (hint) msg = `${msg} ${hint}`;
     throw new InferletError(what ? `${what}: ${msg}` : msg);
   }
 }
@@ -732,7 +733,11 @@ export class ForwardPass {
     // program's own statement, made here since the runtime takes it before
     // the program.
     if (!this.retractableRows) {
-      wit('final-rows', () => this.wit.finalRows());
+      wit(
+        'final-rows',
+        () => this.wit.finalRows(),
+        '(a pass that binds `parents`, or otherwise takes rows back, states `ForwardPass.retractable()`)',
+      );
     }
     const builder = new Builder(this.vocab, this.pageSize);
     const lanes = Math.max(

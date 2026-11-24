@@ -33,13 +33,16 @@ class InferletError(Exception):
     """A host-side refusal (`pie:inferlet` declares `type error = string`)."""
 
 
-def _wit(fn: Callable, *args, what: str = ""):
+def _wit(fn: Callable, *args, what: str = "", hint: str = ""):
     """Call a WIT binding, turning its `Err` into an `InferletError` that
-    says where it came from."""
+    says where it came from (and, with `hint`, what the program states
+    instead)."""
     try:
         return fn(*args)
     except _WitErr as e:
         msg = e.value if isinstance(e.value, str) else repr(e.value)
+        if hint:
+            msg = f"{msg} {hint}"
         raise InferletError(f"{what}: {msg}" if what else msg) from None
 
 
@@ -806,7 +809,12 @@ class ForwardPass:
         # program's own statement, made here since the runtime takes it
         # before the program.
         if not self._retractable:
-            _wit(self.wit.final_rows, what="final-rows")
+            _wit(
+                self.wit.final_rows,
+                what="final-rows",
+                hint="(a pass that binds `parents`, or otherwise takes rows back, "
+                "states `ForwardPass.retractable()`)",
+            )
         builder = Builder(self._vocab, self._page_size)
         lanes = max(
             [1, len(self._lanes)]

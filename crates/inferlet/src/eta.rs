@@ -713,7 +713,7 @@ impl ForwardPass {
     /// A beam search's finish: once this pass's last fire has landed, its
     /// working set holds beam `beam`'s hypothesis at its slots
     /// `[folded, end)`, in its own order, and the other beams' pages are let
-    /// go (`BEAM-PAGE-LISTS.md` §6.6; [`crate::beam::BeamGroup::finish`]).
+    /// go ([`crate::beam::BeamGroup::finish`]).
     pub fn adopt_beam(&self, beam: u32, end: u32) -> Result<(), String> {
         self.wit.adopt_beam(beam, end)
     }
