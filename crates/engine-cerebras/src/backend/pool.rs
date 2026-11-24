@@ -33,6 +33,44 @@ pub(super) struct Pool {
     pub windowed: Vec<(u32, u32)>,
     /// Window-buffer slots the pool holds (0 where no layer is windowed).
     pub buffer_pages: u64,
+    /// A unit program's own ids, where its pages and state slots are the
+    /// wafer's: every slot ref the pool states must name one of them.
+    pub wafer: Option<WaferIds>,
+}
+
+/// What a unit program addresses on the wafer: its K / V columns' pages (the
+/// scratch page not among them) and its recurrences' state slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WaferIds {
+    pub pages: u32,
+    pub state_slots: u32,
+}
+
+/// How a unit program's kv list slot refs name its wafer pages: the pool's
+/// chunks after the null one, `per_chunk` pages a chunk, page `ref -
+/// per_chunk`. The pool states no more chunks than leave every ref a page
+/// ([`Pool::facts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WaferPages {
+    pub per_chunk: u32,
+    pub pages: u32,
+}
+
+impl WaferPages {
+    /// The wafer page kv list slot ref `slot` names, refused by name past
+    /// the program's pages.
+    pub fn page(&self, slot: u32) -> Result<u32, String> {
+        slot.checked_sub(self.per_chunk)
+            .filter(|&page| page < self.pages)
+            .ok_or_else(|| {
+                format!(
+                    "kv slot ref {slot} names no page of the unit program's {} (refs {}..{})",
+                    self.pages,
+                    self.per_chunk,
+                    u64::from(self.per_chunk) + u64::from(self.pages)
+                )
+            })
+    }
 }
 
 impl Pool {
@@ -47,6 +85,19 @@ impl Pool {
                 bytes: u64::from(window) * TOKEN_BYTES,
             })
             .collect()
+    }
+
+    /// How a unit program's kv refs name its pages; `None` where its pages
+    /// are not the wafer's.
+    #[must_use]
+    pub fn wafer_pages(&self) -> Option<WaferPages> {
+        let ids = self.wafer?;
+        let chunk_bytes = self.facts().chunk_bytes;
+        let page_bytes = u64::from(self.page_size) * TOKEN_BYTES;
+        Some(WaferPages {
+            per_chunk: u32::try_from(chunk_bytes / page_bytes.max(1)).unwrap_or(u32::MAX),
+            pages: ids.pages,
+        })
     }
 
     /// The pool as chunks: chunk 0 null, then a chunk a slot of the widest
@@ -97,6 +148,18 @@ impl Pool {
             ));
             total = total.saturating_add(chunks(self.buffer_pages, page_bytes));
         }
+        // A unit program's ids: the shapes share every chunk, so a kv ref
+        // or a record may lie in any of them. No more chunks than leave each
+        // kv ref a wafer page and each record (the seats the runtime numbers
+        // by them) a state slot.
+        if let Some(ids) = self.wafer {
+            let mut most = u64::from(ids.pages) / u64::from(per_chunk(page_bytes).max(1));
+            if has_record {
+                most = most
+                    .min(u64::from(ids.state_slots) / u64::from(per_chunk(record_bytes).max(1)));
+            }
+            total = total.min(1u32.saturating_add(u32::try_from(most).unwrap_or(u32::MAX)));
+        }
         ChunkFacts {
             chunk_bytes,
             total_chunks: total,
@@ -116,5 +179,57 @@ impl Pool {
             windowed: rings,
             ..ChunkFacts::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pool, WaferIds};
+
+    fn unit_pool(state_bytes: u64, wafer: WaferIds) -> Pool {
+        Pool {
+            page_size: 16,
+            kv_pages: 1000,
+            records: 40,
+            state_bytes,
+            windowed: Vec::new(),
+            buffer_pages: 0,
+            wafer: Some(wafer),
+        }
+    }
+
+    /// A unit program's pages and state slots are the wafer's: every kv ref
+    /// the shared pool can hand out names one of its pages, and no more
+    /// records (the runtime's seats) than its state slots, whichever shape
+    /// takes which chunk.
+    #[test]
+    fn every_ref_a_unit_pool_states_is_a_wafer_id() {
+        let wafer = WaferIds {
+            pages: 30,
+            state_slots: 4,
+        };
+        for state_bytes in [0, 64, 4096] {
+            let pool = unit_pool(state_bytes, wafer);
+            let facts = pool.facts();
+            facts.validate().expect("a unit pool's facts hang together");
+            let pages = pool.wafer_pages().expect("a unit pool's pages");
+            for shape in &facts.shapes {
+                let refs = shape.slots_per_chunk..facts.total_chunks * shape.slots_per_chunk;
+                if shape.id == super::KV {
+                    for slot in refs {
+                        let page = pages.page(slot).expect("a kv ref names a wafer page");
+                        assert!(page < wafer.pages);
+                    }
+                } else if shape.id == super::RECORD {
+                    assert!(
+                        refs.len() as u32 <= wafer.state_slots,
+                        "{state_bytes}: {refs:?}"
+                    );
+                }
+            }
+        }
+        let pages = unit_pool(0, wafer).wafer_pages().unwrap();
+        let refused = pages.page(0).expect_err("the null chunk names no page");
+        assert!(refused.contains("names no page"), "{refused}");
     }
 }

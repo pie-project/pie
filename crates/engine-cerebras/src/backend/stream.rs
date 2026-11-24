@@ -688,6 +688,7 @@ impl CerebrasEngine {
         checkpoint: &std::path::Path,
         contract: &checkpoint::contract::ModelContract,
         budgets: &engine::load::Budgets,
+        steps: &engine::StepRules,
         programs: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> EngineResult<engine::load::Loaded> {
         use engine::caps::{Capabilities, FireLimits, PoolFacts};
@@ -808,6 +809,7 @@ impl CerebrasEngine {
             state_bytes: 0,
             windowed: Vec::new(),
             buffer_pages: 0,
+            wafer: None,
         }
         .facts();
         chunks
@@ -854,6 +856,14 @@ impl CerebrasEngine {
             frames_in_flight: 1,
             steps: engine::StatedSteps::default(),
         };
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24), as a decode load states them: a stream
+        // load records no bodies either.
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
         for s in &readings {
             tracing::info!(
                 program = %s.reading.dir.display(),

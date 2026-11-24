@@ -64,6 +64,8 @@ pub struct CerebrasEngine {
     posted: std::collections::VecDeque<posted::Posted>,
     /// A stream reading's program (a diffusion transformer's denoise), when the load is one.
     stream: Option<stream::Streams>,
+    /// A unit program's pages, as its lanes' kv refs name them.
+    wafer_pages: Option<pool::WaferPages>,
 }
 
 impl CerebrasEngine {
@@ -92,6 +94,7 @@ impl CerebrasEngine {
             pending: None,
             posted: std::collections::VecDeque::new(),
             stream: None,
+            wafer_pages: None,
         }
     }
 
@@ -220,25 +223,30 @@ impl Engine for CerebrasEngine {
                 "the cerebras engine loads a checkpoint path".into(),
             ));
         };
-        // What the trace and budgets alone decide, before anything is compiled: a decode model
-        // (no stream reading declared) reads a float output at its readout rows, which bounds
-        // the wafer's vocabulary. A trace without one could serve no fire.
+        // What the trace and budgets alone decide, before anything is compiled: the float output
+        // a trace reads at its readout rows bounds the wafer's vocabulary, wherever it has one. A
+        // decode model (no stream reading declared, which is what routes a load to its stream
+        // readings) without one could serve no fire.
         let slots =
             poem_compiler::state_slots(budgets.slots, &trace, default_state_slots(&budgets));
         let decode = trace.facts.declared("reading").is_none() && self.debug.program.is_none();
-        let width = if decode {
-            let facts = Facts::of(trace.clone(), &budgets, slots).map_err(Error::Load)?;
-            let (_, width) = facts.readout().ok_or_else(|| {
-                Error::Load(
-                    "the trace reads no float output at its readout rows (`logits`, else its \
-                     one float readout): the cerebras engine serves none"
-                        .into(),
-                )
-            })?;
-            Some(width)
+        let readout = if decode {
+            Facts::of(trace.clone(), &budgets, slots)
+                .map_err(Error::Load)?
+                .readout()
         } else {
-            None
+            Facts::of(trace.clone(), &budgets, slots)
+                .ok()
+                .and_then(|facts| facts.readout())
         };
+        if decode && readout.is_none() {
+            return Err(Error::Load(
+                "the trace reads no float output at its readout rows (`logits`, else its one \
+                 float readout): the cerebras engine serves none"
+                    .into(),
+            ));
+        }
+        let width = readout.map(|(_, width)| width);
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
         // a stream reading's program (its host.json), or a directory of them, one a reading
         if let Some(programs) = self
@@ -247,7 +255,7 @@ impl Engine for CerebrasEngine {
             .as_deref()
             .and_then(|d| stream::programs_in(d, self.debug.link.as_deref()))
         {
-            return self.load_stream(trace, &path, &contract, &budgets, &programs);
+            return self.load_stream(trace, &path, &contract, &budgets, &steps, &programs);
         }
         // the program serves the context the config states (else as many positions as it holds)
         let positions = budgets.context_declared.then_some(budgets.max_context);
@@ -327,7 +335,8 @@ impl Engine for CerebrasEngine {
                             decode = %e,
                             "cerebras: no decode program; the model's stream readings are served"
                         );
-                        return self.load_stream(trace, &path, &contract, &budgets, &programs);
+                        return self
+                            .load_stream(trace, &path, &contract, &budgets, &steps, &programs);
                     }
                     return Err(Error::Load(format!("the wafer program: {e}")));
                 }
@@ -339,6 +348,8 @@ impl Engine for CerebrasEngine {
         let model_context = u32::try_from(w.positions).unwrap_or(u32::MAX);
         // a unit program's pages are Pie's (its K / V columns' own, a lane's ids its pages)
         let wafer_pages = w.paging;
+        // (a unit program's state slots its lane slots)
+        let wafer_lanes = w.lanes;
         let posted_loop = w.posted_loop;
         self.model = Some(w);
         self.kv = Kv::default();
@@ -374,11 +385,28 @@ impl Engine for CerebrasEngine {
             buffer_pages: u64::from(paging.slots)
                 * u64::from(budgets.max_tokens.div_ceil(paging.page_size.max(1)) + 2),
             windowed,
+            // a unit program's pages and state slots are its own on the wafer
+            wafer: wafer_pages
+                .zip(wafer_lanes)
+                .map(|((_, pages, _), lanes)| pool::WaferIds {
+                    pages,
+                    state_slots: u32::try_from(lanes).unwrap_or(u32::MAX),
+                }),
         };
+        self.wafer_pages = pool.wafer_pages();
         let chunks = pool.facts();
         chunks
             .validate()
             .map_err(|e| Error::Load(format!("the spatial engine's pool: {e}")))?;
+        if let Some(ids) = pool.wafer
+            && chunks.total_chunks <= 1
+        {
+            return Err(Error::Load(format!(
+                "the unit program's {} pages and {} state slots hold no chunk of {} bytes \
+                 (its widest slot): the pool would name ids the wafer does not hold",
+                ids.pages, ids.state_slots, chunks.chunk_bytes
+            )));
+        }
         self.windows = Windows::new(
             pool.windowed.iter().map(|&(_, window)| window).collect(),
             page_size,
