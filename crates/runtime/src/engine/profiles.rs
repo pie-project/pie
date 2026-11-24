@@ -634,6 +634,10 @@ fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn pro
             i32::try_from(index).unwrap_or(0),
             device,
         ))),
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        "metal" => Some(Box::new(engine_metal::stored::Keys {
+            on: engine_metal::stored::measured_on(device),
+        })),
         _ => None,
     }
 }

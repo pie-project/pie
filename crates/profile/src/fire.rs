@@ -1500,6 +1500,41 @@ mod tests {
         assert!(refused.contains("gemm_tflops_by_rows"), "{refused}");
     }
 
+    /// An export never writes a stale entry. A committed rate or curve
+    /// whose key no longer matches this build is written only as the home
+    /// measured it again under this build (its figure, never the committed
+    /// one); where the home holds no current measurement, the export
+    /// refuses, naming each stale rate and curve. A home entry stored under
+    /// a stale key is dropped too.
+    #[test]
+    fn an_export_writes_a_stale_committed_key_only_as_the_home_re_timed_it() {
+        let exported = build();
+        let committed = stored(&exported);
+        let mut moved = build();
+        moved.code = vec![("tiled", 11), ("coopmat", 23), ("gemv", 33)];
+        // The home re-timed every rate and curve under the moved build.
+        let mut home = stored(&moved);
+        home.launch_ns = committed.launch_ns.map(|ns| ns + 1);
+        home.gemm_tflops_by_rows = Some(vec![(4096, vec![(256, 7.5)])]);
+        let (merged, report) =
+            crate::merge_committed(home.clone(), Some(committed.clone()), Some(&moved)).unwrap();
+        assert_eq!(merged.gemm_tflops_by_rows, home.gemm_tflops_by_rows, "re-timed, not copied");
+        assert_ne!(merged.gemm_tflops_by_rows, committed.gemm_tflops_by_rows);
+        assert!(report.iter().any(|l| l == "`gemm_tflops_by_rows`: measured"), "{report:#?}");
+        // The home holds nothing current: refused by name, never copied.
+        let refused =
+            crate::merge_committed(Rates::default(), Some(committed.clone()), Some(&moved))
+                .unwrap_err();
+        assert!(refused.contains("`gemm_tflops_by_rows`"), "{refused}");
+        assert!(refused.contains("curve "), "the stale curves are named: {refused}");
+        // A home entry stored under the old build is dropped, not written:
+        // the committed one (current under the old build) stands for it.
+        let (merged, report) =
+            crate::merge_committed(stored(&moved), Some(committed), Some(&exported)).unwrap();
+        assert_eq!(merged.gemm_tflops_by_rows, stored(&exported).gemm_tflops_by_rows);
+        assert!(report.iter().any(|l| l.starts_with("dropped: stored")), "{report:#?}");
+    }
+
     /// An export says each model's settle with the curves a boot of it
     /// reads, and leaves out one whose planes carry no curve.
     #[test]

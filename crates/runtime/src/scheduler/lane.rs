@@ -721,8 +721,8 @@ pub(crate) struct BehindTaken {
 /// lowest claim on the pool there is: none is taken while a waiter is
 /// short of a slot (any arrival or parked process comes first), and where
 /// the free slots fall short, idle cache yields what is short of it, the
-/// way it yields to running work (`KvStore::reclaim_droppable`, its
-/// retention keys' order; the rs checkpoints after), never a live, parked
+/// way it yields to running work (`KvStore::reclaim_cache`, its
+/// retention keys' order and tiers; the rs checkpoints after), never a live, parked
 /// or suspended set. Taken in full, or none (empty seats: the slice that
 /// fires waits for a later idle turn). Nothing is waited on: the planner
 /// never sees it.
@@ -800,14 +800,14 @@ pub(crate) fn take_behind(
     let short = (pages as usize).saturating_mul(lanes);
     let freed = crate::store::registry::with_kv_lock(&stores.kv, "behind-reclaim-idle", |kv| {
         let epoch = kv.current_epoch();
-        kv.reclaim_droppable(epoch, short, crate::policy::retention::Installed)
+        kv.reclaim_cache(epoch, short, crate::policy::retention::Installed)
     });
     let rs_freed = if records {
         stores
             .rs
             .lock()
             .unwrap()
-            .reclaim_droppable(crate::policy::retention::Installed)
+            .reclaim_cache(crate::policy::retention::Installed)
     } else {
         0
     };

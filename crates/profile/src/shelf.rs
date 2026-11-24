@@ -446,6 +446,15 @@ pub fn merge_committed(
 ) -> Result<(crate::fire::Rates, Vec<String>), String> {
     use crate::fire::{DENSE_SETTLED, KERNEL_CURVES, KEYED};
     let mut report = Vec::new();
+    // The home's own entries are checked as the committed ones are: one
+    // stored under a key this build no longer matches is never written.
+    let mut measured = measured;
+    if let Some(now) = now {
+        for line in measured.sift_as(now, "stored") {
+            report.push(format!("dropped: {line}"));
+        }
+        measured.stale = None;
+    }
     let Some(mut committed) = committed else {
         for key in KEYED.iter().filter(|key| measured.states(key)) {
             report.push(format!("`{key}`: measured"));
@@ -460,21 +469,15 @@ pub fn merge_committed(
     for line in &dropped {
         report.push(format!("dropped: {line}"));
     }
-    let mut refused = Vec::new();
+    committed.stale = None;
+    let mut refused: Vec<String> = Vec::new();
     for key in KEYED {
         match (measured.states(key), committed.states(key), before.states(key)) {
             (true, _, _) => report.push(format!("`{key}`: measured")),
             (false, true, _) => report.push(format!("`{key}`: carried from the committed profile")),
-            (false, false, true) => refused.push(key),
+            (false, false, true) => refused.push(format!("`{key}`")),
             (false, false, false) => {}
         }
-    }
-    if !refused.is_empty() {
-        return Err(format!(
-            "the committed profile states {refused:?}, whose keys no longer match this build, and \
-             the home did not measure them again: a boot would measure them; boot with `[engine] \
-             measure = true` once, then export"
-        ));
     }
     let curve_ids = |r: &crate::fire::Rates| -> Vec<(u32, u32, u32, u32)> {
         r.kernel_tflops_by_shape
@@ -483,6 +486,25 @@ pub fn merge_committed(
             .map(crate::fire::KernelCurve::id)
             .collect()
     };
+    // A committed curve whose key no longer matches, which the home did not
+    // measure again: never carried, and a boot would time it.
+    let (kept, mine_now) = (curve_ids(&committed), curve_ids(&measured));
+    for curve in before.kernel_tflops_by_shape.iter().flatten() {
+        let id = curve.id();
+        if !kept.contains(&id) && !mine_now.contains(&id) {
+            refused.push(format!("curve {}", curve.name()));
+        }
+    }
+    if !refused.is_empty() {
+        return Err(format!(
+            "the committed profile states {}, whose keys no longer match this build (a kernel's \
+             code or the measuring method changed), and the home holds no current measurement of \
+             them: an export never writes a stale entry. Measure them in this home first (boot \
+             each model with `[engine] measure = true` and let it idle until its `behind serving \
+             ... done` lines, or `pie tune --rates` for the rates), then export",
+            refused.join(", ")
+        ));
+    }
     let (mine, carried) = (curve_ids(&measured), curve_ids(&committed));
     report.push(format!(
         "{KERNEL_CURVES}: {} measured, {} carried from the committed profile",

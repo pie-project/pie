@@ -129,3 +129,40 @@ fn walk(dir: &std::path::Path) -> Vec<String> {
     }
     out
 }
+
+/// A request arriving before every fire of a settle slice: each slice
+/// gives the device back before it fires, nothing is weighed or stored,
+/// and the settle stays pending for a later idle turn.
+#[test]
+fn a_settle_slice_yields_to_an_arrival_before_it_fires() {
+    let profiles = profiles_at("settle-yield");
+    let boot = || backend::DeviceBoot {
+        profiles: Some(profiles.clone()),
+        ..crate::gpu::device_boot()
+    };
+    let Some(mut loaded) = loaded_boot("settle-yield", &Outputs, 4, boot()) else {
+        return;
+    };
+    let behind = ::engine::BehindServing {
+        others: &|| 0,
+        arrived: &|| true,
+        seats: None,
+    };
+    let mut slices = 0;
+    while slices < 32 && loaded.engine.measure_behind(&behind).expect("measuring behind") {
+        slices += 1;
+    }
+    let shell = loaded.engine.loaded_mut().expect("loaded");
+    assert!(
+        shell.settled().iter().all(|range| !range.checked),
+        "no range was weighed: {:?}",
+        shell.settled()
+    );
+    assert!(shell.behind_status().is_some(), "the settle is still pending");
+    drop(loaded);
+    let stored = walk(&profiles)
+        .iter()
+        .any(|text| text.contains("dense_settled_keyed"));
+    let _ = std::fs::remove_dir_all(&profiles);
+    assert!(!stored, "nothing was stored");
+}
