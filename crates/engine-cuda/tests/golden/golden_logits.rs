@@ -25,10 +25,10 @@
 //! device (host work, kept out of the GPU's lock), then `golden_logits`:
 //!
 //! ```text
-//! cargo test -p engine-cuda --features cuda --test engine_cuda \
+//! cargo test -p engine-cuda --features cuda --test golden \
 //!     golden_fixtures -- --ignored --nocapture
 //! flock /tmp/pie-gpu.lock cargo test -p engine-cuda --features cuda \
-//!     --test engine_cuda golden_logits -- --ignored --nocapture --test-threads=1
+//!     --test golden golden_logits -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! It prints one `golden <model> <step> <hash> <argmax>` line a step and one
