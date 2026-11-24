@@ -44,7 +44,6 @@ const TILES: u32 = 2;
 pub struct Prepared {
     pub program: PathBuf,
     pub weights: Weights,
-    pub plan: Plan,
     _scratch: Option<tempfile::TempDir>,
 }
 
@@ -298,7 +297,6 @@ pub fn prepare(
     Ok(Prepared {
         program,
         weights,
-        plan,
         _scratch: scratch,
     })
 }

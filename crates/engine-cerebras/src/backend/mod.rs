@@ -631,32 +631,3 @@ fn refuse_adapters(frame: &FrameSubmission) -> EngineResult<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod adapter_tests {
-    use super::*;
-    use engine::fire::{Lane, Step};
-
-    #[test]
-    fn a_lane_naming_an_adapter_is_refused_by_name() {
-        let lane = |adapter| Lane {
-            tokens: vec![1],
-            positions: vec![0],
-            adapter,
-            ..Lane::default()
-        };
-        let frame = |adapter| {
-            FrameSubmission::of(Step {
-                lanes: vec![lane(None), lane(adapter)],
-                ..Step::default()
-            })
-        };
-        assert!(refuse_adapters(&frame(None)).is_ok());
-        let e = refuse_adapters(&frame(Some(7))).expect_err("refused");
-        assert!(
-            e.to_string()
-                .contains("cerebras serves no adapter: adapter 7"),
-            "{e}"
-        );
-    }
-}

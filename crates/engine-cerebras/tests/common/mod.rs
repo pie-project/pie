@@ -440,7 +440,7 @@ pub fn npy(rows: usize, width: usize, v: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Every node's values of the step, as `wafer-compile stream --values` reads a capture
+/// Every node's values of the step, as the stream compile reads a capture
 /// (`nodes.json`, `n<node>_{in,out}<k>.npy`; ints as floats).
 pub fn capture(forward: &mut Forward, trace: &Trace, step: &StreamStep<'_>, dir: &Path) {
     let all: Vec<usize> = (0..trace.nodes.len()).collect();

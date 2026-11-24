@@ -1753,18 +1753,15 @@ dependencies = [
  "pie-dtype",
  "pie-eta-dsl",
  "pie-eta-ir",
- "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
  "pie-profile",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "toml",
  "tracing",
- "tracing-subscriber",
  "ztensor",
 ]
 

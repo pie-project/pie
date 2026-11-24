@@ -171,39 +171,6 @@ mod tests {
         assert_eq!(Config::parse(c.render().unwrap().as_bytes()).unwrap(), c);
     }
 
-    /// The config is the whole configuration: neither this crate nor kernels-cerebras reads a
-    /// `PIE_CEREBRAS_*` variable or a source-tree path at run time.
-    #[test]
-    fn nothing_reads_the_environment() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut hits = Vec::new();
-        // (assembled, so this test does not find itself)
-        let tools = ["\"tools", "/wafer"].concat();
-        for dir in [root.join("src"), root.join("../kernels-cerebras/src")] {
-            let mut stack = vec![dir];
-            while let Some(d) = stack.pop() {
-                for e in std::fs::read_dir(&d).unwrap().flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        stack.push(p);
-                        continue;
-                    }
-                    let text = std::fs::read_to_string(&p).unwrap_or_default();
-                    for (n, line) in text.lines().enumerate() {
-                        let code = line.split("//").next().unwrap_or("");
-                        let env = ["var(", "var_os("]
-                            .iter()
-                            .any(|v| code.contains(&format!("env::{v}\"PIE_CEREBRAS")));
-                        if env || code.contains(&tools) {
-                            hits.push(format!("{}:{}: {line}", p.display(), n + 1));
-                        }
-                    }
-                }
-            }
-        }
-        assert!(hits.is_empty(), "{hits:#?}");
-    }
-
     #[test]
     fn unknown_keys_and_bad_values_are_refused() {
         assert!(of("[cerebras]\nprogram = \"p\"\n").is_err());

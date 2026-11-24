@@ -3,9 +3,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
+use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{
     ChannelState, ExecPlan, HostOp, InterpInstance, Interpreted, PassInputs, StepOutcome, Value,
@@ -67,28 +67,9 @@ impl Instance {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Tally {
-    interpreted: AtomicU64,
-}
-
 /// A lane's tokens off its `embed_tokens` channel, on the host.
 pub enum Tokens {
     Host(Vec<u32>),
-}
-
-impl Tokens {
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            Tokens::Host(ids) => ids.len(),
-        }
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[derive(Default)]
@@ -99,8 +80,6 @@ pub struct Plane {
     instances: BTreeMap<InstanceId, Instance>,
     next_program: u64,
     next_instance: u64,
-
-    tally: Arc<Tally>,
 }
 
 impl Plane {
@@ -119,14 +98,6 @@ impl Plane {
         tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
-    }
-
-    #[must_use]
-    pub fn package(
-        &self,
-        program: ProgramId,
-    ) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
-        self.programs.get(&program).map(|plan| &plan.package)
     }
 
     pub fn register_channel(
@@ -242,61 +213,6 @@ impl Plane {
         })
     }
 
-    #[must_use]
-    pub fn disagreeing_ticket(&self, instance: InstanceId, tickets: &[Ticket]) -> Option<String> {
-        let seat = self.instances.get(&instance)?;
-        let airborne = 0u64;
-        for ticket in tickets {
-            let Some(dense) = seat.channels.iter().position(|id| *id == ticket.channel) else {
-                return Some(format!(
-                    "instance {instance} predicted about channel {}, which it does not carry",
-                    ticket.channel
-                ));
-            };
-            let Some(ring) = seat.inst.channels.get(dense) else {
-                return Some(format!(
-                    "instance {instance} carries channel {} as its {dense}th, past its rings",
-                    ticket.channel
-                ));
-            };
-            let (takes, puts) =
-                seat.plan
-                    .package
-                    .stages
-                    .iter()
-                    .fold((0u64, 0u64), |(takes, puts), stage| {
-                        (
-                            takes
-                                + stage.takes.iter().filter(|&&c| c as usize == dense).count()
-                                    as u64,
-                            puts + stage
-                                .puts
-                                .iter()
-                                .filter(|p| p.channel as usize == dense)
-                                .count() as u64,
-                        )
-                    });
-            let head = ring.head() + airborne * takes;
-            let tail = ring.tail() + airborne * puts;
-            let stated = |claim: u64, held: u64, end: &str| {
-                (claim != Ticket::NONE && claim != held).then(|| {
-                    format!(
-                        "instance {instance}'s channel {} stands at {end} {held} and the caller \
-                         predicted {claim}",
-                        ticket.channel
-                    )
-                })
-            };
-            if let Some(why) = stated(ticket.expected_head, head, "head") {
-                return Some(why);
-            }
-            if let Some(why) = stated(ticket.expected_tail, tail, "tail") {
-                return Some(why);
-            }
-        }
-        None
-    }
-
     pub fn close_instance(&mut self, id: InstanceId) -> Result<(), Refusal> {
         self.instances
             .remove(&id)
@@ -305,42 +221,6 @@ impl Plane {
                 what: "instance",
                 id: id.0,
             })
-    }
-
-    pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
-        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance.0,
-        })?;
-        let Some(binding) = seat
-            .plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == Port::Fold && !binding.is_const)
-        else {
-            return Ok(None);
-        };
-        let ring = &seat.inst.channels[binding.channel as usize];
-        self.settle_ring(ring);
-        if ring.is_empty() {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: the `fold` ring is empty at the fire"
-            )));
-        }
-        let len = match ring.front() {
-            Value::U32(cells) => cells.first().copied(),
-            Value::I32(cells) => cells.first().map(|&n| n.max(0) as u32),
-            other => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance}: `fold` holds {:?}, not a count",
-                    other.dtype()
-                )));
-            }
-        };
-        len.map(Some).ok_or_else(|| {
-            Refusal::Program(format!("instance {instance}: `fold` holds an empty cell"))
-        })
     }
 
     pub fn envelope_tokens(
@@ -522,72 +402,6 @@ impl Plane {
         }
     }
 
-    pub fn envelope_mask(
-        &self,
-        instance: InstanceId,
-        rows: usize,
-        lane_at: usize,
-    ) -> Result<Option<engine::fire::Masking>, Refusal> {
-        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance.0,
-        })?;
-        if !seat.geometry.ports().contains(Port::EmbedTokens) {
-            return Ok(None);
-        }
-        let Some(binding) = seat
-            .plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == Port::AttnMask && !binding.is_const)
-        else {
-            return Ok(None);
-        };
-        let ring = &seat.inst.channels[binding.channel as usize];
-        self.settle_ring(ring);
-        if ring.is_empty() {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: the `attn_mask` ring is empty at the fire"
-            )));
-        }
-        let Value::Bool(cells) = ring.front() else {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: `attn_mask` holds {:?}, not bools",
-                ring.front().dtype()
-            )));
-        };
-        let keys = seat
-            .plan
-            .package
-            .channels
-            .get(binding.channel as usize)
-            .and_then(|decl| decl.shape.last().copied())
-            .map_or(0, |keys| keys as usize);
-        if keys == 0 || cells.len() % keys != 0 {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: `attn_mask` holds {} cell(s) over {keys} key(s)",
-                cells.len()
-            )));
-        }
-        let span = self.lane_span(
-            seat,
-            instance,
-            "attn_mask",
-            cells.len() / keys,
-            rows,
-            lane_at,
-        )?;
-        let masks: Vec<engine::fire::Mask> = cells[span.start * keys..span.end * keys]
-            .chunks_exact(keys)
-            .map(|row| engine::fire::Mask::new(runs_of(row), keys as u64))
-            .collect();
-        Ok(Some(match masks.as_slice() {
-            [only] => engine::fire::Masking::Extent(only.clone()),
-            _ => engine::fire::Masking::Rows(masks),
-        }))
-    }
-
     /// The outputs `instance`'s program reads from a fire: (name, the pass's
     /// lane). An engine running guests in the interpreter feeds these.
     #[must_use]
@@ -647,14 +461,6 @@ impl Plane {
         true
     }
 
-    /// The plan `instance` runs.
-    #[must_use]
-    pub fn plan_of(&self, instance: InstanceId) -> Option<Arc<ExecPlan>> {
-        self.instances
-            .get(&instance)
-            .map(|seat| Arc::clone(&seat.plan))
-    }
-
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
@@ -678,7 +484,6 @@ impl Plane {
         let inputs = PassInputs { outputs };
         let outcome =
             eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
-        self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
         let program = seat.program;
         match outcome {
             StepOutcome::Committed => Ok(()),
@@ -693,20 +498,6 @@ impl Plane {
 
     /// Nothing is ever in flight on this backend.
     fn settle_ring(&self, _ring: &Arc<ChannelState>) {}
-
-    /// Nothing is ever in flight on this backend.
-    pub fn settle(&self) {}
-
-    #[must_use]
-    pub fn airborne(&self) -> bool {
-        false
-    }
-
-    /// Guest passes run in the interpreter.
-    #[must_use]
-    pub fn tally(&self) -> u64 {
-        self.tally.interpreted.load(Ordering::Acquire)
-    }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
         self.instances.get_mut(&id).ok_or(Refusal::Closed {
@@ -741,30 +532,6 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
         _ => return None,
     })
-}
-
-fn runs_of(row: &[u8]) -> Vec<u32> {
-    let mut runs = Vec::new();
-    let mut current = false;
-    let mut count = 0u32;
-    if row.first().is_some_and(|&cell| cell != 0) {
-        runs.push(0);
-        current = true;
-    }
-    for &cell in row {
-        let value = cell != 0;
-        if value == current {
-            count += 1;
-        } else {
-            runs.push(count);
-            current = value;
-            count = 1;
-        }
-    }
-    if !row.is_empty() {
-        runs.push(count);
-    }
-    runs
 }
 
 // The float-port feeds of the diffusion and video families (serve.rs reads a

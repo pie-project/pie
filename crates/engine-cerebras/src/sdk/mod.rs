@@ -342,8 +342,6 @@ pub struct Runtime {
     _artifacts: Box<ArtifactsMem>,
     _platform: PlatformMem,
     running: bool,
-    /// Nonblocking calls not yet waited on, each with the host words it reads.
-    pending: Vec<(Task, Vec<u32>)>,
     /// Blocking copies and launches so far: calls, time, words.
     pub io: IoStats,
     /// The simulator's host-to-device writes issued since its last landed one.
@@ -456,7 +454,6 @@ impl Runtime {
             _artifacts: artifacts,
             _platform: platform,
             running: false,
-            pending: Vec::new(),
             unlanded: 0,
             landing: None,
             kept: std::collections::HashMap::new(),
@@ -498,7 +495,6 @@ impl Runtime {
 
     /// Stops the program. Idempotent.
     pub fn stop(&mut self) {
-        self.wait_pending();
         if self.running {
             // SAFETY: constructed, running runtime.
             unsafe { (self.api().stop)(self.this()) }
@@ -649,47 +645,6 @@ impl Runtime {
         self.finish(&mut task);
         IoStats::add(&mut self.io.h2d, t0, data.len());
         Ok(())
-    }
-
-    /// [`Runtime::memcpy_h2d`] without waiting: [`Runtime::wait_pending`] (or any later blocking
-    /// call) ends it.
-    pub fn memcpy_h2d_nonblock(
-        &mut self,
-        symbol: &str,
-        data: Vec<u32>,
-        rect: Rect,
-        elems_per_pe: usize,
-        order: Order,
-        data_type: DataType,
-    ) -> Result<()> {
-        let id = self.rpc.id(symbol, RpcKind::Var)?;
-        self.check_size(symbol, rect, elems_per_pe, data.len())?;
-        let opts = MemcpyOptions::new(false, data_type as i32, order as i32, true);
-        let mut task = Task::empty();
-        // SAFETY: data moves into `pending` and lives until the task is waited on.
-        unsafe {
-            (self.api().memcpy_h2d)(
-                &mut task,
-                self.this(),
-                id,
-                data.as_ptr() as *mut c_void,
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                elems_per_pe as i32,
-                &opts,
-            )
-        };
-        self.pending.push((task, data));
-        Ok(())
-    }
-
-    /// Waits for and releases every nonblocking call made so far.
-    pub fn wait_pending(&mut self) {
-        for (mut task, _words) in std::mem::take(&mut self.pending) {
-            self.finish(&mut task);
-        }
     }
 
     /// Launches the exported function `name` with `args` and waits for it.

@@ -66,11 +66,11 @@ enum Model {
 }
 
 impl Model {
-    /// (passes a launch, positions, vocab, hidden)
-    fn sizes(&self) -> (usize, usize, usize, usize) {
+    /// (positions, vocab, hidden)
+    fn sizes(&self) -> (usize, usize, usize) {
         match self {
-            Model::Artifact(m) => (m.cap, m.positions, m.vocab, m.hidden),
-            Model::Units(m) => (1, m.positions, m.vocab, 0),
+            Model::Artifact(m) => (m.positions, m.vocab, m.hidden),
+            Model::Units(m) => (m.positions, m.vocab, 0),
         }
     }
 
@@ -139,8 +139,6 @@ pub struct Wafer {
     /// Posted token loops' answers, in order.
     posted: mpsc::Receiver<Answer>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Passes a launch runs at most.
-    pub cap: usize,
     /// The KV positions the sequence may hold.
     pub positions: usize,
     pub vocab: usize,
@@ -221,7 +219,7 @@ impl Wafer {
         let (post_tx, post_rx) = mpsc::channel::<Answer>();
         let (ready_tx, ready_rx) = mpsc::channel::<
             R<(
-                (usize, usize, usize, usize),
+                (usize, usize, usize),
                 Option<(usize, u32, u32)>,
                 Option<usize>,
             )>,
@@ -291,7 +289,7 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let ((cap, positions, vocab, hidden), paging, lanes) = ready_rx
+        let ((positions, vocab, hidden), paging, lanes) = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
         Ok(Wafer {
@@ -299,7 +297,6 @@ impl Wafer {
             answers: ans_rx,
             posted: post_rx,
             thread: Some(thread),
-            cap,
             positions,
             vocab,
             hidden,

@@ -161,7 +161,7 @@ fn flux_2_minis_statics_are_the_checkpoints() {
     assert!(spans > 0 && files > 0);
 }
 
-/// Every node's values of the step, as `wafer-compile stream --values` reads a capture.
+/// Every node's values of the step, as the stream compile reads a capture.
 fn capture(
     forward: &mut Forward,
     trace: &Trace,
@@ -315,7 +315,7 @@ fn flux_2_minis_denoise_runs_through_the_engine() {
 }
 
 /// A batch's entries: the engine's (`Reading::entries_batch`) are word for word the ones the
-/// compile writes from two requests' captures laid out as a batch (`--batch 2 --values`).
+/// compile writes from two requests' captures laid out as a batch.
 #[test]
 fn a_batch_of_twos_entries_are_its_requests_in_turn() {
     let trace = trace();

@@ -25,7 +25,6 @@ toml = "1.1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 engine = { path = "../engine" }
 engine-cpu = { path = "../engine-cpu" }
-poem = { package = "pie-poem", path = "../poem" }
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
@@ -38,8 +37,6 @@ blake3 = "1"
 
 [dev-dependencies]
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-sha2 = "0.11"
 
 [lints]
 workspace = true

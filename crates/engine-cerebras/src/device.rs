@@ -1,5 +1,4 @@
-//! The wafer as the host drives it: one trait for every host-wafer call the engine makes, so a
-//! harness can run the host side without a fabric (`examples/artifact_baseline.rs`).
+//! The wafer as the host drives it: one trait for every host-wafer call the engine makes.
 
 use crate::sdk::{self, DataType, Order, Rect, Runtime};
 
