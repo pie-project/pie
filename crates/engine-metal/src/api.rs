@@ -526,7 +526,7 @@ impl Engine for Metal {
         // A `curve <n>x<k>` entry: that shape's dense curves, timed by the
         // step a load times them by (`tune::dense::curves_behind`); else
         // one `[rates]` key.
-        let timed = crate::rates::clock_rate(device, profile.clone(), true).and_then(|before| {
+        let timed = crate::rates::clock_rate(device, profile.clone(), true, Some(behind.arrived)).and_then(|before| {
             let rates = match key.strip_prefix(crate::tune::dense::CURVE_BEHIND) {
                 Some(shape) => profile::fire::Rates {
                     kernel_tflops_by_shape: Some(crate::tune::dense::curves_behind(
@@ -564,7 +564,7 @@ impl Engine for Metal {
                 )));
             }
         };
-        let after = crate::rates::clock_rate(device, profile, false).map_err(Error::Load)?;
+        let after = crate::rates::clock_rate(device, profile, false, None).map_err(Error::Load)?;
         let why = if (behind.others)() != submitted {
             Some("another lane submitted while it ran".to_string())
         } else {
