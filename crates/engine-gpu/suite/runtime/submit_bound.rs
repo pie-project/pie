@@ -124,7 +124,14 @@ fn loads(retime: bool) -> Option<(f64, Vec<Submitted>)> {
                 })
                 .unwrap_or_else(|| panic!("no cube fits the bound: {log:#?}"));
             let took = gpu.timed(|c| {
-                (0..fires * slow.get()).try_for_each(|_| gemm::matmul(c, tactic, act, w, y))
+                (0..fires * slow.get()).try_for_each(|_| gemm::matmul(
+                    c,
+                    tactic,
+                    act,
+                    w,
+                    y,
+                    kernels_slang::ssm::RowSpan::whole(act),
+                ))
             });
             log.push(Submitted {
                 what: format!("load {load}: a frame of {fires} {side}^3"),
@@ -152,7 +159,14 @@ fn loads(retime: bool) -> Option<(f64, Vec<Submitted>)> {
                 break;
             }
             let took = gpu.timed(|c| {
-                (0..slow.get()).try_for_each(|_| gemm::matmul(c, tactic, act, w, y))
+                (0..slow.get()).try_for_each(|_| gemm::matmul(
+                    c,
+                    tactic,
+                    act,
+                    w,
+                    y,
+                    kernels_slang::ssm::RowSpan::whole(act),
+                ))
             });
             log.push(Submitted {
                 what: format!("load {load}: {side}^3"),
@@ -238,13 +252,20 @@ fn a_timed_step_reads_its_device_time_once_it_lands() {
     let probe = Probe::<Api>::new(&gpu.device, tactic).expect("the probe lays");
     let probed = probe.fire(&gpu.device).expect("the probe fires");
     // Warmed: the cube's pipeline built and its operands touched.
-    gpu.run(|c| gemm::matmul(c, tactic, act, w, y));
+    gpu.run(|c| gemm::matmul(c, tactic, act, w, y, kernels_slang::ssm::RowSpan::whole(act)));
     // One arm's timestamps, laid once and written by every fire after,
     // walked and kept alike, one in flight at a time.
     let stamps = gpu.stamps();
     for keep in [false, true, false, true] {
         let started = std::time::Instant::now();
-        let ns = gpu.fired(&stamps, keep, |c| gemm::matmul(c, tactic, act, w, y));
+        let ns = gpu.fired(&stamps, keep, |c| gemm::matmul(
+            c,
+            tactic,
+            act,
+            w,
+            y,
+            kernels_slang::ssm::RowSpan::whole(act),
+        ));
         let host = started.elapsed().as_nanos() as u64;
         let ns = ns.unwrap_or_else(|| panic!("a timed step's device time is read (keep {keep})"));
         assert!(ns > 0 && ns <= host, "keep {keep}: {ns} ns on the device, {host} ns on the host");

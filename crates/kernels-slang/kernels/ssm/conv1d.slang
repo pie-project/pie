@@ -86,12 +86,12 @@ struct Params {
     int snap_lane0;
 #endif
 };
-PIE_PARAMS(PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PARAMS_AT, Params, params);
 
 #if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
 // The window's CSR boundary `i`.
 int csr(uint i) {
-    return indptr[uint(params.indptr_at) + i];
+    return indptr[uint(PIE_FIRE(indptr_at)) + i];
 }
 #endif
 PIE_POOL_READ(float, params.seg_words)
@@ -124,12 +124,12 @@ float silu(float z) {
 
 // Channels `c` and `c + 1` of row `row`.
 float2 x_at(uint row, uint chans, uint c) {
-    uint word = x[((params.row0 + row) * chans + c) >> 1];
+    uint word = x[((PIE_FIRE(row0) + row) * chans + c) >> 1];
     return float2(bf16_to_f32(word & 0xffffu), bf16_to_f32(word >> 16));
 }
 
 void y_put(uint row, uint chans, uint c, float2 v) {
-    y[((params.row0 + row) * chans + c) >> 1] = pack_bf16(silu(v.x), silu(v.y));
+    y[((PIE_FIRE(row0) + row) * chans + c) >> 1] = pack_bf16(silu(v.x), silu(v.y));
 }
 
 // The slot's `hist` rows of channels `c`, `c + 1` (column `at.col`).
@@ -217,10 +217,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
     int hist = (width - 1) * params.dilation + 1;
 
 #if defined(PIE_COMMITTED)
-    uint lane = uint(params.lane0) + r;
+    uint lane = uint(PIE_FIRE(lane0)) + r;
     int begin = csr(r);
     for (uint j = 0; j < r; j++) {
-        begin += replay[uint(params.lane0) + j];
+        begin += replay[uint(PIE_FIRE(lane0)) + j];
     }
     int span = (csr(r + 1) - csr(r)) + replay[lane];
     if (span <= 0 || pie_state_none(lane)) {
@@ -243,13 +243,13 @@ void main(uint3 gid : SV_DispatchThreadID) {
 #else
     int snap = -1;
 #endif
-    walk(column(params.row0 + uint(begin), chans, c), begin, span, span, chans, c, snap);
+    walk(column(PIE_FIRE(row0) + uint(begin), chans, c), begin, span, span, chans, c, snap);
 #else
     // A padding row holds no record (its slot -1): it folds nothing.
-    if (pie_state_none(params.row0 + r)) {
+    if (pie_state_none(PIE_FIRE(row0) + r)) {
         return;
     }
-    Column slab = column(params.row0 + r, chans, c);
+    Column slab = column(PIE_FIRE(row0) + r, chans, c);
     float2 past[HIST_MAX];
     past_load(slab, hist, past);
     uint tap0 = c * uint(width);

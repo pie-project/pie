@@ -1362,7 +1362,14 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
                 Work::matmul(rows, cols, k),
             );
             let fire = |sink: &kernels_slang::Ctx<'_>| {
-                kernels_slang::linear::gemm::matmul(sink, tactic, a, w, out)
+                kernels_slang::linear::gemm::matmul(
+                    sink,
+                    tactic,
+                    a,
+                    w,
+                    out,
+                    kernels_slang::ssm::RowSpan::whole(a),
+                )
                     .map_err(fault("rates: matmul"))
             };
             let timed = rig.frame(timer, 1, &fire, &nothing);
@@ -1400,7 +1407,14 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
                 );
                 // One fire, one submission.
                 let fire = |sink: &kernels_slang::Ctx<'_>| {
-                    kernels_slang::linear::gemm::matmul(sink, tactic, a, w, out)
+                    kernels_slang::linear::gemm::matmul(
+                        sink,
+                        tactic,
+                        a,
+                        w,
+                        out,
+                        kernels_slang::ssm::RowSpan::whole(a),
+                    )
                         .map_err(fault("rates: matmul"))
                 };
                 let timed = rig.frame(timer, 1, &fire, &nothing);
@@ -2746,7 +2760,14 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
     let ns = rig.each(timer, &Touched::default(), sets.len(), &|sink| {
         let (x, normed, packed, y) = sets[next.get() % sets.len()];
         next.set(next.get() + 1);
-        kernels_slang::elemwise::norm::rmsnorm(sink, x, weight, 1e-6, normed)
+        kernels_slang::elemwise::norm::rmsnorm(
+            sink,
+            x,
+            weight,
+            1e-6,
+            normed,
+            kernels_slang::ssm::RowSpan::whole(x),
+        )
             .map_err(fault("rates: rmsnorm"))?;
         kernels_slang::linear::glu::swiglu(sink, packed, width, y).map_err(fault("rates: swiglu"))
     })?;
@@ -2795,7 +2816,14 @@ fn warm<B: Serve>(
         let y = rig.zeros(p, p, Dtype::Bf16)?;
         let tactic = tactic_at(p);
         let fire = |sink: &kernels_slang::Ctx<'_>| {
-            kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y)
+            kernels_slang::linear::gemm::matmul(
+                sink,
+                tactic,
+                act,
+                w,
+                y,
+                kernels_slang::ssm::RowSpan::whole(act),
+            )
                 .map_err(fault("rates: matmul"))
         };
         let nothing = |_: &mut B::Frame| Ok(());
@@ -2879,7 +2907,14 @@ fn warm_at<B: Serve>(
     let fire = |sink: &kernels_slang::Ctx<'_>| {
         let w = weights[next.get() % weights.len()];
         next.set(next.get() + 1);
-        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
+        kernels_slang::linear::gemm::matmul(
+            sink,
+            tactic,
+            act,
+            w,
+            y,
+            kernels_slang::ssm::RowSpan::whole(act),
+        ).map_err(fault("rates: matmul"))
     };
     let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
     let nothing = |_: &mut B::Frame| Ok(());
@@ -3035,7 +3070,14 @@ fn matmul_on<B: Serve>(
         let at = next.get();
         next.set(at + 1);
         let (w, y) = (weights[at % weights.len()], ys[at % ys.len()]);
-        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
+        kernels_slang::linear::gemm::matmul(
+            sink,
+            tactic,
+            act,
+            w,
+            y,
+            kernels_slang::ssm::RowSpan::whole(act),
+        ).map_err(fault("rates: matmul"))
     };
     // A curve's point (its planes' touch shared) to a small device budget;
     // a rate of the device's own, settled over repeated rounds.
@@ -3163,6 +3205,7 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         mask: rig.zeros(1, 4, Dtype::U8)?,
         mask_words: rig.words(&crate::mask::none(s.rows as usize), s.rows, 2, Dtype::U32)?,
         row0: 0,
+        table0: 0,
         rows: s.rows,
     };
     let scale = 1.0 / (s.head_dim as f32).sqrt();
@@ -3360,7 +3403,14 @@ fn copy_and_launch<B: Serve>(
     let w = rig.zeros(LAUNCH, LAUNCH, Dtype::Bf16)?;
     let y = rig.zeros(LAUNCH, LAUNCH, Dtype::Bf16)?;
     let tiny = |sink: &kernels_slang::Ctx<'_>| {
-        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
+        kernels_slang::linear::gemm::matmul(
+            sink,
+            tactic,
+            act,
+            w,
+            y,
+            kernels_slang::ssm::RowSpan::whole(act),
+        ).map_err(fault("rates: matmul"))
     };
     let nothing = |_: &mut B::Frame| Ok(());
     // The launch is what a dispatch adds inside one submission: its chains
@@ -3426,11 +3476,25 @@ fn launch_gap<B: Serve>(
             (y, act)
         };
         next.set(next.get() + 1);
-        kernels_slang::linear::gemm::matmul(sink, tactic, from, w, into)
+        kernels_slang::linear::gemm::matmul(
+            sink,
+            tactic,
+            from,
+            w,
+            into,
+            kernels_slang::ssm::RowSpan::whole(from),
+        )
             .map_err(fault("rates: matmul"))
     };
     let one = |sink: &kernels_slang::Ctx<'_>| {
-        kernels_slang::linear::gemm::matmul(sink, tactic, wide, w, wide_y)
+        kernels_slang::linear::gemm::matmul(
+            sink,
+            tactic,
+            wide,
+            w,
+            wide_y,
+            kernels_slang::ssm::RowSpan::whole(wide),
+        )
             .map_err(fault("rates: matmul"))
     };
     let wall = |count: u32, fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>| {
@@ -3557,7 +3621,14 @@ pub fn gemm_rate<B: Serve>(
     let y = rig.zeros(m, n, Dtype::Bf16)?;
     rig.step(format!("check matmul {m}x{n}x{k}"), Work::matmul(m, n, k));
     let ns = rig.each(timer, &Touched::default(), 1, &|sink| {
-        kernels_slang::linear::gemm::matmul(sink, tactic, act, w, y).map_err(fault("rates: matmul"))
+        kernels_slang::linear::gemm::matmul(
+            sink,
+            tactic,
+            act,
+            w,
+            y,
+            kernels_slang::ssm::RowSpan::whole(act),
+        ).map_err(fault("rates: matmul"))
     })?;
     Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / ns as f64)
 }

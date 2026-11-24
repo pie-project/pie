@@ -1,11 +1,13 @@
 //! Paged KV appends (`attn.kv_append`, `attn.kv_append_shared`) from
-//! `kernels/attn/kv_append.slang`.
+//! `kernels/attn/kv_append.slang`. The source rows and the write tables are
+//! bound whole; the window's first row in each is the fire's data.
 
 use dtype::Dtype;
 
 use super::pairs;
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, head_grid, refuse, stated};
 use crate::error::Error;
+use crate::ssm::RowSpan;
 use crate::tensor::{KvPool, Tensor};
 
 const KV_APPEND: &str = "attn/kv_append.slang";
@@ -54,6 +56,7 @@ fn append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
+    rows: Rows,
 ) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, k.dtype, { Bf16 => "attn_kv_append_bf16" });
     if pool.page_size <= 0 {
@@ -68,7 +71,7 @@ fn append(
         "the write tables are u32: one destination page and one in-page slot per lane"
     );
     let (head_dim, heads) = head_split(op, pool, k.width)?;
-    let lanes = head_grid(op, pairs(op, head_dim)?, heads, k.rows)?;
+    let lanes = head_grid(op, pairs(op, head_dim)?, heads, rows.window.held(op, k)?)?;
     ctx.fire(
         Fire::at(KV_APPEND, entry).apply(Grid::of(lanes, [64, 1, 1])),
         &[
@@ -84,10 +87,32 @@ fn append(
                 pool.origin[1].arg(),
                 pool.page_stride[0].arg(),
                 pool.page_stride[1].arg(),
+                rows.window.row0.arg(),
+                rows.tables.arg(),
             ],
         ]
         .concat(),
     )
+}
+
+/// The rows an append walks: the window's of the source rows, bound whole,
+/// and the window's first row in the write tables, bound whole too (each
+/// the fire's data).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rows {
+    pub window: RowSpan,
+    pub tables: u32,
+}
+
+impl Rows {
+    /// Every row of `k` and of the tables, from row 0.
+    #[must_use]
+    pub fn whole(k: Tensor) -> Rows {
+        Rows {
+            window: RowSpan::whole(k),
+            tables: 0,
+        }
+    }
 }
 
 /// The new key and value rows written into their pages.
@@ -98,8 +123,9 @@ pub fn kv_append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
+    rows: Rows,
 ) -> Result<(), Error> {
-    append(ctx, "attn.kv_append", k, v, pool, write_page, write_offset)
+    append(ctx, "attn.kv_append", k, v, pool, write_page, write_offset, rows)
 }
 
 /// One plane written as both the key and the value.
@@ -109,6 +135,7 @@ pub fn kv_append_shared(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
+    rows: Rows,
 ) -> Result<(), Error> {
     append(
         ctx,
@@ -118,5 +145,6 @@ pub fn kv_append_shared(
         pool,
         write_page,
         write_offset,
+        rows,
     )
 }

@@ -78,6 +78,11 @@ pub struct Tables {
     /// row is: they are bound whole, the same views whatever window a fire
     /// cuts, and the kernels add it to each row they index.
     pub row0: u32,
+    /// The row of the tables (positions, owners, mask words) the window's
+    /// first row is: `row0`, but for a query of the fire's readouts, whose
+    /// rows are not the window's tokens and whose tables are still the
+    /// fire's whole.
+    pub table0: u32,
     /// The window's rows, which the kernels launch over.
     pub rows: u32,
 }
@@ -117,13 +122,13 @@ impl Tables {
                 ),
             ));
         }
-        let end = u64::from(tables.row0) + u64::from(tables.rows);
+        let end = u64::from(tables.table0) + u64::from(tables.rows);
         if end > u64::from(tables.positions.rows) || end > u64::from(tables.mask_words.rows) {
             return Err(refuse(
                 op,
                 format!(
                     "the window's rows {}..{end} pass the fire tables' {} positions and {}                      mask entries",
-                    tables.row0, tables.positions.rows, tables.mask_words.rows
+                    tables.table0, tables.positions.rows, tables.mask_words.rows
                 ),
             ));
         }
@@ -146,6 +151,7 @@ struct Shape {
     kv_heads: u32,
     rows: u32,
     row0: u32,
+    table0: u32,
     window: i32,
 }
 
@@ -213,6 +219,7 @@ fn shape(
         kv_heads,
         rows,
         row0: tables.row0,
+        table0: tables.table0,
         window,
     })
 }
@@ -277,6 +284,7 @@ fn args(
         shape.window.arg(),
         stated(op, shape.q_heads)?.arg(),
         shape.row0.arg(),
+        shape.table0.arg(),
     ]);
     Ok(args)
 }
@@ -841,6 +849,7 @@ mod tests {
             mask: tensor(5, 1, 1, Dtype::U8),
             mask_words: tensor(6, staged, 2, Dtype::U32),
             row0: 0,
+            table0: 0,
             rows: staged,
         };
         let plane = tensor(7, 64, heads * head_dim, Dtype::Bf16);

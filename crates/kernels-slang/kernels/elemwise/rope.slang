@@ -23,22 +23,28 @@ struct Params {
     int span;
     int pair_half;
     int heads;
+    // The window's first row in the bound rows, and in the bound
+    // positions: the fire's data.
+    uint row0;
+    uint pos0;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
+    uint row = PIE_FIRE(row0) + gid.z;
+    uint p = PIE_FIRE(pos0) + gid.z;
     uint i = 2u * gid.x;
     if (i >= uint(max(params.pair_half, 0))) {
         return;
     }
     uint head_dim = uint(max(params.head_dim, 1));
     uint span = uint(max(params.span, 1));
-    float pos = float(position[gid.z]);
+    float pos = float(position[p]);
     float t0 = pos * exp2(-float(i) / float(span) * params.base);
     float t1 = pos * exp2(-float(i + 1u) / float(span) * params.base);
-    uint i1 = (gid.z * uint(max(params.heads, 0)) + gid.y) * head_dim + i;
+    uint i1 = (row * uint(max(params.heads, 0)) + gid.y) * head_dim + i;
     rotate_halves(x, i1, i1 + span, turns(t0, t1));
 }
 
@@ -63,8 +69,12 @@ struct Params {
     float high;
     int pair_half;
     int heads;
+    // The window's first row in the bound rows, and in the bound
+    // positions: the fire's data.
+    uint row0;
+    uint pos0;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float inv_freq(uint i, uint rotary) {
     float f = exp2(-2.0 * float(i) / float(max(rotary, 1u)) * params.base);
@@ -86,8 +96,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
     uint head_dim = uint(max(params.head_dim, 1));
     uint rotary = 2u * pair_half;
-    uint head = (gid.z * uint(max(params.heads, 0)) + gid.y) * head_dim + (head_dim - rotary);
-    float pos = params.sign * float(position[gid.z]);
+    uint row = PIE_FIRE(row0) + gid.z;
+    uint head = (row * uint(max(params.heads, 0)) + gid.y) * head_dim + (head_dim - rotary);
+    float pos = params.sign * float(position[PIE_FIRE(pos0) + gid.z]);
     float4 cs = turns(pos * inv_freq(i, rotary), pos * inv_freq(i + 1u, rotary));
     if (params.interleaved != 0) {
         rotate_adjacent(x, head + 2u * i, cs);
@@ -116,8 +127,12 @@ struct Params {
     int interleaved;
     int pair_half;
     int heads;
+    // The window's first row in the bound rows, and in the bound
+    // positions: the fire's data.
+    uint row0;
+    uint pos0;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float theta_at(uint i, uint head_dim, float pos) {
     float base_freq = exp2(-2.0 * float(i) / float(head_dim) * params.base);
@@ -135,8 +150,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
         return;
     }
     uint head_dim = uint(max(params.head_dim, 1));
-    float pos = float(position[gid.z]);
-    uint head = (gid.z * uint(max(params.heads, 0)) + gid.y) * head_dim;
+    uint row = PIE_FIRE(row0) + gid.z;
+    float pos = float(position[PIE_FIRE(pos0) + gid.z]);
+    uint head = (row * uint(max(params.heads, 0)) + gid.y) * head_dim;
     float4 cs = turns(theta_at(i, head_dim, pos), theta_at(i + 1u, head_dim, pos)) * params.mscale;
     if (params.interleaved != 0) {
         rotate_adjacent(x, head + 2u * i, cs);
@@ -166,8 +182,12 @@ struct Params {
     int s2;
     int heads;
     int pairs;
+    // The window's first row in the bound rows, and in the bound
+    // positions: the fire's data.
+    uint row0;
+    uint pos0;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float load_at(uint i) {
     uint word = x[i >> 1].load();
@@ -187,8 +207,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (i >= params.pairs) {
         return;
     }
-    uint m = gid.z;
-    int3 pos = int3(positions[3u * m], positions[3u * m + 1u], positions[3u * m + 2u]);
+    uint m = PIE_FIRE(row0) + gid.z;
+    uint p = PIE_FIRE(pos0) + gid.z;
+    int3 pos = int3(positions[3u * p], positions[3u * p + 1u], positions[3u * p + 2u]);
     uint row = (m * uint(params.heads) + gid.y) * uint(params.head_dim);
     int axis_pos;
     float inv_freq;
@@ -295,8 +316,12 @@ struct Params {
     uint head_dim;
     uint heads;
     int form;
+    // The window's first row in the bound rows, and in the bound
+    // positions: the fire's data.
+    uint row0;
+    uint pos0;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float theta_pow(float base, float e) {
     return exp(e * log(base));
@@ -310,8 +335,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (idx >= params.heads * angles) {
         return;
     }
-    uint row = gid.y;
-    uint pos = row * params.axes;
+    uint row = PIE_FIRE(row0) + gid.y;
+    uint pos = (PIE_FIRE(pos0) + gid.y) * params.axes;
     uint head = idx / angles;
     uint angle = idx % angles;
     uint xh = (row * params.heads + head) * params.head_dim;

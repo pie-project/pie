@@ -2869,12 +2869,18 @@ impl Frame {
 
     /// Folds `what`, a command the frame records, into its hash.
     pub(crate) fn bake(&self, what: &(impl std::hash::Hash + std::fmt::Debug)) {
+        self.bake_named("", what);
+    }
+
+    /// [`Self::bake`], the trail naming the command `name` (a kernel's
+    /// entry point): what reads a parting as more than a key.
+    pub(crate) fn bake_named(&self, name: &str, what: &(impl std::hash::Hash + std::fmt::Debug)) {
         if tracing::enabled!(target: "vkbakeall", tracing::Level::TRACE) {
             tracing::trace!(target: "vkbakeall", what = ?what, "bake");
         }
         what.hash(&mut *self.baked.borrow_mut());
         if trailing() {
-            self.trail.borrow_mut().push(format!("{what:?}"));
+            self.trail.borrow_mut().push(format!("{what:?} {name}"));
         }
     }
 

@@ -3,11 +3,14 @@
 //! `rope_partial_q`), each head's rotated tail (`rope_partial_last`),
 //! whole-head YaRN (`rope_yarn`), on bf16 two pairs a lane so a lane owns
 //! whole words; M-RoPE sections (`rope_mrope`) and position axes
-//! (`rope_axes`), a pair a lane, bf16 halves through atomics.
+//! (`rope_axes`), a pair a lane, bf16 halves through atomics. The rows are
+//! bound whole; a window's first row ([`RowSpan`]) and its first in the
+//! positions (`pos0`) are the fire's data.
 #![allow(clippy::too_many_arguments)]
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::error::Error;
+use crate::ssm::RowSpan;
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -80,6 +83,8 @@ fn rotate(
     op: &'static str,
     x: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     base: f32,
     head_dim: u32,
     rotary: u32,
@@ -87,7 +92,8 @@ fn rotate(
 ) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "elemwise_rope_neox_bf16" });
     positions_stream(op, positions, x);
-    let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
+    let rows = window.held(op, x)?;
+    let lanes = rope_grid(op, rotary, x.width, head_dim, rows)?;
     if !span.is_multiple_of(2) {
         return Err(refuse(
             op,
@@ -104,6 +110,8 @@ fn rotate(
             stated(op, span)?.arg(),
             stated(op, lanes[0])?.arg(),
             stated(op, lanes[1])?.arg(),
+            window.row0.arg(),
+            pos0.arg(),
         ],
     )
 }
@@ -113,6 +121,8 @@ pub fn full(
     q: Tensor,
     k: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     head_dim: u32,
     theta: f32,
     interleaved: bool,
@@ -127,8 +137,8 @@ pub fn full(
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
     let span = head_dim / 2;
-    rotate(ctx, OP, q, positions, base, head_dim, head_dim, span)?;
-    rotate(ctx, OP, k, positions, base, head_dim, head_dim, span)
+    rotate(ctx, OP, q, positions, window, pos0, base, head_dim, head_dim, span)?;
+    rotate(ctx, OP, k, positions, window, pos0, base, head_dim, head_dim, span)
 }
 
 pub fn partial(
@@ -136,6 +146,8 @@ pub fn partial(
     q: Tensor,
     k: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
@@ -144,14 +156,16 @@ pub fn partial(
     const OP: &str = "elemwise.rope";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate(ctx, OP, q, positions, base, head_dim, rotary_dim, span)?;
-    rotate(ctx, OP, k, positions, base, head_dim, rotary_dim, span)
+    rotate(ctx, OP, q, positions, window, pos0, base, head_dim, rotary_dim, span)?;
+    rotate(ctx, OP, k, positions, window, pos0, base, head_dim, rotary_dim, span)
 }
 
 pub fn partial_q(
     ctx: &Ctx<'_>,
     q: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
@@ -163,6 +177,8 @@ pub fn partial_q(
         OP,
         q,
         positions,
+        window,
+        pos0,
         theta.log2(),
         head_dim,
         rotary_dim,
@@ -174,6 +190,8 @@ pub fn partial_last(
     ctx: &Ctx<'_>,
     q: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
@@ -193,7 +211,8 @@ pub fn partial_last(
     }
     let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "elemwise_rope_tail_bf16" });
     positions_stream(OP, positions, q);
-    let lanes = rope_grid(OP, rotary_dim, q.width, head_dim, q.rows)?;
+    let rows = window.held(OP, q)?;
+    let lanes = rope_grid(OP, rotary_dim, q.width, head_dim, rows)?;
     let (factor, low, high) = match yarn {
         Some(y) => {
             let max_position = nonzero(
@@ -227,6 +246,8 @@ pub fn partial_last(
             high.arg(),
             stated(OP, lanes[0])?.arg(),
             stated(OP, lanes[1])?.arg(),
+            window.row0.arg(),
+            pos0.arg(),
         ],
     )
 }
@@ -257,6 +278,8 @@ fn rotate_ramped(
     op: &'static str,
     x: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     base: f32,
     head_dim: u32,
     factor: f32,
@@ -267,7 +290,8 @@ fn rotate_ramped(
 ) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "elemwise_rope_yarn_bf16" });
     positions_stream(op, positions, x);
-    let lanes = rope_grid(op, head_dim, x.width, head_dim, x.rows)?;
+    let rows = window.held(op, x)?;
+    let lanes = rope_grid(op, head_dim, x.width, head_dim, rows)?;
     ctx.fire(
         Fire::at(ROPE, entry).apply(Grid::of(pairs(lanes), [GROUP, 1, 1])),
         &[
@@ -282,6 +306,8 @@ fn rotate_ramped(
             i32::from(interleaved).arg(),
             stated(op, lanes[0])?.arg(),
             stated(op, lanes[1])?.arg(),
+            window.row0.arg(),
+            pos0.arg(),
         ],
     )
 }
@@ -291,6 +317,8 @@ pub fn yarn(
     q: Tensor,
     k: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     head_dim: u32,
     theta: f32,
     factor: f32,
@@ -322,6 +350,8 @@ pub fn yarn(
             OP,
             x,
             positions,
+            window,
+            pos0,
             base,
             head_dim,
             factor,
@@ -353,6 +383,8 @@ fn rotate_sections(
     entry: &'static str,
     x: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     base: f32,
     head_dim: u32,
     pairs: u32,
@@ -362,8 +394,9 @@ fn rotate_sections(
     if heads == 0 || pairs == 0 {
         return Ok(());
     }
+    let rows = window.held(op, x)?;
     ctx.fire(
-        Fire::at(ROPE, entry).apply(Grid::of([pairs, heads, x.rows], [GROUP, 1, 1])),
+        Fire::at(ROPE, entry).apply(Grid::of([pairs, heads, rows], [GROUP, 1, 1])),
         &[
             x.arg_mut(),
             positions.arg(),
@@ -374,6 +407,8 @@ fn rotate_sections(
             stated(op, sections[2])?.arg(),
             stated(op, heads)?.arg(),
             stated(op, pairs)?.arg(),
+            window.row0.arg(),
+            pos0.arg(),
         ],
     )
 }
@@ -476,6 +511,8 @@ fn sections_both(
     q: Tensor,
     k: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     sections: [u32; MROPE_AXES as usize],
     pairs: u32,
     head_dim: u32,
@@ -489,6 +526,8 @@ fn sections_both(
         entry,
         q,
         positions,
+        window,
+        pos0,
         base,
         head_dim,
         pairs,
@@ -501,6 +540,8 @@ fn sections_both(
         entry,
         k,
         positions,
+        window,
+        pos0,
         base,
         head_dim,
         pairs,
@@ -514,6 +555,8 @@ pub fn mrope_interleaved(
     q: Tensor,
     k: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     sections: [u32; MROPE_AXES as usize],
     rotary_dim: u32,
     head_dim: u32,
@@ -529,6 +572,8 @@ pub fn mrope_interleaved(
         q,
         k,
         positions,
+        window,
+        pos0,
         sections,
         rotary_dim / 2,
         head_dim,
@@ -542,6 +587,8 @@ pub fn mrope_blocked(
     q: Tensor,
     k: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     sections: [u32; MROPE_AXES as usize],
     rotary_dim: u32,
     head_dim: u32,
@@ -552,7 +599,7 @@ pub fn mrope_blocked(
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;
     sections_both(
-        ctx, OP, entry, q, k, positions, sections, pairs, head_dim, theta, geom,
+        ctx, OP, entry, q, k, positions, window, pos0, sections, pairs, head_dim, theta, geom,
     )
 }
 
@@ -561,6 +608,8 @@ pub fn mrope_split(
     q: Tensor,
     k: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     sections: [u32; MROPE_AXES as usize],
     rotary_dim: u32,
     head_dim: u32,
@@ -571,7 +620,7 @@ pub fn mrope_split(
     let geom = sections_fit(OP, q, k, positions, sections, rotary_dim, head_dim)?;
     let pairs = blocked_pairs(OP, sections, rotary_dim)?;
     sections_both(
-        ctx, OP, entry, q, k, positions, sections, pairs, head_dim, theta, geom,
+        ctx, OP, entry, q, k, positions, window, pos0, sections, pairs, head_dim, theta, geom,
     )
 }
 
@@ -609,6 +658,8 @@ pub fn axes(
     ctx: &Ctx<'_>,
     x: Tensor,
     positions: Tensor,
+    window: RowSpan,
+    pos0: u32,
     dims: [u32; 4],
     thetas: [f32; 4],
     form: RopeForm,
@@ -626,7 +677,7 @@ pub fn axes(
             format!("{:?} positions; a rotation reads f32", positions.dtype),
         ));
     }
-    let rows = nonzero(OP, "rows", x.rows)?;
+    let rows = window.held(OP, x)?;
     let head_dim = nonzero(OP, "the head width", head_dim)?;
     if !x.width.is_multiple_of(head_dim) {
         return Err(refuse(
@@ -677,6 +728,8 @@ pub fn axes(
             head_dim.arg(),
             heads.arg(),
             form.word().arg(),
+            window.row0.arg(),
+            pos0.arg(),
         ],
     )
 }

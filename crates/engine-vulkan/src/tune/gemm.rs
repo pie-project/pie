@@ -325,6 +325,7 @@ mod device {
                         Tensor::new(ha, m, k, Dtype::Bf16),
                         Tensor::new(hw[copy % hw.len()], n, k, Dtype::Bf16),
                         Tensor::new(ho, m, n, Dtype::Bf16),
+                        kernels_slang::ssm::RowSpan::whole(Tensor::new(ha, m, k, Dtype::Bf16)),
                     )
                 };
                 let mut live = Vec::new();

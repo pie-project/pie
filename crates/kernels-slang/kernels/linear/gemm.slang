@@ -16,6 +16,9 @@ struct Params {
     // mixed fire: no fire-block read on its hot path); a wider one reads M
     // from the fire block, so every row count of its rung is one body.
     int m_fixed;
+    // The window's first row in the bound rows of x and the landing (both
+    // the fire's whole): the fire's data.
+    uint row0;
 };
 PIE_PARAMS_FIRED(3, Params, params);
 
@@ -23,9 +26,14 @@ uint gemm_m() {
     return params.m_fixed != 0 ? uint(params.m_fixed) : uint(PIE_FIRE(m));
 }
 
+// A window row's row in the bound rows.
+uint bound_row(uint row) {
+    return PIE_FIRE(row0) + row;
+}
+
 #if !defined(PIE_GEMV_V)
 float load_x(uint row, uint kk) {
-    return slot_at(x, row * uint(params.k) + kk);
+    return slot_at(x, bound_row(row) * uint(params.k) + kk);
 }
 
 float load_w(uint col, uint kk) {
@@ -37,7 +45,7 @@ void write_out(uint row, uint col, float acc) {
     if (row >= gemm_m() || col >= uint(params.n)) {
         return;
     }
-    slot_put(out_, row * uint(params.n) + col, acc);
+    slot_put(out_, bound_row(row) * uint(params.n) + col, acc);
 }
 
 #if defined(PIE_GEMV)
@@ -134,7 +142,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint4 w3 = w4[wbase + c + 3u * PIE_KLANES];
             [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
                 if (r < m) {
-                    uint xb = (row0 + r) * k8 + c;
+                    uint xb = bound_row(row0 + r) * k8 + c;
                     acc[r] += dot8(x4[xb], w0) + dot8(x4[xb + PIE_KLANES], w1)
                         + dot8(x4[xb + 2u * PIE_KLANES], w2) + dot8(x4[xb + 3u * PIE_KLANES], w3);
                 }
@@ -143,7 +151,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         for (; c < k8; c += PIE_KLANES) {
             uint4 wv = w4[wbase + c];
             [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
-                if (r < m) acc[r] += dot8(x4[(row0 + r) * k8 + c], wv);
+                if (r < m) acc[r] += dot8(x4[bound_row(row0 + r) * k8 + c], wv);
             }
         }
     }
@@ -165,7 +173,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     if (klane == 0u && col < n) {
         [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
-            if (r < m) slot_put(out_, (row0 + r) * n + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
+            if (r < m) slot_put(out_, bound_row(row0 + r) * n + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
         }
     }
 }

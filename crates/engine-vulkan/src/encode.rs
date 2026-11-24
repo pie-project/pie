@@ -94,7 +94,7 @@ pub fn profiling() -> bool {
 
 /// Diagnostic: where `PIE_VK_KERNEL_PROFILE` names a file, every frame is
 /// timed by dispatch, kept ones on every replay, and the totals written there
-/// every 256 frames harvested.
+/// every 16 frames harvested.
 fn profile_path() -> Option<&'static std::path::Path> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| std::env::var_os("PIE_VK_KERNEL_PROFILE").map(std::path::PathBuf::from))
@@ -105,14 +105,32 @@ fn profile_path() -> Option<&'static std::path::Path> {
 pub(crate) fn dump_profile() {
     static HARVESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(path) = profile_path() else { return };
-    if HARVESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 != 255 {
+    if HARVESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16 != 15 {
         return;
     }
-    let mut text = String::new();
-    for (name, calls, ns) in KERNEL_PROFILE.rows() {
-        text.push_str(&format!("{name}\t{calls}\t{ns}\n"));
+    let _ = std::fs::write(path, profile_text());
+}
+
+/// The profile's totals as its file lays them: a header, then a kernel a
+/// line, its device ns, its calls and its ns a call.
+fn profile_text() -> String {
+    let mut text = String::from("name\tns\tcalls\tns_per_call\n");
+    for (name, ns, calls) in KERNEL_PROFILE.rows() {
+        let per = ns.checked_div(calls).unwrap_or(0);
+        text.push_str(&format!("{name}\t{ns}\t{calls}\t{per}\n"));
     }
-    let _ = std::fs::write(path, text);
+    text
+}
+
+/// Under `PIE_VK_KERNEL_PROFILE`, the totals at ready, beside the file
+/// (`<file>.ready`): what the arm walk ran, for a reader to take from the
+/// serving totals.
+#[cfg(feature = "vulkan")]
+pub(crate) fn profile_ready() {
+    let Some(path) = profile_path() else { return };
+    let mut ready = path.as_os_str().to_owned();
+    ready.push(".ready");
+    let _ = std::fs::write(ready, profile_text());
 }
 
 #[must_use]
@@ -123,6 +141,7 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit(name: &str, ns: u64) {
     KERNEL_PROFILE.time(name, ns);
+    KERNEL_PROFILE.fire(name);
 }
 
 pub fn reset_kernel_profile() {
@@ -626,7 +645,7 @@ impl Sink<'_> {
                     "bake"
                 );
             }
-            self.frame.bake(&(
+            self.frame.bake_named(fire.entrypoint, &(
                 key,
                 &scratch.baked,
                 fired.map(|(place, _)| place),
@@ -823,10 +842,13 @@ impl Sink<'_> {
                     pool,
                     at * 2 + 1,
                 );
+            } else {
+                // A timed dispatch is counted where its time is credited, on
+                // every run of it (a kept frame's on every replay).
+                record_kernel(key);
             }
         }
         self.frame.dispatches.set(self.frame.dispatches.get() + 1);
-        record_kernel(key);
         if CAPTURING.load(std::sync::atomic::Ordering::Acquire) {
             use ash::vk::Handle;
             SHAPES
