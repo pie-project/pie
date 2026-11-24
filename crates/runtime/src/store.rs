@@ -242,3 +242,10 @@ pub fn kv_pressure_bucket() -> u8 {
 /// `/metrics`' `pie_kv_cached_from_below_tokens_total`.
 pub static CACHED_FROM_BELOW_TOKENS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Forgets the boot's stores and what their engines were set to, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    registry::reset();
+    shared::reset();
+}

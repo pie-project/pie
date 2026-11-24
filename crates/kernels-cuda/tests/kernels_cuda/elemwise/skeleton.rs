@@ -4,7 +4,8 @@
 //! math (`super::within`): the stream `y` summed in place bit for bit and
 //! the normed row within a norm's ulp, for a row of one to four vectors a
 //! thread, a ragged last vector a thread, and the weight taken as is or as
-//! `1 + weight`.
+//! `1 + weight`. The one-launch residual norm (`norm::residual_rmsnorm`)
+//! lands the unfused ops' bits over the same rows.
 
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg};
@@ -151,6 +152,35 @@ fn the_skeleton_residual_norm_lands_its_math() {
                     "{case}: {n} of {} normed elements apart from the unfused ops",
                     out.len()
                 );
+            }
+        }
+    }
+}
+
+fn one_launch(
+    ctx: &Ctx,
+    x: Tensor,
+    y: &mut Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    out: &mut Tensor,
+) -> Result<(), kernels_cuda::error::Error> {
+    let fired = norm::residual_rmsnorm(ctx, x, y, weight, plus_one, eps, out)?;
+    assert!(fired, "the residual norm declined a row it takes");
+    Ok(())
+}
+
+#[test]
+fn the_one_launch_residual_norm_lands_the_unfused_bits() {
+    for width in [4096usize, 7168, 8192, 2048, 1544, 6152] {
+        for rows in [1usize, 7, 64] {
+            for plus_one in [false, true] {
+                let case = format!("{rows} rows of {width}, plus one {plus_one}");
+                let (y, out) = land(one_launch, rows, width, plus_one);
+                let (y_unfused, out_unfused) = land(unfused, rows, width, plus_one);
+                assert_eq!(apart(&y, &y_unfused), (0, 0), "{case}: the summed stream");
+                assert_eq!(apart(&out, &out_unfused), (0, 0), "{case}: the normed row");
             }
         }
     }

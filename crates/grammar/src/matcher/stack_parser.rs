@@ -412,8 +412,7 @@ impl StackParser {
                             .get(level + 1)
                             .copied()
                             .unwrap_or(self.return_arena.len());
-                        for i in rstart..rend {
-                            let (expected, grandparent) = self.return_arena[i];
+                        for &(expected, grandparent) in &self.return_arena[rstart..rend] {
                             if expected == parent_after.rule_id {
                                 returns.push((rule_id, grandparent));
                             }
@@ -547,8 +546,7 @@ impl StackParser {
                 .unwrap_or(self.return_arena.len());
 
             let mut chain_target = None;
-            for i in rstart..rend {
-                let (expected, parent) = self.return_arena[i];
+            for &(expected, parent) in &self.return_arena[rstart..rend] {
                 if expected == chain_rule_id {
                     if parent.rule_id == chain_rule_id
                         && parent.dfa_state == chain_dfa_state
@@ -588,8 +586,7 @@ impl StackParser {
             .copied()
             .unwrap_or(self.return_arena.len());
 
-        for i in rstart..rend {
-            let (expected, parent) = self.return_arena[i];
+        for &(expected, parent) in &self.return_arena[rstart..rend] {
             if expected == chain_rule_id && visited.insert(parent) {
                 queue.push(parent);
             }

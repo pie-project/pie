@@ -42,6 +42,7 @@ pub use acquire::{Acquired, BindRoomWait};
 pub use departure::{Departure, DepartureWatch, follow_restart};
 pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{PlannerError, StarveCause};
+pub(crate) use global::reset;
 pub use global::{
     assign, engine_of, init_planner, persist_run, place, planner, planner_for, planner_of,
     planners, rekey_holders, release, to_end_facts, wake,

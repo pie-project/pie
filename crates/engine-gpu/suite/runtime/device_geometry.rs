@@ -246,9 +246,7 @@ impl Rig {
     /// The next logits cell the program put, once its pass landed.
     fn logits(&mut self, instance: InstanceId) -> Vec<f32> {
         for _ in 0..600 {
-            if let Some(cell) = self
-                .engine
-                .take_channel(instance, 4)
+            if let Some(cell) = engine::Channels::take(&mut self.engine, instance, 4)
                 .expect("the logits channel reads")
             {
                 return cell
@@ -312,10 +310,10 @@ fn answers_the_host_path(frames: u8) {
         "{:?}",
         loaded.caps.ports
     );
-    let asynchronous = engine.settles_asynchronously();
+    let asynchronous = engine::Completion::asynchronous(&engine);
     let (tx, heard) = mpsc::channel();
     let tx = Mutex::new(tx);
-    engine.on_complete(Arc::new(move |at, outcome| {
+    engine::Completion::on_complete(&mut engine, Arc::new(move |at, outcome| {
         let _ = tx.lock().expect("the sink's sender").send((at, outcome));
     }));
 
@@ -342,7 +340,7 @@ fn answers_the_host_path(frames: u8) {
         "the test's chunks span {commit} segments, the pool has {}",
         facts.segments.max
     );
-    engine.commit_segments(commit).expect("the segments commit");
+    engine::Pool::commit(&mut engine, commit).expect("the segments commit");
     let mut slots = Slots::of(&facts, first, first + 1);
     let mut refs = Refs::of(&facts, LIST, first + 2);
     assert!(refs.per >= 5, "a chunk holds the test's pages");
@@ -433,9 +431,7 @@ fn answers_the_host_path(frames: u8) {
     let bound = eta_ir::validate::bind(beam_program(width), vec![outputs], EngineCaps::default())
         .expect("the beam program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = rig
-        .engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut rig.engine, &ProgramRegistration {
             program_hash: 0xbea3_9e0,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
@@ -498,9 +494,7 @@ fn answers_the_host_path(frames: u8) {
         },
         &channels,
     );
-    let instance = rig
-        .engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut rig.engine, &binding)
         .expect("a device-geometry instance binds")
         .id;
 
@@ -511,8 +505,7 @@ fn answers_the_host_path(frames: u8) {
         let mask: Vec<bool> = masks[step].concat();
         for (channel, cell) in [(0u32, words(&tokens)), (3, bits(&mask))] {
             assert!(
-                rig.engine
-                    .publish_channel(instance, channel, &cell)
+                engine::Channels::publish(&mut rig.engine, instance, channel, &cell)
                     .expect("the cell publishes"),
                 "the ring had room"
             );
@@ -571,8 +564,7 @@ fn answers_the_host_path(frames: u8) {
     // as it does alone.
     for (channel, cell) in [(0u32, words(&TOKENS[0])), (3, bits(&masks[0].concat()))] {
         assert!(
-            rig.engine
-                .publish_channel(instance, channel, &cell)
+            engine::Channels::publish(&mut rig.engine, instance, channel, &cell)
                 .expect("the cell publishes"),
             "the ring had room"
         );
@@ -668,8 +660,7 @@ fn answers_the_host_path(frames: u8) {
         "after the refused lane, the device path's set answers {apart} apart: it wrote there"
     );
 
-    rig.engine
-        .close_instance(instance)
+    engine::Programs::close(&mut rig.engine, instance)
         .expect("the instance closes");
 }
 

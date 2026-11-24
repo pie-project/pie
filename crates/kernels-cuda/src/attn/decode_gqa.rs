@@ -75,23 +75,21 @@ impl Stamp {
         self.smem_over(false)
     }
 
-    /// [`Stamp::smem`] over an e4m3 pool's pages, staged raw before they
-    /// widen.
+    /// [`Stamp::smem`] over an e4m3 pool's pages, staged raw.
     #[must_use]
     pub const fn smem_over(self, e4m3: bool) -> u32 {
         let head_dim = self.head_dim;
         let ld = head_dim + 8;
         let kv_ld = if self.swizzle { head_dim } else { ld };
         let tile = 16 * self.mt;
-        let staged = self.warps * self.stages * 2 * tile * kv_ld * 2;
-        let fold = self.warps * (8 * head_dim + 16) * 4;
-        let region = if staged > fold { staged } else { fold };
-        let raw = if e4m3 {
+        let staged = if e4m3 {
             self.warps * self.stages * 2 * tile * head_dim
         } else {
-            0
+            self.warps * self.stages * 2 * tile * kv_ld * 2
         };
-        region + (8 * ld + self.warps * tile * 8) * 2 + raw
+        let fold = self.warps * (8 * head_dim + 16) * 4;
+        let region = if staged > fold { staged } else { fold };
+        region + (8 * ld + self.warps * tile * 8) * 2
     }
 }
 
@@ -131,6 +129,14 @@ impl Gate {
     pub const fn stamp(self, head_dim: u32, e4m3: bool) -> Option<Stamp> {
         if self.deep_64 && head_dim == 64 && !e4m3 {
             Some(Stamp::DEEP_64)
+        } else if e4m3 {
+            match Stamp::of(head_dim) {
+                Some(stamp) => Some(Stamp {
+                    stages: if head_dim > 128 { 3 } else { 4 },
+                    ..stamp
+                }),
+                None => None,
+            }
         } else {
             Stamp::of(head_dim)
         }
@@ -354,7 +360,8 @@ mod tests {
         let stamp = deep.stamp(64, false).expect("stamped");
         assert_eq!(stamp, Stamp::DEEP_64);
         assert!(4 * (stamp.smem() + (8 * 64 + 8) * 4 + 1024) <= 233_472);
-        assert_eq!(deep.stamp(64, true), Stamp::of(64));
+        let e4m3 = Stamp::of(64).map(|s| Stamp { stages: 4, ..s });
+        assert_eq!(deep.stamp(64, true), e4m3);
         assert_eq!(deep.stamp(256, false), Stamp::of(256));
         assert_eq!(gate.stamp(64, false), Stamp::of(64));
     }

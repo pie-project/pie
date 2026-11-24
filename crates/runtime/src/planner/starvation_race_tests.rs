@@ -160,7 +160,7 @@ impl PoolPort for RacePool {
         self.pulls.lock().push(count);
         if self
             .stall
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Vec::new();
@@ -1559,7 +1559,7 @@ impl PoolPort for RingPool {
     fn release_device(&self, _pages: Vec<PhysicalKvPageId>) {}
     fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
         self.free
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |free| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |free| {
                 free.checked_sub(need.pages)
             })
             .ok()
@@ -2793,7 +2793,7 @@ impl PoolPort for BindRoomPool {
         }
         if self
             .park_down_fails
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             let planner = planner.clone();
@@ -7573,7 +7573,7 @@ fn bench_a_plan_pass_on_a_shared_store() {
     let residents: Vec<ProcessId> = (0..count).map(|_| ProcessId::new_v4()).collect();
     let head = ProcessId::new_v4();
     let mut engine = FakeEngine::default();
-    learn_program(&roles, &engine, PROGRAM).unwrap();
+    learn_program(&roles, &mut engine, PROGRAM).unwrap();
     for &pid in residents.iter().chain([&head]) {
         let binding = ::engine::InstanceBinding {
             program: PROGRAM,

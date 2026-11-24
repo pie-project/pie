@@ -1,0 +1,88 @@
+// wafer/ops/sst.csl: a state PE's side of a gated linear recurrence a head (the root's side:
+// ops/cy_sst.csl), one step a row. A column holds a head's state S (DK x DV, f32): row r keeps
+// state rows i = r (mod PYA) as rows i / PYA.
+//
+// step(): the root's multicast [k~ | q~ | k] (key and query times their row's decay, and the
+// key); partials [Σ k~_i S_i | Σ q~_i S_i] up the column chain; then the root's [delta | decay]:
+// S_i = decay_i S_i + k_i delta. One form covers a decay a head (Gated DeltaNet, Mamba-2) or a key
+// (KDA), and a delta rule's delta or a plain increment (Mamba-2's dt x).
+// SLOTS: a state a lane slot (row t steps slot rowp[3 t + 1], cleared at its position 0).
+//
+// Params: fab, red (the column chain: ops/schain.csl), YM (the root's multicast input queue),
+// DK / DV, PYA (the column's PEs), SLOTS, ROWS.
+param fab: imported_module;
+param red: imported_module;
+param YM: input_queue;
+param DK: u16;
+param DV: u16;
+param PYA: u16;
+param SLOTS: u16 = 1;
+param ROWS: u16 = 1;
+
+const NR: u16 = (DK + PYA - 1) / PYA;
+var st = @zeros([SLOTS * NR * DV]f32);
+var rowp = @zeros([3 * ROWS]u32);
+var kq = @zeros([3 * DK]f32);
+var dd: [DV + DK]f32 align(16) = @zeros([DV + DK]f32);
+var acc: [2 * DV]f32 align(16) = @zeros([2 * DV]f32);
+var myrow: u16 = 0;
+const st_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> st[i] });
+const kq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{3 * DK} -> kq[i] });
+const dd_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV + DK} -> dd[i] });
+const acc_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DV} -> acc[i] });
+
+// A sequence's first step: the state cleared, the PE's row in the column.
+fn init(row: u16) void {
+  myrow = row;
+  var e: u16 = 0;
+  while (e < NR * DV) : (e += 1) { st[e] = 0.0; }
+}
+
+// Slot s's state cleared.
+fn clear(s: u16) void {
+  @fmovs(@set_dsd_length(@increment_dsd_offset(st_d, @as(i16, s * NR * DV), f32), NR * DV), @as(f32, 0.0));
+}
+
+// Row t of a step: its slot's state, cleared at its position 0, stepped.
+fn row(t: u16) void {
+  const s = @as(u16, fab.below(rowp[3 * t + 1], SLOTS));
+  if (rowp[3 * t + 2] == 0) { clear(s); }
+  step_at(s * NR * DV);
+}
+
+fn step() void { step_at(0); }
+
+// A decode step's end, every row's read: each row's position + 1, so the host writes `rowp` only
+// where its rows differ (a prompt, a rollback, a new slot).
+fn advance() void {
+  var r: u16 = 0;
+  while (r < ROWS) : (r += 1) { rowp[3 * r + 2] += 1; }
+}
+
+fn step_at(base: u16) void {
+  @fmovs(kq_d, fab.fin(YM, 3 * DK));
+  @fmovs(acc_d, @as(f32, 0.0));
+  const sk = @set_dsd_length(acc_d, DV);
+  const sq = @increment_dsd_offset(sk, @as(i16, DV), f32);
+  var r: u16 = 0;
+  while (r < NR) : (r += 1) {
+    const i = r * PYA + myrow;
+    if (i < DK) {
+      const srw = @increment_dsd_offset(st_d, @as(i16, base + r * DV), f32);
+      @fmacs(sk, sk, srw, kq[i]);
+      @fmacs(sq, sq, srw, kq[DK + i]);
+    }
+  }
+  red.send(acc_d, 2 * DV);
+  @fmovs(dd_d, fab.fin(YM, DV + DK));
+  const delta = @set_dsd_length(dd_d, DV);
+  r = 0;
+  while (r < NR) : (r += 1) {
+    const i = r * PYA + myrow;
+    if (i < DK) {
+      const srw = @increment_dsd_offset(st_d, @as(i16, base + r * DV), f32);
+      @fmuls(srw, srw, dd[DV + i]);
+      @fmacs(srw, srw, delta, kq[2 * DK + i]);
+    }
+  }
+}

@@ -219,6 +219,52 @@ pub fn rmsnorm_plus_one(
     rms_row(ctx, "elemwise.rmsnorm", OFFSET_BANK, x, weight, y, 0, eps)
 }
 
+pub fn residual_rmsnorm(
+    ctx: &Ctx,
+    x: Tensor,
+    y: &mut Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    out: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "fused.residual_add_rmsnorm";
+    let runs = y.width.div_ceil(8 * BLOCK);
+    let takes = ctx.tuning().rows_vec
+        && [x.dtype, y.dtype, weight.dtype, out.dtype] == [Dtype::Bf16; 4]
+        && (x.rows, x.width) == (y.rows, y.width)
+        && (out.rows, out.width) == (y.rows, y.width)
+        && y.width > 256
+        && y.width.is_multiple_of(8)
+        && runs <= 4
+        && [x.ptr, y.ptr, weight.ptr, out.ptr]
+            .iter()
+            .all(|&at| aligned16(at));
+    if !takes {
+        return Ok(false);
+    }
+    nonzero(OP, "rows", y.rows)?;
+    let runs = runs.next_power_of_two();
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            NORM,
+            &format!("::pie::elemwise::residual_rmsnorm_runs<{runs}, {plus_one}>"),
+        ))
+        .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
+        &[
+            y.arg(),
+            x.arg(),
+            weight.arg(),
+            out.arg(),
+            stated(OP, y.width)?.arg(),
+            eps.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
 pub fn rmsnorm_per_head_plus_one(
     ctx: &Ctx,
     x: Tensor,

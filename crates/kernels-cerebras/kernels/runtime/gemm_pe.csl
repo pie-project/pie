@@ -1,0 +1,340 @@
+
+// ---- the GEMM regime's PE ops (kernels-cerebras src/emit/gemm_pe.csl) ----
+// An op at prog[a]: its code, its length, its words from a + 2. Every PE runs every op: an op
+// of other classes' rows still takes its part of the lines (a GEMM's weights drained).
+//
+// Lines: a row's (the inputs' pieces, C_XF east / C_XB west) and a column's (keys and values,
+// C_KF / C_KB, south / north). A member takes its turn in index order: the pieces before its own
+// on the forward colour, its own sent both ways, the rest on the backward colour. Routes rest as
+// pass-throughs. The weights come up the column from its tape (C_WT, a tree). The row line's two
+// colours each have a queue bound once (C_XF on q2, C_XB on q7): rebinding one between turns
+// could meet a piece of the other colour at its ramp while the row's PEs drift apart.
+
+var X: u16 = 0;
+var Y: u16 = 0;
+var CLS: u16 = 0;
+
+fn md(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(D_mem, @as(i16, o), f32), n); }
+fn rnd(o: u16, n: u16) void {
+  var d: u16 = 0;
+  while (d < n) {
+    const m = if (n - d > XBN) XBN else n - d;
+    @fs2h(xhd(0, m), md(o + d, m)); @fh2s(md(o + d, m), xhd(0, m));
+    d += m;
+  }
+}
+fn xhd(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(D_xh, @as(i16, o), @fp16()), n); }
+fn xhw(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(D_xhw, @as(i16, o >> 1), u32), n); }
+fn wbw(o: u16, n: u16) mem1d_dsd { return @set_dsd_length(@increment_dsd_offset(D_wb, @as(i16, o), u32), n); }
+// [lo, hi) of w over n members, member i's
+fn plo(i: u16, n: u16, w: u16) u16 { return @as(u16, (@as(u32, i) * @as(u32, w)) / @as(u32, n)); }
+fn plen(i: u16, n: u16, w: u16) u16 { return plo(i + 1, n, w) - plo(i, n, w); }
+
+const tile_config = @import_module("<tile_config>");
+const cc0 = tile_config.color_config.get_color_config_addr(@get_color(0));
+fn route(c: u16, b: u16) void {
+  const addr = cc0 + c;
+  const r = @get_config(addr, tile_config.target.color_addr_range) & 0xff00;
+  @set_config(addr, r | b, tile_config.target.color_addr_range);
+}
+fn drain(q: u16) void {
+  while ((tile_config.output_queue_status.get_raw() & (@as(u16, 1) << (8 + q))) == 0) {}
+}
+
+// a row line member's turn: its n words both ways (east root 0x82, west root 0x81)
+fn xsend(src: mem1d_dsd, n: u16) void {
+  if (X > 0) {
+    route(C_XB, 0x81); fab.oqc(2, C_XB); @mov32(fab.fout(q_xo, n), src); drain(2);
+    route(C_XB, 0x31);
+  }
+  if (X + 1 < GX) {
+    route(C_XF, 0x82); fab.oqc(2, C_XF); @mov32(fab.fout(q_xo, n), src); drain(2);
+    route(C_XF, 0x12);
+  }
+}
+// a column line member's turn (south root 0x84, north root 0x88), the line its request's rows:
+// toward the next member last (south in a forward attention, north in a reverse one), so the
+// next member's piece, sent once it has this one, never passes this one's other half
+fn csend_b(cb: u16, src: mem1d_dsd, n: u16) void {
+  if (Y > R0) {
+    route(cb, 0x88); fab.oqc(3, cb); @mov32(fab.fout(q_co, n), src); drain(3);
+    route(cb, 0x58);
+  }
+}
+fn csend_f(cf: u16, src: mem1d_dsd, n: u16) void {
+  if (Y + 1 < R0 + RQ) {
+    route(cf, 0x84); fab.oqc(3, cf); @mov32(fab.fout(q_co, n), src); drain(3);
+    route(cf, 0x74);
+  }
+}
+fn csend(cf: u16, cb: u16, src: mem1d_dsd, n: u16, rev: bool) void {
+  if (rev) { csend_f(cf, src, n); csend_b(cb, src, n); }
+  else { csend_b(cb, src, n); csend_f(cf, src, n); }
+}
+// the attentions run this launch (their members' order alternates)
+var NATT: u16 = 0;
+// the cycles this PE spent in the launch's attentions (its stamps' third word, which the tape's
+// stamps cannot split from the ops around it)
+var ATT_CY: u32 = 0;
+// at the launch's end, every line's input queue empty (iq2-iq7: the row line's two colours, the
+// weight stream, the band reductions, the column line; iq1 is memcpy's); one that is not sets the
+// top bit of the stamps' third word (`LINE_LEFT`): its words would be read first by the next
+// launch, which then stops (the dense layout's klein 1024^2: 1589)
+const LINE_QUEUES: u16 = 0xfc;
+const LINE_LEFT: u32 = 0x80000000;
+fn now32() u32 { timestamp.get_timestamp(&ts); return @as(u32, ts[0]) | (@as(u32, ts[1]) << 16); }
+
+// The column's weight stream: its tape's words up the column (a tree: every PE of the
+// column takes every word), in op order.
+fn wget(o: u16, n: u16) void { @mov32(wbw(o, n), fab.fin(q_wi, n)); }
+fn wdrain(n: u32) void {
+  var left = n;
+  while (left > 0) {
+    const m: u16 = if (left > @as(u32, WBN)) WBN else @as(u16, left);
+    wget(0, m);
+    left -= @as(u32, m);
+  }
+}
+
+// A GEMM: y[rows, its columns] = sum over the row's pieces of x, a block of the column's
+// weights a piece and an output segment.
+fn gemm(a: u16) void {
+  const b = a + 2;
+  const mask = prog[b]; const lane = prog[b + 1]; const xs = prog[b + 2]; const xlw0 = prog[b + 3];
+  const K = prog[b + 4]; const ys = prog[b + 5]; const ylw0 = prog[b + 6]; const ns = prog[b + 7];
+  const fl = prog[b + 8];
+  const rows: u16 = if (lane != 0) 1 else TB;
+  const x32 = (fl & 2) != 0;
+  const xlw = if ((fl & 4) != 0) plen(X, GX, K) else xlw0;
+  // an uneven output: one segment, the PE's piece of it (its width the table's word)
+  const uy = (fl & 8) != 0;
+  const ylw = if (uy) plen(X, GX, prog[b + 10]) else ylw0;
+  // (a piece's size: K over the row's members, a division once where it cuts evenly)
+  const kd = K / GX;
+  const even = kd * GX == K;
+  if (((mask >> CLS) & 1) == 0) {
+    var tot: u32 = 0;
+    var cp: u16 = 0;
+    while (cp < GX) : (cp += 1) {
+      const kc = if (even) kd else plen(cp, GX, K);
+      var s: u16 = 0;
+      while (s < ns) : (s += 1) { tot += @as(u32, kc) * @as(u32, if (uy) ylw else prog[b + 10 + 2 * s]) / 2; }
+    }
+    wdrain(tot);
+    return;
+  }
+  @fmovs(md(ys, rows * ylw), 0.0);
+  const wa0 = @set_dsd_base_addr(D_wa0, @ptrcast([*]@fp16(), &wb[0]));
+  var cp: u16 = 0;
+  while (cp < GX) : (cp += 1) {
+    const kc = if (even) kd else plen(cp, GX, K);
+    if (kc == 0) { continue; }
+    const nh = rows * kc;
+    const hw = (nh + 1) >> 1;
+    const nw = if (x32) 2 * hw else hw;
+    if (cp == X) {
+      var t: u16 = 0;
+      while (t < rows) : (t += 1) {
+        @fs2h(xhd(t * kc, kc), md(xs + t * xlw, kc));
+        if (x32) {
+          @fh2s(md(XT, kc), xhd(t * kc, kc));
+          @fsubs(md(XT, kc), md(xs + t * xlw, kc), md(XT, kc));
+          @fs2h(xhd(2 * hw + t * kc, kc), md(XT, kc));
+        }
+      }
+      xsend(xhw(0, nw), nw);
+    } else {
+      if (cp < X) { @mov32(xhw(0, nw), fab.fin(q_xi, nw)); } else { @mov32(xhw(0, nw), fab.fin(q_xb, nw)); }
+    }
+    var s: u16 = 0;
+    while (s < ns) : (s += 1) {
+      const yo = prog[b + 9 + 2 * s]; const p = if (uy) ylw else prog[b + 10 + 2 * s];
+      if (p == 0) { continue; }
+      wget(0, kc * p / 2);
+      const wa = @set_dsd_length(wa0, p);
+      var t: u16 = 0;
+      while (t < rows) : (t += 1) {
+        matvec.mac32(md(ys + t * ylw + yo, p), wa, xhd(t * kc, kc));
+        if (x32) { matvec.mac32(md(ys + t * ylw + yo, p), wa, xhd(2 * hw + t * kc, kc)); }
+      }
+    }
+  }
+  if ((fl & 1) != 0) { rnd(ys, rows * ylw); }
+}
+
+// halving-tree reductions of n f32s at mem[o] (max or sum), over the scratch row
+fn vred(o: u16, n: u16, mx: bool) f32 {
+  @fmovs(md(RT, n), md(o, n));
+  var m: u16 = n;
+  while (m > 1) {
+    const h = m >> 1;
+    if ((m & 1) != 0) {
+      if (mx) { if (mem[RT + m - 1] > mem[RT]) { mem[RT] = mem[RT + m - 1]; } }
+      else { mem[RT] = mem[RT] + mem[RT + m - 1]; }
+    }
+    if (mx) { @fmaxs(md(RT, h), md(RT, h), md(RT + h, h)); }
+    else { @fadds(md(RT, h), md(RT, h), md(RT + h, h)); }
+    m = h;
+  }
+  return mem[RT];
+}
+
+// The joint attention: every row's [k | v] along the column, KB keys a block; the band's
+// partial scores and probabilities all-reduced; an online softmax a query.
+fn attend(a: u16) void {
+  const att0 = now32();
+  const b = a + 2;
+  const ns = prog[b];
+  var me: u16 = 0;
+  var k: u16 = 0;
+  while (k < ns) : (k += 1) { if (((prog[b + 1 + 9 * k] >> CLS) & 1) != 0) { me = k; } }
+  const s = b + 1 + 9 * me;
+  const qo = prog[s + 1]; const lq = prog[s + 2]; const ko = prog[s + 3]; const lk = prog[s + 4];
+  const vo = prog[s + 5]; const lv = prog[s + 6]; const oo = prog[s + 7]; const lo = prog[s + 8];
+  const e = b + 1 + 9 * ns;
+  const nc = prog[e]; const band = prog[e + 1]; const kbm = prog[e + 2]; const scale = fk[prog[e + 3]];
+  const causal = prog[e + 4]; const rd = prog[e + 5];
+  const KB = kbm * TB;
+  const sl = KB / band;
+  const slo = (X % band) * sl;
+  var t: u16 = 0;
+  while (t < TB) : (t += 1) {
+    mm[t] = -1.0e30; ll[t] = 0.0;
+    @fmovs(md(oo + t * lo, nc), 0.0);
+    @fs2h(@set_dsd_length(@increment_dsd_offset(D_qh, @as(i16, t * nc), @fp16()), nc), md(qo + t * lq, nc));
+  }
+  // The members' order alternates (north first in one attention, reverse in the next): an
+  // attention starts on the colour the last one ended on, iq6 rebound only at a PE's own turn
+  // (no piece of the other colour is coming then). Rebinding between attentions could take the
+  // next one's first C_KF while a row is still in the last's key blocks.
+  const rev = (NATT & 1) != 0;
+  NATT += 1;
+  if (rev) { fab.iqc(6, C_KB); } else { fab.iqc(6, C_KF); }
+  const half = TB * nc;
+  // (the request's rows of PEs: its keys, `j` the block's first in the order)
+  var j: u16 = 0;
+  while (j < RQ) : (j += kbm) {
+    var i: u16 = 0;
+    while (i < kbm) : (i += 1) {
+      const m = if (rev) R0 + RQ - 1 - (j + i) else R0 + j + i;
+      if (m == Y) {
+        if (rev) { fab.iqc(6, C_KF); } else { fab.iqc(6, C_KB); }
+        t = 0;
+        while (t < TB) : (t += 1) {
+          @fs2h(@set_dsd_length(@increment_dsd_offset(D_kvh, @as(i16, t * nc), @fp16()), nc), md(ko + t * lk, nc));
+          @fs2h(@set_dsd_length(@increment_dsd_offset(D_kvh, @as(i16, half + t * nc), @fp16()), nc), md(vo + t * lv, nc));
+        }
+        csend(C_KF, C_KB, @set_dsd_length(D_kvw, half), half, rev);
+      } else {
+        @mov32(@set_dsd_length(D_kvw, half), fab.fin(q_ki, half));
+      }
+      // the keys dim-major (a column a key), the values a row a key
+      t = 0;
+      while (t < TB) : (t += 1) {
+        const dst = @set_dsd_stride(@set_dsd_length(@increment_dsd_offset(D_kt, @as(i16, i * TB + t), @fp16()), nc), @as(i8, @as(i16, KB)));
+        @fmovh(dst, @set_dsd_length(@increment_dsd_offset(D_kvh, @as(i16, t * nc), @fp16()), nc));
+      }
+      @fmovh(@set_dsd_length(@increment_dsd_offset(D_vv, @as(i16, i * TB * nc), @fp16()), half),
+             @set_dsd_length(@increment_dsd_offset(D_kvh, @as(i16, half), @fp16()), half));
+    }
+    const kt = @set_dsd_length(D_kt, KB);
+    t = 0;
+    while (t < TB) : (t += 1) {
+      matvec.tile32(md(SC + t * KB, KB), kt, @set_dsd_length(@increment_dsd_offset(D_qh, @as(i16, t * nc), @fp16()), nc));
+    }
+    gseg.allred(md(SC, TB * KB), TB * KB, true);
+    @fmuls(md(SC, TB * KB), md(SC, TB * KB), scale);
+    if (causal != 0) {
+      t = 0;
+      while (t < TB) : (t += 1) {
+        const qi = (Y - R0) * TB + t;
+        var c: u16 = 0;
+        while (c < KB) : (c += 1) {
+          // (key c's row: its member's, in the block's order)
+          const kp = if (rev) (RQ - 1 - j - c / TB) * TB + c % TB else j * TB + c;
+          if (kp > qi) { mem[SC + t * KB + c] = -1.0e30; }
+        }
+      }
+    }
+    t = 0;
+    while (t < TB) : (t += 1) {
+      const r0 = SC + t * KB;
+      const bm = vred(r0, KB, true);
+      const mn = if (bm > mm[t]) bm else mm[t];
+      const corr = math.exp1(mm[t] - mn);
+      mm[t] = mn;
+      ll[t] = ll[t] * corr;
+      @fmuls(md(oo + t * lo, nc), md(oo + t * lo, nc), corr);
+      var c: u16 = 0;
+      while (c < sl) : (c += 1) { mem[r0 + slo + c] = math.exp1(mem[r0 + slo + c] - mn); }
+      if (slo > 0) { @fmovs(md(r0, slo), 0.0); }
+      if (slo + sl < KB) { @fmovs(md(r0 + slo + sl, KB - slo - sl), 0.0); }
+    }
+    gseg.allred(md(SC, TB * KB), TB * KB, true);
+    const vv = @set_dsd_length(D_vv, nc);
+    t = 0;
+    while (t < TB) : (t += 1) {
+      const r0 = SC + t * KB;
+      ll[t] = ll[t] + vred(r0, KB, false);
+      @fs2h(@set_dsd_length(D_ph, KB), md(r0, KB));
+      matvec.mac32(md(oo + t * lo, nc), vv, @set_dsd_length(D_ph, KB));
+    }
+  }
+  // A row-wide ordering point (a one-word all-reduce over the row): the key blocks' reductions
+  // are the band's alone, so a row's bands drift apart over them; without this a band ahead can
+  // meet one behind in the ops after the attention and stall the row. Costs one row chain an
+  // attention.
+  gseg.allred(md(RT, 1), 1, false);
+  t = 0;
+  while (t < TB) : (t += 1) {
+    @fmuls(md(oo + t * lo, nc), md(oo + t * lo, nc), math.recip(ll[t]));
+    if (rd != 0) { rnd(oo + t * lo, nc); }
+  }
+  ATT_CY += now32() - att0;
+}
+
+// The host's value into its slot; a value out to the host's.
+fn opin(a: u16) void {
+  const b = a + 2;
+  if (((prog[b] >> CLS) & 1) == 0) { return; }
+  const n = (if (prog[b + 1] != 0) 1 else TB) * (if (prog[b + 5] != 0) plen(X, GX, prog[b + 4]) else prog[b + 4]);
+  if (n > 0) { @fmovs(md(prog[b + 2], n), @set_dsd_length(@increment_dsd_offset(D_hin, @as(i16, prog[b + 3]), f32), n)); }
+}
+fn opout(a: u16) void {
+  const b = a + 2;
+  if (((prog[b] >> CLS) & 1) == 0) { return; }
+  const un = prog[b + 4] != 0;
+  const n = if (un) plen(X, GX, prog[b + 3]) else prog[b + 3];
+  const so = prog[b + 1]; const lw = if (un) n else prog[b + 2];
+  const co = prog[b + 5 + CLS]; const rs = if (un) n else HROW[CLS];
+  if (n == 0) { return; }
+  var t: u16 = 0;
+  while (t < TB) : (t += 1) {
+    @fmovs(@set_dsd_length(@increment_dsd_offset(D_hout, @as(i16, t * rs + co), f32), n), md(so + t * lw, n));
+  }
+}
+
+fn run_op(a: u16) void {
+  const op = prog[a];
+  if (op == 1) { opin(a); }
+  else if (op == 2) { opout(a); }
+  else if (op == 3) { gemm(a); }
+  else if (op == 5) { region_op(a); }
+  else if (op == 8) { attend(a); }
+}
+
+// The ops in order, each off the column's stream before its weights: its first word (its
+// code and length), then the rest (an even count of 16-bit words).
+fn run_all() void {
+  NATT = 0;
+  ATT_CY = 0;
+  var i: u16 = 0;
+  while (i < NOPS) : (i += 1) {
+    @mov32(@set_dsd_length(D_progw, 1), fab.fin(q_wi, 1));
+    const n = (prog[1] + 1) >> 1;
+    if (n > 1) { @mov32(@set_dsd_length(@increment_dsd_offset(D_progw, 1, u32), n - 1), fab.fin(q_wi, n - 1)); }
+    run_op(0);
+  }
+  tsc[2] = ATT_CY;
+}
+// ---- end of the ops ----

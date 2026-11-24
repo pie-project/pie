@@ -1139,7 +1139,7 @@ if engine::guest_claims::saying() {
     }
 
     /// Instance `id`'s items lie in `slots` now, where the runtime copied
-    /// them (`Engine::rebind_slots`).
+    /// them (`Programs::rebind`).
     pub fn rebind(
         &mut self,
         id: InstanceId,

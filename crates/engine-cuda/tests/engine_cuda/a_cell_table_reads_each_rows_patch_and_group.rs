@@ -2,9 +2,9 @@
 
 //! `conv::cells`, `gather::group_rows` and `gather::group_first` against a host reference.
 
-use engine::Engine;
 use engine::fire::{FrameSubmission, Lane, Readout, Step, StepVoxels};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
+use engine::{Channels, Engine, Programs};
 use poem::fact;
 use poem::{Dtype, ForwardHybrid, Input, Platform, Request, StateRows, ops};
 use poem_ir::InputAxis;
@@ -245,7 +245,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
         let backend =
             Backend::parse(engine_cuda::api::CODEGEN).expect("the engine's codegen backend");
         let program = engine
-            .register_program(&ProgramRegistration {
+            .register(&ProgramRegistration {
                 program_hash: 0xce11 ^ u64::from(rows),
                 emitted_kernels: emit_program(backend, &stages, &bound),
                 emitter_version: backend.emitter_version(),
@@ -257,8 +257,9 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             })
             .expect("the program registers");
         let channel = engine::ChannelId(at as u64 + 1);
-        engine
-            .register_channel(&engine::channel::ChannelRegistration {
+        Channels::open(
+            &mut engine,
+            &engine::channel::ChannelRegistration {
                 id: channel,
                 shape: vec![rows, WIDTH],
                 dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -318,7 +319,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
         .iter()
         .map(|&instance| {
             engine
-                .take_channel(instance, 0)
+                .take(instance, 0)
                 .expect("the channel reads")
                 .expect("the channel holds a cell")
                 .as_chunks::<4>()

@@ -1060,7 +1060,7 @@ fn scattered_free_chunks_are_compacted_into_a_run_and_residents_keep_their_bytes
         "4..7 cleared, its 5 to the lowest free"
     );
     pool.apply_compaction(&moves, 7).unwrap();
-    // The engine's copy (`Engine::evacuate`): bytes follow the logical chunk.
+    // The engine's copy (`Pool::evacuate`): bytes follow the logical chunk.
     for step in &moves {
         bytes[step.to as usize] = bytes[step.from as usize];
     }

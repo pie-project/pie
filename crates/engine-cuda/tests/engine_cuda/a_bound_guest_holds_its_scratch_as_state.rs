@@ -1006,7 +1006,7 @@ fn a_pair_whose_members_are_all_parked_is_laid_again_where_a_move_left_it() {
     }
 }
 
-/// An evacuation is all or nothing (`Engine::evacuate`): one whose last
+/// An evacuation is all or nothing (`Pool::evacuate`): one whose last
 /// check fails moves nothing. Instance A's state chunk is evacuated, and
 /// the evacuation also names a channel whose slots cannot be spanned, the
 /// check that once ran after the copy and the table change. It is refused,

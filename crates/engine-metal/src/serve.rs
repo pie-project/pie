@@ -2012,7 +2012,7 @@ impl Shell {
         self.pools.commit_segments(segments)
     }
 
-    /// See `Engine::weight_residency`: every frame drains, blocks newly
+    /// See `WeightCache::set_residency`: every frame drains, blocks newly
     /// named a slot land in it, and every address table is rewritten
     /// before the next fire. A held set naming every atom gives back the
     /// tables' own copies (`store::streamed`).
@@ -2095,7 +2095,7 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::weight_uses`: each atom's reads since the last call.
+    /// See `WeightCache::uses`: each atom's reads since the last call.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         // No drain: the counters only grow, and a read takes what landed so
         // far (a fire still in flight counts toward the next read). The
@@ -2534,6 +2534,23 @@ impl Shell {
             self.pools.bytes(),
             self.arena.io_bytes(),
         )
+    }
+
+    pub fn reload_weights(
+        &mut self,
+        contract: &checkpoint::contract::ModelContract,
+        path: &std::path::Path,
+        torn: &mut bool,
+    ) -> Result<(u32, u64)> {
+        if self.ane.is_some() {
+            return Err(Fault::Load(checkpoint::error::Error::Unsupported(
+                "this load runs part of the model on the Neural Engine, which holds its own \
+                 copy of those weights; restart the server on the new checkpoint instead"
+                    .into(),
+            )));
+        }
+        self.drain()?;
+        self.weights.reload(&self.trace, contract, path, torn)
     }
 
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {

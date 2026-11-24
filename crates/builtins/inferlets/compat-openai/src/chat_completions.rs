@@ -11,11 +11,8 @@
 //! (`text`/`json_object`/`json_schema`, and vLLM's and SGLang's
 //! `structural_tag`: see [`crate::response_format`]), `stream` and
 //! `stream_options.include_usage`, `temperature`, `top_p`, `top_k`,
-//! `max_tokens`/`max_completion_tokens`, `ignore_eos`, `stop`, `seed`,
 //! `presence_penalty`, `frequency_penalty`, `repetition_penalty`, vLLM's
 //! `min_tokens` and `min_p`, `n` (each choice its own generation, flown
-//! together), `logprobs` and `top_logprobs` (up to 20, of the raw logits,
-//! every sampled token's as vLLM reports them, the stop token's among them),
 //! vLLM's `prompt_logprobs` (an integer, unstreamed, text prompts: every
 //! rendered prompt token scored, in the response's `prompt_logprobs`),
 //! `reasoning_effort` (`none` switches thinking off; `low`, `medium` and
@@ -36,7 +33,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    chat_logprob, choices, invalid, no_logit_bias, run_choices, stop_sequences, usage_of,
+    chat_logprob, choices, invalid, no_logit_bias, run_choices, stop_reason, stop_sequences,
+    usage_of,
 };
 
 #[derive(Deserialize, Default)]
@@ -48,6 +46,8 @@ struct Body {
     response_format: Option<Value>,
     stream: bool,
     stream_options: Option<StreamOptions>,
+    return_token_ids: bool,
+    return_tokens_as_token_ids: bool,
     temperature: Option<f32>,
     speculative: Option<bool>,
     top_p: Option<f32>,
@@ -57,10 +57,13 @@ struct Body {
     min_tokens: usize,
     ignore_eos: bool,
     stop: Option<Value>,
+    stop_token_ids: Option<Vec<u32>>,
+    include_stop_str_in_output: bool,
     seed: Option<i64>,
     n: Option<u32>,
     logprobs: Option<bool>,
     top_logprobs: Option<u32>,
+    logprobs_mode: Option<String>,
     prompt_logprobs: Option<i64>,
     min_p: Option<f32>,
     presence_penalty: Option<f32>,
@@ -145,8 +148,7 @@ fn content_parts(content: Option<Value>, param: &str) -> Result<(String, Vec<Vec
 }
 
 /// The normalized request, whether a streamed reply ends with a usage
-/// chunk, and how many choices it asks for.
-fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
+fn parse(body: Value) -> Result<(Request, bool, u32, bool), ApiError> {
     let body: Body =
         serde_json::from_value(body).map_err(|e| invalid(format!("request body: {e}"), None))?;
     if body.messages.is_empty() {
@@ -220,6 +222,7 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
 
     let mut req = Request::new(messages);
     req.stream = body.stream;
+    req.return_token_ids = body.return_token_ids;
     req.tools = body
         .tools
         .unwrap_or_default()
@@ -293,6 +296,7 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
         req.sampling.min_p = p;
     }
     req.sampling.logprobs = logprobs;
+    req.sampling.logprobs_mode = crate::logprobs_mode(body.logprobs_mode)?;
     req.sampling.prompt_logprobs = crate::prompt_logprobs(body.prompt_logprobs, body.stream)?;
     if req.sampling.prompt_logprobs.is_some() && req.messages.iter().any(|m| !m.images.is_empty()) {
         return Err(invalid(
@@ -313,6 +317,8 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
     req.min_tokens = body.min_tokens;
     req.ignore_eos = body.ignore_eos;
     req.stop = stop_sequences(body.stop)?;
+    req.stop_token_ids = body.stop_token_ids.unwrap_or_default();
+    req.include_stop_str_in_output = body.include_stop_str_in_output;
     let kwargs = body.chat_template_kwargs.as_ref();
     let effort = body.reasoning_effort.as_deref().or_else(|| {
         kwargs
@@ -340,7 +346,7 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
         };
     }
     let include_usage = body.stream_options.is_some_and(|o| o.include_usage);
-    Ok((req, include_usage, n))
+    Ok((req, include_usage, n, body.return_tokens_as_token_ids))
 }
 
 fn finish_reason(finish: Finish) -> &'static str {
@@ -390,10 +396,18 @@ fn logprobs_field(asked: bool, entries: Vec<Value>) -> Value {
 }
 
 /// One choice's generation, its chunks streamed under its index.
-async fn choice(req: Request, ids: &Ids) -> Result<compat::Outcome, String> {
+async fn choice(req: Request, ids: &Ids, as_ids: bool) -> Result<compat::Outcome, String> {
     let index = req.choice;
     let stream = req.stream;
     let asked = req.sampling.logprobs.is_some();
+    let token_ids = req.return_token_ids;
+    let mut pending_ids = crate::PendingIds::default();
+    let send = |mut chunk: Value, pending_ids: &mut crate::PendingIds| {
+        if token_ids {
+            pending_ids.attach(&mut chunk, false);
+        }
+        emit::send(&chunk);
+    };
     // The role rides on the first delta, as the open servers send it: an
     // empty role chunk ahead of the prefill would read as the first token. A
     // turn the gateway continues builds and drops that delta again, with the
@@ -414,10 +428,18 @@ async fn choice(req: Request, ids: &Ids) -> Result<compat::Outcome, String> {
         }
         let body = match event {
             Event::Logprobs(steps) => {
-                pending.extend(steps.iter().map(|(t, lp)| chat_logprob(*t, lp)));
+                pending.extend(steps.iter().map(|(t, lp)| chat_logprob(*t, lp, as_ids)));
                 return;
             }
             Event::PromptLogprobs(_) => return,
+            Event::PromptTokens(prompt) => {
+                pending_ids.prompt = Some(prompt);
+                return;
+            }
+            Event::Tokens(tokens) => {
+                pending_ids.tokens.extend(tokens);
+                return;
+            }
             Event::Reasoning(text) => delta(json!({"reasoning_content": text})),
             Event::ReasoningEnd => return,
             Event::Text(text) => delta(json!({"content": text})),
@@ -428,23 +450,25 @@ async fn choice(req: Request, ids: &Ids) -> Result<compat::Outcome, String> {
             }
         };
         let logprobs = logprobs_field(asked, std::mem::take(&mut pending));
-        emit::send(&ids.chunk(index, body, None, logprobs));
+        send(ids.chunk(index, body, None, logprobs), &mut pending_ids);
     })
     .await?;
     if stream {
         let logprobs = logprobs_field(asked, pending);
-        emit::send(&ids.chunk(
+        let mut last = ids.chunk(
             index,
             delta(json!({})),
             Some(finish_reason(outcome.finish)),
             logprobs,
-        ));
+        );
+        last["choices"][0]["stop_reason"] = stop_reason(&outcome);
+        send(last, &mut pending_ids);
     }
     Ok(outcome)
 }
 
 pub async fn serve(envelope: Envelope) -> Result<String, String> {
-    let (req, include_usage, n) = parse(envelope.body)?;
+    let (req, include_usage, n, as_ids) = parse(envelope.body)?;
     let ids = Ids {
         id: format!("chatcmpl-{}", compat::short_id()),
         created: envelope.time,
@@ -454,7 +478,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     let asked = req.sampling.logprobs.is_some();
     let prompt_top = req.sampling.prompt_logprobs;
 
-    let outcomes = run_choices(&req, n, |req| choice(req, &ids)).await?;
+    let outcomes = run_choices(&req, n, |req| choice(req, &ids, as_ids)).await?;
     let total = usage_of(&outcomes);
 
     if stream {
@@ -473,6 +497,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     }
 
     let prompt_scored = outcomes.first().map(|o| o.prompt_logprobs.clone());
+    let prompt_ids = outcomes.first().map(|o| o.prompt_token_ids.clone());
     let choices: Vec<Value> = outcomes
         .into_iter()
         .zip(0u32..)
@@ -502,10 +527,14 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
                 outcome
                     .logprobs
                     .iter()
-                    .map(|(t, lp)| chat_logprob(*t, lp))
+                    .map(|(t, lp)| chat_logprob(*t, lp, as_ids))
                     .collect(),
             );
-            json!({"index": index, "message": message, "finish_reason": finish_reason(outcome.finish), "stop_reason": outcome.stop_reason, "logprobs": logprobs})
+            let mut choice = json!({"index": index, "message": message, "finish_reason": finish_reason(outcome.finish), "stop_reason": stop_reason(&outcome), "logprobs": logprobs});
+            if req.return_token_ids {
+                choice["token_ids"] = json!(outcome.token_ids);
+            }
+            choice
         })
         .collect();
     let mut body = json!({
@@ -519,6 +548,9 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     // The first choice scored the prompt, the same for every choice.
     if let (Some(top), Some(first)) = (prompt_top, prompt_scored) {
         body["prompt_logprobs"] = crate::vllm_prompt_logprobs(&first, top as usize);
+    }
+    if let (true, Some(prompt)) = (req.return_token_ids, prompt_ids) {
+        body["prompt_token_ids"] = json!(prompt);
     }
     Ok(body.to_string())
 }

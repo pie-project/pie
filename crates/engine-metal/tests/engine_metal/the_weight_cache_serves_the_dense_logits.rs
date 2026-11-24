@@ -338,7 +338,6 @@ fn check(model: &str) {
 }
 
 fn check_fixture(model: &str, fixture: &Fixture) {
-    let fixture = fixture;
     let (whole, _) = serve(fixture, Mode::Whole);
     for mode in [
         Mode::Host,

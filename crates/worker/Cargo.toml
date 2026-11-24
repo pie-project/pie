@@ -1,6 +1,7 @@
 [package]
 name = "worker"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The role that owns the runtime: loads the model onto its engine and boots the runtime, then serves it to a gateway (`net`), beside one in `pie serve`'s process (`standalone`), or to an app in its own process (`embedded`, `Server`)."

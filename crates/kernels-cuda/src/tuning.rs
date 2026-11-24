@@ -358,6 +358,12 @@ pub struct MoeMxfp4Fp8From(pub u32);
 #[decision(id = "kernel.moe.mxfp4_bf16_from", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeMxfp4Bf16From(pub u32);
 
+/// The fewest routes a block-FP8 select quantizes its rows for and runs on
+/// the FP8 MMA (W8A8); fewer keep the register-held W8A16 kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8a8_from", constant(range(1..=65_536)), default = 64, tune = search)]
+pub struct MoeFp8a8From(pub u32);
+
 /// The fewest routes an expert, on average, a block-FP8 select runs on
 /// Hopper's warp-specialized wgmma GEMM (128 routes by 128 weight rows a CTA,
 /// a producer warpgroup and two consumers); fewer keep the one-warpgroup
@@ -371,6 +377,13 @@ pub struct MoeFp8a8WsFrom(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.fp8a8_ws_narrow", flag, default = false, tune = search)]
 pub struct MoeFp8a8WsNarrow;
+
+/// The one-warpgroup block-FP8 select (a decode's few routes an expert)
+/// with its weight rows landed by TMA, on a bank the device holds. Off but
+/// where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.fp8a8_wgtma", flag, default = false, tune = search)]
+pub struct MoeFp8a8Wgtma;
 
 /// The warp-specialized block-FP8 select (where N takes 256) persistent, its
 /// weight rows landed by TMA (`kernel.moe.fp8a8_ws_from`). Off but where a
@@ -967,9 +980,11 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeMxfp4Fp8From>()
         .add::<MoeMxfp4Bf16From>()
         .add::<MoeMxfp4Bf16Down>()
+        .add::<MoeFp8a8From>()
         .add::<MoeFp8a8WsFrom>()
         .add::<MoeFp8a8WsNarrow>()
         .add::<MoeFp8a8Tma>()
+        .add::<MoeFp8a8Wgtma>()
         .add::<MoeFp8MmaFill>()
         .add::<MoeFp8MmaDepth>()
         .add::<MoeMxfp4Bf16Keep>()
@@ -1271,9 +1286,11 @@ tuning! {
     mxfp4_fp8_from: u32 = 0, get MoeMxfp4Fp8From;
     mxfp4_bf16_from: u32 = 0, get MoeMxfp4Bf16From;
     mxfp4_bf16_down: bool = false, on MoeMxfp4Bf16Down;
+    fp8a8_from: u32 = 64, get MoeFp8a8From;
     fp8a8_ws_from: u32 = 0, get MoeFp8a8WsFrom;
     fp8a8_ws_narrow: bool = false, on MoeFp8a8WsNarrow;
     fp8a8_tma: bool = false, on MoeFp8a8Tma;
+    fp8a8_wgtma: bool = false, on MoeFp8a8Wgtma;
     fp8_mma_fill: u32 = 4, get MoeFp8MmaFill;
     fp8_mma_depth: u32 = 4, get MoeFp8MmaDepth;
     mxfp4_bf16_keep: u32 = 0, get MoeMxfp4Bf16Keep;

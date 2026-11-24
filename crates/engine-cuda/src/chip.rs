@@ -122,8 +122,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PrefillLatticeSteps>()
         .add::<FireLanes>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
-    // The residual norms run as generated row kernels (`FUSIONS` holds no
-    // rule for them).
+    // The residual norms run as generated row kernels where they are on
+    // (`residual_norms` then forms no hand residual norm).
     #[cfg(not(feature = "rocm"))]
     poem_compiler::costs::register_regions(&mut r, 2);
     // HIP graphs have no conditional node: one is priced past any launch it
@@ -740,8 +740,8 @@ mod tests {
         );
         // The compiler's prices, but that CUDA folds each chain
         // into a generated row kernel and each product's epilogue into its
-        // contraction skeleton: its rules hold no residual norm, bias or soft
-        // cap.
+        // contraction skeleton: its rules hold no bias or soft cap, and its
+        // residual norm stands down for the generated one.
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile {

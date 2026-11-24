@@ -1,6 +1,7 @@
 [package]
 name = "gateway"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Client-facing edge plane for Pie: terminates client WebSockets and routes sessions to workers"

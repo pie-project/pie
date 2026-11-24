@@ -133,10 +133,10 @@ impl Roles {
 }
 
 /// Registers channel `plan` by `register`, over the `Channel` slots
-/// [`Engine::ring_facts`] states its ring takes ([`ChannelRegistration::slots`]),
+/// [`Channels::ring_facts`] states its ring takes ([`ChannelRegistration::slots`]),
 /// held for `holder` until it closes. Without `roles`, `plan` as it is.
 ///
-/// [`Engine::ring_facts`]: ::engine::Engine::ring_facts
+/// [`Channels::ring_facts`]: ::engine::Channels::ring_facts
 /// [`ChannelRegistration::slots`]: ::engine::ChannelRegistration::slots
 pub fn register_channel<T>(
     roles: Option<&RolesHandle>,
@@ -151,12 +151,12 @@ pub fn register_channel<T>(
 
 /// Binds `binding` on `engine` over the `Instance` and `Channel` slots its
 /// program's facts state, and the whole chunks of its guest state
-/// ([`Engine::guest_state`], asked at every bind), held for `holder` until
+/// ([`Programs::guest_state`], asked at every bind), held for `holder` until
 /// the instance closes; a ring of a channel `registered` names is the
 /// channel's. A pool short of them refuses the bind by name. Without
 /// `roles`, `binding` as it is: the engine keeps it all itself.
 ///
-/// [`Engine::guest_state`]: ::engine::Engine::guest_state
+/// [`Programs::guest_state`]: ::engine::Programs::guest_state
 pub fn bind_instance(
     roles: Option<&RolesHandle>,
     engine: &mut dyn Engine,

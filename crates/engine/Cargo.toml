@@ -1,6 +1,7 @@
 [package]
 name = "engine"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "The runtime↔engine contract for pie: the Engine verbs, the load request, the fire submission, guest-program registration, and the KV transfer types shared with cross-node transport."

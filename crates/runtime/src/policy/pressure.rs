@@ -205,6 +205,13 @@ static GAUGES: Mutex<[Gauge; 2]> = Mutex::new([Gauge::new(), Gauge::new()]);
 static METER: RwLock<Option<Arc<dyn Meter>>> = RwLock::new(None);
 static SCALES: RwLock<Vec<Scale>> = RwLock::new(Vec::new());
 
+/// Forgets the boot's meter, scales and shortfalls.
+pub(crate) fn reset() {
+    *GAUGES.lock().unwrap() = [Gauge::new(), Gauge::new()];
+    *METER.write().unwrap() = None;
+    SCALES.write().unwrap().clear();
+}
+
 /// Says that waiters on `tier` from `from` (an engine's planner) are short
 /// of `short_bytes` in all, now: not an increment. Zero once they are all
 /// served. The worker policy reads it when the tier's band changes.

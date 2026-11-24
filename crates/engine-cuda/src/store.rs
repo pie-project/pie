@@ -1946,7 +1946,7 @@ impl Pools {
         self.chunks.by_refs()
     }
 
-    /// See `Engine::commit_segments`.
+    /// See `Pool::commit`.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
         match self.chunks.commit_segments(&mut self.pool, segments)? {
             Commit::Committed => Ok(()),
@@ -1954,7 +1954,7 @@ impl Pools {
         }
     }
 
-    /// See `Engine::release_segments`: the activation's span stays.
+    /// See `Pool::release`: the activation's span stays.
     pub fn release_segments(&mut self, segments: u32) -> Result<()> {
         // No move still landing reads or writes a chunk that goes.
         self.settle_swaps()?;
@@ -1988,7 +1988,7 @@ impl Pools {
         seen
     }
 
-    /// Moves the chunks `evacuated` names (see `Engine::evacuate`): the
+    /// Moves the chunks `evacuated` names (see `Pool::evacuate`): the
     /// copy enqueued behind every move still landing, then the table. A
     /// copy that cannot be enqueued leaves the pool as it was.
     pub fn move_chunks(
@@ -2010,7 +2010,7 @@ impl Pools {
         self.stage_expert_tables(stream)
     }
 
-    /// The chunk table as it stands (`Engine::chunk_table`).
+    /// The chunk table as it stands (`Pool::chunk_table`).
     #[must_use]
     pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
         self.chunks.table()
@@ -2158,7 +2158,10 @@ impl Pools {
                 base: self.chunks.base() + plane.offset,
                 len: backed.saturating_sub(plane.offset),
                 page_stride: grain,
-                domain: engine::MemoryDomain::CudaDevice(ordinal),
+                domain: engine::MemoryDomain::Device {
+                    ordinal,
+                    reach: engine::DeviceReach::Peer,
+                },
             });
         }
         let (layers, heads, head_dim, dtype) = self

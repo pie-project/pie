@@ -285,7 +285,7 @@ impl Shell {
         copy: &engine::chunk::SlotCopy,
         landed: Option<(engine::LandingSink, u64)>,
     ) -> Result<bool> {
-        let device = engine::MemoryDomain::MetalShared;
+        let device = engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared };
         if copy.src != device || copy.dst != device {
             self.copy_slots(copy)?;
             return Ok(true);

@@ -180,8 +180,8 @@ fn a_random_activation_answers_the_host_decoded_weights(
             let mut acc = 0.0f64;
             for c in 0..blocks_per_row {
                 let b = src(r, c);
-                for p in 0..BLOCK {
-                    let w = f64::from(f32::from_bits(b.expect_bits[p]));
+                for (p, &bits) in b.expect_bits[..BLOCK].iter().enumerate() {
+                    let w = f64::from(f32::from_bits(bits));
                     let xv = f64::from(bf16_at(&x, v * k + c * BLOCK + p));
                     acc += w * xv;
                 }

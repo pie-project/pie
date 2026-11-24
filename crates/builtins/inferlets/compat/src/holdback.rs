@@ -70,6 +70,10 @@ impl HoldBack {
         std::mem::take(&mut self.held)
     }
 
+    pub fn marker(&self, hit: usize) -> &str {
+        &self.markers[hit]
+    }
+
     fn longest_prefix_tail(&self) -> usize {
         let held = self.held.as_str();
         let mut longest = 0;
@@ -126,5 +130,13 @@ mod tests {
         assert_eq!(run(&[], &["a", "b"]), ("ab".into(), None));
         // Multi-byte text around a marker.
         assert_eq!(run(&["끝"], &["안녕 ", "끝!"]), ("안녕 ".into(), Some(0)));
+    }
+
+    #[test]
+    fn a_hit_names_its_marker_past_an_empty_one() {
+        let mut hb = HoldBack::new(vec![String::new(), "</tool_call>".into()]);
+        let released = hb.push("{}\n</tool_call>");
+        assert_eq!(released.text, "{}\n");
+        assert_eq!(hb.marker(released.hit.unwrap()), "</tool_call>");
     }
 }

@@ -84,7 +84,7 @@ pub fn held(pid: ProcessId) -> bool {
         .is_some_and(|schedule| schedule.held(pid))
 }
 
-#[cfg(test)]
+/// Sets the table outright: a test's, or none at a boot's reset.
 pub(crate) fn install(schedule: Option<Table>) {
     *CURRENT.write() = schedule.map(Arc::new);
     changed(None);
@@ -160,6 +160,10 @@ fn changed(only: Option<&HashSet<ProcessId>>) {
 }
 
 static ALIASES: RwLock<Option<HashMap<ProcessId, ProcessId>>> = RwLock::new(None);
+
+pub(crate) fn reset() {
+    *ALIASES.write() = None;
+}
 
 pub fn plex_id(pid: ProcessId) -> ProcessId {
     ALIASES

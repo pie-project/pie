@@ -38,7 +38,7 @@ pub mod trigger;
 pub use demux::Event;
 pub use envelope::Envelope;
 pub use error::ApiError;
-pub use generate::{Generated, Logprob, Sampling};
+pub use generate::{Generated, Logprob, LogprobsMode, Sampling};
 pub use request::{
     Effort, Message, Request, ResponseFormat, Role, StructuralTag, Structure, Thinking, ToolCall,
     ToolChoice,

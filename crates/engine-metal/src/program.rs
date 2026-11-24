@@ -4728,7 +4728,7 @@ mod tests {
         pools.seat_tier(2 * CHUNK);
         let to_host = |shape, slots: &[u32], first: u32| engine::chunk::SlotCopy {
             shape,
-            src: engine::MemoryDomain::MetalShared,
+            src: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
             dst: engine::MemoryDomain::HostPinned,
             slots: slots
                 .iter()
@@ -4740,7 +4740,7 @@ mod tests {
         let from_host = |copy: &engine::chunk::SlotCopy, back: &[u32]| engine::chunk::SlotCopy {
             shape: copy.shape,
             src: engine::MemoryDomain::HostPinned,
-            dst: engine::MemoryDomain::MetalShared,
+            dst: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
             slots: copy
                 .slots
                 .iter()
@@ -5255,7 +5255,7 @@ mod tests {
                     &mut frame,
                     &engine::chunk::SlotCopy {
                         shape: *shape,
-                        src: engine::MemoryDomain::MetalShared,
+                        src: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                         dst: engine::MemoryDomain::HostPinned,
                         slots: slots.iter().copied().zip(host.iter().copied()).collect(),
                         runs: Vec::new(),
@@ -5292,7 +5292,7 @@ mod tests {
                     &engine::chunk::SlotCopy {
                         shape: *shape,
                         src: engine::MemoryDomain::HostPinned,
-                        dst: engine::MemoryDomain::MetalShared,
+                        dst: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                         slots: host.iter().copied().zip(slots.iter().copied()).collect(),
                         runs: Vec::new(),
                     },
@@ -5313,7 +5313,7 @@ mod tests {
                 &mut frame,
                 &engine::chunk::SlotCopy {
                     shape: INSTANCE,
-                    src: engine::MemoryDomain::MetalShared,
+                    src: engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                     dst: engine::MemoryDomain::LocalDisk,
                     slots: vec![(instance[0], 0)],
                     runs: Vec::new(),

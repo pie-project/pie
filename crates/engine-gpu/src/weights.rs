@@ -348,6 +348,14 @@ impl<B: Backend> Weights<B> {
             }));
         }
 
+        let mut pieces = vec![Vec::new(); places.len()];
+        for (at, param) in trace.params.iter().enumerate() {
+            if let Some(pairing) = pairings.get(param.name.as_str()) {
+                pieces[at] =
+                    bank_pieces(&store, handles, &places, at, pairing, device.max_buffer())?;
+            }
+        }
+
         let mut gathered_widest = [0u64; 3];
         for at in plan.gathered() {
             if places[at].tier != Tier::Host {
@@ -383,7 +391,7 @@ impl<B: Backend> Weights<B> {
             host,
             layout,
             rows,
-            table: WeightTable(weight_table),
+            table: WeightTable(weight_table, pieces),
             banks: banks(trace, &places),
             decoded: Vec::new(),
             cached_bytes: streamed.iter().map(|&at| reserved[at]).sum(),
@@ -874,6 +882,80 @@ pub fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
             })
         })
         .collect()
+}
+
+/// Bank `at`'s pieces where a plane of it outgrows one binding of `ceiling`
+/// bytes: its rows cut into runs whose planes each bind whole, a multiple of
+/// 256 rows apart (every view starts on a 256-byte boundary), each a bank of
+/// views into its planes; none where every plane binds whole. A plane laid
+/// other than row by row is left whole.
+fn bank_pieces<B: Backend>(
+    store: &Store<B>,
+    handles: &Handles<B>,
+    places: &[Place],
+    at: usize,
+    pairing: &Pairing,
+    ceiling: u64,
+) -> Result<Vec<(u32, kernels_slang::Bank)>> {
+    const STEP: u64 = 256;
+    let planes: Vec<&Place> = [Some(at), Some(pairing.scales), pairing.biases]
+        .into_iter()
+        .flatten()
+        .map(|q| &places[q])
+        .collect();
+    let rows = u64::from(places[at].rows);
+    if planes.iter().all(|p| p.bytes <= ceiling)
+        || rows == 0
+        || planes.iter().any(|p| {
+            p.tier != Tier::Device
+                || u64::from(p.rows) != rows
+                || p.bytes % rows != 0
+                || p.dtype == Dtype::U4g64tiled
+        })
+    {
+        return Ok(Vec::new());
+    }
+    let most = planes
+        .iter()
+        .map(|p| ceiling / (p.bytes / rows).max(1))
+        .min()
+        .unwrap_or(0)
+        / STEP
+        * STEP;
+    if most == 0 {
+        return Ok(Vec::new());
+    }
+    let count = rows.div_ceil(most);
+    let per = rows.div_ceil(count).next_multiple_of(STEP).min(most);
+    let view = |p: &Place, first: u64, n: u64| -> Result<Tensor> {
+        let row = p.bytes / rows;
+        Ok(Tensor::new(
+            store.bind(handles, p.offset + first * row, n * row)?,
+            u32::try_from(n).unwrap_or(u32::MAX),
+            p.width,
+            p.dtype,
+        ))
+    };
+    let mut out = Vec::new();
+    let mut first = 0u64;
+    while first < rows {
+        let n = per.min(rows - first);
+        out.push((
+            u32::try_from(first).unwrap_or(u32::MAX),
+            kernels_slang::Bank {
+                codes: view(&places[at], first, n)?,
+                scales: view(&places[pairing.scales], first, n)?,
+                biases: pairing
+                    .biases
+                    .map(|b| view(&places[b], first, n))
+                    .transpose()?,
+                group: pairing.group,
+                bits: pairing.bits,
+            },
+        ));
+        first += n;
+    }
+    Ok(out)
 }
 
 fn rectangle(shape: &[u64]) -> (u64, u64) {

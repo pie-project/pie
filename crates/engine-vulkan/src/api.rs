@@ -5,11 +5,9 @@
 
 use std::path::PathBuf;
 
-#[cfg(feature = "vulkan")]
-use engine::Engine;
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireTicket, Step};
-use engine::transfer::MemoryDomain;
+use engine::transfer::{DeviceReach, MemoryDomain};
 use eta_ir::registry::{PortMask, Stage};
 
 use engine_gpu::api::{Envelope, Host, PendingStep, each_pass, fault, program_attachments};
@@ -84,7 +82,10 @@ impl Host for Api {
     type Programs = crate::program::Plane;
 
     fn domain(boot: &DeviceBoot) -> MemoryDomain {
-        MemoryDomain::VulkanDevice(boot.device_index)
+        MemoryDomain::Device {
+            ordinal: boot.device_index,
+            reach: DeviceReach::Private,
+        }
     }
 
     fn measured_on(device: &crate::device::Context) -> String {
@@ -328,7 +329,7 @@ fn defers(gpu: &Vulkan, step: &Step) -> bool {
     #[cfg(feature = "vulkan")]
     {
         gpu.sink.is_some()
-            && gpu.settles_asynchronously()
+            && Api::settles_asynchronously(gpu)
             && program_attachments(step).next().is_some()
             && program_attachments(step).all(|attachment| gpu.programs.defers(attachment.instance))
     }

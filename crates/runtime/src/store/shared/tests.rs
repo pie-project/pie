@@ -152,7 +152,7 @@ impl FakeEngine {
         Ok(())
     }
 
-    /// The rung moves (`Engine::set_rung`): a raise backs the carve, and is
+    /// The rung moves (`Pool::set_rung`): a raise backs the carve, and is
     /// refused as a placement heap the device has no room for is.
     fn set_rung(&mut self, from: u32, to: u32) -> ::engine::Result<()> {
         if self.refuse && to > from {

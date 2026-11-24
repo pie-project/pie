@@ -643,6 +643,20 @@ impl Client {
         })
     }
 
+    pub async fn reload_weights(&self, path: &str, version: Option<u64>) -> Result<String> {
+        let msg = ClientMessage::ReloadWeights {
+            corr_id: 0,
+            path: path.to_string(),
+            version,
+        };
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
+        if ok {
+            Ok(result)
+        } else {
+            Err(Error::request("ReloadWeights", result))
+        }
+    }
+
     pub async fn ping(&self) -> Result<()> {
         let msg = ClientMessage::Ping { corr_id: 0 };
         let (ok, result) = self.send_msg_and_wait(msg).await?;

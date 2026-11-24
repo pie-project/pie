@@ -4,7 +4,6 @@
 //! host interpreter once took such passes). The same program reading the
 //! load's `logits` registers. Skipped without a PJRT plugin.
 
-use engine::Engine;
 use engine::program::ProgramRegistration;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
@@ -64,9 +63,7 @@ fn register(model: &mut Model, name: &str) -> Result<engine::program::ProgramId,
     .map_err(|e| format!("bind: {e:?}"))?;
     let stages = eta_compiler::plan::compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
-    model
-        .engine
-        .register_program(&ProgramRegistration {
+    engine::Programs::register(&mut model.engine, &ProgramRegistration {
             launch,
             ..Default::default()
         })

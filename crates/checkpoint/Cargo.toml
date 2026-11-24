@@ -1,6 +1,7 @@
 [package]
 name = "checkpoint"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Typed checkpoint compiler: a checkpoint and a contract in, a verified memory layout a device can be pointed at out."

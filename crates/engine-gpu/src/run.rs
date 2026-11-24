@@ -20,8 +20,11 @@ pub enum WeightRow {
     Planes(Bank),
 }
 
+/// The weight rows by param, and beside them each bank whose planes outgrow
+/// one binding cut by its rows: each piece's first row and bank, the pieces
+/// in order (none where the bank binds whole).
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable(pub Vec<Option<WeightRow>>, pub Vec<Vec<(u32, Bank)>>);
 
 /// A fire's carve: each value's rectangle, and its capturing lanes.
 #[derive(Clone, Debug, Default, Hash)]
@@ -1079,6 +1082,16 @@ impl<'c, B: Backend> Run<'c, B> {
         }
     }
 
+    /// Weight value `id`'s bank cut by its rows where a plane of it
+    /// outgrows one binding: each piece's first row and bank, in order;
+    /// empty where the bank binds whole.
+    pub fn bank_pieces(&self, id: ValueId) -> &'c [(u32, Bank)] {
+        match &self.values[id.0 as usize].def {
+            Def::Weight(w) => self.weights.1.get(*w as usize).map_or(&[], Vec::as_slice),
+            _ => &[],
+        }
+    }
+
     /// Weight value `id`'s split-plane bank as the load bound it: the
     /// scheme a tabled kernel reads it at.
     pub fn scheme(&self, id: ValueId) -> Bank {
@@ -1289,6 +1302,14 @@ impl<'c, B: Backend> Run<'c, B> {
                     panic!("the index score slab this load reserved does not mint: {fault}")
                 }),
         )
+    }
+
+    /// The room a projection whose bank outgrows one binding lands its
+    /// logits in, a run of rows at a time.
+    pub fn logits_scratch(&self) -> Option<Tensor> {
+        Some(self.scratch.logits(self.handles)?.unwrap_or_else(|fault| {
+            panic!("the logits room this load reserved does not mint: {fault}")
+        }))
     }
 
     pub fn split_scratch(&self) -> Option<kernels_slang::attn::sdpa::Split> {

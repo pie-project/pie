@@ -12,6 +12,46 @@ impl<B: Backend> DispatchLinear for Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
+    /// The logits of a bank cut by its rows (`Run::bank_pieces`): each run
+    /// of rows lands its columns in the logits room, then the runs take
+    /// their columns of `y` side by side.
+    fn logits_by_pieces(
+        &self,
+        act: kernels_slang::Tensor,
+        pieces: &[(u32, kernels_slang::Bank)],
+        y: kernels_slang::Tensor,
+        capacity: u32,
+    ) -> Result<(), kernels_slang::Error> {
+        const OP: &str = "linear.matmul";
+        let backend = |detail: String| kernels_slang::Error::Backend { op: OP, detail };
+        let room = self.logits_scratch().ok_or_else(|| {
+            backend("its bank outgrows one binding, and the load reserved no logits room".into())
+        })?;
+        let capacity = capacity.min(room.rows);
+        let mut runs = Vec::with_capacity(pieces.len());
+        let mut skip = 0u64;
+        for &(first, bank) in pieces {
+            let width = bank.codes.rows.min(y.width.saturating_sub(first));
+            if width == 0 {
+                continue;
+            }
+            let bytes = u64::from(capacity) * u64::from(width) * y.dtype.bytes_ceil();
+            let run = kernels_slang::Tensor::new(
+                self.handles()
+                    .cut(room.buf, skip, bytes)
+                    .map_err(|fault| backend(fault.to_string()))?,
+                y.rows,
+                width,
+                y.dtype,
+            );
+            skip += bytes.next_multiple_of(256);
+            let ladder = self.qmm_ladder(act, run, bank, capacity);
+            kernels_slang::linear::qmm::lm_head(self.ctx, &ladder, act, bank, run, capacity)?;
+            runs.push(run);
+        }
+        kernels_slang::gather::rows::concat_cols(self.ctx, &runs, y)
+    }
+
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_slang::Error> {
         match op {
             Linear::Relu2 { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
@@ -78,6 +118,10 @@ impl<B: Backend> Run<'_, B> {
                 Some(bank) => {
                     let capacity = self.capacity(*act).min(self.capacity(*y));
                     let (act, y) = (self.tensor(*act), self.tensor(*y));
+                    let pieces = self.bank_pieces(*w);
+                    if !pieces.is_empty() {
+                        return self.logits_by_pieces(act, pieces, y, capacity);
+                    }
                     let ladder = self.qmm_ladder(act, y, bank, capacity);
                     kernels_slang::linear::qmm::lm_head(self.ctx, &ladder, act, bank, y, capacity)
                 }

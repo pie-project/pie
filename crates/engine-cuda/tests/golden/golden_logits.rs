@@ -956,6 +956,7 @@ fn served_by_refs(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             false,
         ));
         let window = windows.first().map_or(&[][..], Vec::as_slice);
+        #[allow(clippy::type_complexity)]
         fn seat<'a>(
             (pages, window, record): (&'a [u32], &'a [u32], Option<u32>),
             word: u64,
@@ -2738,7 +2739,7 @@ fn contract_of(trace: &Trace, path: &Path) -> std::result::Result<ModelContract,
 fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::chunk::{SlotKind, SlotRole};
     use engine::fire::{FoldLen, FrameSubmission, KvDelta, RsVerb, Step};
-    use engine::{Engine, load};
+    use engine::{Engine, Pool, load};
     let boot = engine_cuda::DeviceBoot {
         cache_dir: Some(cache.to_path_buf()),
         knobs: buffering(engine_cuda::Knobs::default()),
@@ -2789,7 +2790,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         unreachable!("the fixed shape")
     };
     engine
-        .commit_segments(facts.segments.committed.max(1))
+        .commit(facts.segments.committed.max(1))
         .expect("the first segment commits");
     let mut refs = Refs::of(facts.clone(), 1);
     let record: Vec<[u32; 2]> = (0..pieces)
@@ -3634,6 +3635,7 @@ enum Serving {
 /// then, the first still holding its record and pages, the second the same
 /// prompt from a record and pages of its own. Each set's steps' hashes and
 /// top tokens.
+#[allow(clippy::type_complexity)]
 fn served_two_sets(
     fixture: &Fixture,
     cache: &Path,

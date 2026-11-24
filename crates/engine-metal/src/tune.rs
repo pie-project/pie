@@ -1217,7 +1217,6 @@ fn measure(
                     let launched = launch(&watch, t, 0).is_ok();
                     let as_itself = ran(&watch.files.borrow(), q);
                     drop(watch);
-                    drop(sink);
                     frame.commit().map_err(|e| e.to_string())?;
                     if !launched || !as_itself {
                         continue;

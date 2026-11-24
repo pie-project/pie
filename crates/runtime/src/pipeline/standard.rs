@@ -1,6 +1,6 @@
 //! The SDK's standard samplers as the served model registers them, so a
 //! load can build their guest code before ready
-//! (`engine::Engine::prewarm_programs`). The stage bodies are the SDK's own
+//! (`engine::Programs::prewarm`). The stage bodies are the SDK's own
 //! ([`eta_dsl::sampler`], which the built-in inferlets' generation loop
 //! runs as `inferlet::sampler`), traced for each of
 //! [`eta_dsl::sampler::standard`]'s shapes over the channels and ports that

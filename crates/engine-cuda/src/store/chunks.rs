@@ -970,7 +970,7 @@ impl Chunks {
         self.table.physical(logical)
     }
 
-    /// The chunk table as it stands (`Engine::chunk_table`).
+    /// The chunk table as it stands (`Pool::chunk_table`).
     #[must_use]
     pub fn table(&self) -> &ChunkTable {
         &self.table

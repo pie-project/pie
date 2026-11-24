@@ -577,7 +577,7 @@ pub fn tiers() -> &'static [kernels_slang::Tier] {
 /// Whether an output of `columns` lands: on WGSL every output pair is one
 /// bf16 word, so an odd count does not.
 pub fn lands(columns: usize) -> bool {
-    crate::backend::SPIRV || columns % 2 == 0
+    crate::backend::SPIRV || columns.is_multiple_of(2)
 }
 
 pub fn close(got: &[f32], want: &[f64], what: &str) {

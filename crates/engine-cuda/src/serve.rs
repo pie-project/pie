@@ -773,7 +773,7 @@ impl Shell {
     }
 
     /// Once every copy into the host tier has landed (the swap stream's and
-    /// the stream's own): see `Engine::read_tier_slots`.
+    /// the stream's own): see `Tiers::read`.
     pub fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -784,7 +784,7 @@ impl Shell {
     }
 
     /// Behind every copy that touches the host tier: see
-    /// `Engine::write_tier_slots`.
+    /// `Tiers::write`.
     pub fn write_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -861,6 +861,29 @@ impl Shell {
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
         self.weights
             .register_adapter(self.device.stream(), id, planes)
+    }
+
+    pub fn reload_weights(
+        &mut self,
+        contract: &checkpoint::contract::ModelContract,
+        path: &std::path::Path,
+        target: checkpoint::plan::StorageTarget,
+        torn: &mut bool,
+    ) -> Result<(u32, u64)> {
+        crate::device::ctx::sync(self.device.stream())?;
+        let written = self.weights.reload(
+            &self.trace,
+            contract,
+            path,
+            target,
+            self.device.stream(),
+            torn,
+        )?;
+        *torn = true;
+        crate::voxels::relabel_conv_weights(&self.device, &self.trace, self.weights.table())?;
+        crate::device::ctx::sync(self.device.stream())?;
+        *torn = false;
+        Ok(written)
     }
 
     pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {

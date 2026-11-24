@@ -279,6 +279,9 @@ pub struct ServerConfig {
     /// and what `pie inferlet install` put here.
     #[serde(default = "default_true")]
     pub allow_upload: bool,
+    /// Whether a client may write new weights over the served model's (`reload_weights`).
+    #[serde(default)]
+    pub allow_weight_reload: bool,
 }
 
 impl Default for ServerConfig {
@@ -289,6 +292,7 @@ impl Default for ServerConfig {
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
             allow_upload: true,
+            allow_weight_reload: false,
         }
     }
 }
@@ -805,8 +809,9 @@ pub struct RuntimeConfig {
     /// Frames the runtime keeps posted to the engine but not yet retired: the
     /// dispatch loop's enqueue horizon, keeping the GPU from idling between
     /// frames. Bounded jointly with `frame_size` — see [`Self::validate`].
-    #[serde(default = "default_frame_dispatch_depth")]
-    pub frame_dispatch_depth: u32,
+    /// Unstated: the engine's preference, else 2 ([`Self::dispatch_depth`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_dispatch_depth: Option<u32>,
     /// Hard cap on inferlets admitted at once. Omit to derive it from the
     /// engine's fire lanes, which is what fills a batch.
     #[serde(default)]
@@ -835,7 +840,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             frame_size: default_frame_size(),
-            frame_dispatch_depth: default_frame_dispatch_depth(),
+            frame_dispatch_depth: None,
             max_concurrent_processes: None,
             worker_policy: default_worker_policy(),
             snapshot_budget: default_snapshot_budget(),
@@ -844,12 +849,21 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// The frames the runtime keeps posted: the stated depth, else the engine's preference
+    /// (`engine`, 0: none), else 2.
+    #[must_use]
+    pub fn dispatch_depth(&self, engine: u32) -> u32 {
+        self.frame_dispatch_depth.unwrap_or(if engine > 0 {
+            engine
+        } else {
+            DEFAULT_FRAME_DISPATCH_DEPTH
+        })
+    }
+
     fn validate(&self, max_frames: u8) -> Result<()> {
         ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
-        ensure!(
-            self.frame_dispatch_depth >= 1,
-            "runtime.frame_dispatch_depth must be >= 1"
-        );
+        let depth = self.dispatch_depth(0);
+        ensure!(depth >= 1, "runtime.frame_dispatch_depth must be >= 1");
         ensure!(
             self.frame_size <= u32::from(Runahead::STEPS_MAX),
             "runtime.frame_size must be at most {} (got {}): it is `k` in the engine's \
@@ -860,14 +874,14 @@ impl RuntimeConfig {
             self.frame_size
         );
         ensure!(
-            self.frame_dispatch_depth <= u32::from(max_frames),
+            depth <= u32::from(max_frames),
             "runtime.frame_dispatch_depth must be at most {} (got {}) on this engine: \
              an engine with a staging ring publishes its free set as one 64-bit \
              word, and `frames_in_flight * {} + 1` must fit in it \
              (`engine::runahead::Runahead::MAX_FRAMES`; the cerebras engine, \
              which has none, takes up to `Runahead::UNSTAGED_MAX_FRAMES`)",
             max_frames,
-            self.frame_dispatch_depth,
+            depth,
             Runahead::STEPS_MAX
         );
         if let Some(n) = self.max_concurrent_processes {
@@ -881,9 +895,7 @@ fn default_frame_size() -> u32 {
     2
 }
 
-fn default_frame_dispatch_depth() -> u32 {
-    2
-}
+const DEFAULT_FRAME_DISPATCH_DEPTH: u32 = 2;
 
 /// `[engine]`: the keys every engine reads, and beside them the named
 /// engine's own, each checked against that engine's options struct.

@@ -1,58 +1,15 @@
-//! A pure-Rust binding to the Cerebras SDK host runtime (`cerebras::SdkRuntime`).
-//!
-//! The SDK ships no C API and no headers: its host runtime is a C++ library,
-//! `libsdkruntime.so`, whose only public surface is the pybind module used by
-//! `cs_python`. This module dlopens the SDK's shared libraries at runtime and
-//! calls their mangled C++ entry points directly, with the object layouts and
-//! calling conventions mirrored in `abi` and [`sys`]. There is no Python,
-//! no C++ shim and no build script; the crate builds on a box without the SDK.
-//!
-//! # Host setup
-//!
-//! The SDK's ELF files hard-code their interpreter and rpath under `/cb/...`
-//! and its helper binaries under `/cbcore/...`, so the unpacked SDK image
-//! must be reachable at those absolute paths. With the image at
-//! `/root/cs_sdk/rootfs` that is two symlinks:
-//!
-//! ```text
-//! ln -s /root/cs_sdk/rootfs/cb /cb
-//! ln -s /root/cs_sdk/rootfs/cbcore /cbcore
-//! ```
-//!
-//! No container, PRoot or environment variables are needed after that.
-//! [`Sdk::open_at`] loads the libraries from a directory (the toolchain
-//! config's `sdk_lib`, by default `/cbcore/lib`) and prepends the sibling `bin/` directory to `PATH` because
-//! the runtime shells out to helpers such as `cself_default`.
-//!
-//! # What is and is not covered
-//!
-//! Covered: the simulator platform, a CS system by `cmaddr` (untested: no
-//! hardware here), `load`/`run`/`stop`, blocking host to device and device to
-//! host copies, RPC launches with `u32` arguments, symbol ids read from the
-//! compiler's `bin/out_rpc.json`. Not yet covered: streaming copies,
-//! non-blocking tasks, ports.
-//!
-//! The simulator writes `sim.log`, `simconfig.json`, `sim_stats.json` and
-//! `wio_flows_tmpdir.*` into the process's current directory, and a stale
-//! scratch directory from an aborted run makes the next start throw. Run
-//! from a scratch directory (`fabric-run` changes into its spec's directory).
-//!
-//! The SDK initialises its message system when the first runtime of a
-//! process is created and asserts that every later runtime is created on
-//! that same thread; [`Runtime::new`] refuses on another thread instead.
-//! Together with the one-simulator-per-process rule this is why programs are
-//! run in dedicated processes (`fabric-run`).
-//!
-//! A C++ exception thrown inside the SDK cannot cross this boundary and
-//! aborts the process. The SDK's own argument checks are therefore
-//! duplicated here where they are cheap (buffer sizes, symbol kinds).
+//! A pure-Rust binding to the Cerebras SDK host runtime (`cerebras::SdkRuntime`): it dlopens
+//! `libsdkruntime.so` and calls its mangled C++ entry points, layouts mirrored in `abi` and
+//! [`sys`]; no Python, shim or build script. The SDK's ELFs hard-code `/cb/...` and `/cbcore/...`,
+//! so the unpacked image must be symlinked there. Runtimes must all be made on one thread, and a
+//! C++ exception aborts the process, so the SDK's cheap argument checks are duplicated here.
 
 #![allow(unsafe_code)]
 
 pub(crate) mod abi;
 pub mod sys;
 
-pub use kernels_cerebras::spatial::toolchain::Arch;
+pub use kernels_cerebras::compile::toolchain::Arch;
 
 impl From<Target> for Arch {
     fn from(t: Target) -> Self {
@@ -101,9 +58,6 @@ pub enum Error {
     /// The SDK's `bin` directory cannot join `PATH` (a path holding the
     /// separator): its helpers would not be found.
     PathJoin(PathBuf, String),
-    /// The threads this process may run are not known (the simulator runs
-    /// on them).
-    Threads(String),
 }
 
 impl fmt::Display for Error {
@@ -129,7 +83,6 @@ impl fmt::Display for Error {
                 f,
                 "the SDK runtime must be created on the process's main thread"
             ),
-            Error::Threads(e) => write!(f, "the threads this process may run: {e}"),
             Error::PathJoin(dir, e) => write!(
                 f,
                 "the SDK's helpers in {} cannot join PATH: {e}",
@@ -155,15 +108,14 @@ pub struct Sdk {
 impl Sdk {
     /// Default library directory: the SDK image's `/cbcore/lib`.
     pub fn default_lib_dir() -> PathBuf {
-        kernels_cerebras::spatial::toolchain::Toolchain::default().sdk_lib()
+        kernels_cerebras::compile::toolchain::Toolchain::default().sdk_lib()
     }
 
     pub fn open() -> Result<Arc<Self>> {
         Self::open_at(&Self::default_lib_dir())
     }
 
-    /// Whether the SDK libraries are on this box, without loading them
-    /// (loading notes the cwd and writes simulator logs there later).
+    /// Whether the SDK libraries are on this box, without loading them.
     pub fn available() -> bool {
         Self::default_lib_dir().join("libsdkruntime.so").is_file()
     }
@@ -171,8 +123,7 @@ impl Sdk {
     pub fn open_at(lib_dir: &Path) -> Result<Arc<Self>> {
         let load = |name: &str| {
             let path = lib_dir.join(name);
-            // SAFETY: loading the SDK's libraries runs their initializers, which
-            // is exactly what cs_python does when it imports the pybind module.
+            // SAFETY: loading runs the libraries' initializers, as cs_python's import does.
             unsafe { Library::new(&path) }
                 .map_err(|e| Error::Library(path.display().to_string(), e.to_string()))
         };
@@ -190,15 +141,15 @@ impl Sdk {
     }
 }
 
-/// The thread that created this process's first runtime. The SDK's message
-/// system is initialised then and asserts that later initialisations happen
-/// on the same thread, so a runtime built elsewhere would abort the process.
+/// The thread that created this process's first runtime: the SDK asserts later ones are made on
+/// it.
 static OWNER: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 
 fn owning_thread() -> bool {
     *OWNER.get_or_init(|| std::thread::current().id()) == std::thread::current().id()
 }
 
+/// `dir` first on `PATH` (the SDK's helpers run from there); a `PATH` it cannot join is refused.
 fn prepend_path(dir: &Path) -> Result<()> {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let joined = prepended(dir, &current)?;
@@ -213,6 +164,14 @@ fn prepended(dir: &Path, current: &std::ffi::OsStr) -> Result<std::ffi::OsString
     let mut parts = vec![dir.to_path_buf()];
     parts.extend(std::env::split_paths(current));
     std::env::join_paths(parts).map_err(|e| Error::PathJoin(dir.to_path_buf(), e.to_string()))
+}
+
+/// The simulator's threads by default: the host's available parallelism (refused if unknown).
+pub fn host_threads() -> std::result::Result<u32, String> {
+    let n = std::thread::available_parallelism().map_err(|e| {
+        format!("the host's available parallelism: {e} (state [engine] num_threads)")
+    })?;
+    Ok(u32::try_from(n.get()).unwrap_or(u32::MAX))
 }
 
 /// Which wafer generation the program was compiled for.
@@ -232,16 +191,13 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    /// The simulator for `target` on every thread this process may run.
-    pub fn new(target: Target) -> Result<Self> {
-        let threads =
-            std::thread::available_parallelism().map_err(|e| Error::Threads(e.to_string()))?;
-        Ok(Simulator {
+    pub fn new(target: Target, num_threads: u32) -> Self {
+        Simulator {
             target,
-            num_threads: u32::try_from(threads.get()).unwrap_or(u32::MAX),
+            num_threads,
             suppress_trace: true,
             dump_core: false,
-        })
+        }
     }
 }
 
@@ -249,9 +205,7 @@ impl Simulator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Platform {
     Simulator(Simulator),
-    /// A CS system reached at `IP:port` (the SDK's `cmaddr`). Building it
-    /// contacts the system; if that fails the SDK throws, which aborts this
-    /// process (see the module docs).
+    /// A CS system reached at `IP:port` (the SDK's `cmaddr`); a failed connect aborts the process.
     System {
         cmaddr: String,
     },
@@ -264,8 +218,7 @@ pub enum Order {
     ColMajor = 1,
 }
 
-/// Width of each element on the wire. Host buffers are always `u32` words;
-/// 16-bit copies pack two device elements per word.
+/// Width of each element on the wire; 16-bit copies pack two elements per `u32` host word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Bits32 = 0,
@@ -388,11 +341,7 @@ impl PlatformMem {
     }
 }
 
-/// A loaded program on a platform: one `cerebras::SdkRuntime`.
-///
-/// Calls are blocking; every task the SDK hands back is waited on and
-/// released before the method returns. `stop` runs on drop if it has not
-/// been called.
+/// A loaded program on a platform: one `cerebras::SdkRuntime`. Calls block; `stop` runs on drop.
 pub struct Runtime {
     sdk: Arc<Sdk>,
     rpc: Rpc,
@@ -400,20 +349,31 @@ pub struct Runtime {
     _artifacts: Box<ArtifactsMem>,
     _platform: PlatformMem,
     running: bool,
-    /// Nonblocking calls not yet waited on, each with the host words it
-    /// reads (kept alive until its task is done).
-    pending: Vec<(Task, Vec<u32>)>,
     /// Blocking copies and launches so far: calls, time, words.
     pub io: IoStats,
+    /// The simulator's host-to-device writes issued since its last landed one.
+    pub unlanded: usize,
+    /// A PE of the last such write (where a read lands them).
+    pub landing: Option<Rect>,
+    /// The words last written to each kept array since the load, by symbol and rectangle origin: a
+    /// later write sends the PEs' changed words alone.
+    pub kept: std::collections::HashMap<(String, i32, i32), Vec<u32>>,
+    /// `rowp` as the device holds it where its program advances it (`state.advances`); `None`
+    /// after a load or a failed launch.
+    pub rows_held: Option<Vec<u32>>,
 }
 
-/// A runtime's blocking calls by kind: how many, how long they took, how
-/// many words they moved (the per-token cost the host pays the device).
+/// A runtime's blocking calls by kind: how many, how long, how many words.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IoStats {
     pub h2d: (u64, u64, u64),
     pub d2h: (u64, u64, u64),
     pub launch: (u64, u64),
+    /// The PEs' stamps read back (apart from `d2h`).
+    pub stamps: (u64, u64, u64),
+    /// Launches whose end was polled ([`crate::reading::Reading::poll`]): how many, and the time
+    /// from each call to a one-word read of its first PE coming back.
+    pub done: (u64, u64),
 }
 
 impl IoStats {
@@ -443,9 +403,8 @@ impl std::fmt::Display for IoStats {
 }
 
 impl Runtime {
-    /// Opens the compiler output at `artifacts_dir` (the `-o` directory given
-    /// to `cslc`) on `platform`. `msg_level` is the SDK's log threshold
-    /// (`"WARNING"` is what cs_python uses).
+    /// Opens the compiler output at `artifacts_dir` on `platform`; `msg_level` is the SDK's log
+    /// threshold (cs_python uses `"WARNING"`).
     pub fn new(
         sdk: Arc<Sdk>,
         artifacts_dir: &Path,
@@ -486,8 +445,7 @@ impl Runtime {
         let mut msg = CxxString::new(msg_level);
         let mut cslc_prefix = CxxString::new("");
         let mut out_prefix = CxxString::new("");
-        // SAFETY: argument order and types follow the exported constructor
-        // signature; the three by-value strings are owned by this frame.
+        // SAFETY: arguments follow the exported constructor; the strings are owned by this frame.
         unsafe {
             (api.runtime_ctor)(
                 this.as_ptr(),
@@ -508,9 +466,18 @@ impl Runtime {
             _artifacts: artifacts,
             _platform: platform,
             running: false,
-            pending: Vec::new(),
+            unlanded: 0,
+            landing: None,
+            kept: std::collections::HashMap::new(),
+            rows_held: None,
             io: IoStats::default(),
         })
+    }
+
+    /// Whether it runs on the fabric simulator.
+    #[must_use]
+    pub fn simulated(&self) -> bool {
+        matches!(self._platform, PlatformMem::Simulator(_))
     }
 
     pub fn rpc(&self) -> &Rpc {
@@ -527,6 +494,8 @@ impl Runtime {
 
     /// Loads the program's ELFs onto the fabric.
     pub fn load(&mut self) {
+        self.kept.clear();
+        self.rows_held = None;
         // SAFETY: constructed runtime.
         unsafe { (self.api().load)(self.this()) }
     }
@@ -540,7 +509,6 @@ impl Runtime {
 
     /// Stops the program. Idempotent.
     pub fn stop(&mut self) {
-        self.wait_pending();
         if self.running {
             // SAFETY: constructed, running runtime.
             unsafe { (self.api().stop)(self.this()) }
@@ -645,10 +613,8 @@ impl Runtime {
         Ok(())
     }
 
-    /// Copies row `r` of `data` (`elems_per_pe` elements a row) into the
-    /// exported variable `symbol` on every PE of row `r` of `rect`: one
-    /// copy whose data is the rectangle's height, not its area (a per-row
-    /// table every column reads).
+    /// Copies row `r` of `data` (`elems_per_pe` elements a row) into `symbol` on every PE of row
+    /// `r` of `rect`: one copy of the rectangle's height, not its area.
     pub fn memcpy_h2d_rowbcast(
         &mut self,
         symbol: &str,
@@ -695,110 +661,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// [`Runtime::memcpy_h2d_rowbcast`] without waiting: queued ahead of
-    /// later calls, `data` kept until [`Runtime::wait_pending`].
-    pub fn memcpy_h2d_rowbcast_nonblock(
-        &mut self,
-        symbol: &str,
-        data: Vec<u32>,
-        rect: Rect,
-        elems_per_pe: usize,
-        data_type: DataType,
-    ) -> Result<()> {
-        let id = self.rpc.id(symbol, RpcKind::Var)?;
-        let expected = (rect.h.max(0) as usize) * elems_per_pe;
-        if data.len() != expected {
-            return Err(Error::Size {
-                symbol: symbol.into(),
-                expected,
-                actual: data.len(),
-            });
-        }
-        let rowbcast = self.api().memcpy_h2d_rowbcast.ok_or_else(|| {
-            Error::MissingSymbol(
-                "cerebras::SdkRuntime::memcpy_h2d_rowbcast".into(),
-                "this SDK has no row-broadcast copy (the batched builds' tables need it)".into(),
-            )
-        })?;
-        let opts = MemcpyOptions::new(false, data_type as i32, Order::RowMajor as i32, true);
-        let mut task = Task::empty();
-        // SAFETY: data moves into `pending` and lives until the task is waited on.
-        unsafe {
-            (rowbcast)(
-                &mut task,
-                self.this(),
-                id,
-                data.as_ptr() as *mut c_void,
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                elems_per_pe as i32,
-                &opts,
-            )
-        };
-        self.pending.push((task, data));
-        Ok(())
-    }
-
-    /// Copies `data` into `symbol` like [`Runtime::memcpy_h2d`] without
-    /// waiting: the copy is queued ahead of later calls, and
-    /// [`Runtime::wait_pending`] (or any later blocking call's caller) ends it.
-    pub fn memcpy_h2d_nonblock(
-        &mut self,
-        symbol: &str,
-        data: Vec<u32>,
-        rect: Rect,
-        elems_per_pe: usize,
-        order: Order,
-        data_type: DataType,
-    ) -> Result<()> {
-        let id = self.rpc.id(symbol, RpcKind::Var)?;
-        self.check_size(symbol, rect, elems_per_pe, data.len())?;
-        let opts = MemcpyOptions::new(false, data_type as i32, order as i32, true);
-        let mut task = Task::empty();
-        // SAFETY: data moves into `pending` and lives until the task is waited on.
-        unsafe {
-            (self.api().memcpy_h2d)(
-                &mut task,
-                self.this(),
-                id,
-                data.as_ptr() as *mut c_void,
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                elems_per_pe as i32,
-                &opts,
-            )
-        };
-        self.pending.push((task, data));
-        Ok(())
-    }
-
-    /// Launches `name` with `args` without waiting (see
-    /// [`Runtime::memcpy_h2d_nonblock`]).
-    pub fn launch_nonblock(&mut self, name: &str, args: &[u32]) -> Result<()> {
-        self.rpc.id(name, RpcKind::Func)?;
-        let name_s = CxxString::new(name);
-        let args = args.to_vec();
-        let vec = CxxVecU32::borrow(&args);
-        let opts = MemcpyOptions::new(false, 0, 0, true);
-        let mut task = Task::empty();
-        // SAFETY: mirrors are live for the call; the arguments stay alive in
-        // `pending` until the task is waited on.
-        unsafe { (self.api().call)(&mut task, self.this(), &*name_s, &vec, &opts) };
-        self.pending.push((task, args));
-        Ok(())
-    }
-
-    /// Waits for and releases every nonblocking call made so far.
-    pub fn wait_pending(&mut self) {
-        for (mut task, _words) in std::mem::take(&mut self.pending) {
-            self.finish(&mut task);
-        }
-    }
-
     /// Launches the exported function `name` with `args` and waits for it.
     pub fn launch(&mut self, name: &str, args: &[u32]) -> Result<()> {
         self.rpc.id(name, RpcKind::Func)?;
@@ -825,21 +687,11 @@ impl Drop for Runtime {
     }
 }
 
-/// Reinterprets `f32` values as the `u32` words the copy calls take.
-pub fn f32_words(v: &[f32]) -> Vec<u32> {
-    v.iter().map(|x| x.to_bits()).collect()
-}
-
-/// Reinterprets copied-back words as `f32`.
-pub fn words_f32(v: &[u32]) -> Vec<f32> {
-    v.iter().map(|x| f32::from_bits(*x)).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{Error, Simulator, Target, prepended};
+    use super::{Error, prepended};
 
     /// The SDK's `bin` goes ahead of the search path; a directory holding
     /// the separator cannot join it and is refused by name, not skipped.
@@ -850,13 +702,5 @@ mod tests {
         assert_eq!(joined, "/sdk/bin:/usr/bin:/bin");
         let refused = prepended(Path::new("/sdk:x/bin"), "/usr/bin".as_ref());
         assert!(matches!(refused, Err(Error::PathJoin(..))), "{refused:?}");
-    }
-
-    /// The simulator runs on every thread the process may run.
-    #[test]
-    fn the_simulator_runs_on_the_available_threads() {
-        let sim = Simulator::new(Target::Wse3).expect("the threads are known here");
-        let threads = std::thread::available_parallelism().expect("known");
-        assert_eq!(sim.num_threads as usize, threads.get());
     }
 }

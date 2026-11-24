@@ -1,0 +1,3 @@
+# Inferlets and policies are WASI 0.3 components.
+[build]
+target = "wasm32-wasip3"

@@ -2,7 +2,7 @@ use super::*;
 
 struct PanickingEngine;
 
-impl engine::Engine for PanickingEngine {
+impl ::engine::Engine for PanickingEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -13,51 +13,12 @@ impl engine::Engine for PanickingEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "panicking"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -70,7 +31,112 @@ impl engine::Engine for PanickingEngine {
     ) -> engine::Result<engine::FrameTicket> {
         panic!("the shape of an interpreter reading lane zero of an empty cell");
     }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
 }
+
+impl ::engine::Programs for PanickingEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for PanickingEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for PanickingEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 /// A batch of decodes asks the rung of its lane count while it is
 /// queued or in flight, and asks nothing once none is.
@@ -727,7 +793,7 @@ struct ExhaustedEngine {
     submits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl engine::Engine for ExhaustedEngine {
+impl ::engine::Engine for ExhaustedEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -738,51 +804,12 @@ impl engine::Engine for ExhaustedEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "exhausted"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -800,7 +827,112 @@ impl engine::Engine for ExhaustedEngine {
             available: 1,
         })
     }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
 }
+
+impl ::engine::Programs for ExhaustedEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for ExhaustedEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for ExhaustedEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
     let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -865,7 +997,7 @@ struct InlineEngine {
     live: ::engine::live::Live,
 }
 
-impl engine::Engine for InlineEngine {
+impl ::engine::Engine for InlineEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -876,25 +1008,8 @@ impl engine::Engine for InlineEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
-    }
-
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
     }
 
     fn kind(&self) -> &'static str {
@@ -905,34 +1020,8 @@ impl engine::Engine for InlineEngine {
         self.live.clone()
     }
 
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
-    }
-
     fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
         Err(engine::Error::Load("no model".into()))
-    }
-
-    fn on_complete(&mut self, sink: ::engine::CompletionSink) {
-        self.sink = Some(sink);
     }
 
     fn submit(
@@ -968,7 +1057,126 @@ impl engine::Engine for InlineEngine {
             ..Default::default()
         })
     }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn ::engine::Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
 }
+
+impl ::engine::Completion for InlineEngine {
+    fn on_complete(&mut self, sink: ::engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
+    fn asynchronous(&self) -> bool {
+        false
+    }
+}
+
+impl ::engine::Programs for InlineEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for InlineEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for InlineEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 /// A synchronous engine has no landing to tell a report with: the lane
 /// gives it a sink all the same, and what its lanes wrote is kept by
@@ -1095,7 +1303,7 @@ struct LaneFaultEngine {
     next: u64,
 }
 
-impl engine::Engine for LaneFaultEngine {
+impl ::engine::Engine for LaneFaultEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -1106,63 +1314,16 @@ impl engine::Engine for LaneFaultEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
-    }
-
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
     }
 
     fn kind(&self) -> &'static str {
         "lane-fault"
     }
 
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
-    }
-
     fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
         Err(engine::Error::Load("no model".into()))
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        self.asynchronous
-    }
-
-    fn on_complete(&mut self, sink: ::engine::CompletionSink) {
-        self.sink = Some(sink);
     }
 
     fn submit(
@@ -1202,7 +1363,126 @@ impl engine::Engine for LaneFaultEngine {
             ..Default::default()
         })
     }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn ::engine::Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
 }
+
+impl ::engine::Completion for LaneFaultEngine {
+    fn on_complete(&mut self, sink: ::engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
+    fn asynchronous(&self) -> bool {
+        self.asynchronous
+    }
+}
+
+impl ::engine::Programs for LaneFaultEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for LaneFaultEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for LaneFaultEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 /// One step of fires, a lane each, each the pass of its own instance
 /// of `instances`; and the fires' completions.
@@ -1382,7 +1662,7 @@ struct LaneRefusalEngine {
     held: Vec<::engine::StepDone>,
 }
 
-impl engine::Engine for LaneRefusalEngine {
+impl ::engine::Engine for LaneRefusalEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -1393,63 +1673,16 @@ impl engine::Engine for LaneRefusalEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
-    }
-
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
     }
 
     fn kind(&self) -> &'static str {
         "lane-refusal"
     }
 
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
-    }
-
     fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
         Err(engine::Error::Load("no model".into()))
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        self.asynchronous
-    }
-
-    fn on_complete(&mut self, sink: ::engine::CompletionSink) {
-        self.sink = Some(sink);
     }
 
     fn submit(
@@ -1519,7 +1752,126 @@ impl engine::Engine for LaneRefusalEngine {
         }
         Ok(engine::FrameTicket::of(id, steps, refused))
     }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn ::engine::Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
 }
+
+impl ::engine::Completion for LaneRefusalEngine {
+    fn on_complete(&mut self, sink: ::engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
+    fn asynchronous(&self) -> bool {
+        self.asynchronous
+    }
+}
+
+impl ::engine::Programs for LaneRefusalEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for LaneRefusalEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for LaneRefusalEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 /// A frame of steps of fires, a lane each, each the pass of its own
 /// instance: step `s` is `steps[s]`, `(instance, unserved)` a fire. A
@@ -1864,7 +2216,7 @@ const HELD: u64 = 96 << 20;
 
 struct HoldingEngine;
 
-impl engine::Engine for HoldingEngine {
+impl ::engine::Engine for HoldingEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -1875,51 +2227,12 @@ impl engine::Engine for HoldingEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "holding"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
@@ -1933,13 +2246,128 @@ impl engine::Engine for HoldingEngine {
         Err(engine::Error::Load("no model".into()))
     }
 
-    fn weight_residency(
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn ::engine::WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for HoldingEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for HoldingEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::WeightCache for HoldingEngine {
+    fn set_residency(
         &mut self,
         _residency: &::engine::chunk::WeightResidency,
     ) -> engine::Result<u64> {
         Ok(HELD)
     }
+
+    fn uses(&mut self) -> ::engine::Result<::engine::chunk::WeightUses> {
+        Err(::engine::Error::unsupported(self.kind(), "weight_uses"))
+    }
 }
+
+impl ::engine::Tiers for HoldingEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 fn within<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
     crate::rt::block_on(async { crate::rt::time::timeout(Duration::from_secs(10), wait).await })

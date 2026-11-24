@@ -440,32 +440,14 @@ pub(crate) fn parse_maps(maps: &str, floor: Option<u64>) -> Result<AddressSpace>
 /// 64-bit macOS gives a process the addresses from its 4 GiB page zero to
 /// `MACH_VM_MAX_ADDRESS`; what it maps is its task's virtual size.
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
 pub(crate) fn read_address_space() -> Result<AddressSpace> {
     const PAGE_ZERO: u64 = 1 << 32;
     #[cfg(target_arch = "aarch64")]
     const MAX_ADDRESS: u64 = 0x0000_7FFF_FE00_0000;
     #[cfg(not(target_arch = "aarch64"))]
     const MAX_ADDRESS: u64 = 0x0000_7FFF_FFE0_0000;
-    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-    // SAFETY: `info` is a `proc_taskinfo` of `size` bytes.
-    let wrote = unsafe {
-        libc::proc_pidinfo(
-            libc::getpid(),
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        )
-    };
-    if wrote != size {
-        bail!(
-            "proc_pidinfo(PROC_PIDTASKINFO): {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    let mapped = info.pti_virtual_size;
+    let mapped = runtime_sys::address::task_virtual_size()
+        .map_err(|error| anyhow::anyhow!("proc_pidinfo(PROC_PIDTASKINFO): {error}"))?;
     let free = (MAX_ADDRESS - PAGE_ZERO).saturating_sub(mapped);
     // What the process maps does not lie in one place (the shared region,
     // the GPU's ranges, the weights), so the range free in one piece is
@@ -489,31 +471,9 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
 /// reservation takes now: each try reserved without access or backing and
 /// let go at once.
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
 fn largest_reservation(upper: u64) -> u64 {
     const GIB: u64 = 1 << 30;
-    let reserves = |bytes: u64| -> bool {
-        let Ok(len) = usize::try_from(bytes) else {
-            return false;
-        };
-        // SAFETY: an anonymous mapping with no access at an address the
-        // kernel picks; nothing reads it, and it is unmapped at once.
-        unsafe {
-            let at = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
-                -1,
-                0,
-            );
-            if at == libc::MAP_FAILED {
-                return false;
-            }
-            libc::munmap(at, len);
-        }
-        true
-    };
+    let reserves = runtime_sys::address::reserves;
     let (mut fits, mut over) = (0u64, upper.saturating_add(GIB));
     while over - fits > GIB {
         let mid = fits + (over - fits) / 2 / GIB * GIB;
@@ -535,29 +495,7 @@ fn largest_reservation(upper: u64) -> u64 {
 /// states the total only: a pool sized to it is one reservation of nearly
 /// all 128 TiB, which no free region holds).
 #[cfg(windows)]
-#[allow(unsafe_code)]
 pub(crate) fn read_address_space() -> Result<AddressSpace> {
-    /// `MEMORY_BASIC_INFORMATION` as 64-bit Windows lays it.
-    #[repr(C)]
-    struct MemoryBasicInformation {
-        base_address: usize,
-        _allocation_base: usize,
-        _allocation_protect: u32,
-        _partition_id: u16,
-        region_size: usize,
-        state: u32,
-        _protect: u32,
-        _kind: u32,
-    }
-    /// `MEM_FREE`: a region nothing has reserved.
-    const MEM_FREE: u32 = 0x1_0000;
-    unsafe extern "system" {
-        fn VirtualQuery(
-            address: *const std::ffi::c_void,
-            buffer: *mut MemoryBasicInformation,
-            length: usize,
-        ) -> usize;
-    }
     let mut space = AddressSpace {
         largest_free: 0,
         free: 0,
@@ -567,29 +505,15 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
         maps: None,
     };
     let mut address = 0usize;
-    loop {
-        // SAFETY: a zeroed `MEMORY_BASIC_INFORMATION` is valid.
-        let mut region: MemoryBasicInformation = unsafe { std::mem::zeroed() };
-        // SAFETY: VirtualQuery reads the region holding `address` into
-        // `region`, a buffer of the length stated; it maps nothing.
-        let written = unsafe {
-            VirtualQuery(
-                address as *const std::ffi::c_void,
-                &mut region,
-                std::mem::size_of::<MemoryBasicInformation>(),
-            )
-        };
-        if written == 0 || region.region_size == 0 {
-            break;
-        }
-        let bytes = region.region_size as u64;
-        if region.state == MEM_FREE {
+    while let Some(region) = runtime_sys::address::region(address) {
+        let bytes = region.size as u64;
+        if region.free {
             space.free += bytes;
             space.largest_free = space.largest_free.max(bytes);
         } else {
             space.mapped += bytes;
         }
-        match region.base_address.checked_add(region.region_size) {
+        match region.base.checked_add(region.size) {
             Some(next) => address = next,
             None => break,
         }
@@ -612,33 +536,8 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
 /// reserving and releasing, halving the gap to a page; nothing is
 /// committed and nothing is held.
 #[cfg(windows)]
-#[allow(unsafe_code)]
 fn largest_reservation(region: u64) -> u64 {
-    const MEM_RESERVE: u32 = 0x2000;
-    const MEM_RELEASE: u32 = 0x8000;
-    const PAGE_NOACCESS: u32 = 0x01;
-    unsafe extern "system" {
-        fn VirtualAlloc(
-            address: *mut std::ffi::c_void,
-            size: usize,
-            kind: u32,
-            protect: u32,
-        ) -> *mut std::ffi::c_void;
-        fn VirtualFree(address: *mut std::ffi::c_void, size: usize, kind: u32) -> i32;
-    }
-    let reserves = |bytes: u64| {
-        // SAFETY: a reservation at no fixed address of `bytes`, released
-        // whole at once; it commits nothing.
-        unsafe {
-            let base = VirtualAlloc(
-                std::ptr::null_mut(),
-                bytes as usize,
-                MEM_RESERVE,
-                PAGE_NOACCESS,
-            );
-            !base.is_null() && VirtualFree(base, 0, MEM_RELEASE) != 0
-        }
-    };
+    let reserves = runtime_sys::address::reserves;
     if reserves(region) {
         return region;
     }
@@ -666,34 +565,13 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
 
 /// `RLIMIT_AS`, where the process is held to one.
 #[cfg(unix)]
-#[allow(unsafe_code)]
 fn address_space_limit() -> Option<u64> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is an `rlimit` to fill.
-    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0
-        || limit.rlim_cur == libc::RLIM_INFINITY
-    {
-        return None;
-    }
-    Some(limit.rlim_cur as u64)
+    runtime_sys::address::limit()
 }
 
 /// The host's page size.
-#[allow(unsafe_code)]
 pub(crate) fn page_bytes() -> u64 {
-    #[cfg(unix)]
-    {
-        // SAFETY: sysconf reads a constant of the system.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page > 0 {
-            return page as u64;
-        }
-    }
-    // Windows pages are 4 KiB on every architecture it runs.
-    4096
+    runtime_sys::address::page_bytes()
 }
 
 #[cfg(test)]
@@ -978,42 +856,17 @@ ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]
     /// free total is not one range.
     #[cfg(windows)]
     #[test]
-    #[allow(unsafe_code)]
     fn the_pool_s_range_is_one_windows_reserves() {
-        const MEM_RESERVE: u32 = 0x2000;
-        const MEM_RELEASE: u32 = 0x8000;
-        const PAGE_NOACCESS: u32 = 0x01;
-        unsafe extern "system" {
-            fn VirtualAlloc(
-                address: *mut std::ffi::c_void,
-                size: usize,
-                kind: u32,
-                protect: u32,
-            ) -> *mut std::ffi::c_void;
-            fn VirtualFree(address: *mut std::ffi::c_void, size: usize, kind: u32) -> i32;
-        }
         let space = read_address_space().unwrap();
         assert!(space.mapped > 0);
         assert!(space.largest_free <= space.free);
         let bytes = space.pool_bytes();
         assert!(bytes > 0);
-        // SAFETY: a reservation with no fixed address, released below; it
-        // commits nothing.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null_mut(),
-                bytes as usize,
-                MEM_RESERVE,
-                PAGE_NOACCESS,
-            )
-        };
         assert!(
-            !base.is_null(),
+            runtime_sys::address::reserves(bytes),
             "reserving the pool's {} failed: {}",
             show(bytes),
             std::io::Error::last_os_error()
         );
-        // SAFETY: `base` is the reservation made above, released whole.
-        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 }

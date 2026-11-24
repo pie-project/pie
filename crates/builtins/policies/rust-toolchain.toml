@@ -1,6 +1,0 @@
-[toolchain]
-# PLEX 1.1 policies are core wasm modules made components after the build
-# (crates/builtins/build.rs): the host's toolchain, wasm32-unknown-unknown.
-channel = "1.98.1"
-components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]

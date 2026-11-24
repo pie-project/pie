@@ -1360,7 +1360,7 @@ impl RsStore {
     /// A shared pool's host rows are slot refs of its host tier: records
     /// (a slot of each fixed shape a piece) and rs list or window slots,
     /// whose bytes the engine reads and writes by those refs
-    /// ([`Self::tier_refs`], `Engine::read_tier_slots`).
+    /// ([`Self::tier_refs`], `Tiers::read`).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn take_host(&mut self, slots: usize, pages: usize) -> Option<Vec<RsSlotId>> {
         self.take_host_of(slots, pages, 0)
@@ -1398,7 +1398,7 @@ impl RsStore {
     /// A shared pool's host rows `rows` as the engine names them: for each
     /// row in order, the refs of each shape it spans (a record's pieces, a
     /// list slot), runs of one shape merged. The order the bytes of
-    /// `Engine::read_tier_slots` lie in.
+    /// `Tiers::read` lie in.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn tier_refs(&self, rows: &[RsSlotId]) -> Vec<(::engine::chunk::ShapeId, Vec<u32>)> {
         let mut out: Vec<(::engine::chunk::ShapeId, Vec<u32>)> = Vec::new();

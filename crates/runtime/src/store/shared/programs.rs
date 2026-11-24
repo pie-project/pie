@@ -1,7 +1,7 @@
 //! The bound programs' guest term (REDESIGN §6): what a fire holding guest
 //! programs' lanes needs beside the model's activation, each program's
 //! per-batch tables and value scratch, sized by the bind's extents
-//! ([`::engine::Engine::fire_facts`]). A program registers and binds after
+//! ([`::engine::Programs::fire_facts`]). A program registers and binds after
 //! load, so the engine cannot state it in [`::engine::chunk::ChunkFacts`];
 //! the pool folds it into every rung's activation instead
 //! ([`super::super::slots::SlotPool::act_chunks`]).
@@ -21,7 +21,7 @@
 //! Beside the term, the engine keeps standing guest bytes in the span for
 //! the live instances of registered programs, whatever the fire (Metal:
 //! the batch tables it lays once a set, every set together;
-//! [`::engine::Engine::standing_after`]). They change only at a bind and a
+//! [`::engine::Programs::standing_after`]). They change only at a bind and a
 //! close, a set shared by instances counted once. A bind asks the engine,
 //! on the lane, what the total would be once it is bound, and holds what
 //! that adds to the total booked ([`ProgramOpen`]) while it is under way:
@@ -284,7 +284,7 @@ impl SharedPool {
     }
 
     /// The engine said fires of `key` need `facts`
-    /// ([`::engine::Engine::fire_facts`]), asked once a pair, before its
+    /// ([`::engine::Programs::fire_facts`]), asked once a pair, before its
     /// first bind counts: nothing is built here unless the pair is open
     /// already and its facts differ.
     pub fn fire_facts_learned(&mut self, key: FireKey, facts: &FireFacts) {
@@ -454,7 +454,7 @@ impl SharedPool {
     }
 
     /// What a bind that would leave the engine's standing guest bytes at
-    /// `total` ([`::engine::Engine::standing_after`], asked on the lane)
+    /// `total` ([`::engine::Programs::standing_after`], asked on the lane)
     /// adds to the total booked: what its [`ProgramOpen`] holds. Read on
     /// the lane, where the booked total is the engine's as it stands.
     #[must_use]
@@ -463,7 +463,7 @@ impl SharedPool {
     }
 
     /// The engine stated its standing guest bytes after a bind or a close
-    /// (`BoundInstance::standing_guest_bytes`, `Engine::close_instance`):
+    /// (`BoundInstance::standing_guest_bytes`, `Programs::close`):
     /// booked as the engine's, beside what the binds under way hold.
     pub fn standing_stated(&mut self, total: u64) {
         self.programs.standing_booked = total;
@@ -669,7 +669,7 @@ pub trait Funder {
 }
 
 /// The engine's side of a raise: the copy of what it moves out of the span
-/// (`Engine::evacuate` through the engine's lane), and the fire epoch handed
+/// (`Pool::evacuate` through the engine's lane), and the fire epoch handed
 /// out last.
 pub trait Mover {
     fn evacuate(
@@ -677,7 +677,7 @@ pub trait Mover {
         evacuation: ::engine::chunk::Evacuation,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
-    /// `Engine::set_rung(from, to)` through the engine's lane.
+    /// `Pool::set_rung(from, to)` through the engine's lane.
     fn set_rung(
         &self,
         from: u32,
@@ -690,7 +690,7 @@ pub trait Mover {
     /// this raise waits on.
     fn engine(&self) -> usize;
 
-    /// The engine's chunk table (`Engine::chunk_table`) checked against
+    /// The engine's chunk table (`Pool::chunk_table`) checked against
     /// `runtime`, the runtime's logical to physical map, through the
     /// engine's lane: `Err` names the first chunk they place apart
     /// ([`table_apart`]).
@@ -866,7 +866,7 @@ pub async fn carry_raise(
     {
         tracing::warn!(%error, "a raise's copy was refused; fires stay at the rung in hand");
         shared.lock().unwrap().raise_refused(evacuation);
-        // Refused means nothing moved (`Engine::evacuate`): the map taken
+        // Refused means nothing moved (`Pool::evacuate`): the map taken
         // back is the engine's table still.
         check_refused(shared, mover).await;
         return Err(format!("the engine refused a raise's copy: {error}"));

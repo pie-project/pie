@@ -31,6 +31,11 @@ static CLAIMS: LazyLock<Mutex<HashMap<Hash256, Claim>>> = LazyLock::new(Default:
 /// Told whenever a pass's claims are released.
 static RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
+/// Forgets the boot's claims, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    CLAIMS.lock().unwrap().clear();
+}
+
 /// How many of `mine`, from the first, others have claimed.
 fn claimed_run<By: PartialEq>(
     claims: &HashMap<Hash256, Claim<By>>,

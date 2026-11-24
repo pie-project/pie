@@ -8,14 +8,17 @@
 use std::collections::{HashMap, HashSet};
 
 use ::engine::chunk::SlotCopy;
-use ::engine::transfer::MemoryDomain;
+use ::engine::transfer::{DeviceReach, MemoryDomain};
 
 use super::*;
 use crate::scheduler::{TierKind, TierMove};
 use crate::store::kv::KvStore;
 use crate::store::kv::page_table::{KvPageBacking, PhysicalKvPageId};
 
-const DEVICE: MemoryDomain = MemoryDomain::CudaDevice(0);
+const DEVICE: MemoryDomain = MemoryDomain::Device {
+    ordinal: 0,
+    reach: DeviceReach::Peer,
+};
 const HOST_CHUNKS: u32 = 8;
 
 /// A host or disk tier with more slots than a `u32` slot ref names is

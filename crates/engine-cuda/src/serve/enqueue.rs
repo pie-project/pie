@@ -1538,13 +1538,15 @@ impl FireCtx<'_> {
                     rows.windows(2)
                         .all(|pair| pair[1] == pair[0].wrapping_add(1))
                 };
-                let wanted = wanted_of(at)?;
+                // The lane's rows and, in lane order, every later lane's of
+                // the pass: what the pass reads from this lane's binding on,
+                // a mixed pass's lanes landing their rows in any order.
+                wanted_of(at)?;
+                let mut wanted = Vec::new();
+                for lane in at..end {
+                    wanted.extend(wanted_of(lane)?);
+                }
                 if consecutive(&wanted) {
-                    let run = |lane: usize| {
-                        let rows = wanted_of(lane).ok()?;
-                        (consecutive(&rows) && !rows.is_empty())
-                            .then(|| (rows[0], u32::try_from(rows.len()).unwrap_or(u32::MAX)))
-                    };
                     return self.programs.bind_output(
                         instance,
                         name,
@@ -1554,7 +1556,7 @@ impl FireCtx<'_> {
                         width,
                         width,
                         wanted.first().copied().unwrap_or(0),
-                        held(&run),
+                        u32::try_from(wanted.len()).unwrap_or(u32::MAX),
                     );
                 }
                 if plane.dtype != Dtype::Bf16 {

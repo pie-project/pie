@@ -474,7 +474,7 @@ impl Pools {
         Ok((bytes, places))
     }
 
-    /// See `Engine::read_tier_slots`: the bytes of host tier slots, shape
+    /// See `Tiers::read`: the bytes of host tier slots, shape
     /// by shape, each laid out as its device slot. The caller has settled
     /// every copy into them.
     pub fn read_tier_slots(
@@ -494,7 +494,7 @@ impl Pools {
         Ok(out)
     }
 
-    /// See `Engine::write_tier_slots`: `bytes`, as [`Self::read_tier_slots`]
+    /// See `Tiers::write`: `bytes`, as [`Self::read_tier_slots`]
     /// lays them out, into host tier slots. The caller has settled every
     /// copy that touches them.
     pub fn write_tier_slots(

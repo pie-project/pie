@@ -177,12 +177,12 @@ impl Shell {
         self.accounting
     }
 
-    /// See `Engine::commit_segments`: off a fire's path.
+    /// See `Pool::commit`: off a fire's path.
     pub fn commit_segments(&mut self, segments: u32) -> crate::Result<()> {
         self.pools.commit_segments(segments)
     }
 
-    /// See `Engine::release_segments`. The runtime has waited out every
+    /// See `Pool::release`. The runtime has waited out every
     /// frame that named the segments' chunks; what the stream still holds
     /// (an evacuation's copy out of them) lands first.
     pub fn release_segments(&mut self, segments: u32) -> crate::Result<()> {
@@ -190,7 +190,7 @@ impl Shell {
         self.pools.release_segments(segments)
     }
 
-    /// See `Engine::evacuate`: the copy and the table change are ordered on
+    /// See `Pool::evacuate`: the copy and the table change are ordered on
     /// the stream behind every fire enqueued so far and before the next.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {
         self.evacuate_with(evacuation, &[]).map(drop)
@@ -233,7 +233,7 @@ impl Shell {
         Ok(at)
     }
 
-    /// The state pool's chunk table as it stands (`Engine::chunk_table`).
+    /// The state pool's chunk table as it stands (`Pool::chunk_table`).
     #[must_use]
     pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
         self.pools.chunk_table()
@@ -310,7 +310,7 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::weight_residency`: stream-ordered before the next fire.
+    /// See `WeightCache::set_residency`: stream-ordered before the next fire.
     /// Answers what the fit holds back of the chunks stated
     /// ([`Self::held_and_outside`]) once the set is taken.
     pub fn weight_residency(
@@ -421,7 +421,7 @@ impl Shell {
         self.pools.row_blocks()
     }
 
-    /// See `Engine::weight_uses`.
+    /// See `WeightCache::uses`.
     pub fn weight_uses(&mut self) -> crate::Result<engine::chunk::WeightUses> {
         self.pools.weight_uses(self.device.stream())
     }

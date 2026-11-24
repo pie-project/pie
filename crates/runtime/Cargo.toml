@@ -1,6 +1,7 @@
 [package]
 name = "runtime"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (Pie)"
@@ -14,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+runtime-sys = { path = "../runtime-sys" }
 state = { path = "../state" }
 profile = { package = "pie-profile", path = "../profile" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
@@ -102,7 +104,7 @@ wasmtime-wasi-http = { version = "49.0.2", default-features = false, features = 
 http-body-util = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+winapi-util = "0.1.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.53", default-features = false, features = ["sync", "macros"] }
@@ -133,9 +135,6 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 # iOS, iPadOS, visionOS, tvOS and watchOS give an app no executable memory.
 [target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
 wasmtime = { version = "49.0.2", default-features = false, features = ["pulley"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }

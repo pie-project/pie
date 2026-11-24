@@ -53,7 +53,10 @@ impl TestLane {
                 program_ids: Mutex::new(HashMap::new()),
                 accepting: AtomicBool::new(true),
                 stats: Arc::new(SchedulerStats::default()),
-                device_domain: ::engine::MemoryDomain::CudaDevice(0),
+                device_domain: ::engine::MemoryDomain::Device {
+                    ordinal: 0,
+                    reach: ::engine::DeviceReach::Peer,
+                },
                 codegen_backend: None,
             }),
         };

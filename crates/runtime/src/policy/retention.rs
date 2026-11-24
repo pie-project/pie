@@ -181,6 +181,12 @@ const fn own_tiers() -> u8 {
     ALL_TIERS
 }
 
+/// Forgets the policy's table, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    *CURRENT.write() = None;
+    REVISION.fetch_add(1, Ordering::AcqRel);
+}
+
 #[cfg(test)]
 pub(crate) fn install(retention: Option<Table>) {
     {

@@ -1,3 +1,5 @@
+pub mod reload;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokenizer::Specials;
@@ -7,7 +9,8 @@ use anyhow::{Result, anyhow};
 use chat_template::Instruct;
 use tokenizer::Tokenizer;
 
-static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
+static MODEL: crate::slot::Slot<Arc<Model>> = crate::slot::Slot::new();
+static PAD: crate::slot::Slot<Option<u32>> = crate::slot::Slot::new();
 
 #[derive(Clone, Debug)]
 pub struct ModelMetadata {
@@ -195,24 +198,30 @@ pub(crate) fn template_of(model: &poem::star::Model) -> chat_template::Spec {
     }
 }
 
-pub fn model() -> &'static Arc<Model> {
+pub fn model() -> Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
 
 /// The model where one is registered (a scheduler built in a test has none).
-pub fn registered() -> Option<&'static Arc<Model>> {
+pub fn registered() -> Option<Arc<Model>> {
     MODEL.get()
 }
 
 /// So a key means the same state across restarts and every worker serving
 /// the model, whatever its engine, variant or page size.
-pub fn identity() -> Option<&'static state::ModelIdentity> {
-    MODEL.get().map(|m| &m.identity)
+pub fn identity() -> Option<state::ModelIdentity> {
+    MODEL.get().map(|m| m.identity.clone())
+}
+
+/// Clears what [`register`] set, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    MODEL.clear();
+    PAD.clear();
+    reload::reset();
 }
 
 pub fn media_pad() -> Option<u32> {
-    static PAD: OnceLock<Option<u32>> = OnceLock::new();
-    *PAD.get_or_init(|| {
+    PAD.get_or_init(|| {
         let m = model();
         let spelling = m.image()?.placeholder.clone();
         match m.tokenize(&spelling)[..] {

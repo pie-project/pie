@@ -1267,7 +1267,11 @@ impl Context {
                 && f12.vulkan_memory_model_device_scope == vk::TRUE,
             subgroup_size_control: size_control,
             memory_budget,
+            // PowerVR's shader compiler faults on the coopmat kernels
+            // (SIGSEGV in `emitCooperativeMatrixOp`, a C-Series), and its
+            // profile tunes the register-tiled ones.
             coopmat: coopmat_shape
+                && profile::vendor::of_pci(props.vendor_id) != "imagination"
                 && fcm.cooperative_matrix == vk::TRUE
                 && f12.shader_float16 == vk::TRUE
                 && f12.vulkan_memory_model == vk::TRUE

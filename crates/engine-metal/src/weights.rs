@@ -9,6 +9,7 @@ use checkpoint::file::read::parse_metadata;
 use checkpoint::file::serve;
 use checkpoint::file::serve::Artifact;
 use checkpoint::file::zt;
+use checkpoint::overwrite::{Held, Overwrite};
 use checkpoint::plan::{LoadPlan, StorageTarget, compile};
 use checkpoint::serving::{self, Stamp};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
@@ -58,6 +59,7 @@ pub struct Weights {
     /// mapping and each one's offset in it, so a pool slot is filled from
     /// the file without touching the mapping's pages.
     filed: BTreeMap<usize, (std::sync::Arc<Mapping>, u64, u64)>,
+    places: Vec<Place>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,6 +291,7 @@ impl Weights {
             decoded: Vec::new(),
             hosted,
             filed: BTreeMap::new(),
+            places,
         })
     }
 
@@ -390,6 +393,61 @@ impl Weights {
     #[must_use]
     pub fn widest_bank_plane(&self) -> u64 {
         self.banks.values().map(|bank| bank.slot).max().unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn unreloadable(&self) -> Option<&'static str> {
+        if !self.mapped.is_empty() {
+            Some(
+                "reads its planes in place out of the artifact's file mapping, which a \
+                 reload cannot write; serve the checkpoint's own directory to reload it",
+            )
+        } else if !self.hosted.is_empty() || !self.filed.is_empty() {
+            Some("streams embedding rows from a copy of their own")
+        } else if !self.decoded.is_empty() {
+            Some("derives planes from the checkpoint's at load (decoded or repacked copies)")
+        } else {
+            None
+        }
+    }
+
+    pub fn reload(
+        &mut self,
+        trace: &Trace,
+        contract: &ModelContract,
+        path: &Path,
+        torn: &mut bool,
+    ) -> Result<(u32, u64)> {
+        if let Some(why) = self.unreloadable() {
+            return Err(Fault::Load(LoadError::Unsupported(format!(
+                "this load {why}, which a reload does not redo: restart the server on the \
+                 new checkpoint instead"
+            ))));
+        }
+        serves_this_deployment(path, trace.platform.backend(), &trace.name)?;
+        let held: Vec<Option<Held<'_>>> = trace
+            .params
+            .iter()
+            .zip(&self.places)
+            .map(|(param, place)| {
+                (param.source == ParamSource::Checkpoint).then_some(Held {
+                    name: &param.name,
+                    shape: &param.shape,
+                    bytes: place.full,
+                })
+            })
+            .collect();
+        let target = StorageTarget::for_backend(BackendKind::Metal, 0, 1);
+        let overwrite = Overwrite::plan(path, contract, target, &held)?;
+        let (store, places) = (&mut self.store, &self.places);
+        *torn = true;
+        let written = overwrite.run(None, |at, plane| {
+            store
+                .write(places[at].offset, plane)
+                .map_err(|fault| LoadError::Internal(fault.to_string()))
+        })?;
+        *torn = false;
+        Ok(written)
     }
 
     #[must_use]
@@ -1296,6 +1354,7 @@ fn warm(
         decoded: Vec::new(),
         hosted,
         filed,
+        places: Vec::new(),
     })
 }
 

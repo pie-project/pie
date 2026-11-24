@@ -1,6 +1,7 @@
 [package]
 name = "pie-dtype"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The one element-type enum: what a weight plane, a kv page, a checkpoint tensor and a compute value all say when asked what they hold. A leaf crate — the enum, its width in bits, plain serde, no internal deps. Internal to pie; depend on `inferlet` or `pie-client` instead."

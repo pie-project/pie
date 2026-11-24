@@ -1,6 +1,7 @@
 [package]
 name = "kernels-rocm"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Pure HIP kernel definitions for AMD GPUs: hiprtc unit names, argument marshalling, and launch geometry over a stream. The ROCm counterpart of kernels-cuda; knows nothing about the IR."
@@ -15,7 +16,7 @@ path = "src/lib.rs"
 [features]
 default = []
 
-rocm = ["dep:libloading", "dep:miniz_oxide", "dep:zstd"]
+rocm = ["dep:libloading", "dep:miniz_oxide", "dep:zstd", "dep:tracing"]
 # The references and counters only the crate's own tests read: the serial
 # scans the chunked passes answer to, the tiled product at a stated tuple,
 # the hipBLASLt leg's launch count.
@@ -30,7 +31,7 @@ libloading = { version = "0.9", optional = true }
 miniz_oxide = { version = "0.9", optional = true }
 zstd = { version = "0.14", optional = true }
 
-tracing = "0.1"
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 engine = { path = "../engine" }

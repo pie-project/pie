@@ -11,13 +11,13 @@ impl SlotPool {
     /// held chunks are fewest is cleared: each held chunk in it moves to a
     /// free chunk outside it, the lowest first. A chunk moves on its
     /// logical id, so its holders keep their refs and the engine copies its
-    /// bytes ([`Engine::evacuate`]). `None` where a run stands already,
+    /// bytes ([`Pool::evacuate`]). `None` where a run stands already,
     /// where a move this pool made is still fenced (one at a time), or
     /// where no window can be cleared: no free chunks outside it for what
     /// it holds, or something in it that does not move (a reserved chunk,
     /// a run taken whole, a fenced one).
     ///
-    /// [`Engine::evacuate`]: ::engine::Engine::evacuate
+    /// [`Pool::evacuate`]: ::engine::Pool::evacuate
     #[must_use]
     pub fn plan_compaction(&self, run: u32) -> Option<Vec<ChunkMove>> {
         self.plan_compaction_for(run, 1)

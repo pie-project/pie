@@ -2,35 +2,36 @@ use serde::{Deserialize, Serialize};
 
 use poem_ir::Dtype;
 
+/// Where memory sits, by who can address it, never by whose device it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemoryDomain {
     HostPinned,
-    CudaDevice(u32),
-    RocmDevice(u32),
-    MetalShared,
-    MetalPrivate,
-    VulkanDevice(u32),
-    WgpuDevice(u32),
-    XlaDevice(u32),
-    CerebrasDevice(u32),
+    /// Device `ordinal`'s memory, addressed as `reach` says.
+    Device {
+        ordinal: u32,
+        reach: DeviceReach,
+    },
     /// The engine's own slot file, one kv page per slot.
     LocalDisk,
+}
+
+/// Who besides its engine addresses a device's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceReach {
+    /// No one.
+    Private,
+    /// The host, which maps it.
+    HostShared,
+    /// A peer's transport, by device address.
+    Peer,
 }
 
 impl MemoryDomain {
     #[must_use]
     pub const fn ordinal(self) -> Option<u32> {
         match self {
-            MemoryDomain::CudaDevice(ordinal)
-            | MemoryDomain::RocmDevice(ordinal)
-            | MemoryDomain::VulkanDevice(ordinal)
-            | MemoryDomain::WgpuDevice(ordinal)
-            | MemoryDomain::XlaDevice(ordinal)
-            | MemoryDomain::CerebrasDevice(ordinal) => Some(ordinal),
-            MemoryDomain::HostPinned
-            | MemoryDomain::MetalShared
-            | MemoryDomain::MetalPrivate
-            | MemoryDomain::LocalDisk => None,
+            MemoryDomain::Device { ordinal, .. } => Some(ordinal),
+            MemoryDomain::HostPinned | MemoryDomain::LocalDisk => None,
         }
     }
 }
@@ -253,8 +254,8 @@ mod tests {
 
     fn copy(src_pages: &[u32], dst_pages: &[u32], moves: Vec<KvMove>) -> KvCopy {
         KvCopy {
-            src: MemoryDomain::MetalShared,
-            dst: MemoryDomain::MetalShared,
+            src: MemoryDomain::HostPinned,
+            dst: MemoryDomain::HostPinned,
             src_page_ids: src_pages.to_vec(),
             dst_page_ids: dst_pages.to_vec(),
             moves,

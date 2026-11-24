@@ -8,8 +8,8 @@
 //! histogram carried on the device, an optional grammar mask, temperature,
 //! then min-p, top-k and top-p truncation and a Gumbel-max draw. Temperature
 //! zero is exact greedy. Asked for logprobs, the epilogue also lands the
-//! sampled token's log-probability under the model's raw logits and the
-//! `top_logprobs` likeliest tokens', as vLLM's `raw_logprobs` reports them.
+//! sampled token's log-probability and the `top_logprobs` likeliest tokens',
+//! scored as vLLM's `logprobs_mode` says (`raw_logprobs` by default).
 //!
 //! Asked for prompt logprobs, the prefill reads out every prompt row but the
 //! last and scores row `i` against token `i + 1`: its logprob, its rank and
@@ -63,16 +63,20 @@ pub struct Sampling {
     /// Land each sampled token's logprob and this many likeliest
     /// alternatives' (`Some(0)`: the sampled token's alone).
     pub logprobs: Option<u32>,
+    pub logprobs_mode: LogprobsMode,
     /// Score every prompt token after the first under the rows before it,
     /// with its rank and this many likeliest alternatives (vLLM's
     /// `prompt_logprobs`); a text prompt only.
     pub prompt_logprobs: Option<u32>,
 }
 
+/// What a step's logprobs score (vLLM's `logprobs_mode`).
+pub use inferlet::sampler::LogprobsMode;
+
 /// The most alternatives a step reports, as OpenAI caps `top_logprobs`.
 pub const MAX_TOP_LOGPROBS: u32 = 20;
 
-/// A sampled token's log-probability under the model's raw logits, and the
+/// A sampled token's logprob (as [`LogprobsMode`] scores it), and the
 /// likeliest tokens' with theirs, most likely first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Logprob {
@@ -131,6 +135,7 @@ impl Default for Sampling {
             repetition_penalty: 1.0,
             min_p: 0.0,
             logprobs: None,
+            logprobs_mode: LogprobsMode::RawLogprobs,
             prompt_logprobs: None,
         }
     }
@@ -208,6 +213,7 @@ struct KnobChannels {
     frequency: Option<Channel>,
     presence: Option<Channel>,
     logprobs: Option<u32>,
+    logprobs_mode: LogprobsMode,
 }
 
 impl KnobChannels {
@@ -228,6 +234,7 @@ impl KnobChannels {
             frequency: f(penalized, s.frequency_penalty),
             presence: f(penalized, s.presence_penalty),
             logprobs: s.logprobs,
+            logprobs_mode: s.logprobs_mode,
         }
     }
 
@@ -338,6 +345,7 @@ async fn score_prompt(
         });
 
         let fwd = ForwardPass::new();
+        fwd.release_on_drop();
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(&[ws], StateGeometry::folding())?;
         fwd.readout(&readout)?;
@@ -534,6 +542,7 @@ pub async fn generate(
     let knobs = KnobChannels::new(&sampling);
 
     let fwd = ForwardPass::new();
+    fwd.release_on_drop();
     fwd.embed(&toks, &embed_indptr)?;
     if !images.is_empty() {
         let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
@@ -544,9 +553,10 @@ pub async fn generate(
         let carried_on = carried_on.map(|(tok_in, hist)| {
             (tok_in.traced(), hist.map(|(c, p)| (c.traced(), p.traced())))
         });
-        sampler::prefill(
+        sampler::prefill_with(
             vocab,
             &knobs.read(),
+            knobs.logprobs_mode,
             &slots(rng, hist, mask, lp_ch),
             &g0_ch.traced(),
             carried_on.as_ref(),
@@ -611,12 +621,14 @@ pub async fn generate(
     let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
 
     let fwd = ForwardPass::new();
+    fwd.release_on_drop();
     fwd.embed(&tok_in, &lane1)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        sampler::decode(
+        sampler::decode_with(
             vocab,
             &knobs.read(),
+            knobs.logprobs_mode,
             &slots(rng, hist, mask, lp_ch),
             &tok_in.traced(),
             &out.traced(),
@@ -733,6 +745,25 @@ mod tests {
         a.set_seed(-7);
         b.set_seed(-7);
         assert_eq!(a.seed, b.seed);
+    }
+
+    #[test]
+    fn logprobs_modes_go_by_vllms_names() {
+        assert_eq!(LogprobsMode::default(), LogprobsMode::RawLogprobs);
+        for (name, processed, logits) in [
+            ("raw_logprobs", false, false),
+            ("raw_logits", false, true),
+            ("processed_logprobs", true, false),
+            ("processed_logits", true, true),
+        ] {
+            let mode = LogprobsMode::from_name(name).unwrap();
+            assert_eq!(
+                (mode.processed(), mode.logits()),
+                (processed, logits),
+                "{name}"
+            );
+        }
+        assert_eq!(LogprobsMode::from_name("processed"), None);
     }
 
     #[test]

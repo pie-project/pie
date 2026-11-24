@@ -138,6 +138,44 @@ pub struct Knobs {
     pub logprobs: Option<u32>,
 }
 
+/// What a step's logprobs score (vLLM's `logprobs_mode`): the model's raw
+/// logits or the row the draw was made from (penalized, masked, scaled and
+/// cut), as log-probabilities or as the values themselves. A program
+/// constant: [`standard`]'s shapes land raw logprobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogprobsMode {
+    #[default]
+    RawLogprobs,
+    RawLogits,
+    ProcessedLogprobs,
+    ProcessedLogits,
+}
+
+impl LogprobsMode {
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "raw_logprobs" => Self::RawLogprobs,
+            "raw_logits" => Self::RawLogits,
+            "processed_logprobs" => Self::ProcessedLogprobs,
+            "processed_logits" => Self::ProcessedLogits,
+            _ => return None,
+        })
+    }
+
+    /// Scores the row the draw was made from, not the model's.
+    #[must_use]
+    pub fn processed(self) -> bool {
+        matches!(self, Self::ProcessedLogprobs | Self::ProcessedLogits)
+    }
+
+    /// Lands the values themselves, not their log-softmax.
+    #[must_use]
+    pub fn logits(self) -> bool {
+        matches!(self, Self::RawLogits | Self::ProcessedLogits)
+    }
+}
+
 /// The value a request's temperature `t` rides in its channel as: `1 / t`,
 /// rounded once to f32 on the host, which the cut and the draw multiply by
 /// (a multiply is correctly rounded on every backend, a divide is not).
@@ -174,12 +212,25 @@ pub fn prefill(
     g0: &Channel,
     carried_on: Option<&(Channel, Option<(Channel, Channel)>)>,
 ) {
+    prefill_with(vocab, knobs, LogprobsMode::RawLogprobs, slots, g0, carried_on);
+}
+
+/// [`prefill`], its logprobs scored as `mode` says.
+pub fn prefill_with(
+    vocab: u32,
+    knobs: &Knobs,
+    mode: LogprobsMode,
+    slots: &Slots,
+    g0: &Channel,
+    carried_on: Option<&(Channel, Option<(Channel, Channel)>)>,
+) {
     let r = slots.rng.take();
     let taken = slots.hist.as_ref().map(|(c, p)| (c.take(), p.take()));
     let m = slots.mask.as_ref().map(Channel::take);
     let (token, counts_next, landed) = sample(
         vocab,
         knobs,
+        mode,
         &r,
         taken.as_ref().map(|(c, p)| (c, p)),
         m.as_ref(),
@@ -200,12 +251,25 @@ pub fn prefill(
 /// fire embeds) and `out` (which the host drains), and steps the rng and
 /// the histogram.
 pub fn decode(vocab: u32, knobs: &Knobs, slots: &Slots, tok_in: &Channel, out: &Channel) {
+    decode_with(vocab, knobs, LogprobsMode::RawLogprobs, slots, tok_in, out);
+}
+
+/// [`decode`], its logprobs scored as `mode` says.
+pub fn decode_with(
+    vocab: u32,
+    knobs: &Knobs,
+    mode: LogprobsMode,
+    slots: &Slots,
+    tok_in: &Channel,
+    out: &Channel,
+) {
     let r = slots.rng.take();
     let taken = slots.hist.as_ref().map(|(c, p)| (c.take(), p.take()));
     let m = slots.mask.as_ref().map(Channel::take);
     let (token, counts_next, landed) = sample(
         vocab,
         knobs,
+        mode,
         &r,
         taken.as_ref().map(|(c, p)| (c, p)),
         m.as_ref(),
@@ -239,12 +303,21 @@ fn land(landed: Option<Landed>, channels: Option<&(Channel, Option<Channel>)>) {
 pub fn sample(
     vocab: u32,
     k: &Knobs,
+    mode: LogprobsMode,
     r: &Tensor,
     histogram: Option<(&Tensor, &Tensor)>,
     mask: Option<&Tensor>,
 ) -> (Tensor, Option<Tensor>, Option<Landed>) {
     let model = reshape(intrinsics::output(0, "logits"), [vocab]);
-    let raw = k.logprobs.map(|_| shifted(&model));
+    // Raw logprobs read the model's row shifted by its max (a bf16 row),
+    // raw logits the model's f32 row itself.
+    let raw = k.logprobs.filter(|_| !mode.processed()).map(|_| {
+        if mode.logits() {
+            model.clone()
+        } else {
+            shifted(&model)
+        }
+    });
     // A step that changes the logits works on a bf16 copy of them; one
     // that does not (greedy, or a draw) reads the model's f32 row.
     let changes = histogram.is_some() || mask.is_some();
@@ -281,8 +354,9 @@ pub fn sample(
     if let Some(mask) = mask {
         logits = mask_apply(&logits, mask);
     }
-    let token = match &k.temperature {
-        None => reduce_argmax(&logits),
+    let processed = k.logprobs.is_some() && mode.processed();
+    let (token, drawn_from) = match &k.temperature {
+        None => (reduce_argmax(&logits), processed.then(|| logits.clone())),
         Some(inverse) => {
             // The temperature's one form: a multiply by its reciprocal.
             let inverse = knob(inverse);
@@ -309,15 +383,29 @@ pub fn sample(
                     });
                 }
             }
-            match keep {
+            // The processed row is laid only where its logprobs are asked:
+            // the scaled logits, cut.
+            let drawn_from = processed.then(|| {
+                let scaled = &logits * &inverse;
+                match &keep {
+                    Some(keep) => mask_apply(&scaled, keep),
+                    None => scaled,
+                }
+            });
+            let token = match keep {
                 Some(keep) => gumbel_argmax(&logits, keep, &inverse, r),
                 None => gumbel_argmax(&logits, true, &inverse, r),
-            }
+            };
+            (token, drawn_from)
         }
     };
     let next = histogram.map(|(counts, _)| scatter_add(counts, &token, 1.0f32));
-    let landed = raw.zip(k.logprobs).map(|(raw, top)| {
-        let lp = log_softmax(&raw);
+    let landed = raw.or(drawn_from).zip(k.logprobs).map(|(scored, top)| {
+        let lp = if mode.logits() {
+            scored
+        } else {
+            log_softmax(&scored)
+        };
         let chosen = cast(
             reshape(scalar_gather(&lp, reshape(&token, [1])), [1]),
             dtype::f32,

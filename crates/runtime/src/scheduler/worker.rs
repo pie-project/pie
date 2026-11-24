@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use ::engine::{ChannelRegistration, ProgramRegistration, StateCopy};
+use ::engine::{ChannelRegistration, Engine, ProgramRegistration, StateCopy};
 
+use crate::engine::verbs::serve;
 use crate::engine::{
     BoundInstance, ChannelJoin, EngineBox, EngineId, InstanceBindingPlan, RegisteredChannel,
     SchedulerLimits, SubmissionCompletion, WorkItemCompletion,
@@ -350,31 +351,31 @@ pub(super) fn seal_rows(cap: u32, held: u32, granted: Option<u32>, queued: usize
 /// A change to how much of the pool has memory under it.
 #[derive(Debug, Clone)]
 pub(crate) enum PoolOp {
-    /// A shared pool backs segments `0..n` (`Engine::commit_segments`).
+    /// A shared pool backs segments `0..n` (`Pool::commit`).
     CommitSegments(u32),
-    /// A shared pool gives back segments `n..` (`Engine::release_segments`).
+    /// A shared pool gives back segments `n..` (`Pool::release`).
     ReleaseSegments(u32),
-    /// The activation rung moves (`Engine::set_rung`), where the span is
+    /// The activation rung moves (`Pool::set_rung`), where the span is
     /// backed on demand: a raise before any fire of the wider rung, a lower
     /// as a notice after its retire fence.
     Rung { from: u32, to: u32 },
     /// A shared pool whose span is backed on demand backs its top `n` span
-    /// segments (`Engine::commit_span`).
+    /// segments (`Pool::commit_span`).
     CommitSpan(u32),
     /// A shared pool whose span is backed on demand keeps its top `n` span
-    /// segments and gives back the rest (`Engine::release_span`).
+    /// segments and gives back the rest (`Pool::release_span`).
     ReleaseSpan(u32),
     /// A shared pool's chunks move, ahead of every fire queued after it
-    /// (`Engine::evacuate`).
+    /// (`Pool::evacuate`).
     Evacuate(::engine::chunk::Evacuation),
     /// An instance's tables or a ring were unparked into these slots
-    /// (`Engine::rebind_slots`), ahead of every fire queued after it.
+    /// (`Programs::rebind`), ahead of every fire queued after it.
     Rebind(::engine::Rebind),
-    /// Every copy submitted so far has landed (`Engine::settle_copies`):
+    /// Every copy submitted so far has landed (`Tiers::settle`):
     /// what an aborted move waits for before it gives back slots a copy may
     /// still be writing.
     SettleCopies,
-    /// The engine's chunk table (`Engine::chunk_table`) checked against the
+    /// The engine's chunk table (`Pool::chunk_table`) checked against the
     /// runtime's logical to physical map, by logical chunk: refused naming
     /// the first chunk they place apart. What a refused evacuation is
     /// checked by, the engine's word that nothing moved not taken on trust.
@@ -401,6 +402,7 @@ impl PoolOp {
 /// A read or write of host kv slots' bytes, behind every copy queued before
 /// it.
 #[derive(Debug)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) enum HostKvOp {
     Write(Vec<u32>, Vec<u8>),
     /// The engine's host-tier layout, as JSON; empty when it cannot say.
@@ -411,28 +413,26 @@ pub(crate) enum HostKvOp {
     /// The bytes of host kv slots.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     Read(Vec<u32>),
-    /// The bytes of host rs rows: state slots, then buffer pages.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
-    ReadState(Vec<u32>, Vec<u32>),
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
-    WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
-    /// The bytes of host tier slots, shape by shape (`Engine::read_tier_slots`).
+    /// The bytes of host tier slots, shape by shape (`Tiers::read`).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     ReadTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>),
     #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
-    /// The engine's tap groups (`Engine::tap_groups`), as JSON.
+    /// The engine's tap groups (`Taps::groups`), as JSON.
     TapGroups,
-    /// The weight cache's resident set (`Engine::weight_residency`),
+    /// The weight cache's resident set (`WeightCache::set_residency`),
     /// answered with the bytes the engine holds back once it took it, ahead
     /// of every fire queued after it.
     WeightResidency(::engine::chunk::WeightResidency),
     /// The engine's weight use record since it last answered
-    /// (`Engine::weight_uses`), as JSON.
+    /// (`WeightCache::uses`), as JSON.
     WeightUses,
-    /// A beam group's beam's page list (`Engine::beam_list`), little-endian
+    /// A beam group's beam's page list (`Programs::beam_list`), little-endian
     /// u32s: behind every fire queued before it.
     BeamList(::engine::InstanceId, u32),
+    /// Overwrites the model's weights in place from a checkpoint
+    /// (`WeightCache::reload`), answering what it wrote as JSON.
+    ReloadWeights(std::path::PathBuf),
 }
 
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
@@ -563,14 +563,14 @@ pub(super) enum QueuedItem {
         pipeline_id: Option<ProcessId>,
     },
     /// A program's registration, first step: the engine checks it and
-    /// hands back its compile (`Engine::prepare_program`), which runs off
+    /// hands back its compile (`Programs::prepare`), which runs off
     /// the lane while the lane fires on.
     PrepareProgram {
         program: Box<ProgramRegistration>,
         response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
     },
     /// A program's registration, last step: the engine takes what its
-    /// compile made (`Engine::finish_program`), and the lane learns what an
+    /// compile made (`Programs::finish`), and the lane learns what an
     /// instance of it holds in the pool.
     FinishProgram {
         prepared: ::engine::Prepared,
@@ -1625,7 +1625,8 @@ impl BatchScheduler {
         let outstanding = std::mem::take(instances);
         for (instance_id, instance) in outstanding {
             if let Some(engine) = engine.as_mut()
-                && let Err(err) = engine.close_instance(instance_id)
+                && let Err(err) = serve(engine, Engine::programs, "close_instance")
+                    .and_then(|programs| programs.close(instance_id))
             {
                 tracing::warn!(
                     instance_id = instance_id.0,
@@ -1641,7 +1642,8 @@ impl BatchScheduler {
         let outstanding = std::mem::take(channels).into_ids();
         for channel_id in outstanding {
             if let Some(engine) = engine.as_mut()
-                && let Err(err) = engine.close_channel(channel_id)
+                && let Err(err) = serve(engine, Engine::channels, "close_channel")
+                    .and_then(|channels| channels.close(channel_id))
             {
                 tracing::warn!(
                     channel_id = channel_id.0,

@@ -86,6 +86,27 @@ impl RuntimeShutdown {
     }
 }
 
+/// Clears what a boot set process-wide, and frees bootstrap for the next
+/// boot in this process, which may serve another model. Call it once the
+/// boot's [`BootstrapHandle::shutdown`] returned and the tokio runtime it
+/// ran on is dropped, so no task of the boot is left to see the state go.
+pub fn reset() {
+    server::reset();
+    process::reset();
+    linker::stop();
+    program::stop();
+    crate::policy::reset();
+    crate::pipeline::reset();
+    crate::offload::reset();
+    crate::handle::snapshot::reset();
+    crate::scheduler::reset();
+    crate::planner::reset();
+    crate::store::reset();
+    model::reset();
+    engine::backend::reset();
+    RUNTIME_ACTIVE.store(false, Ordering::Release);
+}
+
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -137,6 +158,7 @@ pub struct RuntimeConfig {
     /// Whether a client may install its own programs; without, the
     /// system's alone run.
     pub allow_upload: bool,
+    pub allow_weight_reload: bool,
     /// Where the `<language>.wasm` language components live.
     pub languages_dir: PathBuf,
     /// Where wasmtime caches compiled code across boots; `None` compiles
@@ -378,7 +400,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         rx
     };
     let max_upload_bytes = config.runtime.max_upload_mb.saturating_mul(1024 * 1024);
-    server::init(max_upload_bytes, config.runtime.allow_upload);
+    server::init(
+        max_upload_bytes,
+        config.runtime.allow_upload,
+        config.runtime.allow_weight_reload,
+    );
     let bound_port = config.port;
 
     let ModelConfig {
@@ -623,9 +649,11 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         let backend =
             crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
         let registrations = crate::pipeline::standard::registrations(backend.as_deref(), rows)?;
-        engine
-            .engine_backend
-            .prewarm_programs(&registrations)
+        let Some(programs) = engine.engine_backend.programs() else {
+            continue;
+        };
+        programs
+            .prewarm(&registrations)
             .map_err(|error| {
                 anyhow::anyhow!("engine {at}: the standard samplers' guest code: {error}")
             })?;
@@ -712,14 +740,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .collect::<Result<Vec<_>>>()?;
     // Test builds: a slot the shared pool gives back is poisoned by its
-    // engine before the engine's next verb (`Engine::poison_queue`), so a
+    // engine before the engine's next verb (`Pool::poison_queue`), so a
     // fire that reads a cell its owner never wrote reads NaN.
     #[cfg(feature = "test-slot-fill")]
     for (engine, stores) in engine_configs.iter_mut().zip(&arena_stores) {
         if let Some(shared) = &stores.shared {
             let queue = ::engine::chunk::PoisonQueue::default();
             shared.lock().unwrap().pool_mut().poison_into(queue.clone());
-            engine.engine_backend.poison_queue(queue);
+            if let Some(pool) = engine.engine_backend.pool() {
+                pool.poison_queue(queue);
+            }
         }
     }
     // A shared pool's tiers are its host chunks and disk slots; today's

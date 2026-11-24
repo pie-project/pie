@@ -186,6 +186,16 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
             })
         })
         .collect();
+    // An index a reset freed is taken again, the lowest first, so the next
+    // boot's model is 0.
+    let freed = {
+        let mut freed = FREED.lock().unwrap();
+        freed.pop_first()
+    };
+    if let Some(idx) = freed {
+        *REGISTRY[idx].write().unwrap() = stores;
+        return idx;
+    }
     REGISTRY.push(RwLock::new(stores))
 }
 
@@ -210,6 +220,20 @@ fn kv_seed() -> [u8; 32] {
         return seed;
     }
     rand::random::<[u8; 32]>()
+}
+
+/// The indices [`reset`] emptied.
+static FREED: Mutex<std::collections::BTreeSet<usize>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Empties every model's stores, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    KV_TAINTED.store(false, std::sync::atomic::Ordering::Release);
+    let mut freed = FREED.lock().unwrap();
+    for (idx, model) in REGISTRY.iter() {
+        model.write().unwrap().clear();
+        freed.insert(idx);
+    }
 }
 
 /// The stores of an engine whose pool is `shared`: kv pages are the list

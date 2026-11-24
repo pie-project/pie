@@ -12,7 +12,7 @@ impl Roles {
     }
 
     /// `holder`'s items whose slots moved since the engine last named them:
-    /// what [`::engine::Engine::rebind_slots`] tells it, channels first (an
+    /// what [`::engine::Programs::rebind`] tells it, channels first (an
     /// instance's tables may address their rings).
     #[must_use]
     pub fn stale(&self, holder: Holder) -> Vec<Rebind> {

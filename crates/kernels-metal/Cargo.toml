@@ -1,6 +1,7 @@
 [package]
 name = "kernels-metal"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Pure Metal kernel definitions: shader entry names, argument marshalling, and dispatch geometry, plus the Neural Engine bridge the split MLP hands work to. Knows nothing about the IR; an engine Run resolves plan ids to handles and calls these entry functions."

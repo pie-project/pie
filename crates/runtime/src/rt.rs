@@ -7,7 +7,7 @@ mod imp {
     pub use tokio::task::{JoinHandle, spawn, spawn_blocking, yield_now};
 
     pub mod time {
-        pub use tokio::time::{Instant, interval, timeout};
+        pub use tokio::time::{Instant, interval, sleep, timeout};
     }
 
     pub use crossbeam::channel;
@@ -36,7 +36,7 @@ mod imp {
     pub use web_std::{JoinHandle, spawn, spawn_blocking, yield_now};
 
     pub mod time {
-        pub use web_std::time::{Instant, interval, timeout};
+        pub use web_std::time::{Instant, interval, sleep, timeout};
     }
 
     pub use web_std::channel;

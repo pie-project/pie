@@ -81,9 +81,7 @@ fn bind_fold(model: &mut Model) -> InstanceId {
     let bound = eta_ir::validate::bind(container, vec![Vec::new()], engine_caps)
         .expect("the fold program binds");
     let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
-    let program = model
-        .engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut model.engine, &ProgramRegistration {
             launch,
             ..Default::default()
         })
@@ -93,9 +91,7 @@ fn bind_fold(model: &mut Model) -> InstanceId {
         .enumerate()
         .map(|(at, &width)| {
             let id = ChannelId((1 << 20) + at as u64);
-            model
-                .engine
-                .register_channel(&ChannelRegistration {
+            engine::Channels::open(&mut model.engine, &ChannelRegistration {
                     id,
                     shape: vec![width],
                     dtype: ChanDType::Concrete(EtaDtype::U32),
@@ -110,9 +106,7 @@ fn bind_fold(model: &mut Model) -> InstanceId {
             id
         })
         .collect();
-    model
-        .engine
-        .bind_instance(&InstanceBinding {
+    engine::Programs::bind(&mut model.engine, &InstanceBinding {
             program,
             channels,
             seeds: Vec::new(),
@@ -290,9 +284,7 @@ fn tell(model: &mut Model, instance: InstanceId, lane: &Lane) {
     let tokens: Vec<u8> = lane.tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
     for (channel, bytes) in [(0, tokens), (1, N.to_le_bytes().to_vec())] {
         assert!(
-            model
-                .engine
-                .publish_channel(instance, channel, &bytes)
+            engine::Channels::publish(&mut model.engine, instance, channel, &bytes)
                 .expect("the cell publishes"),
             "the ring had room"
         );
@@ -425,7 +417,7 @@ fn a_kv_only_device_fold_reports_its_count() {
     let instance = bind_fold(&mut model);
     let heard: std::sync::Arc<std::sync::Mutex<Vec<engine::KvWrites>>> = Default::default();
     let into = std::sync::Arc::clone(&heard);
-    model.engine.on_complete(std::sync::Arc::new(move |_, outcome| {
+    engine::Completion::on_complete(&mut model.engine, std::sync::Arc::new(move |_, outcome| {
         into.lock().expect("heard").extend(outcome.wrote);
     }));
     let mut seq = Seq::new(0);

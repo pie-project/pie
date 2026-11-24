@@ -26,7 +26,7 @@ const PREFILL_DEADLINE: Duration = Duration::from_secs(300);
 /// deployment, which names the served variant; the page size rides in the
 /// format.
 pub fn hello(worker: WorkerId, engine: &str) -> Hello {
-    let identity = runtime::model::identity().cloned();
+    let identity = runtime::model::identity();
     let page_tokens = runtime::offload::prefill::page_tokens();
     Hello {
         worker,

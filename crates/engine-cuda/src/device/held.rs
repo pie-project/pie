@@ -272,6 +272,7 @@ impl Fence {
 pub mod pool {
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{Fence, adopted, current_device};
     use crate::device::rt;
@@ -294,12 +295,20 @@ pub mod pool {
     /// Cells past this many bytes are freed rather than kept.
     const LARGEST: usize = 64 << 20;
 
+    const DEVICE_BUDGET: usize = 256 << 20;
+
     struct Entry {
         held: Held,
         fence: Fence,
     }
 
     static POOL: Mutex<Option<HashMap<PoolKey, Vec<Entry>>>> = Mutex::new(None);
+
+    static DEVICE_KEPT: AtomicUsize = AtomicUsize::new(0);
+
+    fn device_bytes(held: &Held) -> usize {
+        held.2.as_ref().map_or(0, Buffer::bytes)
+    }
 
     /// The key an endpoint of this shape pools under, if any: none on a
     /// device whose compute stream was never adopted, or for huge cells.
@@ -344,6 +353,7 @@ pub mod pool {
             entry.fence.landed() && (entry.held.2.is_none() || stream.is_some())
         })?;
         let entry = list.swap_remove(at);
+        DEVICE_KEPT.fetch_sub(device_bytes(&entry.held), Ordering::Relaxed);
         drop(pool);
         let (words, mirror, cells) = entry.held;
         words.zero();
@@ -398,9 +408,11 @@ pub mod pool {
             .get_or_insert_with(HashMap::new)
             .entry(key)
             .or_default();
-        if list.len() >= PER_KEY {
+        let device = device_bytes(&held);
+        if list.len() >= PER_KEY || DEVICE_KEPT.load(Ordering::Relaxed) + device > DEVICE_BUDGET {
             return;
         }
+        DEVICE_KEPT.fetch_add(device, Ordering::Relaxed);
         list.push(Entry { held, fence });
     }
 }
@@ -759,9 +771,20 @@ pub(crate) mod heap {
             })
         }
 
-        /// One more chunk; the calling thread is bound to the heap's device.
-        fn make_chunk(self) -> Result<Cell> {
-            let bytes = self.kind.chunk();
+        fn make_chunk_for(self, bytes: usize) -> Result<(Cell, usize)> {
+            chunk_within(
+                self.kind.chunk(),
+                bytes,
+                |size| self.make_chunk(size),
+                || {
+                    super::release_idle();
+                },
+            )
+        }
+
+        /// One more chunk of `bytes`; the calling thread is bound to the
+        /// heap's device.
+        fn make_chunk(self, bytes: usize) -> Result<Cell> {
             match self.kind {
                 Kind::Pinned => {
                     let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -813,6 +836,27 @@ pub(crate) mod heap {
         }
     }
 
+    fn chunk_within(
+        whole: usize,
+        bytes: usize,
+        mut make: impl FnMut(usize) -> Result<Cell>,
+        mut trim: impl FnMut(),
+    ) -> Result<(Cell, usize)> {
+        let mut size = whole;
+        let mut trimmed = false;
+        loop {
+            match make(size) {
+                Ok(cell) => return Ok((cell, size)),
+                Err(crate::error::Fault::OutOfMemory { .. }) if !trimmed => {
+                    trimmed = true;
+                    trim();
+                }
+                Err(crate::error::Fault::OutOfMemory { .. }) if size / 2 >= bytes => size /= 2,
+                Err(fault) => return Err(fault),
+            }
+        }
+    }
+
     /// A cell: its host address (0 on the device), its device address, and
     /// the device it is on (-1 for pinned memory).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -839,6 +883,7 @@ pub(crate) mod heap {
     struct Chunk {
         at: Cell,
         used: usize,
+        bytes: usize,
     }
 
     struct Kept {
@@ -853,8 +898,8 @@ pub(crate) mod heap {
     struct Heap {
         /// The chunk cells are carved from.
         current: Option<Chunk>,
-        /// Chunks made ahead, not yet carved from.
-        ready: Vec<Cell>,
+        /// Chunks made ahead, not yet carved from, and their sizes.
+        ready: Vec<(Cell, usize)>,
         /// A chunk is being made for this heap.
         making: bool,
         free: Vec<Vec<Kept>>,
@@ -901,8 +946,9 @@ pub(crate) mod heap {
                 }
             };
             let made = (key.ordinal < 0 || crate::device::ctx::bind_thread(key.ordinal).is_ok())
-                .then(|| key.make_chunk().ok())
-                .flatten();
+                .then(|| key.make_chunk(key.kind.chunk()).ok())
+                .flatten()
+                .map(|cell| (cell, key.kind.chunk()));
             let mut all = locked(&heaps.heaps);
             let heap = all.entry(key).or_default();
             heap.making = false;
@@ -941,13 +987,18 @@ pub(crate) mod heap {
             all.get(&key).is_none_or(|heap| heap.current.is_none())
         };
         if fresh {
-            let chunk = key.make_chunk()?;
+            let bytes = kind.chunk();
+            let chunk = key.make_chunk(bytes)?;
             let mut all = locked(&heaps().heaps);
             let heap = all.entry(key).or_default();
             if heap.current.is_none() {
-                heap.current = Some(Chunk { at: chunk, used: 0 });
+                heap.current = Some(Chunk {
+                    at: chunk,
+                    used: 0,
+                    bytes,
+                });
             } else {
-                heap.ready.push(chunk);
+                heap.ready.push((chunk, bytes));
             }
             ask_ahead(heap, key);
         }
@@ -996,11 +1047,15 @@ pub(crate) mod heap {
                     return Ok(list.swap_remove(at).cell);
                 }
                 let fits =
-                    |chunk: &Chunk| chunk.used.next_multiple_of(bytes) + bytes <= kind.chunk();
+                    |chunk: &Chunk| chunk.used.next_multiple_of(bytes) + bytes <= chunk.bytes;
                 if !heap.current.as_ref().is_some_and(fits)
-                    && let Some(next) = heap.ready.pop()
+                    && let Some((next, size)) = heap.ready.pop()
                 {
-                    heap.current = Some(Chunk { at: next, used: 0 });
+                    heap.current = Some(Chunk {
+                        at: next,
+                        used: 0,
+                        bytes: size,
+                    });
                     ask_ahead(heap, key);
                 }
                 if let Some(chunk) = heap.current.as_mut().filter(|chunk| fits(chunk)) {
@@ -1011,7 +1066,7 @@ pub(crate) mod heap {
             }
             // Dry: the chunk is made here, outside the lock, and carved from
             // on the next pass.
-            let chunk = key.make_chunk()?;
+            let chunk = key.make_chunk_for(bytes)?;
             let mut all = locked(&heaps().heaps);
             all.entry(key).or_default().ready.push(chunk);
         }
@@ -1054,6 +1109,51 @@ pub(crate) mod heap {
                 assert_eq!(class_of(kind, kind.largest()), Some(kind.classes() - 1));
                 assert_eq!(class_of(kind, kind.largest() + 1), None);
             }
+        }
+
+        #[test]
+        fn a_card_short_of_a_whole_chunk_still_carves_a_small_cell() {
+            let cell = Cell {
+                host: 0,
+                device: 1,
+                ordinal: 0,
+            };
+            let room = 24 << 20;
+            let (mut asked, mut trims) = (Vec::new(), 0);
+            let made = chunk_within(
+                256 << 20,
+                1 << 20,
+                |size| {
+                    asked.push(size >> 20);
+                    if size <= room {
+                        Ok(cell)
+                    } else {
+                        Err(crate::error::Fault::OutOfMemory {
+                            need: size as u64,
+                            have: room as u64,
+                        })
+                    }
+                },
+                || trims += 1,
+            );
+            assert_eq!(made.unwrap().1, 16 << 20);
+            assert_eq!(asked, [256, 256, 128, 64, 32, 16]);
+            assert_eq!(trims, 1, "what is kept idle goes back once, first");
+            let short = chunk_within(
+                256 << 20,
+                64 << 20,
+                |size| {
+                    Err(crate::error::Fault::OutOfMemory {
+                        need: size as u64,
+                        have: 0,
+                    })
+                },
+                || {},
+            );
+            assert!(matches!(
+                short,
+                Err(crate::error::Fault::OutOfMemory { need, .. }) if need == 64 << 20
+            ));
         }
     }
 }

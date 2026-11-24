@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64};
+
 use serde::{Deserialize, Serialize};
 
 use eta_ir::container::{ChanDType, ExternDir, HostRole};
@@ -52,15 +55,28 @@ impl Default for ChannelRegistration {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A channel ring the engine maps on the host: its four control words and
+/// its `capacity + 1` cells.
+pub trait MirrorMemory: Send + Sync + std::fmt::Debug {
+    fn words(&self) -> &[AtomicU64];
+    fn cells(&self) -> &[AtomicU8];
+    /// The cells as words where they start on a word boundary: the same
+    /// memory as `cells`, or the cells alone where `cells` is empty, which
+    /// then only the host touches.
+    fn cell_words(&self) -> &[AtomicU64] {
+        &[]
+    }
+}
+
+/// A host mapping, alive for as long as any clone of it is.
+#[derive(Debug, Clone)]
 pub struct HostMirror {
-    pub mirror: u64,
-    pub words: u64,
+    pub memory: Arc<dyn MirrorMemory>,
     pub cell_bytes: u32,
     pub capacity: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredChannel {
     pub id: ChannelId,
     pub reader_wait_id: u64,

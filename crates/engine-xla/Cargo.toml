@@ -1,6 +1,7 @@
 [package]
 name = "engine-xla"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The XLA engine: a PJRT client (libtpu or any PJRT plugin, dlopened at runtime) that answers every Dispatch* trait by emitting kernels-xla StableHLO, tracing one fire into one executable and running it."

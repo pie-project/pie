@@ -1747,7 +1747,8 @@ impl<B: Serve> Shell<B> {
         let rs_bytes = rows.rs.as_ref().map_or(0, |rs| rs.bytes);
         let rs_tokens = rows.rs.as_ref().map_or(0, |rs| rs.tokens);
         // One working set: its pages, its record and one written
-        // copy-on-write, and its rs-list pages, beside the null chunk.
+        // copy-on-write, and a chunk of the rs list for the rows a fire
+        // leaves unfolded (as the runtime counts one), beside the null chunk.
         let least_chunks = crate::store::layout::Layout::least_chunks(
             chunk,
             [rows.list_bytes, rows.fixed_bytes],
@@ -2102,6 +2103,7 @@ impl<B: Serve> Shell<B> {
                 &rung_tokens,
                 least,
                 &tuning,
+                device.max_buffer(),
             )?;
             // A fire's own windowed rows lie in slots of its activation
             // span, laid as the window buffer's (CONTRACT-BC 19).
@@ -4675,7 +4677,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots`: landed when this returns. A move off the
+    /// See `Tiers::copy`: landed when this returns. A move off the
     /// device, which rides the queue past `copy_slots_landing`, is waited
     /// out here.
     pub fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> Result<()> {
@@ -4685,7 +4687,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::copy_slots_landing`: whether the copy's sources may go
+    /// See `Tiers::copy_landing`: whether the copy's sources may go
     /// back when this returns.
     /// - Within the device, and between the device and mapped host chunks:
     ///   in queue order, behind every frame submitted before, with no
@@ -4717,7 +4719,7 @@ impl<B: Serve> Shell<B> {
             None if queued && parks => {
                 return Err(Fault::Unbound {
                     what: "a copy on the device with no landing sink installed \
-                           (Engine::on_landed comes before any copy_slots_landing)"
+                           (Tiers::on_landed comes before any copy_landing)"
                         .to_string(),
                 });
             }
@@ -4747,14 +4749,14 @@ impl<B: Serve> Shell<B> {
         }
     }
 
-    /// See `Engine::settle_copies`: every frame and copy in flight lands,
+    /// See `Tiers::settle`: every frame and copy in flight lands,
     /// a slot file read's copy onto the device too.
     pub fn settle_copies(&mut self) -> Result<()> {
         self.drain()?;
         self.pools.settle_spill()
     }
 
-    /// See `Engine::read_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::read`: every frame and copy lands first.
     pub fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -4763,7 +4765,7 @@ impl<B: Serve> Shell<B> {
         self.pools.read_tier_slots(slots)
     }
 
-    /// See `Engine::write_tier_slots`: every frame and copy lands first.
+    /// See `Tiers::write`: every frame and copy lands first.
     pub fn write_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -4846,7 +4848,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::weight_residency`: every slot newly named filled from
+    /// See `WeightCache::set_residency`: every slot newly named filled from
     /// the host before the next fire, every block's entry rewritten. The
     /// first after a load that seated its weights says how many atoms it
     /// names elsewhere (each filled again there).
@@ -4936,7 +4938,7 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// See `Engine::weight_uses`.
+    /// See `WeightCache::uses`.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         self.drain()?;
         let (mut uses, mut held) = self.row_caches.uses()?;

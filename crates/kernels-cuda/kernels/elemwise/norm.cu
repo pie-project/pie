@@ -151,6 +151,80 @@ __global__ void __launch_bounds__(256) rmsnorm_runs(
     }
 }
 
+template <int kRuns, bool WEIGHT_PLUS_ONE>
+__global__ void __launch_bounds__(256) residual_rmsnorm_runs(
+    bf16* __restrict__ y,
+    const bf16* __restrict__ x,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ out,
+    int hidden,
+    float eps,
+    const u32* __restrict__ win)
+{
+    pdl_wait();
+    pdl_launch();
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const long long base = static_cast<long long>(plane_row) * hidden;
+    bf16* yr = y + base;
+    const bf16* xr = x + base;
+    const int runs = hidden >> 3;
+    uint4 v[kRuns];
+#pragma unroll
+    for (int r = 0; r < kRuns; ++r) {
+        const int at = tid + r * 256;
+        if (at >= runs) {
+            v[r] = make_uint4(0, 0, 0, 0);
+            continue;
+        }
+        uint4 a = *reinterpret_cast<const uint4*>(yr + at * 8);
+        const uint4 b = *reinterpret_cast<const uint4*>(xr + at * 8);
+        bf16x2* ah = reinterpret_cast<bf16x2*>(&a);
+        const bf16x2* bh = reinterpret_cast<const bf16x2*>(&b);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 fa = bf16x2_to_f32(ah[j]);
+            const float2 fb = bf16x2_to_f32(bh[j]);
+            ah[j] = f32_to_bf16x2(fa.x + fb.x, fa.y + fb.y);
+        }
+        *reinterpret_cast<uint4*>(yr + at * 8) = a;
+        v[r] = a;
+    }
+    float local = 0.f;
+#pragma unroll
+    for (int r = 0; r < kRuns; ++r) {
+        const bf16* e = reinterpret_cast<const bf16*>(&v[r]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float f = Elem<bf16>::to_f32(e[j]);
+            local += f * f;
+        }
+    }
+    __shared__ float buf[256];
+    const float sum = block_reduce_sum_fast<256>(local, buf);
+    const float inv_rms = rsqrtf(sum / static_cast<float>(hidden) + eps);
+    bf16* outr = out + base;
+#pragma unroll
+    for (int r = 0; r < kRuns; ++r) {
+        const int at = tid + r * 256;
+        if (at >= runs) continue;
+        const uint4 wr = *reinterpret_cast<const uint4*>(weight + at * 8);
+        const bf16* e = reinterpret_cast<const bf16*>(&v[r]);
+        const bf16* wv = reinterpret_cast<const bf16*>(&wr);
+        uint4 o;
+        bf16* oe = reinterpret_cast<bf16*>(&o);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float w = Elem<bf16>::to_f32(wv[j]);
+            if constexpr (WEIGHT_PLUS_ONE) w += 1.f;
+            oe[j] = Elem<bf16>::from_f32(Elem<bf16>::to_f32(e[j]) * inv_rms * w);
+        }
+        *reinterpret_cast<uint4*>(outr + at * 8) = o;
+    }
+}
+
 // `rmsnorm` (`rmsnorm_plus_one` under PLUS_ONE) of a whole row of `256 *
 // PER`, landing its bits: each thread's values (its elements `t`, `t + 256`,
 // ...) and their weights loaded at once and held, the squares summed in the

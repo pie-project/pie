@@ -594,6 +594,7 @@ impl HostTier {
     /// `swap`, behind what it has enqueued. Returns the event the last copy
     /// lands at on the stream (a fire naming one of the device slots waits
     /// on it); the bytes reach the tier on the landing thread.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_host(
         &mut self,
         swap: *mut core::ffi::c_void,

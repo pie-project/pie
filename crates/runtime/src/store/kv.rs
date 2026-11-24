@@ -281,9 +281,7 @@ pub struct KvStore {
     /// Per trie node, the epoch through which a fire may still read its
     /// pages: the last a working set holding it was let go at (or a copy
     /// into it was handed out at). An idle entry's pages go back after the
-    /// latest of its path's nodes, not after every fire in flight: a waiter
-    /// short of a prompt's pages waited behind ~1600 handed-out epochs (a
-    /// second) for cache last read long before ([`Self::fence_of`]).
+    /// latest of its path's nodes and every fire in flight ([`Self::fence_of`]).
     node_epochs: HashMap<NodeId, u64>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
@@ -953,7 +951,7 @@ impl KvStore {
     }
 
     /// The epoch after which the pages an idle entry ending at `terminal`
-    /// holds alone may go back: the latest stamp on its path, at most
+    /// holds alone may go back: the latest stamp on its path, at least
     /// `epoch` (now). Stamps every fire has retired through are dropped.
     fn fence_of(&mut self, terminal: NodeId, epoch: u64) -> u64 {
         let retired = self.retired_through();
@@ -964,7 +962,7 @@ impl KvStore {
             .filter_map(|node| self.node_epochs.get(node).copied())
             .max()
             .unwrap_or(0)
-            .min(epoch)
+            .max(epoch)
     }
 
     fn release_entry(&mut self, entry: KeptEntry, epoch: u64) -> usize {
@@ -1037,6 +1035,17 @@ impl KvStore {
                 });
         }
         sets.into_values().collect()
+    }
+
+    pub fn live_working_sets(&self) -> usize {
+        self.table.live_working_sets()
+    }
+
+    pub fn rekey(&mut self, domain: Hash256) -> usize {
+        let keys: Vec<u64> = self.cache.keys().copied().collect();
+        let freed = self.drop_entries(keys, By::Client, self.current_epoch());
+        self.domain = domain;
+        freed
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2406,7 +2415,7 @@ impl KvStore {
 
     /// A shared pool's host slots for a read or a write none of the
     /// planner's: kv list slots of its host tier, whose bytes the engine
-    /// reads and writes by those refs (`Engine::read_tier_slots`), not by
+    /// reads and writes by those refs (`Tiers::read`), not by
     /// `read_host_kv`. `None` off a shared pool, or if the host lacks them.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
     pub fn alloc_tier_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {

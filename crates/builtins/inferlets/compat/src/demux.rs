@@ -36,6 +36,8 @@ pub enum Event {
     /// ahead of the first sampled token (streamed requests that ask for
     /// prompt logprobs only).
     PromptLogprobs(Vec<(u32, Option<crate::generate::Logprob>)>),
+    PromptTokens(Vec<u32>),
+    Tokens(Vec<u32>),
 }
 
 pub(crate) struct Demux {
@@ -51,6 +53,8 @@ pub(crate) struct Demux {
     /// a streamed answer should read as the whole one does, trimmed.
     reasoning_held: String,
     in_tool_call: bool,
+    tools_on: bool,
+    verbatim: bool,
     content_filter: HoldBack,
     /// Drop whitespace at the start of the next content: the template puts
     /// a blank line after a thinking block or a tool call, and that is
@@ -65,10 +69,14 @@ pub(crate) struct Demux {
 impl Demux {
     /// `cue` is the generation cue the prompt ends with: a cue that opens a
     /// thinking block puts the first token inside it. `choice` is the
-    /// request's ([`crate::Request::choice`]).
-    pub fn new(cue: &[u32], choice: u32) -> Self {
+    pub fn new(cue: &[u32], choice: u32, tools: bool) -> Self {
         let reasoning = reasoning::Decoder::for_cue(cue);
         let in_reasoning = reasoning.starts_inside();
+        let markers = if tools {
+            vec!["<tool_call>".to_string()]
+        } else {
+            Vec::new()
+        };
         Self {
             reasoning,
             tools: tools::Decoder::new(),
@@ -77,7 +85,9 @@ impl Demux {
             reasoning_strip_leading: true,
             reasoning_held: String::new(),
             in_tool_call: false,
-            content_filter: HoldBack::new(vec!["<tool_call>".to_string()]),
+            tools_on: tools,
+            verbatim: false,
+            content_filter: HoldBack::new(markers),
             strip_leading: true,
             choice,
             reasoning_text: String::new(),
@@ -85,17 +95,26 @@ impl Demux {
         }
     }
 
-    /// Keep whitespace where a stream starts: a raw completion continues its
-    /// prompt verbatim, its leading space part of the text.
     pub fn verbatim(&mut self) {
-        self.strip_leading = false;
-        self.reasoning_strip_leading = false;
+        self.verbatim = true;
     }
 
     /// Classify one token. Stop tokens must not be fed: the caller ends the
     /// turn on them and then calls [`Demux::finish`].
     pub fn feed(&mut self, token: u32) -> Result<Vec<Event>, String> {
         let mut events = Vec::new();
+
+        if self.verbatim {
+            if let chat::Event::Delta(delta) = self
+                .chat
+                .feed(&[token])
+                .map_err(|e| format!("chat decoder: {e:?}"))?
+                && !delta.is_empty()
+            {
+                events.push(Event::Text(delta));
+            }
+            return Ok(events);
+        }
 
         match self
             .reasoning
@@ -139,25 +158,23 @@ impl Demux {
             reasoning::Event::Delta(_) => {}
         }
 
-        match self
-            .tools
-            .feed(&[token])
-            .map_err(|e| format!("tools decoder: {e:?}"))?
+        if self.tools_on
+            && let tools::Event::Call(call) = self
+                .tools
+                .feed(&[token])
+                .map_err(|e| format!("tools decoder: {e:?}"))?
         {
-            tools::Event::Call(call) => {
-                self.in_tool_call = false;
-                self.strip_leading = true;
-                self.content_filter.flush();
-                let call = ToolCall {
-                    id: crate::call_id(self.choice, self.tool_calls.len()),
-                    name: call.name,
-                    arguments: call.arguments_json,
-                };
-                self.tool_calls.push(call.clone());
-                events.push(Event::ToolCall(call));
-                return Ok(events);
-            }
-            tools::Event::Start => {}
+            self.in_tool_call = false;
+            self.strip_leading = true;
+            self.content_filter.flush();
+            let call = ToolCall {
+                id: crate::call_id(self.choice, self.tool_calls.len()),
+                name: call.name,
+                arguments: call.arguments_json,
+            };
+            self.tool_calls.push(call.clone());
+            events.push(Event::ToolCall(call));
+            return Ok(events);
         }
 
         match self

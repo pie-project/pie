@@ -136,7 +136,12 @@ pub(crate) fn channel_state_by_gid(gid: u64) -> Option<ChannelRef> {
 }
 
 pub(crate) fn release_channel_state(gid: u64) -> bool {
-    CHANNELS_BY_GID.with_borrow_mut(|map| map.remove(&gid).is_some())
+    CHANNELS_BY_GID
+        .try_with(|map| {
+            map.try_borrow_mut()
+                .is_ok_and(|mut map| map.remove(&gid).is_some())
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn is_tracing() -> bool {

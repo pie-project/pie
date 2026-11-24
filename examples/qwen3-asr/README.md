@@ -9,7 +9,7 @@ transcript.
 
 ```bash
 pie model import Qwen/Qwen3-ASR-0.6B --deployment qwen3-asr-0.6b-u8g64-kv-bf16
-cargo build -p qwen3-asr --release --target wasm32-wasip3   # from examples
+cargo build -p qwen3-asr --release   # from examples
 pie run qwen3-asr -- --audio-b64 "$(base64 < clip.wav)"
 ```
 

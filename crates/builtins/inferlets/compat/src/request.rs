@@ -151,7 +151,6 @@ pub struct Request {
     pub messages: Vec<Message>,
     /// A raw completion prompt: the text is tokenized as-is after the
     /// model's prefix, with no chat template, and `messages` and `tools`
-    /// are ignored. The legacy completions API.
     pub raw_prompt: Option<String>,
     /// A completion prompt given as token ids: used as they are, as vLLM
     /// and SGLang do, with no prefix added.
@@ -171,11 +170,13 @@ pub struct Request {
     /// to `max_tokens` or a stop sequence.
     pub ignore_eos: bool,
     /// Stop sequences: generation ends when the content ends with one, and
-    /// the sequence itself is not returned.
     pub stop: Vec<String>,
+    pub stop_token_ids: Vec<u32>,
+    pub include_stop_str_in_output: bool,
     pub thinking: Thinking,
     pub effort: Effort,
     pub stream: bool,
+    pub return_token_ids: bool,
     /// Which of a request's choices this is, 0 for the first: it keeps the
     /// choices' tool-call ids apart.
     pub choice: u32,
@@ -200,9 +201,12 @@ impl Request {
             min_tokens: 0,
             ignore_eos: false,
             stop: Vec::new(),
+            stop_token_ids: Vec::new(),
+            include_stop_str_in_output: false,
             thinking: Thinking::ModelDefault,
             effort: Effort::Xhigh,
             stream: false,
+            return_token_ids: false,
             choice: 0,
         }
     }

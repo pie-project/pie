@@ -438,16 +438,14 @@ impl Sink<'_> {
         }
 
         let declared = pipeline.bindings as usize;
-        for at in views.len()..declared {
-            if pipeline.used[at] {
-                return Err(Sink::backend(
-                    fire,
-                    format!(
-                        "the module declares binding {at} but the entry passed only {} buffers",
-                        views.len()
-                    ),
-                ));
-            }
+        if let Some(at) = (views.len()..declared).find(|&at| pipeline.used[at]) {
+            return Err(Sink::backend(
+                fire,
+                format!(
+                    "the module declares binding {at} but the entry passed only {} buffers",
+                    views.len()
+                ),
+            ));
         }
         for (at, view) in views.iter().enumerate() {
             if at >= declared {

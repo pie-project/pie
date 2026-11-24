@@ -285,14 +285,18 @@ impl Package {
                      handle where the forward reads or writes it"
                 );
             }
-            let trace = if states.is_empty() {
-                traced(name, StateRows::default(), &mut eval, run, m, platform)?
-            } else {
+            crate::star::forward::DEPTH.with(|d| d.set(deploy.layers));
+            let trace = (|| {
+                if states.is_empty() {
+                    return traced(name, StateRows::default(), &mut eval, run, m, platform);
+                }
                 let first = crate::star::state::provisional(&states)?;
                 let first = traced(name, first, &mut eval, run, m, platform)?;
                 let spec = crate::star::state::lowered(&states, &first)?;
-                traced(name, spec, &mut eval, run, m, platform)?
-            };
+                traced(name, spec, &mut eval, run, m, platform)
+            })();
+            crate::star::forward::DEPTH.with(|d| d.set(None));
+            let trace = trace?;
             if let Some(factor) = deploy.yarn
                 && !stretched(&trace)
             {

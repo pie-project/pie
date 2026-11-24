@@ -1072,11 +1072,16 @@ impl Inputs {
             _ => false,
         };
         if let Some(snaps) = fire.rs_snaps {
-            if snaps.len() != lanes as usize * SNAP_INTS as usize {
+            let per_lane: u32 = self
+                .bands
+                .iter()
+                .map(|&w| kernels_metal::ssm::RS_SNAPSHOTS * (1 + w))
+                .sum();
+            if snaps.len() != lanes as usize * per_lane as usize {
                 return Err(Fault::Ceiling {
                     what: "recurrent snapshot tables, one row per lane",
                     need: snaps.len() as u64,
-                    have: u64::from(lanes) * u64::from(SNAP_INTS),
+                    have: u64::from(lanes) * u64::from(per_lane),
                 });
             }
             self.store.write(self.rs_snaps, bytes_of(snaps))?;

@@ -155,8 +155,8 @@ fn serve(fixture: &Fixture, fork: Fork) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         shell
             .copy_slots(&SlotCopy {
                 shape: LIST,
-                src: MemoryDomain::MetalShared,
-                dst: MemoryDomain::MetalShared,
+                src: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+                dst: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                 slots: copies,
                 runs: Vec::new(),
             })

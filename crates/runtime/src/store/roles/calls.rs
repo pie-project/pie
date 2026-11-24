@@ -2,18 +2,23 @@
 //! and registered, an instance bound, pumped and rebound.
 
 use super::*;
+use crate::engine::verbs::serve;
 
 /// Asks `engine` what an instance of `program` holds, where `roles` has
 /// not yet: once a program, at its registration.
 pub fn learn_program(
     roles: &RolesHandle,
-    engine: &dyn Engine,
+    engine: &mut dyn Engine,
     program: ProgramId,
 ) -> ::engine::Result<()> {
     if roles.lock().unwrap().knows(program) {
         return Ok(());
     }
-    let facts = engine.program_facts(program)?;
+    // An engine that serves no programs states no facts of one.
+    let facts = match engine.programs() {
+        Some(programs) => programs.facts(program)?,
+        None => ::engine::ProgramFacts::default(),
+    };
     roles.lock().unwrap().program_registered(program, facts);
     Ok(())
 }
@@ -29,7 +34,10 @@ pub fn take_ring(
     let Some(roles) = roles else {
         return Ok(None);
     };
-    let Some(facts) = engine.ring_facts(plan)? else {
+    let Some(facts) = engine
+        .channels()
+        .map_or(Ok(None), |channels| channels.ring_facts(plan))?
+    else {
         return Ok(None);
     };
     let mut roles = roles.lock().unwrap();
@@ -61,17 +69,20 @@ pub fn take_rings(
 }
 
 /// The channels of `plans`, registered by the bind they come with, whose
-/// rings the engine holds ([`Engine::holds_channel`]): with the channels
+/// rings the engine holds ([`Channels::holds`]): with the channels
 /// it holds registered already, what a bind's `registered` names
 /// ([`take_bind`]). A channel the engine leaves to the runtime is each
 /// instance's own ring, registered by this bind or not.
 ///
-/// [`Engine::holds_channel`]: ::engine::Engine::holds_channel
+/// [`Channels::holds`]: ::engine::Channels::holds
 #[must_use]
-pub fn held_by(engine: &dyn Engine, plans: &[ChannelRegistration]) -> Vec<ChannelId> {
+pub fn held_by(engine: &mut dyn Engine, plans: &[ChannelRegistration]) -> Vec<ChannelId> {
+    let Some(channels) = engine.channels() else {
+        return Vec::new();
+    };
     plans
         .iter()
-        .filter(|plan| engine.holds_channel(plan))
+        .filter(|plan| channels.holds(plan))
         .map(|plan| plan.id)
         .collect()
 }
@@ -142,8 +153,13 @@ pub fn take_bind(
         return Err(RolesError::HolderParked(holder).into());
     }
     learn_program(roles, engine, binding.program)?;
-    let state = engine.guest_state(binding.program, &binding.extents, binding.geometry)?;
-    let adapter = engine.adapter_key(binding)?;
+    let (state, adapter) = match engine.programs() {
+        Some(programs) => (
+            programs.guest_state(binding.program, &binding.extents, binding.geometry)?,
+            programs.adapter_key(binding)?,
+        ),
+        None => (::engine::GuestState::default(), None),
+    };
     let pair = FireKey {
         program: binding.program,
         extents: binding.extents,
@@ -252,7 +268,7 @@ pub fn bind_taken(
     taken: Option<Taken>,
 ) -> anyhow::Result<BoundInstance> {
     let (Some(roles), Some(taken)) = (roles, taken) else {
-        return Ok(engine.bind_instance(binding)?);
+        return Ok(serve(engine, Engine::programs, "bind_instance")?.bind(binding)?);
     };
     let binding = InstanceBinding {
         instance_slots: taken.instance_slots(),
@@ -263,7 +279,7 @@ pub fn bind_taken(
         pair_generation: taken.pair_generation(),
         ..binding.clone()
     };
-    match engine.bind_instance(&binding) {
+    match serve(engine, Engine::programs, "bind_instance").and_then(|programs| programs.bind(&binding)) {
         Ok(bound) => {
             roles.lock().unwrap().bound(bound.id, holder, taken);
             Ok(bound)
@@ -618,7 +634,11 @@ pub fn rebind(
         return Ok(());
     }
     let parked = matches!(rebind, Rebind::Parked { .. });
-    engine.rebind_slots(rebind)?;
+    // An engine that serves no programs states no `Instance` or `Channel`
+    // shape, and is never asked.
+    if let Some(programs) = engine.programs() {
+        programs.rebind(rebind)?;
+    }
     // A park names no new slots: nothing is rebound, no held write goes.
     if parked {
         return Ok(());

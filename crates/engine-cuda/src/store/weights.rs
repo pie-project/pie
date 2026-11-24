@@ -308,7 +308,7 @@ impl Pools {
             .collect()
     }
 
-    /// See `Engine::weight_residency`: the blocks newly named a slot are
+    /// See `WeightCache::set_residency`: the blocks newly named a slot are
     /// filled from the host copy and every table rewritten, on `stream`
     /// behind the fires it holds and before the next. A block no longer
     /// named is read from the host copy again. Returns whether a bank's
@@ -1017,7 +1017,7 @@ impl Pools {
             .collect()
     }
 
-    /// See `Engine::weight_uses`: each block's reads since the last call.
+    /// See `WeightCache::uses`: each block's reads since the last call.
     /// The counters run on (never zeroed but by
     /// [`Pools::forget_weight_uses`]); each call enqueues a snapshot of them
     /// into mapped host memory on `stream` behind the fires that counted,

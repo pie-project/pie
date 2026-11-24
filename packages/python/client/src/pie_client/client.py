@@ -165,6 +165,17 @@ class HandleError(Exception):
         self.code = code or _refusal_code(message)
 
 
+def _closed_because(closed: "websockets.ConnectionClosed", limit: int | None) -> str:
+    why = "WebSocket connection closed"
+    ours = closed.sent is not None and (closed.rcvd is None or closed.rcvd_then_sent is False)
+    frame = closed.sent if ours else (closed.rcvd or closed.sent)
+    if frame is None:
+        return why
+    if ours and frame.code == 1009:
+        return f"{why}: a server message exceeded max_message_size={limit} ({frame.reason})"
+    return f"{why} ({frame.code}: {frame.reason})" if frame.reason else why
+
+
 def _refusal_code(message: str) -> str | None:
     """The code a refusal's text starts with, if it is one."""
     code = message.split(":", 1)[0]
@@ -272,7 +283,13 @@ class PieClient:
     This client is designed to be used as an async context manager.
     """
 
-    def __init__(self, server_uri: str, identity: str = "default/bench"):
+    def __init__(
+        self,
+        server_uri: str,
+        identity: str = "default/bench",
+        *,
+        max_message_size: int | None = None,
+    ):
         """
         Initialize the client.
         :param server_uri: The WebSocket server URI (e.g., "ws://127.0.0.1:8080").
@@ -281,10 +298,12 @@ class PieClient:
             gateway requires (`gateway/src/ingress/identity.rs`). A deployment
             terminates identity at an edge proxy; a direct client must supply it
             or the upgrade is rejected before the socket opens.
+        :param max_message_size: Largest message accepted from the server, in bytes; None for no limit.
         """
         self.server_uri = server_uri
         self._last_handle = 0
         self.identity = identity
+        self.max_message_size = max_message_size
         self.ws = None
         self.listener_task = None
         self.corr_id_counter = 0
@@ -315,32 +334,49 @@ class PieClient:
         if not urlsplit(uri).path.strip("/"):
             uri = uri.rstrip("/") + "/v1/ws"
         self.ws = await websockets.connect(
-            uri, additional_headers={"x-pie-identity": self.identity})
+            uri,
+            additional_headers={"x-pie-identity": self.identity},
+            max_size=self.max_message_size,
+        )
         self.listener_task = asyncio.create_task(self._listen_to_server())
 
     async def _listen_to_server(self):
         """Background task to receive and process all incoming server messages."""
+        why = "WebSocket connection closed"
         try:
             async for raw_msg in self.ws:
-                if isinstance(raw_msg, bytes):
-                    try:
-                        message = msgpack.unpackb(raw_msg, raw=False)
-                        await self._process_server_message(message)
-                    except msgpack.UnpackException:
-                        pass
-                else:
+                if not isinstance(raw_msg, bytes):
                     self._note_server_error(raw_msg)
-        except (
-            websockets.ConnectionClosedOK,
-            websockets.ConnectionClosedError,
-            Exception,
-        ):
-            pass
+                    continue
+                try:
+                    message = msgpack.unpackb(raw_msg, raw=False)
+                except Exception:
+                    continue
+                try:
+                    await self._process_server_message(message)
+                except Exception as exc:
+                    self._fail_message_owner(message, exc)
+        except websockets.ConnectionClosed as closed:
+            why = _closed_because(closed, self.max_message_size)
+        except Exception as exc:
+            why = f"{why}: the client's listener failed: {exc!r}"
         finally:
-            why = "WebSocket connection closed"
             if self.server_error:
                 why = f"{why}: {self.server_error}"
             self._fail_connection_waiters(ConnectionError(why))
+
+    def _fail_message_owner(self, message, exc: Exception):
+        if not isinstance(message, dict):
+            return
+        why = f"the client could not process a `{message.get('type')}` message: {exc!r}"
+        process_id = message.get("process_id")
+        queue = self.process_event_queues.pop(process_id, None)
+        if queue is not None:
+            queue.put_nowait((Event.Error.value, why))
+        self.pending_downloads.pop(message.get("file_hash"), None)
+        future = self.pending_requests.pop(message.get("corr_id"), None)
+        if future is not None and not future.done():
+            future.set_exception(RuntimeError(why))
 
     def _note_server_error(self, text: str):
         """Remember the reason in a `{"type": "error"}` text frame."""
@@ -788,6 +824,13 @@ class PieClient:
             except (json.JSONDecodeError, TypeError):
                 return []
         raise Exception(f"List processes failed: {result}")
+
+    async def reload_weights(self, path: "str | Path", version: int | None = None) -> dict:
+        msg = {"type": "reload_weights", "path": str(Path(path).absolute()), "version": version}
+        ok, result = await self._send_msg_and_wait(msg)
+        if not ok:
+            raise Exception(f"Reload weights failed: {result}")
+        return json.loads(result)
 
     async def ping(self) -> None:
         """Ping the server to check connectivity."""

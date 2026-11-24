@@ -252,16 +252,17 @@ pub(crate) fn landing_requests(
     landing
 }
 
-/// The classes the lattice keys and arms: those a plain request lands in,
-/// and, on a model with a drafter (an output only drafting classes write,
-/// MTP's `mtp.drafts`), those writing it that a request plain but for
-/// reading its pass's drafts lands in (the drafter's verify).
+/// The classes the lattice keys and arms: those a plain request, or one
+/// plain but for its adapter, lands in, and, on a model with a drafter (an
+/// output only drafting classes write, MTP's `mtp.drafts`), those writing it
+/// that a request plain but for reading its pass's drafts lands in (the
+/// drafter's verify).
 #[must_use]
 pub(crate) fn plain_of(
     landing: &[Vec<poem_ir::Request>],
     outputs: &[poem_exec::feeds::ClassOutput],
 ) -> poem_ir::ClassSet {
-    let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
+    let plain = |class: usize| landing[class].iter().any(plain_or_adapted);
     // An output's name no plain class writes: the drafter's (a name written
     // by several value sets is one output a set).
     let plain_names: std::collections::HashSet<&str> = outputs
@@ -284,6 +285,12 @@ pub(crate) fn plain_of(
 #[must_use]
 pub(crate) fn drafts_only(request: &poem_ir::Request) -> bool {
     request.drafts() && request.departures() == usize::from(request.query_len() != 1) + 1
+}
+
+#[must_use]
+pub(crate) fn plain_or_adapted(request: &poem_ir::Request) -> bool {
+    request.departures()
+        == usize::from(request.query_len() != 1) + usize::from(request.has_adapter())
 }
 
 #[must_use]

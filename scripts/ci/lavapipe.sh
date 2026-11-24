@@ -27,7 +27,7 @@ echo "== pie with the $engine engine"
 cargo build --release -p pie --features "$engine"
 pie=./target/release/pie
 echo "== inferlets (wasm32-wasip3)"
-(cd examples && cargo build -q --release --target wasm32-wasip3 -p text-completion -p naive-baseline)
+(cd examples && cargo build -q --release -p text-completion -p naive-baseline)
 
 echo "== import"
 "$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source

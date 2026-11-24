@@ -14,11 +14,11 @@ use tarpc::serde_transport::unix;
 use tarpc::server::{BaseChannel, Channel};
 use tokio::sync::{Mutex, Notify, mpsc};
 use worker_api::{
-    Accepted, Control, GatewayInboundClient, Priority, Request, Tokens, WorkerControl,
-    connect_gateway_link, dispatch_codec,
+    Accepted, Control, GatewayInboundClient, LINK_MAX_FRAME_BYTES, Priority, Request, Tokens,
+    WorkerControl, connect_gateway_link, dispatch_codec,
 };
 
-const LINK_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const LINK_HEADROOM_BYTES: usize = 64 * 1024;
 
 const PUSH_DEADLINE: Duration = Duration::from_secs(300);
 
@@ -693,6 +693,7 @@ async fn run_turn(
                 let Some(msg) = msg else {
                     return TurnEnd::Aborted;
                 };
+                let msg = within_link(msg, LINK_MAX_FRAME_BYTES - LINK_HEADROOM_BYTES);
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
                 if !armed && let Some(rx) = arm(&process_id) {
                     start = Some(rx);
@@ -727,6 +728,34 @@ async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {
             tracing::warn!(%req_id, error = %e, "push Eos transport error");
             TurnEnd::LinkGone
         }
+    }
+}
+
+fn within_link(msg: ServerMessage, budget: usize) -> ServerMessage {
+    match msg {
+        ServerMessage::ProcessEvent {
+            process_id,
+            event,
+            value,
+        } if value.len() > budget => ServerMessage::ProcessEvent {
+            value: format!(
+                "`{event}` of {} bytes exceeds the {budget}-byte message limit; send large results with session.send-file",
+                value.len()
+            ),
+            process_id,
+            event: "error".to_string(),
+        },
+        ServerMessage::Response {
+            corr_id, result, ..
+        } if result.len() > budget => ServerMessage::Response {
+            corr_id,
+            ok: false,
+            result: format!(
+                "response of {} bytes exceeds the {budget}-byte message limit",
+                result.len()
+            ),
+        },
+        other => other,
     }
 }
 
@@ -789,7 +818,8 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
         | AttachProcess { corr_id, .. }
         | TerminateProcess { corr_id, .. }
         | ListProcesses { corr_id }
-        | Ping { corr_id } => Some(*corr_id),
+        | Ping { corr_id }
+        | ReloadWeights { corr_id, .. } => Some(*corr_id),
         SignalProcess { .. } | TransferFile { .. } => None,
     }
 }
@@ -836,6 +866,45 @@ fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod handle_turn_tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_message_becomes_an_error_for_its_owner() {
+        let event = |value: String| ServerMessage::ProcessEvent {
+            process_id: "p".to_string(),
+            event: "return".to_string(),
+            value,
+        };
+        let ServerMessage::ProcessEvent { event: kind, .. } =
+            within_link(event("x".repeat(16)), 16)
+        else {
+            unreachable!()
+        };
+        assert_eq!(kind, "return");
+        let failed = within_link(event("x".repeat(17)), 16);
+        assert!(turn_terminal(
+            &failed,
+            None,
+            true,
+            &mut Some("p".to_string())
+        ));
+        let ServerMessage::ProcessEvent {
+            event: kind, value, ..
+        } = failed
+        else {
+            unreachable!()
+        };
+        assert_eq!(kind, "error");
+        assert!(value.contains("17 bytes"), "{value}");
+        let response = ServerMessage::Response {
+            corr_id: 1,
+            ok: true,
+            result: "y".repeat(17),
+        };
+        let ServerMessage::Response { ok, .. } = within_link(response, 16) else {
+            unreachable!()
+        };
+        assert!(!ok);
+    }
 
     fn reply(ok: bool) -> ServerMessage {
         ServerMessage::Response {

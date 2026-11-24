@@ -33,8 +33,11 @@ __global__ void widen_e4m3_pages(
         unsigned b[8];
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
-            b[2 * u] = pack_bf16x2(e4m3_to_f32(w[u] & 0xff), e4m3_to_f32((w[u] >> 8) & 0xff));
-            b[2 * u + 1] = pack_bf16x2(e4m3_to_f32((w[u] >> 16) & 0xff), e4m3_to_f32(w[u] >> 24));
+            float f[4];
+            e4m3_pair_f32(static_cast<unsigned short>(w[u]), f[0], f[1]);
+            e4m3_pair_f32(static_cast<unsigned short>(w[u] >> 16), f[2], f[3]);
+            b[2 * u] = pack_bf16x2(f[0], f[1]);
+            b[2 * u + 1] = pack_bf16x2(f[2], f[3]);
         }
         out[x][2 * i] = make_uint4(b[0], b[1], b[2], b[3]);
         out[x][2 * i + 1] = make_uint4(b[4], b[5], b[6], b[7]);

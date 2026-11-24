@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireTicket, Step};
-use engine::transfer::MemoryDomain;
+use engine::transfer::{DeviceReach, MemoryDomain};
 use eta_ir::registry::PortMask;
 
 use engine_gpu::api::{Envelope, Host, PendingStep, program_attachments};
@@ -84,7 +84,10 @@ impl Host for Api {
     type Programs = crate::program::Plane;
 
     fn domain(boot: &DeviceBoot) -> MemoryDomain {
-        MemoryDomain::WgpuDevice(boot.adapter_index)
+        MemoryDomain::Device {
+            ordinal: boot.adapter_index,
+            reach: DeviceReach::Private,
+        }
     }
 
     fn measured_on(device: &crate::device::Context) -> String {

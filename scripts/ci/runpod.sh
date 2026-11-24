@@ -15,7 +15,11 @@ case "${1:?start|stop|status}" in
     # 500 while it does not: keep asking for a while, then say so and leave
     # `up=false` for the workflow, which skips the CUDA job instead of failing.
     up() { [[ -n "${GITHUB_OUTPUT:-}" ]] && echo "up=$1" >> "$GITHUB_OUTPUT"; return 0; }
-    s=$(status); echo "$s"
+    if ! s=$(status 2>&1); then
+      echo "::warning::RunPod pod ${RUNPOD_POD_ID} is not available ($s); the CUDA job is skipped"
+      up false; exit 0
+    fi
+    echo "$s"
     case "$s" in RUNNING*) up true; exit 0 ;; esac
     for attempt in $(seq 1 20); do
       if out=$(call POST /start 2>&1); then

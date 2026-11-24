@@ -15,6 +15,7 @@ unsafe extern "C" {
 }
 
 fn clock_ms() -> f64 {
+    // SAFETY: a host import with no arguments and no preconditions.
     unsafe { pie_now() }
 }
 
@@ -23,12 +24,14 @@ fn clock_ns() -> u64 {
 }
 
 fn wake() {
+    // SAFETY: a host import with no arguments and no preconditions.
     unsafe { pie_wake() }
 }
 
 #[wasm_bindgen]
 pub fn pie_init(log_filter: Option<String>) {
     // Run the static constructors once; referencing this keeps wasm-ld from wrapping every export to rerun them.
+    // SAFETY: called once, before any other export runs.
     unsafe { __wasm_call_ctors() };
     console_error_panic_hook::set_once();
     crate::log::install(log_filter.as_deref().unwrap_or("info"));

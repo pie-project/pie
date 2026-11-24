@@ -150,7 +150,7 @@ impl SlotPool {
     }
 
     /// The engine's standing guest bytes from now on
-    /// ([`::engine::Engine::standing_after`]): the span bytes it keeps for
+    /// ([`::engine::Programs::standing_after`]): the span bytes it keeps for
     /// the live instances of registered programs beside every fire, with
     /// what the binds under way may add. Set aside below the carve at
     /// every rung ([`Self::act_chunks`]); nothing moves here, as with

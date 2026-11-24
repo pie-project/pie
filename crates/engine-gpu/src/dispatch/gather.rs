@@ -173,6 +173,20 @@ impl<B: Backend> Run<'_, B> {
                 concat: false,
                 ..
             } => match self.banked(*table) {
+                // A bank past one binding lands a run of its rows at a time.
+                Some(_) if !self.bank_pieces(*table).is_empty() => {
+                    for &(first, bank) in self.bank_pieces(*table) {
+                        kernels_slang::gather::embed::embed_banked_rows(
+                            self.ctx,
+                            self.tensor(*ids),
+                            bank,
+                            first,
+                            bank.codes.rows.min(vocab.saturating_sub(first)),
+                            self.tensor(*y),
+                        )?;
+                    }
+                    Ok(())
+                }
                 Some(bank) => kernels_slang::gather::embed::embed_banked(
                     self.ctx,
                     self.tensor(*ids),

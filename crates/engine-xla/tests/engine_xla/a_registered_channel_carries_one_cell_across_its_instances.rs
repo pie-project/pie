@@ -10,7 +10,6 @@
 //! a reader ring, so the counts read back are the order the passes ran in.
 //! Skipped without a PJRT plugin.
 
-use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration, ChannelSeed};
 use engine::chunk::SlotCopy;
 use engine::program::{BindExtents, InstanceBinding, InstanceId, ProgramId, Rebind};
@@ -69,8 +68,7 @@ fn words(values: &[u32]) -> Vec<u8> {
 
 fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
     let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
-    rig.engine
-        .bind_instance(&InstanceBinding {
+    engine::Programs::bind(&mut rig.engine, &InstanceBinding {
             program,
             channels: vec![COUNTER, out],
             seeds: if seeded {
@@ -107,9 +105,7 @@ fn pass(rig: &mut Rig, instance: InstanceId, page: u32) -> u32 {
         vec![attach(0, instance)],
         Vec::new(),
     );
-    let bytes = rig
-        .engine
-        .take_channel(instance, 1)
+    let bytes = engine::Channels::take(&mut rig.engine, instance, 1)
         .expect("the reader ring reads")
         .expect("the pass put a cell");
     let cell: Vec<u32> = (bytes.as_chunks::<4>().0.iter())
@@ -150,9 +146,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
         capacity: 1,
         ..ChannelRegistration::default()
     };
-    let ring = rig
-        .engine
-        .ring_facts(&registration)
+    let ring = engine::Channels::ring_facts(&rig.engine, &registration)
         .expect("the engine answers")
         .expect("a channel an instance may carry keeps its ring in Channel slots");
     assert_eq!(ring.footprint.slots, 1, "one 1 KiB slot holds the cell");
@@ -161,20 +155,19 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
         ..registration.clone()
     };
     assert_eq!(
-        rig.engine.ring_facts(&reader).expect("the engine answers"),
+        engine::Channels::ring_facts(&rig.engine, &reader).expect("the engine answers"),
         None,
         "a channel the host reads keeps no ring in the pool"
     );
     registration.slots = contiguous(&mut refs, ring.footprint.slots);
-    rig.engine
-        .register_channel(&registration)
+    engine::Channels::open(&mut rig.engine, &registration)
         .expect("the counter registers over its slots");
 
     // Two programs of one content, as an inferlet's prefill and decode
     // programs share their sampler's channel.
     let first = rig.register(counter());
     let second = rig.register(counter());
-    let facts = rig.engine.program_facts(first).expect("the program's facts");
+    let facts = engine::Programs::facts(&rig.engine, first).expect("the program's facts");
     assert!(
         facts.rings.iter().any(|r| r.channel == 0),
         "the counter is carried on the device: {facts:?}"
@@ -189,8 +182,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
     // The counter's slot moves while `y` holds its cell on the device.
     let moved = contiguous(&mut refs, ring.footprint.slots);
     let device = rig.loaded.caps.device.domain;
-    rig.engine
-        .copy_slots(&SlotCopy {
+    engine::Tiers::copy(&mut rig.engine, &SlotCopy {
             shape: CHANNEL,
             src: device,
             dst: device,
@@ -200,8 +192,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
         .expect("the counter's slot moves");
     // What the old slot held is gone: a slot never written lands over it.
     let junk = contiguous(&mut refs, ring.footprint.slots);
-    rig.engine
-        .copy_slots(&SlotCopy {
+    engine::Tiers::copy(&mut rig.engine, &SlotCopy {
             shape: CHANNEL,
             src: device,
             dst: device,
@@ -209,8 +200,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
             runs: Vec::new(),
         })
         .expect("the old slot is overwritten");
-    rig.engine
-        .rebind_slots(Rebind::Channel {
+    engine::Programs::rebind(&mut rig.engine, Rebind::Channel {
             id: COUNTER,
             slots: moved,
         })
@@ -219,7 +209,7 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
     counts.push(pass(&mut rig, y, page));
 
     // `y` closes holding the cell; a fresh instance carries on from it.
-    rig.engine.close_instance(y).expect("y closes");
+    engine::Programs::close(&mut rig.engine, y).expect("y closes");
     let z = bind(&mut rig, first, true);
     counts.push(pass(&mut rig, z, page));
     counts.push(pass(&mut rig, x, page));
@@ -276,8 +266,7 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
     let bound = |rig: &mut Rig, seeded: bool| -> InstanceId {
         let input = rig.channel_of(vec![2], Dtype::U32, HostRole::Writer);
         let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
-        rig.engine
-            .bind_instance(&InstanceBinding {
+        engine::Programs::bind(&mut rig.engine, &InstanceBinding {
                 program,
                 channels: vec![input, out],
                 seeds: if seeded {
@@ -305,7 +294,7 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
     let starved = bound(&mut rig, false);
     let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let heard = std::sync::Arc::clone(&outcomes);
-    rig.engine.on_complete(std::sync::Arc::new(move |_, outcome| {
+    engine::Completion::on_complete(&mut rig.engine, std::sync::Arc::new(move |_, outcome| {
         heard.lock().expect("outcomes lock").push(outcome);
     }));
     rig.fire(
@@ -322,9 +311,7 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
     assert_eq!(faulted.len(), 1, "one lane faults: {faulted:?}");
     assert_eq!(faulted[0].lane, 1, "the starved instance's lane");
     assert_eq!(faulted[0].instance, Some(starved));
-    let bytes = rig
-        .engine
-        .take_channel(fed, 1)
+    let bytes = engine::Channels::take(&mut rig.engine, fed, 1)
         .expect("the reader ring reads")
         .expect("the fed instance's pass committed its cell");
     let cell: Vec<u32> = (bytes.as_chunks::<4>().0.iter())

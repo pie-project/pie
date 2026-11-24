@@ -61,13 +61,8 @@ impl<B: Backend> Store<B> {
                 start + held,
                 "the spans are packed from zero, in order"
             );
-            if reserved > ceiling {
-                return Err(Fault::Ceiling {
-                    what: "bytes of one plane in one buffer",
-                    need: reserved,
-                    have: ceiling,
-                });
-            }
+            // A plane past one binding takes a buffer of its own, which its
+            // readers bind a run of rows at a time.
             if held > 0 && held + reserved > ceiling {
                 chunks.push(Chunk {
                     start,

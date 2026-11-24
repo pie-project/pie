@@ -4,7 +4,7 @@
 //! the copies, spills and evacuations that move slots.
 
 use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
-use engine::transfer::{KvRun, MemoryDomain};
+use engine::transfer::{DeviceReach, KvRun, MemoryDomain};
 use kernels_metal::{KvPool, RecurrentPool, StateMap, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
 use poem_ir::{CacheRow, Dtype, Trace};
@@ -1104,7 +1104,7 @@ impl Pools {
         Ok(())
     }
 
-    /// See [`engine::Engine::read_tier_slots`]: the bytes of host tier
+    /// See [`engine::Tiers::read`]: the bytes of host tier
     /// slots, shape by shape, each laid out as `copy_slots` moves it (the
     /// device slot's bytes). Unified memory: the host tier is plain host
     /// memory, so this is one memcpy a slot, no staging. The caller has
@@ -1132,7 +1132,7 @@ impl Pools {
         Ok(out)
     }
 
-    /// See [`engine::Engine::write_tier_slots`]: `bytes`, laid out as
+    /// See [`engine::Tiers::write`]: `bytes`, laid out as
     /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
     /// whole when the byte count differs or a ref lies past the tier. The
     /// caller has drained every frame.
@@ -2260,11 +2260,14 @@ impl Pools {
         Ok(())
     }
 
-    /// Slots of one shape copied as [`engine::Engine::copy_slots`] states
+    /// Slots of one shape copied as [`engine::Tiers::copy`] states
     /// them: on the device (whole slots, and token runs of the list), or
     /// between the device and the slot files.
     pub fn copy_slots(&mut self, frame: &mut Frame, copy: &SlotCopy) -> Result<()> {
-        let device = MemoryDomain::MetalShared;
+        let device = MemoryDomain::Device {
+            ordinal: 0,
+            reach: DeviceReach::HostShared,
+        };
         match (copy.src, copy.dst) {
             (src, dst) if src == device && dst == device => {
                 self.copy_whole(frame, copy.shape, &copy.slots)?;
@@ -2589,7 +2592,7 @@ impl Pools {
         Ok(u64::from(physical) * self.layout.chunk_bytes + u64::from(index) * slot_bytes)
     }
 
-    /// See `Engine::weight_residency`: blocks newly named a slot are copied
+    /// See `WeightCache::set_residency`: blocks newly named a slot are copied
     /// into it in `frame`. The caller has drained every frame, commits
     /// `frame`, then calls [`Pools::restage_weights`].
     pub fn weight_residency(
@@ -2917,7 +2920,7 @@ impl Pools {
             .collect()
     }
 
-    /// See `Engine::weight_uses`. No frame is in flight.
+    /// See `WeightCache::uses`. No frame is in flight.
     pub fn weight_uses(&mut self) -> Result<engine::chunk::WeightUses> {
         let mut uses = Vec::new();
         for cache in &mut self.weight_caches {
@@ -3082,8 +3085,8 @@ mod copy_landing_tests {
             }
             let copy = SlotCopy {
                 shape: CHANNEL,
-                src: MemoryDomain::MetalShared,
-                dst: MemoryDomain::MetalShared,
+                src: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+                dst: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
                 slots: src.iter().copied().zip(dst.iter().copied()).collect(),
                 runs: Vec::new(),
             };

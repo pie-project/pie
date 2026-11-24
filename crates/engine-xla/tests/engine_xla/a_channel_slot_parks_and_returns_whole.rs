@@ -3,7 +3,6 @@
 //! slot, and back to another host slot whole (CONTRACT-BC 22). Skipped
 //! without a PJRT plugin.
 
-use engine::Engine;
 use engine::chunk::SlotCopy;
 use engine::transfer::MemoryDomain;
 use engine_xla::store::layout::CHANNEL;
@@ -25,14 +24,10 @@ fn a_channel_slot_parks_and_returns_whole() {
     let (d1, d2) = (refs.take(CHANNEL), refs.take(CHANNEL));
     let (h1, h2) = (0u32, 1u32);
     let bytes: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
-    model
-        .engine
-        .write_tier_slots(&[(CHANNEL, vec![h1])], &bytes)
+    engine::Tiers::write(&mut model.engine, &[(CHANNEL, vec![h1])], &bytes)
         .expect("the host slot writes");
     let copy = |model: &mut Model, src, dst, slots: Vec<(u32, u32)>| {
-        model
-            .engine
-            .copy_slots(&SlotCopy {
+        engine::Tiers::copy(&mut model.engine, &SlotCopy {
                 shape: CHANNEL,
                 src,
                 dst,
@@ -44,9 +39,7 @@ fn a_channel_slot_parks_and_returns_whole() {
     copy(&mut model, MemoryDomain::HostPinned, device, vec![(h1, d1)]);
     copy(&mut model, device, device, vec![(d1, d2)]);
     copy(&mut model, device, MemoryDomain::HostPinned, vec![(d2, h2)]);
-    let back = model
-        .engine
-        .read_tier_slots(&[(CHANNEL, vec![h2])])
+    let back = engine::Tiers::read(&mut model.engine, &[(CHANNEL, vec![h2])])
         .expect("the host slot reads");
     assert_eq!(back, bytes, "the cell came back whole");
 }

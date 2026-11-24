@@ -1,6 +1,7 @@
 [package]
 name = "waker"
 version.workspace = true
+rust-version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "X0 tensor-waker substrate (Runtime–Engine Boundary B9–B12): the Rust-owned waker slot table + pie_wake FFI the direct-call transport parks on. A leaf crate (std + loom only) so the register/commit race is model-checked under `--cfg loom` without dragging the runtime's dependency graph into the loom build."

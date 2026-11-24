@@ -222,7 +222,7 @@ impl GuestEngine {
     }
 }
 
-impl Engine for GuestEngine {
+impl ::engine::Engine for GuestEngine {
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -233,51 +233,12 @@ impl Engine for GuestEngine {
 
     }
 
-
     fn skips_measuring(&self) -> bool {
         false
     }
 
-    /// A test engine's copies land inside the call: nothing to wait for.
-    fn settle_copies(&mut self) -> ::engine::Result<()> {
-        Ok(())
-    }
-
-    /// A test engine's copies complete inside the call: their sources are
-    /// read by the time it returns.
-    fn copy_slots_landing(
-        &mut self,
-        copy: &::engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> ::engine::Result<bool> {
-        self.copy_slots(copy)?;
-        Ok(true)
-    }
-
     fn kind(&self) -> &'static str {
         "fake-guests"
-    }
-
-    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(self.unsupported("chunk_table"))
-    }
-
-    fn prepare_program(
-        &mut self,
-        _registration: &::engine::program::ProgramRegistration,
-    ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-    }
-
-    fn finish_program(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-    }
-
-    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
     fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
@@ -288,7 +249,43 @@ impl Engine for GuestEngine {
         unreachable!("nothing fires here")
     }
 
-    fn program_facts(&self, _program: ProgramId) -> ::engine::Result<ProgramFacts> {
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for GuestEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn facts(&self, _program: ProgramId) -> ::engine::Result<ProgramFacts> {
         Ok(ProgramFacts::default())
     }
 
@@ -301,7 +298,7 @@ impl Engine for GuestEngine {
         Ok(self.state)
     }
 
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> ::engine::Result<BoundInstance> {
         self.claim(InstanceId(self.next + 1), &binding.scratch)?;
         self.next += 1;
         self.bindings.push(binding.clone());
@@ -313,7 +310,7 @@ impl Engine for GuestEngine {
         })
     }
 
-    fn rebind_slots(&mut self, rebind: Rebind) -> ::engine::Result<()> {
+    fn rebind(&mut self, rebind: Rebind) -> ::engine::Result<()> {
         match &rebind {
             Rebind::Instance { id, scratch, .. } => self.claim(*id, scratch)?,
             Rebind::Parked { id, .. } => {
@@ -326,7 +323,72 @@ impl Engine for GuestEngine {
         self.rebinds.push(rebind);
         Ok(())
     }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
 }
+
+impl ::engine::Pool for GuestEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for GuestEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
 
 fn holder(n: u128) -> super::Holder {
     uuid::Uuid::from_u128(n)
@@ -555,7 +617,7 @@ fn a_park_gives_the_scratch_back_whole_and_an_unpark_takes_fresh_chunks() {
         "none of another instance's: {fresh:?} {others:?}"
     );
     for rebind in stale {
-        engine.rebind_slots(rebind).unwrap();
+        <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
         roles.lock().unwrap().rebound(Owner::Instance(id));
     }
     assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
@@ -2292,7 +2354,7 @@ async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() 
         roles.lock().unwrap().commit(back);
         let stale = roles.lock().unwrap().stale(holder(by));
         for rebind in stale {
-            engine.rebind_slots(rebind).unwrap();
+            <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
             roles.lock().unwrap().rebound(Owner::Instance(id));
         }
     }
@@ -2382,7 +2444,7 @@ fn with_no_host_tier_a_shared_pair_s_state_goes_back_once_every_holder_parked() 
         roles.lock().unwrap().commit(back);
         let stale = roles.lock().unwrap().stale(holder(by));
         for rebind in stale {
-            engine.rebind_slots(rebind).unwrap();
+            <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
             roles.lock().unwrap().rebound(Owner::Instance(id));
         }
     }
@@ -3302,7 +3364,7 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
     assert_eq!(*rebound, id);
     assert_eq!(pieces_of(&device, scratch).len(), 2, "two runs: {scratch:?}");
     for rebind in stale {
-        engine.rebind_slots(rebind).unwrap();
+        <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
         roles.lock().unwrap().rebound(Owner::Instance(id));
     }
     assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "nothing left unbound");

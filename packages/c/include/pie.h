@@ -58,7 +58,8 @@ const char *pie_version(void);
 
    `home` is a writable directory the runtime keeps its files under;
    `listen` (`"host:port"`, or NULL) also serves pie's gateway there. One
-   server per process. */
+   server at a time per process: the next, of any model, starts once this
+   one is shut down. */
 pie_status pie_server_start(const char *artifact, const char *config, const char *home,
                             const char *listen, pie_server **out, char **error);
 

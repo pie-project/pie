@@ -1,0 +1,4 @@
+# PLEX 1.1 policies are core wasm modules, made components after the build
+# (crates/builtins/build.rs): a policy imports only the contract, no WASI.
+[build]
+target = "wasm32-unknown-unknown"

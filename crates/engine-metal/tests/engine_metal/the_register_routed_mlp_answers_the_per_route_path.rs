@@ -595,7 +595,6 @@ fn the_eight_bit_routed_select_answers_f64() {
         Tensor::new(bind(&yb), TOKENS, N, Dtype::Bf16),
     )
     .expect("the select");
-    drop(sink);
     frame.commit().expect("commit");
     let mut raw = vec![0u8; (TOKENS * N * 2) as usize];
     yb.read(0, &mut raw).expect("read");

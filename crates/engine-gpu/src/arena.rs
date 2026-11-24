@@ -142,6 +142,7 @@ pub fn grain(map: &ArenaMap, value: ValueId) -> Option<Grain> {
 }
 
 impl Rung {
+    #[allow(clippy::too_many_arguments)]
     fn lay<T: Tactics + ?Sized>(
         trace: &Trace,
         compiled: &CompiledModel,
@@ -150,6 +151,8 @@ impl Rung {
         paging: Paging,
         tuning: &T,
         routers: &[u32],
+        planes: &[u64],
+        max_buffer: u64,
     ) -> Result<Rung> {
         let map = if tokens >= budgets.tokens.max_tokens {
             compiled.arena.clone()
@@ -162,7 +165,7 @@ impl Rung {
             })?
         };
         let rooms = Rooms::lay(
-            trace, compiled, &map, budgets, tokens, paging, tuning, routers,
+            trace, compiled, &map, budgets, tokens, paging, tuning, routers, planes, max_buffer,
         );
         let rooms_at = map.bytes.next_multiple_of(ALIGN);
         let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
@@ -241,12 +244,20 @@ impl<B: Backend> Span<B> {
         tokens: &[u32],
         paging: Paging,
         tuning: &B::Tuning,
+        max_buffer: u64,
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
+        // A projection whose bank outgrows one binding lands its logits in
+        // a room of the rung's, a run of rows at a time.
+        let planes = crate::weights::plane_bytes(trace)?;
         let capture = CaptureRows::of(trace, paging.context(), paging.page_size)?;
         let rungs = tokens
             .iter()
-            .map(|&tokens| Rung::lay(trace, compiled, budgets, tokens, paging, tuning, &routers))
+            .map(|&tokens| {
+                Rung::lay(
+                    trace, compiled, budgets, tokens, paging, tuning, &routers, &planes, max_buffer,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Span {
             widest: (0..rungs.len()).collect(),

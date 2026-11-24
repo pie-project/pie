@@ -2346,7 +2346,7 @@ impl Shell {
                     None if !self.exports.reads_readout_rows() => BodyReads::Rows,
                     _ if !self.landing[class as usize]
                         .iter()
-                        .any(poem_ir::Request::plain) =>
+                        .any(crate::exports::plain_or_adapted) =>
                     {
                         BodyReads::Verify
                     }

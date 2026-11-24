@@ -248,10 +248,11 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     let engine = crate::chip::Engine::of(chip);
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
     let profile = poem_compiler::DeviceProfile::of(chip, sms, &crate::EXCLUSIVE, grouped);
-    let trace = poem_compiler::fuse::fuse(
-        row.trace(poem::Platform::Cuda),
-        poem_compiler::fuse::flags::on(chip, &crate::FUSIONS),
-    );
+    #[cfg(not(feature = "rocm"))]
+    let rules = crate::fusions(chip);
+    #[cfg(feature = "rocm")]
+    let rules = poem_compiler::fuse::flags::on(chip, &crate::FUSIONS);
+    let trace = poem_compiler::fuse::fuse(row.trace(poem::Platform::Cuda), rules);
     #[cfg(not(feature = "rocm"))]
     let trace = {
         let tuning = kernels_cuda::tuning::Tuning::of(chip);
@@ -266,6 +267,9 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
             || tuning.ssm_gdn_out_bf16(),
         )
     };
+    #[cfg(not(feature = "rocm"))]
+    let trace =
+        poem_compiler::fuse::fuse(trace, crate::residual_norms(chip, profile.synth_regions));
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budget = poem_compiler::Budget::new(slots, CONTEXT);
     budget.buckets = crate::api::lattice(

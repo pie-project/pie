@@ -96,8 +96,7 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
     let bound = eta_ir::validate::bind(fold_program(), vec![Vec::new()], EngineCaps::default())
         .expect("the fold program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(engine, &ProgramRegistration {
             program_hash: 0xf01d,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
@@ -149,8 +148,7 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
         },
         &channels,
     );
-    engine
-        .bind_instance(&binding)
+    engine::Programs::bind(engine, &binding)
         .expect("the fold program binds an instance")
         .id
 }
@@ -395,8 +393,7 @@ impl Model {
         let tokens: Vec<u8> = lane.tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         for (channel, bytes) in [(0, tokens), (1, N.to_le_bytes().to_vec())] {
             assert!(
-                self.engine
-                    .publish_channel(instance, channel, &bytes)
+                engine::Channels::publish(&mut self.engine, instance, channel, &bytes)
                     .expect("the cell publishes"),
                 "the ring had room"
             );
@@ -513,10 +510,10 @@ fn load_on(
             steps: Default::default(),
         })
         .expect("the miniature loads");
-    let asynchronous = engine.settles_asynchronously();
+    let asynchronous = engine::Completion::asynchronous(&engine);
     let (tx, heard) = mpsc::channel();
     let tx = Mutex::new(tx);
-    engine.on_complete(Arc::new(move |at, outcome| {
+    engine::Completion::on_complete(&mut engine, Arc::new(move |at, outcome| {
         let _ = tx.lock().expect("the sink's sender").send((at, outcome));
     }));
 
@@ -574,7 +571,7 @@ fn load_on(
         most >= commit,
         "the test's chunks span {commit} segments, the pool has {most} for them"
     );
-    engine.commit_segments(commit).expect("the segments commit");
+    engine::Pool::commit(&mut engine, commit).expect("the segments commit");
     eprintln!(
         "{MODEL}: {need} chunks from {first}, {segment} a segment; {pieces} piece(s) a record, \
          {rs_tokens} rows an rs slot"

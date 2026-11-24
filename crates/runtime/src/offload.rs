@@ -39,18 +39,33 @@ pub fn home_kv_handle() -> Option<engine::KvHandle> {
 /// TTLs, pages held for one that never released them and runs no fetch
 /// took, so an executor that serves nothing more still lets them go.
 fn sweep_idle() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        let every = prefill::LEASE_TTL.min(stream::UNTAKEN_TTL) / 2;
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(every);
-            loop {
-                tick.tick().await;
-                prefill::expire_leases();
-                stream::expire_untaken();
-            }
-        });
+    if SWEEPING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let every = prefill::LEASE_TTL.min(stream::UNTAKEN_TTL) / 2;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            prefill::expire_leases();
+            stream::expire_untaken();
+        }
     });
+}
+
+/// The sweep ends with its runtime; the next boot's starts its own.
+static SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Forgets the boot's offload state, for [`crate::bootstrap::reset`]. What
+/// the cluster link set (directory, remote, dialer, peer) is the link's,
+/// which outlives a boot.
+pub(crate) fn reset() {
+    PREFILL_MIN_SUFFIX_TOKENS.store(usize::MAX, Ordering::Release);
+    *HOME_KV_HANDLE.write().unwrap() = None;
+    SWEEPING.store(false, Ordering::Release);
+    prefill::reset();
+    executors::reset();
+    stream::reset();
 }
 
 pub(crate) fn prefill_min_suffix_tokens() -> Option<usize> {

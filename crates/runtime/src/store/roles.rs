@@ -5,7 +5,7 @@
 //! [`SlotRole::Channel`] or [`SlotRole::Adapter`] places a bound instance's
 //! launch tables, a ring's cells and the adapter an instance lands in slots
 //! of them, which the runtime takes from the pool on demand:
-//! [`Engine::program_facts`] and [`Engine::ring_facts`] say how many, and
+//! [`Programs::facts`] and [`Channels::ring_facts`] say how many, and
 //! the binding ([`InstanceBinding::instance_slots`],
 //! [`InstanceBinding::ring_slots`], [`InstanceBinding::adapter_slots`]) or
 //! registration ([`ChannelRegistration::slots`]) names them. They are no
@@ -16,7 +16,7 @@
 //! with their process on the host tier, as it parks the process's kv: a
 //! park copies each item to host slots and frees its device slots, an
 //! unpark copies it into fresh device slots, and the engine is told the new
-//! refs ([`Engine::rebind_slots`]) before the next fire reads them. What
+//! refs ([`Programs::rebind`]) before the next fire reads them. What
 //! the host has no room for at the park stays on the device, parked, until
 //! the device wants its room ([`Roles::prepare_park_down`]): then it goes
 //! on down to the host, or, where the load states no host tier (unified
@@ -26,12 +26,12 @@
 //! A ring an instance holds itself is the instance's item. A registered
 //! channel's ring is the channel's, shared by every instance bound to it,
 //! and freed once the channel is closed and the last of them has closed
-//! too. An adapter is keyed by its content ([`Engine::adapter_key`]): every
+//! too. An adapter is keyed by its content ([`Programs::adapter_key`]): every
 //! instance whose binding lands the same planes holds the one item, taken
 //! at the first bind and freed at the last close; it parks only when every
 //! instance holding it parks, and each holder is rebound to where it lands.
 //!
-//! [`Engine::adapter_key`]: ::engine::Engine::adapter_key
+//! [`Programs::adapter_key`]: ::engine::Programs::adapter_key
 //!
 //! A guest program's scratch is state too ([`::engine::GuestState`]): each
 //! instance's, held while it is bound ([`InstanceBinding::scratch`]), and
@@ -55,9 +55,9 @@
 //! [`InstanceBinding::pair`]: ::engine::InstanceBinding::pair
 //! [`Rebind::Instance`]: ::engine::Rebind::Instance
 //!
-//! [`Engine::program_facts`]: ::engine::Engine::program_facts
-//! [`Engine::ring_facts`]: ::engine::Engine::ring_facts
-//! [`Engine::rebind_slots`]: ::engine::Engine::rebind_slots
+//! [`Programs::facts`]: ::engine::Programs::facts
+//! [`Channels::ring_facts`]: ::engine::Channels::ring_facts
+//! [`Programs::rebind`]: ::engine::Programs::rebind
 //! [`InstanceBinding::instance_slots`]: ::engine::InstanceBinding::instance_slots
 //! [`InstanceBinding::ring_slots`]: ::engine::InstanceBinding::ring_slots
 //! [`InstanceBinding::adapter_slots`]: ::engine::InstanceBinding::adapter_slots

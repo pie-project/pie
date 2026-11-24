@@ -11,7 +11,7 @@ use crate::core::{
     Backend, BackendKind, Completion, PageSet, PeerConn, RegisteredHandle, TransferId, WorkerId,
 };
 use crate::error::{Result, TransportError};
-use engine::{KvHandle, MemoryDomain};
+use engine::{DeviceReach, KvHandle, MemoryDomain};
 use ffi::{
     nixl_capi_agent_t, nixl_capi_backend_t, nixl_capi_create_agent, nixl_capi_create_backend,
     nixl_capi_create_reg_dlist, nixl_capi_create_xfer_dlist, nixl_capi_create_xfer_req,
@@ -37,21 +37,16 @@ fn err(ctx: &str, st: nixl_capi_status_t) -> TransportError {
 }
 
 /// The NIXL segment a domain's memory registers as, and its device id: host
-/// memory as DRAM, a CUDA or ROCm device's as VRAM. The rest (Metal, Vulkan,
-/// wgpu, XLA, Cerebras memory, a slot file) NIXL cannot reach.
+/// memory as DRAM, device memory a peer reaches as VRAM. The rest (device
+/// memory only its engine or the host maps, a slot file) NIXL cannot reach.
 fn segment(domain: MemoryDomain) -> Result<(nixl_capi_mem_type_t, u64)> {
     match domain {
         MemoryDomain::HostPinned => Ok((nixl_capi_mem_type_t_NIXL_CAPI_MEM_DRAM, 0)),
-        MemoryDomain::CudaDevice(n) | MemoryDomain::RocmDevice(n) => {
-            Ok((nixl_capi_mem_type_t_NIXL_CAPI_MEM_VRAM, u64::from(n)))
-        }
-        MemoryDomain::MetalShared
-        | MemoryDomain::MetalPrivate
-        | MemoryDomain::VulkanDevice(_)
-        | MemoryDomain::WgpuDevice(_)
-        | MemoryDomain::XlaDevice(_)
-        | MemoryDomain::CerebrasDevice(_)
-        | MemoryDomain::LocalDisk => Err(TransportError::Unsupported(
+        MemoryDomain::Device {
+            ordinal,
+            reach: DeviceReach::Peer,
+        } => Ok((nixl_capi_mem_type_t_NIXL_CAPI_MEM_VRAM, u64::from(ordinal))),
+        MemoryDomain::Device { .. } | MemoryDomain::LocalDisk => Err(TransportError::Unsupported(
             "NIXL reaches host memory and CUDA or ROCm device memory only",
         )),
     }

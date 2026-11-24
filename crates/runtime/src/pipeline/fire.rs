@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 /// A prologue that takes or puts a channel commits before its fire's forward.
 fn container_prologue_moves(container: &eta_ir::container::TraceContainer) -> bool {
     use eta_ir::op::ChannelUse;
@@ -1020,6 +1018,12 @@ fn beam_common_of(instance: ::engine::InstanceId) -> u32 {
     BEAM_COMMON.lock().unwrap().get(&instance).copied().unwrap_or(0)
 }
 
+/// Forgets the boot's landed records, for [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    KV_WRITES.lock().unwrap().clear();
+    BEAM_COMMON.lock().unwrap().clear();
+}
+
 pub(crate) fn record_kv_writes(writes: Vec<::engine::KvWrites>) {
     let mut held = KV_WRITES.lock().unwrap();
     for written in writes {
@@ -1157,9 +1161,9 @@ fn reported_rows(
         (offset < page).then_some(index * page + offset)
     };
     let first = slot(0)?;
-    for row in 0..rows {
+    for (row, &position) in written.positions.iter().enumerate() {
         let at = first + row as u64;
-        if slot(row)? != at || u64::from(written.positions[row]) != at {
+        if slot(row)? != at || u64::from(position) != at {
             return None;
         }
     }
@@ -1383,7 +1387,8 @@ impl Switched {
 
     /// Whether the pass's rows may be cut, keyed and logged by their tokens.
     pub(crate) fn plain(&self) -> bool {
-        let facts = crate::model::model().facts();
+        let model = crate::model::model();
+        let facts = model.facts();
         !self.rows_read
             && self.lanes.iter().flatten().all(|(name, value)| {
                 facts

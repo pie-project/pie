@@ -14,11 +14,11 @@ fn in_two_steps(
     engine: &mut crate::backend::Engine,
     registration: &ProgramRegistration,
 ) -> engine::Result<engine::program::ProgramId> {
-    let compile = engine.prepare_program(registration)?;
+    let compile = engine::Programs::prepare(engine, registration)?;
     let prepared = std::thread::spawn(compile)
         .join()
         .expect("the compile thread");
-    engine.finish_program(prepared)
+    engine::Programs::finish(engine, prepared)
 }
 
 #[test]
@@ -27,9 +27,7 @@ fn a_program_prepared_off_thread_is_the_program_registered_whole() {
         return;
     };
     let registration = epilogue_registration(&loaded.caps);
-    let whole = loaded
-        .engine
-        .register_program(&registration)
+    let whole = engine::Programs::register(&mut loaded.engine, &registration)
         .expect("the program registers whole");
     let split = in_two_steps(&mut loaded.engine, &registration)
         .expect("the program registers in two steps");
@@ -42,9 +40,7 @@ fn a_program_prepared_off_thread_is_the_program_registered_whole() {
         "the same package"
     );
     let facts = |program| {
-        loaded
-            .engine
-            .program_facts(program)
+        engine::Programs::facts(&loaded.engine, program)
             .expect("an instance's facts")
     };
     assert_eq!(facts(whole), facts(split), "the same facts");
@@ -62,9 +58,7 @@ fn a_program_prepared_off_thread_is_the_program_registered_whole() {
     );
     // And a prepared program another engine's compile made is refused.
     let foreign = engine::Prepared(Box::new(0u8));
-    let refused = loaded
-        .engine
-        .finish_program(foreign)
+    let refused = engine::Programs::finish(&mut loaded.engine, foreign)
         .expect_err("a foreign prepared program is refused");
     assert!(
         refused.to_string().contains("did not prepare"),
@@ -167,8 +161,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");
         for dense in [0, 1] {
-            engine
-                .take_channel(instance, dense)
+            engine::Channels::take(engine, instance, dense)
                 .expect("the channel reads")
                 .expect("the channel holds a cell");
         }
@@ -183,8 +176,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
     // pay, before the compile window opens.
     let cold = super::outputs::registration_of(&decls, heavier_epilogue(ROUNDS), 0xc01d);
     let whole = std::time::Instant::now();
-    engine
-        .register_program(&cold)
+    engine::Programs::register(&mut engine, &cold)
         .expect("the program registers whole");
     let whole = whole.elapsed();
     let (mut normal, mut steady) = (std::time::Duration::ZERO, 0u32);
@@ -202,7 +194,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
     // The same compile off the lane, the prepare and the thread's spawn in
     // the window's first gap.
     let mut last = std::time::Instant::now();
-    let compile = engine.prepare_program(&cold).expect("the program prepares");
+    let compile = engine::Programs::prepare(&mut engine, &cold).expect("the program prepares");
     let began = std::time::Instant::now();
     let compiling = std::thread::spawn(move || {
         let prepared = compile();
@@ -218,8 +210,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
     }
     let (prepared, built) = compiling.join().expect("the compile finishes");
     let finishing = std::time::Instant::now();
-    let program = engine
-        .finish_program(prepared)
+    let program = engine::Programs::finish(&mut engine, prepared)
         .expect("the program registers");
     let finished = finishing.elapsed();
     eprintln!(
@@ -290,15 +281,11 @@ fn a_prewarm_holds_a_programs_calls_to_the_loads_pipelines() {
     assert_eq!(narrow.forms, wide.forms, "the same dispatches");
     assert_eq!(narrow.calls, wide.calls, "the same pipelines");
 
-    loaded
-        .engine
-        .prewarm_programs(&[registration.clone(), wider.clone()])
+    engine::Programs::prewarm(&mut loaded.engine, &[registration.clone(), wider.clone()])
         .expect("the prewarm finds every call built");
     let live = loaded.engine.live();
     for program in [&registration, &wider] {
-        loaded
-            .engine
-            .register_program(program)
+        engine::Programs::register(&mut loaded.engine, program)
             .expect("the program registers");
     }
     assert_eq!(live.tallied(Tally::BuiltAtRegister), 0, "a registration built nothing");
@@ -306,9 +293,7 @@ fn a_prewarm_holds_a_programs_calls_to_the_loads_pipelines() {
 
     let call = *narrow.calls.first().expect("the program dispatches a call");
     loaded.engine.programs.forget_step(call);
-    let refused = loaded
-        .engine
-        .prewarm_programs(std::slice::from_ref(&registration))
+    let refused = engine::Programs::prewarm(&mut loaded.engine, std::slice::from_ref(&registration))
         .expect_err("a call with no pipeline from the load refuses the prewarm");
     assert!(
         refused.to_string().contains(&format!("guest step call {call}")),

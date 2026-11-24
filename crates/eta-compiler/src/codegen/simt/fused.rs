@@ -903,6 +903,9 @@ pub fn emit_fused_region(
                 at += covered - 1;
                 continue;
             }
+            if op.tag == tags::OUTPUT && streams.intrinsic_unread(base) {
+                continue;
+            }
         }
         // A split row's op outside a stream runs in its region's current
         // phase (`emit_stream`'s count of the phases its meets begin).

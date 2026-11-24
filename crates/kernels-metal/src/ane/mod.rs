@@ -34,8 +34,13 @@ pub(crate) use program::{CONSTANT_OFFSET, constant_blob};
 pub use surface::{Element, Surface};
 
 /// Whether the private framework loads and still has every call the bridge
-/// makes. The first call resolves it; later calls answer at once.
+/// makes. The first call resolves it; later calls answer at once. On iOS the
+/// framework loads but the sandbox refuses an app its compile service
+/// ("Operation not permitted"), so the work stays on the GPU there.
 pub fn available() -> Result<(), String> {
+    if cfg!(target_os = "ios") {
+        return Err("the Neural Engine compiler is not open to iOS apps".into());
+    }
     let mut err = sys::message();
     // SAFETY: `err` is a `CAP`-byte buffer, the length the call is told.
     if unsafe { sys::pie_ane_available(err.as_mut_ptr(), sys::CAP as c_int) } == 1 {

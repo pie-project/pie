@@ -8,11 +8,11 @@ use checkpoint::contract::ModelContract;
 use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
 use engine::ChannelId;
-use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
+use engine::Engine;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Stage};
@@ -390,8 +390,7 @@ fn bound_with(
         .expect("the plan reads `t`") as u32;
 
     let decls = output_decls(&loaded);
-    let program = engine
-        .register_program(&registration_of(&decls, epilogue(), 0x0e7))
+    let program = engine::Programs::register(&mut engine, &registration_of(&decls, epilogue(), 0x0e7))
         .expect("the program registers");
     before(&mut engine, program);
     let chunks = &loaded.caps.chunks;
@@ -448,13 +447,11 @@ fn bound_with(
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     assert!(
-        engine
-            .publish_channel(instance, 2, &T.to_le_bytes())
+        engine::Channels::publish(&mut engine, instance, 2, &T.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
@@ -517,8 +514,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
     engine.settle_frame(&mut ticket).expect("the frame settles");
 
     let take = |engine: &mut backend::Engine, dense: u32| {
-        engine
-            .take_channel(instance, dense)
+        engine::Channels::take(engine, instance, dense)
             .expect("the channel reads")
             .expect("the channel holds a cell")
     };
@@ -676,15 +672,13 @@ fn a_pipeline_built_after_the_load_is_counted() {
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");
         for dense in [0, 1] {
-            engine
-                .take_channel(instance, dense)
+            engine::Channels::take(engine, instance, dense)
                 .expect("the channel reads")
                 .expect("the channel holds a cell");
         }
         // The next fire's timestep, where the ring has room for it (a
         // full ring still holds this one's).
-        engine
-            .publish_channel(instance, 2, &T.to_le_bytes())
+        engine::Channels::publish(engine, instance, 2, &T.to_le_bytes())
             .expect("the timestep publishes");
     };
 

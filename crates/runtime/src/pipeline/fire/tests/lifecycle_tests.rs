@@ -279,12 +279,10 @@ pub(crate) fn resolve_test_completion(
     if failed {
         completion.reject("test callback failure");
     } else {
-        // SAFETY: `completion` is borrowed for the whole call and owns this
-        // terminal cell, so the pointer is live; `publish` is an atomic store.
-        unsafe {
-            (*completion.terminal_cell_ptr().0)
-                .publish(crate::engine::completion::TERMINAL_OUTCOME_SUCCESS);
-        }
+        completion
+            .terminal_cell_ptr()
+            .0
+            .publish(crate::engine::completion::TERMINAL_OUTCOME_SUCCESS);
         completion
             .resolve_from_terminal()
             .expect("publish successful completion");

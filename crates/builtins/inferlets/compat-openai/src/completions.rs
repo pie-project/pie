@@ -30,8 +30,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    alternatives, choices, invalid, no_logit_bias, run_choices, stop_sequences, token_text,
-    usage_of,
+    alternatives, choices, invalid, no_logit_bias, run_choices, stop_reason, stop_sequences,
+    token_label, token_text, usage_of,
 };
 
 #[derive(Deserialize, Default)]
@@ -45,16 +45,21 @@ struct Body {
     top_p: Option<f32>,
     top_k: Option<u32>,
     stop: Option<Value>,
+    stop_token_ids: Option<Vec<u32>>,
+    include_stop_str_in_output: bool,
     response_format: Option<Value>,
     seed: Option<i64>,
     n: Option<u32>,
     logprobs: Option<Value>,
+    logprobs_mode: Option<String>,
     prompt_logprobs: Option<i64>,
     min_p: Option<f32>,
     echo: bool,
     suffix: Option<String>,
     stream: bool,
     stream_options: Option<StreamOptions>,
+    return_token_ids: bool,
+    return_tokens_as_token_ids: bool,
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
@@ -77,6 +82,7 @@ struct Parsed {
     logprobs: Option<u32>,
     /// How many alternatives vLLM's `prompt_logprobs` carries, where asked.
     prompt_logprobs: Option<u32>,
+    as_ids: bool,
 }
 
 impl Parsed {
@@ -143,6 +149,7 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
         None => req.raw_prompt = Some(prompt.clone()),
     }
     req.stream = body.stream;
+    req.return_token_ids = body.return_token_ids;
     req.max_tokens = body.max_tokens.unwrap_or(16);
     req.ignore_eos = body.ignore_eos;
     if req.max_tokens == 0 {
@@ -171,6 +178,7 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
         req.sampling.min_p = p;
     }
     req.sampling.logprobs = logprobs;
+    req.sampling.logprobs_mode = crate::logprobs_mode(body.logprobs_mode)?;
     let echo_logprobs = logprobs.filter(|_| body.echo);
     let prompt_logprobs = crate::prompt_logprobs(body.prompt_logprobs, body.stream)?;
     req.sampling.prompt_logprobs = echo_logprobs.max(prompt_logprobs);
@@ -179,6 +187,8 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
     }
     req.sampling.validate().map_err(|e| invalid(e, None))?;
     req.stop = stop_sequences(body.stop)?;
+    req.stop_token_ids = body.stop_token_ids.unwrap_or_default();
+    req.include_stop_str_in_output = body.include_stop_str_in_output;
     req.response_format = crate::response_format(body.response_format)?;
     Ok(Parsed {
         req,
@@ -188,6 +198,7 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
         n,
         logprobs,
         prompt_logprobs,
+        as_ids: body.return_tokens_as_token_ids,
     })
 }
 
@@ -222,6 +233,7 @@ impl Ids {
 /// `null`s for a token nothing scored.
 #[derive(Default)]
 struct Legacy {
+    as_ids: bool,
     tokens: Vec<String>,
     values: Vec<Value>,
     tops: Vec<Value>,
@@ -229,6 +241,13 @@ struct Legacy {
 }
 
 impl Legacy {
+    fn new(as_ids: bool) -> Self {
+        Self {
+            as_ids,
+            ..Self::default()
+        }
+    }
+
     /// `steps` with the first token's text starting at character `offset`,
     /// each with at most `top` alternatives.
     fn push<'a>(
@@ -239,10 +258,9 @@ impl Legacy {
     ) -> &mut Self {
         let mut at = offset;
         for (token, lp) in steps {
-            let text = token_text(token);
             self.offsets.push(at);
-            at += text.chars().count();
-            self.tokens.push(text);
+            at += token_text(token).chars().count();
+            self.tokens.push(token_label(token, self.as_ids));
             let Some(lp) = lp else {
                 self.values.push(Value::Null);
                 self.tops.push(Value::Null);
@@ -254,9 +272,10 @@ impl Legacy {
             };
             let mut alts = serde_json::Map::new();
             for (alt, alt_lp) in alternatives(token, &lp) {
-                alts.entry(token_text(alt)).or_insert(json!(alt_lp));
+                alts.entry(token_label(alt, self.as_ids))
+                    .or_insert(json!(alt_lp.max(-9999.0)));
             }
-            self.values.push(json!(lp.logprob));
+            self.values.push(json!(lp.logprob.max(-9999.0)));
             self.tops.push(Value::Object(alts));
         }
         self
@@ -282,8 +301,8 @@ fn echoed(prompt: &[(u32, Option<compat::Logprob>)]) -> &[(u32, Option<compat::L
 
 /// Legacy logprobs over sampled `steps`, the first token's text starting at
 /// character `offset`.
-fn legacy_logprobs(steps: &[(u32, compat::Logprob)], offset: usize) -> Value {
-    Legacy::default().sampled(steps, offset).json()
+fn legacy_logprobs(parsed: &Parsed, steps: &[(u32, compat::Logprob)], offset: usize) -> Value {
+    Legacy::new(parsed.as_ids).sampled(steps, offset).json()
 }
 
 /// Legacy logprobs over the echoed prompt (where scored), then the sampled
@@ -293,7 +312,7 @@ fn echoed_legacy_logprobs(
     prompt: &[(u32, Option<compat::Logprob>)],
     steps: &[(u32, compat::Logprob)],
 ) -> Value {
-    let mut legacy = Legacy::default();
+    let mut legacy = Legacy::new(parsed.as_ids);
     if let Some(top) = parsed.echo_logprobs() {
         let prompt = echoed(prompt).iter().map(|(t, lp)| (*t, lp.as_ref()));
         legacy.push(prompt, 0, top as usize);
@@ -328,11 +347,18 @@ async fn choice(
     let mut text = String::new();
     let mut offset = text_offset(parsed);
     let mut pending: Vec<(u32, compat::Logprob)> = Vec::new();
+    let token_ids = req.return_token_ids;
+    let mut pending_ids = crate::PendingIds::default();
+    let send = |mut chunk: Value, pending_ids: &mut crate::PendingIds| {
+        if token_ids {
+            pending_ids.attach(&mut chunk, true);
+        }
+        emit::send(&chunk);
+    };
     let outcome = compat::run(&req, |event| {
         let piece = match event {
-            Event::Text(t) | Event::Reasoning(t) => t,
-            Event::ReasoningEnd => return,
-            Event::ToolCall(call) => call.arguments,
+            Event::Text(t) => t,
+            Event::Reasoning(_) | Event::ReasoningEnd | Event::ToolCall(_) => return,
             Event::Logprobs(steps) => {
                 pending.extend(steps);
                 return;
@@ -340,21 +366,32 @@ async fn choice(
             Event::PromptLogprobs(prompt) => {
                 if stream && echo_scored {
                     let logprobs = echoed_legacy_logprobs(parsed, &prompt, &[]);
-                    emit::send(&ids.chunk(index, &parsed.prompt, None, logprobs));
+                    send(
+                        ids.chunk(index, &parsed.prompt, None, logprobs),
+                        &mut pending_ids,
+                    );
                 }
+                return;
+            }
+            Event::PromptTokens(prompt) => {
+                pending_ids.prompt = Some(prompt);
+                return;
+            }
+            Event::Tokens(tokens) => {
+                pending_ids.tokens.extend(tokens);
                 return;
             }
         };
         if stream {
             let logprobs = if asked {
-                let lp = legacy_logprobs(&pending, offset);
+                let lp = legacy_logprobs(parsed, &pending, offset);
                 pending.clear();
                 lp
             } else {
                 Value::Null
             };
             offset += piece.chars().count();
-            emit::send(&ids.chunk(index, &piece, None, logprobs));
+            send(ids.chunk(index, &piece, None, logprobs), &mut pending_ids);
         } else {
             text.push_str(&piece);
         }
@@ -362,11 +399,13 @@ async fn choice(
     .await?;
     if stream {
         let logprobs = if asked {
-            legacy_logprobs(&pending, offset)
+            legacy_logprobs(parsed, &pending, offset)
         } else {
             Value::Null
         };
-        emit::send(&ids.chunk(index, "", Some(finish_reason(outcome.finish)), logprobs));
+        let mut last = ids.chunk(index, "", Some(finish_reason(outcome.finish)), logprobs);
+        last["choices"][0]["stop_reason"] = stop_reason(&outcome);
+        send(last, &mut pending_ids);
     }
     Ok((outcome, text))
 }
@@ -413,12 +452,13 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
             } else {
                 Value::Null
             };
-            let mut choice = json!({"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish_reason(outcome.finish)});
-            if let Some(reason) = &outcome.stop_reason {
-                choice["stop_reason"] = json!(reason);
-            }
+            let mut choice = json!({"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish_reason(outcome.finish), "stop_reason": stop_reason(&outcome)});
             if let Some(top) = parsed.prompt_logprobs {
                 choice["prompt_logprobs"] = crate::vllm_prompt_logprobs(scored, top as usize);
+            }
+            if parsed.req.return_token_ids {
+                choice["prompt_token_ids"] = json!(outcome.prompt_token_ids);
+                choice["token_ids"] = json!(outcome.token_ids);
             }
             choice
         })

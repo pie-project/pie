@@ -756,7 +756,7 @@ impl ProcessCtx {
         let Some((id, input)) = model.input(&name, &switches) else {
             return Ok(Err(format!(
                 "this model reads no input `{name}`; {}",
-                input_names(model)
+                input_names(&model)
             )));
         };
         let (rows, clip) = match validate_input_channel(input, &shape, dtype) {
@@ -2122,33 +2122,21 @@ mod tests {
             pending_fire_fixture, resolve_test_completion,
         };
         use std::future::Future;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::Ordering;
 
         for failed in [false, true] {
-            // The channel is visible before the native completion: a
-            // ready Take must not remove an unresolved fire.
-            let mirror = Box::new([7i32, 0]);
-            let words = Box::new([
-                AtomicU64::new(0),
-                AtomicU64::new(1),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ]);
+            // The channel is visible before the native completion, which is
+            // the ready-Take path that used to remove an unresolved fire.
+            let mirror = crate::engine::channel::HostRing::new(4, 1)
+                .binding(engine::ChannelId(0))
+                .memory;
+            crate::engine::channel::Cells::of(&*mirror).store(0, &7i32.to_ne_bytes());
+            let words = mirror.words();
+            words[1].store(1, Ordering::Release);
             let mut cell = ChannelCell::new(vec![1], Dtype::I32, 1);
             cell.role = Some(HostRole::Reader);
-            cell.attach_reader_mirror(
-                0,
-                mirror.as_ptr() as u64,
-                words.as_ptr() as u64,
-                4,
-                1,
-                0,
-                0,
-                1,
-                2,
-                3,
-            )
-            .map_err(anyhow::Error::msg)?;
+            cell.attach_reader_mirror(0, Arc::clone(&mirror), 4, 1, 0, 0, 1, 2, 3)
+                .map_err(anyhow::Error::msg)?;
             let cell = Arc::new(Mutex::new(cell));
             assert_eq!(
                 cell.lock().expect("test channel").read(),

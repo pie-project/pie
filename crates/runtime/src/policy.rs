@@ -23,6 +23,15 @@ mod seat_to_end_tests;
 #[cfg(not(target_arch = "wasm32"))]
 pub use port::{LoadError, reload, start};
 
+/// Ends the policy thread and forgets what the boot's policy set, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    #[cfg(not(target_arch = "wasm32"))]
+    port::reset();
+    pressure::reset();
+    schedule::reset();
+}
+
 use client_api::Props;
 
 /// The worker columns a port enacts, as `/metrics` names them.

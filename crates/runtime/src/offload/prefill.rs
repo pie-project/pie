@@ -670,6 +670,10 @@ struct Lease {
 static LEASES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Lease>>> =
     std::sync::LazyLock::new(Default::default);
 
+pub(crate) fn reset() {
+    LEASES.lock().unwrap().clear();
+}
+
 static NEXT_LEASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Gives back the pages lease `lease` held; a lease already gone is no fault.

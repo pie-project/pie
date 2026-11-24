@@ -6,8 +6,8 @@ use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use crate::chunk::{ChunkTable, Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
-use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
-use crate::load::{LoadRequest, Loaded};
+use crate::fire::{FrameId, FrameSubmission, FrameTicket, Step};
+use crate::load::{LoadRequest, Loaded, Reload, Reloaded};
 use crate::program::{
     BindExtents, BoundInstance, FireFacts, GuestState, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
     ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
@@ -15,10 +15,10 @@ use crate::program::{
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
 /// What a program's compile made, off the engine's thread, for the engine
-/// that prepared it ([`Engine::finish_program`]).
+/// that prepared it ([`Programs::finish`]).
 pub struct Prepared(pub Box<dyn std::any::Any + Send>);
 
-/// A program's compile ([`Engine::prepare_program`]): run once, on any
+/// A program's compile ([`Programs::prepare`]): run once, on any
 /// thread.
 pub type ProgramCompile = Box<dyn FnOnce() -> Prepared + Send>;
 
@@ -149,7 +149,7 @@ pub struct KvWrites {
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
 
 /// How a copy the engine answered as still landing
-/// ([`Engine::copy_slots_landing`]) ended.
+/// ([`Tiers::copy_landing`]) ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
     /// The copy read every source slot and wrote every destination.
@@ -162,12 +162,12 @@ pub enum Landing {
 }
 
 /// Where an engine tells how a copy it answered as still landing
-/// ([`Engine::copy_slots_landing`]) ended: called once with the copy's
+/// ([`Tiers::copy_landing`]) ended: called once with the copy's
 /// token and its [`Landing`], from any thread.
 pub type LandingSink = std::sync::Arc<dyn Fn(u64, Landing) + Send + Sync>;
 
 /// A group of a tapped lane's pages, read out: each page's spans of group
-/// `group` (of [`Engine::tap_groups`]), page after page; or why not. A tap
+/// `group` (of [`Taps::groups`]), page after page; or why not. A tap
 /// that fails says so once, for its first group not told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tapped {
@@ -243,6 +243,12 @@ pub trait Engine: Send {
         None
     }
 
+    /// Whether the engine keeps a disk kv tier. One that keeps none is not
+    /// handed the default `disk_kv_dir`; a stated one it still refuses.
+    fn disk_kv_tier(&self) -> bool {
+        true
+    }
+
     /// What the runtime's host cover depends on in this engine (`runtime`'s
     /// `measure_host_cover`): its device and driver, and the kernels and
     /// guest code a sampler's fire runs on it, as one fingerprint. A boot
@@ -282,10 +288,6 @@ pub trait Engine: Send {
         None
     }
 
-    fn export_kv_handle(&self) -> Option<KvHandle> {
-        None
-    }
-
     /// What it counts while it serves, read by the runtime from load on
     /// ([`crate::live`]): the fires served other than by a captured body.
     /// Nothing of arming: which rungs are armed and which eager is a load
@@ -300,17 +302,138 @@ pub trait Engine: Send {
 
     fn load(&mut self, request: LoadRequest) -> Result<Loaded>;
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
-        let _ = registration;
-        Err(self.unsupported("register_program"))
+    /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a
+    /// row beside the model's activation, or none where they land inside
+    /// the span already, and the rows a fixed store holds, if any. Asked
+    /// once, after load. A sibling of [`Programs::fire_facts`], not a field
+    /// of it: every fire reads out, programs or none, so the facts are the
+    /// engine's, not a (program, extents) pair's. The default states the
+    /// rows inside the span and no store: no term, no bound, nothing
+    /// changes.
+    fn readout_facts(&self) -> Result<ReadoutFacts> {
+        Ok(ReadoutFacts::default())
     }
+
+    /// Submits a frame's steps. A submit that returns `Err` refused the
+    /// frame before any of its lanes ran, and fails the pipeline of every
+    /// lane in it. A fault an engine can place on lanes (a guest pass
+    /// faulting, a guard, a row out of bounds) is not an `Err`: the step
+    /// settles with those lanes in [`StepOutcome::faulted`], each failing
+    /// its own pipeline, and every other lane commits. The sets a failed
+    /// pipeline owns cannot be claimed by another. Nothing replays from
+    /// what such a step left. A position an engine keeps by slot
+    /// still goes back where a refused step found it: the slot outlives
+    /// the set, and its next tenant must not meet it.
+    ///
+    /// A refusal a step's lanes earn for their own sake (a lane's word,
+    /// mask, positions, adapter or payload this load does not serve as
+    /// stated) names those lanes, never the frame: refused at the frame's
+    /// first step it is [`Error::Lanes`], nothing of the frame having run;
+    /// refused at a later step, the frame stops there and answers a ticket
+    /// of the steps before it with the lanes in
+    /// [`FrameTicket::refused`]. The runtime fails those lanes' fires alone
+    /// and submits what is left again.
+    fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
+
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> Result<()>;
+
+    /// Whether the load left measuring to run behind serving
+    /// ([`Engine::measure_behind`]): a dense settle no stored or committed
+    /// entry of its key decided. The default: none.
+    fn measures_behind(&self) -> bool {
+        false
+    }
+
+    /// What the next slice behind serving fires, where it fires on the
+    /// pool: the runtime takes one point's slots for it (taking idle cache
+    /// where the pool has no room for them, never live work) and hands
+    /// them over in [`BehindServing::seats`]. `None`: the next slice fires
+    /// nothing on the pool.
+    fn behind_need(&self) -> Option<BehindNeed> {
+        None
+    }
+
+    /// One slice of the measuring the load left behind serving. The
+    /// engine's lane calls it only where it would otherwise sleep (no fire
+    /// or call waits, nothing landing is owed); a slice that fires on the
+    /// pool fires on the slots the runtime took for it
+    /// ([`BehindServing::seats`], [`Engine::behind_need`]). Nothing it does changes what the
+    /// load serves, records or builds; what it decides is stored for the
+    /// next load ([`BehindServing`] says what the runtime tells it). Whether
+    /// it fired (`false`: nothing left, or nothing it can fire now).
+    fn measure_behind(&mut self, behind: &BehindServing<'_>) -> Result<bool> {
+        let _ = behind;
+        Ok(false)
+    }
+
+    /// Where steps land, where the engine tells it ([`Completion`]).
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        None
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        None
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        None
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
+        None
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+        None
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        None
+    }
+
+    fn peers(&mut self) -> Option<&mut dyn Peers> {
+        None
+    }
+
+    fn taps(&mut self) -> Option<&mut dyn Taps> {
+        None
+    }
+}
+
+pub trait Completion: Engine {
+    /// Where a step's outcome goes. An engine that settles asynchronously
+    /// answers every step here. One that settles inside
+    /// [`Engine::submit`] tells here, before `submit` returns, each step
+    /// whose lanes wrote or faulted; a step it does not tell committed.
+    fn on_complete(&mut self, sink: CompletionSink);
+
+    /// Whether a step lands after [`Engine::submit`] returns, told through
+    /// [`Self::on_complete`] (`true`), or settles inside `submit`, which
+    /// tells the sink only of steps whose lanes wrote or faulted. Every
+    /// engine that answers [`Engine::completion`] states it.
+    fn asynchronous(&self) -> bool;
+
+    /// Publishes what the guests' programs of the steps already landed put
+    /// on their channels, without waiting on a step still in flight. An
+    /// engine that publishes as each step lands needs nothing here.
+    fn publish_landed(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn expect_fire(&mut self, submission: &Step) {
+        let _ = submission;
+    }
+}
+
+pub trait Programs: Engine {
+    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId>;
 
     /// Builds what registering each of `registrations` would build (a
     /// backend's compiled guest code), without registering any: the
     /// runtime's prewarm of the programs its standard samplers register,
     /// before ready, so a registration of one of them builds nothing
     /// (`crate::live::Tally::BuiltAtRegister`). The default builds nothing.
-    fn prewarm_programs(&mut self, registrations: &[ProgramRegistration]) -> Result<()> {
+    fn prewarm(&mut self, registrations: &[ProgramRegistration]) -> Result<()> {
         let _ = registrations;
         Ok(())
     }
@@ -318,15 +441,15 @@ pub trait Engine: Send {
     /// A registration in two steps, so the thread that fires does not
     /// wait out a program's compile: this, on the engine's thread and
     /// quick, hands back the program's compile, which the runtime runs on a
-    /// worker thread while the engine fires on; [`Engine::finish_program`],
+    /// worker thread while the engine fires on; [`Programs::finish`],
     /// on the engine's thread again, takes what the compile made and
     /// answers the program's id. The program binds no instance until then.
-    fn prepare_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramCompile>;
+    fn prepare(&mut self, registration: &ProgramRegistration) -> Result<ProgramCompile>;
 
-    /// The second half of [`Engine::prepare_program`]: the program's id,
+    /// The second half of [`Programs::prepare`]: the program's id,
     /// from what its compile made; a compile that refused refuses here, by
     /// the program's name.
-    fn finish_program(&mut self, prepared: Prepared) -> Result<ProgramId>;
+    fn finish(&mut self, prepared: Prepared) -> Result<ProgramId>;
 
     /// Releases a registered program no instance binds: its id answers
     /// nothing after. The runtime closes one it could not learn the facts
@@ -337,7 +460,7 @@ pub trait Engine: Send {
     /// `Instance` and `Channel` slots, asked before the runtime takes them
     /// and binds. The default states none: the engine keeps its tables and
     /// rings itself.
-    fn program_facts(&self, program: ProgramId) -> Result<ProgramFacts> {
+    fn facts(&self, program: ProgramId) -> Result<ProgramFacts> {
         let _ = program;
         Ok(ProgramFacts::default())
     }
@@ -370,7 +493,7 @@ pub trait Engine: Send {
     /// [`InstanceBinding::pair`]) and in every [`Rebind::Instance`]. Asked
     /// at every bind, on the lane, before it is sent. The default states
     /// none: an engine that lays its guests' scratch in the fire's span
-    /// ([`Self::fire_facts`]) states it there until it moves it here.
+    /// ([`Programs::fire_facts`]) states it there until it moves it here.
     /// `class` is the geometry class the instance is bound at
     /// ([`InstanceBinding::geometry`]): the engine states its scratch arms
     /// per class ([`GuestState::scratch_arms`]).
@@ -384,18 +507,6 @@ pub trait Engine: Send {
         Ok(GuestState::default())
     }
 
-    /// What the rows a fire reads out take ([`ReadoutFacts`]): the bytes a
-    /// row beside the model's activation, or none where they land inside
-    /// the span already, and the rows a fixed store holds, if any. Asked
-    /// once, after load. A sibling of [`Engine::fire_facts`], not a field
-    /// of it: every fire reads out, programs or none, so the facts are the
-    /// engine's, not a (program, extents) pair's. The default states the
-    /// rows inside the span and no store: no term, no bound, nothing
-    /// changes.
-    fn readout_facts(&self) -> Result<ReadoutFacts> {
-        Ok(ReadoutFacts::default())
-    }
-
     /// The standing guest bytes the engine would hold once `binding` is
     /// bound: the span bytes it keeps for the live instances of registered
     /// programs beside every fire (Metal: the batch tables it lays once a
@@ -405,41 +516,11 @@ pub trait Engine: Send {
     /// Asked before every bind is sent: the runtime backs the total below
     /// the carve, beside the fire term, before the engine lays it. The
     /// total a bind leaves is [`BoundInstance::standing_guest_bytes`], the
-    /// one a close leaves what [`Engine::close_instance`] returns. The
+    /// one a close leaves what [`Programs::close`] returns. The
     /// default keeps none.
     fn standing_after(&self, binding: &InstanceBinding) -> Result<u64> {
         let _ = binding;
         Ok(0)
-    }
-
-    /// Whether [`Engine::register_channel`] takes `registration`: the
-    /// engine then holds the channel's ring (in its `Channel` slots, or
-    /// itself, as a host mirror), and an instance bound on the channel
-    /// reads that ring. `false` where it answers `Unsupported`: the runtime
-    /// keeps the channel alone, and each instance holds its own ring in
-    /// slots of its own ([`InstanceBinding::ring_slots`]). A fact of the
-    /// registration, asked before anything of a bind is taken, so a bind
-    /// that registers a channel takes its instance's rings by it. The
-    /// default holds none, as the default `register_channel` takes none.
-    fn holds_channel(&self, registration: &ChannelRegistration) -> bool {
-        let _ = registration;
-        false
-    }
-
-    /// The `Channel` slots a registered channel's ring takes, asked before
-    /// [`Engine::register_channel`]. `None`: the engine keeps the ring
-    /// itself.
-    fn ring_facts(&self, registration: &ChannelRegistration) -> Result<Option<RingFacts>> {
-        let _ = registration;
-        Ok(None)
-    }
-
-    /// Test builds (`test-slot-fill`): the queue the runtime pushes the
-    /// pool's given-back byte ranges to ([`crate::chunk::PoisonQueue`]). An
-    /// engine that takes it fills them before its next verb; the default
-    /// leaves them as they are.
-    fn poison_queue(&mut self, queue: crate::chunk::PoisonQueue) {
-        let _ = queue;
     }
 
     /// An instance's or a channel's pool slots moved: the runtime parked
@@ -449,62 +530,22 @@ pub trait Engine: Send {
     /// too ([`Rebind::Parked`]): the instance's old slots are another
     /// owner's from then on. A channel closed with
     /// an instance still bound on it is still registered
-    /// ([`Engine::close_channel`]): its rebind is served like an open one's.
+    /// ([`Channels::close`]): its rebind is served like an open one's.
     /// The default does nothing: an engine that states no `Instance` or
     /// `Channel` shape is never asked.
-    fn rebind_slots(&mut self, rebind: Rebind) -> Result<()> {
+    fn rebind(&mut self, rebind: Rebind) -> Result<()> {
         let _ = rebind;
         Ok(())
     }
 
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> Result<RegisteredChannel> {
-        let _ = registration;
-        Err(self.unsupported("register_channel"))
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> Result<BoundInstance> {
-        let _ = binding;
-        Err(self.unsupported("bind_instance"))
-    }
+    fn bind(&mut self, binding: &InstanceBinding) -> Result<BoundInstance>;
 
     /// Closes instance `id`: the engine's standing guest bytes after the
-    /// close ([`Engine::standing_after`]), less any set no live instance
+    /// close ([`Programs::standing_after`]), less any set no live instance
     /// shares any more. A closed channel this was the last instance bound
-    /// on is released with it ([`Engine::close_channel`]): once this
+    /// on is released with it ([`Channels::close`]): once this
     /// returns, the runtime gives the channel's `Channel` slots back.
-    fn close_instance(&mut self, id: InstanceId) -> Result<u64> {
-        let _ = id;
-        Err(self.unsupported("close_instance"))
-    }
-
-    /// Closes channel `id`. With no instance bound on it, the channel and
-    /// its endpoint are released now. With an instance still bound on it,
-    /// the channel is only closing: its registration, endpoint and ring
-    /// stay, every instance bound on it keeps reading and writing it, a
-    /// [`Engine::rebind_slots`] of its ring (the runtime parked and
-    /// restored it with those instances) is served as an open channel's,
-    /// and an evacuation that moves its slots rebases it; no new instance
-    /// binds on it. The last such instance's [`Engine::close_instance`]
-    /// releases it. The runtime keeps the channel's `Channel` slots owned
-    /// until then, and gives them back only after that close returns, so
-    /// the engine never addresses slots the runtime handed elsewhere.
-    fn close_channel(&mut self, id: ChannelId) -> Result<()> {
-        let _ = id;
-        Err(self.unsupported("close_channel"))
-    }
-
-    fn publish_channel(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> Result<bool> {
-        let _ = (instance, channel, cell);
-        Err(self.unsupported("publish_channel"))
-    }
-
-    fn take_channel(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>> {
-        let _ = (instance, channel);
-        Err(self.unsupported("take_channel"))
-    }
+    fn close(&mut self, id: InstanceId) -> Result<u64>;
 
     /// Beam `beam`'s page list of instance `instance`'s beam group, as its
     /// last fire left it (`BEAM-PAGE-LISTS.md` §6.6): the pool page of each
@@ -513,57 +554,75 @@ pub trait Engine: Send {
     /// an engine waits for them.
     fn beam_list(&mut self, instance: InstanceId, beam: u32) -> Result<Vec<u32>> {
         let _ = (instance, beam);
-        Err(self.unsupported("beam_list"))
+        Err(Error::unsupported(self.kind(), "beam_list"))
     }
 
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> Result<()> {
+    fn adapter(&mut self, registration: &AdapterRegistration) -> Result<()>;
+}
+
+pub trait Channels: Engine {
+    /// Whether [`Channels::open`] takes `registration`: the
+    /// engine then holds the channel's ring (in its `Channel` slots, or
+    /// itself, as a host mirror), and an instance bound on the channel
+    /// reads that ring. `false` where it answers `Unsupported`: the runtime
+    /// keeps the channel alone, and each instance holds its own ring in
+    /// slots of its own ([`InstanceBinding::ring_slots`]). A fact of the
+    /// registration, asked before anything of a bind is taken, so a bind
+    /// that registers a channel takes its instance's rings by it. The
+    /// default holds none, as the default `register_channel` takes none.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
         let _ = registration;
-        Err(self.unsupported("register_adapter"))
+        false
     }
 
-    /// Submits a frame's steps. A submit that returns `Err` refused the
-    /// frame before any of its lanes ran, and fails the pipeline of every
-    /// lane in it. A fault an engine can place on lanes (a guest pass
-    /// faulting, a guard, a row out of bounds) is not an `Err`: the step
-    /// settles with those lanes in [`StepOutcome::faulted`], each failing
-    /// its own pipeline, and every other lane commits. The sets a failed
-    /// pipeline owns cannot be claimed by another. Nothing replays from
-    /// what such a step left. A position an engine keeps by slot
-    /// still goes back where a refused step found it: the slot outlives
-    /// the set, and its next tenant must not meet it.
-    ///
-    /// A refusal a step's lanes earn for their own sake (a lane's word,
-    /// mask, positions, adapter or payload this load does not serve as
-    /// stated) names those lanes, never the frame: refused at the frame's
-    /// first step it is [`Error::Lanes`], nothing of the frame having run;
-    /// refused at a later step, the frame stops there and answers a ticket
-    /// of the steps before it with the lanes in
-    /// [`FrameTicket::refused`]. The runtime fails those lanes' fires alone
-    /// and submits what is left again.
-    fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
+    /// The `Channel` slots a registered channel's ring takes, asked before
+    /// [`Channels::open`]. `None`: the engine keeps the ring
+    /// itself.
+    fn ring_facts(&self, registration: &ChannelRegistration) -> Result<Option<RingFacts>> {
+        let _ = registration;
+        Ok(None)
+    }
 
+    fn open(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> Result<RegisteredChannel>;
+
+    /// Closes channel `id`. With no instance bound on it, the channel and
+    /// its endpoint are released now. With an instance still bound on it,
+    /// the channel is only closing: its registration, endpoint and ring
+    /// stay, every instance bound on it keeps reading and writing it, a
+    /// [`Programs::rebind`] of its ring (the runtime parked and
+    /// restored it with those instances) is served as an open channel's,
+    /// and an evacuation that moves its slots rebases it; no new instance
+    /// binds on it. The last such instance's [`Programs::close`]
+    /// releases it. The runtime keeps the channel's `Channel` slots owned
+    /// until then, and gives them back only after that close returns, so
+    /// the engine never addresses slots the runtime handed elsewhere.
+    fn close(&mut self, id: ChannelId) -> Result<()>;
+
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> Result<bool>;
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>>;
+}
+
+pub trait Pool: Engine {
     /// Backs the pool's first `segments` segments
     /// ([`crate::chunk::ChunkFacts::segments`]), ahead of the runtime
     /// handing out any of their chunks; never on a fire's path. A refusal
     /// leaves what was committed standing.
-    fn commit_segments(&mut self, segments: u32) -> Result<()> {
-        let _ = segments;
-        Err(self.unsupported("commit_segments"))
-    }
+    fn commit(&mut self, segments: u32) -> Result<()>;
 
     /// Gives back every segment at and past `segments`. The runtime has
     /// evacuated their chunks and waited out every frame that named them;
-    /// an [`Self::evacuate`] copy that still reads them, the engine waits
+    /// an [`Pool::evacuate`] copy that still reads them, the engine waits
     /// out here.
-    fn release_segments(&mut self, segments: u32) -> Result<()> {
-        let _ = segments;
-        Err(self.unsupported("release_segments"))
-    }
+    fn release(&mut self, segments: u32) -> Result<()>;
 
     /// Backs the top `segments` segments of the span under the largest
     /// rung's activation, counted from the top of the pool, ahead of the
     /// runtime opening any chunk of theirs for state; never on a fire's
-    /// path. Monotone as [`Self::commit_segments`]' prefix, from the other
+    /// path. Monotone as [`Pool::commit`]' prefix, from the other
     /// end. Only where [`crate::chunk::ChunkFacts::span_backed_on_demand`];
     /// the engine backs its own activation carve itself.
     fn commit_span(&mut self, segments: u32) -> Result<()> {
@@ -573,7 +632,7 @@ pub trait Engine: Send {
 
     /// Keeps the top `segments` span segments backed and gives back the
     /// span segments below them, which hold no state chunk and which no
-    /// rung lends any more ([`Self::commit_span`]'s counting). Whatever of
+    /// rung lends any more ([`Pool::commit_span`]'s counting). Whatever of
     /// them the engine's own activation carve uses stays its own to back.
     fn release_span(&mut self, segments: u32) -> Result<()> {
         let _ = segments;
@@ -585,7 +644,7 @@ pub trait Engine: Send {
     /// [`crate::chunk::ChunkFacts::span_backed_on_demand`], through the
     /// lane, never on a fire's path, and only where the two differ. A raise
     /// (`to > from`) comes before any fire of the wider rung, and before
-    /// the raise's [`Self::evacuate`] where it moves state: the engine
+    /// the raise's [`Pool::evacuate`] where it moves state: the engine
     /// backs its carve for `to` here, and a refusal (`Error::Exhausted`)
     /// takes the raise back, no fire passing `from`. A lower (`to < from`)
     /// is a notice once every fire wider than `to` has retired: the engine
@@ -606,7 +665,7 @@ pub trait Engine: Send {
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
     /// before the next fire; the slot refs the runtime holds stand. The
-    /// copy has a completion of its own, which [`Self::release_segments`]
+    /// copy has a completion of its own, which [`Pool::release`]
     /// waits on before the evacuated segment goes: the runtime waits on no
     /// later fire for it, so an idle engine's segment goes too.
     ///
@@ -617,22 +676,60 @@ pub trait Engine: Send {
     /// state the moved chunks hold included) against the moved table
     /// before it commits any copy; a failure after it committed is a bug
     /// (a fault, not a refusal).
-    fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
-        let _ = evacuation;
-        Err(self.unsupported("evacuate"))
-    }
+    fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()>;
 
     /// The engine's chunk table as it holds it now ([`ChunkTable`], the
     /// identity until an evacuation moves chunks): a plain read, no fire
     /// waited on, which the runtime checks its own logical to physical map
-    /// against where an evacuation was refused ([`Self::evacuate`]). One
+    /// against where an evacuation was refused ([`Pool::evacuate`]). One
     /// table, the state pool's; an engine whose pool moves no chunk answers
     /// its identity, one that keeps no pool `Error::Unsupported`. Stated by
     /// every engine: no default.
     fn chunk_table(&self) -> Result<ChunkTable>;
 
+    /// Test builds (`test-slot-fill`): the queue the runtime pushes the
+    /// pool's given-back byte ranges to ([`crate::chunk::PoisonQueue`]). An
+    /// engine that takes it fills them before its next verb; the default
+    /// leaves them as they are.
+    fn poison_queue(&mut self, queue: crate::chunk::PoisonQueue) {
+        let _ = queue;
+    }
+}
+
+pub trait WeightCache: Engine {
+    /// Which atoms of the streamable weights
+    /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next
+    /// fire on, and in which pool slots; the whole set each time. The
+    /// runtime calls it once a governor tick at most, ordered before the
+    /// next fire; the engine fills slots newly named (from its host copy)
+    /// before a fire reads them. A use of an atom not named is the
+    /// engine's: it streams through a staging slot and is not kept.
+    ///
+    /// Answers the bytes the engine holds back of the chunks it stated
+    /// ([`crate::chunk::ChunkFacts::held_bytes`]) once it has taken the
+    /// set. An engine that armed nothing at load arms at the residency the
+    /// load starts with and settles its fit there, so it holds less from
+    /// then on than its load stated; the runtime lifts the pool's hold-back
+    /// by that answer before the load returns. Nothing moves what is held
+    /// after that: every later answer repeats it.
+    fn set_residency(&mut self, residency: &WeightResidency) -> Result<u64>;
+
+    /// How often fires read each streamable atom, resident or not: the
+    /// record the runtime orders the weight cache by. An engine may answer
+    /// a call behind (the reads between the two calls before, its use
+    /// counters read without waiting for the device), every read counted
+    /// once.
+    fn uses(&mut self) -> Result<WeightUses>;
+
+    fn reload(&mut self, reload: &Reload) -> Result<Reloaded> {
+        let _ = reload;
+        Err(Error::unsupported(self.kind(), "reload_weights"))
+    }
+}
+
+pub trait Tiers: Engine {
     /// Copies slots of one shape between tiers or within one; replaces
-    /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend
+    /// [`Tiers::copy_kv`] and [`Tiers::copy_state`] once every backend
     /// serves it.
     ///
     /// Tiers (CONTRACT-BC 22): an engine that states
@@ -652,25 +749,22 @@ pub trait Engine: Send {
     /// shape, which anything the engine does may write (a bind's seeds, a
     /// channel's cells, a guest's stage, not a fire alone), so the runtime
     /// gives a source slot back only once the copy has read it: at once
-    /// after this call, or when [`Engine::copy_slots_landing`] tells it.
-    fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
-        let _ = copy;
-        Err(self.unsupported("copy_slots"))
-    }
+    /// after this call, or when [`Tiers::copy_landing`] tells it.
+    fn copy(&mut self, copy: &SlotCopy) -> Result<()>;
 
-    /// [`Engine::copy_slots`], answering whether its source slots may go
+    /// [`Tiers::copy`], answering whether its source slots may go
     /// back now (`true`): the copy has read them, or every write that could
     /// reach them after they go back is ordered behind the copy. `false`:
     /// the copy may still read them, and the engine calls the sink
-    /// [`Engine::on_landed`] gave it with `token` once it has read every
+    /// [`Tiers::on_landed`] gave it with `token` once it has read every
     /// source slot. The sink is called with [`Landing::Failed`] where the
     /// copy faulted; its sources then still hold their bytes (an engine never
     /// hands them on before telling). Every engine
     /// states it: an answer of `true` for a copy still reading its sources
     /// hands their memory to its next owner under the copy.
-    fn copy_slots_landing(&mut self, copy: &SlotCopy, token: u64) -> Result<bool>;
+    fn copy_landing(&mut self, copy: &SlotCopy, token: u64) -> Result<bool>;
 
-    /// Where [`Engine::copy_slots_landing`] tells a copy landed.
+    /// Where [`Tiers::copy_landing`] tells a copy landed.
     fn on_landed(&mut self, sink: LandingSink) {
         let _ = sink;
     }
@@ -680,191 +774,62 @@ pub trait Engine: Send {
     /// was still writing (an aborted restore's destinations) waits for, so
     /// no late write reaches them once they are another's. Every engine
     /// states it.
-    fn settle_copies(&mut self) -> Result<()>;
-
-    /// Which atoms of the streamable weights
-    /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next
-    /// fire on, and in which pool slots; the whole set each time. The
-    /// runtime calls it once a governor tick at most, ordered before the
-    /// next fire; the engine fills slots newly named (from its host copy)
-    /// before a fire reads them. A use of an atom not named is the
-    /// engine's: it streams through a staging slot and is not kept.
-    ///
-    /// Answers the bytes the engine holds back of the chunks it stated
-    /// ([`crate::chunk::ChunkFacts::held_bytes`]) once it has taken the
-    /// set. An engine that armed nothing at load arms at the residency the
-    /// load starts with and settles its fit there, so it holds less from
-    /// then on than its load stated; the runtime lifts the pool's hold-back
-    /// by that answer before the load returns. Nothing moves what is held
-    /// after that: every later answer repeats it.
-    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<u64> {
-        let _ = residency;
-        Err(self.unsupported("weight_residency"))
-    }
-
-    /// How often fires read each streamable atom, resident or not: the
-    /// record the runtime orders the weight cache by. An engine may answer
-    /// a call behind (the reads between the two calls before, its use
-    /// counters read without waiting for the device), every read counted
-    /// once.
-    fn weight_uses(&mut self) -> Result<WeightUses> {
-        Err(self.unsupported("weight_uses"))
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        false
-    }
-
-    /// Whether the load left measuring to run behind serving
-    /// ([`Engine::measure_behind`]): a dense settle no stored or committed
-    /// entry of its key decided. The default: none.
-    fn measures_behind(&self) -> bool {
-        false
-    }
-
-    /// What the next slice behind serving fires, where it fires on the
-    /// pool: the runtime takes one point's slots for it (taking idle cache
-    /// where the pool has no room for them, never live work) and hands
-    /// them over in [`BehindServing::seats`]. `None`: the next slice fires
-    /// nothing on the pool.
-    fn behind_need(&self) -> Option<BehindNeed> {
-        None
-    }
-
-    /// One slice of the measuring the load left behind serving. The
-    /// engine's lane calls it only where it would otherwise sleep (no fire
-    /// or call waits, nothing landing is owed); a slice that fires on the
-    /// pool fires on the slots the runtime took for it
-    /// ([`BehindServing::seats`], [`Engine::behind_need`]). Nothing it does changes what the
-    /// load serves, records or builds; what it decides is stored for the
-    /// next load ([`BehindServing`] says what the runtime tells it). Whether
-    /// it fired (`false`: nothing left, or nothing it can fire now).
-    fn measure_behind(&mut self, behind: &BehindServing<'_>) -> Result<bool> {
-        let _ = behind;
-        Ok(false)
-    }
-
-    /// Where a step's outcome goes. An engine that settles asynchronously
-    /// answers every step here. One that settles inside
-    /// [`Engine::submit`] tells here, before `submit` returns, each step
-    /// whose lanes wrote or faulted; a step it does not tell committed.
-    fn on_complete(&mut self, sink: CompletionSink) {
-        let _ = sink;
-    }
-
-    /// The groups a tapped page's planes are read out in, each as spans
-    /// `(offset, bytes)` of a host kv slot, in the order they land; `None`:
-    /// this engine taps nothing.
-    fn tap_groups(&self) -> Option<TapGroups> {
-        None
-    }
-
-    fn on_tapped(&mut self, sink: TapSink) {
-        let _ = sink;
-    }
-
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> Result<()> {
-        let _ = ticket;
-        Ok(())
-    }
-
-    /// Publishes what the guests' programs of the steps already landed put
-    /// on their channels, without waiting on a step still in flight. An
-    /// engine that publishes as each step lands needs nothing here.
-    fn publish_landed(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn expect_fire(&mut self, submission: &Step) {
-        let _ = submission;
-    }
-
-    fn copy_kv(&mut self, copy: &KvCopy) -> Result<()> {
-        let _ = copy;
-        Err(self.unsupported("copy_kv"))
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> Result<()> {
-        let _ = copy;
-        Err(self.unsupported("copy_state"))
-    }
-
-    fn encode(&mut self, plan: &mut MediaEncode) -> Result<()> {
-        let _ = plan;
-        Err(self.unsupported("encode"))
-    }
-
-    /// How [`Engine::read_host_kv`] lays out pages, when another engine of
-    /// another layout should be able to take them; `None` when this one
-    /// cannot say.
-    fn host_kv_layout(&self) -> Option<state::PageLayout> {
-        None
-    }
-
-    /// The bytes of host kv slots `slots`, one slot after another, laid out
-    /// as this engine lays a slot out, once every copy into them has landed.
-    /// What one worker's slots hold, another worker of the same layout takes
-    /// with [`Engine::write_host_kv`].
-    fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
-        let _ = slots;
-        Err(self.unsupported("read_host_kv"))
-    }
-
-    /// Writes `bytes`, laid out as [`Engine::read_host_kv`] returns them, into
-    /// host kv slots `slots`.
-    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
-        let _ = (slots, bytes);
-        Err(self.unsupported("write_host_kv"))
-    }
-
-    /// The bytes of host rs rows: `slots`' state, then `pages`' buffers, one
-    /// after another, once every copy into them has landed. For a model whose
-    /// state is a window, `pages` are host windowed pages and `slots` empty
-    /// (removed by the windowed-state change; do not use in new code).
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
-        let _ = (slots, pages);
-        Err(self.unsupported("read_host_state"))
-    }
-
-    /// Writes `bytes`, laid out as [`Engine::read_host_state`] returns them.
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
-        let _ = (slots, pages, bytes);
-        Err(self.unsupported("write_host_state"))
-    }
+    fn settle(&mut self) -> Result<()>;
 
     /// The bytes of host tier slots (CONTRACT-BC 22): for each `(shape,
     /// refs)` in order, each ref's slot of that shape at
     /// [`crate::chunk::SlotShape::tier_offset`] of the host chunks, laid out
-    /// as the device slot (what [`Engine::copy_slots`] moves whole), one
+    /// as the device slot (what [`Tiers::copy`] moves whole), one
     /// slot after another; once every copy into them has landed (the
     /// runtime waits on that copy's completion first). What a shared pool's
     /// snapshot reads of a set's state: its record's pieces (the windowed
     /// layers' rings among them) and its rs list or window buffer slots,
     /// parked on the host.
-    fn read_tier_slots(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
-        let _ = slots;
-        Err(self.unsupported("read_tier_slots"))
-    }
+    fn read(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>>;
 
-    /// Writes `bytes`, laid out as [`Engine::read_tier_slots`] returns
-    /// them, into host tier slots `slots`; a later [`Engine::copy_slots`]
+    /// Writes `bytes`, laid out as [`Tiers::read`] returns
+    /// them, into host tier slots `slots`; a later [`Tiers::copy`]
     /// from the host tier reads them.
-    fn write_tier_slots(
+    fn write(
         &mut self,
         slots: &[(crate::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
-    ) -> Result<()> {
-        let _ = (slots, bytes);
-        Err(self.unsupported("write_tier_slots"))
-    }
+    ) -> Result<()>;
 
-    fn disconnect(&self, message: &str) {
-        let _ = message;
-    }
+    fn copy_kv(&mut self, copy: &KvCopy) -> Result<()>;
 
-    fn unsupported(&self, verb: &'static str) -> Error {
-        Error::unsupported(self.kind(), verb)
+    fn copy_state(&mut self, copy: &StateCopy) -> Result<()> {
+        let _ = copy;
+        Err(Error::unsupported(self.kind(), "copy_state"))
     }
+}
+
+pub trait Peers: Engine {
+    fn export(&self) -> Option<KvHandle>;
+
+    /// How [`Peers::read`] lays out pages, when another engine of
+    /// another layout should be able to take them; `None` when this one
+    /// cannot say.
+    fn layout(&self) -> Option<state::PageLayout>;
+
+    /// The bytes of host kv slots `slots`, one slot after another, laid out
+    /// as this engine lays a slot out, once every copy into them has landed.
+    /// What one worker's slots hold, another worker of the same layout takes
+    /// with [`Peers::write`].
+    fn read(&mut self, slots: &[u32]) -> Result<Vec<u8>>;
+
+    /// Writes `bytes`, laid out as [`Peers::read`] returns them, into
+    /// host kv slots `slots`.
+    fn write(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()>;
+}
+
+pub trait Taps: Engine {
+    /// The groups a tapped page's planes are read out in, each as spans
+    /// `(offset, bytes)` of a host kv slot, in the order they land; `None`:
+    /// this engine taps nothing.
+    fn groups(&self) -> Option<TapGroups>;
+
+    fn subscribe(&mut self, sink: TapSink);
 }
 
 // `Engine` stays object safe: the runtime holds engines as `dyn Engine`.

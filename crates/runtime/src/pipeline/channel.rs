@@ -1,8 +1,8 @@
-#![allow(unsafe_code)]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::engine::channel::Cells;
 use crate::engine::{ChannelBinding, ChannelEndpoint};
 use eta_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use eta_ir::types::Dtype;
@@ -45,8 +45,7 @@ pub struct ChannelCell {
 
 #[derive(Clone, Debug)]
 struct ReaderMirror {
-    mirror_base: u64,
-    word_base: u64,
+    memory: Arc<dyn engine::channel::MirrorMemory>,
     cell_bytes: usize,
     cap1: u64,
     head_word_index: usize,
@@ -219,11 +218,10 @@ impl ChannelCell {
     pub fn bind(&mut self, decl: &ChannelDecl) {
         if self.attachments.is_empty() {
             if let Some(endpoint) = &self.endpoint {
-                let binding = endpoint.registered().binding;
-                self.device_reserved_head =
-                    load_word(binding.word_base, binding.head_word_index as usize);
-                self.device_reserved_tail =
-                    load_word(binding.word_base, binding.tail_word_index as usize);
+                let binding = &endpoint.registered().binding;
+                let words = binding.memory.words();
+                self.device_reserved_head = load_word(words, binding.head_word_index as usize);
+                self.device_reserved_tail = load_word(words, binding.tail_word_index as usize);
                 if decl.host_role == HostRole::Writer {
                     self.writer_tail = self.writer_tail.max(self.device_reserved_tail);
                 }
@@ -307,15 +305,13 @@ impl ChannelCell {
 
     pub fn writer_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
         let endpoint = self.endpoint.clone()?;
-        let binding = endpoint.registered().binding;
-        Some((
-            endpoint,
-            load_word(binding.word_base, binding.head_word_index as usize),
-        ))
+        let binding = &endpoint.registered().binding;
+        let head = load_word(binding.memory.words(), binding.head_word_index as usize);
+        Some((endpoint, head))
     }
 
     pub fn attach_endpoint(&mut self, endpoint: Arc<ChannelEndpoint>) -> Result<(), String> {
-        let binding = endpoint.registered().binding;
+        let binding = &endpoint.registered().binding;
         if binding.channel_id != self.global_id {
             return Err(format!(
                 "channel {} received endpoint {}",
@@ -334,8 +330,7 @@ impl ChannelCell {
         if self.role == Some(HostRole::Reader) {
             self.attach_reader_mirror(
                 0,
-                binding.mirror_base,
-                binding.word_base,
+                Arc::clone(&binding.memory),
                 binding.cell_bytes,
                 binding.capacity,
                 0,
@@ -384,14 +379,14 @@ impl ChannelCell {
                 self.staged.is_empty(),
                 "writer staging must flush when the endpoint attaches"
             );
-            return self.write_writer_ring(endpoint.registered().binding, native);
+            return self.write_writer_ring(&endpoint.registered().binding, native);
         }
         let consumed = self
             .endpoint
             .as_ref()
             .map(|endpoint| {
-                let binding = endpoint.registered().binding;
-                load_word(binding.word_base, binding.head_word_index as usize)
+                let binding = &endpoint.registered().binding;
+                load_word(binding.memory.words(), binding.head_word_index as usize)
             })
             .unwrap_or(0);
         let in_flight = self.writer_tail.saturating_sub(consumed);
@@ -419,22 +414,23 @@ impl ChannelCell {
         }
 
         if let Some(endpoint) = self.endpoint.clone() {
-            let binding = endpoint.registered().binding;
-            let poison = load_word(binding.word_base, binding.poison_word_index as usize);
+            let binding = &endpoint.registered().binding;
+            let words = binding.memory.words();
+            let poison = load_word(words, binding.poison_word_index as usize);
             if poison != 0 {
                 return Err(ChannelError::Poisoned(format!(
                     "engine published poison epoch {poison}"
                 )));
             }
-            if load_word(binding.word_base, binding.closed_word_index as usize) != 0 {
+            if load_word(words, binding.closed_word_index as usize) != 0 {
                 return Err(ChannelError::Closed);
             }
 
             if self.role == Some(HostRole::Reader) {
                 self.refresh_reader_mirrors()?;
             }
-            let head = load_word(binding.word_base, binding.head_word_index as usize);
-            let tail = load_word(binding.word_base, binding.tail_word_index as usize);
+            let head = load_word(words, binding.head_word_index as usize);
+            let tail = load_word(words, binding.tail_word_index as usize);
             let committed_tail = if self.role == Some(HostRole::Writer) {
                 tail.saturating_sub(self.ring_host_copies.len() as u64)
             } else {
@@ -473,7 +469,7 @@ impl ChannelCell {
 
     fn replace_ring_cell(
         &self,
-        binding: ChannelBinding,
+        binding: &ChannelBinding,
         sequence: u64,
         native: &[u8],
     ) -> Result<(), ChannelError> {
@@ -490,25 +486,18 @@ impl ChannelCell {
             });
         }
         let cap1 = u64::from(binding.capacity).saturating_add(1);
-        let offset = (sequence % cap1) * cell_bytes as u64;
-        // SAFETY: the mirror spans `cap1` cells of `cell_bytes` and lives until
-        // channel close, as in `write_writer_ring`; the one caller (`set_ref`,
-        // holding `&mut self`) has checked the device has not reserved this
-        // cell (`device_reserved_head <= sequence`).
-        let cell = unsafe {
-            std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
-        };
-        if self.dtype == Dtype::Bool {
-            pack_bool_into(native, cell);
-        } else {
-            // A row-extent cell is the program's row bound wide: the
-            // instance's rows, cut or padded to it (the host keeps them all).
-            let (rows, pad) = cell.split_at_mut(wire_len.min(cell_bytes));
-            rows.copy_from_slice(&native[..rows.len()]);
-            pad.fill(crate::pipeline::program::ROW_PAD);
-        }
-        let tail = load_word(binding.word_base, binding.tail_word_index as usize);
-        store_word(binding.word_base, binding.tail_word_index as usize, tail);
+        let offset = ((sequence % cap1) * cell_bytes as u64) as usize;
+        store_wire(
+            Cells::of(&*binding.memory),
+            offset,
+            cell_bytes,
+            self.dtype,
+            native,
+            wire_len,
+        );
+        let words = binding.memory.words();
+        let tail = load_word(words, binding.tail_word_index as usize);
+        store_word(words, binding.tail_word_index as usize, tail);
         Ok(())
     }
 
@@ -522,19 +511,20 @@ impl ChannelCell {
 
     fn write_writer_ring(
         &mut self,
-        binding: ChannelBinding,
+        binding: &ChannelBinding,
         native: &[u8],
     ) -> Result<(), ChannelError> {
-        let poison = load_word(binding.word_base, binding.poison_word_index as usize);
+        let words = binding.memory.words();
+        let poison = load_word(words, binding.poison_word_index as usize);
         if poison != 0 {
             return Err(ChannelError::Poisoned(format!(
                 "engine published poison epoch {poison}"
             )));
         }
-        if load_word(binding.word_base, binding.closed_word_index as usize) != 0 {
+        if load_word(words, binding.closed_word_index as usize) != 0 {
             return Err(ChannelError::Closed);
         }
-        let head = load_word(binding.word_base, binding.head_word_index as usize);
+        let head = load_word(words, binding.head_word_index as usize);
         if self.writer_tail.saturating_sub(head) >= u64::from(self.capacity) {
             return Err(ChannelError::Full);
         }
@@ -551,28 +541,17 @@ impl ChannelCell {
             });
         }
         let cap1 = u64::from(binding.capacity).saturating_add(1);
-        let offset = (self.writer_tail % cap1) * cell_bytes as u64;
-        // SAFETY: mirror validated at registration (mirror_bytes >=
-        // cell_bytes * cap1) and stays alive until channel close; SPSC
-        // discipline makes this cell ours.
-        let cell = unsafe {
-            std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
-        };
-        if self.dtype == Dtype::Bool {
-            pack_bool_into(native, cell);
-        } else {
-            // A row-extent cell is the program's row bound wide: the
-            // instance's rows, cut or padded to it (the host keeps them all).
-            let (rows, pad) = cell.split_at_mut(wire_len.min(cell_bytes));
-            rows.copy_from_slice(&native[..rows.len()]);
-            pad.fill(crate::pipeline::program::ROW_PAD);
-        }
-        self.writer_tail += 1;
-        store_word(
-            binding.word_base,
-            binding.tail_word_index as usize,
-            self.writer_tail,
+        let offset = ((self.writer_tail % cap1) * cell_bytes as u64) as usize;
+        store_wire(
+            Cells::of(&*binding.memory),
+            offset,
+            cell_bytes,
+            self.dtype,
+            native,
+            wire_len,
         );
+        self.writer_tail += 1;
+        store_word(words, binding.tail_word_index as usize, self.writer_tail);
         self.ring_host_copies.push_back(native.to_vec());
         Ok(())
     }
@@ -584,7 +563,7 @@ impl ChannelCell {
         let Some(endpoint) = self.endpoint.clone() else {
             return Ok(());
         };
-        let binding = endpoint.registered().binding;
+        let binding = &endpoint.registered().binding;
         while let Some(native) = self.staged.pop_front() {
             if let Err(error) = self.write_writer_ring(binding, &native) {
                 self.staged.push_front(native);
@@ -614,7 +593,7 @@ impl ChannelCell {
         let consumed = self
             .reader
             .as_ref()
-            .map(|reader| load_word(reader.word_base, reader.head_word_index))
+            .map(|reader| load_word(reader.memory.words(), reader.head_word_index))
             .unwrap_or(0);
         (self.device_reserved_tail, consumed)
     }
@@ -646,8 +625,9 @@ impl ChannelCell {
         self.taken += 1;
         self.front_override = None;
         if let Some(reader) = &self.reader {
-            let head = load_word(reader.word_base, reader.head_word_index);
-            store_word(reader.word_base, reader.head_word_index, head + 1);
+            let words = reader.memory.words();
+            let head = load_word(words, reader.head_word_index);
+            store_word(words, reader.head_word_index, head + 1);
         }
         Ok(value)
     }
@@ -700,20 +680,13 @@ impl ChannelCell {
         if endpoint.registered().adopted() {
             return;
         }
-        let binding = endpoint.registered().binding;
-        if load_word(binding.word_base, binding.tail_word_index as usize) == 0
-            && load_word(binding.word_base, binding.head_word_index as usize) == 0
+        let binding = &endpoint.registered().binding;
+        let words = binding.memory.words();
+        if load_word(words, binding.tail_word_index as usize) == 0
+            && load_word(words, binding.head_word_index as usize) == 0
         {
-            store_word(
-                binding.word_base,
-                binding.tail_word_index as usize,
-                self.writer_tail,
-            );
-            store_word(
-                binding.word_base,
-                binding.head_word_index as usize,
-                self.writer_tail,
-            );
+            store_word(words, binding.tail_word_index as usize, self.writer_tail);
+            store_word(words, binding.head_word_index as usize, self.writer_tail);
         }
     }
 
@@ -721,8 +694,7 @@ impl ChannelCell {
     pub fn attach_reader_mirror(
         &mut self,
         _instance_id: u64,
-        mirror_base: u64,
-        word_base: u64,
+        memory: Arc<dyn engine::channel::MirrorMemory>,
         cell_bytes: u32,
         capacity: u32,
         _mirror_offset: u64,
@@ -737,7 +709,7 @@ impl ChannelCell {
                 self.global_id, self.role
             ));
         }
-        if mirror_base == 0 || word_base == 0 || cell_bytes == 0 {
+        if memory.words().is_empty() || Cells::of(&*memory).len() == 0 || cell_bytes == 0 {
             return Err(format!(
                 "channel {}: engine returned an invalid mirror binding",
                 self.global_id
@@ -760,8 +732,7 @@ impl ChannelCell {
             ));
         }
         self.reader = Some(ReaderMirror {
-            mirror_base,
-            word_base,
+            memory,
             cell_bytes,
             cap1: u64::from(capacity).saturating_add(1),
             head_word_index: head_word_index as usize,
@@ -781,13 +752,14 @@ impl ChannelCell {
         let mut closed = false;
         let mut visible_tail = 0;
         if let Some(reader) = self.reader.as_ref() {
-            let poison = load_word(reader.word_base, reader.poison_word_index);
+            let words = reader.memory.words();
+            let poison = load_word(words, reader.poison_word_index);
             if poison != 0 {
                 poison_reason = Some(format!("engine published poison epoch {poison}"));
-            } else if load_word(reader.word_base, reader.closed_word_index) != 0 {
+            } else if load_word(words, reader.closed_word_index) != 0 {
                 closed = true;
             } else {
-                let tail = load_word(reader.word_base, reader.tail_word_index);
+                let tail = load_word(words, reader.tail_word_index);
                 if tail.saturating_sub(reader.copied_tail) >= reader.cap1 {
                     poison_reason = Some(format!(
                         "channel mirror overrun (tail {tail}, copied {}, capacity {})",
@@ -866,24 +838,51 @@ pub fn consume_writer_host_copy(cell: &Arc<Mutex<ChannelCell>>) {
     c.ring_host_copies.pop_front();
 }
 
-fn load_word(word_base: u64, index: usize) -> u64 {
-    // SAFETY: aligned atomic word array alive until instance close; mirrors
-    // detach before that close.
-    unsafe { (&*((word_base as *const AtomicU64).add(index))).load(Ordering::Acquire) }
+fn load_word(words: &[AtomicU64], index: usize) -> u64 {
+    words[index].load(Ordering::Acquire)
 }
 
-fn store_word(word_base: u64, index: usize, value: u64) {
-    // SAFETY: as `load_word`; the store is atomic, so a concurrent device or
-    // host reader sees either value.
-    unsafe { (&*((word_base as *const AtomicU64).add(index))).store(value, Ordering::Release) }
+fn store_word(words: &[AtomicU64], index: usize, value: u64) {
+    words[index].store(value, Ordering::Release);
 }
 
 fn read_mirror_cell(reader: &ReaderMirror, sequence: u64) -> Vec<u8> {
-    let slot = (sequence % reader.cap1) * reader.cell_bytes as u64;
-    let ptr = (reader.mirror_base + slot) as *const u8;
-    // SAFETY: binding validates the mirror extent; engine owns it through
-    // instance close.
-    unsafe { std::slice::from_raw_parts(ptr, reader.cell_bytes).to_vec() }
+    let slot = ((sequence % reader.cap1) * reader.cell_bytes as u64) as usize;
+    let mut wire = vec![0; reader.cell_bytes];
+    Cells::of(&*reader.memory).load(slot, &mut wire);
+    wire
+}
+
+/// Writes `native` into the cell at `offset` as the wire carries it.
+/// Lands `native` in the `cell_bytes` cell at `offset`: bools packed, and
+/// a row-extent cell the program's row bound wide, the instance's rows cut
+/// or padded to it (the host keeps them all).
+fn store_wire(
+    cells: Cells<'_>,
+    offset: usize,
+    cell_bytes: usize,
+    dtype: Dtype,
+    native: &[u8],
+    wire_len: usize,
+) {
+    if dtype != Dtype::Bool {
+        let rows = wire_len.min(cell_bytes);
+        cells.store(offset, &native[..rows]);
+        if rows < cell_bytes {
+            let pad = vec![crate::pipeline::program::ROW_PAD; cell_bytes - rows];
+            cells.store(offset + rows, &pad);
+        }
+        return;
+    }
+    let mut packed = [0u8; 4096];
+    for (at, bits) in (offset..)
+        .step_by(packed.len())
+        .zip(native.chunks(8 * packed.len()))
+    {
+        let packed = &mut packed[..bits.len().div_ceil(8)];
+        pack_bool_into(bits, packed);
+        cells.store(at, packed);
+    }
 }
 
 fn decode_reader_cell(
@@ -979,24 +978,16 @@ mod tests {
 
     fn publish_wire(cell: &Arc<Mutex<ChannelCell>>, wire: &[u8]) {
         let capacity = cell.lock().unwrap().capacity;
-        let mut mirror = vec![0u8; wire.len() * capacity.saturating_add(1) as usize];
-        mirror[..wire.len()].copy_from_slice(wire);
-        let mirror = Box::leak(mirror.into_boxed_slice());
-        let words = Box::leak(
-            vec![
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ]
-            .into_boxed_slice(),
-        );
+        let mirror = crate::engine::channel::HostRing::new(wire.len() as u32, capacity)
+            .binding(engine::ChannelId(0))
+            .memory;
+        Cells::of(&*mirror).store(0, wire);
+        let words = mirror.words();
         cell.lock()
             .unwrap()
             .attach_reader_mirror(
                 0,
-                mirror.as_ptr() as u64,
-                words.as_ptr() as u64,
+                Arc::clone(&mirror),
                 wire.len() as u32,
                 capacity,
                 0,

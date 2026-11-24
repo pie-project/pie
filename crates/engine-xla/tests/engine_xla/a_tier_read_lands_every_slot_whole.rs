@@ -6,7 +6,6 @@
 //! host, move to a device slot, and back to other host slots. Skipped
 //! without a PJRT plugin.
 
-use engine::Engine;
 use engine::chunk::{SlotCopy, SlotKind, SlotRole};
 use engine::transfer::MemoryDomain;
 
@@ -42,14 +41,10 @@ fn a_tier_read_lands_every_slot_whole() {
         seed += 7919;
         let there: Vec<u32> = (0..n).collect();
         let back: Vec<u32> = (n..2 * n).collect();
-        model
-            .engine
-            .write_tier_slots(&[(kv.id, there.clone())], &bytes)
+        engine::Tiers::write(&mut model.engine, &[(kv.id, there.clone())], &bytes)
             .expect("the host slots write");
         let copy = |model: &mut Model, src, dst, pairs: Vec<(u32, u32)>| {
-            model
-                .engine
-                .copy_slots(&SlotCopy {
+            engine::Tiers::copy(&mut model.engine, &SlotCopy {
                     shape: kv.id,
                     src,
                     dst,
@@ -70,9 +65,7 @@ fn a_tier_read_lands_every_slot_whole() {
             .zip(back.iter().copied())
             .collect();
         copy(&mut model, device, MemoryDomain::HostPinned, pairs);
-        let got = model
-            .engine
-            .read_tier_slots(&[(kv.id, back)])
+        let got = engine::Tiers::read(&mut model.engine, &[(kv.id, back)])
             .expect("the host slots read");
         let want: Vec<u8> = bytes.chunks(len).rev().flatten().copied().collect();
         assert!(got == want, "{n} slots of {len} bytes came back whole and in order");

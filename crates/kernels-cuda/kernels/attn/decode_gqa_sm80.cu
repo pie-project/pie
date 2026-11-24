@@ -10,7 +10,7 @@
 //
 // Each warp's product is swapped (keys as the MMA's rows, the group's query
 // heads, padded to eight, as its columns): S^T = K Q^T and O^T += V^T P^T on
-// bf16 m16n8k16 with f32 accumulators, so a group of up to eight heads costs
+// bf16 (an e4m3 pool's f16) m16n8k16 with f32 accumulators, so a group of up to eight heads costs
 // one column tile and the output sits in HEAD_DIM / 4 registers a lane. The
 // keys stream through shared memory on `cp.async`, STAGES tiles deep a warp.
 // A sliding window starts the walk at the window, and where the plan does
@@ -50,6 +50,23 @@ __device__ __forceinline__ void cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
 }
 
+__device__ __forceinline__ unsigned e4m3x2_f16x2(unsigned x) {
+    unsigned r;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(x)));
+#else
+    const unsigned w = ((x & 0x7fu) << 7) | ((x & 0x80u) << 8) | ((x & 0x7f00u) << 15) | ((x & 0x8000u) << 16);
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(w), "r"(0x5c005c00u));
+#endif
+    return r;
+}
+
+__device__ __forceinline__ unsigned pack_f16x2(float lo, float hi) {
+    unsigned r;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+
 template <int HEAD_DIM, int MT, int WARPS, int STAGES, bool FP8 = false, bool SWZ = false>
 struct Shape {
     // A 16-byte pad a row puts the eight rows one `ldmatrix` reads in eight
@@ -64,15 +81,13 @@ struct Shape {
     static constexpr int WARP_ELEMS = STAGES * STAGE_ELEMS;
     static constexpr int Q_ELEMS = 8 * LD;
     static constexpr int P_ELEMS = TILE * 8;
-    static constexpr int STAGED_BYTES = WARPS * WARP_ELEMS * 2;
+    // An e4m3 pool's K and V stay raw, swizzled, and widen in registers.
+    static constexpr int RAW_STAGE = 2 * TILE * HEAD_DIM;
+    static constexpr int STAGED_BYTES = FP8 ? WARPS * STAGES * RAW_STAGE : WARPS * WARP_ELEMS * 2;
     // The warps' states, folded through the staged region once it drains.
     static constexpr int FOLD_BYTES = WARPS * (8 * HEAD_DIM + 16) * 4;
     static constexpr int REGION = STAGED_BYTES > FOLD_BYTES ? STAGED_BYTES : FOLD_BYTES;
-    // An e4m3 pool's K and V land raw first, a stage a warp, and widen to
-    // the bf16 tiles the products read.
-    static constexpr int RAW_OFF = REGION + (Q_ELEMS + WARPS * P_ELEMS) * 2;
-    static constexpr int RAW_STAGE = 2 * TILE * HEAD_DIM;
-    static constexpr int SMEM_BYTES = RAW_OFF + (FP8 ? WARPS * STAGES * RAW_STAGE : 0);
+    static constexpr int SMEM_BYTES = REGION + (Q_ELEMS + WARPS * P_ELEMS) * 2;
 };
 
 template <int HEAD_DIM, int MT, int WARPS, int STAGES, class S, class KV, bool SWZ>
@@ -107,7 +122,7 @@ __device__ __forceinline__ void decode_body(
     u32 ranks)
 {
     constexpr bool FP8 = sizeof(KV) == 1;
-    static_assert(!(SWZ && FP8), "an e4m3 pool's tiles widen into padded rows");
+    static_assert(!(SWZ && FP8), "the swizzled stamp reads a bf16 pool");
     using Sh = Shape<HEAD_DIM, MT, WARPS, STAGES, FP8, SWZ>;
     constexpr int CHUNKS8 = HEAD_DIM / 16;  // 16-byte pieces an e4m3 row
     constexpr int LD = Sh::LD;
@@ -117,6 +132,7 @@ __device__ __forceinline__ void decode_body(
     constexpr int KLD = Sh::KV_LD;
     // Key row r's 16-byte piece c in a K or V tile.
     auto kv_at = [](int r, int c) { return r * KLD + (SWZ ? (c ^ (r & 7)) : c) * 8; };
+    auto raw_at = [](int r, int c) { return r * HEAD_DIM + (CHUNKS8 >= 8 ? c ^ (r & 7) : c ^ ((r >> 1) & 3)) * 16; };
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     bf16* staged = reinterpret_cast<bf16*>(smem_raw);
@@ -187,7 +203,7 @@ __device__ __forceinline__ void decode_body(
     // Stage the warp's j-th tile (the chunk's tile warp + j * WARPS): lane
     // r < TILE finds row r's cell once, and the copies read it off a shuffle.
     auto raw_of = [&](int stage) {
-        return smem_raw + Sh::RAW_OFF + (warp * STAGES + stage) * Sh::RAW_STAGE;
+        return smem_raw + (warp * STAGES + stage) * Sh::RAW_STAGE;
     };
     auto load = [&](int j, int stage) {
         const int tile = warp + j * WARPS;
@@ -214,8 +230,8 @@ __device__ __forceinline__ void decode_body(
                 long long at = __shfl_sync(0xffffffffu, cell, r & 31);
                 const bool live = at >= 0;
                 at = live ? at + c * 16 : 0;
-                cp16(rk + r * HEAD_DIM + c * 16, k_data + at, live);
-                cp16(rv + r * HEAD_DIM + c * 16, v_data + at, live);
+                cp16(rk + raw_at(r, c), k_data + at, live);
+                cp16(rv + raw_at(r, c), v_data + at, live);
             }
             return;
         }
@@ -228,29 +244,6 @@ __device__ __forceinline__ void decode_body(
             at = live ? at + c * 8 : 0;
             cp16(ks + kv_at(r, c), k_data + at, live);
             cp16(vs + kv_at(r, c), v_data + at, live);
-        }
-    };
-    // An e4m3 stage's raw rows widened into its bf16 tiles (exact).
-    auto widen = [&](int stage) {
-        const unsigned char* rk = raw_of(stage);
-        bf16* ks = mine + stage * Sh::STAGE_ELEMS;
-#pragma unroll
-        for (int e = lane; e < 2 * TILE * CHUNKS8; e += 32) {
-            const int half = e / (TILE * CHUNKS8);
-            const int r = (e / CHUNKS8) % TILE;
-            const int c = e % CHUNKS8;
-            const uint4 w = *reinterpret_cast<const uint4*>(rk + half * TILE * HEAD_DIM + r * HEAD_DIM + c * 16);
-            const unsigned words[4] = {w.x, w.y, w.z, w.w};
-            unsigned out[8];
-#pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                const unsigned x = words[u];
-                out[2 * u] = pack_bf16x2(e4m3_to_f32(x & 0xff), e4m3_to_f32((x >> 8) & 0xff));
-                out[2 * u + 1] = pack_bf16x2(e4m3_to_f32((x >> 16) & 0xff), e4m3_to_f32(x >> 24));
-            }
-            uint4* dst = reinterpret_cast<uint4*>(ks + half * Sh::TILE_ELEMS + r * LD + c * 16);
-            dst[0] = make_uint4(out[0], out[1], out[2], out[3]);
-            dst[1] = make_uint4(out[4], out[5], out[6], out[7]);
         }
     };
 
@@ -273,18 +266,27 @@ __device__ __forceinline__ void decode_body(
     cp_wait<STAGES - 1>();
     __syncthreads();  // the query rows
 
+    // Q's dims in the order the raw key rows widen in: four adjacent ones a lane.
+    unsigned qf[FP8 ? DT : 1][2];
+    if constexpr (FP8) {
+#pragma unroll
+        for (int kc = 0; kc < DT; ++kc) {
+            const uint2 w = *reinterpret_cast<const uint2*>(qs + g * LD + kc * 16 + 4 * t);
+            qf[kc][0] = pack_f16x2(__uint_as_float(w.x << 16) * scale, __uint_as_float(w.x & 0xffff0000u) * scale);
+            qf[kc][1] = pack_f16x2(__uint_as_float(w.y << 16) * scale, __uint_as_float(w.y & 0xffff0000u) * scale);
+        }
+    }
+
     for (int j = 0; j < mine_tiles; ++j) {
         const int stage = j % STAGES;
         if (j + STAGES - 1 < mine_tiles) load(j + STAGES - 1, (j + STAGES - 1) % STAGES);
         cp_commit();
         cp_wait<STAGES - 1>();
         __syncwarp();
-        if constexpr (FP8) {
-            widen(stage);
-            __syncwarp();
-        }
         const bf16* ks = mine + stage * Sh::STAGE_ELEMS;
         const bf16* vs = ks + Sh::TILE_ELEMS;
+        const unsigned char* rk = raw_of(stage);
+        const unsigned char* rv = rk + TILE * HEAD_DIM;
         const int base = chunk_start + (warp + j * WARPS) * TILE;
 
         float s[MT][4];
@@ -294,15 +296,27 @@ __device__ __forceinline__ void decode_body(
             float s2[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int x = 0; x < 4; ++x) s[mt][x] = 0.f;
+            if constexpr (FP8) {
 #pragma unroll
-            for (int kc = 0; kc < DT; ++kc) {
-                unsigned a[4], b[2];
-                ldmatrix_x4(a, ks + kv_at(mt * 16 + (lane & 15), kc * 2 + (lane >> 4)));
-                ld_b(b, qs + kc * 16, LD, lane);
-                if (kc & 1) {
-                    mma_m16n8k16(s2, a, b);
-                } else {
-                    mma_m16n8k16(s[mt], a, b);
+                for (int kb = 0; kb < HEAD_DIM / 32; ++kb) {
+                    unsigned r[4];
+                    ldmatrix_x4(r, rk + raw_at(mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8, kb * 2 + (lane >> 4)));
+                    const unsigned a0[4] = {e4m3x2_f16x2(r[0]), e4m3x2_f16x2(r[1]), e4m3x2_f16x2(r[0] >> 16), e4m3x2_f16x2(r[1] >> 16)};
+                    const unsigned a1[4] = {e4m3x2_f16x2(r[2]), e4m3x2_f16x2(r[3]), e4m3x2_f16x2(r[2] >> 16), e4m3x2_f16x2(r[3] >> 16)};
+                    mma_m16n8k16_f16(s[mt], a0, qf[2 * kb]);
+                    mma_m16n8k16_f16(s2, a1, qf[2 * kb + 1]);
+                }
+            } else {
+#pragma unroll
+                for (int kc = 0; kc < DT; ++kc) {
+                    unsigned a[4], b[2];
+                    ldmatrix_x4(a, ks + kv_at(mt * 16 + (lane & 15), kc * 2 + (lane >> 4)));
+                    ld_b(b, qs + kc * 16, LD, lane);
+                    if (kc & 1) {
+                        mma_m16n8k16(s2, a, b);
+                    } else {
+                        mma_m16n8k16(s[mt], a, b);
+                    }
                 }
             }
 #pragma unroll
@@ -318,14 +332,15 @@ __device__ __forceinline__ void decode_body(
             const int at = k - origin;
             return ((bits[at >> 3] >> (at & 7)) & 1) != 0;
         };
+        const float s_scale = FP8 ? 1.f : scale;
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             const int r0 = base + mt * 16 + g;
             const bool v0 = r0 < chunk_end && admits(r0), v1 = r0 + 8 < chunk_end && admits(r0 + 8);
-            s[mt][0] = v0 ? s[mt][0] * scale : kMasked;
-            s[mt][1] = v0 ? s[mt][1] * scale : kMasked;
-            s[mt][2] = v1 ? s[mt][2] * scale : kMasked;
-            s[mt][3] = v1 ? s[mt][3] * scale : kMasked;
+            s[mt][0] = v0 ? s[mt][0] * s_scale : kMasked;
+            s[mt][1] = v0 ? s[mt][1] * s_scale : kMasked;
+            s[mt][2] = v1 ? s[mt][2] * s_scale : kMasked;
+            s[mt][3] = v1 ? s[mt][3] * s_scale : kMasked;
             mx0 = fmaxf(mx0, fmaxf(s[mt][0], s[mt][2]));
             mx1 = fmaxf(mx1, fmaxf(s[mt][1], s[mt][3]));
         }
@@ -353,22 +368,40 @@ __device__ __forceinline__ void decode_body(
             const float p2 = exp2f(s[mt][2] - n0), p3 = exp2f(s[mt][3] - n1);
             l0 += p0 + p2;
             l1 += p1 + p3;
-            // P as [key][head] bf16, the B operand's storage.
-            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g) * 8 + 2 * t) = pack_bf16x2(p0, p1);
-            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g + 8) * 8 + 2 * t) = pack_bf16x2(p2, p3);
+            // P as [key][head] bf16 (f16 over an e4m3 pool), the B operand's storage.
+            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g) * 8 + 2 * t) = FP8 ? pack_f16x2(p0, p1) : pack_bf16x2(p0, p1);
+            *reinterpret_cast<unsigned*>(ps + (mt * 16 + g + 8) * 8 + 2 * t) = FP8 ? pack_f16x2(p2, p3) : pack_bf16x2(p2, p3);
         }
         __syncwarp();
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             unsigned b[2];
             ld_b_trans(b, ps + mt * 16 * 8, 8, lane);
+            if constexpr (FP8) {
+                // Each 32 dims of V^T as an even-dim tile and an odd-dim tile.
 #pragma unroll
-            for (int d = 0; d < DT; ++d) {
-                unsigned a[4];
-                // V^T as the A operand: V's rows are keys (k), its columns
-                // the value dims (m).
-                ldmatrix_x4_trans(a, vs + kv_at(mt * 16 + (lane & 7) + ((lane >> 4) << 3), d * 2 + ((lane >> 3) & 1)));
-                mma_m16n8k16(o_acc[d], a, b);
+                for (int kb = 0; kb < HEAD_DIM / 32; ++kb) {
+                    unsigned r[4];
+                    ldmatrix_x4_trans(r, rv + raw_at(mt * 16 + (lane & 7) + (lane >> 4) * 8, kb * 2 + ((lane >> 3) & 1)));
+                    unsigned ev[4], od[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const unsigned x = __byte_perm(r[i], 0, 0x3120);
+                        ev[i] = e4m3x2_f16x2(x);
+                        od[i] = e4m3x2_f16x2(x >> 16);
+                    }
+                    mma_m16n8k16_f16(o_acc[2 * kb], ev, b);
+                    mma_m16n8k16_f16(o_acc[2 * kb + 1], od, b);
+                }
+            } else {
+#pragma unroll
+                for (int d = 0; d < DT; ++d) {
+                    unsigned a[4];
+                    // V^T as the A operand: V's rows are keys (k), its columns
+                    // the value dims (m).
+                    ldmatrix_x4_trans(a, vs + kv_at(mt * 16 + (lane & 7) + ((lane >> 4) << 3), d * 2 + ((lane >> 3) & 1)));
+                    mma_m16n8k16(o_acc[d], a, b);
+                }
             }
         }
         __syncwarp();
@@ -395,10 +428,12 @@ __device__ __forceinline__ void decode_body(
     }
 #pragma unroll
     for (int d = 0; d < DT; ++d) {
-        wo[(2 * t) * HEAD_DIM + d * 16 + g] = o_acc[d][0];
-        wo[(2 * t + 1) * HEAD_DIM + d * 16 + g] = o_acc[d][1];
-        wo[(2 * t) * HEAD_DIM + d * 16 + g + 8] = o_acc[d][2];
-        wo[(2 * t + 1) * HEAD_DIM + d * 16 + g + 8] = o_acc[d][3];
+        const int col = FP8 ? (d >> 1) * 32 + 2 * g + (d & 1) : d * 16 + g;
+        const int hi = FP8 ? 16 : 8;
+        wo[(2 * t) * HEAD_DIM + col] = o_acc[d][0];
+        wo[(2 * t + 1) * HEAD_DIM + col] = o_acc[d][1];
+        wo[(2 * t) * HEAD_DIM + col + hi] = o_acc[d][2];
+        wo[(2 * t + 1) * HEAD_DIM + col + hi] = o_acc[d][3];
     }
     __syncthreads();
 

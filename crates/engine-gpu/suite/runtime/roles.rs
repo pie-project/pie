@@ -142,9 +142,7 @@ impl Bound {
             .settle_frame(&mut ticket)
             .map_err(|e| e.to_string())?;
         let mut take = |dense: u32| -> Result<i32, String> {
-            let cell = self
-                .engine
-                .take_channel(self.instance, dense)
+            let cell = engine::Channels::take(&mut self.engine, self.instance, dense)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("channel {dense} holds no cell"))?;
             let first = i32::from_le_bytes(cell[..4].try_into().expect("an i32"));
@@ -160,8 +158,7 @@ impl Bound {
         };
         let got = (take(0)?, take(4)?);
         // The stacked rows are another test's: drained so the ring has room.
-        self.engine
-            .take_channel(self.instance, 1)
+        engine::Channels::take(&mut self.engine, self.instance, 1)
             .map_err(|e| e.to_string())?;
         Ok(got)
     }
@@ -282,8 +279,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
     let bound = eta_ir::validate::bind(program(), vec![decls], EngineCaps::default())
         .expect("the program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut engine, &ProgramRegistration {
             program_hash: 0x5107,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
@@ -350,13 +346,11 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         channel_shape.is_some(),
         "the own kept channel takes slots where cells lie on the device"
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     assert!(
-        engine
-            .publish_channel(instance, 2, &0.375f32.to_le_bytes())
+        engine::Channels::publish(&mut engine, instance, 2, &0.375f32.to_le_bytes())
             .expect("the timestep publishes"),
         "the ring had room"
     );
@@ -422,9 +416,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
             .map(|(_, pair)| pair)
             .collect(),
     };
-    bound
-        .engine
-        .evacuate(&moves([
+    engine::Pool::evacuate(&mut bound.engine, &moves([
             (tables, onto),
             (cells, onto_cells),
             (blank, tables),
@@ -454,9 +446,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         "without a rebind the pass reads blank tables, and answered {stale:?}"
     );
     // The rebind the bare evacuation skipped: the same refs, placed anew.
-    bound
-        .engine
-        .rebind_slots(Rebind::Instance {
+    engine::Programs::rebind(&mut bound.engine, Rebind::Instance {
             id: bound.instance,
             instance: binding.instance_slots.clone(),
             rings: binding.ring_slots.clone(),
@@ -475,8 +465,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
     // blanked, copied back into fresh refs.
     let device = <backend::Api as engine_gpu::api::Host>::domain(bound.engine.boot());
     let copy = |engine: &mut backend::Engine, shape: ShapeId, src, dst, pairs: Vec<(u32, u32)>| {
-        engine
-            .copy_slots(&SlotCopy {
+        engine::Tiers::copy(engine, &SlotCopy {
                 shape,
                 src,
                 dst,
@@ -533,9 +522,7 @@ fn an_instance_in_pool_slots_fires_through_moves() {
         "unparked without a rebind the pass reads blank tables, and answered {stale:?}"
     );
     let before = last;
-    bound
-        .engine
-        .rebind_slots(Rebind::Instance {
+    engine::Programs::rebind(&mut bound.engine, Rebind::Instance {
             id: bound.instance,
             instance: fresh[0].clone(),
             rings: binding

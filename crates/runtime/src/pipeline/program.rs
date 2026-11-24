@@ -514,6 +514,11 @@ fn global() -> MutexGuard<'static, Registry> {
     GLOBAL.lock().expect("global lock poisoned")
 }
 
+/// Forgets the programs registered against the boot's model.
+pub(crate) fn reset() {
+    *global() = Registry::new(NonZeroUsize::new(DEFAULT_CAPACITY).expect("nonzero capacity"));
+}
+
 /// Registers `bytes` for the served model. `rows` is the most rows one of
 /// its fires binds (`model.max-pass-rows()`), which a row-extent channel is
 /// declared at ([`identity`]); `None` for a float pass.

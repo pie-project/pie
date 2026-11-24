@@ -82,7 +82,7 @@ impl SlotPool {
     }
 
     /// The engine narrowed its carve to the activation set aside now (a
-    /// lower's notice landed, `Engine::set_rung`): the span above it opens
+    /// lower's notice landed, `Pool::set_rung`): the span above it opens
     /// for state ([`Self::carved`]).
     pub fn engine_narrowed(&mut self) {
         let was = self.state_limit();

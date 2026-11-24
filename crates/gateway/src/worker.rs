@@ -11,8 +11,8 @@ use tarpc::server::{BaseChannel, Channel};
 use tokio::net::ToSocketAddrs;
 use tokio::sync::watch;
 use worker_api::{
-    Accepted, Control, GatewayInbound, Request, Tokens, WorkerControlClient, accept_gateway_link,
-    dispatch_codec,
+    Accepted, Control, GatewayInbound, LINK_MAX_FRAME_BYTES, Request, Tokens, WorkerControlClient,
+    accept_gateway_link, dispatch_codec,
 };
 
 use crate::session::Sessions;
@@ -185,9 +185,7 @@ pub async fn serve(
     let mut incoming = tcp::listen(bind, dispatch_codec)
         .await
         .context("bind worker-facing listener")?;
-    incoming
-        .config_mut()
-        .max_frame_length(WORKER_MAX_FRAME_BYTES);
+    incoming.config_mut().max_frame_length(LINK_MAX_FRAME_BYTES);
     let bound = incoming.local_addr();
 
     let task = tokio::spawn(async move {

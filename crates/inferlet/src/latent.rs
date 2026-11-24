@@ -253,6 +253,14 @@ impl DenoiseLoop {
     }
 }
 
+impl Drop for DenoiseLoop {
+    fn drop(&mut self) {
+        [self.step, self.timestep, self.ts, self.dts]
+            .into_iter()
+            .for_each(Channel::release);
+    }
+}
+
 /// DPM-Solver++ 2M over a flow schedule, as per-fire scalar tables indexed
 /// by `DenoiseLoop`'s fire `k` (fire 0 is the seed and steps nowhere; fire
 /// `k` steps from `sigmas[k-1]` to `sigmas[k]`). With `x0 = x - sigma_s * v`

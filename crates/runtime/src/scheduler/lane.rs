@@ -2,8 +2,9 @@ use crate::rt::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ::engine::ChannelRegistration;
+use ::engine::{ChannelRegistration, Engine};
 
+use crate::engine::verbs::serve;
 use crate::engine::{
     BoundInstance, ChannelJoin, EngineBox, RegisteredChannel, SubmissionCompletion,
 };
@@ -467,8 +468,8 @@ fn refuse_lanes(
                 gone.push((instance, reason.clone()));
             }
             tracing::warn!(%reason, "a fire's lanes were refused; it fails alone");
-            if let Some(&cell) = fire.terminal_cells.get(member) {
-                completion::settle(&[cell], completion::TERMINAL_OUTCOME_FAILED);
+            if let Some(cell) = fire.terminal_cells.get(member) {
+                completion::settle(std::slice::from_ref(cell), completion::TERMINAL_OUTCOME_FAILED);
             }
             if let Some(completion) = fire.completions.get(member) {
                 completion.reject_unsubmitted(reason.clone());
@@ -1309,24 +1310,31 @@ impl Lane {
             if let Err(error) = engine.bind_thread() {
                 tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
             }
-            engine.on_tapped(crate::offload::stream::sink());
+            if let Some(taps) = engine.taps() {
+                taps.subscribe(crate::offload::stream::sink());
+            }
             // A copy still landing settles its tracked completion here: the
             // runtime gives its source slots back only then.
             let landed = broker.clone();
-            engine.on_landed(std::sync::Arc::new(move |token: u64, landing: ::engine::Landing| {
-                // A copy that failed leaves its data at its source: its
-                // completion settles failed, never landed, and the move
-                // waiting on it is taken back (`planner::exec`).
-                tell_landing(&landed, engine_idx, token, landing);
-                // The scheduler retires the copy's completion on its next
-                // turn: woken now, not at its idle backstop, so the move
-                // waiting on it commits (and its pages come back) at once.
-                if let Ok(handle) = crate::scheduler::scheduler_handle(engine_idx) {
-                    let _ = handle.nudge();
-                }
-            }));
-            if engine.settles_asynchronously() {
-                engine.on_complete(std::sync::Arc::new(
+            if let Some(tiers) = engine.tiers() {
+                tiers.on_landed(std::sync::Arc::new(move |token: u64, landing: ::engine::Landing| {
+                    // A copy that failed leaves its data at its source: its
+                    // completion settles failed, never landed, and the move
+                    // waiting on it is taken back (`planner::exec`).
+                    tell_landing(&landed, engine_idx, token, landing);
+                    // The scheduler retires the copy's completion on its next
+                    // turn: woken now, not at its idle backstop, so the move
+                    // waiting on it commits (and its pages come back) at once.
+                    if let Ok(handle) = crate::scheduler::scheduler_handle(engine_idx) {
+                        let _ = handle.nudge();
+                    }
+                }));
+            }
+            let asynchronous = crate::engine::verbs::settles_asynchronously(engine.as_mut());
+            if let Some(completion) = engine.completion()
+                && asynchronous
+            {
+                completion.on_complete(std::sync::Arc::new(
                     move |at: engine::StepDone, mut outcome: engine::StepOutcome| {
                         // What lanes wrote is kept before their step is published
                         // settled, so the fires that asked find it.
@@ -1350,20 +1358,22 @@ impl Lane {
                 // here before `submit` returns, so it is kept before the
                 // frame's cells settle.
                 let faulted = Arc::clone(&inline_faults);
-                engine.on_complete(std::sync::Arc::new(
-                    move |at: engine::StepDone, outcome: engine::StepOutcome| {
-                        crate::pipeline::fire::record_beam_common(outcome.beam_common);
-                        if !outcome.wrote.is_empty() {
-                            crate::pipeline::fire::record_kv_writes(outcome.wrote);
-                        }
-                        if !outcome.faulted.is_empty() {
-                            faulted
-                                .lock()
-                                .unwrap()
-                                .push((at.step as usize, outcome.faulted));
-                        }
-                    },
-                ));
+                if let Some(completion) = engine.completion() {
+                    completion.on_complete(std::sync::Arc::new(
+                        move |at: engine::StepDone, outcome: engine::StepOutcome| {
+                            crate::pipeline::fire::record_beam_common(outcome.beam_common);
+                            if !outcome.wrote.is_empty() {
+                                crate::pipeline::fire::record_kv_writes(outcome.wrote);
+                            }
+                            if !outcome.faulted.is_empty() {
+                                faulted
+                                    .lock()
+                                    .unwrap()
+                                    .push((at.step as usize, outcome.faulted));
+                            }
+                        },
+                    ));
+                }
             }
         }
         let mut stash: Option<LaneRequest> = None;
@@ -1494,7 +1504,9 @@ impl Lane {
                         result
                     }));
                     let panicked = served.is_err();
-                    let _ = reply.send(served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string().into())));
+                    let _ = reply.send(
+                        served.unwrap_or_else(|_| Err(LANE_PANICKED.to_string().into())),
+                    );
                     panicked
                 }
                 LaneRequest::Control { item, reply } => {
@@ -1541,7 +1553,9 @@ impl Lane {
                         take_landing(&mut landed_instances, frame, step as usize)
                             .unwrap_or_default();
                     if let Some(engine) = engine.as_mut() {
-                        if let Err(error) = engine.publish_landed() {
+                        if let Some(completion) = engine.completion()
+                            && let Err(error) = completion.publish_landed()
+                        {
                             tracing::error!(frame = frame.0, step, %error, "publishing a landed step");
                         }
                         let roles = roles.get_or_init(|| roles_of(engine_idx)).as_ref();
@@ -1660,8 +1674,9 @@ impl Lane {
         {
             if let LaneRequest::Launch { submission, .. } = &queued
                 && let Some(first) = submission.steps.first()
+                && let Some(completion) = engine.completion()
             {
-                engine.expect_fire(&first.submission);
+                completion.expect_fire(&first.submission);
             }
             *stash = Some(queued);
         }
@@ -1683,7 +1698,7 @@ impl Lane {
             }
         }
 
-        let asynchronous = engine.settles_asynchronously();
+        let asynchronous = crate::engine::verbs::settles_asynchronously(engine.as_mut());
         // The engine frames this one took, where they settle off the
         // submit: each one's id, the steps of `frame` it fired, and the
         // waiters on what each step puts.
@@ -1730,7 +1745,7 @@ impl Lane {
             // submit itself where the engine settles inside it, else from
             // here to its first step's landing.
             match &submit_result {
-                Ok(ticket) if engine.settles_asynchronously() => {
+                Ok(ticket) if asynchronous => {
                     SUBMITTED_AT.lock().unwrap().insert(ticket.id.0, submit_start);
                 }
                 Ok(_) => note_step(submit_start.elapsed().as_nanos() as u64),
@@ -1952,21 +1967,26 @@ impl Lane {
             QueuedItem::PrepareProgram { program, response } => {
                 // Its host codegen ran off this thread before it was sent.
                 let prepared =
-                    backend(engine).and_then(|engine| Ok(engine.prepare_program(&program)?));
+                    backend(engine).and_then(|engine| {
+                        Ok(serve(engine, Engine::programs, "prepare_program")?
+                            .prepare(&program)?)
+                    });
                 let _ = response.send(prepared);
                 LaneCommit::None
             }
             QueuedItem::FinishProgram { prepared, response } => {
                 let registered = backend(engine).and_then(|engine| {
-                    let program_id = engine.finish_program(prepared)?;
+                    let program_id =
+                        serve(engine, Engine::programs, "finish_program")?.finish(prepared)?;
                     // What an instance of it holds in the pool, asked once
                     // at registration. A program whose facts are not
                     // learned is released: the registration fails whole.
                     if let Some(roles) = roles_of(engine_idx)
                         && let Err(error) =
-                            crate::store::roles::learn_program(&roles, &**engine, program_id)
+                            crate::store::roles::learn_program(&roles, &mut **engine, program_id)
                     {
-                        let released = engine.close_program(program_id);
+                        let released = serve(engine, Engine::programs, "close_program")
+                            .and_then(|programs| programs.close_program(program_id));
                         return Err(match released {
                             Ok(()) => anyhow!("its facts: {error}; released"),
                             Err(also) => anyhow!(
@@ -1981,7 +2001,8 @@ impl Lane {
             }
             QueuedItem::FireFacts { key, response } => {
                 let asked = backend(engine).and_then(|engine| {
-                    let facts = engine.fire_facts(key.program, &key.extents)?;
+                    let facts = serve(engine, Engine::programs, "fire_facts")?
+                        .fire_facts(key.program, &key.extents)?;
                     if let Some(shared) =
                         crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared)
                     {
@@ -1994,7 +2015,8 @@ impl Lane {
             }
             QueuedItem::StandingAfter { binding, response } => {
                 let asked = backend(engine).and_then(|engine| {
-                    let total = engine.standing_after(&binding)?;
+                    let total = serve(engine, Engine::programs, "standing_after")?
+                        .standing_after(&binding)?;
                     // The booked total is the engine's as it stands: every
                     // bind and close books its total on this lane.
                     Ok(crate::store::registry::try_get(0, engine_idx)
@@ -2035,7 +2057,7 @@ impl Lane {
                     }
                 };
                 let roles = roles_of(engine_idx);
-                let held = crate::store::roles::held_by(&**engine, &plans);
+                let held = crate::store::roles::held_by(&mut **engine, &plans);
                 // Everything it takes of the pool first, its rings, its
                 // guest state, its tables: a bind short of room is answered
                 // so before it registers anything, and waits for room
@@ -2178,14 +2200,27 @@ impl Lane {
             QueuedItem::Pool { op, response } => {
                 let result = backend(engine).and_then(|engine| {
                     match op {
-                        PoolOp::CommitSegments(segments) => engine.commit_segments(segments),
-                        PoolOp::ReleaseSegments(segments) => engine.release_segments(segments),
-                        PoolOp::CommitSpan(segments) => engine.commit_span(segments),
-                        PoolOp::Rung { from, to } => engine.set_rung(from, to),
-                        PoolOp::ReleaseSpan(segments) => engine.release_span(segments),
-                        PoolOp::Evacuate(evacuation) => engine.evacuate(&evacuation),
-                        PoolOp::SettleCopies => engine.settle_copies(),
-                        PoolOp::CheckTable(runtime) => engine.chunk_table().and_then(|table| {
+                        PoolOp::CommitSegments(segments) => {
+                            serve(engine, Engine::pool, "commit_segments")
+                                .and_then(|pool| pool.commit(segments))
+                        }
+                        PoolOp::ReleaseSegments(segments) => {
+                            serve(engine, Engine::pool, "release_segments")
+                                .and_then(|pool| pool.release(segments))
+                        }
+                        PoolOp::CommitSpan(segments) => serve(engine, Engine::pool, "commit_span")
+                            .and_then(|pool| pool.commit_span(segments)),
+                        PoolOp::Rung { from, to } => serve(engine, Engine::pool, "set_rung")
+                            .and_then(|pool| pool.set_rung(from, to)),
+                        PoolOp::ReleaseSpan(segments) => serve(engine, Engine::pool, "release_span")
+                            .and_then(|pool| pool.release_span(segments)),
+                        PoolOp::Evacuate(evacuation) => serve(engine, Engine::pool, "evacuate")
+                            .and_then(|pool| pool.evacuate(&evacuation)),
+                        PoolOp::SettleCopies => serve(engine, Engine::tiers, "settle_copies")
+                            .and_then(|tiers| tiers.settle()),
+                        PoolOp::CheckTable(runtime) => serve(engine, Engine::pool, "chunk_table")
+                            .and_then(|pool| pool.chunk_table())
+                            .and_then(|table| {
                             match crate::store::shared::programs::table_apart(
                                 table.as_slice(),
                                 &runtime,
@@ -2211,44 +2246,54 @@ impl Lane {
             }
             QueuedItem::HostKv { op, response } => {
                 let result = backend(engine).and_then(|engine| match op {
-                    HostKvOp::Write(slots, bytes) => engine
-                        .write_host_kv(&slots, &bytes)
+                    HostKvOp::Write(slots, bytes) => serve(engine, Engine::peers, "write_host_kv")
+                        .and_then(|peers| peers.write(&slots, &bytes))
                         .map(|()| Vec::new())
                         .map_err(Into::into),
-                    HostKvOp::CopyRead(copy, slots) => engine
-                        .copy_kv(&copy)
-                        .and_then(|()| engine.read_host_kv(&slots))
+                    HostKvOp::CopyRead(copy, slots) => serve(engine, Engine::tiers, "copy_kv")
+                        .and_then(|tiers| tiers.copy_kv(&copy))
+                        .and_then(|()| serve(engine, Engine::peers, "read_host_kv"))
+                        .and_then(|peers| peers.read(&slots))
                         .map_err(Into::into),
-                    HostKvOp::Read(slots) => engine.read_host_kv(&slots).map_err(Into::into),
-                    HostKvOp::ReadState(slots, pages) => {
-                        engine.read_host_state(&slots, &pages).map_err(Into::into)
+                    HostKvOp::Read(slots) => serve(engine, Engine::peers, "read_host_kv")
+                        .and_then(|peers| peers.read(&slots))
+                        .map_err(Into::into),
+                    HostKvOp::ReadTier(slots) => serve(engine, Engine::tiers, "read_tier_slots")
+                        .and_then(|tiers| tiers.read(&slots))
+                        .map_err(Into::into),
+                    HostKvOp::WriteTier(slots, bytes) => {
+                        serve(engine, Engine::tiers, "write_tier_slots")
+                            .and_then(|tiers| tiers.write(&slots, &bytes))
+                            .map(|()| Vec::new())
+                            .map_err(Into::into)
                     }
-                    HostKvOp::WriteState(slots, pages, bytes) => engine
-                        .write_host_state(&slots, &pages, &bytes)
-                        .map(|()| Vec::new())
-                        .map_err(Into::into),
-                    HostKvOp::ReadTier(slots) => engine.read_tier_slots(&slots).map_err(Into::into),
-                    HostKvOp::WriteTier(slots, bytes) => engine
-                        .write_tier_slots(&slots, &bytes)
-                        .map(|()| Vec::new())
-                        .map_err(Into::into),
                     HostKvOp::TapGroups => {
-                        Ok(serde_json::to_vec(&engine.tap_groups()).unwrap_or_default())
+                        let groups = engine.taps().and_then(|taps| taps.groups());
+                        Ok(serde_json::to_vec(&groups).unwrap_or_default())
                     }
-                    HostKvOp::WeightResidency(residency) => engine
-                        .weight_residency(&residency)
-                        .map(|held| serde_json::to_vec(&held).unwrap_or_default())
-                        .map_err(Into::into),
-                    HostKvOp::WeightUses => engine
-                        .weight_uses()
+                    HostKvOp::WeightResidency(residency) => {
+                        serve(engine, Engine::weights, "weight_residency")
+                            .and_then(|weights| weights.set_residency(&residency))
+                            .map(|held| serde_json::to_vec(&held).unwrap_or_default())
+                            .map_err(Into::into)
+                    }
+                    HostKvOp::WeightUses => serve(engine, Engine::weights, "weight_uses")
+                        .and_then(|weights| weights.uses())
                         .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
                         .map_err(Into::into),
-                    HostKvOp::BeamList(instance, beam) => engine
-                        .beam_list(instance, beam)
+                    HostKvOp::BeamList(instance, beam) => serve(engine, Engine::programs, "beam_list")
+                        .and_then(|programs| programs.beam_list(instance, beam))
                         .map(|list| list.iter().flat_map(|page| page.to_le_bytes()).collect())
                         .map_err(Into::into),
+                    HostKvOp::ReloadWeights(checkpoint) => {
+                        serve(engine, Engine::weights, "reload_weights")
+                            .and_then(|weights| weights.reload(&::engine::Reload { checkpoint }))
+                            .map(|written| serde_json::to_vec(&written).unwrap_or_default())
+                            .map_err(Into::into)
+                    }
                     HostKvOp::Layout => Ok(engine
-                        .host_kv_layout()
+                        .peers()
+                        .and_then(|peers| peers.layout())
                         .and_then(|layout| serde_json::to_vec(&layout).ok())
                         .unwrap_or_default()),
                 });
@@ -2257,7 +2302,11 @@ impl Lane {
             }
             QueuedItem::CloseInstance { id, .. } => {
                 let closed = backend(engine)
-                    .and_then(|engine| engine.close_instance(id).map_err(anyhow::Error::from));
+                    .and_then(|engine| {
+                        serve(engine, Engine::programs, "close_instance")
+                            .and_then(|programs| programs.close(id))
+                            .map_err(anyhow::Error::from)
+                    });
                 let shared = crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared);
                 close_books(
                     id,
@@ -2308,7 +2357,9 @@ impl Lane {
     }
 
     fn close_channel(engine: &mut EngineBox, id: ::engine::ChannelId) -> Result<()> {
-        match engine.close_channel(id) {
+        match serve(engine, Engine::channels, "close_channel")
+            .and_then(|channels| channels.close(id))
+        {
             Ok(()) | Err(engine::Error::Unsupported { .. }) => Ok(()),
             Err(error) => Err(anyhow::Error::from(error)),
         }
@@ -2330,7 +2381,9 @@ impl Lane {
         let undo =
             |engine: &mut EngineBox, channels: &mut ChannelJoin, ids: &[::engine::ChannelId]| {
                 for &channel_id in ids.iter().rev() {
-                    let _ = engine.close_channel(channel_id);
+                    if let Some(open) = engine.channels() {
+                        let _ = open.close(channel_id);
+                    }
                     channels.remove(channel_id);
                     if let Some(roles) = &roles {
                         roles.lock().unwrap().close_channel(channel_id);
@@ -2427,18 +2480,25 @@ impl Lane {
 /// Runs `plan` on `engine`: its completion settles once the copy has read
 /// its sources, so what waits on it gives them back only then, not while the
 /// copy may still read slots another owner now writes
-/// ([`::engine::Engine::copy_slots_landing`]).
+/// ([`::engine::Tiers::copy_landing`]).
 fn copy_settled_on_landing(
     engine: &mut EngineBox,
     broker: &crate::engine::CompletionBroker,
     plan: PreLaunchCopy,
 ) -> anyhow::Result<SubmissionCompletion> {
     match plan {
-        PreLaunchCopy::Kv(plan) => crate::engine::verbs::settled(engine.copy_kv(&plan)),
-        PreLaunchCopy::State(plan) => crate::engine::verbs::settled(engine.copy_state(&plan)),
+        PreLaunchCopy::Kv(plan) => crate::engine::verbs::settled(
+            serve(engine, Engine::tiers, "copy_kv").and_then(|tiers| tiers.copy_kv(&plan)),
+        ),
+        PreLaunchCopy::State(plan) => crate::engine::verbs::settled(
+            serve(engine, Engine::tiers, "copy_state")
+                .and_then(|tiers| tiers.copy_state(&plan)),
+        ),
         PreLaunchCopy::Slots(plan) => {
             let landing = broker.landing_completion(waker::FIRST_COMPLETION_EPOCH);
-            if engine.copy_slots_landing(&plan, landing.wait_id())? {
+            if serve(engine, Engine::tiers, "copy_slots")?
+                .copy_landing(&plan, landing.wait_id())?
+            {
                 Ok(SubmissionCompletion::ready())
             } else {
                 Ok(landing)
@@ -2495,7 +2555,7 @@ mod landing_tests {
         tokens: Arc<std::sync::Mutex<Vec<u64>>>,
     }
 
-    impl Engine for LateCopies {
+    impl ::engine::Engine for LateCopies {
         fn committed_covers(&self) -> &'static [&'static str] {
             &[]
         }
@@ -2506,35 +2566,12 @@ mod landing_tests {
 
         }
 
-
         fn skips_measuring(&self) -> bool {
             false
         }
 
         fn kind(&self) -> &'static str {
             "fake-late-copies"
-        }
-
-        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-            Err(self.unsupported("chunk_table"))
-        }
-
-        fn prepare_program(
-            &mut self,
-            _registration: &::engine::program::ProgramRegistration,
-        ) -> ::engine::Result<::engine::ProgramCompile> {
-            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
-        }
-
-        fn finish_program(
-            &mut self,
-            _prepared: ::engine::Prepared,
-        ) -> ::engine::Result<::engine::ProgramId> {
-            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
-        }
-
-        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
 
         fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
@@ -2545,17 +2582,89 @@ mod landing_tests {
             unreachable!("nothing fires here")
         }
 
-        fn copy_slots(&mut self, _copy: &SlotCopy) -> ::engine::Result<()> {
+        fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+            Some(self)
+        }
+
+        fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+            Some(self)
+        }
+
+        fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+            Some(self)
+        }
+    }
+
+    impl ::engine::Programs for LateCopies {
+        fn prepare(
+            &mut self,
+            _registration: &::engine::program::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramCompile> {
+            Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+        }
+
+        fn finish(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+        }
+
+        fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "close_program"))
+        }
+
+        fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "register_program"))
+        }
+
+        fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+            Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+        }
+
+        fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+            Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+        }
+
+        fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+        }
+    }
+
+    impl ::engine::Pool for LateCopies {
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+        }
+
+        fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+        }
+
+        fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        }
+
+        fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+        }
+    }
+
+    impl ::engine::Tiers for LateCopies {
+        fn copy(&mut self, _copy: &SlotCopy) -> ::engine::Result<()> {
             Ok(())
         }
 
         /// A test engine's copies land inside the call: nothing to wait for.
-        fn settle_copies(&mut self) -> ::engine::Result<()> {
+        fn settle(&mut self) -> ::engine::Result<()> {
             Ok(())
         }
 
-        fn copy_slots_landing(&mut self, copy: &SlotCopy, token: u64) -> ::engine::Result<bool> {
-            self.copy_slots(copy)?;
+        fn copy_landing(&mut self, copy: &SlotCopy, token: u64) -> ::engine::Result<bool> {
+            ::engine::Tiers::copy(self, copy)?;
             self.tokens.lock().unwrap().push(token);
             Ok(self.lands_in_call)
         }
@@ -2563,12 +2672,28 @@ mod landing_tests {
         fn on_landed(&mut self, sink: LandingSink) {
             *self.sink.lock().unwrap() = Some(sink);
         }
+
+        fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+            Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+        }
+
+        fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+        }
+
+        fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+        }
     }
+
 
     fn park() -> PreLaunchCopy {
         PreLaunchCopy::Slots(SlotCopy {
             shape: ShapeId(0),
-            src: MemoryDomain::CudaDevice(0),
+            src: MemoryDomain::Device {
+                ordinal: 0,
+                reach: ::engine::DeviceReach::Peer,
+            },
             dst: MemoryDomain::HostPinned,
             slots: vec![(3, 0), (4, 1)],
             runs: Vec::new(),
@@ -2588,7 +2713,7 @@ mod landing_tests {
             tokens: Arc::clone(&tokens),
         };
         let told = broker.clone();
-        engine.on_landed(Arc::new(move |token, landing| {
+        <LateCopies as ::engine::Tiers>::on_landed(&mut engine, Arc::new(move |token, landing| {
             tell_landing(&told, 0, token, landing);
         }));
         (Box::new(engine), tokens, sink)
@@ -2663,57 +2788,134 @@ mod behind_tests {
     /// An engine with work left behind serving, counting the slices it ran.
     struct Pending(Arc<std::sync::atomic::AtomicUsize>);
 
-    impl Engine for Pending {
+    impl ::engine::Engine for Pending {
         fn committed_covers(&self) -> &'static [&'static str] {
             &[]
         }
+
         fn measured_at_load(&self) -> Vec<String> {
             Vec::new()
         }
+
         fn skips_measuring(&self) -> bool {
             false
         }
+
         fn kind(&self) -> &'static str {
             "fake-behind"
         }
-        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-            Err(self.unsupported("chunk_table"))
+
+        fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
+            Err(::engine::Error::Load("no model".into()))
         }
-        fn prepare_program(
+
+        fn submit(&mut self, _frame: &FrameSubmission) -> ::engine::Result<FrameTicket> {
+            unreachable!("nothing fires here")
+        }
+
+        fn measures_behind(&self) -> bool {
+            true
+        }
+
+        fn measure_behind(&mut self, _behind: &::engine::BehindServing<'_>) -> ::engine::Result<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(true)
+        }
+
+        fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+            Some(self)
+        }
+
+        fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+            Some(self)
+        }
+
+        fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+            Some(self)
+        }
+    }
+
+    impl ::engine::Programs for Pending {
+        fn prepare(
             &mut self,
             _registration: &::engine::program::ProgramRegistration,
         ) -> ::engine::Result<::engine::ProgramCompile> {
             Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
         }
-        fn finish_program(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
+
+        fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
             Err(::engine::Error::unsupported(self.kind(), "finish_program"))
         }
+
         fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
             Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
-        fn load(&mut self, _request: LoadRequest) -> ::engine::Result<Loaded> {
-            Err(::engine::Error::Load("no model".into()))
+
+        fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(self.kind(), "register_program"))
         }
-        fn submit(&mut self, _frame: &FrameSubmission) -> ::engine::Result<FrameTicket> {
-            unreachable!("nothing fires here")
+
+        fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+            Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
         }
-        fn copy_slots(&mut self, _copy: &SlotCopy) -> ::engine::Result<()> {
-            Ok(())
+
+        fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+            Err(::engine::Error::unsupported(self.kind(), "close_instance"))
         }
-        fn settle_copies(&mut self) -> ::engine::Result<()> {
-            Ok(())
-        }
-        fn copy_slots_landing(&mut self, _copy: &SlotCopy, _token: u64) -> ::engine::Result<bool> {
-            Ok(true)
-        }
-        fn measures_behind(&self) -> bool {
-            true
-        }
-        fn measure_behind(&mut self, _behind: &::engine::BehindServing<'_>) -> ::engine::Result<bool> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(true)
+
+        fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
         }
     }
+
+    impl ::engine::Pool for Pending {
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+        }
+
+        fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+        }
+
+        fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        }
+
+        fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+        }
+    }
+
+    impl ::engine::Tiers for Pending {
+        fn copy(&mut self, _copy: &SlotCopy) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        fn settle(&mut self) -> ::engine::Result<()> {
+            Ok(())
+        }
+
+        fn copy_landing(&mut self, _copy: &SlotCopy, _token: u64) -> ::engine::Result<bool> {
+            Ok(true)
+        }
+
+        fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+            Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+        }
+
+        fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+        }
+
+        fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+        }
+    }
+
 
     /// While a process has work outstanding (a pipeline open), the lane runs
     /// none of an engine's behind work, whatever the engine states: never

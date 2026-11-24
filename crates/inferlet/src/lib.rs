@@ -58,7 +58,8 @@ pub mod model {
         BlockDrafter, InputAxis, InputDecl, LaneDecl, LatentSpace, OutputDecl, RowCount,
         ScheduleFact, ScheduleKind, SwitchDecl, architecture, channel_capacity, draft_block,
         draft_depth, frame_size, frames_in_flight, kv_page_size, lane, latent, max_pass_rows,
-        name, output_vocab_size, rs_state_size, run_ahead_window, schedule, switches,
+        max_sequence_tokens, name, output_vocab_size, rs_state_size, run_ahead_window, schedule,
+        switches,
     };
 
     /// What a lane under these `(name, value)` switches binds.

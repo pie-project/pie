@@ -119,8 +119,7 @@ fn folded_roots_and_puts_lay_once_in_their_pass() {
         launch.plan_local(3),
         "the compile folds the two broadcasts into one value"
     );
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut engine, &ProgramRegistration {
             program_hash: 0xf01d,
             launch,
             ..Default::default()
@@ -173,16 +172,14 @@ fn folded_roots_and_puts_lay_once_in_their_pass() {
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     // Twice: the second fire replays the first's recording where the
     // backend records.
     for round in 0..2 {
         assert!(
-            engine
-                .publish_channel(instance, 2, &0.375f32.to_le_bytes())
+            engine::Channels::publish(&mut engine, instance, 2, &0.375f32.to_le_bytes())
                 .expect("the timestep publishes"),
             "the ring had room"
         );
@@ -217,8 +214,7 @@ fn folded_roots_and_puts_lay_once_in_their_pass() {
             .settle_frame(&mut ticket)
             .expect("the frame settles: its pass asked for no more than its berth");
         for channel in [0, 1] {
-            let cell = engine
-                .take_channel(instance, channel)
+            let cell = engine::Channels::take(&mut engine, instance, channel)
                 .expect("the channel reads")
                 .expect("the channel holds a cell");
             let got: Vec<f32> = cell

@@ -159,8 +159,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
     let bound = eta_ir::validate::bind(program(), vec![outputs], EngineCaps::default())
         .expect("the program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = engine
-        .register_program(&ProgramRegistration {
+    let program = engine::Programs::register(&mut engine, &ProgramRegistration {
             program_hash: 0xb00e,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
@@ -218,8 +217,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
         },
         &channels,
     );
-    let instance = engine
-        .bind_instance(&binding)
+    let instance = engine::Programs::bind(&mut engine, &binding)
         .expect("the instance binds")
         .id;
     let readers = [
@@ -236,8 +234,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
             (1, bits(&line_of(salt))),
         ] {
             assert!(
-                engine
-                    .publish_channel(instance, channel, &cell)
+                engine::Channels::publish(&mut engine, instance, channel, &cell)
                     .expect("the cell publishes"),
                 "the ring had room"
             );
@@ -272,8 +269,7 @@ fn bool_outputs_are_written_by_every_op_that_moves_them() {
         engine.settle_frame(&mut ticket).expect("the frame settles");
         let expected = want(&mask_of(salt), &line_of(salt));
         for ((name, channel), want) in readers.iter().zip(&expected) {
-            let got = engine
-                .take_channel(instance, *channel)
+            let got = engine::Channels::take(&mut engine, instance, *channel)
                 .expect("the channel reads")
                 .expect("the channel holds a cell");
             if &got != want {

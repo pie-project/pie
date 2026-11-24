@@ -5,7 +5,7 @@ use super::{ProcessId, ResidencyPlanner};
 
 type PlannerMap = HashMap<(usize, usize), Arc<ResidencyPlanner>>;
 
-static PRIMARY: OnceLock<Arc<ResidencyPlanner>> = OnceLock::new();
+static PRIMARY: crate::slot::Slot<Arc<ResidencyPlanner>> = crate::slot::Slot::new();
 static PLANNERS: OnceLock<RwLock<PlannerMap>> = OnceLock::new();
 
 pub fn init_planner(model: usize, engine: usize, planner: ResidencyPlanner) {
@@ -64,7 +64,7 @@ pub(crate) fn set_test_planner(
 
 pub fn planner_for(model: usize, engine: usize) -> Option<Arc<ResidencyPlanner>> {
     if model == 0 && engine == 0 {
-        return PRIMARY.get().cloned();
+        return PRIMARY.get();
     }
     PLANNERS
         .get()?
@@ -82,7 +82,7 @@ pub fn wake(pid: ProcessId) {
     }
 }
 
-pub fn planner() -> Option<&'static Arc<ResidencyPlanner>> {
+pub fn planner() -> Option<Arc<ResidencyPlanner>> {
     PRIMARY.get()
 }
 
@@ -186,6 +186,18 @@ pub fn to_end_facts() -> (Option<u64>, bool) {
         .map(|(lanes, _)| *lanes)
         .try_fold(0u64, |sum, lanes| lanes.map(|lanes| sum.saturating_add(lanes)));
     (lanes, facts.iter().all(|&(_, spread)| spread))
+}
+
+/// Forgets the boot's planners and where its processes ran, for
+/// [`crate::bootstrap::reset`].
+pub(crate) fn reset() {
+    PRIMARY.clear();
+    if let Some(planners) = PLANNERS.get() {
+        planners.write().unwrap().clear();
+    }
+    if let Some(held) = ENGINE_OF.get() {
+        held.write().unwrap().clear();
+    }
 }
 
 /// Every engine's planner, engine 0's first: for what frees pages or

@@ -87,6 +87,7 @@ fn tests_every_case() {
     a_prefix_computed_twice_maps_whole_from_either_copy();
     a_page_no_one_else_reads_is_written_in_place();
     a_lookup_takes_the_copy_on_the_device();
+    a_lookup_follows_one_copy_to_its_children();
     what_a_decode_folds_seals();
     a_truncated_set_ends_where_it_was_cut();
     a_set_never_ends_inside_a_sealed_page();
@@ -112,6 +113,7 @@ fn tests_every_case() {
     a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
     a_beams_finish_copies_the_chosen_pages_another_reads();
     a_cut_waits_out_a_move();
+    new_weights_find_no_page_the_old_ones_sealed();
 }
 
 /// A beam search's finish while its set is suspending waits for the move
@@ -198,6 +200,38 @@ fn a_cut_waits_out_a_move() {
     store.abort_suspend(txn);
     store.truncate(ws, 0).unwrap();
     assert_eq!(store.mapped_len(ws).unwrap(), 0);
+}
+
+/// A reload in place rekeys the cache: what the old weights sealed is
+/// dropped, and the same tokens key otherwise under the new ones.
+fn new_weights_find_no_page_the_old_ones_sealed() {
+    let mut store = KvStore::new(16, h(41));
+    let tokens: Vec<u32> = (0..40).map(|t| 1300 + t).collect();
+    let owner = ProcessId::from_u128(41);
+    sealed_and_gone(&mut store, &tokens, owner);
+    let reader = store.create_working_set();
+    let old = keys_ahead(&store, reader, 0, &tokens);
+    assert_eq!(store.cached_run(&old).len(), 2);
+    assert_eq!(store.live_working_sets(), 1);
+    store.release_working_set(reader, store.current_epoch());
+    assert_eq!(store.live_working_sets(), 0);
+
+    assert_eq!(store.rekey(h(42)), 2, "the two kept pages go back");
+    assert_eq!(store.available_pages(), 16);
+    assert!(store.cached_working_sets().is_empty());
+    assert!(store.cached_run(&old).is_empty());
+    let reader = store.create_working_set();
+    let new = keys_ahead(&store, reader, 0, &tokens);
+    assert_ne!(
+        new, old,
+        "the same tokens key otherwise under the new weights"
+    );
+    assert!(store.cached_run(&new).is_empty());
+    store.release_working_set(reader, store.current_epoch());
+
+    sealed_and_gone(&mut store, &tokens, owner);
+    assert_eq!(store.cached_run(&new).len(), 2);
+    assert!(store.cached_run(&old).is_empty());
 }
 
 /// Pages that came from another worker, whose keys this worker computes from
@@ -1167,6 +1201,30 @@ fn a_lookup_takes_the_copy_on_the_device() {
     let other = store.cached_run(&keys);
     assert_eq!(other.len(), 3, "the other copy, whole");
     assert_ne!(other[0].node, run[0].node);
+}
+
+fn a_lookup_follows_one_copy_to_its_children() {
+    let mut store = KvStore::new(32, h(77));
+    store.set_keeps(true);
+    let opening = prompt(77, 2);
+    let mut history = opening.clone();
+    history.extend(prompt(78, 2));
+    let first = store.create_working_set();
+    sealed(&mut store, first, &opening);
+    let agent = reader(&mut store, &opening, 2);
+    commit_opaque(&mut store, agent, 2);
+    seal(&mut store, agent, 32, &history[32..]);
+    let second = store.create_working_set();
+    sealed(&mut store, second, &opening);
+    for ws in [first, agent, second] {
+        store.release_working_set(ws, store.current_epoch());
+    }
+    store.retire_idle();
+    let next = store.create_working_set();
+    let keys = keys_ahead(&store, next, 0, &history);
+    let run = store.cached_run(&keys);
+    assert_eq!(run.len(), 4);
+    assert_eq!(store.attach_run(next, &run, 4).unwrap(), 4);
 }
 
 fn decoded(store: &mut KvStore, tokens: &[u32], prefilled: usize, logged: usize) -> WorkingSetId {
@@ -2176,6 +2234,8 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     );
     store.settle(busy);
     store.settle(other);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 8, "back once they retire");
 
     // A reader holds it in a fire now in flight, and lets go.
     let tokens = kept_and_gone(&mut store, 21, 3, owner);

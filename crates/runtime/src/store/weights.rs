@@ -206,16 +206,23 @@ pub enum Proposal {
 
 impl<E: ::engine::Engine + ?Sized> WeightPort for E {
     fn uses(&mut self) -> ::engine::Result<WeightUses> {
-        self.weight_uses()
+        let kind = self.kind();
+        self.weights()
+            .ok_or(::engine::Error::unsupported(kind, "weight_uses"))?
+            .uses()
     }
 
     fn set_residency(&mut self, residency: &WeightResidency) -> ::engine::Result<()> {
-        self.weight_residency(residency).map(|_held| ())
+        let kind = self.kind();
+        self.weights()
+            .ok_or(::engine::Error::unsupported(kind, "weight_residency"))?
+            .set_residency(residency)
+            .map(|_held| ())
     }
 
     fn propose(&mut self, residency: &WeightResidency) -> Proposal {
-        match self.weight_residency(residency) {
-            Ok(_held) => Proposal::Taken,
+        match WeightPort::set_residency(self, residency) {
+            Ok(()) => Proposal::Taken,
             Err(_) => Proposal::Refused,
         }
     }

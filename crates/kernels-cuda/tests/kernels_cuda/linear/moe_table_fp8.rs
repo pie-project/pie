@@ -257,6 +257,52 @@ fn the_w8a8_selects_land_the_same_bits_through_any_table() {
     }
 }
 
+#[test]
+fn the_tma_fed_w8a8_select_lands_the_same_bits_through_any_table() {
+    if kernels_cuda::jit::cache::arch() != Some("sm_90") {
+        return;
+    }
+    let mut g = Gpu::open();
+    let mut lcg = Lcg::seeded(0x7a8);
+    let tuning = Tuning {
+        fp8a8_wgtma: true,
+        ..Tuning::DEFAULT
+    };
+    #[rustfmt::skip]
+    let cases = [(16usize, 3usize, 8usize, 256usize, 1024usize, true), (8, 6, 4, 384, 512, false),
+        (4, 24, 4, 256, 768, true), (4, 50, 4, 128, 512, true)];
+    for (ex, tokens, top, n, k, by_token) in cases {
+        let planes = fp8_bank(&mut g, 0x7a8 ^ (n + k) as u64, [ex, n, k], 128);
+        let planes = [planes[0].aligned(k as u64), planes[1]];
+        let f = fire_of(&mut g, &mut lcg, [ex, tokens, top, n, k], by_token);
+        let ctx = g.ctx().with_tuning(tuning);
+        let xr = if by_token { tokens } else { tokens * top };
+        let what = format!("TMA-fed W8A8 {ex}x{tokens}x{top} {n}x{k}");
+        same_bits(
+            &mut g,
+            &what,
+            ex,
+            &planes,
+            (f.y, tokens * top * n * 2),
+            |table| {
+                let (x, r) = (t(f.x, xr, k, Bf16), t(f.r, tokens, top, I32));
+                let mut y = t(f.y, tokens * top, n, Bf16);
+                moe::select_fp8_w8a8(
+                    &ctx,
+                    x,
+                    planes[0].base,
+                    planes[1].base,
+                    ex as u32,
+                    r,
+                    &mut y,
+                    table,
+                )
+                .expect("the W8A8 select fires");
+            },
+        );
+    }
+}
+
 /// The indirection's cost: the W8A16 decode select and the bf16 GEMV timed
 /// with no table and with a scattered one (`PIE_TABLE_TIMING=1` prints).
 #[test]
