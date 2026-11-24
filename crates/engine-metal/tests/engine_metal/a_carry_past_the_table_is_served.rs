@@ -4,11 +4,12 @@
 //! refused: the scan makes each chunk's reductions itself, and answers as it
 //! does through the table.
 
+use engine_metal::chip;
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::ssm::{self, Committed, Corrected, DotsTable, Paged, VerifyGates};
 use kernels_metal::tensor::RecurrentPool;
-use kernels_metal::{StateMap, Tensor};
+use kernels_metal::{StateMap, Tensor, Tuning};
 use poem_ir::Dtype;
 
 const K_HEADS: u32 = 2;
@@ -36,6 +37,8 @@ fn f32_bytes(n: usize, salt: u64, scale: f32) -> Vec<u8> {
 #[test]
 fn a_carry_past_the_table_is_served() {
     let Ok(device) = Context::bind() else { return };
+    let (profile, _) = chip::resolve(device.name(), &chip::facts(device.family(), device.cores(), 10, true), None);
+    let tuning = Tuning::new(profile, false, device.cores());
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     let keep = std::cell::RefCell::new(Vec::new());
@@ -115,7 +118,7 @@ fn a_carry_past_the_table_is_served() {
         let dots = DotsTable { table: work, rows, max_rep: CARRIED };
         let frame = device.frame().expect("frame");
         let sink = Sink::new(&device, &frame, &pipelines, &handles);
-        ssm::gated_delta_carried(&sink, qkv, indptr, &committed, &verify, ba_paged, corrected, &pool, K_HEADS, V_HEADS, D, D, y, dots)
+        ssm::gated_delta_carried(&sink, &tuning, qkv, indptr, &committed, &verify, ba_paged, corrected, &pool, K_HEADS, V_HEADS, D, D, y, dots)
             .expect("a carry past the table is served");
         frame.commit().expect("commit");
         answers.push((read(y, (V_HEADS * D) as usize), read(state, bank)));
