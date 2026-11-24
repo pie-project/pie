@@ -5,6 +5,7 @@
 //! its cache holds them; a committed profile and committed records are read
 //! by the same keys) loads each measuring nothing (`Shell::measured_at_load`
 //! empty, the load's "measured 0"), as engine-gpu's suite checks the same.
+//! The fixtures are the golden probe's (`PIE_GOLDEN_CACHE`).
 
 use std::path::{Path, PathBuf};
 
