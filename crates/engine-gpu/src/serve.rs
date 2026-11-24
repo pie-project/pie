@@ -682,11 +682,36 @@ fn tier_of(number: u32) -> kernels_slang::Tier {
 /// kernel it takes over its range where it replaced the curves' one.
 fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
     let [_, _, replaced, vector, wide, tier] = row;
-    (replaced != 0).then(|| kernels_slang::linear::gemm::Tactic {
+    (replaced == ROW_REPLACED || replaced == ROW_KEPT).then(|| kernels_slang::linear::gemm::Tactic {
         tier: tier_of(tier),
         vector,
         wide: wide != 0,
     })
+}
+
+/// A stored settle row's third field: the range kept the curves' kernel,
+/// not named (a row written before the kept kernel was recorded, or a range
+/// whose planes took different kernels): the curves' pick serves it.
+const ROW_KEPT_UNNAMED: u32 = 0;
+/// The range replaced the curves' kernel with the one the row names.
+const ROW_REPLACED: u32 = 1;
+/// The range kept the curves' kernel, which the row names (every plane
+/// took the same one): what a load whose curves moved serves it by.
+const ROW_KEPT: u32 = 2;
+
+/// The row of a range `bottom..=top` that kept `standing`'s kernel: named
+/// where every plane takes one kernel over the range, else unnamed.
+fn kept_row(standing: &crate::dense::Dense, bottom: u32, top: u32) -> [u32; 6] {
+    let mut kernels: Vec<kernels_slang::linear::gemm::Tactic> = Vec::new();
+    for t in (bottom..=top).flat_map(|r| standing.tactics_at(r)) {
+        if !kernels.contains(&t) {
+            kernels.push(t);
+        }
+    }
+    match kernels.as_slice() {
+        [t] => [bottom, top, ROW_KEPT, t.vector, u32::from(t.wide), tier_number(t.tier)],
+        _ => [bottom, top, ROW_KEPT_UNNAMED, 0, 0, 0],
+    }
 }
 
 /// The dense settle left to weigh behind serving ([`Shell::measure_behind`]):
@@ -3137,7 +3162,7 @@ impl<B: Serve> Shell<B> {
                 self.dense = self.dense.with_rows(row[0], row[1], tactic);
             }
         }
-        let replaced = stored.iter().filter(|r| r[2] != 0).count();
+        let replaced = stored.iter().filter(|r| r[2] == ROW_REPLACED).count();
         // Skipped: nothing fires, now or behind serving; each range the
         // settle would weigh keeps the kernel the curves (or the profile
         // path) chose, said by name.
@@ -3732,7 +3757,7 @@ impl<B: Serve> Shell<B> {
             });
             // A range no whole served step weighs keeps the curves' kernel,
             // stored so the next load does not open it again.
-            return Ok(Opened::Kept(Some([bottom, top, 0, 0, 0, 0])));
+            return Ok(Opened::Kept(Some(kept_row(standing, bottom, top))));
         }
         Ok(Opened::Steps(Trial {
             bottom,
@@ -4065,13 +4090,18 @@ impl<B: Serve> Shell<B> {
             kernel,
             decided: pick.is_some(),
         });
-        let (vector, wide, tier) = kernel.map_or((0, 0, 0), |t| {
-            (t.vector, u32::from(t.wide), tier_number(t.tier))
-        });
-        (
-            [bottom, top, u32::from(taken != 0), vector, wide, tier],
-            kernel,
-        )
+        let row = match kernel.filter(|_| taken != 0) {
+            Some(t) => [
+                bottom,
+                top,
+                ROW_REPLACED,
+                t.vector,
+                u32::from(t.wide),
+                tier_number(t.tier),
+            ],
+            None => kept_row(&options[0], bottom, top),
+        };
+        (row, kernel)
     }
     /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, which
     /// model's settle it is (`crate::dense::settle_of`: its planes, the
@@ -10426,6 +10456,37 @@ mod tests {
                     bytes: 16
                 },
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod settle_row_tests {
+    use super::{ROW_KEPT, ROW_KEPT_UNNAMED, ROW_REPLACED, kept_row, row_tactic};
+    use kernels_slang::linear::gemm::Tactic;
+
+    /// A settle row names the kernel it kept where every plane took one, and
+    /// a load reads it back as that kernel; a row that names none (an old
+    /// row's 0) serves the curves' pick, never a guess.
+    #[test]
+    fn a_kept_row_names_its_kernel_and_an_unnamed_one_serves_the_curves() {
+        let gemv = Tactic {
+            tier: kernels_slang::Tier::Baseline,
+            vector: 8,
+            wide: false,
+        };
+        let standing = crate::dense::Dense::path(&[1, 2, 4, 8], |_| gemv);
+        let row = kept_row(&standing, 5, 8);
+        assert_eq!(row[2], ROW_KEPT);
+        assert_eq!(row_tactic(row), Some(gemv), "the kept kernel read back");
+        assert_eq!(row_tactic([5, 8, ROW_KEPT_UNNAMED, 0, 0, 0]), None, "the curves' pick");
+        assert_eq!(
+            row_tactic([5, 8, ROW_REPLACED, 4, 1, 0]),
+            Some(Tactic {
+                tier: kernels_slang::Tier::Baseline,
+                vector: 4,
+                wide: true
+            })
         );
     }
 }
