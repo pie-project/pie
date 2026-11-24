@@ -104,6 +104,39 @@ pub fn fold_count(
         .ok_or_else(|| Refusal::Program(format!("instance {instance}: `fold` holds an empty cell")))
 }
 
+/// The parents `ring`, channel `channel` of `instance`'s `parents` port,
+/// holds at the fire: each beam's parent (`crate::beam`). As with
+/// [`fold_count`], the next fire's parents are what this one's pass puts, so
+/// a fire staged while that pass is on the queue finds its cell in the ring
+/// before the value (a placeholder of zeros, which would continue every beam
+/// from beam 0): it waits for the landing. A fire whose parents are already
+/// in the ring reads them at once.
+pub fn parents(
+    instance: InstanceId,
+    channel: u32,
+    ring: &ChannelState,
+    owed: &Owed,
+    faulted: &AtomicBool,
+) -> std::result::Result<Vec<u32>, Refusal> {
+    owed.wait((channel, ring.head()), faulted);
+    if faulted.load(Ordering::Acquire) {
+        return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+    }
+    if ring.is_empty() {
+        return Err(Refusal::Program(format!(
+            "instance {instance}: the `parents` ring is empty at the fire"
+        )));
+    }
+    match ring.front() {
+        Value::U32(cells) => Ok(cells),
+        Value::I32(cells) => Ok(cells.iter().map(|&p| p as u32).collect()),
+        other => Err(Refusal::Program(format!(
+            "instance {instance}: `parents` holds {:?}, not beams",
+            other.dtype()
+        ))),
+    }
+}
+
 /// The cells of channels the device keeps between fires, by channel: one
 /// set for the engine, so a pass reads what another program's pass kept.
 /// A channel's cell lies in the `Channel` slots the runtime took for it
@@ -795,7 +828,7 @@ pub fn outcome_of<P>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelState, InstanceId, Owed, Value, fold_count};
+    use super::{ChannelState, InstanceId, Owed, Value, fold_count, parents};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -847,6 +880,52 @@ mod tests {
             fold_count(instance, FOLD, &ring, &owed, &faulted).unwrap(),
             Some(4)
         );
+        lands.join().unwrap();
+    }
+
+    /// A beam group's fire staged behind the pass that puts its parents
+    /// (on the queue: its cell a placeholder of zeros in the ring) reads the
+    /// parents that pass lands, not the placeholder that would continue every
+    /// beam from beam 0; a fire whose parents are in the ring reads them at
+    /// once.
+    #[test]
+    fn a_beam_fire_staged_behind_a_pass_in_flight_reads_the_parents_it_lands() {
+        const PARENTS: u32 = 5;
+        let instance = InstanceId(1);
+        let ring = Arc::new(ChannelState::host(eta_ir::Dtype::U32, 4, 4));
+        let owed = Arc::new(Owed::default());
+        let faulted = Arc::new(AtomicBool::new(false));
+
+        // The seeded parents: the first fire reads them at once.
+        assert!(ring.push(&Value::U32(vec![0, 1, 2, 3])));
+        assert_eq!(
+            parents(instance, PARENTS, &ring, &owed, &faulted).unwrap(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(ring.pop().is_some());
+        // Its pass and the next fire's go to the queue: each puts a cell of
+        // zeros whose value lands later.
+        for _ in 0..2 {
+            let sequence = ring.tail();
+            assert!(ring.push(&Value::U32(vec![0; 4])));
+            owed.owe(&[(PARENTS, sequence)]);
+        }
+        let landed = [vec![2, 2, 0, 3], vec![1, 3, 3, 0]];
+        let lands = {
+            let (ring, owed, landed) = (Arc::clone(&ring), Arc::clone(&owed), landed.clone());
+            std::thread::spawn(move || {
+                for (sequence, cell) in [(1, &landed[0]), (2, &landed[1])] {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    ring.encode_sequence(sequence, &Value::U32(cell.clone()));
+                    owed.land(&[(PARENTS, sequence)]);
+                }
+            })
+        };
+        // The second fire, staged while the first's pass is on the queue.
+        assert_eq!(parents(instance, PARENTS, &ring, &owed, &faulted).unwrap(), landed[0]);
+        assert!(ring.pop().is_some());
+        // The third, staged while the second's is.
+        assert_eq!(parents(instance, PARENTS, &ring, &owed, &faulted).unwrap(), landed[1]);
         lands.join().unwrap();
     }
 
