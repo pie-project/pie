@@ -108,8 +108,8 @@ impl Shell {
         self.live.tally(engine::live::Tally::BuiltInFire, built);
         let total = self.live.tallied(engine::live::Tally::BuiltInFire);
         if total.is_power_of_two() || built >= total {
-            eprintln!(
-                "engine-cuda: WARNING: a serving fire built {built} kernel instantiation(s) no \
+            tracing::warn!(
+                "a serving fire built {built} kernel instantiation(s) no \
                  walk of the load resolved; {total} so far (Tally::BuiltInFire). Every one a \
                  fire can reach is built before ready"
             );

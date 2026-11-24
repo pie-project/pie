@@ -76,7 +76,7 @@ fn tell_after(ordinal: i32, settle: Settle, told: Told) -> Result<()> {
                     if ordinal >= 0
                         && let Err(why) = crate::device::ctx::bind_thread(ordinal)
                     {
-                        eprintln!("engine-cuda: the landing waiter bound no device: {why}");
+                        tracing::warn!("the landing waiter bound no device: {why}");
                     }
                     while let Ok(Waited(settle, told)) = waits.recv() {
                         // A move left untold would hold its slots forever:

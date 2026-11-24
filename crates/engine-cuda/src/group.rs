@@ -244,7 +244,7 @@ impl Group {
                 }
                 Ok((rank, Err(error))) => {
                     heard += 1;
-                    eprintln!("engine-cuda: tensor-parallel rank {rank} refused: {error}");
+                    tracing::warn!("tensor-parallel rank {rank} refused: {error}");
                     if refused.is_none() {
                         // Every rank refusing the same lanes ran nothing:
                         // the group stays whole (`engine::Error::Lanes`).
@@ -265,8 +265,8 @@ impl Group {
                                         (&error, &lanes),
                                         (Error::Lanes(these), Some(first)) if these == first
                                     );
-                                    eprintln!(
-                                        "engine-cuda: tensor-parallel rank {rank} refused: {error}"
+                                    tracing::warn!(
+                                        "tensor-parallel rank {rank} refused: {error}"
                                     );
                                 }
                                 Ok(_) => {
@@ -294,7 +294,7 @@ impl Group {
                          within {}s; the group is aborted and poisoned",
                         wait.as_secs()
                     );
-                    eprintln!("engine-cuda: {why}");
+                    tracing::warn!("{why}");
                     self.poison_with(&why);
                     refused = Some(Error::Device(why));
                     break;
@@ -336,7 +336,7 @@ impl Group {
         })?;
         shell.bind_thread()?;
         verb(&mut shell).inspect_err(|error| {
-            eprintln!("engine-cuda: tensor-parallel rank {rank} refused: {error}");
+            tracing::warn!("tensor-parallel rank {rank} refused: {error}");
         })
     }
 

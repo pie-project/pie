@@ -309,8 +309,8 @@ fn restore_from_checkpoint(
         Err(_) => return Err(Rotten::Machine("a digest worker panicked".to_string())),
         Ok(Ok(())) => {}
     }
-    eprintln!(
-        "engine-cuda: this boot read its whole image out of {:?} — {} device image(s) \
+    tracing::info!(
+        "this boot read its whole image out of {:?} — {} device image(s) \
          pumped and {} T1 plane(s) {}, so the executor never ran",
         serving.path(),
         pumped,
@@ -633,8 +633,8 @@ impl Weights {
                     }),
                 ) {
                     Ok(ring) => {
-                        eprintln!(
-                            "engine-cuda: the weights cross by a pinned ring of 2 x {} KiB: the \
+                        tracing::info!(
+                            "the weights cross by a pinned ring of 2 x {} KiB: the \
                              link moves {:.1} GB/s from {} KiB copies past a {:.1} us latency; \
                              a slot fills at {:.1} GB/s ({} in {} ms)",
                             ring.slot_bytes() >> 10,
@@ -648,8 +648,8 @@ impl Weights {
                         Some(ring)
                     }
                     Err(why) => {
-                        eprintln!(
-                            "engine-cuda: no pinned ring for the weights ({why}); each is copied \
+                        tracing::info!(
+                            "no pinned ring for the weights ({why}); each is copied \
                              as it lands"
                         );
                         None
@@ -687,8 +687,8 @@ impl Weights {
             if let Some(ring) = &sink.ring {
                 ring.drain()?;
             }
-            eprintln!(
-                "engine-cuda: the weights landed in {} ms",
+            tracing::info!(
+                "the weights landed in {} ms",
                 landing_started.elapsed().as_millis()
             );
             // What this machine's landing measured, where it measured it

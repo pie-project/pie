@@ -136,8 +136,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         if let Some(fit) = walk_fire_fit(&boot.trace, engine.walk_fire_rows, device.device().num_sm)
             && fit * 2 <= boot.budget.max_tokens
         {
-            eprintln!(
-                "engine-cuda: fires of {fit} rows where {} were asked: the chunked gated delta \
+            tracing::info!(
+                "fires of {fit} rows where {} were asked: the chunked gated delta \
                  walk's blocks fit one wave (engine.walk_fire_rows)",
                 boot.budget.max_tokens
             );
@@ -150,8 +150,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if engine.host_planes {
         let freed = boot.residency.host_declared(&boot.trace)?;
         if freed > 0 {
-            eprintln!(
-                "engine-cuda: {:.1} GiB of planes the package declares `host` serve from \
+            tracing::info!(
+                "{:.1} GiB of planes the package declares `host` serve from \
                  pinned host memory (engine.host_planes)",
                 freed as f64 / f64::from(1u32 << 30)
             );
@@ -316,7 +316,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // context and kernel modules among it; no weight has landed yet), the
     // weight tier to come, and the driver's floor.
     let room_line = room_line(boot.allowance, ceiling, total - free, weight_tier, after_weights);
-    eprintln!("engine-cuda: {room_line}");
+    tracing::info!("{room_line}");
     let after_weights = held_beside(boot, after_weights)?;
     // A declared context is the model's, not the operator's: it is served at
     // the longest one sequence of which takes half the room this line leaves
@@ -480,12 +480,12 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         // waves of the kernels hipBLASLt states, or the measured curve as
         // timed and why its solutions went unread.
         #[cfg(feature = "rocm")]
-        eprintln!(
-            "engine-cuda: the matmuls weighed by {}",
+        tracing::info!(
+            "the matmuls weighed by {}",
             kernels_cuda::hip::lt_kernel::pricing()
         );
-        eprintln!(
-            "engine-cuda: {}",
+        tracing::info!(
+            "{}",
             engine::load::line_of(
                 &top,
                 top.tokens,
@@ -526,8 +526,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 let seat = crate::voxels::Seat::of(&boot.trace, &at);
                 working(tokens, &Some(at)).saturating_add(seat.payload_bytes())
             });
-            eprintln!(
-                "engine-cuda: the voxel rung derived: {fitted} rows of the widest voxel \
+            tracing::info!(
+                "the voxel rung derived: {fitted} rows of the widest voxel \
                  value fit the working set beside {tokens} tokens"
             );
             Some(ladder.at(fitted))
@@ -718,8 +718,8 @@ fn host_copy(boot: &Boot<'_>, params: &[usize]) -> Result<HostCopy> {
         if in_file {
             return Ok(HostCopy::Filed);
         }
-        eprintln!(
-            "engine-cuda: {} MiB of weights the pool will hold are copied to the host at \
+        tracing::info!(
+            "{} MiB of weights the pool will hold are copied to the host at \
              load (pageable, freed once seated): {} does not hold their planes as this plan \
              reads them (a plane decoded at load), so their slots cannot be filled from the \
              file",
@@ -959,8 +959,8 @@ fn refit(
     if scoped {
         for (stream, plane) in planes.iter().enumerate() {
             if plane.widest > plane.at_tokens {
-                eprintln!(
-                    "engine-cuda: the decoded-weight tile on stream {stream} is held to {} MiB, \
+                tracing::info!(
+                    "the decoded-weight tile on stream {stream} is held to {} MiB, \
                      the widest plane fired at token rows, not the {} MiB plane fired at \
                      readout rows: at {asked_lanes} lanes it leaves no room for one sequence on \
                      this card. A plane past the tile is served by the fused-dequant arm.",
@@ -976,8 +976,8 @@ fn refit(
     if (lanes, tokens) == (asked_lanes, asked_tokens) {
         return Ok((compiled, budgets, tiles_of(&planes, scoped)));
     }
-    eprintln!(
-        "engine-cuda: a fire of {} tokens and {asked_lanes} lanes is served at {tokens} \
+    tracing::info!(
+        "a fire of {} tokens and {asked_lanes} lanes is served at {tokens} \
          and {lanes}: at the asked budgets a fire's working set (activation arena, attention \
          workspaces, decoded-weight tiles) takes {} MiB of the {} MiB this \
          card has after the weight tier under the load's allowance, past the half the cache \
@@ -1155,11 +1155,11 @@ impl Shell {
         )?;
         if let Some(measured) = weights.landing() {
             match crate::rates::save_landing(boot.knobs.profiles.as_deref(), device.name(), &keys, measured) {
-                Ok(Some(path)) => eprintln!(
-                    "engine-cuda: how this machine lands weights, measured, saved to {path}"
+                Ok(Some(path)) => tracing::info!(
+                    "how this machine lands weights, measured, saved to {path}"
                 ),
                 Ok(None) => {}
-                Err(why) => eprintln!("engine-cuda: the landing's rates were not saved: {why}"),
+                Err(why) => tracing::warn!("the landing's rates were not saved: {why}"),
             }
         }
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
@@ -1467,8 +1467,8 @@ impl Shell {
         // top, above every carve (`store::OwnRows`).
         let own_rows = pools.own_rows_bytes();
         let arena_bytes = arena_bytes + own_rows;
-        eprintln!(
-            "engine-cuda: activation rungs {:?} under an arena of {arena_bytes} bytes",
+        tracing::info!(
+            "activation rungs {:?} under an arena of {arena_bytes} bytes",
             rungs
                 .iter()
                 .map(|(tokens, map)| (*tokens, map.bytes))
@@ -1683,7 +1683,7 @@ impl Shell {
         // It is a staged run of the activation's span: the fit seats it or
         // refuses the load, naming it (`Staging::short`).
         if let Some(fact) = expert_staging.fact() {
-            eprintln!("{fact}");
+            tracing::info!("{fact}");
         }
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
@@ -1802,8 +1802,8 @@ impl Shell {
             _released: Released,
         };
         if !shell.graphs.records() || !shell.bodies {
-            eprintln!(
-                "engine-cuda: a test's pinned modes ({:?}, {recording:?}): every fire \
+            tracing::info!(
+                "a test's pinned modes ({:?}, {recording:?}): every fire \
                  walks eagerly (~470 kernel launches of host time per decode step) with \
                  nothing captured",
                 shell.graphs
@@ -1970,8 +1970,8 @@ impl Shell {
             // load measures again, arming what fits and stating the rest
             // eager, as a load with no record does.
             Err(Fault::Residency(why)) if shell.bodies_from_record => {
-                eprintln!(
-                    "engine-cuda: the bodies' record no longer fits ({why}); this load measures \
+                tracing::warn!(
+                    "the bodies' record no longer fits ({why}); this load measures \
                      them again"
                 );
                 shell.bodies_from_record = false;
@@ -2099,8 +2099,8 @@ impl Shell {
         // program's: loaded here, before ready, so no first fire builds them.
         kernels_cuda::runtime::channel::load_wave_kernels()?;
         kernels_cuda::runtime::channel::load_gather_kernels()?;
-        eprintln!(
-            "engine-cuda: guests' samplers meet in {} KiB of lane arenas laid at load ({} \
+        tracing::info!(
+            "guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",
             arenas >> 10,
             self.programs.flight(),
@@ -2181,8 +2181,8 @@ impl Staged {
             shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
         if deferred {
             shell.arm_deferred = true;
-            eprintln!(
-                "engine-cuda: this load streams its weights; its bodies arm at the starting \
+            tracing::info!(
+                "this load streams its weights; its bodies arm at the starting \
                  weight residency, over the slots the cache holds then"
             );
         } else {
@@ -2250,8 +2250,8 @@ impl Staged {
         // runtime is stated is the pool the card backed.
         shell.back_whole()?;
         if let Some(kv) = shell.pools.stated_kv() {
-            eprintln!(
-                "engine-cuda: kv_device_tokens = {}: the device pool holds {} kv pages of {} \
+            tracing::info!(
+                "kv_device_tokens = {}: the device pool holds {} kv pages of {} \
                  tokens ({} asked), {} chunks of {} MiB: {} for the kv pages and the shapes \
                  beside them, {} for the weights held whole",
                 kv.tokens,
@@ -2366,8 +2366,8 @@ impl Shell {
         };
         let wanted = routes.wanted();
         if wanted.is_empty() {
-            eprintln!(
-                "engine-cuda: decode products' kernels from the profile: every shape the bodies \
+            tracing::info!(
+                "decode products' kernels from the profile: every shape the bodies \
                  hold reused, 0 measured"
             );
             return Ok(());
@@ -2376,8 +2376,8 @@ impl Shell {
         // there is no body to time a product's kernel by, so it keeps the
         // routes it has, saves no choice to the profile, and says so.
         if !self.records_bodies() {
-            eprintln!(
-                "engine-cuda: card: routes unmeasured, no recorded bodies: {} decode product \
+            tracing::info!(
+                "card: routes unmeasured, no recorded bodies: {} decode product \
                  shape(s) keep their routes as they stand, and none is saved",
                 wanted.len()
             );
@@ -2386,8 +2386,8 @@ impl Shell {
         // Under `[engine] measure = false` nothing is timed: each shape no
         // layer states keeps its stated kernel, by name, and none is saved.
         if self.routes_measuring == engine::rates::Measuring::Skip {
-            eprintln!(
-                "engine-cuda: rates: skipped: `[rates] product_ns` for {} decode product \
+            tracing::info!(
+                "rates: skipped: `[rates] product_ns` for {} decode product \
                  shape(s): nothing timed (`[engine] measure = false`); each keeps its stated \
                  kernel",
                 wanted.len()
@@ -2400,8 +2400,8 @@ impl Shell {
             // Every shape a decode body times is the profile's: nothing is
             // measured or saved; the rest (rows no decode body carries) keep
             // their stated kernel.
-            eprintln!(
-                "engine-cuda: decode products' kernels from the profile: 0 measured; {} shape(s) \
+            tracing::info!(
+                "decode products' kernels from the profile: 0 measured; {} shape(s) \
                  at rows no decode body carries keep their stated kernel",
                 wanted.len()
             );
@@ -2449,8 +2449,8 @@ impl Shell {
                 )
             })
             .collect();
-        eprintln!(
-            "engine-cuda: chose the kernel of {} decode product shapes by their bodies' times in \
+        tracing::info!(
+            "chose the kernel of {} decode product shapes by their bodies' times in \
              {:.1} s ({}); {}",
             said.len(),
             started.elapsed().as_secs_f64(),
@@ -2497,8 +2497,8 @@ impl Shell {
                 .pools
                 .preseat_plan()
                 .map_or(0, |plan| self.pools.weight_chunks(&plan).len());
-            eprintln!(
-                "engine-cuda: a measuring boot's flat range held the least range the bodies \
+            tracing::info!(
+                "a measuring boot's flat range held the least range the bodies \
                  armed over; it was reserved anew at {} chunks, and the weights the pool holds \
                  ({chunks} chunks) were seated in it again from their copy in {:.1} s",
                 fitted.chunks,
@@ -2513,8 +2513,8 @@ impl Shell {
         self.arming_at_load = false;
         self.rearming = false;
         armed?;
-        eprintln!(
-            "engine-cuda: a measuring boot: with no record of what this deployment's bodies \
+        tracing::info!(
+            "a measuring boot: with no record of what this deployment's bodies \
              take, they armed over the least range that serves and took {} MiB; the range was \
              fitted again to the rest ({} chunks) and the lattice armed over it in {:.1} s. \
              Later boots hold the measured figure and fit once",

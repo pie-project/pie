@@ -176,8 +176,8 @@ impl Rebalancer {
             count += moves;
         }
         self.moved += count as u64;
-        eprintln!(
-            "engine-cuda: rebalanced the experts: {count} slot copies over {layers} layers \
+        tracing::info!(
+            "rebalanced the experts: {count} slot copies over {layers} layers \
              in {:.2} ms, their worst peak over mean {was:.3} to {now:.3}",
             began.elapsed().as_secs_f64() * 1e3
         );
