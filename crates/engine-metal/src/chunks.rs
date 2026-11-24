@@ -21,9 +21,10 @@ impl Shell {
                 .map(|&(_, adapters, _)| adapters)
                 .min()
                 .unwrap_or(0),
-            // The sliding rows are paged in full here: the model's window
-            // is a fact of the model, its pool is not.
-            window_tokens: poem_exec::store::kv::declared_window(self.trace()).unwrap_or(0),
+            // No window list: Metal serves windowed layers as ring + buffer
+            // only (`Capabilities::windowed_state`, each layer's window in
+            // `ChunkFacts::windowed`), so it states no window-list window.
+            window_tokens: 0,
         }
     }
 
