@@ -14,11 +14,9 @@ use tarpc::serde_transport::unix;
 use tarpc::server::{BaseChannel, Channel};
 use tokio::sync::{Mutex, Notify, mpsc};
 use worker_api::{
-    Accepted, Control, GatewayInboundClient, Priority, Request, Tokens, WorkerControl,
-    connect_gateway_link, dispatch_codec,
+    Accepted, Control, GatewayInboundClient, LINK_MAX_FRAME_BYTES, Priority, Request, Tokens,
+    WorkerControl, connect_gateway_link, dispatch_codec,
 };
-
-const LINK_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 const PUSH_DEADLINE: Duration = Duration::from_secs(300);
 

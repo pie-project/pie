@@ -13,6 +13,11 @@ use crate::{
     WorkerControlRequest, WorkerControlResponse,
 };
 
+/// The largest frame either end of a worker–gateway link reads or writes:
+/// both ends set it, so a frame one end writes the other can read. A turn's
+/// pushed output (tokens, a media payload) rides one frame.
+pub const LINK_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Serialize, Deserialize)]
 pub enum TwoWayMessage<Req, Resp> {
     Request(tarpc::ClientMessage<Req>),
