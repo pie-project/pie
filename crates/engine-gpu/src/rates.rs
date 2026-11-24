@@ -2553,6 +2553,12 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
             rig.fired.borrow_mut().extend(fired);
             (side, warmed, worst)
         }
+        // Behind serving no cube warms the device: rotated until its clock
+        // stops falling, it heats a passively cooled device (a phone read
+        // its stored rates ~20% low after it). Each slice's clock is read
+        // settled on the small reference laid at load instead, and the
+        // frames are admitted as the probe estimates them.
+        None if behind_serving => (0, engine::rates::Warmed { rotations: 0, rate: 0.0 }, 1.0),
         None => {
             let warm = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
             if let Some(r) = resume.as_deref_mut() {
@@ -2897,7 +2903,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
             range.floor_factor()
         ));
     }
-    let sustained = if max_submit.is_some() && clock_table.is_none() {
+    // Behind serving the sustained drop is not measured (it would load the
+    // device for seconds): the margin is the step's drift and swing.
+    let sustained = if max_submit.is_some() && clock_table.is_none() && !behind_serving {
         rig.memo(&mut resume, "sustained".into(), |rig| -> Result<f64> {
         // Rotated as the warm-up rotated it: each fire its own submission,
         // admitted at the worst ratio the warm-up's walk measured (not at
