@@ -158,6 +158,8 @@ pub struct ModelConfig {
     pub metadata: ModelMetadata,
     pub engines: Vec<EngineConfig>,
     pub scheduler: SchedulerConfig,
+    /// The CUDA device a media encode (NVENC) runs on: the engine's own.
+    pub media_device: u32,
 }
 
 pub struct EngineConfig {
@@ -379,7 +381,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         metadata,
         engines: mut engine_configs,
         scheduler,
+        media_device,
     } = config.model;
+    crate::inferlet::host::frames::set_media_device(media_device);
 
     // The library forms programs are planned with: what every engine served
     // here states (`pipeline::program::serve_forms`), before any program
