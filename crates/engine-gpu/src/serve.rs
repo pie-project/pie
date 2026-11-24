@@ -2945,7 +2945,27 @@ impl<B: Serve> Shell<B> {
                 .map(|_| B::lay_stamps(&self.device, 1))
                 .collect::<Result<Vec<_>>>()?;
         }
+        // The device's clock before and after the weighing: a settle
+        // weighed below its nominal clock serves this load alone.
+        let reference = {
+            use crate::backend::Tactics as _;
+            self.tuning.gemm(self.tier, crate::submit::PROBE.0)
+        };
+        let clock_before = crate::rates::clock_read::<B>(&self.device, reference)?;
         let settled = self.settle_dense_to(lanes, &decided);
+        let throttle = crate::rates::throttled(
+            clock_before,
+            crate::rates::clock_read::<B>(&self.device, reference)?,
+        );
+        if let Some(ratio) = throttle {
+            tracing::warn!(
+                ratio,
+                "dense settle: weighed with the device {ratio:.2}x slower than its nominal clock: \
+                 served this load, not stored"
+            );
+            self.timed
+                .push(format!("settle (device {ratio:.2}x below its nominal clock: not stored)"));
+        }
         if laid {
             self.stamps.clear();
         }
@@ -3043,7 +3063,9 @@ impl<B: Serve> Shell<B> {
             };
             self.dense_rates.dense_settled.retain(|s| s.of != of);
             self.dense_rates.dense_settled.push(keep.clone());
-            self.to_store = Some(keep);
+            if throttle.is_none() {
+                self.to_store = Some(keep);
+            }
         }
         let weighed = self.settled.iter().any(|range| range.checked);
         self.say_served(

@@ -2023,6 +2023,8 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
          key or short of {top} rows: {}",
         wanted.iter().map(name).collect::<Vec<_>>().join(", ")
     );
+    let reference = tactics.gemm(tier, crate::submit::PROBE.0);
+    let clock_before = clock_read::<B>(device, reference)?;
     let curves = measure_shapes::<B, T>(
         device,
         tactics,
@@ -2049,17 +2051,37 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     }
     .over(stated.clone());
     let joined = fresh;
-    let saved_to = save
-        .map(|save| engine::rates::save_rates(&save, &joined))
-        .transpose()
-        .map_err(|why| Fault::Device {
-            call: "rates at load",
-            why,
-        })?;
+    // Curves timed on a device below its nominal clock serve this load
+    // alone, never stored (a hot or unramped device's curves would steer
+    // every later load's picks).
+    let throttle = throttled(clock_before, clock_read::<B>(device, reference)?);
+    let saved_to = match throttle {
+        None => save
+            .map(|save| engine::rates::save_rates(&save, &joined))
+            .transpose()
+            .map_err(|why| Fault::Device {
+                call: "rates at load",
+                why,
+            })?,
+        Some(ratio) => {
+            tracing::warn!(
+                ratio,
+                "rates: the dense curves were timed with the device {ratio:.2}x slower than its \
+                 nominal clock: served this load, not stored"
+            );
+            None
+        }
+    };
     let mut tuned = chip.tuned().clone();
     tuned.rates = measured;
     tuned.measured_this_load = true;
-    tuned.timed.push(format!("dense curves ({})", wanted.len()));
+    tuned.timed.push(match throttle {
+        None => format!("dense curves ({})", wanted.len()),
+        Some(ratio) => format!(
+            "dense curves ({}; device {ratio:.2}x below its nominal clock: not stored)",
+            wanted.len()
+        ),
+    });
     if saved_to.is_some() {
         tuned.saved_to = saved_to;
     }
@@ -2179,6 +2201,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // The keys a load asks for at this bound ([`keys_at`]), those `stated`
     // lacks.
     let want = Wanted::of(stated, &keys_at(max_submit));
+    // The device's clock before the step: read again after it, the step's
+    // rates are this load's alone where either read is below nominal.
+    let reference = tactics.gemm(tier, crate::submit::PROBE.0);
+    let clock_before = clock_read::<B>(device, reference)?;
     let mut rig = Rig::<B>::new(device, max_submit);
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
@@ -2640,6 +2666,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     Ok(engine::rates::Measured {
         rates,
         unsettled: rig.unsettled.get(),
+        throttled: {
+            drop(rig);
+            throttled(clock_before, clock_read::<B>(device, reference)?)
+        },
     })
 }
 
@@ -3720,6 +3750,61 @@ pub fn resident_for_skip<B: Serve, T: Tactics + ?Sized>(
     Ok((resident?, started.elapsed().as_millis()))
 }
 
+/// The device's clock read off its reference kernel ([`crate::submit::Probe`],
+/// the smallest shape on the matmul curve): the fastest of [`ROUNDS`] single
+/// fires and their spread, `(slowest - fastest) / fastest`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockRead {
+    pub fastest_ns: f64,
+    pub spread: f64,
+}
+
+/// The reference kernel's fastest time this process has read on any device
+/// phase: the device at its nominal clock, as far as the process has seen
+/// it (f64 bits; 0 before any read).
+static NOMINAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `device`'s clock now ([`ClockRead`]), its reference kernel under `tactic`.
+pub fn clock_read<B: Serve>(
+    device: &B::Context,
+    tactic: kernels_slang::linear::gemm::Tactic,
+) -> Result<ClockRead> {
+    let probe = crate::submit::Probe::<B>::new(device, tactic)?;
+    let fires = (0..ROUNDS)
+        .map(|_| probe.fire(device))
+        .collect::<Result<Vec<f64>>>()?;
+    let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
+    let slowest = fires.iter().copied().fold(0.0, f64::max);
+    let read = ClockRead {
+        fastest_ns: fastest,
+        spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
+    };
+    let nominal = f64::from_bits(NOMINAL_NS.load(std::sync::atomic::Ordering::Relaxed));
+    if nominal == 0.0 || fastest < nominal {
+        NOMINAL_NS.store(fastest.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(read)
+}
+
+/// Whether a measuring phase ran below the device's nominal clock: its
+/// reference kernel read `before` and `after` it, against the fastest the
+/// process has read ([`NOMINAL_NS`]). Throttled where either read is slower
+/// than nominal by more than the reads' own spread (the reference's noise,
+/// no margin chosen): `Some(the slower read over nominal)`.
+#[must_use]
+pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
+    let nominal = f64::from_bits(NOMINAL_NS.load(std::sync::atomic::Ordering::Relaxed));
+    let nominal = if nominal > 0.0 {
+        nominal.min(before.fastest_ns).min(after.fastest_ns)
+    } else {
+        before.fastest_ns.min(after.fastest_ns)
+    };
+    let slower = before.fastest_ns.max(after.fastest_ns);
+    let noise = before.spread.max(after.spread);
+    let ratio = slower / nominal.max(f64::MIN_POSITIVE);
+    (ratio > 1.0 + noise).then_some(ratio)
+}
+
 /// The fires a warm-up rotation's next frame holds of `left`: as many as fit
 /// under `bound` at `per_fire` ns a fire (the slowest the rotation measured)
 /// times `worst` (at least the walk's measured worst ratio); 0 where not one
@@ -4223,5 +4308,22 @@ mod bound_tests {
             "a 512-row step at 4096 keys is past 2 s whole: {:?}",
             held.step_ns(step(512, 4096))
         );
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// A phase is throttled where a reference read is slower than the
+    /// fastest the process has seen by more than the reads' own spread.
+    #[test]
+    fn a_phase_below_the_nominal_clock_is_throttled() {
+        let read = |fastest_ns, spread| ClockRead { fastest_ns, spread };
+        NOMINAL_NS.store(100.0_f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(throttled(read(101.0, 0.05), read(103.0, 0.05)), None, "inside the noise");
+        let hot = throttled(read(101.0, 0.02), read(160.0, 0.02)).expect("throttled");
+        assert!((hot - 1.6).abs() < 1e-9, "{hot}");
+        assert_eq!(throttled(read(90.0, 0.02), read(91.0, 0.02)), None, "a faster read is nominal");
     }
 }
