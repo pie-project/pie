@@ -398,6 +398,12 @@ pub trait Serve: Backend {
     /// Replays `prepared` where a kept step answers it, else how it walks.
     fn plan(shell: &mut Shell<Self>, prepared: &mut Prepared<'_, Self>) -> Result<Plan<Self>>;
 
+    /// What the backend holds for its recordings now (command buffers,
+    /// frames, descriptor sets and pools), for the arm walk's progress line.
+    fn held() -> String {
+        String::new()
+    }
+
     /// Submits the walked `frame`.
     fn submit(
         shell: &mut Shell<Self>,
@@ -10615,6 +10621,7 @@ impl<B: Serve> Shell<B> {
         let before = rss();
         let mut dearest = 0u64;
         let mut dearest_device = 0u64;
+        let mut spent_at: Option<usize> = None;
         if let Some(known) = &known {
             match steps {
                 Some(_) => self.eager_from = known.eager.map(|at| at as usize),
@@ -10687,6 +10694,7 @@ impl<B: Serve> Shell<B> {
                     shapes_recording = armed_shapes.len(),
                     host_bytes = rss().saturating_sub(before),
                     dearest,
+                    held = %B::held(),
                     "the arm walk so far"
                 );
             }
@@ -10743,14 +10751,43 @@ impl<B: Serve> Shell<B> {
                     self.arms.give(before);
                 }
                 if let Err(fault) = fired {
-                    tracing::error!(
+                    // A driver out of what a recording takes (command buffers,
+                    // descriptor pools, its memory) ends the walk where it
+                    // stands, the rest stated eager, as the allowance does; any
+                    // other failure fails the load.
+                    let why = fault.to_string();
+                    let spent = [
+                        "vkAllocate",
+                        "vkCreateDescriptorPool",
+                        "vkCreateCommandPool",
+                        "vkBeginCommandBuffer",
+                        "command buffers",
+                        "descriptor pools",
+                        "VkResult -1 ",
+                        "VkResult -2 ",
+                        "VkResult -1000069000",
+                    ]
+                    .iter()
+                    .any(|named| why.contains(named) || why.ends_with(named.trim_end()));
+                    if !spent {
+                        tracing::error!(
+                            %fault,
+                            arm,
+                            lanes = ?lanes,
+                            "the arm walk's fire failed; the load fails with it"
+                        );
+                        self.arming = false;
+                        return Err(fault);
+                    }
+                    tracing::warn!(
                         %fault,
                         arm,
-                        lanes = ?lanes,
-                        "the arm walk's fire failed; the load fails with it"
+                        walked = at,
+                        "the arm walk ran the driver out of what a recording takes: the shapes \
+                         from here run eager, stated at load"
                     );
-                    self.arming = false;
-                    return Err(fault);
+                    spent_at = Some(at);
+                    break;
                 }
                 // A body's cost: what it took of the host's memory or of the
                 // device's (a driver that keeps its command buffers and
@@ -10763,6 +10800,15 @@ impl<B: Serve> Shell<B> {
             }
             if self.recorded > families {
                 armed_shapes.push(at);
+            }
+            if let Some(at) = spent_at {
+                match tags[at] {
+                    Some(shape) => self.eager_from = Some(shape),
+                    None => {
+                        self.eager_rows = Some(shapes[at].0.iter().map(|&(_, rows)| rows).sum());
+                    }
+                }
+                break;
             }
         }
         self.arming = false;
