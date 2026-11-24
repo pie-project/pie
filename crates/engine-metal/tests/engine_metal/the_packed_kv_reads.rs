@@ -30,8 +30,7 @@
 //! the staging load should reconstruct. A correct dequant + attention agrees with
 //! it to a bf16-rounding-tight tolerance; a wrong offset, nibble parity, byte
 //! index or scale shows up as a large deviation (a bug to surface, not a tolerance
-//! to loosen). The packed-vs-original deviation is printed too — that IS the 4-bit
-//! quant error, expected small-but-nonzero.
+//! to loosen).
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
