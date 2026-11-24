@@ -917,7 +917,7 @@ impl ResidencyPlanner {
                                     proc.unfired,
                                     proc.firing(),
                                     proc.bind_waiting,
-                                    proc.restored_past.is_some(),
+                                    !proc.restored_past.is_empty(),
                                     inner.host_swap_blocked.contains(pid) || inner.prepare_blocked.contains(pid),
                                 ),
                                 None => format!("{pid}: gone"),
@@ -1219,7 +1219,7 @@ impl ResidencyPlanner {
                             && (!queued(*pid) || !quiet()))
                         // Restored past this head while it stood passed
                         // over: it fires before this head moves it again.
-                        && proc.restored_past != Some(waiter.pid)
+                        && !proc.restored_past.contains(&waiter.pid)
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
                         // Being failed: it frees its pages as it ends.
@@ -1325,7 +1325,7 @@ impl ResidencyPlanner {
                     || inner.bind_served(pid)
                     || inner.evicted_for_by(head_pid, pid)
                     || inner.unfired_protects(pid)
-                    || proc.restored_past == Some(head_pid)
+                    || proc.restored_past.contains(&head_pid)
                     || (proc.rank() <= head_rank && !yields)
                     || inner.keeps_room(pid, head_rank, quiet)
                     || (!proc.progressed && !yields && !e6_relaxed)
@@ -1484,7 +1484,7 @@ impl ResidencyPlanner {
                             // over: the last resort keeps that rule too, or
                             // it goes round with the head, restored past it
                             // and moved for it again.
-                            if proc.restored_past == Some(waiter.pid)
+                            if proc.restored_past.contains(&waiter.pid)
                                 || proc.last_resort_for == Some(waiter.pid)
                                 || (proc.rank() <= head_rank && !proc.idle && !proc.held)
                                 || (proc.holder && !proc.idle)

@@ -707,9 +707,7 @@ impl Inner {
     /// for it again ([`super::proc::Proc::restored_past`]).
     pub(super) fn arrived(&mut self, pid: ProcessId) {
         for proc in self.procs.values_mut() {
-            if proc.restored_past == Some(pid) {
-                proc.restored_past = None;
-            }
+            proc.restored_past.retain(|&head| head != pid);
             if proc.last_resort_for == Some(pid) {
                 proc.last_resort_for = None;
             }

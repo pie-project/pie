@@ -1615,9 +1615,12 @@ impl ResidencyPlanner {
                         // once it fired, it would go round with a head no
                         // move forms runs for, restored past it and moved
                         // back.
-                        proc.restored_past = proc.evicted_for.filter(|head| {
+                        if let Some(head) = proc.evicted_for.filter(|head| {
                             inner.passed.iter().any(|&(_, passed)| passed == *head)
-                        });
+                        }) && !proc.restored_past.contains(&head)
+                        {
+                            proc.restored_past.push(head);
+                        }
                         let proc = inner.procs.get_mut(&pid).expect("read above");
                         proc.state = Residency::Restoring;
                         if let Some(waiter) = inner.queue.remove(&key) {
