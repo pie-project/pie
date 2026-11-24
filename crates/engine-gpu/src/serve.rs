@@ -1199,6 +1199,9 @@ pub struct Shell<B: Serve> {
     /// The stated step shapes the load runs eager: the set's tail from this
     /// index on, which its allowance did not hold the bodies of.
     eager_from: Option<usize>,
+    /// The stated shapes the arm walk lays no composition of: stated eager
+    /// at load beside the allowance's tail.
+    eager_bare: Vec<usize>,
     /// The stated step compositions ([`Shell::record_bodies`]).
     pub steps: Option<engine::StepShapes>,
     /// The composition of the step being fired, where its caller states it
@@ -3081,6 +3084,7 @@ impl<B: Serve> Shell<B> {
             unkept: 0,
             eager_rows: None,
             eager_from: None,
+            eager_bare: Vec::new(),
             steps: None,
             step: None,
             arming: false,
@@ -5149,9 +5153,9 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn eager_by_rows(&self, rows: u32) -> bool {
         if let (Some(steps), Some(step)) = (&self.steps, &self.step) {
-            return self
-                .eager_from
-                .is_some_and(|from| steps.shape_of(step).is_some_and(|at| at >= from));
+            return steps.shape_of(step).is_some_and(|at| {
+                self.eager_from.is_some_and(|from| at >= from) || self.eager_bare.contains(&at)
+            });
         }
         self.eager_rows.is_some_and(|eager| rows >= eager)
     }
@@ -5161,8 +5165,12 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn eager_shapes_from(&self) -> Vec<u32> {
         let len = self.steps.as_ref().map_or(0, engine::StepShapes::len);
-        self.eager_from
-            .map_or(0..0, |from| from..len)
+        let mut eager: Vec<usize> = self.eager_from.map_or(0..0, |from| from..len).collect();
+        eager.extend(self.eager_bare.iter().copied().filter(|&at| at < len));
+        eager.sort_unstable();
+        eager.dedup();
+        eager
+            .into_iter()
             .map(|at| u32::try_from(at).unwrap_or(u32::MAX))
             .collect()
     }
@@ -10476,13 +10484,16 @@ impl<B: Serve> Shell<B> {
                     .filter(|&(_, &covered)| !covered)
                     .map(|(shape, _)| shape.to_string())
                     .collect();
+                // A stated shape the walk lays no composition of has no
+                // body: stated eager at load, its fires counted eager.
+                self.eager_bare = (0..steps.len()).filter(|&at| !covered[at]).collect();
                 if !bare.is_empty() {
-                    tracing::warn!(
+                    tracing::info!(
                         shapes = bare.len(),
                         of = steps.len(),
-                        bare = ?bare,
-                        "stated step shapes the arm walk lays no composition of: a fire of one \
-                         is unarmed"
+                        eager = ?bare,
+                        "stated step shapes the arm walk lays no composition of run eager, \
+                         stated at load"
                     );
                 }
                 tagged
