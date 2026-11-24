@@ -280,6 +280,23 @@ fn adapter_of(
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
 ) -> EngineResult<Option<crate::adapter::Binding>> {
+    if let Some(channel) = shell.program_adapter_bundle(program).map_err(fault)? {
+        let wire = seeds
+            .iter()
+            .find(|(seeded, _)| *seeded == channel)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| {
+                Error::Load(format!(
+                    "this program's `adapter` sink reads its bundle out of channel \
+                     {channel} and this bind seeded nothing into it"
+                ))
+            })?;
+        let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
+        return shell
+            .bind_adapter(crate::adapter::Source::Bundle { bundle: &bundle })
+            .map(Some)
+            .map_err(fault);
+    }
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
         return Ok(None);
     };
@@ -1050,7 +1067,7 @@ impl Metal {
                 Error::Invalid(format!(
                     "lane {at} is attached to an instance that bound an adapter, and \
                      this load's model text has no corrected class for its fact word \
-                     {:#x}: the text declares no `linear.lora_correct` arm, or the arm's \
+                     {:#x}: the text declares no arm reading a registered bank, or the arm's \
                      window is not decided by one fact. A lane that asked for a \
                      correction and got the base model is the one wrong answer this \
                      axis refuses to give",

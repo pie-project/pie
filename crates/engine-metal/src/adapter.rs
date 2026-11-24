@@ -242,6 +242,21 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
     }))
 }
 
+/// This load's banks as `engine::bundle` fills them.
+#[must_use]
+pub fn banks(seats: &[BankSeat]) -> Vec<engine::bundle::Bank<'_>> {
+    seats
+        .iter()
+        .map(|seat| engine::bundle::Bank {
+            name: &seat.name,
+            rows: seat.rows,
+            cols: seat.cols,
+            slot: seat.slot,
+            dtype: seat.dtype,
+        })
+        .collect()
+}
+
 pub fn planes_of(
     role: Role,
     site: Option<Site>,
@@ -400,6 +415,10 @@ pub enum Source<'a> {
     Shared {
         name: &'a str,
     },
+    /// A bundle; every bind of the same bytes shares one slot.
+    Bundle {
+        bundle: &'a engine::bundle::Bundle<'a>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,12 +433,18 @@ pub struct Binding {
 pub enum Key {
     Instance(InstanceId),
     Shared(crate::blob::Stamp),
+    /// A bundle, by the digest of its bytes (`engine::bundle::Bundle::key`).
+    Content([u8; 32]),
 }
 
 #[derive(Debug, Default)]
 pub struct Slots {
     seats: u32,
     held: BTreeMap<Key, (u32, u32)>,
+    /// The slots no bind holds that still keep a bundle, the oldest release
+    /// first: a bind of the same bytes takes its slot back unwritten, and a
+    /// new adapter takes a free slot before it takes one of these.
+    kept: Vec<(Key, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -434,6 +459,7 @@ impl Slots {
         Slots {
             seats,
             held: BTreeMap::new(),
+            kept: Vec::new(),
         }
     }
 
@@ -455,33 +481,50 @@ impl Slots {
                 fresh: false,
             });
         }
-        let taken: Vec<u32> = self.held.values().map(|(slot, _)| *slot).collect();
-        let slot = (0..self.seats)
-            .find(|slot| !taken.contains(slot))
-            .ok_or(Fault::AdapterSlots { seats: self.seats })?;
+        if let Some(at) = self.kept.iter().position(|(kept, _)| *kept == key) {
+            let (_, slot) = self.kept.remove(at);
+            self.held.insert(key, (slot, 1));
+            return Ok(Grant { slot, fresh: false });
+        }
+        let taken: Vec<u32> = self
+            .held
+            .values()
+            .map(|(slot, _)| *slot)
+            .chain(self.kept.iter().map(|(_, slot)| *slot))
+            .collect();
+        let slot = match (0..self.seats).find(|slot| !taken.contains(slot)) {
+            Some(slot) => slot,
+            None if !self.kept.is_empty() => self.kept.remove(0).1,
+            None => return Err(Fault::AdapterSlots { seats: self.seats }),
+        };
         self.held.insert(key, (slot, 1));
         Ok(Grant { slot, fresh: true })
     }
 
+    /// Gives back a hold whose write failed: its slot keeps nothing.
     pub fn abandon(&mut self, key: &Key) {
         self.release_key(key);
     }
 
+    /// Gives back a hold. A bundle's slot is kept once the last hold goes,
+    /// until another adapter needs it.
     pub fn release(&mut self, key: &Key) {
-        self.release_key(key);
+        if let Some(slot) = self.release_key(key)
+            && matches!(key, Key::Content(_))
+        {
+            self.kept.push((key.clone(), slot));
+        }
     }
 
-    fn release_key(&mut self, key: &Key) {
-        let drop = match self.held.get_mut(key) {
-            Some((_, count)) => {
-                *count = count.saturating_sub(1);
-                *count == 0
-            }
-            None => false,
-        };
-        if drop {
+    /// Drops one hold of `key`, and answers its slot if that was the last.
+    fn release_key(&mut self, key: &Key) -> Option<u32> {
+        let (slot, count) = self.held.get_mut(key)?;
+        *count = count.saturating_sub(1);
+        let (slot, last) = (*slot, *count == 0);
+        if last {
             self.held.remove(key);
         }
+        last.then_some(slot)
     }
 }
 
@@ -498,6 +541,7 @@ mod tests {
             rows,
             cols,
             elem: 2,
+            dtype: poem_ir::Dtype::Bf16,
         }
     }
 

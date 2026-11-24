@@ -704,22 +704,7 @@ impl PreparedLoad<'_> {
                 "class {class} attends both ways under one mask"
             )));
         }
-        let mut corrected = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_correction = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Linear(
-                        poem_ir::Linear::LoraCorrect { .. }
-                    ))
-                )
-            });
-            if runs_correction {
-                for class in region.mask.iter() {
-                    corrected.insert(class);
-                }
-            }
-        }
+        let corrected = poem_exec::feeds::adapted_classes(&boot.trace, &compiled);
 
         let handles = Handles::new();
         let mut weights = Weights::resident(
@@ -1712,6 +1697,17 @@ impl Shell {
         crate::adapter::sink_of(&program.plan.package)
     }
 
+    /// The channel whose seed is the bundle `program_id` attaches, if it does.
+    pub fn program_adapter_bundle(&self, program_id: engine::ProgramId) -> Result<Option<u32>> {
+        let program = self.programs.program(program_id).ok_or_else(|| {
+            Fault::program(
+                "serve::shell",
+                format!("no program {program_id} to read an adapter sink off"),
+            )
+        })?;
+        Ok(engine::bundle::channel_of(&program.plan.package)?)
+    }
+
     pub fn bind_adapter(
         &mut self,
         source: crate::adapter::Source<'_>,
@@ -1721,6 +1717,7 @@ impl Shell {
             crate::adapter::Source::Shared { name } => {
                 crate::adapter::Key::Shared(self.blobs.stamp(name)?)
             }
+            crate::adapter::Source::Bundle { bundle } => crate::adapter::Key::Content(bundle.key()),
         };
         let shared = matches!(source, crate::adapter::Source::Shared { .. });
         let grant = self.adapters.acquire(key.clone())?;
@@ -1751,6 +1748,27 @@ impl Shell {
                     }
                     Err(why) => Err(why),
                 }
+            }
+            crate::adapter::Source::Bundle { bundle } => {
+                let seats = self.weights.seats();
+                let built = bundle.planes(&crate::adapter::banks(&seats));
+                built.map_err(Fault::from).and_then(|built| {
+                    let planes: Vec<AdapterPlane<'_>> = built
+                        .iter()
+                        .map(|(bank, bytes)| AdapterPlane {
+                            bank: bank.as_str(),
+                            bytes,
+                        })
+                        .collect();
+                    self.weights.register_adapter(grant.slot, &planes)?;
+                    tracing::info!(
+                        slot = grant.slot,
+                        named = planes.len(),
+                        zeroed = seats.len() - planes.len(),
+                        "an adapter bundle was written into its slot"
+                    );
+                    Ok(())
+                })
             }
         };
         match landed {

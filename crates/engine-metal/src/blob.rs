@@ -496,6 +496,7 @@ mod tests {
             rows,
             cols,
             elem: ELEM,
+            dtype: poem_ir::Dtype::Bf16,
         }
     }
 
