@@ -1004,7 +1004,7 @@ impl ForwardPass {
 }
 
 /// States a pass's rows final through `final_rows` unless the program said
-/// the pass is retractable: a pass is final by default (CONTRACT-BC 25), and
+/// the pass is retractable: a pass is final by default, and
 /// this is the program's own statement, made when its program is attached
 /// because the runtime takes it before the program.
 fn state_final(
@@ -1362,7 +1362,7 @@ impl ForwardPass {
     /// fold only what the program has read, so a stop can take the rest
     /// back, and [`run_ahead`] retracts the rows past a break.
     ///
-    /// Without it a pass is final (CONTRACT-BC 25): the SDK states its
+    /// Without it a pass is final: the SDK states its
     /// sampled rows final when the program is attached, its lanes fold
     /// every row at fire and run the plain step, [`Pipeline::retract`] over
     /// one of its fires is refused by name, and [`run_ahead`] leaves its
