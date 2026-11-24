@@ -1577,13 +1577,9 @@ pub struct Prepared<'a> {
     /// Why not, in a load that records bodies: the key and the reason.
     unbodied: Option<String>,
     admits: std::sync::Arc<[crate::window::Admit]>,
-    /// The key's island bits, so the fire records and replays under the key
-    /// that was prepared.
-    islands: Box<[u8]>,
-    ladder: record::Ladder,
+    /// The body's key as prepared: the fire records and replays under it.
+    key: record::BodyKey,
     lane_ceiling: u32,
-    patch_ladder: Option<record::Ladder>,
-    towered: bool,
 }
 
 impl Drop for Prepared<'_> {

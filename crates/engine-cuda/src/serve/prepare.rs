@@ -2206,16 +2206,14 @@ impl Shell {
             _ => self.budget.max_lanes,
         };
         let lane_ceiling = self.lane_ceiling().min(max_lanes);
-        let patches = composition.axis(poem_ir::RowAxis::Patches);
-        let key = record::BodyKey::of(
-            &token_axis.classes,
-            token_axis.bucket,
+        let key = record::BodyKey::for_fire(
+            &composition,
             &self.decoding,
             lane_ceiling,
             &self.tiers,
-            self.towered.then_some((&patches.classes, patches.bucket)),
-        )
-        .with_rs(rs_body);
+            self.towered,
+            rs_body,
+        );
         let copies_here = copies
             && key.classes.rungs().iter().all(|(class, _)| {
                 !self.wide.contains(*class as usize)
@@ -2300,8 +2298,6 @@ impl Shell {
             &self.compiled,
             &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
         ));
-        let ladder = key.classes.clone();
-        let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());
         let records_bodies = self.records_bodies();
         let (admits, world): (std::sync::Arc<[crate::window::Admit]>, bool) = if records_bodies {
             self.segmentation(&key, &windows, totals, copies_here)
@@ -2332,7 +2328,7 @@ impl Shell {
         // An unlisted ladder (a class no plain request lands, as a DiT's) is
         // the whole-bucket body: every class present at the bucket.
         let whole: Vec<(u32, u32)>;
-        let rungs = if ladder.rungs().is_empty() {
+        let rungs = if key.classes.rungs().is_empty() {
             whole = token_axis
                 .classes
                 .present_in_order()
@@ -2340,7 +2336,7 @@ impl Shell {
                 .collect();
             whole.as_slice()
         } else {
-            ladder.rungs()
+            key.classes.rungs()
         };
         let per_lane = self.budget.readouts_per_lane.max(1);
         let reads: Vec<(BodyReads, u32)> = rungs
@@ -2562,11 +2558,8 @@ impl Shell {
             bodied,
             unbodied,
             admits,
-            islands: key.islands.clone(),
-            ladder,
+            key,
             lane_ceiling,
-            patch_ladder,
-            towered: self.towered,
             lanes,
             attachments,
             composition,
