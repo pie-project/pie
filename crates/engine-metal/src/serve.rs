@@ -364,9 +364,10 @@ pub struct Shell {
     /// ([`Pools::fold_window_rows`]): planned as the fire is prepared,
     /// encoded after its forward in its own frame.
     window_folds: Vec<(usize, Vec<(u64, u64, u32, u32)>)>,
-    /// The boundary own-row pages' fills from their ring pages, `(window
-    /// table, (from, to) bytes)`: encoded before this fire's forward.
-    window_fills: Vec<(usize, Vec<(u64, u64)>)>,
+    /// The boundary pages' fills from their ring pages, `(window table,
+    /// (from, to) bytes, first row, rows)`: encoded before this fire's
+    /// forward.
+    window_fills: Vec<(usize, Vec<(u64, u64, u32, u32)>)>,
     /// Own-row pages this fire's lanes took of `Shell::own_top`.
     own_used: u32,
     /// The first ring piece (cow side) of each ring two lanes of this fire
@@ -3848,18 +3849,28 @@ impl Shell {
             own: &own_ix,
             own_page,
         };
-        let mut fills: Vec<(u64, u64)> = by_index
+        // An own-row page takes its ring page's rows whole: the fire writes
+        // its own rows over them after.
+        let mut fills: Vec<(u64, u64, u32, u32)> = by_index
             .own_fills(seated.folded)
             .into_iter()
-            .map(|(ring, own)| (bytes[ring as usize], bytes[own as usize]))
+            .map(|(ring, own)| (bytes[ring as usize], bytes[own as usize], 0, page))
             .collect();
         // A buffer slot holding rows folded before the fire (its first, from
         // `base` up to `folded`: rows a fire folded itself into the ring and
-        // wrote to no slot) is refilled from its ring page, which holds them.
+        // wrote to no slot) takes those rows from its ring page, and those
+        // alone: its rows from `folded` on are unfolded, held in the slot only.
         for (i, &slot_at) in buffer_at.iter().enumerate() {
             let n = fold.base / page + u32::try_from(i).unwrap_or(u32::MAX);
-            if u64::from(n) * u64::from(page) < u64::from(seated.folded) {
-                fills.push((ring_at[n as usize % ring_at.len().max(1)], slot_at));
+            let first = u64::from(n) * u64::from(page);
+            if first < u64::from(seated.folded) {
+                let rows = (u64::from(seated.folded) - first).min(u64::from(page));
+                fills.push((
+                    ring_at[n as usize % ring_at.len().max(1)],
+                    slot_at,
+                    0,
+                    u32::try_from(rows).unwrap_or(page),
+                ));
             }
         }
         if !fills.is_empty() {
@@ -6978,7 +6989,7 @@ impl Shell {
         // dry walk encodes for no fire; a fill again is the same bytes).
         if !dry && !self.window_fills.is_empty() {
             for (k, fills) in &self.window_fills {
-                self.pools.copy_window_slots(&mut frame, *k, fills)?;
+                self.pools.fold_window_rows(&mut frame, *k, fills)?;
             }
             #[cfg(target_vendor = "apple")]
             frame.next_pass()?;
