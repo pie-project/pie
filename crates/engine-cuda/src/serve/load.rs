@@ -90,16 +90,27 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     .map_err(Fault::Card)?;
     // What the rates step timed (none where every rate was stated).
     let timed_at_open = chip.tuned().timed.clone();
+    // The roofline keys served by a stale figure, timed behind serving.
+    let behind = super::behind::Behind::of(&chip);
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
     // lacks, measured once it has armed (`Staged::finish`).
     let products = chip.rates().product_ns.clone().unwrap_or_default();
+    // The product times stored under a stale key (a kernel's code changed)
+    // answer what the matching ones lack: a fair estimate, served while
+    // the load times them again behind serving (`Shell::queue_behind`).
+    let estimates = chip
+        .rates()
+        .stale
+        .as_ref()
+        .and_then(|stale| stale.product_ns.clone())
+        .unwrap_or_default();
     // How the device's profile says this machine lands weights, under a
     // matching key: a load that finds it measures nothing of it.
     let landing = chip.rates().landing;
     device.set_routes(std::sync::Arc::new(
-        kernels_cuda::linear::routes::Routes::of(&products),
+        kernels_cuda::linear::routes::Routes::estimating(&products, &estimates),
     ));
     let engine = crate::chip::Engine::of(&chip);
     // The most rows one prompt lays: its context, where the model keeps a
@@ -635,6 +646,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         ceiling,
         weighed,
         timed_at_open,
+        behind,
     })
 }
 
@@ -1031,6 +1043,7 @@ impl Shell {
             ceiling,
             weighed,
             timed_at_open,
+            behind,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -1697,6 +1710,7 @@ impl Shell {
             keys,
             products,
             routes_measuring: boot.knobs.measuring,
+            behind,
             measured: timed_at_open,
             forced_bucket: None,
             budget: budgets.tokens.clone(),
@@ -2170,6 +2184,7 @@ impl Staged {
             shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
         if deferred {
             shell.arm_deferred = true;
+            shell.queue_behind(std::collections::BTreeMap::new(), profiles.as_deref());
             eprintln!(
                 "engine-cuda: this load streams its weights; its bodies arm at the starting \
                  weight residency, over the slots the cache holds then"
@@ -2179,7 +2194,16 @@ impl Staged {
             let armed = shell.arm_bodies();
             shell.arming_at_load = false;
             armed?;
+            // What arming's picks read an estimate of, before the products'
+            // measuring lays a table of its own.
+            let noted = shell
+                .device
+                .ctx()
+                .routes()
+                .map(|routes| routes.behind())
+                .unwrap_or_default();
             shell.routes_measured(profiles.as_deref())?;
+            shell.queue_behind(noted, profiles.as_deref());
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
             }
@@ -2970,6 +2994,8 @@ pub(super) struct Baked {
     pub(super) weighed: Option<crate::top::Weighed>,
     /// What the rates step timed at open (none where every rate was stated).
     pub(super) timed_at_open: Vec<String>,
+    /// The roofline keys served by a stale figure.
+    pub(super) behind: super::behind::Behind,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

@@ -3862,13 +3862,8 @@ pub fn resident_for_skip<B: Serve, T: Tactics + ?Sized>(
 }
 
 /// The device's clock read off its reference kernel ([`crate::submit::Probe`],
-/// the smallest shape on the matmul curve): the fastest of [`ROUNDS`] single
-/// fires and their spread, `(slowest - fastest) / fastest`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ClockRead {
-    pub fastest_ns: f64,
-    pub spread: f64,
-}
+/// the smallest shape on the matmul curve): `engine::rates`' shared reading.
+pub use engine::rates::{ClockRead, clock_moved, throttled};
 
 /// `device`'s clock now ([`ClockRead`]), its reference kernel under `tactic`:
 /// one read, as a phase's after read is taken.
@@ -3905,52 +3900,11 @@ pub fn clock_warmed<B: Serve>(
     warmed(|| read_clock(device, &probe))
 }
 
-/// Reads of `read` taken until two in a row agree within their own spread
-/// (either way: a ramp still rising and a boost still falling both move by
-/// more): the settled clock, the median of the settled pair, at the wider
-/// spread. No process-wide fastest is kept: the reference is the clock
-/// measured right around the phase. A clock settles (a ramp has a top, a
-/// boost a sustained floor), so the reads end.
-pub fn warmed(mut read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
-    let mut last = read()?;
-    loop {
-        let next = read()?;
-        let noise = last.spread.max(next.spread);
-        let low = last.fastest_ns.min(next.fastest_ns);
-        let high = last.fastest_ns.max(next.fastest_ns);
-        if high <= low * (1.0 + noise) {
-            return Ok(ClockRead {
-                fastest_ns: (low + high) / 2.0,
-                spread: noise,
-            });
-        }
-        last = next;
-    }
+/// `engine::rates::warmed` over this crate's faults.
+pub fn warmed(read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
+    engine::rates::warmed(read)
 }
 
-/// Whether a point's clock moved under it: its own warmed `before` read
-/// and its `after` read differ, either way, by more than their own spread
-/// (a boost ending, a ramp still rising, a sag): `Some(after over
-/// before)`. A point timed across a clock transition measures the
-/// transition, not the kernel, and is discarded.
-#[must_use]
-pub fn clock_moved(before: ClockRead, after: ClockRead) -> Option<f64> {
-    let noise = before.spread.max(after.spread);
-    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
-    (ratio > 1.0 + noise || ratio < 1.0 / (1.0 + noise)).then_some(ratio)
-}
-
-/// Whether a measuring phase ran throttled: its reference kernel read
-/// `before` it (warmed, [`clock_warmed`]) and `after` it. Throttling builds
-/// during a phase: throttled where the after read is slower than the
-/// before by more than the reads' own spread (the reference's noise, no
-/// margin chosen): `Some(after over before)`.
-#[must_use]
-pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
-    let noise = before.spread.max(after.spread);
-    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
-    (ratio > 1.0 + noise).then_some(ratio)
-}
 
 /// The fires a warm-up rotation's next frame holds of `left`: as many as fit
 /// under `bound` at `per_fire` ns a fire (the slowest the rotation measured)

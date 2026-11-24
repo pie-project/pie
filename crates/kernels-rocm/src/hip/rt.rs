@@ -467,6 +467,14 @@ pub unsafe fn hipStreamDestroy(stream: Stream) -> HipError {
     }
 }
 
+pub unsafe fn hipStreamQuery(stream: Stream) -> HipError {
+    match sys::api() {
+        // SAFETY: forwarded unchanged; the caller holds HIP's contract.
+        Ok(api) => unsafe { (api.hip.hipStreamQuery)(stream) },
+        Err(_) => hipErrorNotInitialized,
+    }
+}
+
 pub unsafe fn hipStreamSynchronize(stream: Stream) -> HipError {
     match sys::api() {
         // SAFETY: forwarded unchanged; the caller holds HIP's contract.
