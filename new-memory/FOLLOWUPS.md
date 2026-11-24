@@ -1570,3 +1570,19 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F87. Shared host crate, phase 2: the kernels-rocm / kernels-cuda host files that differ by 10–30%
+
+**What.** After phase 1 moves the byte-identical and comment-only host files into the shared crate, 15 same-path files (~4.7k lines a side) remain near-copies: attn/plan.rs, elemwise/rope.rs, linear/affine/tiled.rs, jit/ctx.rs, synth.rs, elemwise/pointwise.rs, jit/kernel.rs, conv/conv3d.rs and others, plus the attention schedulers (kernels-rocm attn/sched_{decode,prefill,mla}.rs against kernels-cuda attn/plan/{decode,prefill,mla}.rs: 70 / 277 / 80 diff lines).
+
+**Idea.** Move each into the shared crate with its backend differences as parameters (wave 64 vs warp 32, unit names `.hip` / `.cuh`, `-ffp-contract=off` vs `fmad=false`, the device facts each reads), one file a commit, each verified by both backends' kernel tests.
+
+**Why later.** Too large this close to the PR (coordinator, 2026-11-24); phase 1 is pure moves, this is not.
+
+## F88. ROCm: one carried GDN step for 128-wide heads, the conv fused or not
+
+**What.** kernels-rocm has three carried GDN decode steps: `ssm_gdn_step_carried<BV>` (any head width), `ssm_gdn_rows_carried<128, 128, 256>` (128-wide heads, the conv run apart) and `ssm_gdn_step_fused_carried` (128-wide heads, the conv fused). The last two share a layout, but 356 of their ~860 lines differ: the fused step stages carried rows into LDS a chunk at a time, resolves their page slots once, and reads a lane that writes no state wholly as linear attention.
+
+**Idea.** One kernel with a `FUSED` flag: rows_carried's body replaced by the fused step's with its conv half compiled out. It changes rows_carried's arithmetic order, so it needs the per-shape rocprofv3 microbench (rows 1 / 8 / 64, carried 0 / 1, commit 1 / 8) and bit-identical outputs and states before it lands.
+
+**Why later.** Not a mechanical merge (the cleanup round took only moves); `ssm_gdn_step_carried` stays the fallback for other head widths either way.
