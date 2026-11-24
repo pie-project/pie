@@ -61,6 +61,11 @@ fn fire(shell: &mut Shell, trace: &poem_ir::Trace, tokens: &[u32], rs: &RsVerb, 
 fn served(lag: u32) -> Option<Served> {
     let fixture = fixture(MODEL, None);
     let mut shell = load(&fixture, CONTEXT)?;
+    // The bodies armed before the load serves, as an engine's load arms them:
+    // a serving fire fills one and replays it, recording nothing.
+    shell.record_bodies(None, None).expect("the load arms its bodies");
+    let _ = (shell.recorded_serving(), shell.unkept_serving(), shell.eager_serving());
+    shell.serving = true;
     let page = shell.pools().rs_rows().expect("the pool lays an rs list").tokens;
     shell.open(0).expect("slot 0 opens");
     let prompt: Vec<u32> = (0..PROMPT).map(|t| (t * 7 + 11) % 1000).collect();
@@ -166,9 +171,9 @@ fn a_lagged_lane_answers_the_folding_lane() {
         );
         if crate::backend::NAME == "vulkan" {
             assert!(
-                lagged.recorded <= 1 && lagged.unkept == 0,
+                lagged.recorded == 0 && lagged.unkept == 0,
                 "at a lag of {lag} the lagged decodes made {} recordings and walked {} fires \
-                 unkept: their carried rows keyed their recordings",
+                 unkept: the armed bodies serve every carried count",
                 lagged.recorded,
                 lagged.unkept
             );

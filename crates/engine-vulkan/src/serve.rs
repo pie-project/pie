@@ -341,7 +341,12 @@ impl Serve for Api {
         let (uniform, storage) = device.fire_alignments();
         let scalars = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
         let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
-        let bytes = u64::from(fires.dispatches.max(1)) * per_dispatch + fires.readout_rows * 16;
+        // A recording moves every readout copy with the copier (its table,
+        // count and group counts laid in the block, each at its alignment):
+        // one copier's slack beside each plane's rows.
+        let copier = 16 + uniform + storage + 64;
+        let bytes = u64::from(fires.dispatches.max(1)) * (per_dispatch + copier)
+            + fires.readout_rows * 16;
         let arms = (0..readout.len())
             .map(|_| crate::device::ArmBlock::new(device, bytes))
             .collect::<Result<Vec<_>>>()?;
@@ -418,13 +423,6 @@ impl Serve for Api {
             && !split)
         .then(|| record_key(shell, prepared));
 
-        // A shape no fill names, of a fixed body the load recorded, fills
-        // from the body without a walk.
-        if let Some(shape) = key
-            && matches!(shell.shelf.recorder.next(shape), crate::record::Next::Walk(None))
-        {
-            fill_body(shell, prepared, shape)?;
-        }
 
         let mut varying = None;
         let replayable = match key.map(|key| shell.shelf.recorder.next(key)) {
@@ -697,10 +695,8 @@ impl Serve for Api {
             counts,
             done,
             fed_check,
-            pixels,
             ..
         } = launch;
-        let launch_pixels_empty = pixels.spans.is_empty();
         shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
         let on_done: Box<dyn Fn(Option<String>) + Send + 'static> =
             Box::new(move |refused: Option<String>| {
@@ -735,7 +731,6 @@ impl Serve for Api {
                     (!cuts.is_empty()).then_some(shape),
                 );
                 let groups = std::sync::Arc::new(kept.groups().to_vec());
-                let fixed = kept.fixed() && launch_pixels_empty;
                 enum Act {
                     Fill,
                     Record(std::sync::Arc<Vec<bool>>),
@@ -755,20 +750,6 @@ impl Serve for Api {
                         (0..groups.len()).map(|at| kept.indirect(at)).collect(),
                     )),
                 };
-                // A walk that fills or records a fixed body names it by its
-                // body key: a later fire of it fills without a walk.
-                if fixed && !matches!(act, Act::Alone) {
-                    let body = body_key(shell, prepared);
-                    shell.shelf.recorder.insert_body(
-                        body,
-                        crate::record::Body {
-                            family,
-                            groups: std::sync::Arc::clone(&groups),
-                            image: std::sync::Arc::clone(&image),
-                            launches,
-                        },
-                    );
-                }
                 // A load recording its bodies runs none of them: the fire
                 // lands on an empty submission, and its block is written by
                 // the first serving fire's head.
@@ -917,50 +898,6 @@ impl Serve for Api {
     }
 }
 
-/// Fills `shape` from its body, where the recorder holds a fixed body of
-/// the fire's body key: the body's image and group counts (its commands
-/// carry its rows, so every fire of it lays the same), and the fire's own
-/// readout. Only where the fire's readout copies move the regions the
-/// body's recording does: a fixed body carries them in its commands.
-fn fill_body(
-    shell: &mut Shell<Api>,
-    prepared: &Prepared<'_, Api>,
-    shape: crate::record::Key,
-) -> Result<()> {
-    let body = body_key(shell, prepared);
-    let Some(held) = shell.shelf.recorder.body(body) else {
-        return Ok(());
-    };
-    let Some(family) = shell.shelf.recorder.family(held.family) else {
-        return Ok(());
-    };
-    let recorded: Vec<[u32; 3]> = family.recording.kept.copies().to_vec();
-    let fill = (
-        held.family,
-        std::sync::Arc::clone(&held.groups),
-        std::sync::Arc::clone(&held.image),
-        held.launches,
-    );
-    if !shell.pixel_spans(prepared)?.spans.is_empty() {
-        return Ok(());
-    }
-    let (layout, regions) = shell.readout_copies(prepared)?;
-    // A recording moves its readout rows with the copier, their regions the
-    // fire's table: each copy stands for its most rows alone.
-    let copies: Vec<[u32; 3]> = (regions.iter())
-        .map(|(_, _, most)| [u32::MAX, u32::MAX, u32::try_from(*most).unwrap_or(u32::MAX)])
-        .collect();
-    if copies != recorded {
-        return Ok(());
-    }
-    let (family, groups, image, launches) = fill;
-    shell.shelf.recorder.insert_fill(
-        shape,
-        crate::record::Fill::new(family, groups, image, layout, launches),
-    );
-    Ok(())
-}
-
 /// The kept frame of `family`, for a diagnostic.
 fn held_family_kept(shell: &Shell<Api>, family: crate::record::Key) -> Option<&crate::device::Kept> {
     shell
@@ -1023,14 +960,10 @@ fn family_key(
     key.finish()
 }
 
+/// A fire's shape: what its fill (the block image, the group counts, the
+/// readout layout) is kept under.
 fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
     keyed(shell, p, true)
-}
-
-/// A fire's body key: its record key but for what its lanes read out, which
-/// reaches its commands only through its readout copies' regions.
-fn body_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
-    keyed(shell, p, false)
 }
 
 fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {

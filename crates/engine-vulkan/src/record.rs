@@ -113,20 +113,6 @@ impl Fill {
     }
 }
 
-/// A fixed body: a family whose commands carry their rows, found by what
-/// a fire binds and launches, not by its makeup ([`Recorder::body`]). Its
-/// image and group counts are any fill's of it; a fire of it whose readout
-/// copies move the regions its recording's do fills without a walk.
-pub(crate) struct Body {
-    pub(crate) family: Key,
-
-    pub(crate) groups: Arc<Vec<[u32; 3]>>,
-
-    pub(crate) image: Arc<Image>,
-
-    pub(crate) launches: u32,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Key(u64);
 
@@ -206,8 +192,6 @@ pub(crate) struct Recorder {
     /// Each fire shape's fill, under the shape's key.
     fills: Held<Fill>,
 
-    /// Each fixed body, under its body key.
-    bodies: HashMap<Key, Body>,
 
     recorded: std::cell::Cell<u64>,
     filled: std::cell::Cell<u64>,
@@ -231,7 +215,6 @@ impl Recorder {
             // serves, a fixed set, and none leaves for a later one.
             families: Held::new(usize::MAX),
             fills: Held::new(FILLS_KEPT),
-            bodies: HashMap::new(),
             recorded: std::cell::Cell::new(0),
             filled: std::cell::Cell::new(0),
             clock: std::cell::Cell::new(0),
@@ -300,7 +283,6 @@ impl Recorder {
     pub(crate) fn forget(&mut self) {
         self.families.by_key.clear();
         self.fills.by_key.clear();
-        self.bodies.clear();
     }
 
     /// Every family held: its key and recording.
@@ -327,7 +309,6 @@ impl Recorder {
         if !pinned.is_empty() {
             let gone = |family: &Key| pinned.iter().any(|(key, _)| key == family);
             self.fills.by_key.retain(|_, fill| !gone(&fill.family));
-            self.bodies.retain(|_, body| !gone(&body.family));
         }
         pinned.into_iter().map(|(_, why)| why).collect()
     }
@@ -340,14 +321,6 @@ impl Recorder {
             .insert(key, Family { recording, varying }, |held| {
                 held.recording.used.get()
             });
-    }
-
-    pub(crate) fn body(&self, key: Key) -> Option<&Body> {
-        self.bodies.get(&key)
-    }
-
-    pub(crate) fn insert_body(&mut self, key: Key, body: Body) {
-        self.bodies.insert(key, body);
     }
 
     pub(crate) fn insert_fill(&mut self, shape: Key, fill: Fill) {

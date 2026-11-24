@@ -10,7 +10,7 @@ pub const ENCODING: u32 = 3;
 
 /// The hash of the encoder's layout files as [`ENCODING`] was set for them
 /// (`build.rs`, `PIE_ENCODER_LAYOUT`): a test holds the two together.
-pub const ENCODER_LAYOUT: u64 = 0xef94_2151_fc2b_6ed9;
+pub const ENCODER_LAYOUT: u64 = 0x1a2b_f904_943e_59fe;
 
 /// What keys what a load armed: [`ENCODING`] and the code of every kernel
 /// the load built (each module's SPIR-V, by its key, in key order).
