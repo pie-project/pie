@@ -31,7 +31,7 @@ pub struct Pipeline {
     /// working set, in submission order: what `retract` takes back. No more
     /// than the run-ahead window are kept, the most a program runs ahead
     /// of what it reads.
-    pub(crate) written: Mutex<std::collections::VecDeque<fire::FireWrites>>,
+    pub(crate) written: Mutex<std::collections::VecDeque<fire::WrittenFire>>,
 }
 
 impl Pipeline {

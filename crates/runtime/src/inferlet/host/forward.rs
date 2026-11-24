@@ -25,6 +25,11 @@ use super::pie;
 const UNSHARED_CHECKPOINT: &str =
     "a checkpoint on a set that shares nothing can never be resumed; ask share first";
 
+/// `final-rows` beside `parents`: a beam search keeps its rows buffered
+/// (`BEAM-PAGE-LISTS.md` §11.3), and reorders them every fire.
+const FINAL_BEAMS: &str = "final rows: a beam search's rows are not final; a pass binding \
+     `parents` states no final rows";
+
 type Anyhow<T> = anyhow::Result<T>;
 
 /// The rows or clip a channel bound to `input` carries, once its shape and dtype match it.
@@ -583,6 +588,9 @@ impl ProcessCtx {
                  state is a window each lane needs a working set of its own"
             )));
         }
+        if parents.is_some() && self.ctx().table.get(&this)?.bindings.final_rows {
+            return Ok(Err(FINAL_BEAMS.to_string()));
+        }
         let binding = StateBinding {
             lanes: reps,
             positions: positions.map(|resource| resource.rep()),
@@ -673,6 +681,20 @@ impl ProcessCtx {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
         pass.bindings.checkpoints = slots;
+        Ok(Ok(()))
+    }
+
+    /// The pass states its sampled rows final (`forward.wit` `final-rows`,
+    /// CONTRACT-BC 25).
+    async fn core_final_rows(&mut self, this: Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.state.as_ref().is_some_and(|state| state.parents.is_some()) {
+            return Ok(Err(FINAL_BEAMS.to_string()));
+        }
+        pass.bindings.final_rows = true;
         Ok(Ok(()))
     }
 
@@ -1739,6 +1761,10 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         slots: Vec<u32>,
     ) -> Anyhow<Result<(), String>> {
         self.core_checkpoints(this, slots).await
+    }
+
+    async fn final_rows(&mut self, this: Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
+        self.core_final_rows(this).await
     }
 
     async fn media(

@@ -409,10 +409,18 @@ fn prompt_rows(
 ///
 /// With a `guide`, every fire's logits are masked to what it allows next,
 /// and generation ends when it terminates.
+///
+/// `final_rows`: the caller states the decode's sampled rows final
+/// (`ForwardPass::final_rows`, CONTRACT-BC 25): its fires fold at fire and
+/// run the plain folded step, and the rows run ahead past a stop stay in
+/// the request's working set, which ends with the request. A draft keeps
+/// its own pass, never final.
+#[allow(clippy::too_many_arguments, reason = "the request's parts, and what it states")]
 pub async fn generate(
     prompt: &Prompt,
     sampling: Sampling,
     max_tokens: usize,
+    final_rows: bool,
     mut guide: Option<&mut dyn Guide>,
     on_prompt: &mut dyn FnMut(&[Logprob]),
     on_token: &mut dyn FnMut(u32, Option<Logprob>) -> ControlFlow<()>,
@@ -604,6 +612,9 @@ pub async fn generate(
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
+    if final_rows {
+        fwd.final_rows()?;
+    }
     fwd.epilogue(move || {
         sampler::decode(
             vocab,

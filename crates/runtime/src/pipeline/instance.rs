@@ -39,6 +39,10 @@ pub struct ForwardBindings {
     pub readout: Option<u32>,
     pub mask: Option<u32>,
     pub checkpoints: Vec<u32>,
+    /// The program stated its sampled rows final (`forward.wit`
+    /// `final-rows`, CONTRACT-BC 25): its fires fold every row they hold
+    /// and are never taken back.
+    pub final_rows: bool,
     /// By lane, up to the highest lane a verb named.
     pub lanes: Vec<LaneBinding>,
 }

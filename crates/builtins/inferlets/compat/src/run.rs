@@ -212,10 +212,15 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
             }
         }
     };
+    // A request with no stop sequences states its decode rows final
+    // (CONTRACT-BC 25): it ends at a stop token or its budget and releases
+    // its set. One with stop sequences keeps the lagged fold, and a stop
+    // takes back what ran past it.
     let ran = generate(
         &prompt,
         req.sampling,
         req.max_tokens.saturating_sub(continued.len()),
+        req.stop.is_empty(),
         guide.as_mut().map(|g| g.as_mut() as &mut dyn Guide),
         &mut on_prompt,
         &mut on_token,
