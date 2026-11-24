@@ -340,8 +340,6 @@ async fn score_prompt(
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(&[ws], StateGeometry::folding())?;
-        // A scored prompt row is never taken back (CONTRACT-BC 25).
-        fwd.final_rows()?;
         fwd.readout(&readout)?;
         fwd.epilogue(move || {
             let lp = log_softmax(reshape(intrinsics::output(0, "logits"), [len, vocab]));
@@ -412,14 +410,14 @@ fn prompt_rows(
 /// With a `guide`, every fire's logits are masked to what it allows next,
 /// and generation ends when it terminates.
 ///
-/// Every pass but a draft's states its rows final (`ForwardPass::final_rows`,
-/// CONTRACT-BC 25): the prompt's and the decode's fires fold at fire and run
-/// the plain folded step. A request makes its own working set and releases
-/// it when it ends, so a stop (a stop token, a stop sequence, the budget, a
-/// grammar's end) only ends the output: what ran past it stays in the set,
-/// published keyed by the tokens it holds, and nothing is taken back. The
-/// speculative path rewrites a rejected draft's slots, so its passes state
-/// nothing.
+/// Every pass but the speculative path's is final, the SDK's default
+/// (CONTRACT-BC 25): the prompt's and the decode's fires fold at fire and
+/// run the plain folded step. A request makes its own working set and
+/// releases it when it ends, so a stop (a stop token, a stop sequence, the
+/// budget, a grammar's end) only ends the output: what ran past it stays in
+/// the set, published keyed by the tokens it holds, and nothing is taken
+/// back. The speculative path rewrites a rejected draft's slots, so its
+/// passes are `ForwardPass::retractable`.
 pub async fn generate(
     prompt: &Prompt,
     sampling: Sampling,
@@ -542,7 +540,6 @@ pub async fn generate(
         fwd.media(0, &spans)?;
     }
     fwd.state(&[&ws], StateGeometry::folding())?;
-    fwd.final_rows()?;
     fwd.epilogue(move || {
         let carried_on = carried_on.map(|(tok_in, hist)| {
             (tok_in.traced(), hist.map(|(c, p)| (c.traced(), p.traced())))
@@ -616,7 +613,6 @@ pub async fn generate(
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
-    fwd.final_rows()?;
     fwd.epilogue(move || {
         sampler::decode(
             vocab,

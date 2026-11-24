@@ -390,7 +390,8 @@ class Pipeline:
     ) -> int:
         """Keep the runtime's run-ahead window full while `on_token` consumes
         results, until `budget` fires submit or `on_token` returns False.
-        Returns the run count."""
+        Returns the run count. A break takes back the fires past the one read
+        when `fwd` is retractable; a final pass's stay in its sets."""
         if budget == 0:
             return 0
         # Every slot of a frame is its own fire: the runtime advances the
@@ -430,9 +431,10 @@ class Pipeline:
                 if not ended:
                     self.close()
                 # The fire whose output broke the loop read a token the
-                # program took, so its rows stay; those past it are taken back.
+                # program took, so its rows stay; those past it are taken
+                # back, unless the pass is final: then they stay in its sets.
                 kept = consumed + 1
-                if submitted > kept:
+                if submitted > kept and not fwd.is_final():
                     self.retract(submitted - kept)
                 return kept
             consumed += 1
@@ -563,6 +565,7 @@ class ForwardPass:
         self._lanes: list[WorkingSet] = []
         self._fold_all: Channel | None = None
         self._switches: list[tuple[int, str, str]] = []
+        self._retractable = False
 
     # -- ports ----------------------------------------------------------------
 
@@ -634,6 +637,7 @@ class ForwardPass:
                 kv_len=wits[2],
                 fold=wits[3],
                 parents=None,
+                parents_end=None,
             ),
             what="state",
         )
@@ -644,6 +648,23 @@ class ForwardPass:
     def checkpoints(self, slots: Sequence[int]) -> None:
         """Slots to keep a recurrent state at, so a later pass over these tokens resumes there."""
         _wit(self.wit.checkpoints, [int(s) for s in slots], what="checkpoints")
+
+    def retractable(self) -> None:
+        """State that this pass may take back rows it sampled: the program
+        retracts, truncates, rolls back or rewinds its sets below a sampled
+        row (a stop string cut in a set it continues, a draft or speculative
+        verify, a beam, a rollback). Without it a pass is final
+        (CONTRACT-BC 25): the SDK states its rows final when the program is
+        attached, its lanes fold every row at fire, a retract over one of its
+        fires is refused by name, and `run_ahead` leaves its rows past a
+        break in place. Before the program."""
+        if self._program_attached:
+            raise InferletError("forward pass program is already attached")
+        self._retractable = True
+
+    def is_final(self) -> bool:
+        """Whether this pass's rows are final: `retractable()` was not stated."""
+        return not self._retractable
 
     # -- switches and inputs ---------------------------------------------------
 
@@ -781,6 +802,11 @@ class ForwardPass:
     def attach_program(self) -> None:
         if self._program_attached:
             return
+        # A pass is final unless the program said it may take rows back: the
+        # program's own statement, made here since the runtime takes it
+        # before the program.
+        if not self._retractable:
+            _wit(self.wit.final_rows, what="final-rows")
         builder = Builder(self._vocab, self._page_size)
         lanes = max(
             [1, len(self._lanes)]

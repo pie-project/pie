@@ -631,7 +631,7 @@ struct ForwardInner {
     adapter_scale_sites: u32,
     inputs: Vec<(u32, String, DslChannel)>,
     switches: Vec<(u32, String, String)>,
-    final_rows: bool,
+    retractable: bool,
 }
 
 impl ForwardPass {
@@ -667,7 +667,7 @@ impl ForwardPass {
                 adapter_scale_sites: 0,
                 inputs: Vec::new(),
                 switches: Vec::new(),
-                final_rows: false,
+                retractable: false,
             }),
         }
     }
@@ -969,6 +969,7 @@ impl ForwardPass {
         if self.inner.borrow().program_attached {
             return Ok(());
         }
+        state_final(self.inner.borrow().retractable, || self.wit.final_rows())?;
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
         builder.outputs(lane_outputs(&inner)?);
@@ -1000,6 +1001,25 @@ impl ForwardPass {
         self.inner.borrow_mut().program_attached = true;
         Ok(())
     }
+}
+
+/// States a pass's rows final through `final_rows` unless the program said
+/// the pass is retractable: a pass is final by default (CONTRACT-BC 25), and
+/// this is the program's own statement, made when its program is attached
+/// because the runtime takes it before the program.
+fn state_final(
+    retractable: bool,
+    final_rows: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if retractable {
+        return Ok(());
+    }
+    final_rows().map_err(|error| {
+        format!(
+            "{error} (a pass that binds `parents`, or otherwise takes rows back, states \
+             `ForwardPass::retractable`)"
+        )
+    })
 }
 
 impl Default for ForwardPass {
@@ -1134,9 +1154,9 @@ pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(),
 /// Fires `pass` up to `budget` times, never more, running ahead of
 /// `on_token`, whose `i`-th call reads fire `i`'s output. A break keeps the
 /// fires through the one it read and takes back the rows of those
-/// submitted past it ([`Pipeline::retract`]), unless the pass stated its
-/// rows final ([`ForwardPass::final_rows`]): those stay in its sets. The
-/// count kept is returned.
+/// submitted past it ([`Pipeline::retract`]) when the pass is
+/// [`ForwardPass::retractable`]; a final pass's (the default) stay in its
+/// sets. The count kept is returned.
 pub async fn run_ahead(
     on: &Pipeline,
     pass: &ForwardPass,
@@ -1334,29 +1354,33 @@ impl ForwardPass {
         self.wit.checkpoints(slots)
     }
 
-    /// States that this pass's sampled rows are final: once a fire of it
-    /// samples a row, the program never takes back, truncates, rolls back
-    /// or rewinds its working sets below that row. Its lanes then fold
-    /// every row at fire and carry none into the next fire, the plain
-    /// decode step. Unstated, a pass is not final: on a recurrent or
-    /// windowed set its run-ahead fires fold only what the program has
-    /// read, so a stop can take the rest back. State it on a pass that only
-    /// appends (no stop strings, drafts or beams); a pass that may stop
-    /// short and continue its set must not. [`Pipeline::retract`] over a
-    /// final fire is refused, and [`run_ahead`] leaves a final pass's rows
-    /// past a break in place. Set before the program is attached.
-    pub fn final_rows(&self) -> Result<(), String> {
-        if self.inner.borrow().program_attached {
+    /// States that this pass may take back rows it sampled: the program
+    /// retracts ([`Pipeline::retract`]), truncates, rolls back or rewinds
+    /// its working sets below a row a fire of it sampled (a stop string
+    /// cut in a set it continues, a draft or speculative verify, a beam, a
+    /// rollback). Its run-ahead fires on a recurrent or windowed set then
+    /// fold only what the program has read, so a stop can take the rest
+    /// back, and [`run_ahead`] retracts the rows past a break.
+    ///
+    /// Without it a pass is final (CONTRACT-BC 25): the SDK states its
+    /// sampled rows final when the program is attached, its lanes fold
+    /// every row at fire and run the plain step, [`Pipeline::retract`] over
+    /// one of its fires is refused by name, and [`run_ahead`] leaves its
+    /// rows past a break in place. A pass binding `parents` (a beam) must
+    /// state this. Set before the program is attached.
+    pub fn retractable(&self) -> Result<(), String> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.program_attached {
             return Err("forward pass program is already attached".to_string());
         }
-        self.wit.final_rows()?;
-        self.inner.borrow_mut().final_rows = true;
+        inner.retractable = true;
         Ok(())
     }
 
-    /// Whether [`Self::final_rows`] was stated.
+    /// Whether this pass's rows are final: [`Self::retractable`] was not
+    /// stated.
     pub fn is_final(&self) -> bool {
-        self.inner.borrow().final_rows
+        !self.inner.borrow().retractable
     }
 }
 
@@ -1428,6 +1452,30 @@ mod tests {
             std::task::Poll::Ready(out) => out,
             std::task::Poll::Pending => panic!("the driver never waits here"),
         }
+    }
+
+    /// A pass is final unless the program states it retractable: the SDK
+    /// states its rows final then, and only then, and a refusal names the
+    /// opt-out.
+    #[test]
+    fn a_pass_is_final_unless_it_is_retractable() {
+        use std::cell::Cell;
+        let stated = Cell::new(0);
+        state_final(false, || {
+            stated.set(stated.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stated.get(), 1, "a default pass states its rows final");
+        state_final(true, || {
+            stated.set(stated.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stated.get(), 1, "a retractable pass states nothing");
+        let refused = state_final(false, || Err("final rows: a beam".to_string())).unwrap_err();
+        assert!(refused.starts_with("final rows: a beam"), "{refused}");
+        assert!(refused.contains("ForwardPass::retractable"), "{refused}");
     }
 
     /// A run ahead never submits past its budget, whatever its frame, its
