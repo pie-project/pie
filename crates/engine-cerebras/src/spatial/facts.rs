@@ -105,7 +105,7 @@ impl Facts {
     /// through a window narrower than the context. A window that spans the
     /// context is no window.
     pub fn windowed_layers(&self) -> R<Vec<(u32, u32)>> {
-        let census = poem_compiler::chunk::census::census(&self.trace, false, false, false)
+        let census = poem_compiler::chunk::census::census(&self.trace, false, false, false, false)
             .map_err(|e| e.to_string())?;
         let mut layers: Vec<(u32, u32)> = Vec::new();
         for row in &census.tokens {
