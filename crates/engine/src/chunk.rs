@@ -588,7 +588,8 @@ impl ChunkFacts {
     /// The guest state the device can hold live: its state chunks' bytes
     /// less what the engine holds back of them. The room a guest program's
     /// registration binds within, and so the most guest state any seats
-    /// hold on the device.
+    /// hold on the device, which a disk tier derived on its own gives a
+    /// home when they are evicted.
     #[must_use]
     pub fn guest_room_bytes(&self) -> u64 {
         u64::from(self.state_chunks())

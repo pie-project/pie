@@ -205,7 +205,7 @@ fn every_shape(model: &str) {
     ));
     std::fs::create_dir_all(&dir).expect("the slot file's dir");
     let chunks = shell
-        .seat_disk_kv(Some(BUDGET), Some(&dir))
+        .seat_disk_kv(Some(BUDGET), Some(&dir), 8, CONTEXT)
         .expect("the slot file opens");
     // The budget divides into disk chunks of a pool chunk each, on the
     // direct I/O boundary, and the facts state them.

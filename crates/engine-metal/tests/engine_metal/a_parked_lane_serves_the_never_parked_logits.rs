@@ -173,7 +173,7 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
     ));
     std::fs::create_dir_all(&dir).expect("a disk tier's dir");
     shell
-        .seat_disk_kv(Some(64 << 20), Some(&dir))
+        .seat_disk_kv(Some(64 << 20), Some(&dir), 1, CONTEXT)
         .expect("the disk tier seats");
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");

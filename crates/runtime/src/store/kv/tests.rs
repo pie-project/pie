@@ -2852,3 +2852,39 @@ async fn under_noop_device_pressure_moves_idle_cache_down_and_the_waiter_is_serv
         );
     });
 }
+
+#[test]
+/// A unified device (no host tier) with a default home: the disk tier the
+/// engine derives when budget_disk is unstated ([`engine::disk::derived_budget`]:
+/// every seat's kv at the full context, within the free disk) takes a
+/// suspend under kv pressure whole, so the process is suspended to disk,
+/// not restarted, and reads back whole.
+fn a_unified_load_with_defaults_suspends_kv_to_disk() {
+    const SEATS: u64 = 1;
+    const PAGES_A_SEAT: u64 = 3;
+    let page = ::engine::disk::ALIGN as u64;
+    let derived = ::engine::disk::derived_budget(0, 0, SEATS * PAGES_A_SEAT, page, 0, u64::MAX);
+    let disk = (derived / page) as u32;
+    assert_eq!(disk, 3, "every seat's kv at the full context");
+    let mut store = KvStore::new_with_swap(4, 0, disk, h(65));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, PAGES_A_SEAT, 1);
+    let sets = HashSet::from([ws]);
+    let txn = store
+        .prepare_suspend(&sets, floor)
+        .expect("a disk tier takes it, not a refusal")
+        .expect("three resident pages suspend");
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    use ::engine::transfer::MemoryDomain::LocalDisk;
+    assert_eq!(tiers, [(LocalDisk, 3)], "straight to the disk");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 3);
+    assert_eq!(store.swapped_page_count(&sets).unwrap(), 3);
+    store.retire_idle();
+    let mut granted = store.reserve_device_pages(3).unwrap();
+    let txn = store.prepare_restore(&sets, &mut granted).unwrap();
+    assert_eq!(store.commit_restore(txn).unwrap(), 3, "read back whole");
+}
