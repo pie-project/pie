@@ -795,14 +795,18 @@ impl<B: Backend> RowCaches<B> {
 
     /// Table `param`'s row table for a fire gathering `ids`, the pool as
     /// `pool` binds it: rows of blocks not resident staged from the host
-    /// (`host`, the table's plane `plane`) for this fire. Where the ids are
-    /// the fire's tokens from row `first` (`ring`: `(arm, first)`), the host
-    /// staged them in the arm's stage before the fire
-    /// ([`RowCaches::prestage`]); where the host holds the ids (`known`: the
-    /// fire's tokens) the rows land in the stage in the frame's order
-    /// ([`crate::backend::Frame::update`]), behind every fire before it; else after the
-    /// frame recorded so far lands (`ids` may be written by it), the ids are
-    /// read back and staged. `None` where `param` is not streamed.
+    /// (`host`, the table's plane `plane`) for this fire. `ids` are the
+    /// fire's rows from row `first` on (a class region's window of them):
+    /// the stage is laid by the fire's rows, so the windows of one fire
+    /// stage apart and a later region's rows never land over an earlier
+    /// one's before either reads them. Where the ids are the fire's tokens
+    /// staged in arm `ring`'s stage before the fire
+    /// ([`RowCaches::prestage`]), that stage is read; where the host holds
+    /// the ids (`known`: the window's tokens) the rows land in the stage in
+    /// the frame's order ([`crate::backend::Frame::update`]), behind every
+    /// fire before it; else after the frame recorded so far lands (`ids`
+    /// may be written by it), the ids are read back and staged. `None`
+    /// where `param` is not streamed.
     #[allow(clippy::too_many_arguments)]
     pub fn table(
         &self,
@@ -811,7 +815,8 @@ impl<B: Backend> RowCaches<B> {
         plane: &HostPlane,
         param: usize,
         ids: Tensor,
-        ring: Option<(usize, u32)>,
+        ring: Option<usize>,
+        first: u32,
         known: Option<&[i32]>,
         read: &std::cell::RefCell<Option<(u32, Vec<i32>)>>,
         pool: kernels_slang::Segments,
@@ -822,10 +827,10 @@ impl<B: Backend> RowCaches<B> {
         let cache = &self.caches[at];
         let table = cache.shape.tables[k];
         let rows = ids.rows;
-        if rows > self.rows {
+        if u64::from(first) + u64::from(rows) > u64::from(self.rows) {
             return Err(Fault::Ceiling {
                 what: "rows a fire stages of a row table",
-                need: u64::from(rows),
+                need: u64::from(first) + u64::from(rows),
                 have: u64::from(self.rows),
             });
         }
@@ -856,6 +861,7 @@ impl<B: Backend> RowCaches<B> {
             let mut stage_rows = vec![NOT_HELD; rows as usize];
             let mut image = vec![0u8; ids_host.len() * row_bytes];
             let mut last = 0usize;
+            // The window's row `n` is the fire's row `first + n`, staged there.
             for (n, &raw) in ids_host.iter().enumerate() {
                 let id = if raw >= 0 && u64::from(raw.unsigned_abs()) < cache.shape.rows {
                     u64::from(raw.unsigned_abs())
@@ -871,34 +877,35 @@ impl<B: Backend> RowCaches<B> {
                     id,
                     &mut image[n * row_bytes..(n + 1) * row_bytes],
                 )?;
-                stage_rows[n] = u32::try_from(n).unwrap_or(NOT_HELD);
+                stage_rows[n] = first.saturating_add(u32::try_from(n).unwrap_or(NOT_HELD));
                 last = n + 1;
             }
             let bytes: Vec<u8> = stage_rows.iter().flat_map(|r| r.to_le_bytes()).collect();
             let (stage, staged) = (&cache.stage[k], &cache.staged[k]);
             let image = &image[..last * row_bytes];
+            let (stage_at, staged_at) = (u64::from(first) * table.row_bytes, u64::from(first) * 4);
             if known.is_some() {
                 // In the frame's order: no fire in flight reads it changed.
                 B::with_frame(|frame| {
-                    frame.update(stage, 0, image)?;
-                    frame.update(staged, 0, &bytes)
+                    frame.update(stage, stage_at, image)?;
+                    frame.update(staged, staged_at, &bytes)
                 })
                 .ok_or_else(|| Fault::Residency("no frame is recording on this thread".into()))??;
             } else {
-                stage.write_shared(0, image)?;
-                staged.write_shared(0, &bytes)?;
+                stage.write_shared(stage_at, image)?;
+                staged.write_shared(staged_at, &bytes)?;
             }
         }
-        let (stage, staged, first) = match ring {
-            Some((arm, first)) => {
+        let (stage, staged) = match ring {
+            Some(arm) => {
                 let (stage, staged) = cache.ring.get(arm).ok_or(Fault::Ceiling {
                     what: "fire arms a row table stages for",
                     need: arm as u64 + 1,
                     have: cache.ring.len() as u64,
                 })?;
-                (&stage[k], &staged[k], first)
+                (&stage[k], &staged[k])
             }
-            None => (&cache.stage[k], &cache.staged[k], 0),
+            None => (&cache.stage[k], &cache.staged[k]),
         };
         let bind = |buffer: &B::Buffer, len: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
             let handle = handles.bind(buffer, 0, len.max(4))?;
