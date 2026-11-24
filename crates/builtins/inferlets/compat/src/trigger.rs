@@ -477,7 +477,7 @@ mod tests {
         assert!(!bit_allowed(&mask, b'x' as usize));
         assert!(!bit_allowed(&mask, STOP as usize));
         feed(&mut guide, "get_weather>");
-        // The schema now: only an object opens.
+        // Then the schema: only an object opens.
         let mask = guide.mask();
         assert!(bit_allowed(&mask, b'{' as usize) && !bit_allowed(&mask, b'"' as usize));
         feed(&mut guide, "{\"city\": \"Paris\"}");

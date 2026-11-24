@@ -653,8 +653,8 @@ class ForwardPass:
         """State that this pass may take back rows it sampled: the program
         retracts, truncates, rolls back or rewinds its sets below a sampled
         row (a stop string cut in a set it continues, a draft or speculative
-        verify, a beam, a rollback). Without it a pass is final
-        (CONTRACT-BC 25): the SDK states its rows final when the program is
+        verify, a beam, a rollback). Without it a pass is final:
+        the SDK states its rows final when the program is
         attached, its lanes fold every row at fire, a retract over one of its
         fires is refused by name, and `run_ahead` leaves its rows past a
         break in place. Before the program."""

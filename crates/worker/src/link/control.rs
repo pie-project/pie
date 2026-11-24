@@ -12,11 +12,19 @@ use tokio::sync::watch;
 
 use super::gateway::GatewayLinkManager;
 
+/// Four beats inside the controller's default heartbeat timeout (8 s).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+/// An unchanged load is restated at the heartbeat's pace.
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the load is read for a band change, which is reported at once.
 const REPORT_POLL: Duration = Duration::from_millis(100);
+/// How often dead gateway links are reaped and missing ones dialed again:
+/// the heartbeat's pace.
 const LINK_HEAL_INTERVAL: Duration = Duration::from_secs(2);
+/// The transport deadline on a long-poll watch: far past the controller's
+/// hang time (20 s), so only a lost controller trips it.
 const WATCH_DEADLINE: Duration = Duration::from_secs(300);
+/// The pause after a failed watch, so a down controller is not spun on.
 const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 fn restart_after_lost_registration() -> ! {

@@ -2,11 +2,9 @@
 export type Error = string;
 export type Blob = Uint8Array;
 /**
- * ── Shape-typed tensor primitives (absorbed from the former `tensor`
- * interface; shared with the `forward` interface via
- * `use types.{shape, dtype, data}`). These are pure type aliases — the
- * device-resident tensor/program resources (the removed PSIR sampler front
- * door) are gone; programmable sampling now lives entirely in `forward`.
+ * ── Shape-typed tensor primitives, shared with the `forward` interface
+ * via `use types.{shape, dtype, data}`. These are pure type aliases;
+ * programmable sampling lives in `forward`.
  * Tensor dimensions. Rank is `shape.len()`: `[]` is scalar, `[n]` is a
  * vector, `[m, n]` is a matrix. All dimensions are static; dynamic/ragged
  * buffers are not represented.
