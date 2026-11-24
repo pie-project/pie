@@ -577,6 +577,14 @@ impl Engine for Xla {
         // The program a bind or a host pass lands guest cells with.
         let (rows, _) = shell.pool_geometry();
         crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;
+        // A known limitation: a program's generated code goes onto the
+        // device at its first run and stays while there is room; a load's
+        // programs together can take more than the device holds (v6e
+        // Qwen3.5: ~47 GB over 424 programs), and XLA's runtime evicts and
+        // reloads them, a device allocation after ready.
+        tracing::info!(
+            "engine-xla: program code is cached by XLA and may reload after ready; resident code follows in a later release"
+        );
         // from here a program built is a fire the ladder missed
         shell.device().seal();
         let trace_name = shell.trace().name.clone();
