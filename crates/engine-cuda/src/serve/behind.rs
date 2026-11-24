@@ -3,13 +3,19 @@
 //! (`profile::fire::Rates::stale`), timed again where the engine's lane
 //! would otherwise sleep, after ready, one point a call: a roofline rate
 //! (`crate::rates::measure_behind`) or one decode product on one kernel
-//! (`Shell::time_point_behind`). A point is kept only where it had the
-//! device alone at a steady clock: the stream idle as it starts, no other
-//! lane submitting while it runs (the runtime's submission count), and its
-//! clock's warmed before read and after read agreeing within their spread
-//! (`engine::rates::clock_moved`); otherwise it is discarded and timed
-//! again in a later call. Each kept point is stored for the next load as it
-//! is taken; this load serves on by the figures it loaded with.
+//! (`crate::rates::time_product`). A product point is launched directly,
+//! one eager dispatch at a time on the lane's stream, each timed by events:
+//! nothing is recorded or compiled, and serving's recorded bodies are not
+//! touched. A request that arrives between two dispatches abandons the
+//! point (yielded), so it waits at most one dispatch. A point is kept only
+//! where it had the device alone at a steady clock: the stream idle as it
+//! starts, no other lane submitting while it runs (the runtime's submission
+//! count), and its clock's warmed before read and after read agreeing
+//! within their spread (`engine::rates::clock_moved`); otherwise it is
+//! discarded and timed again in a later call. A bank's points are stored
+//! for the next load together, once every candidate of it is kept, so its
+//! figures are all of one method; this load serves on by the figures it
+//! loaded with.
 
 use std::collections::VecDeque;
 
@@ -18,13 +24,13 @@ use kernels_cuda::linear::routes::Shape;
 use super::Shell;
 use crate::error::Result;
 
-/// One product point timed behind serving: the decode body's median ns a
-/// fire and the rounds' interquartile spread, between its clock's reads.
-pub(crate) struct Timed {
-    pub ns: f64,
-    pub spread: f64,
-    pub before: engine::rates::ClockRead,
-    pub after: engine::rates::ClockRead,
+/// One decode product to time behind serving: its bank, a candidate
+/// kernel, and the served weight it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Point {
+    shape: Shape,
+    kernel: u32,
+    weight: u64,
 }
 
 /// What is left to time behind serving, and what has been.
@@ -34,14 +40,17 @@ pub(crate) struct Behind {
     rates: VecDeque<String>,
     /// The launch's cost the rates step takes off each rate.
     launch_ns: Option<u64>,
-    /// Each decode product a pick read an estimate of, on each kernel no
-    /// figure under a matching key states.
-    points: VecDeque<(Shape, u32)>,
+    /// Each candidate of each decode product bank a pick read an estimate
+    /// of, a bank's candidates together.
+    points: VecDeque<Point>,
+    /// The kept points of the bank at the front, stored once it is whole.
+    bank: Vec<(Shape, u32, f64, f64)>,
     /// The points at the load.
     pending: usize,
     stored: usize,
     discarded: u64,
-    /// The longest call: what an arrival waited behind at most.
+    yielded: u64,
+    /// The longest call.
     longest: std::time::Duration,
     /// Where the user's profile lies (`None`: nothing is stored).
     profiles: Option<std::path::PathBuf>,
@@ -64,29 +73,29 @@ impl Behind {
 }
 
 impl Shell {
-    /// The decode products this load's picks read an estimate of, noted by
-    /// its arming (`Routes::behind`): each kernel whose figure is one, at
-    /// rows a decode body carries, queued to time behind serving, the
-    /// profile they are stored in at `profiles`.
+    /// The decode product banks this load's picks read an estimate of,
+    /// noted by its arming (`Routes::behind`), each with every candidate
+    /// (timed alike, so a bank's figures are of one method), queued to
+    /// time behind serving over the first weight the bank met; stored in
+    /// the profile at `profiles`.
     pub(super) fn queue_behind(
         &mut self,
         noted: std::collections::BTreeMap<Shape, kernels_cuda::linear::routes::Wanted>,
         profiles: Option<&std::path::Path>,
     ) {
         self.behind.profiles = profiles.map(std::path::Path::to_path_buf);
-        if self.routes_measuring != engine::rates::Measuring::Time || !self.records_bodies() {
+        if self.routes_measuring != engine::rates::Measuring::Time {
             return;
         }
-        let Some(served) = self.device.ctx().routes().cloned() else {
-            return;
-        };
-        let mut shapes: Vec<_> = noted.into_iter().filter(|(s, _)| self.timable(s.m)).collect();
-        shapes.sort_by_key(|(s, _)| (s.m, s.rows, s.k));
-        for (shape, wanted) in shapes {
-            for kernel in wanted.candidates {
-                if !served.measured_at(shape, kernel) {
-                    self.behind.points.push_back((shape, kernel));
-                }
+        let mut banks: Vec<_> = noted
+            .into_iter()
+            .filter(|(shape, _)| shape.kind == kernels_cuda::linear::routes::Kind::Plain)
+            .filter_map(|(shape, wanted)| Some((shape, *wanted.weights.first()?, wanted.candidates)))
+            .collect();
+        banks.sort_by_key(|(s, ..)| (s.m, s.rows, s.k));
+        for (shape, weight, candidates) in banks {
+            for kernel in candidates {
+                self.behind.points.push_back(Point { shape, kernel, weight });
             }
         }
         self.behind.pending = self.behind.points.len();
@@ -94,7 +103,7 @@ impl Shell {
             eprintln!(
                 "engine-cuda: rates: `[rates] product_ns`: {} decode product point(s) served by \
                  the figures stored under their stale key; timed again behind serving, one a \
-                 call, stored for the next load",
+                 call, a dispatch at a time, stored for the next load",
                 self.behind.pending
             );
         }
@@ -107,28 +116,28 @@ impl Shell {
     }
 
     /// One point behind serving (a roofline key first, then a decode
-    /// product), where the stream is idle; whether it fired. `others`
-    /// reads the runtime's count of every lane's submissions.
-    pub fn measure_behind(&mut self, others: &dyn Fn() -> u64) -> Result<bool> {
+    /// product), where the stream is idle; whether it fired.
+    pub fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> Result<bool> {
         if !self.behind.left() || !crate::device::ctx::idle(self.device.stream())? {
             return Ok(false);
         }
         let began = std::time::Instant::now();
         if self.behind.rates.is_empty() {
-            self.point_behind(others)?;
+            self.point_behind(behind);
         } else {
-            self.rate_behind(others);
+            self.rate_behind(behind.others);
         }
         self.behind.longest = self.behind.longest.max(began.elapsed());
         if !self.behind.left() {
             let b = &self.behind;
             eprintln!(
                 "engine-cuda: rates behind serving done: {} of {} product point(s) stored for \
-                 the next load ({} discarded and timed again); the longest call, what an \
-                 arrival waited behind at most, {:.1} ms",
+                 the next load ({} discarded and timed again, {} yielded to an arrival); the \
+                 longest call {:.1} ms",
                 b.stored,
                 b.pending,
                 b.discarded,
+                b.yielded,
                 b.longest.as_secs_f64() * 1e3
             );
         }
@@ -148,6 +157,7 @@ impl Shell {
                         let moved = timed.moved;
                         (timed, moved)
                     })
+                    .map_err(crate::rates::Unfinished::Fault)
             },
             |key, timed| kept = Some((key, timed)),
         );
@@ -157,7 +167,7 @@ impl Shell {
                 // timed again by the next.
                 if let Some(key) = self.behind.rates.pop_front() {
                     eprintln!(
-                        "engine-cuda: rates behind serving: `[rates] {key}` not timed ({why}); \
+                        "engine-cuda: rates behind serving: `[rates] {key}` not timed ({why:?}); \
                          this load serves on by its stale figure"
                     );
                 }
@@ -185,38 +195,69 @@ impl Shell {
         );
     }
 
-    fn point_behind(&mut self, others: &dyn Fn() -> u64) -> Result<()> {
-        let mut points = std::mem::take(&mut self.behind.points);
-        let mut discarded = self.behind.discarded;
+    fn point_behind(&mut self, behind: &engine::BehindServing<'_>) {
+        let Some(served) = self.device.ctx().routes().cloned() else {
+            self.behind.points.clear();
+            return;
+        };
+        let device = &self.device;
         let mut kept = None;
         let outcome = one_point(
-            &mut points,
-            &mut discarded,
-            others,
-            |&(shape, kernel): &(Shape, u32)| {
-                self.time_point_behind(shape, kernel).map(|timed| {
+            &mut self.behind.points,
+            &mut self.behind.discarded,
+            behind.others,
+            |point: &Point| {
+                crate::rates::time_product(
+                    device,
+                    &served,
+                    point.shape,
+                    point.kernel,
+                    point.weight,
+                    behind.arrived,
+                )
+                .map(|timed| {
                     let moved = engine::rates::clock_moved(timed.before, timed.after);
                     (timed, moved)
                 })
             },
             |point, timed| kept = Some((point, timed)),
         );
-        self.behind.points = points;
-        self.behind.discarded = discarded;
-        if let Some(why) = outcome? {
-            if let Some(&(shape, kernel)) = self.behind.points.front() {
-                eprintln!(
-                    "engine-cuda: rates behind serving: product {} discarded ({why}); timed \
-                     again later",
-                    point_said(shape, kernel)
-                );
+        match outcome {
+            Err(crate::rates::Unfinished::Yielded) => self.behind.yielded += 1,
+            Err(crate::rates::Unfinished::Fault(why)) => {
+                // The device refused the bank's dispatch: the bank keeps
+                // its stale figures for this load and is timed by the next.
+                if let Some(point) = self.behind.points.front().copied() {
+                    eprintln!(
+                        "engine-cuda: rates behind serving: product {} not timed ({why}); its \
+                         bank serves on by its stale figures",
+                        point_said(point.shape, point.kernel)
+                    );
+                    self.behind.points.retain(|p| p.shape != point.shape);
+                    self.behind.bank.clear();
+                }
             }
+            Ok(Some(why)) => {
+                if let Some(point) = self.behind.points.front() {
+                    eprintln!(
+                        "engine-cuda: rates behind serving: product {} discarded ({why}); timed \
+                         again later",
+                        point_said(point.shape, point.kernel)
+                    );
+                }
+            }
+            Ok(None) => {}
         }
-        let Some(((shape, kernel), timed)) = kept else {
-            return Ok(());
+        let Some((point, timed)) = kept else {
+            return;
         };
-        self.behind.stored += 1;
-        let measured = vec![(shape, kernel, timed.ns, timed.spread)];
+        self.behind.bank.push((point.shape, point.kernel, timed.ns, timed.spread));
+        if self.behind.points.front().is_some_and(|next| next.shape == point.shape) {
+            return;
+        }
+        // The bank is whole: its candidates stored together.
+        let measured = std::mem::take(&mut self.behind.bank);
+        self.behind.stored += measured.len();
         let saved = crate::rates::save_product_times(
             self.behind.profiles.as_deref(),
             self.device.name(),
@@ -224,18 +265,24 @@ impl Shell {
             &self.products,
             &measured,
         );
-        // What the next point's save joins: this load's picks stay as they
+        // What the next bank's save joins: this load's picks stay as they
         // are (the served table is not touched).
         self.products = crate::rates::joined_product_times(&self.products, &measured);
+        let times: Vec<String> = measured
+            .iter()
+            .map(|&(_, kernel, ns, _)| format!("{kernel:08x} {:.1} us", ns / 1e3))
+            .collect();
         eprintln!(
-            "engine-cuda: rates behind serving: product {}: step {:.1} us, {} (this load \
-             serves on by its stale figure); {} point(s) left",
-            point_said(shape, kernel),
-            timed.ns / 1e3,
+            "engine-cuda: rates behind serving: product {:?} {}x{} m{}: {}; {} (this load \
+             serves on by its stale figures); {} point(s) left",
+            point.shape.kind,
+            point.shape.rows,
+            point.shape.k,
+            point.shape.m,
+            times.join(" / "),
             said(saved),
             self.behind.points.len()
         );
-        Ok(())
     }
 }
 
@@ -257,8 +304,9 @@ fn said(saved: std::result::Result<Option<String>, String>) -> String {
 /// lane counted by `others` while it ran, its clock unmoved): taken off the
 /// queue and handed to `keep`, which stores it. Otherwise discarded: left
 /// at the front, counted in `discarded`, timed again on a later call; the
-/// reason returned. Nothing on an empty queue. A fault of `time` is
-/// returned as it is, the queue untouched.
+/// reason returned. Nothing on an empty queue. A point `time` did not
+/// finish (yielded to an arrival, or faulted) is returned as it is, left at
+/// the front.
 fn one_point<P, T, E>(
     queue: &mut VecDeque<P>,
     discarded: &mut u64,
@@ -327,6 +375,42 @@ mod tests {
         assert_eq!(timed, [1, 1, 1, 2], "one point a call, a discarded one again");
         assert_eq!(stored, [(1, 10), (2, 20)]);
         assert_eq!(discarded, 2);
+        assert!(queue.is_empty());
+    }
+
+    /// A request arriving between two dispatches abandons the point: no
+    /// dispatch runs after it, nothing is stored, the point stays at the
+    /// front and is timed whole on a later call.
+    #[test]
+    fn an_arrival_between_dispatches_yields_the_point() {
+        use crate::rates::Unfinished;
+        let arrivals = std::cell::Cell::new(false);
+        let dispatched = std::cell::Cell::new(0u32);
+        // A point of four dispatches, `arrived` read before each.
+        let point = |arrive_after: Option<u32>| -> std::result::Result<(f64, Option<f64>), Unfinished> {
+            let mut sum = 0.0;
+            for at in 0..4 {
+                if arrive_after == Some(at) {
+                    arrivals.set(true);
+                }
+                if arrivals.get() {
+                    return Err(Unfinished::Yielded);
+                }
+                dispatched.set(dispatched.get() + 1);
+                sum += 1.0;
+            }
+            Ok((sum, None))
+        };
+        let mut queue: VecDeque<u32> = [1].into();
+        let (mut discarded, mut stored) = (0, Vec::new());
+        let out = one_point(&mut queue, &mut discarded, &|| 0, |_| point(Some(2)), |p, t| stored.push((p, t)));
+        assert_eq!(out, Err(Unfinished::Yielded));
+        assert_eq!(dispatched.get(), 2, "no dispatch once the request arrived");
+        assert_eq!((queue.len(), discarded, stored.len()), (1, 0, 0));
+        arrivals.set(false);
+        let out = one_point(&mut queue, &mut discarded, &|| 0, |_| point(None), |p, t| stored.push((p, t)));
+        assert_eq!(out, Ok(None));
+        assert_eq!(stored, [(1, 4.0)], "timed whole again, then stored");
         assert!(queue.is_empty());
     }
 

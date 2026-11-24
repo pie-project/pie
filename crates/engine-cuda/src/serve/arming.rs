@@ -1168,7 +1168,24 @@ impl Shell {
     /// rounds and their interquartile spread. Every timed fire must replay
     /// the body (none walks eagerly).
     fn time_decode_body(&mut self, m: u32) -> Result<(f64, f64)> {
-        let owned = self.decode_body_lanes(m)?;
+        let targets = self
+            .lattice_targets()
+            .map_or_else(Vec::new, |lattice| lattice.targets);
+        let (target, treatment) = timing_target(
+            targets
+                .iter()
+                .map(|(bucket, target, treatment)| (*bucket, target, treatment.rs)),
+            m,
+        )
+        .ok_or_else(|| {
+            Fault::Card(format!(
+                "timing a product of {m} rows: no body the lattice arms at bucket {m} \
+                 carries them"
+            ))
+        })?;
+        self.arm_rs = treatment;
+        let (lanes, media) = target.lanes();
+        let owned = self.synthetic_lanes_with(&lanes, &media);
         for _ in 0..BODY_FIRES {
             self.fire_synthetic(&owned)?;
             self.device.synchronize()?;
@@ -1196,126 +1213,6 @@ impl Shell {
             rounds[BODY_ROUNDS / 2],
             rounds[3 * BODY_ROUNDS / 4] - rounds[BODY_ROUNDS / 4],
         ))
-    }
-
-    /// The synthetic lanes of the body the lattice armed at bucket `m` that
-    /// carries `m` rows ([`timing_target`]), its treatment laid for them.
-    fn decode_body_lanes(&mut self, m: u32) -> Result<Vec<Synthetic>> {
-        let targets = self
-            .lattice_targets()
-            .map_or_else(Vec::new, |lattice| lattice.targets);
-        let (target, treatment) = timing_target(
-            targets
-                .iter()
-                .map(|(bucket, target, treatment)| (*bucket, target, treatment.rs)),
-            m,
-        )
-        .ok_or_else(|| {
-            Fault::Card(format!(
-                "timing a product of {m} rows: no body the lattice arms at bucket {m} \
-                 carries them"
-            ))
-        })?;
-        self.arm_rs = treatment;
-        let (lanes, media) = target.lanes();
-        Ok(self.synthetic_lanes_with(&lanes, &media))
-    }
-
-    /// Whether a product of `m` rows is timed by a decode body the lattice
-    /// arms ([`timing_target`]).
-    pub(super) fn timable(&self, m: u32) -> bool {
-        let targets = self
-            .lattice_targets()
-            .map_or_else(Vec::new, |lattice| lattice.targets);
-        timing_target(
-            targets
-                .iter()
-                .map(|(bucket, target, treatment)| (*bucket, target, treatment.rs)),
-            m,
-        )
-        .is_some()
-    }
-
-    /// One product point timed behind serving: `shape`'s bank forced onto
-    /// `kernel`, its bucket armed so into a stash of its own (the load's
-    /// recordings of that bucket taken out and put back whole after,
-    /// [`record::Bodies::stash_bucket`]; the served table laid back), and
-    /// the decode body of its rows replayed as [`Shell::routes_by_body`]
-    /// times it, between two reads of the same body's clock: one warmed
-    /// before ([`engine::rates::warmed`]) and one after. Nothing the load
-    /// serves, records or counts changes.
-    pub(super) fn time_point_behind(
-        &mut self,
-        shape: kernels_cuda::linear::routes::Shape,
-        kernel: u32,
-    ) -> Result<super::behind::Timed> {
-        let Some(served) = self.device.ctx().routes().cloned() else {
-            return Err(Fault::Card("timing a product behind serving: no product table".into()));
-        };
-        let took = self.bodies_took;
-        let stash = self.cache.stash_bucket(shape.m);
-        self.device
-            .set_routes(std::sync::Arc::new(served.forcing(shape, kernel)));
-        self.arm_only = Some(shape.m);
-        self.rearming = true;
-        let timed = self.arm_bodies().and_then(|()| self.time_body_behind(shape.m));
-        self.rearming = false;
-        self.arm_only = None;
-        self.arm_rs = record::RsBody::Folds;
-        self.cache.unstash_bucket(stash);
-        self.device.set_routes(served);
-        self.bodies_took = took;
-        timed
-    }
-
-    /// [`Shell::time_decode_body`] between two clock reads of the same
-    /// body: the reads are single fires, the fastest of [`BODY_FIRES`] and
-    /// their spread.
-    fn time_body_behind(&mut self, m: u32) -> Result<super::behind::Timed> {
-        let owned = self.decode_body_lanes(m)?;
-        let read = |shell: &mut Shell| -> Result<engine::rates::ClockRead> {
-            let mut fires = Vec::with_capacity(BODY_FIRES);
-            for _ in 0..BODY_FIRES {
-                let began = std::time::Instant::now();
-                shell.fire_synthetic(&owned)?;
-                shell.device.synchronize()?;
-                fires.push(began.elapsed().as_secs_f64() * 1e9);
-            }
-            let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
-            let slowest = fires.iter().copied().fold(0.0, f64::max);
-            Ok(engine::rates::ClockRead {
-                fastest_ns: fastest,
-                spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
-            })
-        };
-        let before = engine::rates::warmed(|| read(self))?;
-        let before_hits = self.cache.body_stats().tally.hits;
-        let mut rounds = Vec::with_capacity(BODY_ROUNDS);
-        for _ in 0..BODY_ROUNDS {
-            let began = std::time::Instant::now();
-            for _ in 0..BODY_FIRES {
-                self.fire_synthetic(&owned)?;
-                self.device.synchronize()?;
-            }
-            rounds.push(began.elapsed().as_secs_f64() * 1e9 / BODY_FIRES as f64);
-        }
-        let after = read(self)?;
-        let fired = self.cache.body_stats().tally.hits - before_hits;
-        let all = (BODY_ROUNDS * BODY_FIRES) as u64;
-        if fired < all {
-            return Err(Fault::Card(format!(
-                "timing the decode body of {m} lanes behind serving: {fired} of its fires \
-                 replayed it; a product's kernel is chosen by its body's time, never an eager \
-                 walk's"
-            )));
-        }
-        rounds.sort_by(f64::total_cmp);
-        Ok(super::behind::Timed {
-            ns: rounds[BODY_ROUNDS / 2],
-            spread: rounds[3 * BODY_ROUNDS / 4] - rounds[BODY_ROUNDS / 4],
-            before,
-            after,
-        })
     }
 
     /// Bucket `bucket`'s bodies forgotten and armed again, the other

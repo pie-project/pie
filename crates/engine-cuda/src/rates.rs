@@ -410,6 +410,71 @@ pub fn measure_behind(
     }
 }
 
+/// One decode product point timed behind serving ([`time_product`]): the
+/// median ns of one dispatch over [`PRODUCT_ROUNDS`] rounds and their
+/// interquartile spread, between two reads of the same dispatch's clock.
+pub struct ProductTimed {
+    pub ns: f64,
+    pub spread: f64,
+    pub before: engine::rates::ClockRead,
+    pub after: engine::rates::ClockRead,
+}
+
+/// Why a product point was not timed to its end.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unfinished {
+    /// A request arrived between two of its dispatches: the point is
+    /// abandoned and timed again later.
+    Yielded,
+    /// The device refused a dispatch, by name.
+    Fault(String),
+}
+
+/// Rounds a product point is timed in behind serving: the median kept,
+/// the interquartile range its spread.
+pub const PRODUCT_ROUNDS: usize = 5;
+
+/// Dispatches a round (and a clock read) of a product point.
+pub const PRODUCT_FIRES: usize = 10;
+
+/// `shape`'s product on `kernel` (a candidate's code), timed behind
+/// serving by launching it directly: one eager dispatch at a time on the
+/// device's stream, each timed by events, through a context of slabs of
+/// its own (`crate::device::Context::apart`) whose product table forces
+/// `kernel` for the bank (`Routes::forcing` over `served`). It reads the
+/// served weight at `weight` and lays its own activation and output.
+/// Nothing serving records or launches through changes. `arrived` is read
+/// before every dispatch: a request that arrived abandons the point
+/// ([`Unfinished::Yielded`]), so it waits at most one dispatch.
+pub fn time_product(
+    device: &crate::device::Context,
+    served: &kernels_cuda::linear::routes::Routes,
+    shape: kernels_cuda::linear::routes::Shape,
+    kernel: u32,
+    weight: u64,
+    arrived: &dyn Fn() -> bool,
+) -> Result<ProductTimed, Unfinished> {
+    #[cfg(feature = "device")]
+    {
+        let (mut ctx, slabs) = device.apart();
+        let timed = on_device::time_product(device, &mut ctx, served, shape, kernel, weight, arrived);
+        // SAFETY: the dispatches were waited on (each timing waits on its
+        // stop event, a fault synchronizes below), and nothing launches
+        // through `ctx` again.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = crate::device::ctx::sync(device.stream());
+            slabs.release();
+        }
+        timed
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (device, served, shape, kernel, weight, arrived);
+        Err(Unfinished::Fault(crate::error::Fault::Runtimeless.to_string()))
+    }
+}
+
 #[cfg(feature = "device")]
 #[allow(unsafe_code)]
 mod on_device {
@@ -460,6 +525,92 @@ mod on_device {
     }
 
     type Kernel = kernels_cuda::Error;
+
+    /// [`super::time_product`] on `ctx`.
+    pub(super) fn time_product(
+        device: &Context,
+        ctx: &mut Ctx,
+        served: &kernels_cuda::linear::routes::Routes,
+        shape: kernels_cuda::linear::routes::Shape,
+        kernel: u32,
+        weight: u64,
+        arrived: &dyn Fn() -> bool,
+    ) -> Result<ProductTimed, Unfinished> {
+        let fault = |e: String| Unfinished::Fault(e);
+        let (m, n, k) = (shape.m, shape.rows, shape.k);
+        let stream = device.stream();
+        let clock = Clock::new(stream).map_err(fault)?;
+        let random = Random::new(stream).map_err(fault)?;
+        let act = random.operand(m as usize * k as usize * 2).map_err(fault)?;
+        let y = zeroed(m as usize * n as usize * 2).map_err(fault)?;
+        let fire = |ctx: &Ctx| {
+            kernels_cuda::linear::gemm::matmul(
+                ctx,
+                Tensor::new(act.ptr(), m, k, Dtype::Bf16),
+                Tensor::new(weight, n, k, Dtype::Bf16),
+                &mut Tensor::new(y.ptr(), m, n, Dtype::Bf16),
+            )
+        };
+        ctx.set_routes(std::sync::Arc::new(served.forcing(shape, kernel)));
+        let mut held = Vec::new();
+        lay(&mut held, || fire(ctx)).map_err(fault)?;
+        let timed = timed_dispatches(&*ctx, &clock, &fire, arrived);
+        // A forced library pick is laid process-wide for its shape: the
+        // served table's pick laid back by a walk that launches nothing.
+        ctx.set_routes(std::sync::Arc::new(served.with(&[])));
+        crate::sizing::begin();
+        let _ = fire(ctx);
+        let _ = crate::sizing::end();
+        timed
+    }
+
+    /// A product point's dispatches through `ctx`, each `fire` timed on
+    /// `clock`: its clock read warmed, [`PRODUCT_ROUNDS`] rounds, its clock
+    /// read again; abandoned before any dispatch once `arrived`.
+    fn timed_dispatches(
+        ctx: &Ctx,
+        clock: &Clock,
+        fire: &dyn Fn(&Ctx) -> Result<(), Kernel>,
+        arrived: &dyn Fn() -> bool,
+    ) -> Result<ProductTimed, Unfinished> {
+        // One dispatch, the unit: none starts once a request has arrived.
+        let dispatch = || -> Result<f64, Unfinished> {
+            if arrived() {
+                return Err(Unfinished::Yielded);
+            }
+            clock
+                .time(&mut || fire(ctx).map_err(say("the product")))
+                .map_err(Unfinished::Fault)
+        };
+        let read = || -> Result<engine::rates::ClockRead, Unfinished> {
+            let fires = (0..PRODUCT_FIRES)
+                .map(|_| dispatch())
+                .collect::<Result<Vec<f64>, Unfinished>>()?;
+            let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
+            let slowest = fires.iter().copied().fold(0.0, f64::max);
+            Ok(engine::rates::ClockRead {
+                fastest_ns: fastest,
+                spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
+            })
+        };
+        let before = engine::rates::warmed(read)?;
+        let mut rounds = Vec::with_capacity(PRODUCT_ROUNDS);
+        for _ in 0..PRODUCT_ROUNDS {
+            let mut sum = 0.0;
+            for _ in 0..PRODUCT_FIRES {
+                sum += dispatch()?;
+            }
+            rounds.push(sum / PRODUCT_FIRES as f64);
+        }
+        let after = read()?;
+        rounds.sort_by(f64::total_cmp);
+        Ok(ProductTimed {
+            ns: rounds[PRODUCT_ROUNDS / 2],
+            spread: rounds[3 * PRODUCT_ROUNDS / 4] - rounds[PRODUCT_ROUNDS / 4],
+            before,
+            after,
+        })
+    }
 
     fn say<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> String {
         move |e| format!("rates: {what}: {e}")

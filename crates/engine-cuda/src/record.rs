@@ -56,22 +56,6 @@ pub struct BodyMap {
     sealed: bool,
 }
 
-/// One bucket's recordings, taken out of the map while a product's timing
-/// behind serving arms that bucket under a forced choice
-/// ([`Bodies::stash_bucket`]).
-pub struct BucketStash {
-    bucket: u32,
-    bodies: Vec<(BodyKey, Body)>,
-    order: Vec<BodyKey>,
-    warm: Vec<(BodyKey, u32)>,
-    cold_refused: Vec<BodyKey>,
-    refused: Vec<BodyKey>,
-    sealed: bool,
-    sealed_seen: Vec<BodyKey>,
-    tally: BodyTally,
-    last_capture: LastCapture,
-}
-
 #[derive(Default)]
 pub struct Recorder {
     airborne: crate::settle::Airborne,
@@ -963,48 +947,6 @@ impl Bodies {
     pub fn forget_bodies_at(&mut self, bucket: u32) {
         self.map.forget_bucket(bucket);
         self.recorder.sealed_seen.retain(|key| key.bucket != bucket);
-    }
-
-    /// Takes bucket `bucket`'s recorded bodies (and what was refused or
-    /// warmed there) out of the map, the map unsealed so the bucket arms
-    /// again, beside the tally serving counts: what a product's timing
-    /// behind serving arms its forced choice into, then puts back whole
-    /// ([`Bodies::unstash_bucket`]), so the load's recordings never change.
-    pub fn stash_bucket(&mut self, bucket: u32) -> BucketStash {
-        let map = &mut self.map;
-        let at = |key: &BodyKey| key.bucket == bucket;
-        let stash = BucketStash {
-            bucket,
-            bodies: map.bodies.extract_if(|key, _| at(key)).collect(),
-            order: map.body_order.iter().filter(|key| at(key)).cloned().collect(),
-            warm: map.body_warm.extract_if(|key, _| at(key)).collect(),
-            cold_refused: map.cold_refused.extract_if(|key| at(key)).collect(),
-            refused: map.bodies_refused.extract_if(|key| at(key)).collect(),
-            sealed: map.sealed,
-            sealed_seen: self.recorder.sealed_seen.extract_if(|key| at(key)).collect(),
-            tally: self.recorder.bstats,
-            last_capture: self.recorder.last_capture,
-        };
-        map.body_order.retain(|key| !at(key));
-        map.sealed = false;
-        stash
-    }
-
-    /// What [`Bodies::stash_bucket`] took, put back: whatever armed in its
-    /// bucket since is dropped, and the map's seal and the serving tally
-    /// stand as they were.
-    pub fn unstash_bucket(&mut self, stash: BucketStash) {
-        self.forget_bodies_at(stash.bucket);
-        let map = &mut self.map;
-        map.bodies.extend(stash.bodies);
-        map.body_order.extend(stash.order);
-        map.body_warm.extend(stash.warm);
-        map.cold_refused.extend(stash.cold_refused);
-        map.bodies_refused.extend(stash.refused);
-        map.sealed = stash.sealed;
-        self.recorder.sealed_seen.extend(stash.sealed_seen);
-        self.recorder.bstats = stash.tally;
-        self.recorder.last_capture = stash.last_capture;
     }
 
     /// Drops the one recorded body `key`: arming gives back the capture
