@@ -631,6 +631,58 @@ fn serve(
     rows
 }
 
+/// The most a logit of one placement may differ from the same logit of
+/// another, `ulps` bf16 units in the last place of the larger magnitude:
+/// the lanes' rows meet the kernels in another order once their pages lie
+/// elsewhere, and bf16 operands round each partial sum to 8 significant
+/// bits, so the same row may land a few such units apart (no batch
+/// invariance is promised; an argmax apart, or a logit past this, is a bug).
+fn bf16_bound(a: f32, b: f32, ulps: f32) -> f32 {
+    let magnitude = a.abs().max(b.abs()).max(f32::MIN_POSITIVE);
+    // A bf16's unit in the last place: 2^(exponent - 7).
+    ulps * 2f32.powi(magnitude.log2().floor() as i32 - 7)
+}
+
+/// Panics at the first row whose argmax differs, or a logit of which lies
+/// past [`bf16_bound`] of two units from the other's.
+pub(super) fn close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    assert_eq!(got.len(), want.len(), "{what}: rows");
+    for (at, (got, want)) in got.iter().zip(want).enumerate() {
+        assert_eq!(got.len(), want.len(), "{what}: row {at}'s logits");
+        assert_eq!(argmax(got), argmax(want), "{what}: row {at}'s argmax");
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(&a, &b)| ((a - b).abs(), bf16_bound(a, b, 2.0), a, b))
+            .filter(|&(apart, bound, ..)| !(apart <= bound))
+            .collect::<Vec<_>>();
+        assert!(
+            worst.is_empty(),
+            "{what}: row {at}: {} of {} logits past two bf16 units, first {:?}",
+            worst.len(),
+            want.len(),
+            worst.first()
+        );
+    }
+}
+
+/// The bound passes two bf16 units of a logit and refuses three, and an
+/// argmax apart is refused at once whatever the logits' distance.
+#[test]
+fn close_holds_two_bf16_units_and_the_argmax() {
+    let unit = 2f32.powi(-7); // a bf16 unit at 1.0
+    let row = vec![1.0f32, 0.5, -3.0];
+    close("two units", &[vec![1.0 + 2.0 * unit, 0.5, -3.0]], &[row.clone()]);
+    let three = std::panic::catch_unwind(|| {
+        close("three units", &[vec![1.0 + 3.0 * unit, 0.5, -3.0]], &[vec![1.0f32, 0.5, -3.0]]);
+    });
+    assert!(three.is_err(), "three bf16 units apart is refused");
+    let swapped = std::panic::catch_unwind(|| {
+        close("argmax", &[vec![0.5f32, 0.5001, -3.0]], &[vec![0.5001f32, 0.5, -3.0]]);
+    });
+    assert!(swapped.is_err(), "an argmax apart is refused");
+}
+
 /// Panics at the first row whose logits differ in a bit.
 pub(super) fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
@@ -761,7 +813,7 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles
             }
         },
     );
-    same(
+    close(
         &format!("{model}: scattered and evacuated slots against the seats' runs"),
         &scattered,
         &seats,
@@ -816,7 +868,7 @@ fn a_refused_evacuation_moves_nothing() {
             assert!(refused.is_err(), "{model}: the injected refusal is answered");
             assert_eq!(shell.chunk_table(), before, "{model}: a refused evacuation moves nothing");
         });
-        same(
+        close(
             &format!("{model}: decoding on past a refused evacuation, against the seats' runs"),
             &scattered,
             &seats,
