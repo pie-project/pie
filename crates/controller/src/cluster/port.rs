@@ -6,7 +6,10 @@
 //! own requests from 0. A worker is its id in decimal.
 //!
 //! The gate: a gateway does not dispatch a launch before every policy has
-//! heard it, or its gate bound has passed. Each arrival's host sequence
+//! heard it, or its gate bound has passed, while a loaded policy imports a
+//! column that decides a pending process ([`GATED`]). With none, the gate
+//! bound is zero: a launch goes by the rows in force and the policies hear
+//! it after. Each arrival's host sequence
 //! number is kept beside the gateway's own, and a gateway's `heard` is its
 //! highest arrival whose host number the host has heard
 //! ([`plex_host::host::Host::heard`]).
@@ -160,10 +163,25 @@ enum Event {
     State(Arc<DirectoryView>, Arc<RoutingTable>),
 }
 
-/// A launch's gate time: one call's deadline per policy, the longest a
-/// round that heard the arrival can take before a policy is stuck.
-fn gate_ms(config: &Config, policies: usize) -> u64 {
-    config.deadline_ms * policies as u64
+/// The columns that decide a pending process: its placement, read once at
+/// dispatch (PLEX 1.1 §2, the gate: "the row must be there first"), and its
+/// termination, answered at the gate while it is pending. An import is the
+/// authority to write (§1 principle 6, §6 "an import is a capability"): a
+/// policy that imports neither has stated it decides no arrival before
+/// dispatch.
+const GATED: &[&str] = &[tables::PLACEMENT_WORKERS, tables::TERMINATE];
+
+/// Whether a policy importing `imports` decides arrivals at the gate.
+fn gates(imports: &[String]) -> bool {
+    imports.iter().any(|i| GATED.contains(&i.as_str()))
+}
+
+/// A launch's gate time: one call's deadline per policy that decides
+/// arrivals at the gate, the longest a round that heard the arrival can
+/// take before a policy is stuck. Zero when none does: a launch goes by the
+/// rows in force, and the policies hear it after.
+fn gate_ms(config: &Config, gating: usize) -> u64 {
+    config.deadline_ms * gating as u64
 }
 
 impl Host {
@@ -181,9 +199,10 @@ impl Host {
         };
         let mut host = PlexHost::new(config.clone());
         let mut names = Vec::new();
+        let mut gating = 0;
         for (spec, component) in &policies {
             let name = policy_name(spec);
-            host.load(&name, component).map_err(LoadError)?;
+            gating += usize::from(gates(&host.load(&name, component).map_err(LoadError)?));
             names.push(name);
         }
         host.start();
@@ -191,7 +210,7 @@ impl Host {
             tables: RwLock::default(),
             heard: Mutex::default(),
             dead: AtomicBool::new(names.is_empty()),
-            gate_ms: AtomicU64::new(gate_ms(&config, names.len())),
+            gate_ms: AtomicU64::new(gate_ms(&config, gating)),
             terminated: Mutex::default(),
             live: Mutex::default(),
             views: Mutex::default(),
@@ -552,8 +571,13 @@ impl Port {
         for (name, _) in &self.loaded {
             self.host.unload(name);
         }
+        let mut gating = 0;
         for (i, (name, component)) in policies.iter().enumerate() {
-            if let Err(error) = self.host.load(name, component) {
+            let loaded = self.host.load(name, component);
+            if let Ok(imports) = &loaded {
+                gating += usize::from(gates(imports));
+            }
+            if let Err(error) = loaded {
                 tracing::error!(%error, policy = %name, "cluster policies not reloaded; the running ones go on");
                 for (name, _) in &policies[..i] {
                     self.host.unload(name);
@@ -570,7 +594,7 @@ impl Port {
             .store(policies.is_empty(), Ordering::Release);
         self.shared
             .gate_ms
-            .store(gate_ms(&self.config, policies.len()), Ordering::Release);
+            .store(gate_ms(&self.config, gating), Ordering::Release);
         self.loaded = policies;
         Ok(())
     }
@@ -926,6 +950,62 @@ mod tests {
             views: Mutex::default(),
             directory: RwLock::new(Arc::new(directory)),
         }
+    }
+
+    fn imports_of(name: &str) -> Vec<String> {
+        let component = builtins::policy(name).unwrap().component;
+        plex_host::runtime::Program::load(name, component)
+            .unwrap()
+            .imports
+    }
+
+    /// `default-cluster` writes only defaults: by its imports it can neither
+    /// place nor end a process, so it decides no arrival before dispatch and
+    /// a launch under it does not wait at the gate. A policy that places
+    /// (`test-route`) still gates.
+    #[test]
+    fn only_a_policy_that_decides_pending_processes_gates_launches() {
+        let imports = imports_of("default-cluster");
+        assert!(
+            imports.iter().any(|i| i == tables::PLACEMENT_HELPERS)
+                && imports.iter().any(|i| i == tables::REPLICATION_WORKERS),
+            "it writes its defaults: {imports:?}"
+        );
+        assert!(
+            !gates(&imports),
+            "it states no arrival decision: {imports:?}"
+        );
+        assert!(gates(&imports_of("test-route")));
+
+        let config = Config::default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _in = runtime.enter();
+        let gate = |names: &[&str]| {
+            let programs = names
+                .iter()
+                .map(|n| {
+                    (
+                        n.to_string(),
+                        builtins::policy(n).unwrap().component.to_vec(),
+                    )
+                })
+                .collect();
+            let host = Host::start(
+                programs,
+                watch::channel(RoutingTable {
+                    epoch: 0,
+                    workers: Vec::new(),
+                    author: None,
+                })
+                .1,
+                watch::channel(DirectoryView::default()).1,
+            )
+            .unwrap();
+            host.decisions(GatewayId(0)).borrow().gate_ms
+        };
+        assert_eq!(gate(&["default-cluster"]), 0);
+        assert_eq!(gate(&["test-route"]), config.deadline_ms);
+        assert_eq!(gate(&["default-cluster", "test-route"]), config.deadline_ms);
     }
 
     #[test]
