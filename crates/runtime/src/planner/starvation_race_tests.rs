@@ -9328,6 +9328,192 @@ async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it()
     waiting.abort();
 }
 
+/// The test-pause policy (`crates/builtins/policies/test-pause`), built and
+/// run as PLEX 1.1 runs it: a process that states `pause-at-ms: 200` and
+/// `pause-for-ms: 300` is held from 200 ms after its arrival to 500 ms, by
+/// its `schedule/hold` row, and lifted at the alarm it set for 500 ms. The
+/// rows go to the schedule table as the port enacts them, and the planner
+/// reads them: before its window it runs, inside it its set stays parked
+/// (no restore, even with its lanes asking), and once lifted its restore is
+/// queued. Another process, stating none, is never held; one stating the
+/// prop as text is terminated with a reason naming it, and never held.
+#[tokio::test(flavor = "current_thread")]
+async fn the_test_pause_policy_parks_a_set_in_its_window_and_resumes_it_after() {
+    use plex_host::host::{Config, Host};
+    use plex_host::tables::Value;
+    use std::str::FromStr;
+
+    const MS: u64 = 1_000_000;
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    crate::policy::schedule::install(None);
+    let host = Host::new(Config {
+        supported: vec![plex_host::tables::SCHEDULE_HOLD.to_string()],
+        manual: true,
+        ..Config::default()
+    });
+    let component = builtins::policy("test-pause").expect("built with test-policies");
+    let imports = host.load("test-pause", component.component).unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| i == plex_host::tables::SCHEDULE_HOLD),
+        "it writes schedule/hold: {imports:?}"
+    );
+    // Each round's committed hold rows, enacted as the port enacts them.
+    let round = |at_ms: u64| {
+        host.set_now(at_ms * MS);
+        host.run(false);
+        let delta = host.poll_delta();
+        let holds = delta
+            .schedule_hold
+            .rows
+            .into_iter()
+            .map(|(id, row)| (ProcessId::from_str(&id).unwrap(), row))
+            .collect();
+        crate::policy::schedule::apply(crate::policy::schedule::Change {
+            holds,
+            hold_default: delta.schedule_hold.default,
+            ..Default::default()
+        });
+    };
+
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(64))));
+    let (paused, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [paused, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    host.set_now(10 * MS);
+    let hints = |at: Value| {
+        vec![
+            ("pause-at-ms".to_string(), at),
+            ("pause-for-ms".to_string(), Value::Int(300)),
+        ]
+    };
+    host.arrived(
+        &paused.to_string(),
+        None,
+        None,
+        Some("self".into()),
+        None,
+        None,
+        hints(Value::Int(200)),
+        0,
+    );
+    host.arrived(
+        &other.to_string(),
+        None,
+        None,
+        Some("self".into()),
+        None,
+        None,
+        vec![],
+        0,
+    );
+    host.started(&paused.to_string());
+    host.started(&other.to_string());
+
+    let restore_queued = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| {
+            inner.queue.values().any(|waiter| {
+                waiter.pid == paused && matches!(waiter.kind, WaitKind::Restore { .. })
+            })
+        })
+    };
+    let held = |pid| crate::policy::schedule::held(pid);
+
+    // Before its window: it runs, and the policy asks to be woken at 210.
+    round(10);
+    assert!(
+        !held(paused) && !held(other),
+        "before its window nothing is held"
+    );
+    assert_eq!(host.alarm(), Some(210 * MS), "woken where its window opens");
+    round(100);
+    assert!(!held(paused), "still before its window");
+
+    // Inside it: held, and the planner pauses it (its set parked below the
+    // device, as the pause path leaves it).
+    round(210);
+    assert!(held(paused), "held inside its window");
+    assert!(!held(other), "one stating no pause is never held");
+    assert_eq!(
+        host.alarm(),
+        Some(510 * MS),
+        "woken where its window closes"
+    );
+    planner.reschedule();
+    planner.with_inner(|inner| {
+        assert!(inner.procs[&paused].held, "the planner reads the hold");
+        assert!(!inner.procs[&other].held);
+        let proc = inner.procs.get_mut(&paused).unwrap();
+        proc.state = Residency::Evicted;
+        proc.parked = Some(Demand {
+            kv_pages: 2,
+            rs: RsUnits::default(),
+        });
+    });
+    let p = planner.clone();
+    let waiting = crate::rt::spawn(async move { p.wait_resident(paused).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    round(400);
+    planner.reschedule();
+    assert!(held(paused), "still inside its window");
+    assert!(
+        !restore_queued(&planner),
+        "held: its set stays parked though its lanes ask"
+    );
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&paused].state),
+        Residency::Evicted
+    );
+
+    // Its window closes at the alarm: lifted, its restore queued.
+    round(510);
+    assert!(!held(paused), "lifted once its window closed");
+    assert_eq!(host.alarm(), None, "no later edge: no alarm");
+    planner.reschedule();
+    assert!(restore_queued(&planner), "lifted: its restore is queued");
+    waiting.abort();
+
+    // A prop stated as text ("300") is refused by name: the process is
+    // terminated with a reason naming it, and nothing is held.
+    let text = ProcessId::new_v4();
+    host.set_now(600 * MS);
+    host.arrived(
+        &text.to_string(),
+        None,
+        None,
+        Some("self".into()),
+        None,
+        None,
+        hints(Value::Text("300".into())),
+        0,
+    );
+    host.run(false);
+    let delta = host.poll_delta();
+    assert!(
+        delta
+            .terminate
+            .iter()
+            .any(|(id, why)| *id == text.to_string() && why.contains("pause-at-ms")),
+        "refused by name: {:?}",
+        delta.terminate
+    );
+    assert!(
+        !delta
+            .schedule_hold
+            .rows
+            .iter()
+            .any(|(id, row)| *id == text.to_string() && *row == Some(true)),
+        "and never held"
+    );
+    assert_eq!(host.stats().traps, 0, "no call traps");
+    crate::policy::schedule::install(None);
+}
+
 /// Mac Pro at 2 GiB disk-only on 1e87ab171, stalled at 86 serves: a
 /// process suspended for its bind (two runs of nine Instance chunks
 /// short), evicted to disk, restored ~95 ms later, then waiting on

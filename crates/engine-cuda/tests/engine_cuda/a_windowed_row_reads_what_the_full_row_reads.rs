@@ -55,6 +55,7 @@ fn served(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
@@ -235,6 +236,7 @@ fn served_masked(trace: Trace, path: &Path, prompt: &[u32], decodes: u32, ringed
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");

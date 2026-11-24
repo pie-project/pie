@@ -275,15 +275,20 @@ pub struct Gpu<B: Host> {
 }
 
 impl<B: Host> Gpu<B> {
-    /// One slice behind serving of a `[rates]` key the load serves by a
-    /// figure stored under a stale key (`profile::fire::Tuned::behind`):
-    /// the rates step timing that key alone, over the rates the load
-    /// serves by. Taken only where it had the device alone at a steady
-    /// clock (the device idle as it starts, no other lane submitting while
-    /// it runs, the step's own clock check not refusing it): stored for the
-    /// next load; else discarded and timed again in a later slice. This
-    /// load serves on by the stale figure.
-    fn rate_behind(&mut self, others: &dyn Fn() -> u64) -> EngineResult<bool> {
+    /// One slice behind serving of a `[rates]` key or a dense kernel's curve
+    /// the load serves by a figure stored under a stale key
+    /// (`profile::fire::Tuned::behind`): the rates step timing that key
+    /// alone over the rates the load serves by, or that curve alone. Each
+    /// frame of it reads whether a request arrived and stops the slice where
+    /// one did (`crate::rates::yielded`), so an arrival waits at most the
+    /// frame in flight; the key is timed again whole at a later idle turn.
+    /// Kept only where it had the device alone at a steady clock (the
+    /// device idle as it starts, no other lane submitting while it runs,
+    /// the device's settled clock before it no faster than after it): stored
+    /// for the next load; else discarded and timed again later. This load
+    /// serves on by the stale figure.
+    fn rate_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
+        use crate::backend::Tactics as _;
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
@@ -293,37 +298,96 @@ impl<B: Host> Gpu<B> {
         if !crate::backend::Context::idle(shell.device()) {
             return Ok(false);
         }
-        let mut stated = {
-            use crate::backend::Tactics as _;
-            shell.tuning().profile().rates()
-        };
-        stated.unstate(&key);
-        let submitted = others();
+        let max_submit = B::submit_bound(&self.boot);
+        let mut stated = shell.tuning().profile().rates();
+        stated.stale = None;
+        let reference = shell.tuning().gemm(shell.tier(), crate::submit::PROBE.0);
+        let submitted = (behind.others)();
         let began = std::time::Instant::now();
-        let measured = B::measure_rates(
-            shell.device(),
-            shell.tuning(),
-            B::submit_bound(&self.boot),
-            &stated,
-        )
-        .map_err(fault)?;
+        let before = crate::rates::clock_warmed::<B>(shell.device(), reference).map_err(fault)?;
+        let timed: crate::error::Result<profile::fire::Rates> =
+            match key.strip_prefix(crate::rates::CURVE_BEHIND) {
+                Some(curve) => {
+                    let Some(wanted) = shell.curve_behind(curve) else {
+                        tracing::warn!(
+                            curve,
+                            "rates behind serving: the curve names no kernel of this load; not timed"
+                        );
+                        shell.rate_timed(&key);
+                        return Ok(true);
+                    };
+                    stated.kernel_tflops_by_shape = stated.kernel_tflops_by_shape.map(|all| {
+                        all.into_iter().filter(|c| c.name() != curve).collect()
+                    });
+                    B::measure_curves(
+                        shell.device(),
+                        shell.tuning(),
+                        max_submit,
+                        &stated,
+                        &[wanted],
+                        shell.curve_top(),
+                        behind.arrived,
+                    )
+                    .map(|curves| profile::fire::Rates {
+                        kernel_tflops_by_shape: Some(curves),
+                        ..profile::fire::Rates::default()
+                    })
+                }
+                None => {
+                    stated.unstate(&key);
+                    B::measure_rates(
+                        shell.device(),
+                        shell.tuning(),
+                        max_submit,
+                        &stated,
+                        behind.arrived,
+                    )
+                    .and_then(|measured| match measured.throttled {
+                        None => Ok(measured.rates),
+                        Some(ratio) => Err(crate::error::Fault::Device {
+                            call: "rates behind serving",
+                            why: format!(
+                                "the device's clock {ratio:.2}x slower at its end than its \
+                                 settled start"
+                            ),
+                        }),
+                    })
+                }
+            };
         let ms = began.elapsed().as_secs_f64() * 1e3;
-        let why = if others() != submitted {
+        let timed = match timed {
+            Ok(rates) => rates,
+            Err(why) if crate::rates::yielded(&why) => {
+                tracing::info!(
+                    key = %key,
+                    ms,
+                    "rates behind serving: `{key}` yielded to an arrival; timed again later"
+                );
+                return Ok(true);
+            }
+            Err(why @ crate::error::Fault::Device { call: "rates behind serving", .. }) => {
+                tracing::info!(key = %key, ms, "rates behind serving: `{key}` discarded ({why})");
+                return Ok(true);
+            }
+            Err(why) => return Err(fault(why)),
+        };
+        let after = crate::rates::clock_read::<B>(shell.device(), reference).map_err(fault)?;
+        let why = if (behind.others)() != submitted {
             Some("another lane submitted while it ran".to_string())
         } else {
-            measured.throttled.map(|ratio| {
-                format!("the device's clock {ratio:.2}x slower at its end than its warmed start")
+            crate::rates::throttled(before, after).map(|ratio| {
+                format!("the device's clock {ratio:.2}x slower after it than its settled start")
             })
         };
         if let Some(why) = why {
             tracing::info!(
                 key = %key,
                 ms,
-                "rates behind serving: `[rates] {key}` discarded ({why}); timed again later"
+                "rates behind serving: `{key}` discarded ({why}); timed again later"
             );
             return Ok(true);
         }
-        if let Err(why) = B::save_rates(shell.device(), &self.boot, &measured.rates) {
+        if let Err(why) = B::save_rates(shell.device(), &self.boot, &timed) {
             tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
         }
         let left = shell.rate_timed(&key);
@@ -331,8 +395,8 @@ impl<B: Host> Gpu<B> {
             key = %key,
             ms,
             left,
-            "rates behind serving: `[rates] {key}` timed and stored for the next load (this load \
-             serves on by its stale figure); {left} left"
+            "rates behind serving: `{key}` timed and stored for the next load (this load serves \
+             on by its stale figure); {left} left"
         );
         Ok(true)
     }
@@ -1666,7 +1730,7 @@ where
             .is_some_and(|shell| shell.measures_behind() || shell.rates_behind().is_some())
     }
 
-    fn measure_behind(&mut self, others: &dyn Fn() -> u64) -> EngineResult<bool> {
+    fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
         // A frame whose numbers are not yet taken holds its readout seats.
         if self.pending.is_some() {
             return Ok(false);
@@ -1677,9 +1741,9 @@ where
         // The settle's ranges first (decode's rows before the large ones),
         // then each rate served by a stale figure.
         if !shell.measures_behind() {
-            return self.rate_behind(others);
+            return self.rate_behind(behind);
         }
-        let fired = shell.measure_behind(others).map_err(fault)?;
+        let fired = shell.measure_behind(behind.others).map_err(fault)?;
         // What the settle decided so far, kept in the user's profile for
         // the next load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {

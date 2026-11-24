@@ -334,8 +334,8 @@ fn trace_of(model: &str) -> Trace {
     panic!("`{model}` does not trace: {}", first.unwrap_or_default())
 }
 
-struct Fixture {
-    model: String,
+pub(super) struct Fixture {
+    pub(super) model: String,
     trace: Trace,
     contract: ModelContract,
     container: PathBuf,
@@ -343,7 +343,7 @@ struct Fixture {
 
 /// `model`'s trace and its seeded checkpoint, written once into `cache`'s
 /// `fixtures` and read back by every later run.
-fn fixture(model: &str, cache: &Path) -> Fixture {
+pub(super) fn fixture(model: &str, cache: &Path) -> Fixture {
     fixture_as(model, cache, false)
 }
 
@@ -455,7 +455,7 @@ fn fixture_key(trace: &Trace, serving: bool) -> u64 {
 
 /// The fixture cache, `PIE_GOLDEN_CACHE`: refused unset, since a default
 /// in a run's own temp dir rebuilds every fixture (tens of GB) each run.
-fn cache_dir() -> PathBuf {
+pub(super) fn cache_dir() -> PathBuf {
     std::env::var_os("PIE_GOLDEN_CACHE").map_or_else(
         || panic!("set PIE_GOLDEN_CACHE to the fixture cache; unset would rebuild every fixture"),
         PathBuf::from,
@@ -484,7 +484,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
 }
 
 /// [`load_with`] under `allowance`, its refusal returned.
-fn load_under(
+pub(super) fn load_under(
     fixture: &Fixture,
     cache: &Path,
     knobs: engine_cuda::Knobs,
@@ -526,6 +526,7 @@ fn load_under(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .map_err(|why| why.to_string())
     .inspect(|shell| record_picks(cache, shell))
@@ -560,6 +561,7 @@ fn load_declared(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .map_err(|why| why.to_string())
 }
@@ -642,7 +644,7 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
 /// state pool aims near, so a miniature's records are cut into pieces as a
 /// full model's are. The logits are the same either way.
-fn knobs() -> engine_cuda::Knobs {
+pub(super) fn knobs() -> engine_cuda::Knobs {
     let mut knobs = engine_cuda::Knobs::default();
     knobs.profiles = Some(cache_dir().join("profiles"));
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
@@ -1893,6 +1895,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     // As a worker boots it: every chunk the fit left the pool backed at
@@ -2063,6 +2066,7 @@ fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f3
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2209,6 +2213,7 @@ fn served_lagged_over(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2440,6 +2445,7 @@ fn served_pace(fixture: &Fixture, cache: &Path, schedule: &str) -> f64 {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2546,6 +2552,7 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     let page = rs_page(&mut shell);
@@ -2686,6 +2693,7 @@ fn every_lane_of_a_wide_replaying_fire_replays_its_own_rows() {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{model} loads: {why}"));
     let page = rs_page(&mut shell);
@@ -3591,6 +3599,7 @@ fn load_lanes(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
 }
@@ -3857,6 +3866,7 @@ fn served_partial_fold(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");

@@ -107,6 +107,7 @@ fn stage(
         world: engine_cuda::World::default(),
         expert,
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the micro loads");
     (staged, Scratch(dir))

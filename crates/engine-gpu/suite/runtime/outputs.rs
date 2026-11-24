@@ -274,8 +274,12 @@ pub(super) fn loaded_bound(
 /// it: one slice a call, no other lane submitting. The slices it ran.
 pub(super) fn measure_behind(engine: &mut impl ::engine::Engine) -> usize {
     let mut slices = 0;
+    let behind = ::engine::BehindServing {
+        others: &|| 0,
+        arrived: &|| false,
+    };
     while engine
-        .measure_behind(&|| 0)
+        .measure_behind(&behind)
         .expect("measuring behind serving")
     {
         slices += 1;

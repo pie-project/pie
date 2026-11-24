@@ -222,9 +222,10 @@ __global__ void ssm_conv1d_fold(StateRows rows, int C, int K, int dil, Carry car
             carry.fold_at(cl, f.fold_off, t, slot, pos);
             return carry.plane_at<const T>(slot, pos, 0)[c];
         };
-        T cells[8];
-        for (int k = 0; k < span && k < 8; ++k) cells[k] = at(n - span + k);
-        for (int k = 0; k < span && k < 8; ++k) state[k * cs + ci] = cells[k];
+        // In place, ascending: cell k takes run position n - span + k, which
+        // is a committed cell only as the old cell n + k > k (n >= 1), not
+        // yet written; so any span folds without a copy of the window.
+        for (int k = 0; k < span; ++k) state[k * cs + ci] = at(n - span + k);
     }
 }
 

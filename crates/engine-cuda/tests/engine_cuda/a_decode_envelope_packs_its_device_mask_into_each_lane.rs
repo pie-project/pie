@@ -94,6 +94,7 @@ fn shell(trace: poem::Trace, path: &Path, runahead: Runahead) -> Shell {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the shell loads");
     for slot in 0..MAX_BEAMS {

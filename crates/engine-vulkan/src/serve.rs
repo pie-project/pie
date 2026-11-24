@@ -192,8 +192,21 @@ impl Serve for Api {
         tuning: &crate::tuning::Tuning,
         max_submit: Option<std::time::Duration>,
         stated: &profile::fire::Rates,
+        yield_to: &dyn Fn() -> bool,
     ) -> Result<engine::rates::Measured> {
-        crate::rates::measure(device, tuning, max_submit, stated)
+        crate::rates::measure_behind(device, tuning, max_submit, stated, yield_to)
+    }
+
+    fn measure_curves(
+        device: &Context,
+        tuning: &crate::tuning::Tuning,
+        max_submit: Option<std::time::Duration>,
+        stated: &profile::fire::Rates,
+        wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
+        top: u32,
+        yield_to: &dyn Fn() -> bool,
+    ) -> Result<Vec<profile::fire::KernelCurve>> {
+        crate::rates::curves_behind(device, tuning, max_submit, stated, wanted, top, yield_to)
     }
 
     fn chunk_bytes(boot: &crate::api::DeviceBoot) -> Option<u64> {

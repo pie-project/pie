@@ -161,14 +161,30 @@ pub trait Serve: Backend {
 
     /// The rates of `device` that `stated` lacks, under `tuning`'s tactics,
     /// each timed frame under `max_submit` (the backend's rates step,
-    /// `crate::rates::measure`): what a load times behind serving of a key
-    /// it served by a stale figure (`profile::fire::Tuned::behind`).
+    /// `crate::rates::measure_yielding`): what a load times behind serving
+    /// of a key it served by a stale figure (`profile::fire::Tuned::behind`).
+    /// `yield_to` is read before each frame: an arrival stops the step
+    /// (`crate::rates::yielded`).
     fn measure_rates(
         device: &Self::Context,
         tuning: &Self::Tuning,
         max_submit: Option<std::time::Duration>,
         stated: &profile::fire::Rates,
+        yield_to: &dyn Fn() -> bool,
     ) -> Result<engine::rates::Measured>;
+
+    /// Each of `wanted`'s dense kernel curves to `top` rows on `device`
+    /// (`crate::rates::measure_shapes`), behind serving as
+    /// [`Serve::measure_rates`] is.
+    fn measure_curves(
+        device: &Self::Context,
+        tuning: &Self::Tuning,
+        max_submit: Option<std::time::Duration>,
+        stated: &profile::fire::Rates,
+        wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
+        top: u32,
+        yield_to: &dyn Fn() -> bool,
+    ) -> Result<Vec<profile::fire::KernelCurve>>;
 
     /// `tuning` with each dense kernel's rate curve at each of the model's
     /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
@@ -3290,6 +3306,22 @@ impl<B: Serve> Shell<B> {
         self.rates_behind.first().cloned()
     }
 
+    /// The kernel and plane the curve `name` (`<kind>/<key> at <n>x<k>`)
+    /// names among this load's dense kernels at its planes, to time behind
+    /// serving.
+    #[must_use]
+    pub fn curve_behind(&self, name: &str) -> Option<(kernels_slang::linear::gemm::Tactic, u32, u32)> {
+        let kernels = crate::rates::dense_kernels(B::TARGET, &self.tuning, self.tier, self.curve_top());
+        let shapes: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
+        crate::rates::curve_named(B::TARGET, &kernels, &shapes, name)
+    }
+
+    /// The rows a curve of this load is timed to: its widest rung.
+    #[must_use]
+    pub fn curve_top(&self) -> u32 {
+        self.dense.entries().into_iter().max().unwrap_or(1)
+    }
+
     /// `key` timed behind serving and stored: how many are left.
     pub fn rate_timed(&mut self, key: &str) -> usize {
         self.rates_behind.retain(|k| k != key);
@@ -5867,6 +5899,11 @@ impl<B: Serve> Shell<B> {
         &self.pipelines
     }
 
+    pub fn tier(&self) -> kernels_slang::Tier {
+        self.tier
+    }
+
+    #[must_use]
     pub fn device(&self) -> &B::Context {
         &self.device
     }

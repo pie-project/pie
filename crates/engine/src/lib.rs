@@ -50,7 +50,7 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses, WindowedLayer,
 };
 pub use engine::{
-    CompletionSink, Engine, HostRoom, KvWrites, Landing, LandingSink, LaneFault, Prepared, ProgramCompile,
+    BehindServing, CompletionSink, Engine, HostRoom, KvWrites, Landing, LandingSink, LaneFault, Prepared, ProgramCompile,
     StepDone,
     StepOutcome, TapGroups, TapSink, Tapped,
 };

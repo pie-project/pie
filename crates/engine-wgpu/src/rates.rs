@@ -251,6 +251,68 @@ pub fn shapes_at_load(
     Ok(tuning.with_profile(chip?))
 }
 
+/// [`measure`] behind serving: `yield_to` read before each frame, an
+/// arrival stopping the step (`engine_gpu::rates::yielded`).
+pub fn measure_behind(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    max_submit: Option<std::time::Duration>,
+    stated: &profile::fire::Rates,
+    yield_to: &dyn Fn() -> bool,
+) -> Result<engine::rates::Measured> {
+    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
+    let timer = timer();
+    let mut measured = engine_gpu::rates::measure_yielding::<Api, _>(
+        device,
+        tuning,
+        tier,
+        &timer,
+        max_submit,
+        stated,
+        &mut |_| {},
+        Some(yield_to),
+    )?;
+    measured.rates.measured_on = Some(device.measured_on());
+    Ok(measured)
+}
+
+/// Each of `wanted`'s dense kernel curves to `top` rows behind serving
+/// (`engine_gpu::rates::measure_shapes`), each point timed as
+/// [`shapes_at_load`] times it, `yield_to` read before each frame.
+pub fn curves_behind(
+    device: &Context,
+    tuning: &crate::tuning::Tuning,
+    max_submit: Option<std::time::Duration>,
+    stated: &profile::fire::Rates,
+    wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
+    top: u32,
+    yield_to: &dyn Fn() -> bool,
+) -> Result<Vec<profile::fire::KernelCurve>> {
+    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
+    let timer = |frame: Frame| {
+        let started = std::time::Instant::now();
+        let span = frame.commit_spanned()?;
+        Ok((
+            span.filter(|&ns| ns > 0),
+            started.elapsed().as_nanos() as u64,
+        ))
+    };
+    engine_gpu::rates::measure_shapes::<Api, _>(
+        device,
+        tuning,
+        tier,
+        &timer,
+        max_submit,
+        None,
+        stated,
+        wanted,
+        None,
+        top,
+        &mut |_| {},
+        Some(yield_to),
+    )
+}
+
 /// How a rates frame is timed on wgpu: the device's span where it states
 /// one, and the host's clock around submit and wait.
 fn timer() -> impl Fn(Frame) -> Result<(Option<u64>, u64)> {

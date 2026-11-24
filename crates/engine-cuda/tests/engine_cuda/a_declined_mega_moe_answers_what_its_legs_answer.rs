@@ -115,6 +115,7 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the model loads");
     let mut shell = staged.finish().expect("the model arms");
