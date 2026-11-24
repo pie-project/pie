@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 toml = { version = "1.1", default-features = false, features = ["parse", "std", "preserve_order"] }
+tracing = "0.1"
 profile-macros = { package = "pie-profile-macros", path = "../profile-macros" }
 
 [lints]

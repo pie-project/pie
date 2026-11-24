@@ -1197,13 +1197,10 @@ impl<'a> Walk<'a> {
             let (key, rates) = (k.get_ref().to_string(), &mut rates);
             self.rate_entry(k, v, rates, &positive);
             if matches!(self.strict, Strict::User | Strict::Measured) && self.diags.len() > before {
-                let why: Vec<String> = self
-                    .diags
-                    .drain(before..)
-                    .map(|d| d.message)
-                    .collect();
+                let why: Vec<String> = self.diags.drain(before..).map(|d| d.message).collect();
                 rates.unstate(&key);
-                self.skipped_rates.push(format!("{key} ({})", why.join("; ")));
+                self.skipped_rates
+                    .push(format!("{key} ({})", why.join("; ")));
             }
         }
         rates
@@ -1378,7 +1375,6 @@ impl<'a> Walk<'a> {
     /// `rates.product_ns`: a list of `[kind, rows, k, m, kernel, ns, spread]`,
     /// whole numbers then a positive time and a spread at least zero, no
     /// shape twice.
-
     fn product_times(
         &mut self,
         value: &Spanned<DeValue<'_>>,
@@ -1532,15 +1528,17 @@ impl<'a> Walk<'a> {
                         .collect::<Option<Vec<(u32, u32)>>>(),
                     _ => None,
                 };
-                head.zip(ranges).zip(planes).map(|((((method, of), code), ranges), planes)| {
-                    crate::fire::DenseSettled {
-                        method,
-                        of,
-                        code,
-                        ranges,
-                        planes,
-                    }
-                })
+                head.zip(ranges)
+                    .zip(planes)
+                    .map(
+                        |((((method, of), code), ranges), planes)| crate::fire::DenseSettled {
+                            method,
+                            of,
+                            code,
+                            ranges,
+                            planes,
+                        },
+                    )
             }
             _ => None,
         };

@@ -3,13 +3,13 @@
 //! file, the user's file) against a [`Registry`], each layer checked against
 //! the probed facts and applied whole or not at all.
 
-pub mod routes;
 pub mod fire;
 pub mod ladder;
 pub mod profile;
 pub mod region;
 pub mod registry;
 pub mod render;
+pub mod routes;
 pub mod search;
 pub mod shelf;
 pub mod spec;
