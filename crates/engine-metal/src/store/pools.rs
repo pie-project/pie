@@ -1527,6 +1527,19 @@ impl Pools {
                     values_cell,
                     ..
                 } if *at == paging => Some((*keys, *keys_cell, *values, *values_cell)),
+                // A pool gather's compressor state beside a windowed row:
+                // its projection and score planes, a cell a row each, move
+                // with the rows they were computed from.
+                Row::Compressed {
+                    paging: at,
+                    width,
+                    kv,
+                    score,
+                    ..
+                } if *at == paging => {
+                    let cell = width * u64::from(elem_size(Dtype::Bf16));
+                    Some((*kv, cell, *score, cell))
+                }
                 _ => None,
             })
             .collect();
