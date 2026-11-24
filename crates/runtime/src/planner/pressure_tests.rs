@@ -1,5 +1,6 @@
-//! The pressure bucket the gateway admits on: room only idle work or idle
-//! cache holds, on the device or below it, never saturates it.
+//! The pressure bucket the default cluster policy places by: room only
+//! idle work or idle cache holds, on the device or below it, never
+//! saturates it.
 
 use super::*;
 
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use crate::store::kv::page_table::PhysicalKvPageId;
 use crate::store::rs::RsUnits;
 
-/// The gateway's default saturation mark (`AdmissionConfig::kv_saturate_bucket`).
+/// The default cluster policy's full mark (`FULL_PRESSURE`).
 const SATURATED: u8 = 240;
 
 /// Each tier's `(free, total)` and what of it only idle cache holds.

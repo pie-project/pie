@@ -123,18 +123,11 @@ impl ControlLink for ControllerLink {
 }
 
 fn report_band(status: &WorkerStatus) -> (u8, bool, u32, u32, bool) {
-    let bucket = status.kv_pressure_bucket;
-    let band = if bucket >= 240 {
-        u8::MAX
-    } else if bucket >= 224 {
-        u8::MAX - 1
-    } else {
-        bucket / 16
-    };
-    // Seats and the queue move the router's load attrs: report a change
-    // in either (the queue by quarters, so a long one is not chattier).
+    // The kv pressure by sixteenths, and the seats and the queue (the queue
+    // by quarters, so a long one is not chattier): what a cluster policy
+    // places by.
     (
-        band,
+        status.kv_pressure_bucket / 16,
         status.inflight == 0,
         status.running,
         status.waiting.div_ceil(4),

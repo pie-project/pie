@@ -51,7 +51,7 @@ use worker_api::{Priority, Tokens};
 
 use crate::GatewayState;
 use crate::ingress::identity::REQUEST_ID_HEADER;
-use crate::session::{Affinity, Identity, Resume, SessionError, SessionHandle, TokenRx, TurnInput};
+use crate::session::{Identity, Resume, SessionError, SessionHandle, TokenRx, TurnInput};
 
 /// Route → the built-in inferlet that serves it.
 pub const ROUTES: &[(&str, &str)] = &[
@@ -315,7 +315,7 @@ impl Launch {
         };
         self.state
             .sessions
-            .create(self.identity.clone(), turn, Affinity::Ephemeral)
+            .create(self.identity.clone(), turn)
             .await
     }
 }
@@ -639,7 +639,7 @@ pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Re
     };
     let (_handle, mut rx) = match state
         .sessions
-        .create(identity(&headers), turn, Affinity::Ephemeral)
+        .create(identity(&headers), turn)
         .await
     {
         Ok(pair) => pair,

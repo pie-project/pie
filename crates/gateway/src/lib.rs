@@ -115,7 +115,7 @@ impl TurnRouter for RouteBackend {
         if let Some(router) = self.router_for(req) {
             return router.admit(req, &self.routing).await;
         }
-        match self.routing.admit_queued(req).await {
+        match self.routing.admit(req) {
             AdmissionDecision::Admit => Ok(()),
             AdmissionDecision::Reject(reason) => Err(AdmitReject::Full(reason.to_string())),
         }
@@ -124,7 +124,6 @@ impl TurnRouter for RouteBackend {
     async fn dispatch(
         &self,
         req: &Request,
-        affinity: Option<u64>,
         pinned: Option<WorkerId>,
     ) -> std::result::Result<WorkerId, DispatchFail> {
         let router = self.router_for(req);
@@ -155,7 +154,7 @@ impl TurnRouter for RouteBackend {
                     }
                     if let Ok(target) = self
                         .routing
-                        .dispatch_with_retry(&self.workers, req, affinity, None, Some(worker))
+                        .dispatch_with_retry(&self.workers, req, None, Some(worker))
                         .await
                     {
                         taken = Some(target.worker_id);
@@ -166,14 +165,14 @@ impl TurnRouter for RouteBackend {
             }
             Some(Placed::Located(at)) => {
                 self.routing
-                    .dispatch_with_retry(&self.workers, req, affinity, Some(at), pinned)
+                    .dispatch_with_retry(&self.workers, req, Some(at), pinned)
                     .await
                     .map_err(|_| DispatchFail)?
                     .worker_id
             }
             None => {
                 self.routing
-                    .dispatch_with_retry(&self.workers, req, affinity, None, pinned)
+                    .dispatch_with_retry(&self.workers, req, None, pinned)
                     .await
                     .map_err(|_| DispatchFail)?
                     .worker_id

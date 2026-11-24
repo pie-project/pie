@@ -13,7 +13,7 @@ use futures::Stream;
 
 use crate::GatewayState;
 use crate::ingress::identity;
-use crate::session::{Affinity, Identity, SessionHandle, TokenRx, TurnInput};
+use crate::session::{Identity, SessionHandle, TokenRx, TurnInput};
 use client_api::ClientMessage;
 use worker_api::{Priority, Tokens};
 
@@ -42,7 +42,7 @@ pub async fn generate(
 
     let (handle, rx) = match state
         .sessions
-        .create(ident, turn, Affinity::Ephemeral)
+        .create(ident, turn)
         .await
     {
         Ok(pair) => pair,
