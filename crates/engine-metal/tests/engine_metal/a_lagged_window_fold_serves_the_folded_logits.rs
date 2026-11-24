@@ -131,6 +131,8 @@ impl Placed {
 /// then decodes past the ring's wrap; every step's logits agree within two
 /// bf16 units and the argmax.
 fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
+    // Each case loads a miniature with a long window: one at a time.
+    let _heavy = crate::common::one_heavy_load();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
