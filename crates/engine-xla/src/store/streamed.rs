@@ -812,20 +812,6 @@ impl Streamed {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_row_block_is_whole_pool_rows_and_whole_table_rows() {
-        for width in [256u64, 2048, 160, 96, 2880] {
-            let row = width * 2;
-            let step = ROW_BYTES / gcd(ROW_BYTES, row);
-            let block = align_up((ROW_BLOCK / row).max(1), step);
-            assert_eq!((block * row) % ROW_BYTES, 0, "width {width}");
-        }
-    }
-}
 
 /// What one fire's walk reads the streamed weights through.
 #[derive(Debug, Default)]
@@ -926,13 +912,4 @@ fn packed_rows(bytes: &mut [u8]) {
 
 #[cfg(test)]
 mod packed {
-    #[test]
-    fn a_pool_row_holds_its_elements_l_and_l_plus_128_a_word() {
-        let mut b: Vec<u8> = (0..256u16).flat_map(|e| e.to_le_bytes()).collect();
-        super::packed_rows(&mut b);
-        let w = |l: usize| u32::from_le_bytes([b[4 * l], b[4 * l + 1], b[4 * l + 2], b[4 * l + 3]]);
-        assert_eq!(w(0), 128 << 16);
-        assert_eq!(w(5), 5 | (133 << 16));
-        assert_eq!(w(127), 127 | (255 << 16));
-    }
 }

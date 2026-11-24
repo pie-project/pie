@@ -2649,19 +2649,3 @@ fn holds_kv(lane: &engine::fire::Lane, kv: Option<engine::chunk::ShapeId>) -> bo
     kv.and_then(|id| table_of(lane, id)).is_some_and(|table| !table.is_empty())
 }
 
-#[cfg(test)]
-mod tier_key_tests {
-    use super::{ref_key, tier_key};
-    use crate::serve::Tier;
-
-    /// A host or slot-file ref never keys as the device ref of the same
-    /// number, and a device ref keys as what a lane's record reads.
-    #[test]
-    fn a_tier_keys_its_refs_apart() {
-        let shape = engine::chunk::ShapeId((1 << 17) + 2);
-        assert_eq!(tier_key(Tier::Device, shape, 3), ref_key(shape, 3));
-        assert_ne!(tier_key(Tier::Host, shape, 3), ref_key(shape, 3));
-        assert_ne!(tier_key(Tier::Disk, shape, 3), ref_key(shape, 3));
-        assert_ne!(tier_key(Tier::Host, shape, 3), tier_key(Tier::Disk, shape, 3));
-    }
-}

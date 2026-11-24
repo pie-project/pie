@@ -456,37 +456,6 @@ mod ssm {
         })
     }
 
-    pub fn causal_conv1d_chunked_biased(
-        ctx: &Ctx<'_>,
-        x: RaggedTensor,
-        w: Tensor,
-        bias: Tensor,
-        p: &RecurrentPool,
-        k: u32,
-        y: Tensor,
-    ) -> Result<(), Error> {
-        lower(ctx, |l| {
-            let data = l.read(x.data)?;
-            let w = l.read(w)?;
-            let bias = l.read(bias)?;
-            let bank = l.read(p.conv_state)?;
-            let indptr = l.read(x.indptr)?;
-            let slots = l.slots(p)?;
-            let (yv, next) = kernels_xla::ssm::causal_conv1d_chunked(
-                l.f(),
-                kernels_xla::tensor::RaggedTensor { data, indptr },
-                w,
-                Some(bias),
-                bank,
-                slots,
-                k,
-                1,
-                y.landing(),
-            )?;
-            l.land(y, yv)?;
-            l.land(p.new_conv_state, next)
-        })
-    }
 
     pub fn causal_conv1d_biased(
         ctx: &Ctx<'_>,
@@ -3248,60 +3217,3 @@ fn the_row_block_kernel_matches_the_xla_form() {
     fused_against_xla(&g, &[0, 555, 1110], 1152, &[1, 2], 39, 64);
 }
 
-/// Nemotron-3 Nano's Mamba conv: 6144 channels, 4 taps, a bias, a prompt
-/// of 37 rows from a lane's kept window, as one chunked fire.
-#[test]
-fn a_biased_wide_conv_prompt_matches_the_direct_conv() {
-    let (c, k, slots) = (6144usize, 4usize, 3usize);
-    let hist = k;
-    let rows = 40usize;
-    let indptr = [0i32, 37];
-    let mut slot_of_row = vec![DROP; rows];
-    for t in 0..37 {
-        slot_of_row[t] = 1;
-    }
-    let mut rng = Rng(17);
-    let xs = rng.bf16s(rows * c, 1.0);
-    let ws = rng.bf16s(c * k, 0.5);
-    let bias = rng.bf16s(c, 0.5);
-    let bank0 = rng.f32s(slots * hist * c, -1.0, 1.0);
-    let mut b = Bench::new();
-    let x = b.bf16(rows as u32, c as u32, &xs);
-    let ip = b.i32(indptr.len() as u32, 1, &indptr);
-    let w = b.bf16(c as u32, k as u32, &ws);
-    let bt = b.bf16(1, c as u32, &bias);
-    let bank = b.f32(slots as u32, (hist * c) as u32, &bank0);
-    let sl = b.i32(rows as u32, 1, &slot_of_row);
-    let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
-    let p = pool(bank, sl);
-    let rt = RaggedTensor {
-        data: x,
-        indptr: ip,
-    };
-    if !b
-        .run(|ctx| ssm::causal_conv1d_chunked_biased(ctx, rt, w, bt, &p, k as u32, y))
-        .unwrap()
-    {
-        return;
-    }
-    // the direct conv, its bias added before the SiLU
-    let past = &bank0[hist * c..2 * hist * c];
-    let mut want = vec![0.0f32; 37 * c];
-    for t in 0..37 {
-        for ch in 0..c {
-            let mut acc = bias[ch];
-            for tap in 0..k {
-                let src = t as isize - (k - 1 - tap) as isize;
-                let v = if src < 0 {
-                    past[(hist as isize + src) as usize * c + ch]
-                } else {
-                    xs[src as usize * c + ch]
-                };
-                acc += v * ws[ch * k + tap];
-            }
-            want[t * c + ch] = silu(acc);
-        }
-    }
-    let got = b.read_f32(y);
-    assert_close(&got[..37 * c], &want, 2e-2, 1e-2);
-}

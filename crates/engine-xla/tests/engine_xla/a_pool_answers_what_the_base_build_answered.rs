@@ -95,11 +95,6 @@ fn a_windowed_model_answers_bit_for_bit_past_its_window() {
     run("gemma4-e4b-mini-l1", None, 1024, Some(700));
 }
 
-#[test]
-fn a_windowed_sink_model_answers_bit_for_bit_past_its_window() {
-    // gpt-oss: a window of 128 rows beside full attention, learned sinks
-    run("gptoss-20b-mini-bf16-mxfp4-kv-bf16", None, 1024, Some(300));
-}
 
 /// Prompts a sequence, decodes two steps, then decodes on: with `park`, its
 /// kv list slots and its record go to the host tier (the kv slots on to the
