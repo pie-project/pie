@@ -448,7 +448,7 @@ fn attend_pool(
             ),
         ));
     }
-    let g = naive::wave_group(num_q_heads, stated(op, rows)?);
+    let g = naive::wave_group(num_q_heads, stated(op, rows)?, ctx.multiprocessors(op)?);
     #[allow(clippy::cast_sign_loss)]
     let launch = Launch::grid(
         [rows, (num_q_heads / g).max(1) as u32, 1],
