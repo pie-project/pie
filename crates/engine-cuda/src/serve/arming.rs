@@ -1597,6 +1597,8 @@ impl Shell {
                 !self.inputs().is_empty(),
                 state_rows && self.lands_snapshots(),
             ),
+            // (CUDA lays every mixed step within its limits)
+            mixed: engine::MixedLanes::Any,
         };
         self.steps = engine::StepShapes::of(rules, &facts);
     }

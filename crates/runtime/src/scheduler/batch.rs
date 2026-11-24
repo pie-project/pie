@@ -154,6 +154,7 @@ fn checked_shapes(limits: &SchedulerLimits) -> Option<std::borrow::Cow<'static, 
             max_readouts: count(limits.max_readouts),
             buffers: true,
             attachments: ::engine::Attachments::served(true, true, true),
+            mixed: ::engine::MixedLanes::Any,
         };
         Some(std::borrow::Cow::Owned(::engine::StepShapes::of(
             &::engine::StepRules::runtime(),
@@ -1850,6 +1851,7 @@ mod tests {
             max_readouts: limits.max_readouts as u32,
             buffers,
             attachments: ::engine::Attachments::served(true, true, true),
+            mixed: ::engine::MixedLanes::Any,
         }
     }
 
@@ -1972,6 +1974,68 @@ mod tests {
             }
         }
         assert!(buffered_steps > 0, "buffered steps were formed");
+    }
+
+    /// On a load that lays its mixed steps at prompt-lane rungs (an engine
+    /// stating `MixedLanes::Laid`: XLA pads a mixed fire's prompts and a
+    /// rest lane to 16, 32 or 64 lanes, the decodes beside them in the lanes
+    /// left of 80), a wave of 18 decodes and then 43 prompts is not one step
+    /// (43 prompts pad to 64 lanes, which leave room for 16 decodes): the
+    /// prompts join while the step stays stated, and those past it lead the
+    /// next step in the order they came (v6e Qwen3.5 c64: 43 prompts beside
+    /// 18 decodes fired with no padded layout and compiled after ready).
+    #[test]
+    fn a_mixed_step_past_the_engines_lane_rungs_defers_its_last_prompts_to_lead_the_next() {
+        let base = SchedulerLimits {
+            max_forward_requests: 80,
+            max_forward_tokens: 2048,
+            max_page_refs: 4096,
+            ..limits()
+        };
+        let rung = |prompt_lanes, decode_lanes| ::engine::MixedRung {
+            prompt_lanes,
+            decode_lanes,
+        };
+        let facts = facts(base, &[2048], false).with_mixed(::engine::MixedLanes::Laid(vec![
+            rung(16, 64),
+            rung(32, 32),
+            rung(64, 16),
+        ]));
+        let shapes = ::engine::StepShapes::of(&::engine::StepRules::runtime(), &facts);
+        let limits = holding(base, shapes.clone());
+        let mut wave: Vec<Box<PendingRequest>> = (0..18u64)
+            .map(|i| pending(decode(1, 1), InstanceId(i)))
+            .collect();
+        wave.extend((0..43u64).map(|i| prompt(100 + i, 36)));
+        let (frame, flattened) =
+            build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+        for step in compositions(&frame) {
+            shapes.holds(&step).unwrap_or_else(|gap| panic!("{gap}"));
+        }
+        let first = ::engine::StepComposition::of(&frame.steps[0].submission.lanes);
+        assert_eq!(
+            (first.decode_lanes, first.prompt_lanes),
+            (18, 31),
+            "{first}"
+        );
+        // the deferred prompts, in the order they came, lead the step after
+        let after: Vec<u64> = flattened[49..].iter().map(|r| r.instance_id.0).collect();
+        assert_eq!(after, (131..143).collect::<Vec<_>>(), "{after:?}");
+        // the stated set holds no mixed step past the rungs, and as many
+        // decodes beside 31 prompts as beside 16
+        let mixed = |decodes, prompts| ::engine::StepComposition {
+            rows: decodes + prompts * 36,
+            decode_lanes: decodes,
+            prompt_lanes: prompts,
+            prompt_rows: prompts * 36,
+            readout_rows: decodes + prompts,
+            lane_rows: ::engine::shapes::Span { lo: 36, hi: 36 },
+            ..::engine::StepComposition::default()
+        };
+        assert!(shapes.shape_of(&mixed(18, 43)).is_none());
+        assert!(shapes.shape_of(&mixed(16, 43)).is_some());
+        assert!(shapes.shape_of(&mixed(32, 31)).is_some());
+        assert!(shapes.shape_of(&mixed(33, 31)).is_none());
     }
 
     /// A formed step carries the stated shape its composition is of
