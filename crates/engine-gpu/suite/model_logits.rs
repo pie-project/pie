@@ -2053,8 +2053,10 @@ fn windowed_prompt(rows: u32) -> Vec<u32> {
 }
 
 /// One seat-addressed lane prefilling `prompt` in fires of `piece` rows
-/// (past the model's window) and decoding `steps` on, each step fed its
-/// own argmax: the logit row of each step, and the tokens it fed.
+/// (past the model's window) and decoding `steps` on, each step fed
+/// `feed`'s token or else its own argmax: the logit row of each step, and
+/// the tokens it fed.
+#[allow(clippy::too_many_arguments)]
 fn windowed_rows(
     fixture: &Fixture,
     page: u32,
@@ -2063,6 +2065,7 @@ fn windowed_rows(
     prompt: &[u32],
     piece: usize,
     steps: usize,
+    feed: Option<&[u32]>,
 ) -> Option<(Vec<Vec<f32>>, Vec<u32>)> {
     let mut shell = load_with(
         fixture,
@@ -2091,7 +2094,9 @@ fn windowed_rows(
             last = shell.fire_seated(&[seated]).expect("the fire lands");
             have += piece.len() as u32;
         }
-        let next = argmax(&last[0]);
+        let next = feed
+            .and_then(|feed| feed.get(tokens.len()).copied())
+            .unwrap_or_else(|| argmax(&last[0]));
         tokens.push(next);
         fed = vec![next];
         out.extend(last);
@@ -2140,13 +2145,19 @@ fn dense_rows(
         .collect()
 }
 
-/// A windowed model's prompt in fires of `piece` rows past its window and
-/// its decodes through the ring held to the dense answer, row for row.
-fn windowed_check(what: &str, fixture: &Fixture, page: u32, budget: Option<u64>, piece: usize, steps: usize) {
+/// A windowed model's prompt of 184 rows in fires of 64, past its window
+/// of at most 64 rows twice over, and `steps` decodes through the ring,
+/// held to the dense answer row for row (its fires of at most 200 rows
+/// fit every backend's). A model of a layer or two only: deeper, a
+/// miniature's logits move with how a prompt is cut into fires far past
+/// the bound (bf16 rounding through its random weights, F77), so the
+/// dense fire is no answer to hold it to ([`same_cut_check`]).
+fn windowed_check(what: &str, fixture: &Fixture, page: u32, budget: Option<u64>, steps: usize) {
+    const PROMPT: u32 = 184;
     let window = poem_exec::store::kv::declared_window(&fixture.trace).unwrap_or(0);
-    assert!(window > 0 && window < 700, "{what}: a window of {window} under the prompt");
-    let prompt = windowed_prompt(700);
-    let Some((rows, tokens)) = windowed_rows(fixture, page, 1024, budget, &prompt, piece, steps) else {
+    assert!(window > 0 && 2 * window < PROMPT, "{what}: a window of {window} twice under the prompt");
+    let prompt = windowed_prompt(PROMPT);
+    let Some((rows, tokens)) = windowed_rows(fixture, page, 1024, budget, &prompt, 64, steps, None) else {
         return;
     };
     let want = dense_rows(fixture, page, 1024, budget, &prompt, &tokens);
@@ -2154,31 +2165,55 @@ fn windowed_check(what: &str, fixture: &Fixture, page: u32, budget: Option<u64>,
 }
 
 /// A windowed layer as ring + buffer (CONTRACT-BC 19, 21) answers what
-/// one dense fire does: a prefill of 700 rows past the 512-row window in
-/// fires of 256 (each fire's own rows read from its fire slots and folded
-/// into the ring), and 16 decodes reading the ring.
-fn windowed_logits(model: &str, page: u32) {
-    windowed_check(&format!("{model}-p{page}"), &fixture(model, None), page, None, 256, 16);
-}
-
+/// one dense fire does: a prefill past its window (narrowed to 64 rows)
+/// in fires of 64 (each fire's own rows read from its fire slots and
+/// folded into the ring), and 16 decodes reading the ring.
 #[test]
 fn a_windowed_layer_answers_what_one_dense_fire_does() {
-    windowed_logits("gemma4-e4b-mini-l1", PAGE);
+    const MODEL: &str = "gemma4-e4b-mini-l1";
+    let fixture = narrowed(MODEL, None, "64 if win != None else win", "-w64");
+    windowed_check(&format!("{MODEL}-p{PAGE}"), &fixture, PAGE, None, 16);
+}
+
+/// A deep windowed model through its rings, held to the same model with
+/// its windows taken out, fed the same rows in the same fires (a prompt of
+/// 184 rows in fires of 64 and `steps` decodes, all inside its window): a
+/// row inside its window reads what plain attention reads, through the
+/// ring its earlier fires folded, the buffer and its own fire slots.
+fn same_cut_check(model: &str, layers: Option<u32>, page: u32, budget: Option<u64>, steps: usize) {
+    let windowed = fixture_in(
+        poem_compiler::catalog::package_of(model).expect("the model is listed"),
+        model,
+        layers,
+        "",
+    );
+    let window = poem_exec::store::kv::declared_window(&windowed.trace).unwrap_or(0);
+    let prompt = windowed_prompt(184);
+    assert!(window as usize > prompt.len() + steps, "{model}: a window past the rows");
+    let plain = narrowed(model, layers, "None", "-plain");
+    assert_eq!(poem_exec::store::kv::declared_window(&plain.trace), None, "{model}: no window left");
+    let Some((rows, tokens)) = windowed_rows(&windowed, page, 1024, budget, &prompt, 64, steps, None) else {
+        return;
+    };
+    let (want, _) = windowed_rows(&plain, page, 1024, budget, &prompt, 64, steps, Some(&tokens))
+        .expect("loaded before");
+    near(&format!("{model}: ring + buffer against plain attention, fire for fire"), &rows, &want);
 }
 
 /// Windowed layers beside the kv list's, the buffer's slot the kv page.
 #[test]
-fn windowed_layers_beside_full_ones_answer_what_one_dense_fire_does() {
-    windowed_logits("gemma4-e4b-mini-l6", 32);
+fn windowed_layers_beside_full_ones_answer_what_plain_attention_does() {
+    same_cut_check("gemma4-e4b-mini-l6", None, 32, None, 16);
 }
 
-/// Two windows beside full rows: Gemma's miniature with every other
-/// sliding layer reading back 256 rows instead of 512, each ring its own
-/// rows, the fold dropping what a narrower ring holds no place for.
-#[test]
-fn two_windows_answer_what_one_dense_fire_does() {
-    const MODEL: &str = "gemma4-e4b-mini-l6";
-    let package = poem_compiler::catalog::package_of(MODEL).expect("the model is listed");
+/// `model` (cut to `layers`) with its sliding layers' windows as `rule`
+/// states them (a Starlark expression of `win` and the layer `l`), in its
+/// attention and its readout tail's alike: windows a dense fire spans past
+/// on every backend, or none (`"None"`). Two windows of one fold are held
+/// at the kernel (`attn::ring`'s narrower ring), a deep miniature having no
+/// answer across fire cuts to hold them to (F77).
+fn narrowed(model: &str, layers: Option<u32>, rule: &str, variant: &str) -> Fixture {
+    let package = poem_compiler::catalog::package_of(model).expect("the model is listed");
     let (_, text) = package
         .files()
         .find(|(_, text)| text.contains("def forward(m, inputs):"))
@@ -2188,16 +2223,17 @@ fn two_windows_answer_what_one_dense_fire_does() {
         + text[start..]
             .find("\ndef ")
             .expect("a function after the forward");
-    let stated = "        d, kv_heads, win = geometry(m, at.reading)\n";
-    let forward = text[start..end].replace(
-        stated,
-        &format!("{stated}        win = 256 if win != None and l % 2 == 1 else win\n"),
-    );
-    assert_ne!(forward, text[start..end], "the forward reads its geometry");
-    let narrowed = poem_compiler::catalog::replacing(MODEL, "forward", &forward)
+    let mut forward = text[start..end].to_string();
+    for stated in [
+        "        d, kv_heads, win = geometry(m, at.reading)\n",
+        "        d, _, win = geometry(m, at.reading)\n",
+    ] {
+        assert!(forward.contains(stated), "{model}'s forward reads its geometry: {stated:?}");
+        forward = forward.replace(stated, &format!("{stated}        win = {rule}\n"));
+    }
+    let narrowed = poem_compiler::catalog::replacing(model, "forward", &forward)
         .unwrap_or_else(|why| panic!("the narrowed forward loads: {why}"));
-    let fixture = fixture_in(&narrowed, MODEL, None, "-two-windows");
-    windowed_check(&format!("{MODEL}-two-windows"), &fixture, 32, None, 256, 16);
+    fixture_in(&narrowed, model, layers, variant)
 }
 
 /// Slot refs of one shape `id` the runtime would hand out: slot `k` of
@@ -3281,10 +3317,9 @@ fn a_device_counted_fold_folds_what_its_count_says() {
 
 
 /// Gemma's shared tail: its layers write no kv and read their owner
-/// layers' rings (a 26-layer cut of the 30-layer miniature: two tail
-/// layers over the trunk's), held to one dense fire's answer.
+/// layers' rings (the 30-layer miniature: six tail layers over 24 owners),
+/// held to the same model with plain attention, fire for fire.
 #[test]
-fn a_shared_tail_answers_what_one_dense_fire_does() {
-    let fixture = fixture("gemma4-e4b-mini-l30", Some(26));
-    windowed_check("gemma4-e4b-mini-l30-26", &fixture, PAGE, Some(20 << 30), 256, 8);
+fn a_shared_tail_answers_what_plain_attention_does() {
+    same_cut_check("gemma4-e4b-mini-l30", None, PAGE, Some(20 << 30), 8);
 }
