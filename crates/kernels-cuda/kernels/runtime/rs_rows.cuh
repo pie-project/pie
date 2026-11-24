@@ -9,7 +9,8 @@ namespace pie {
 // (slot `base + tok`) is the row of slot `σ` on entry `(σ - base) / T` of
 // `bases` (`bases_len` entries of `T` rows each, their slot addresses), row
 // `(σ - base) mod T`. A lane alone on its set reads its own pages: `list`
-// null and `σ` the slot. A beam on a hybrid (BEAM-PAGE-LISTS §11, §11.1)
+// null and `σ` the slot. A beam on a hybrid, whose rs rows are paged by
+// the same lists as its kv slots,
 // reads its set's entries through its row of its group's list, which the
 // fire's `beam_step` points `list` at: `σ = (f0 + list[slot / S - f0]) S +
 // slot mod S`, a slot below `f0 S` the set's own; `cap` bounds the list.

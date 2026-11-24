@@ -3,7 +3,7 @@
 //! function, written from the spec. Off the serving path: each backend's
 //! test checks its device step against it fire by fire.
 
-/// What `BEAM-PAGE-LISTS.md` §7 calls each lane's fault.
+/// Each lane's fault word: why its page list failed it.
 pub mod fault {
     pub const PAST_RESERVE: u32 = 1;
     pub const SHORT: u32 = 2;
@@ -14,7 +14,7 @@ pub mod fault {
     pub const TOO_WIDE: u32 = 7;
 }
 
-/// Why lane `lane`'s fault word `code` (§7) fails it, named; `backend`
+/// Why lane `lane`'s fault word `code` fails it, named; `backend`
 /// names the engine in the log line a code that is a bug states.
 #[must_use]
 pub fn fault_reason(code: u32, lane: usize, backend: &str) -> String {
@@ -33,7 +33,7 @@ pub fn fault_reason(code: u32, lane: usize, backend: &str) -> String {
             tracing::error!(
                 lane,
                 "{backend}: BUG: a beam group found fewer free pages than it hands out; its pool \
-                 is sized exactly (BEAM-PAGE-LISTS.md §3)"
+                 is sized exactly"
             );
             "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
         }

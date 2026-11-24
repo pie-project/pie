@@ -405,7 +405,7 @@ impl Engine for Group {
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
-        // The shared pool's tiers (CONTRACT-BC 22): each rank pins and opens
+        // The shared pool's tiers: each rank pins and opens
         // its own, and the group moves what every rank holds.
         let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
             answers
@@ -655,8 +655,8 @@ impl Engine for Group {
         self.lead(move |rank| rank.copy_kv(&copy))
     }
 
-    /// Each rank moves its band of every slot to and from its own tiers
-    /// (CONTRACT-BC 22).
+    /// Each rank moves its band of every slot to and from its own tiers,
+    /// whole slots laid alike.
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
         self.lead(move |rank| rank.commit_segments(segments))
     }

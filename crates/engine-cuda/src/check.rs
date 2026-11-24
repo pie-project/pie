@@ -15,14 +15,15 @@ use crate::tune::{Shape, load, patches};
 
 /// The lanes a served CUDA load is asked (`pie serve`'s); its tokens are
 /// left to the engine (its fire top on the card).
-const SERVED_LANES: u32 = 512;
+const SERVED_LANES: u32 = engine::load::CUDA_FIRE_LANES;
 
 /// The context a served-shape load is asked: the most tokens one prompt
 /// holds, so the fire top it weighs is the model's, not a short context's.
-const SERVED_CONTEXT: u32 = 32_768;
+/// The server card's working-set context (`ChunkProfile::SERVER_CUDA`).
+const SERVED_CONTEXT: u32 = poem_compiler::chunk::ChunkProfile::SERVER_CUDA.context;
 
-/// The page a check's loads lay their cache in.
-const PAGE: u32 = 16;
+/// The page a check's loads lay their cache in: a served load's.
+const PAGE: u32 = engine::load::CUDA_PAGE_SIZE;
 
 /// One model's check loads on GPU 0, under the profile the device resolves
 /// with the user's profiles.

@@ -1,7 +1,7 @@
 #![cfg(feature = "device")]
 
 //! A guest's `Instance` and `Channel` slots move between the device and the
-//! host tier as every state shape's do (CONTRACT-BC 22): what suspends a
+//! host tier as every state shape's do: what suspends a
 //! process that has bound a guest program.
 
 use std::path::Path;
@@ -18,7 +18,6 @@ const WIDTH: u64 = 128;
 const HEAD_DIM: u32 = 64;
 const HEADS: u32 = 2;
 const KV_ROW: &str = "kv";
-const PAGE: u32 = 16;
 const LANES: u32 = 4;
 /// The slots of an item: a run, as a guest item past one slot takes.
 const RUN: u32 = 3;
@@ -62,30 +61,11 @@ impl ForwardHybrid for Micro {
 fn shell(trace: poem::Trace, path: &Path) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     Shell::load(Boot {
-        voxels: None,
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract: &contract,
-        checkpoint: path,
-        budget: Budget::new(LANES, 64),
-        patches: None,
-        page_size: PAGE,
-        context: 256,
-        slots: LANES,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
             pin: Some((Graphs::Off, Some(Recording::Shaped))),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(trace, &contract, path, Budget::new(LANES, 64), 256, LANES)
     })
     .expect("the shell loads")
 }

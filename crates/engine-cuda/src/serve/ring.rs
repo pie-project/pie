@@ -1,4 +1,4 @@
-//! A windowed lane's page table as ring + buffer (CONTRACT-BC 19, 21): the
+//! A windowed lane's page table as ring + buffer: the
 //! attention kernels read a window's rows by one page table, so each fire
 //! composes a lane's from three kinds of pages, every one laid as a
 //! window-buffer slot and named by a page id of the buffer's grain:
@@ -98,8 +98,8 @@ pub fn compose(
             "a windowed lane whose record holds no ring",
         ));
     }
-    // The buffer starts at or below the fold the fire leaves (CONTRACT-BC
-    // 21: past the rows a fire folds itself where it buffers none earlier).
+    // The buffer starts at or below the fold the fire leaves: past the rows
+    // a fire folds itself where it buffers none earlier.
     if lane.base % page != 0 || lane.base > lane.folded + lane.fold {
         return Err(Fault::program(
             "serve::ring",

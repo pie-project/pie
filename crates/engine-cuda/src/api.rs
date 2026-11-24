@@ -234,7 +234,7 @@ impl Cuda {
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -927,7 +927,7 @@ impl Engine for Cuda {
             steps: engine::StatedSteps::default(),
         };
         // The set as the load states it, from its stated facts, with those
-        // the arm walk left eager (CONTRACT-BC 24). It is the set the walk
+        // the arm walk left eager. It is the set the walk
         // took: a fire's stamped shape names the walk's shape.
         let stated = engine::StepShapes::of(
             &steps,
@@ -1222,7 +1222,7 @@ impl Engine for Cuda {
         let shell = self.loaded_mut()?;
         shell.take_refs();
         if from != Tier::Device || to != Tier::Device {
-            // Between tiers (CONTRACT-BC 22): whole slots, each laid alike.
+            // Between tiers: whole slots, each laid alike.
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
                     "token runs move within the device; between tiers a slot moves whole".into(),
@@ -1610,8 +1610,8 @@ impl Engine for Cuda {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
-        // 22): a kv copy is within the device.
+        // The host and disk tiers move through `copy_slots`, whole slots
+        // laid alike: a kv copy is within the device.
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
@@ -1622,7 +1622,7 @@ impl Engine for Cuda {
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
         // Windowed pages a write into a shared one copies first ride the
-        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
+        // pre-launch copy beside the kv list's.
         let windowed: Vec<engine::transfer::KvRun> = copy
             .windowed
             .iter()
@@ -1669,7 +1669,7 @@ impl Cuda {
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -1840,8 +1840,8 @@ impl Cuda {
             nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
             let record = match pieces {
                 [] => None,
-                // A record's pieces: its rings' first, then its state's
-                // (CONTRACT-BC 21), named as one record by its first.
+                // A record's pieces: its rings' first, then its state's,
+                // named as one record by its first.
                 stated
                     if stated.iter().all(|(shape, _)| *shape == FIXED || *shape == RING)
                         && stated.windows(2).all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>

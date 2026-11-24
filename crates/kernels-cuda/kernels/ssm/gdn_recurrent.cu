@@ -1236,7 +1236,7 @@ __global__ void __launch_bounds__(W * 32) gdn_tail_corrected(
     }
 }
 
-// A beam group's fold of its gated-delta state (BEAM-PAGE-LISTS §11.3): its
+// A beam group's fold of its gated-delta state: its
 // fold rows (gates from `[b | a]`, keys and `u`: planes 0, 1 and 2, through
 // the representative lane's pages) folded in order as a decode step folds a
 // token and stores it, `S <- bf16(bf16(g S) + k^ u^T)`, and the state stored

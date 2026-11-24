@@ -277,7 +277,7 @@ fn mamba2_scan(
     )
 }
 
-/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, `carry`'s
+/// Folds each beam group's fold rows (`carry`'s
 /// planes step size and `x | B`) into its Mamba-2 state, as a decode step
 /// folds a committed row, the state stored once.
 /// The groups that fold lead `folds` (`groups` entries at most, the first of
