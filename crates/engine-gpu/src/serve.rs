@@ -9937,12 +9937,13 @@ impl<B: Serve> Shell<B> {
         // reads the fire's own (`FireBindings::row_ring`): another body.
         // Each shape carrying decode lanes is recorded so too.
         let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
+        let capturing: Vec<bool> = (0..decoding.len()).map(|class| self.captures(class)).collect();
         // Where the trace buffers a recurrence, a decode lane carries the
         // rows it has not folded (the lagged fold): its scans are the
         // carried forms, another body. Each shape carrying decode lanes is
         // recorded so too.
         let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
-        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering)> = shapes
+        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, bool)> = shapes
             .into_iter()
             .flat_map(|lanes| {
                 let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
@@ -9963,12 +9964,24 @@ impl<B: Serve> Shell<B> {
                         forms.push(Buffering::Tail);
                     }
                 }
+                // A capturing class's lanes read their page rows, or their key
+                // rows alone: a fire laying no page row sums none (another
+                // form of commands).
+                let pageless = [false, true];
+                let captures = lanes.iter().any(|&(class, _)| capturing[class]);
                 forms
                     .into_iter()
                     .flat_map(move |form| {
                         let lanes = lanes.clone();
-                        std::iter::once((lanes.clone(), false, form))
-                            .chain(fed.then_some((lanes, true, form)))
+                        pageless
+                            .into_iter()
+                            .filter(move |&keys_only| !keys_only || captures)
+                            .flat_map(move |keys_only| {
+                                let lanes = lanes.clone();
+                                std::iter::once((lanes.clone(), false, form, keys_only))
+                                    .chain(fed.then_some((lanes, true, form, keys_only)))
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>()
             })
@@ -9990,20 +10003,21 @@ impl<B: Serve> Shell<B> {
                 };
                 let attachments: Vec<engine::Attachments> =
                     (0..decoding.len()).map(carries).collect();
-                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering), usize)> = shapes
+                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, bool), usize)> = shapes
                     .into_iter()
                     .filter_map(|entry| {
                         let step = step_of(&entry.0, entry.2 != Buffering::None, &attachments);
                         steps.shape_of(&step).map(|at| (entry, at))
                     })
                     .collect();
-                tagged.sort_by_key(|((lanes, fed, carried), at)| {
+                tagged.sort_by_key(|((lanes, fed, carried, keys_only), at)| {
                     (
                         *at,
                         lanes.iter().map(|&(_, rows)| rows).sum::<u32>(),
                         std::cmp::Reverse(lanes.len()),
                         *fed,
                         *carried as u8,
+                        *keys_only,
                     )
                 });
                 let mut covered = vec![false; steps.len()];
@@ -10119,7 +10133,7 @@ impl<B: Serve> Shell<B> {
                 None => self.eager_rows = known.eager,
             }
         }
-        for (at, (lanes, fed, carried)) in shapes.iter().enumerate() {
+        for (at, (lanes, fed, carried, keys_only)) in shapes.iter().enumerate() {
             // A known lattice arms the shapes that recorded a family, and
             // states eager what its allowance did.
             if known.as_ref().is_some_and(|known| !known.shapes.contains(&at)) {
@@ -10130,7 +10144,7 @@ impl<B: Serve> Shell<B> {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
-                    .map(|(lanes, _, _)| {
+                    .map(|(lanes, ..)| {
                         format!(
                             "{} lane(s) of classes {:?}, {} rows",
                             lanes.len(),
@@ -10160,6 +10174,11 @@ impl<B: Serve> Shell<B> {
                     .iter()
                     .map(|&(class, rows)| {
                         let mut lane = self.naming_lane(class, rows)?;
+                        // A capturing lane of a pageless form reads its key
+                        // rows alone: its fire lays no page row.
+                        if *keys_only {
+                            lane.reads.retain(|read| read != SCORE_PAGES);
+                        }
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
                         if *carried != Buffering::None {
                             let carry = u32::from(rows == 1 && decoding[class]);
