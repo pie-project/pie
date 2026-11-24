@@ -17,6 +17,9 @@ use worker_api::{
     WorkerControl, connect_gateway_link, dispatch_codec,
 };
 
+/// The room a pushed message's envelope (its request id, the chunk wrapper,
+/// the codec's framing) takes beside its payload in one link frame: a
+/// payload past [`LINK_MAX_FRAME_BYTES`] less this is replaced by a refusal.
 const LINK_HEADROOM_BYTES: usize = 64 * 1024;
 
 const TURN_QUEUE_DEPTH: usize = 64;
