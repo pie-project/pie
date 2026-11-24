@@ -72,18 +72,11 @@ impl Shell {
                     }
                     vec![rung]
                 } else {
-                    // A masked load's mixed fire (prompts beside decodes)
-                    // stages the mask plane over as many lanes as the rung
-                    // seats, past a prefill's (`Shell::fire_full`): the
-                    // rung's rows over its most lanes, each at the page
-                    // bound, bound it.
-                    let mixed = with_mask.then(|| rung.min(lanes_cap));
                     buckets
                         .iter()
                         .copied()
                         .filter(|&n| n <= lanes_cap && n * 2 <= rung)
                         .chain(std::iter::once(1))
-                        .chain(mixed)
                         .collect()
                 };
                 for lanes in counts {
