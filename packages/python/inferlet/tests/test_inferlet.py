@@ -408,6 +408,56 @@ class TestForwardPassState:
         assert fwd.wit.checkpoint_slots == [16, 32]
 
 
+class TestFinalRows:
+    """A pass is final unless the program states it retractable (CONTRACT-BC 25)."""
+
+    @staticmethod
+    def _pass():
+        from inferlet.eta import ForwardPass, StateGeometry, WorkingSet
+
+        fwd = ForwardPass()
+        fwd.state([WorkingSet()], StateGeometry.folding())
+        return fwd
+
+    def test_a_pass_is_final_unless_retractable(self):
+        from inferlet.eta import InferletError
+
+        fwd = self._pass()
+        assert fwd.is_final()
+        fwd.attach_program()
+        fwd.attach_program()
+        assert fwd.wit.final_stated == 1
+
+        lagged = self._pass()
+        lagged.retractable()
+        assert not lagged.is_final()
+        lagged.attach_program()
+        assert lagged.wit.final_stated == 0
+        with pytest.raises(InferletError, match="already attached"):
+            lagged.retractable()
+
+    def test_run_ahead_retracts_only_a_retractable_pass(self):
+        import asyncio
+
+        from inferlet.eta import Pipeline
+
+        for retractable in (False, True):
+            fwd = self._pass()
+            if retractable:
+                fwd.retractable()
+            pipe = Pipeline()
+            reads = 0
+
+            def on_token():
+                nonlocal reads
+                reads += 1
+                return None if reads < 2 else False
+
+            assert asyncio.run(pipe.run_ahead(fwd, 8, on_token)) == 2
+            # A window of 4, refilled after the first read: 5 submitted, 2 kept.
+            assert pipe.wit.retracted == (3 if retractable else 0)
+
+
 class TestDiffusionSurface:
     def test_model_facts(self):
         from inferlet import model

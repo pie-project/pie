@@ -80,9 +80,9 @@ struct Input {
     /// replay at a steady lag). 0 folds all it writes.
     #[serde(default)]
     fold_lag: u32,
-    /// Whether the prefill and the decode state their rows final
-    /// (`ForwardPass::final_rows`): the bench never takes a row back, so it
-    /// does unless asked not to (`false`: the lagged fold, for an A/B
+    /// Whether the prefill and the decode are final, the SDK's default: the
+    /// bench never takes a row back, so they are unless asked not to
+    /// (`false`: `ForwardPass::retractable`, the lagged fold, for an A/B
     /// against it) or a `fold_lag` holds rows unfolded on purpose.
     #[serde(default = "stated_final")]
     final_rows: bool,
@@ -418,13 +418,14 @@ async fn run_one(
         .state(&[&ws], geometry(lag, &prefill_fold))
         .context("bind prefill state")?;
     // The bench never takes a row back, the prompt's included: a prefill
-    // stated final as its decodes are leaves no row for the first decode to
-    // carry, so no steady step catches one buffered (CONTRACT-BC 25).
+    // final as its decodes are leaves no row for the first decode to carry,
+    // so no steady step catches one buffered (CONTRACT-BC 25). Final is the
+    // SDK's default; the lagged A/B and a fold lag opt out.
     let final_rows = input.final_rows && lag == 0;
-    if final_rows {
+    if !final_rows {
         fwd_p
-            .final_rows()
-            .context("state the prefill's rows final")?;
+            .retractable()
+            .context("state the prefill retractable")?;
     }
     if input.checkpoint_prompt_end {
         let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
@@ -451,8 +452,8 @@ async fn run_one(
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], geometry(lag, &decode_fold))
                 .context("bind decode state")?;
-            if final_rows {
-                fwd.final_rows().context("state the decode's rows final")?;
+            if !final_rows {
+                fwd.retractable().context("state the decode retractable")?;
             }
             let knobs = SampleKnobs::new(temperature, top_p, top_k);
             fwd.epilogue(move || {

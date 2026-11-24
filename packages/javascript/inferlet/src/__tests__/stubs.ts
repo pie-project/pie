@@ -152,7 +152,10 @@ export class ForwardPassStub {
   checkpoints(slots: Uint32Array) {
     this.checkpointSlots = Array.from(slots);
   }
-  finalRows() {}
+  finalStated = 0;
+  finalRows() {
+    this.finalStated += 1;
+  }
   media(lane: number, spans: unknown[]) {
     this.mediaLane = lane;
     this.spans = [...spans];

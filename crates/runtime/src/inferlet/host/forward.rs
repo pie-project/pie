@@ -2067,6 +2067,55 @@ mod tests {
         Ok(())
     }
 
+    /// A pass states its rows final only by `final-rows` (CONTRACT-BC 25):
+    /// the SDKs send it on every pass not declared retractable, so a default
+    /// pass reaches the fire final and a retractable one (which sends
+    /// nothing) lagged; the runtime infers nothing from the pass. Refused
+    /// once the program is attached, and on a pass binding `parents` (a
+    /// beam) by name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_is_final_only_by_its_statement() -> anyhow::Result<()> {
+        use super::*;
+        let mut context = ProcessCtx::new(
+            uuid::Uuid::new_v4(),
+            crate::inferlet::process::OutputMode::Discard,
+            &crate::inferlet::sandbox::InstancePolicy::deny_all(),
+            None,
+        )
+        .await?;
+        let final_of = |context: &mut ProcessCtx, pass: u32| -> anyhow::Result<bool> {
+            let pass: Resource<ForwardPass> = Resource::new_borrow(pass);
+            Ok(context.ctx().table.get(&pass)?.bindings.final_rows)
+        };
+        // The SDK's default: stated, so final.
+        let stated = context.ctx().table.push(ForwardPass::default())?.rep();
+        assert_eq!(context.core_final_rows(Resource::new_borrow(stated)).await?, Ok(()));
+        assert!(final_of(&mut context, stated)?, "a default pass is final");
+        // `retractable`: nothing sent, so lagged.
+        let retractable = context.ctx().table.push(ForwardPass::default())?.rep();
+        assert!(!final_of(&mut context, retractable)?, "a retractable pass is not");
+        // A beam's pass binds `parents`: refused by name, left lagged.
+        let beam = context.ctx().table.push(ForwardPass::default())?.rep();
+        {
+            let pass: Resource<ForwardPass> = Resource::new_borrow(beam);
+            context.ctx().table.get_mut(&pass)?.bindings.state = Some(StateBinding {
+                lanes: Vec::new(),
+                positions: None,
+                slots: None,
+                kv_len: None,
+                fold: None,
+                parents: Some(1),
+                parents_end: None,
+            });
+        }
+        assert_eq!(
+            context.core_final_rows(Resource::new_borrow(beam)).await?,
+            Err(FINAL_BEAMS.to_string())
+        );
+        assert!(!final_of(&mut context, beam)?);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_ready_take_keeps_pending_kv_for_teardown() -> anyhow::Result<()> {
         use super::*;

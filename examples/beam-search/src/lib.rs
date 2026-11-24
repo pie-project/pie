@@ -285,6 +285,9 @@ async fn main(input: Input) -> Result<String> {
 
         let corrupt_parent = input.corrupt.as_deref() == Some("parent");
         let fwd = ForwardPass::new();
+        // Beams bind `parents` and adopt one beam's rows: not final
+        // (CONTRACT-BC 25; a final pass binding parents is refused).
+        fwd.retractable()?;
         fwd.embed(&toks, &lanes_b)?;
         let pool: Vec<&WorkingSet> = vec![&ws; b as usize];
         // Every beam reads the folded prompt and its own pages: beam `i`'s

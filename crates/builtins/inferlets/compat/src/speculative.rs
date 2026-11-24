@@ -86,6 +86,9 @@ async fn pass(
     });
     let chances = sampled.as_ref().map(|(_, _, chances)| *chances);
     let fwd = ForwardPass::new();
+    // A verify's rejected draft rows are written again by the next round:
+    // the rows are taken back, so the pass is not final (CONTRACT-BC 25).
+    fwd.retractable()?;
     if drafting {
         fwd.switch(0, "block_draft", "on").context("draft block")?;
     }

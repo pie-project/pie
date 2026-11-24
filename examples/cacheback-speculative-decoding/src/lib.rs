@@ -166,6 +166,11 @@ async fn fire(
     };
 
     let fwd = ForwardPass::new();
+    // A verify window reads every draft row, and the next round writes the
+    // rejected tail's slots again: it takes rows back (CONTRACT-BC 25).
+    if !last_only {
+        fwd.retractable()?;
+    }
     fwd.embed(&ids, &embed_indptr)?;
     fwd.readout(&readout)?;
     fwd.state(

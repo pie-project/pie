@@ -366,7 +366,9 @@ export class Pipeline {
 
   /**
    * Keep the runtime's run-ahead window full while `onToken` consumes
-   * results, until `budget` fires submit or `onToken` returns `false`.
+   * results, until `budget` fires submit or `onToken` returns `false`. A
+   * break takes back the fires past the one read when `fwd` is retractable;
+   * a final pass's stay in its sets.
    * Returns the run count. `onToken` is synchronous here (host reads block).
    */
   runAhead(fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
@@ -400,9 +402,10 @@ export class Pipeline {
       if (onToken() === false) {
         if (!ended) this.close();
         // The fire whose output broke the loop read a token the program
-        // took, so its rows stay; those past it are taken back.
+        // took, so its rows stay; those past it are taken back, unless the
+        // pass is final: then they stay in its sets.
         const kept = consumed + 1;
-        if (submitted > kept) this.retract(submitted - kept);
+        if (submitted > kept && !fwd.isFinal()) this.retract(submitted - kept);
         return kept;
       }
       consumed += 1;
@@ -524,6 +527,7 @@ export class ForwardPass {
   private lanes: WorkingSet[] = [];
   private foldAll: Channel | undefined;
   private switches: [number, string, string][] = [];
+  private retractableRows = false;
 
   constructor() {
     this.wit = new witForward.ForwardPass();
@@ -592,12 +596,21 @@ export class ForwardPass {
   }
 
   /**
-   * State that this pass's sampled rows are final: the program never takes back a row once
-   * sampled, so its lanes fold every row at fire. Unstated, a pass is not final. Before the program.
+   * State that this pass may take back rows it sampled: the program retracts, truncates, rolls
+   * back or rewinds its sets below a sampled row (a stop string cut in a set it continues, a
+   * draft or speculative verify, a beam, a rollback). Without it a pass is final (CONTRACT-BC 25):
+   * the SDK states its rows final when the program is attached, its lanes fold every row at fire,
+   * a retract over one of its fires is refused by name, and `runAhead` leaves its rows past a
+   * break in place. Before the program.
    */
-  finalRows(): void {
+  retractable(): void {
     if (this.programAttached) throw new InferletError('forward pass program is already attached');
-    wit('final-rows', () => this.wit.finalRows());
+    this.retractableRows = true;
+  }
+
+  /** Whether this pass's rows are final: `retractable()` was not stated. */
+  isFinal(): boolean {
+    return !this.retractableRows;
   }
 
   /** Set lane `lane`'s model switch `name` to `value`, before the program. */
@@ -715,6 +728,12 @@ export class ForwardPass {
 
   attachProgram(): void {
     if (this.programAttached) return;
+    // A pass is final unless the program said it may take rows back: the
+    // program's own statement, made here since the runtime takes it before
+    // the program.
+    if (!this.retractableRows) {
+      wit('final-rows', () => this.wit.finalRows());
+    }
     const builder = new Builder(this.vocab, this.pageSize);
     const lanes = Math.max(
       1,

@@ -12,8 +12,8 @@ import * as session from '../session.js';
 import * as chat from '../chat.js';
 import * as reasoning from '../reasoning.js';
 import * as inferlet from '../index.js';
-import { Channel, ForwardPass, Port, WorkingSet, dtype } from '../eta/index.js';
-import { ForwardPassStub, chatScript, reasoningScript, sessionSpy } from './stubs.js';
+import { Channel, ForwardPass, Pipeline, Port, WorkingSet, dtype } from '../eta/index.js';
+import { ForwardPassStub, PipelineStub, chatScript, reasoningScript, sessionSpy } from './stubs.js';
 
 describe('package surface', () => {
   it('exports only the live modules', () => {
@@ -258,5 +258,43 @@ describe('eta state binding', () => {
     const fwd = new ForwardPass();
     fwd.checkpoints([16, 32]);
     expect(stub(fwd).checkpointSlots).toEqual([16, 32]);
+  });
+});
+
+describe('final rows (CONTRACT-BC 25)', () => {
+  const stub = (fwd: ForwardPass) => fwd.wit as unknown as ForwardPassStub;
+  const pass = () => {
+    const fwd = new ForwardPass();
+    fwd.state([new WorkingSet()], { fold: 'all' });
+    return fwd;
+  };
+
+  it('states a pass final at attach unless it is retractable', () => {
+    const fwd = pass();
+    expect(fwd.isFinal()).toBe(true);
+    fwd.attachProgram();
+    fwd.attachProgram();
+    expect(stub(fwd).finalStated).toBe(1);
+
+    const lagged = pass();
+    lagged.retractable();
+    expect(lagged.isFinal()).toBe(false);
+    lagged.attachProgram();
+    expect(stub(lagged).finalStated).toBe(0);
+    expect(() => lagged.retractable()).toThrow(/already attached/);
+  });
+
+  it('retracts past a run-ahead break only for a retractable pass', () => {
+    for (const retractable of [false, true]) {
+      const fwd = pass();
+      if (retractable) fwd.retractable();
+      const pipe = new Pipeline();
+      let reads = 0;
+      const kept = pipe.runAhead(fwd, 8, () => (++reads < 2 ? undefined : false));
+      expect(kept).toBe(2);
+      const retracted = (pipe.wit as unknown as PipelineStub).retracted;
+      // A window of 4, refilled after the first read: 5 submitted, 2 kept.
+      expect(retracted).toBe(retractable ? 3 : 0);
+    }
   });
 });
