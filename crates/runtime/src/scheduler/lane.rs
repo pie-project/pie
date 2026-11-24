@@ -873,6 +873,72 @@ pub(crate) fn turn_behind() {
     }
 }
 
+/// The served steps' recent times, ns (each frame's submit to its first
+/// step's landing, or the submit itself where the engine settles inside
+/// it): the grace behind work waits after the last pipeline closes is the
+/// longest of them ([`behind_grace`]).
+static STEPS_SEEN: std::sync::Mutex<std::collections::VecDeque<u64>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// When each frame was submitted, by id, until its first step lands.
+static SUBMITTED_AT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, crate::rt::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Whether any engine stated behind work at its lane's last idle turn: no
+/// delayed turn is started without.
+static BEHIND_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The served steps kept for the grace.
+const STEPS_KEPT: usize = 16;
+
+/// A served step of `ns`.
+pub(crate) fn note_step(ns: u64) {
+    let mut seen = STEPS_SEEN.lock().unwrap();
+    if seen.len() == STEPS_KEPT {
+        seen.pop_front();
+    }
+    seen.push_back(ns);
+}
+
+/// How long behind work waits after the last pipeline parks or closes: the
+/// longest recent served step on this runtime (derived from the load's own
+/// steps; none before any step is served).
+#[must_use]
+pub(crate) fn behind_grace() -> std::time::Duration {
+    std::time::Duration::from_nanos(STEPS_SEEN.lock().unwrap().iter().copied().max().unwrap_or(0))
+}
+
+/// The last pipeline parked or closed: the lanes are turned once the grace
+/// ([`behind_grace`]) has passed with no pipeline opening, never before.
+/// A pipeline opening meanwhile cancels the turn. Nothing where no engine
+/// has behind work left.
+pub(crate) fn turn_behind_after() {
+    if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire)
+        || !BEHIND_PENDING.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    let grace = behind_grace();
+    let opened = crate::pipeline::opened();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = crate::rt::thread::Builder::new()
+            .name("pie-behind-grace".into())
+            .spawn(move || {
+                std::thread::sleep(grace);
+                if crate::pipeline::none_active() && crate::pipeline::opened() == opened {
+                    turn_behind();
+                }
+            });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (grace, opened);
+        turn_behind();
+    }
+}
+
 /// Whether a lane said its behind work waits for ready.
 static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1152,6 +1218,7 @@ impl Lane {
         if !engine.measures_behind() {
             return None;
         }
+        BEHIND_PENDING.store(true, std::sync::atomic::Ordering::Release);
         if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire) {
             if !BEHIND_SAID_EARLY.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::info!(
@@ -1169,7 +1236,15 @@ impl Lane {
         // snapshots are no process) and no waiter is short of a slot: never
         // between the steps of live traffic. The last pipeline to park or
         // close turns the lanes ([`turn_behind`]).
-        let alone = crate::pipeline::none_active()
+        // ...and only once a grace of one served step has passed since the
+        // last pipeline parked or closed (a back-to-back request opens
+        // inside it); the turn delayed by it wakes the lane then.
+        let rested = match crate::pipeline::idle_for() {
+            Some(idle) => idle >= behind_grace(),
+            None => crate::pipeline::none_active(),
+        };
+        let alone = rested
+            && crate::pipeline::none_active()
             && !stores
                 .as_ref()
                 .and_then(|stores| stores.shared.as_ref())
@@ -1450,6 +1525,11 @@ impl Lane {
                     step,
                     outcome,
                 } => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if step == 0
+                        && let Some(at) = SUBMITTED_AT.lock().unwrap().remove(&frame.0)
+                    {
+                        note_step(at.elapsed().as_nanos() as u64);
+                    }
                     // Taken, not read: a frame's steps land in any order (an
                     // engine tells a step with no instance from its device's
                     // completion, one with instances at a later harvest), and
@@ -1643,6 +1723,16 @@ impl Lane {
             let submit_start = crate::rt::Instant::now();
             SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Release);
             let submit_result = engine.submit(&submitted);
+            // A served step's time, for the grace behind work waits: the
+            // submit itself where the engine settles inside it, else from
+            // here to its first step's landing.
+            match &submit_result {
+                Ok(ticket) if engine.settles_asynchronously() => {
+                    SUBMITTED_AT.lock().unwrap().insert(ticket.id.0, submit_start);
+                }
+                Ok(_) => note_step(submit_start.elapsed().as_nanos() as u64),
+                Err(_) => {}
+            }
             tracing::debug!(
                 target: "pie::launch",
                 steps = submitted.steps.len(),
@@ -2627,5 +2717,34 @@ mod behind_tests {
         assert!(sliced.is_none(), "no slice while a process has work outstanding");
         assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 0);
         drop(live);
+    }
+
+    /// After the last pipeline closes, behind work waits a grace of the
+    /// longest recent served step: a request opening inside it pays no
+    /// slice; past it, the work runs (a slice at a time).
+    #[test]
+    fn behind_work_waits_a_served_step_after_the_last_pipeline_closes() {
+        open_behind();
+        note_step(60_000_000);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine: Option<EngineBox> = Some(Box::new(Pending(Arc::clone(&ran))));
+        drop(crate::pipeline::Pipeline::new());
+        if !crate::pipeline::none_active() {
+            // Another test holds a pipeline: nothing to read here.
+            return;
+        }
+        assert!(
+            Lane::measure_behind(usize::MAX, &mut engine, &|| false).is_none(),
+            "inside the grace, nothing runs"
+        );
+        assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 0);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        if crate::pipeline::none_active() && crate::pipeline::idle_for().is_some() {
+            assert!(
+                Lane::measure_behind(usize::MAX, &mut engine, &|| false).is_some(),
+                "past the grace, a slice runs"
+            );
+            assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 1, "one slice a turn");
+        }
     }
 }
