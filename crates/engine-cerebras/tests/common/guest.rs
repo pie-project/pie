@@ -1,11 +1,11 @@
 //! The guest's denoise loop over flux2-mini's `denoise` reading, driven through
 //! `CerebrasEngine::submit` as the runtime drives a pass.
 
-use engine::Engine;
 use engine::caps::Capabilities;
 use engine::channel::{ChannelId, ChannelRegistration, ChannelSeed};
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step, StepVoxels};
 use engine::program::{InstanceBinding, InstanceId, ProgramRegistration};
+use engine::{Channels, Engine, Programs};
 use engine_cerebras::reading::Denoise;
 use eta_dsl::prelude::*;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Stage};
@@ -141,7 +141,7 @@ pub fn loop_on_rows(
     let stages = eta_compiler::plan::compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
     let program_id = engine
-        .register_program(&ProgramRegistration {
+        .register(&ProgramRegistration {
             program_hash: bound.hash,
             launch,
             ..Default::default()
@@ -153,7 +153,7 @@ pub fn loop_on_rows(
     for (i, decl) in container.channels.iter().enumerate() {
         let id = ChannelId(100 + i as u64);
         engine
-            .register_channel(&ChannelRegistration {
+            .open(&ChannelRegistration {
                 id,
                 shape: decl.shape.dims().to_vec(),
                 dtype: decl.dtype,
@@ -176,7 +176,7 @@ pub fn loop_on_rows(
         .collect();
     let total = (rows() + image_rows as usize) as u32;
     let instance: InstanceId = engine
-        .bind_instance(&InstanceBinding {
+        .bind(&InstanceBinding {
             program: program_id,
             channels: channels.clone(),
             seeds,
@@ -258,7 +258,7 @@ pub fn loop_on_rows(
         let mut ticket = engine.submit(&frame).expect("the step runs");
         engine.settle_frame(&mut ticket).expect("the frame settles");
         let cell = engine
-            .take_channel(instance, dense(g.out))
+            .take(instance, dense(g.out))
             .expect("the latent channel reads")
             .expect("the epilogue put the step's latent");
         latents.push(f32s(&cell));

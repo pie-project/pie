@@ -2159,7 +2159,7 @@ impl Pools {
         self.chunks.by_refs()
     }
 
-    /// See `Engine::commit_segments`.
+    /// See `Pool::commit`.
     pub fn commit_segments(&mut self, segments: u32) -> Result<()> {
         match self.chunks.commit_segments(&mut self.pool, segments)? {
             Commit::Committed => Ok(()),
@@ -2167,7 +2167,7 @@ impl Pools {
         }
     }
 
-    /// See `Engine::release_segments`: the activation's span stays.
+    /// See `Pool::release`: the activation's span stays.
     pub fn release_segments(&mut self, segments: u32) -> Result<()> {
         // No move still landing reads or writes a chunk that goes.
         self.settle_swaps()?;
@@ -2179,7 +2179,7 @@ impl Pools {
         self.fitted.min(self.chunks.total())
     }
 
-    /// See `Engine::evacuate`.
+    /// See `Pool::evacuate`.
     pub fn evacuate(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -2488,7 +2488,7 @@ impl Pools {
             .collect()
     }
 
-    /// See `Engine::weight_residency`: the blocks newly named a slot are
+    /// See `WeightCache::set_residency`: the blocks newly named a slot are
     /// filled from the host copy and every table rewritten, on `stream`
     /// behind the fires it holds and before the next. A block no longer
     /// named is read from the host copy again. Returns whether a bank's
@@ -3028,7 +3028,7 @@ impl Pools {
             .collect()
     }
 
-    /// See `Engine::weight_uses`: each block's reads since the last call.
+    /// See `WeightCache::uses`: each block's reads since the last call.
     /// The counters run on (never zeroed but by
     /// [`Pools::forget_weight_uses`]); each call enqueues a snapshot of them
     /// into mapped host memory on `stream` behind the fires that counted,
@@ -3427,7 +3427,7 @@ impl Pools {
         ))
     }
 
-    /// See `Engine::read_tier_slots`: the bytes of host tier slots, shape
+    /// See `Tiers::read`: the bytes of host tier slots, shape
     /// by shape, each laid out as its device slot. The caller has settled
     /// every copy into them.
     pub fn read_tier_slots(
@@ -3447,7 +3447,7 @@ impl Pools {
         Ok(out)
     }
 
-    /// See `Engine::write_tier_slots`: `bytes`, as [`Self::read_tier_slots`]
+    /// See `Tiers::write`: `bytes`, as [`Self::read_tier_slots`]
     /// lays them out, into host tier slots. The caller has settled every
     /// copy that touches them.
     pub fn write_tier_slots(

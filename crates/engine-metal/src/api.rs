@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -16,6 +15,7 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
+use engine::{Channels, Completion, Engine, Pool, Programs, Tiers, WeightCache};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -598,79 +598,6 @@ impl Engine for Metal {
         })
     }
 
-    fn reload_weights(
-        &mut self,
-        reload: &engine::load::Reload,
-    ) -> EngineResult<engine::load::Reloaded> {
-        let path = reload.checkpoint.as_path();
-        let shell = self
-            .shell
-            .as_mut()
-            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))?;
-        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
-        let (planes, bytes) = shell
-            .reload_weights(&contract, path, &mut self.torn)
-            .map_err(fault)?;
-        Ok(engine::load::Reloaded { planes, bytes })
-    }
-
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
-    }
-
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_segments(segments).map_err(fault)
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_segments(segments).map_err(fault)
-    }
-
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
-    }
-
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.loaded_mut()?.copy_slots(copy).map_err(fault)
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_tier_slots(slots, bytes)
-            .map_err(fault)
-    }
-
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
-        self.loaded_mut()?
-            .weight_residency(residency)
-            .map_err(fault)
-    }
-
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
-    }
-
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         if self.torn {
             return Err(Error::Load(
@@ -711,20 +638,10 @@ impl Engine for Metal {
         }
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, pending));
-        if !self.settles_asynchronously() {
+        if self.completion().is_none() {
             self.settle_frame(&mut ticket)?;
         }
         Ok(ticket)
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        self.shell
-            .as_ref()
-            .is_some_and(|shell| shell.frames_in_flight() > 1)
-    }
-
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -776,48 +693,60 @@ impl Engine for Metal {
         Ok(())
     }
 
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        if self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.frames_in_flight() > 1)
+        {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+}
+
+impl Completion for Metal {
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
         if let Some(shell) = self.shell.as_mut() {
             let _ = shell.reap();
         }
     }
+}
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+impl Programs for Metal {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         self.loaded_mut()?
             .register_program(registration)
             .map_err(fault)
     }
 
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        if registration.host_role != eta_ir::container::HostRole::None {
-            return Err(self.unsupported("register_channel"));
-        }
-        let shape = crate::program::ChannelShape {
-            capacity: registration.capacity.max(1),
-            numel: registration
-                .shape
-                .iter()
-                .map(|&dim| dim as usize)
-                .product::<usize>()
-                .max(1),
-            dtype: registration.dtype.program_dtype(),
-        };
-        self.loaded_mut()?
-            .register_shared_channel(registration.id, shape)
-            .map_err(fault)?;
-        Ok(RegisteredChannel {
-            id: registration.id,
-            reader_wait_id: 0,
-            writer_wait_id: 0,
-            mirror: None,
-        })
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         let caps = self
             .caps
             .as_ref()
@@ -863,7 +792,7 @@ impl Engine for Metal {
         })
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
         let held = self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
         if let Some(bound) = held.as_ref() {
@@ -872,32 +801,66 @@ impl Engine for Metal {
         shell.close_program_instance(id).map_err(fault)
     }
 
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        let planes: Vec<AdapterPlane<'_>> = registration
+            .planes
+            .iter()
+            .map(|plane| AdapterPlane {
+                bank: plane.bank.as_str(),
+                bytes: &plane.bytes,
+            })
+            .collect();
+        self.loaded_mut()?
+            .register_adapter(registration.id, &planes)
+            .map_err(fault)
+    }
+}
+
+impl Channels for Metal {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        if registration.host_role != eta_ir::container::HostRole::None {
+            return Err(Error::unsupported(self.kind(), "register_channel"));
+        }
+        let shape = crate::program::ChannelShape {
+            capacity: registration.capacity.max(1),
+            numel: registration
+                .shape
+                .iter()
+                .map(|&dim| dim as usize)
+                .product::<usize>()
+                .max(1),
+            dtype: registration.dtype.program_dtype(),
+        };
+        self.loaded_mut()?
+            .register_shared_channel(registration.id, shape)
+            .map_err(fault)?;
+        Ok(RegisteredChannel {
+            id: registration.id,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+            mirror: None,
+        })
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
         if self.loaded_mut()?.close_shared_channel(id) {
             return Ok(());
         }
-        Err(self.unsupported("close_channel"))
+        Err(Error::unsupported(self.kind(), "close_channel"))
     }
 
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         self.instance(instance)?
             .publish(channel, cell)
             .map_err(fault)
     }
 
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.instance(instance)?.take(channel).map_err(fault)
     }
+}
 
+impl Tiers for Metal {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
@@ -910,6 +873,63 @@ impl Engine for Metal {
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
+    }
+
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault)
+    }
+}
+
+impl Pool for Metal {
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+}
+
+impl WeightCache for Metal {
+    fn reload(&mut self, reload: &engine::load::Reload) -> EngineResult<engine::load::Reloaded> {
+        let path = reload.checkpoint.as_path();
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))?;
+        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
+        let (planes, bytes) = shell
+            .reload_weights(&contract, path, &mut self.torn)
+            .map_err(fault)?;
+        Ok(engine::load::Reloaded { planes, bytes })
+    }
+
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
     }
 }
 

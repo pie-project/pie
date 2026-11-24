@@ -5,7 +5,7 @@ use crate::caps::DeviceFacts;
 use crate::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use crate::chunk::{Evacuation, SlotCopy, WeightResidency, WeightUses};
 use crate::error::{Error, Result};
-use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
+use crate::fire::{FrameId, FrameSubmission, FrameTicket, Step};
 use crate::load::{LoadRequest, Loaded, Reload, Reloaded};
 use crate::program::{
     BoundInstance, InstanceBinding, InstanceId, ProgramCompiler, ProgramId, ProgramRegistration,
@@ -41,7 +41,7 @@ pub struct KvWrites {
 pub type CompletionSink = std::sync::Arc<dyn Fn(StepDone, StepOutcome) + Send + Sync>;
 
 /// A group of a tapped lane's pages, read out: each page's spans of group
-/// `group` (of [`Engine::tap_groups`]), page after page; or why not. A tap
+/// `group` (of [`Taps::groups`]), page after page; or why not. A tap
 /// that fails says so once, for its first group not told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tapped {
@@ -69,67 +69,11 @@ pub trait Engine: Send {
         true
     }
 
-    fn export_kv_handle(&self) -> Option<KvHandle> {
-        None
-    }
-
     fn bind_thread(&mut self) -> Result<()> {
         Ok(())
     }
 
     fn load(&mut self, request: LoadRequest) -> Result<Loaded>;
-
-    fn reload_weights(&mut self, reload: &Reload) -> Result<Reloaded> {
-        let _ = reload;
-        Err(self.unsupported("reload_weights"))
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> Result<ProgramId> {
-        let _ = registration;
-        Err(self.unsupported("register_program"))
-    }
-
-    fn program_compiler(&self) -> Option<ProgramCompiler> {
-        None
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> Result<RegisteredChannel> {
-        let _ = registration;
-        Err(self.unsupported("register_channel"))
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> Result<BoundInstance> {
-        let _ = binding;
-        Err(self.unsupported("bind_instance"))
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> Result<()> {
-        let _ = id;
-        Err(self.unsupported("close_instance"))
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> Result<()> {
-        let _ = id;
-        Err(self.unsupported("close_channel"))
-    }
-
-    fn publish_channel(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> Result<bool> {
-        let _ = (instance, channel, cell);
-        Err(self.unsupported("publish_channel"))
-    }
-
-    fn take_channel(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>> {
-        let _ = (instance, channel);
-        Err(self.unsupported("take_channel"))
-    }
-
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> Result<()> {
-        let _ = registration;
-        Err(self.unsupported("register_adapter"))
-    }
 
     fn submit(&mut self, frame: &FrameSubmission) -> Result<FrameTicket>;
 
@@ -137,32 +81,123 @@ pub trait Engine: Send {
         false
     }
 
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> Result<()>;
+
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        None
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        None
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        None
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
+        None
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+        None
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        None
+    }
+
+    fn peers(&mut self) -> Option<&mut dyn Peers> {
+        None
+    }
+
+    fn taps(&mut self) -> Option<&mut dyn Taps> {
+        None
+    }
+}
+
+pub trait Completion: Engine {
+    fn on_complete(&mut self, sink: CompletionSink);
+
+    /// Publishes what the guests' programs of the steps already landed put
+    /// on their channels, without waiting on a step still in flight. An
+    /// engine that publishes as each step lands needs nothing here.
+    fn publish_landed(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn expect_fire(&mut self, submission: &Step) {
+        let _ = submission;
+    }
+}
+
+pub trait Programs: Engine {
+    fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId>;
+
+    fn compiler(&self) -> Option<ProgramCompiler> {
+        None
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> Result<BoundInstance>;
+
+    fn close(&mut self, id: InstanceId) -> Result<()>;
+
+    fn adapter(&mut self, registration: &AdapterRegistration) -> Result<()>;
+}
+
+pub trait Channels: Engine {
+    fn open(&mut self, registration: &ChannelRegistration) -> Result<RegisteredChannel>;
+
+    fn close(&mut self, id: ChannelId) -> Result<()>;
+
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> Result<bool>;
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> Result<Option<Vec<u8>>>;
+}
+
+pub trait Pool: Engine {
     /// Backs the pool's first `segments` segments
     /// ([`crate::chunk::ChunkFacts::segments`]), ahead of the runtime
     /// handing out any of their chunks; never on a fire's path. A refusal
     /// leaves what was committed standing.
-    fn commit_segments(&mut self, segments: u32) -> Result<()> {
-        let _ = segments;
-        Err(self.unsupported("commit_segments"))
-    }
+    fn commit(&mut self, segments: u32) -> Result<()>;
 
     /// Gives back every segment at and past `segments`. The runtime has
     /// evacuated their chunks and waited out every frame that named them.
-    fn release_segments(&mut self, segments: u32) -> Result<()> {
-        let _ = segments;
-        Err(self.unsupported("release_segments"))
-    }
+    fn release(&mut self, segments: u32) -> Result<()>;
 
     /// Copies each moved chunk's bytes onto its new physical chunk and
     /// updates the engine's [`crate::chunk::ChunkTable`], stream-ordered
     /// before the next fire; the slot refs the runtime holds stand.
-    fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()> {
-        let _ = evacuation;
-        Err(self.unsupported("evacuate"))
-    }
+    fn evacuate(&mut self, evacuation: &Evacuation) -> Result<()>;
+}
 
+pub trait WeightCache: Engine {
+    /// Which atoms of the streamable weights
+    /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next
+    /// fire on, and in which pool slots; the whole set each time. The
+    /// runtime calls it once a governor tick at most, ordered before the
+    /// next fire; the engine fills slots newly named (from its host copy)
+    /// before a fire reads them. A use of an atom not named is the
+    /// engine's: it streams through a staging slot and is not kept.
+    fn set_residency(&mut self, residency: &WeightResidency) -> Result<()>;
+
+    /// How often fires read each streamable atom, resident or not: the
+    /// record the runtime orders the weight cache by. An engine may answer
+    /// a call behind (the reads between the two calls before, its use
+    /// counters read without waiting for the device), every read counted
+    /// once.
+    fn uses(&mut self) -> Result<WeightUses>;
+
+    fn reload(&mut self, reload: &Reload) -> Result<Reloaded> {
+        let _ = reload;
+        Err(Error::unsupported(self.kind(), "reload_weights"))
+    }
+}
+
+pub trait Tiers: Engine {
     /// Copies slots of one shape between tiers or within one; replaces
-    /// [`Engine::copy_kv`] and [`Engine::copy_state`] once every backend
+    /// [`Tiers::copy_kv`] and [`Tiers::copy_state`] once every backend
     /// serves it.
     ///
     /// Tiers (CONTRACT-BC 22): an engine that states
@@ -179,148 +214,57 @@ pub trait Engine: Send {
     /// after (a stream-ordered copy, or a drain), and copies in submission
     /// order: the runtime reuses a source slot and names a destination
     /// again as soon as the call returns.
-    fn copy_slots(&mut self, copy: &SlotCopy) -> Result<()> {
-        let _ = copy;
-        Err(self.unsupported("copy_slots"))
-    }
-
-    /// Which atoms of the streamable weights
-    /// ([`crate::chunk::ChunkFacts::weights`]) are resident from the next
-    /// fire on, and in which pool slots; the whole set each time. The
-    /// runtime calls it once a governor tick at most, ordered before the
-    /// next fire; the engine fills slots newly named (from its host copy)
-    /// before a fire reads them. A use of an atom not named is the
-    /// engine's: it streams through a staging slot and is not kept.
-    fn weight_residency(&mut self, residency: &WeightResidency) -> Result<()> {
-        let _ = residency;
-        Err(self.unsupported("weight_residency"))
-    }
-
-    /// How often fires read each streamable atom, resident or not: the
-    /// record the runtime orders the weight cache by. An engine may answer
-    /// a call behind (the reads between the two calls before, its use
-    /// counters read without waiting for the device), every read counted
-    /// once.
-    fn weight_uses(&mut self) -> Result<WeightUses> {
-        Err(self.unsupported("weight_uses"))
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        false
-    }
-
-    fn on_complete(&mut self, sink: CompletionSink) {
-        let _ = sink;
-    }
-
-    /// The groups a tapped page's planes are read out in, each as spans
-    /// `(offset, bytes)` of a host kv slot, in the order they land; `None`:
-    /// this engine taps nothing.
-    fn tap_groups(&self) -> Option<TapGroups> {
-        None
-    }
-
-    fn on_tapped(&mut self, sink: TapSink) {
-        let _ = sink;
-    }
-
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> Result<()>;
-
-    /// Publishes what the guests' programs of the steps already landed put
-    /// on their channels, without waiting on a step still in flight. An
-    /// engine that publishes as each step lands needs nothing here.
-    fn publish_landed(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn expect_fire(&mut self, submission: &Step) {
-        let _ = submission;
-    }
-
-    fn copy_kv(&mut self, copy: &KvCopy) -> Result<()> {
-        let _ = copy;
-        Err(self.unsupported("copy_kv"))
-    }
-
-    fn copy_state(&mut self, copy: &StateCopy) -> Result<()> {
-        let _ = copy;
-        Err(self.unsupported("copy_state"))
-    }
-
-    fn encode(&mut self, plan: &mut MediaEncode) -> Result<()> {
-        let _ = plan;
-        Err(self.unsupported("encode"))
-    }
-
-    /// How [`Engine::read_host_kv`] lays out pages, when another engine of
-    /// another layout should be able to take them; `None` when this one
-    /// cannot say.
-    fn host_kv_layout(&self) -> Option<state::PageLayout> {
-        None
-    }
-
-    /// The bytes of host kv slots `slots`, one slot after another, laid out
-    /// as this engine lays a slot out, once every copy into them has landed.
-    /// What one worker's slots hold, another worker of the same layout takes
-    /// with [`Engine::write_host_kv`].
-    fn read_host_kv(&mut self, slots: &[u32]) -> Result<Vec<u8>> {
-        let _ = slots;
-        Err(self.unsupported("read_host_kv"))
-    }
-
-    /// Writes `bytes`, laid out as [`Engine::read_host_kv`] returns them, into
-    /// host kv slots `slots`.
-    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()> {
-        let _ = (slots, bytes);
-        Err(self.unsupported("write_host_kv"))
-    }
-
-    /// The bytes of host rs rows: `slots`' state, then `pages`' buffers, one
-    /// after another, once every copy into them has landed. For a model whose
-    /// state is a window, `pages` are host windowed pages and `slots` empty.
-    fn read_host_state(&mut self, slots: &[u32], pages: &[u32]) -> Result<Vec<u8>> {
-        let _ = (slots, pages);
-        Err(self.unsupported("read_host_state"))
-    }
-
-    /// Writes `bytes`, laid out as [`Engine::read_host_state`] returns them.
-    fn write_host_state(&mut self, slots: &[u32], pages: &[u32], bytes: &[u8]) -> Result<()> {
-        let _ = (slots, pages, bytes);
-        Err(self.unsupported("write_host_state"))
-    }
+    fn copy(&mut self, copy: &SlotCopy) -> Result<()>;
 
     /// The bytes of host tier slots (CONTRACT-BC 22): for each `(shape,
     /// refs)` in order, each ref's slot of that shape at
     /// [`crate::chunk::SlotShape::tier_offset`] of the host chunks, laid out
-    /// as the device slot (what [`Engine::copy_slots`] moves whole), one
+    /// as the device slot (what [`Tiers::copy`] moves whole), one
     /// slot after another; once every copy into them has landed (the
     /// runtime waits on that copy's completion first). What a shared pool's
     /// snapshot reads of a set's state: its record's pieces and its rs list
     /// or window slots, parked on the host.
-    fn read_tier_slots(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
-        let _ = slots;
-        Err(self.unsupported("read_tier_slots"))
-    }
+    fn read(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)]) -> Result<Vec<u8>>;
 
-    /// Writes `bytes`, laid out as [`Engine::read_tier_slots`] returns
-    /// them, into host tier slots `slots`; a later [`Engine::copy_slots`]
+    /// Writes `bytes`, laid out as [`Tiers::read`] returns
+    /// them, into host tier slots `slots`; a later [`Tiers::copy`]
     /// from the host tier reads them.
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(crate::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> Result<()> {
-        let _ = (slots, bytes);
-        Err(self.unsupported("write_tier_slots"))
-    }
+    fn write(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)], bytes: &[u8]) -> Result<()>;
 
-    fn disconnect(&self, message: &str) {
-        let _ = message;
-    }
+    fn copy_kv(&mut self, copy: &KvCopy) -> Result<()>;
 
-    fn unsupported(&self, verb: &'static str) -> Error {
-        Error::unsupported(self.kind(), verb)
+    fn copy_state(&mut self, copy: &StateCopy) -> Result<()> {
+        let _ = copy;
+        Err(Error::unsupported(self.kind(), "copy_state"))
     }
+}
+
+pub trait Peers: Engine {
+    fn export(&self) -> Option<KvHandle>;
+
+    /// How [`Peers::read`] lays out pages, when another engine of
+    /// another layout should be able to take them; `None` when this one
+    /// cannot say.
+    fn layout(&self) -> Option<state::PageLayout>;
+
+    /// The bytes of host kv slots `slots`, one slot after another, laid out
+    /// as this engine lays a slot out, once every copy into them has landed.
+    /// What one worker's slots hold, another worker of the same layout takes
+    /// with [`Peers::write`].
+    fn read(&mut self, slots: &[u32]) -> Result<Vec<u8>>;
+
+    /// Writes `bytes`, laid out as [`Peers::read`] returns them, into
+    /// host kv slots `slots`.
+    fn write(&mut self, slots: &[u32], bytes: &[u8]) -> Result<()>;
+}
+
+pub trait Taps: Engine {
+    /// The groups a tapped page's planes are read out in, each as spans
+    /// `(offset, bytes)` of a host kv slot, in the order they land; `None`:
+    /// this engine taps nothing.
+    fn groups(&self) -> Option<TapGroups>;
+
+    fn subscribe(&mut self, sink: TapSink);
 }
 
 const _: () = {

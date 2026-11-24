@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -16,6 +15,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain};
+use engine::{Channels, Completion, Engine, Pool, Tiers, WeightCache};
 use eta_ir::registry::{GeometryClass, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -548,49 +548,6 @@ where
         })
     }
 
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_segments(segments).map_err(fault)
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_segments(segments).map_err(fault)
-    }
-
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
-    }
-
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.loaded_mut()?.copy_slots(copy).map_err(fault)
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_tier_slots(slots, bytes)
-            .map_err(fault)
-    }
-
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
-        self.loaded_mut()?
-            .weight_residency(residency)
-            .map_err(fault)
-    }
-
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
-    }
-
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         frame.validate_for(
             self.caps
@@ -635,113 +592,10 @@ where
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, pending));
 
-        if !self.settles_asynchronously() {
+        if self.completion().is_none() {
             self.settle_frame(&mut ticket)?;
         }
         Ok(ticket)
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        self.programs
-            .register_channel(registration)
-            .map_err(refusal)
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        let caps = self
-            .caps
-            .as_ref()
-            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
-        if !caps.admits(binding.geometry) {
-            return Err(Error::Program(format!(
-                "this load resolves {:?} on the device, so it binds at most {:?} and not {:?}",
-                caps.ports, caps.geometry, binding.geometry
-            )));
-        }
-
-        let device = self.shell.as_ref().map(Shell::device);
-        let bound = self.programs.bind(binding, device).map_err(refusal)?;
-
-        let seeds: Vec<(u32, Vec<u8>)> = binding
-            .seeds
-            .iter()
-            .map(|seed| (seed.channel, seed.bytes.clone()))
-            .collect();
-        let package = self.programs.package(binding.program).cloned();
-        let landed = match (package, self.shell.as_mut()) {
-            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
-            _ => Ok(None),
-        };
-        match landed {
-            Ok(Some(binding)) => {
-                self.adapters.insert(bound.id, binding);
-            }
-            Ok(None) => {}
-            Err(why) => {
-                let _ = self.programs.close_instance(bound.id);
-                return Err(why);
-            }
-        }
-        Ok(bound)
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
-            shell.release_adapter(&held);
-        }
-        self.programs.close_instance(id).map_err(refusal)
-    }
-
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<crate::weights::AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| crate::weights::AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.programs.close_channel(id).map_err(refusal)
-    }
-
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        self.programs
-            .publish(instance, channel, cell)
-            .map_err(refusal)
-    }
-
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
-        self.programs.take(instance, channel).map_err(refusal)
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        B::settles_asynchronously(self)
-    }
-
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -794,13 +648,148 @@ where
         Ok(())
     }
 
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        if B::settles_asynchronously(self) {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn engine::Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+}
+
+impl<B: Host> engine::Programs for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        self.programs.register(registration).map_err(refusal)
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+        let caps = self
+            .caps
+            .as_ref()
+            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
+        if !caps.admits(binding.geometry) {
+            return Err(Error::Program(format!(
+                "this load resolves {:?} on the device, so it binds at most {:?} and not {:?}",
+                caps.ports, caps.geometry, binding.geometry
+            )));
+        }
+
+        let device = self.shell.as_ref().map(Shell::device);
+        let bound = self.programs.bind(binding, device).map_err(refusal)?;
+
+        let seeds: Vec<(u32, Vec<u8>)> = binding
+            .seeds
+            .iter()
+            .map(|seed| (seed.channel, seed.bytes.clone()))
+            .collect();
+        let package = self.programs.package(binding.program).cloned();
+        let landed = match (package, self.shell.as_mut()) {
+            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
+            _ => Ok(None),
+        };
+        match landed {
+            Ok(Some(binding)) => {
+                self.adapters.insert(bound.id, binding);
+            }
+            Ok(None) => {}
+            Err(why) => {
+                let _ = self.programs.close_instance(bound.id);
+                return Err(why);
+            }
+        }
+        Ok(bound)
+    }
+
+    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
+        if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
+            shell.release_adapter(&held);
+        }
+        self.programs.close_instance(id).map_err(refusal)
+    }
+
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        let planes: Vec<crate::weights::AdapterPlane<'_>> = registration
+            .planes
+            .iter()
+            .map(|plane| crate::weights::AdapterPlane {
+                bank: plane.bank.as_str(),
+                bytes: &plane.bytes,
+            })
+            .collect();
+        self.loaded_mut()?
+            .register_adapter(registration.id, &planes)
+            .map_err(fault)
+    }
+}
+
+impl<B: Host> Channels for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        self.programs
+            .register_channel(registration)
+            .map_err(refusal)
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.programs.close_channel(id).map_err(refusal)
+    }
+
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
+        self.programs
+            .publish(instance, channel, cell)
+            .map_err(refusal)
+    }
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
+        self.programs.take(instance, channel).map_err(refusal)
+    }
+}
+
+impl<B: Host> Completion for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
         if let Some(shell) = self.shell.as_mut() {
             let _ = shell.reap();
         }
     }
+}
 
+impl<B: Host> Tiers for Gpu<B>
+where
+    Gpu<B>: Send,
+{
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
@@ -813,6 +802,56 @@ where
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
+    }
+
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault)
+    }
+}
+
+impl<B: Host> Pool for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+}
+
+impl<B: Host> WeightCache for Gpu<B>
+where
+    Gpu<B>: Send,
+{
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
+    }
+
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
     }
 }
 

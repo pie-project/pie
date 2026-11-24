@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
@@ -16,6 +15,7 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
+use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Taps, Tiers, WeightCache};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -514,10 +514,6 @@ impl Engine for Cuda {
         self.caps.as_ref().map(|caps| &caps.device)
     }
 
-    fn export_kv_handle(&self) -> Option<engine::KvHandle> {
-        self.caps.as_ref()?.kv_handle.clone()
-    }
-
     fn bind_thread(&mut self) -> EngineResult<()> {
         match self.shell.as_ref() {
             Some(shell) => shell.bind_thread().map_err(fault),
@@ -791,35 +787,223 @@ impl Engine for Cuda {
         })
     }
 
-    fn reload_weights(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
-        if self.expert.size > 1 {
-            return Err(Error::Unsupported {
-                verb: "reload_weights on a rank of an expert-parallel group",
-                engine: "cuda",
-            });
+    fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        self.refused_unlaunched = true;
+        if self.torn {
+            return Err(Error::Load(
+                "a weight reload failed partway, so this engine's weights are part old and \
+                 part new; reload them again before anything fires"
+                    .into(),
+            ));
         }
-        let target = self.target();
-        let path = reload.checkpoint.as_path();
-        let shell = self
-            .shell
-            .as_mut()
-            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))?;
-        refuse_an_artifact_for_another_deployment(
-            path,
-            shell.trace().platform.backend(),
-            width_free(&shell.trace().name),
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
-        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
-        let (planes, bytes) = shell
-            .reload_weights(&contract, path, target, &mut self.torn)
-            .map_err(fault)?;
-        Ok(engine::Reloaded { planes, bytes })
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+        self.pending = None;
+
+        let mut steps = Vec::with_capacity(frame.steps.len());
+        let mut settled = Vec::with_capacity(frame.steps.len());
+        for (index, step) in frame.steps.iter().enumerate() {
+            let at = engine::StepDone {
+                frame: id,
+                step: index as u32,
+            };
+            // A causal encoder-decoder's long prompts: their leading rows
+            // through the encoder alone first, unannounced, then the step
+            // with each such prompt's last window (`crate::replay`).
+            let split = self
+                .replay
+                .zip(self.shell.as_ref())
+                .and_then(|(replay, shell)| {
+                    replay.split(step, |word| {
+                        shell.trace().facts.plain(word) && !shell.wide(word)
+                    })
+                });
+            if let Some((head, _)) = &split {
+                if let Err(error) = self.fire_step(head, at, false) {
+                    self.pending = None;
+                    self.refused_unlaunched &= self.refused_in_prepare(&error);
+                    let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
+                    return Err(attributed(error, airborne));
+                }
+                self.refused_unlaunched = false;
+            }
+            let step = split.as_ref().map_or(step, |(_, tail)| tail);
+            let (ticket, step_settled) = match self.fire_step(step, at, true) {
+                Ok(both) => both,
+                Err(error) => {
+                    self.pending = None;
+                    self.refused_unlaunched &= self.refused_in_prepare(&error);
+                    let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
+                    return Err(attributed(error, airborne));
+                }
+            };
+            self.refused_unlaunched = false;
+            steps.push(ticket);
+            settled.push(step_settled);
+        }
+        self.pending = Some((id, settled));
+        Ok(FrameTicket { id, steps })
     }
 
-    fn register_adapter(
-        &mut self,
-        registration: &engine::adapter::AdapterRegistration,
-    ) -> EngineResult<()> {
+    fn refused_unlaunched(&self) -> bool {
+        self.refused_unlaunched
+    }
+
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
+        let Some((id, _)) = self.pending.as_ref() else {
+            return Err(Error::Invalid(format!(
+                "frame {}'s numbers are gone: nothing is pending, so either it was \
+                 never submitted to this engine or a later frame has already carved \
+                 over its arena rectangles",
+                ticket.id
+            )));
+        };
+        if *id != ticket.id {
+            return Err(Error::Invalid(format!(
+                "frame {}'s numbers are gone: frame {id} has been submitted since, and \
+                 the readout plane is one arena rectangle that every fire carves over. Ask \
+                 for a frame's readouts before submitting the next one",
+                ticket.id
+            )));
+        }
+        let (_, mut settled) = self.pending.take().expect("checked just above");
+        let shell = self.loaded_mut()?;
+        for step in &mut settled {
+            shell
+                .read_out_rows(&mut step.settled, &step.readout)
+                .map_err(fault)?;
+        }
+        for (receipt, step) in ticket.steps.iter_mut().zip(&settled) {
+            receipt.readouts = readouts_of(step);
+        }
+        self.pending = Some((ticket.id, settled));
+        Ok(())
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+
+    fn peers(&mut self) -> Option<&mut dyn Peers> {
+        Some(self)
+    }
+
+    fn taps(&mut self) -> Option<&mut dyn Taps> {
+        Some(self)
+    }
+}
+
+impl Completion for Cuda {
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.reap_landed_guests().map_err(fault),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Programs for Cuda {
+    fn compiler(&self) -> Option<engine::ProgramCompiler> {
+        self.shell.as_ref()?.program_compiler()
+    }
+
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        self.loaded_mut()?
+            .register_program(registration)
+            .map_err(fault)
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+        let caps = self
+            .caps
+            .as_ref()
+            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
+        if !caps.admits(binding.geometry) {
+            return Err(Error::Program(format!(
+                "this load resolves {:?} on the device, so it binds at most {:?} and \
+                 not {:?}",
+                caps.ports, caps.geometry, binding.geometry
+            )));
+        }
+        let seeds: Vec<(u32, Vec<u8>)> = binding
+            .seeds
+            .iter()
+            .map(|seed| (seed.channel, seed.bytes.clone()))
+            .collect();
+        let adopted: Vec<Option<Arc<crate::program::Endpoint>>> = binding
+            .channels
+            .iter()
+            .map(|id| self.channels.get(id).cloned())
+            .collect();
+        let shell = self.loaded_mut()?;
+        let id = shell
+            .bind_program(
+                binding.program,
+                &seeds,
+                extents(&binding.extents),
+                binding.geometry,
+                binding.device_resolved,
+                &adopted,
+                &binding.channels,
+            )
+            .map_err(fault)?;
+        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let bound = match landed {
+            Ok(bound) => bound,
+            Err(why) => {
+                let _ = shell.close_program_instance(id);
+                return Err(why);
+            }
+        };
+        if let Some(bound) = bound {
+            self.adapters.insert(id, bound);
+        }
+        Ok(BoundInstance {
+            id,
+            program: binding.program,
+            geometry: binding.geometry,
+        })
+    }
+
+    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
+        let held = self.adapters.remove(&id);
+        let shell = self.loaded_mut()?;
+        if let Some(held) = held {
+            shell.release_adapter(held);
+        }
+        shell.close_program_instance(id).map_err(fault)
+    }
+
+    fn adapter(&mut self, registration: &engine::adapter::AdapterRegistration) -> EngineResult<()> {
         let planes: Vec<crate::AdapterPlane<'_>> = registration
             .planes
             .iter()
@@ -832,30 +1016,138 @@ impl Engine for Cuda {
             .register_adapter(registration.id, &planes)
             .map_err(fault)
     }
+}
 
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+impl Channels for Cuda {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        if self.channels.contains_key(&registration.id) {
+            return Err(Error::Program(format!(
+                "channel {} is already registered on this engine",
+                registration.id
+            )));
+        }
+        let numel = registration
+            .shape
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>()
+            .max(1);
+        let device_only = registration.host_role == eta_ir::container::HostRole::None;
+        let cell_bytes = u32::try_from(if device_only {
+            crate::program::launch::native_cell_bytes(registration.dtype.program_dtype(), numel)
+        } else {
+            eta_exec::wire_cell_bytes(registration.dtype.program_dtype(), numel)
+        })
+        .map_err(|_| {
+            Error::Program(format!(
+                "channel {}'s cell is wider than a u32 counts",
+                registration.id
+            ))
+        })?;
+        let capacity = registration.capacity.max(1);
+        let stream = self.loaded_mut()?.stream();
+        let endpoint = Arc::new(
+            crate::program::Endpoint::open(registration.host_role, cell_bytes, capacity, stream)
+                .map_err(fault)?,
+        );
+        let mirror = (!device_only).then(|| HostMirror {
+            memory: endpoint.clone(),
+            cell_bytes,
+            capacity,
+        });
+        self.channels.insert(registration.id, endpoint);
+        Ok(RegisteredChannel {
+            id: registration.id,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+            mirror,
+        })
     }
 
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.channels.remove(&id);
+        Ok(())
     }
 
-    fn weight_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
-        self.loaded_mut()?
-            .weight_residency(residency)
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
+        let stream = self.loaded_mut()?.stream();
+        self.instance(instance)?
+            .publish(channel, cell, stream)
             .map_err(fault)
     }
 
-    fn weight_uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
+        self.instance(instance)?.take(channel).map_err(fault)
+    }
+}
+
+impl Peers for Cuda {
+    fn export(&self) -> Option<engine::KvHandle> {
+        self.caps.as_ref()?.kv_handle.clone()
     }
 
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    fn layout(&self) -> Option<state::PageLayout> {
+        self.shell.as_ref()?.host_kv_layout(1)
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn read(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_host_kv(slots).map_err(fault)
+    }
+
+    fn write(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_host_kv(slots, bytes)
+            .map_err(fault)
+    }
+}
+
+impl Tiers for Cuda {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
+        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.loaded_mut()?
+            .write_tier_slots(slots, bytes)
+            .map_err(fault)
+    }
+
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+        copy.validate()?;
+        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
+        // 22): a kv copy is within the device.
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
+            return Err(Error::Unsupported {
+                verb: kv_copy_direction(copy.src, copy.dst),
+                engine: "cuda",
+            });
+        }
+        let page_size = self.loaded_mut()?.paging().page_size;
+        let moves = copy.runs(page_size)?;
+        // Windowed pages a write into a shared one copies first ride the
+        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
+        let windowed: Vec<engine::transfer::KvRun> = copy
+            .windowed
+            .iter()
+            .map(|&(src, dst)| engine::transfer::KvRun {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page_size,
+            })
+            .collect();
+        self.loaded_mut()?
+            .copy_kv_with(&moves, &windowed, !copy.moves.is_empty())
+            .map_err(fault)
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::store::Tier;
         use crate::store::layout::{FIXED, LIST, WINDOW};
         let tier = |domain| match domain {
@@ -932,337 +1224,71 @@ impl Engine for Cuda {
             .copy_token_slots(copy.shape == WINDOW, &runs)
             .map_err(fault)
     }
+}
 
-    fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        self.refused_unlaunched = true;
-        if self.torn {
-            return Err(Error::Load(
-                "a weight reload failed partway, so this engine's weights are part old and \
-                 part new; reload them again before anything fires"
-                    .into(),
-            ));
+impl Pool for Cuda {
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_segments(segments).map_err(fault)
+    }
+
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_segments(segments).map_err(fault)
+    }
+
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+}
+
+impl WeightCache for Cuda {
+    fn reload(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
+        if self.expert.size > 1 {
+            return Err(Error::Unsupported {
+                verb: "reload_weights on a rank of an expert-parallel group",
+                engine: "cuda",
+            });
         }
-        frame.validate_for(
-            self.caps
-                .as_ref()
-                .map_or(engine::Serves::NONE, engine::Serves::of),
+        let target = self.target();
+        let path = reload.checkpoint.as_path();
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))?;
+        refuse_an_artifact_for_another_deployment(
+            path,
+            shell.trace().platform.backend(),
+            width_free(&shell.trace().name),
         )?;
-        let id = FrameId(self.next_frame);
-        self.next_frame = self.next_frame.wrapping_add(1);
-        self.pending = None;
-
-        let mut steps = Vec::with_capacity(frame.steps.len());
-        let mut settled = Vec::with_capacity(frame.steps.len());
-        for (index, step) in frame.steps.iter().enumerate() {
-            let at = engine::StepDone {
-                frame: id,
-                step: index as u32,
-            };
-            // A causal encoder-decoder's long prompts: their leading rows
-            // through the encoder alone first, unannounced, then the step
-            // with each such prompt's last window (`crate::replay`).
-            let split = self
-                .replay
-                .zip(self.shell.as_ref())
-                .and_then(|(replay, shell)| {
-                    replay.split(step, |word| {
-                        shell.trace().facts.plain(word) && !shell.wide(word)
-                    })
-                });
-            if let Some((head, _)) = &split {
-                if let Err(error) = self.fire_step(head, at, false) {
-                    self.pending = None;
-                    self.refused_unlaunched &= self.refused_in_prepare(&error);
-                    let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
-                    return Err(attributed(error, airborne));
-                }
-                self.refused_unlaunched = false;
-            }
-            let step = split.as_ref().map_or(step, |(_, tail)| tail);
-            let (ticket, step_settled) = match self.fire_step(step, at, true) {
-                Ok(both) => both,
-                Err(error) => {
-                    self.pending = None;
-                    self.refused_unlaunched &= self.refused_in_prepare(&error);
-                    let airborne = self.shell.as_ref().map_or(0, Shell::airborne_steps);
-                    return Err(attributed(error, airborne));
-                }
-            };
-            self.refused_unlaunched = false;
-            steps.push(ticket);
-            settled.push(step_settled);
-        }
-        self.pending = Some((id, settled));
-        Ok(FrameTicket { id, steps })
+        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
+        let (planes, bytes) = shell
+            .reload_weights(&contract, path, target, &mut self.torn)
+            .map_err(fault)?;
+        Ok(engine::Reloaded { planes, bytes })
     }
 
-    fn settles_asynchronously(&self) -> bool {
-        true
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map_err(fault)
     }
 
-    fn refused_unlaunched(&self) -> bool {
-        self.refused_unlaunched
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
     }
+}
 
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
-    }
-
+impl Taps for Cuda {
     /// One rank's planes hold a band of each layer's heads, so a
     /// tensor-parallel rank taps nothing.
-    fn tap_groups(&self) -> Option<engine::TapGroups> {
+    fn groups(&self) -> Option<engine::TapGroups> {
         self.shell.as_ref()?.tap_groups()
     }
 
-    fn on_tapped(&mut self, sink: engine::TapSink) {
+    fn subscribe(&mut self, sink: engine::TapSink) {
         if let Some(shell) = self.shell.as_mut() {
             shell.on_tapped(sink.clone());
         }
         self.tap_sink = Some(sink);
-    }
-
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
-        let Some((id, _)) = self.pending.as_ref() else {
-            return Err(Error::Invalid(format!(
-                "frame {}'s numbers are gone: nothing is pending, so either it was \
-                 never submitted to this engine or a later frame has already carved \
-                 over its arena rectangles",
-                ticket.id
-            )));
-        };
-        if *id != ticket.id {
-            return Err(Error::Invalid(format!(
-                "frame {}'s numbers are gone: frame {id} has been submitted since, and \
-                 the readout plane is one arena rectangle that every fire carves over. Ask \
-                 for a frame's readouts before submitting the next one",
-                ticket.id
-            )));
-        }
-        let (_, mut settled) = self.pending.take().expect("checked just above");
-        let shell = self.loaded_mut()?;
-        for step in &mut settled {
-            shell
-                .read_out_rows(&mut step.settled, &step.readout)
-                .map_err(fault)?;
-        }
-        for (receipt, step) in ticket.steps.iter_mut().zip(&settled) {
-            receipt.readouts = readouts_of(step);
-        }
-        self.pending = Some((ticket.id, settled));
-        Ok(())
-    }
-
-    fn publish_landed(&mut self) -> EngineResult<()> {
-        match self.shell.as_mut() {
-            Some(shell) => shell.reap_landed_guests().map_err(fault),
-            None => Ok(()),
-        }
-    }
-
-    fn program_compiler(&self) -> Option<engine::ProgramCompiler> {
-        self.shell.as_ref()?.program_compiler()
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.loaded_mut()?
-            .register_program(registration)
-            .map_err(fault)
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        if self.channels.contains_key(&registration.id) {
-            return Err(Error::Program(format!(
-                "channel {} is already registered on this engine",
-                registration.id
-            )));
-        }
-        let numel = registration
-            .shape
-            .iter()
-            .map(|&dim| dim as usize)
-            .product::<usize>()
-            .max(1);
-        let device_only = registration.host_role == eta_ir::container::HostRole::None;
-        let cell_bytes = u32::try_from(if device_only {
-            crate::program::launch::native_cell_bytes(registration.dtype.program_dtype(), numel)
-        } else {
-            eta_exec::wire_cell_bytes(registration.dtype.program_dtype(), numel)
-        })
-        .map_err(|_| {
-            Error::Program(format!(
-                "channel {}'s cell is wider than a u32 counts",
-                registration.id
-            ))
-        })?;
-        let capacity = registration.capacity.max(1);
-        let stream = self.loaded_mut()?.stream();
-        let endpoint = Arc::new(
-            crate::program::Endpoint::open(registration.host_role, cell_bytes, capacity, stream)
-                .map_err(fault)?,
-        );
-        let mirror = (!device_only).then(|| HostMirror {
-            memory: endpoint.clone(),
-            cell_bytes,
-            capacity,
-        });
-        self.channels.insert(registration.id, endpoint);
-        Ok(RegisteredChannel {
-            id: registration.id,
-            reader_wait_id: 0,
-            writer_wait_id: 0,
-            mirror,
-        })
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        let caps = self
-            .caps
-            .as_ref()
-            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
-        if !caps.admits(binding.geometry) {
-            return Err(Error::Program(format!(
-                "this load resolves {:?} on the device, so it binds at most {:?} and \
-                 not {:?}",
-                caps.ports, caps.geometry, binding.geometry
-            )));
-        }
-        let seeds: Vec<(u32, Vec<u8>)> = binding
-            .seeds
-            .iter()
-            .map(|seed| (seed.channel, seed.bytes.clone()))
-            .collect();
-        let adopted: Vec<Option<Arc<crate::program::Endpoint>>> = binding
-            .channels
-            .iter()
-            .map(|id| self.channels.get(id).cloned())
-            .collect();
-        let shell = self.loaded_mut()?;
-        let id = shell
-            .bind_program(
-                binding.program,
-                &seeds,
-                extents(&binding.extents),
-                binding.geometry,
-                binding.device_resolved,
-                &adopted,
-                &binding.channels,
-            )
-            .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
-        let bound = match landed {
-            Ok(bound) => bound,
-            Err(why) => {
-                let _ = shell.close_program_instance(id);
-                return Err(why);
-            }
-        };
-        if let Some(bound) = bound {
-            self.adapters.insert(id, bound);
-        }
-        Ok(BoundInstance {
-            id,
-            program: binding.program,
-            geometry: binding.geometry,
-        })
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        let held = self.adapters.remove(&id);
-        let shell = self.loaded_mut()?;
-        if let Some(held) = held {
-            shell.release_adapter(held);
-        }
-        shell.close_program_instance(id).map_err(fault)
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.channels.remove(&id);
-        Ok(())
-    }
-
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        let stream = self.loaded_mut()?.stream();
-        self.instance(instance)?
-            .publish(channel, cell, stream)
-            .map_err(fault)
-    }
-
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
-        self.instance(instance)?.take(channel).map_err(fault)
-    }
-
-    fn host_kv_layout(&self) -> Option<state::PageLayout> {
-        self.shell.as_ref()?.host_kv_layout(1)
-    }
-
-    fn read_host_kv(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_host_kv(slots).map_err(fault)
-    }
-
-    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_host_kv(slots, bytes)
-            .map_err(fault)
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_tier_slots(slots, bytes)
-            .map_err(fault)
-    }
-
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
-        copy.validate()?;
-        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
-        // 22): a kv copy is within the device.
-        let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
-            return Err(Error::Unsupported {
-                verb: kv_copy_direction(copy.src, copy.dst),
-                engine: "cuda",
-            });
-        }
-        let page_size = self.loaded_mut()?.paging().page_size;
-        let moves = copy.runs(page_size)?;
-        // Windowed pages a write into a shared one copies first ride the
-        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
-        let windowed: Vec<engine::transfer::KvRun> = copy
-            .windowed
-            .iter()
-            .map(|&(src, dst)| engine::transfer::KvRun {
-                src_page: src,
-                src_token: 0,
-                dst_page: dst,
-                dst_token: 0,
-                tokens: page_size,
-            })
-            .collect();
-        self.loaded_mut()?
-            .copy_kv_with(&moves, &windowed, !copy.moves.is_empty())
-            .map_err(fault)
     }
 }
 

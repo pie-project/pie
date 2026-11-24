@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use ::engine::{ChannelRegistration, ProgramRegistration, StateCopy};
+use ::engine::{ChannelRegistration, Engine, ProgramRegistration, StateCopy};
 
+use crate::engine::verbs::serve;
 use crate::engine::{
     BoundInstance, ChannelJoin, EngineBox, EngineId, InstanceBindingPlan, RegisteredChannel,
     SchedulerLimits, SubmissionCompletion, WorkItemCompletion,
@@ -292,12 +293,12 @@ enum SchedulerItem {
 /// A change to how much of the pool has memory under it.
 #[derive(Debug, Clone)]
 pub(crate) enum PoolOp {
-    /// A shared pool backs segments `0..n` (`Engine::commit_segments`).
+    /// A shared pool backs segments `0..n` (`Pool::commit`).
     CommitSegments(u32),
-    /// A shared pool gives back segments `n..` (`Engine::release_segments`).
+    /// A shared pool gives back segments `n..` (`Pool::release`).
     ReleaseSegments(u32),
     /// A shared pool's chunks move, ahead of every fire queued after it
-    /// (`Engine::evacuate`).
+    /// (`Pool::evacuate`).
     Evacuate(::engine::chunk::Evacuation),
 }
 
@@ -314,19 +315,16 @@ pub(crate) enum HostKvOp {
     CopyRead(::engine::KvCopy, Vec<u32>),
     /// The bytes of host kv slots.
     Read(Vec<u32>),
-    /// The bytes of host rs rows: state slots, then buffer pages.
-    ReadState(Vec<u32>, Vec<u32>),
-    WriteState(Vec<u32>, Vec<u32>, Vec<u8>),
-    /// The bytes of host tier slots, shape by shape (`Engine::read_tier_slots`).
+    /// The bytes of host tier slots, shape by shape (`Tiers::read`).
     ReadTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>),
     WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
-    /// The engine's tap groups (`Engine::tap_groups`), as JSON.
+    /// The engine's tap groups (`Taps::groups`), as JSON.
     TapGroups,
-    /// The weight cache's resident set (`Engine::weight_residency`), ahead
+    /// The weight cache's resident set (`WeightCache::set_residency`), ahead
     /// of every fire queued after it.
     WeightResidency(::engine::chunk::WeightResidency),
     /// The engine's weight use record since it last answered
-    /// (`Engine::weight_uses`), as JSON.
+    /// (`WeightCache::uses`), as JSON.
     WeightUses,
     ReloadWeights(std::path::PathBuf),
 }
@@ -1041,9 +1039,9 @@ impl BatchScheduler {
         frame_size: usize,
         compiler: Arc<std::sync::OnceLock<(::engine::ProgramCompiler, Option<String>)>>,
     ) {
-        let engine = crate::engine::take_engine_backend(engine_id).ok();
-        if let Some(engine) = engine.as_ref()
-            && let Some(compile) = engine.program_compiler()
+        let mut engine = crate::engine::take_engine_backend(engine_id).ok();
+        if let Some(engine) = engine.as_mut()
+            && let Some(compile) = engine.programs().and_then(|programs| programs.compiler())
         {
             let backend = crate::engine::verbs::codegen_backend(engine).map(str::to_owned);
             let _ = compiler.set((compile, backend));
@@ -2722,7 +2720,8 @@ impl BatchScheduler {
         let outstanding = std::mem::take(instances);
         for (instance_id, instance) in outstanding {
             if let Some(engine) = engine.as_mut()
-                && let Err(err) = engine.close_instance(instance_id)
+                && let Err(err) = serve(engine, Engine::programs, "close_instance")
+                    .and_then(|programs| programs.close(instance_id))
             {
                 tracing::warn!(
                     instance_id = instance_id.0,
@@ -2738,7 +2737,8 @@ impl BatchScheduler {
         let outstanding = std::mem::take(channels).into_ids();
         for channel_id in outstanding {
             if let Some(engine) = engine.as_mut()
-                && let Err(err) = engine.close_channel(channel_id)
+                && let Err(err) = serve(engine, Engine::channels, "close_channel")
+                    .and_then(|channels| channels.close(channel_id))
             {
                 tracing::warn!(
                     channel_id = channel_id.0,

@@ -12,11 +12,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step, StepVoxels};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use engine::{Channels, Engine, Programs};
 use engine_xla::{DeviceBoot, Xla};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -658,7 +658,7 @@ impl Rig {
         let bound = bind(container, lanes, self.caps()).expect("the program binds");
         let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
         self.engine
-            .register_program(&ProgramRegistration {
+            .register(&ProgramRegistration {
                 launch,
                 ..Default::default()
             })
@@ -677,8 +677,9 @@ impl Rig {
     ) -> ChannelId {
         let id = ChannelId(self.next_channel);
         self.next_channel += 1;
-        self.engine
-            .register_channel(&ChannelRegistration {
+        Channels::open(
+            &mut self.engine,
+            &ChannelRegistration {
                 id,
                 shape,
                 dtype: ChanDType::Concrete(dtype),
@@ -687,14 +688,15 @@ impl Rig {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
-            })
-            .expect("the channel registers");
+            },
+        )
+        .expect("the channel registers");
         id
     }
 
     pub fn bind(&mut self, program: ProgramId, channels: Vec<ChannelId>, rows: u32) -> InstanceId {
         self.engine
-            .bind_instance(&InstanceBinding {
+            .bind(&InstanceBinding {
                 program,
                 channels,
                 seeds: Vec::new(),
@@ -745,7 +747,7 @@ impl Rig {
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let accepted = self
             .engine
-            .publish_channel(instance, dense, &bytes)
+            .publish(instance, dense, &bytes)
             .expect("the cell publishes");
         assert!(accepted, "the ring had room");
     }
@@ -753,7 +755,7 @@ impl Rig {
     pub fn take(&mut self, instance: InstanceId, dense: u32) -> Vec<f32> {
         let bytes = self
             .engine
-            .take_channel(instance, dense)
+            .take(instance, dense)
             .expect("the channel reads")
             .expect("the channel holds a cell");
         bytes

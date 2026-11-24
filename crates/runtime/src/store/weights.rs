@@ -271,11 +271,17 @@ pub trait WeightPort {
 
 impl<E: ::engine::Engine + ?Sized> WeightPort for E {
     fn uses(&mut self) -> ::engine::Result<WeightUses> {
-        self.weight_uses()
+        let kind = self.kind();
+        self.weights()
+            .ok_or(::engine::Error::unsupported(kind, "weight_uses"))?
+            .uses()
     }
 
     fn set_residency(&mut self, residency: &WeightResidency) -> ::engine::Result<()> {
-        self.weight_residency(residency)
+        let kind = self.kind();
+        self.weights()
+            .ok_or(::engine::Error::unsupported(kind, "weight_residency"))?
+            .set_residency(residency)
     }
 }
 

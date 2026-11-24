@@ -1430,7 +1430,7 @@ impl KvStore {
 
     /// A shared pool's host slots for a read or a write none of the
     /// planner's: kv list slots of its host tier, whose bytes the engine
-    /// reads and writes by those refs (`Engine::read_tier_slots`), not by
+    /// reads and writes by those refs (`Tiers::read`), not by
     /// `read_host_kv`. `None` off a shared pool, or if the host lacks them.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn alloc_tier_slots(&mut self, n: usize) -> Option<Vec<HostKvSlotId>> {

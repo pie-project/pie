@@ -23,7 +23,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -34,6 +33,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
+use engine::{Channels, Completion, Engine, Pool, Programs, Tiers};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -503,14 +503,10 @@ impl Engine for Xla {
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, settles));
         tracing::debug!(frame = id.0, "xla submitted");
-        if !self.settles_asynchronously() {
+        if self.completion().is_none() {
             self.settle_frame(&mut ticket)?;
         }
         Ok(ticket)
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        !synchronous()
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -537,20 +533,33 @@ impl Engine for Xla {
         Ok(())
     }
 
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        if synchronous() { None } else { Some(self) }
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+}
+
+impl Programs for Xla {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
         self.programs.register(registration).map_err(refusal)
     }
 
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        self.programs
-            .register_channel(registration)
-            .map_err(refusal)
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         let caps = self
             .caps
             .as_ref()
@@ -585,14 +594,14 @@ impl Engine for Xla {
         Ok(bound)
     }
 
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
         if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
             shell.release_adapter(&held);
         }
         self.programs.close_instance(id).map_err(refusal)
     }
 
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
         let planes: Vec<crate::weights::AdapterPlane<'_>> = registration
             .planes
             .iter()
@@ -605,34 +614,64 @@ impl Engine for Xla {
             .register_adapter(registration.id, &planes)
             .map_err(fault)
     }
+}
 
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
+impl Channels for Xla {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        self.programs
+            .register_channel(registration)
+            .map_err(refusal)
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
         self.programs.close_channel(id).map_err(refusal)
     }
 
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         self.programs
             .publish(instance, channel, cell)
             .map_err(refusal)
     }
 
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.programs.take(instance, channel).map_err(refusal)
     }
+}
 
+impl Completion for Xla {
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         self.sink = Some(sink);
     }
+}
 
+impl Pool for Xla {
+    /// The pool is fixed at load: one segment, committed whole.
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        if segments <= 1 {
+            return Ok(());
+        }
+        Err(Error::Invalid(format!(
+            "this pool is one segment fixed at load; {segments} cannot be committed"
+        )))
+    }
+
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        if segments >= 1 {
+            return Ok(());
+        }
+        Err(Error::Invalid(
+            "this pool is one segment fixed at load and is never released".into(),
+        ))
+    }
+
+    /// Moves chunks within the fixed pool (the runtime does not ask it of a
+    /// `Growth::Fixed` pool; served for a defragmenting caller).
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
+    }
+}
+
+impl Tiers for Xla {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let served = self
@@ -663,39 +702,11 @@ impl Engine for Xla {
         Ok(())
     }
 
-    /// The pool is fixed at load: one segment, committed whole.
-    fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
-        if segments <= 1 {
-            return Ok(());
-        }
-        Err(Error::Invalid(format!(
-            "this pool is one segment fixed at load; {segments} cannot be committed"
-        )))
-    }
-
-    fn release_segments(&mut self, segments: u32) -> EngineResult<()> {
-        if segments >= 1 {
-            return Ok(());
-        }
-        Err(Error::Invalid(
-            "this pool is one segment fixed at load and is never released".into(),
-        ))
-    }
-
-    /// Moves chunks within the fixed pool (the runtime does not ask it of a
-    /// `Growth::Fixed` pool; served for a defragmenting caller).
-    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
-        self.loaded_mut()?.evacuate(evacuation).map_err(fault)
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
     }
 
-    fn write_tier_slots(
+    fn write(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
@@ -709,7 +720,7 @@ impl Engine for Xla {
     /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
     /// from sc/tier-shared's contract) lands here; until that contract is
     /// merged only device-to-device copies are served.
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         let tier = |domain| match domain {

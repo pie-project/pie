@@ -602,7 +602,7 @@ impl Shell {
     }
 
     /// Once every copy into the host tier has landed (the swap stream's and
-    /// the stream's own): see `Engine::read_tier_slots`.
+    /// the stream's own): see `Tiers::read`.
     pub fn read_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
@@ -613,7 +613,7 @@ impl Shell {
     }
 
     /// Behind every copy that touches the host tier: see
-    /// `Engine::write_tier_slots`.
+    /// `Tiers::write`.
     pub fn write_tier_slots(
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],

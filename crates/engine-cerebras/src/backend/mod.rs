@@ -8,7 +8,6 @@ mod launch;
 mod posted;
 mod stream;
 
-use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::chunk::{ChunkFacts, DegenerateBytes};
@@ -17,6 +16,7 @@ use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, La
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{DeviceReach, MemoryDomain};
+use engine::{Channels, Completion, Engine, Programs, Tiers};
 use eta_ir::registry::{GeometryClass, PortMask};
 
 use kv::Kv;
@@ -397,177 +397,6 @@ impl Engine for CerebrasEngine {
         })
     }
 
-    /// Recurrent states replay from their tokens: a copy is not a device move here.
-    fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
-        let _ = copy;
-        Err(Error::Unsupported {
-            verb: "`copy_state` on the wafer program (its state replays from tokens)",
-            engine: "cerebras-spatial",
-        })
-    }
-
-    /// The load states its pools pinned (`ChunkFacts::degenerate`), so the runtime moves its kv
-    /// through `copy_kv`; there is no shared pool and no host or disk tier.
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        let _ = copy;
-        Err(Error::Unsupported {
-            verb: "`copy_slots` on the wafer program (its pools are pinned, device tier only: \
-                   kv moves through `copy_kv`)",
-            engine: "cerebras-spatial",
-        })
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        let _ = slots;
-        Err(Error::Unsupported {
-            verb: "`read_tier_slots` on the wafer program (it states no host tier)",
-            engine: "cerebras-spatial",
-        })
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        let _ = (slots, bytes);
-        Err(Error::Unsupported {
-            verb: "`write_tier_slots` on the wafer program (it states no host tier)",
-            engine: "cerebras-spatial",
-        })
-    }
-
-    fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
-        copy.validate()?;
-        if self.model.as_ref().is_some_and(|w| w.paging.is_some()) {
-            // a unit program's pages hold its K / V on the wafer: no copy moves them
-            return Err(Error::Unsupported {
-                verb: "`copy_kv` on a unit program (its pages are the wafer's K / V)",
-                engine: "cerebras-spatial",
-            });
-        }
-        let t0 = std::time::Instant::now();
-        self.drain();
-        tracing::info!(
-            pages = copy.src_page_ids.len(),
-            drain_ms = t0.elapsed().as_secs_f64() * 1e3,
-            "spatial: copy_kv"
-        );
-        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
-            tracing::debug!(target: "spatial_trace", "spatial-trace copy_kv: {copy:?}");
-        }
-        let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if Some(copy.src) != device || Some(copy.dst) != device {
-            return Err(Error::Unsupported {
-                verb: "`copy_kv` between domains other than this load's device",
-                engine: "cerebras-spatial",
-            });
-        }
-        let size = self.kv.page_size.max(1);
-        for run in copy.runs(size)? {
-            let src: Vec<Option<u32>> = self
-                .kv
-                .pages
-                .get(&run.src_page)
-                .cloned()
-                .unwrap_or_else(|| vec![None; size as usize]);
-            let dst = self
-                .kv
-                .pages
-                .entry(run.dst_page)
-                .or_insert_with(|| vec![None; size as usize]);
-            self.kv.copied.insert(run.dst_page);
-            for k in 0..run.tokens as usize {
-                if let (Some(&cell), Some(slot)) = (
-                    src.get(run.src_token as usize + k),
-                    dst.get_mut(run.dst_token as usize + k),
-                ) {
-                    *slot = cell;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        self.programs
-            .register_channel(registration)
-            .map_err(refusal)
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        let caps = self
-            .caps
-            .as_ref()
-            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
-        if !caps.admits(binding.geometry) {
-            return Err(Error::Program(format!(
-                "this load binds at most {:?} and not {:?}",
-                caps.geometry, binding.geometry
-            )));
-        }
-        self.programs.bind(binding).map_err(refusal)
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        self.drain();
-        self.programs.close_instance(id).map_err(refusal)
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.drain();
-        self.programs.close_channel(id).map_err(refusal)
-    }
-
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        self.programs
-            .publish(instance, channel, cell)
-            .map_err(refusal)
-    }
-
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
-        self.programs.take(instance, channel).map_err(refusal)
-    }
-
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
-    }
-
-    fn settles_asynchronously(&self) -> bool {
-        self.asynchronous()
-    }
-
-    fn publish_landed(&mut self) -> EngineResult<()> {
-        self.pump();
-        Ok(())
-    }
-
-    fn register_adapter(
-        &mut self,
-        registration: &engine::adapter::AdapterRegistration,
-    ) -> EngineResult<()> {
-        Err(no_adapter(registration.id))
-    }
-
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         refuse_adapters(frame)?;
         frame.validate_for(
@@ -631,6 +460,178 @@ impl Engine for CerebrasEngine {
                 receipt.readouts = read.clone();
             }
         }
+        Ok(())
+    }
+
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        if self.asynchronous() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+}
+
+impl Tiers for CerebrasEngine {
+    /// Recurrent states replay from their tokens (the program holds one
+    /// sequence's): a copy is not a device move here.
+    fn copy_state(&mut self, copy: &engine::transfer::StateCopy) -> EngineResult<()> {
+        let _ = copy;
+        Err(Error::Unsupported {
+            verb: "`copy_state` on the wafer program (its state replays from tokens)",
+            engine: "cerebras-spatial",
+        })
+    }
+
+    /// The load states its pools pinned (`ChunkFacts::degenerate`), so the
+    /// runtime moves its kv through `copy_kv`; there is no shared pool and
+    /// no host or disk tier to move slots between.
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        let _ = copy;
+        Err(Error::Unsupported {
+            verb: "`copy_slots` on the wafer program (its pools are pinned, device tier only: \
+                   kv moves through `copy_kv`)",
+            engine: "cerebras-spatial",
+        })
+    }
+
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
+        let _ = slots;
+        Err(Error::Unsupported {
+            verb: "`read_tier_slots` on the wafer program (it states no host tier)",
+            engine: "cerebras-spatial",
+        })
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        let _ = (slots, bytes);
+        Err(Error::Unsupported {
+            verb: "`write_tier_slots` on the wafer program (it states no host tier)",
+            engine: "cerebras-spatial",
+        })
+    }
+
+    fn copy_kv(&mut self, copy: &engine::transfer::KvCopy) -> EngineResult<()> {
+        copy.validate()?;
+        let t0 = std::time::Instant::now();
+        self.drain();
+        tracing::info!(
+            pages = copy.src_page_ids.len(),
+            drain_ms = t0.elapsed().as_secs_f64() * 1e3,
+            "spatial: copy_kv"
+        );
+        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
+            tracing::debug!(target: "spatial_trace", "spatial-trace copy_kv: {copy:?}");
+        }
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if Some(copy.src) != device || Some(copy.dst) != device {
+            return Err(Error::Unsupported {
+                verb: "`copy_kv` between domains other than this load's device",
+                engine: "cerebras-spatial",
+            });
+        }
+        let size = self.kv.page_size.max(1);
+        for run in copy.runs(size)? {
+            let src: Vec<Option<u32>> = self
+                .kv
+                .pages
+                .get(&run.src_page)
+                .cloned()
+                .unwrap_or_else(|| vec![None; size as usize]);
+            let dst = self
+                .kv
+                .pages
+                .entry(run.dst_page)
+                .or_insert_with(|| vec![None; size as usize]);
+            self.kv.copied.insert(run.dst_page);
+            for k in 0..run.tokens as usize {
+                if let (Some(&cell), Some(slot)) = (
+                    src.get(run.src_token as usize + k),
+                    dst.get_mut(run.dst_token as usize + k),
+                ) {
+                    *slot = cell;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Programs for CerebrasEngine {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        self.programs.register(registration).map_err(refusal)
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+        let caps = self
+            .caps
+            .as_ref()
+            .ok_or_else(|| Error::Program("bind_instance before load".to_string()))?;
+        if !caps.admits(binding.geometry) {
+            return Err(Error::Program(format!(
+                "this load binds at most {:?} and not {:?}",
+                caps.geometry, binding.geometry
+            )));
+        }
+        self.programs.bind(binding).map_err(refusal)
+    }
+
+    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
+        self.drain();
+        self.programs.close_instance(id).map_err(refusal)
+    }
+
+    fn adapter(&mut self, registration: &engine::adapter::AdapterRegistration) -> EngineResult<()> {
+        Err(no_adapter(registration.id))
+    }
+}
+
+impl Channels for CerebrasEngine {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        self.programs
+            .register_channel(registration)
+            .map_err(refusal)
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.drain();
+        self.programs.close_channel(id).map_err(refusal)
+    }
+
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
+        self.programs
+            .publish(instance, channel, cell)
+            .map_err(refusal)
+    }
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
+        self.programs.take(instance, channel).map_err(refusal)
+    }
+}
+
+impl Completion for CerebrasEngine {
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        self.pump();
         Ok(())
     }
 }

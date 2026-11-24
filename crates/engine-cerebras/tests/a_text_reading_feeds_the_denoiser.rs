@@ -9,11 +9,11 @@ mod common;
 use std::path::Path;
 
 use common::{MINI, rows};
-use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::fire::{Attachment, FrameSubmission, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
+use engine::{Channels, Engine, Programs};
 use engine_cpu::Forward;
 use eta_dsl::prelude::*;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Stage};
@@ -128,7 +128,7 @@ fn text_pass(engine: &mut engine_cerebras::CerebrasEngine, tokens: &[u32]) -> Ve
     let stages = eta_compiler::plan::compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
     let program = engine
-        .register_program(&ProgramRegistration {
+        .register(&ProgramRegistration {
             program_hash: bound.hash,
             launch,
             ..Default::default()
@@ -139,7 +139,7 @@ fn text_pass(engine: &mut engine_cerebras::CerebrasEngine, tokens: &[u32]) -> Ve
     for (i, decl) in container.channels.iter().enumerate() {
         let id = ChannelId(200 + i as u64 + 100 * u64::from(n));
         engine
-            .register_channel(&ChannelRegistration {
+            .open(&ChannelRegistration {
                 id,
                 shape: decl.shape.dims().to_vec(),
                 dtype: decl.dtype,
@@ -153,7 +153,7 @@ fn text_pass(engine: &mut engine_cerebras::CerebrasEngine, tokens: &[u32]) -> Ve
         channels.push(id);
     }
     let instance = engine
-        .bind_instance(&InstanceBinding {
+        .bind(&InstanceBinding {
             program,
             channels,
             seeds: Vec::new(),
@@ -199,7 +199,7 @@ fn text_pass(engine: &mut engine_cerebras::CerebrasEngine, tokens: &[u32]) -> Ve
         .expect("the out channel") as u32;
     f32s(
         &engine
-            .take_channel(instance, at)
+            .take(instance, at)
             .expect("the channel reads")
             .expect("the epilogue put the rows"),
     )

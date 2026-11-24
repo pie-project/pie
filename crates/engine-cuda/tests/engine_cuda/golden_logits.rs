@@ -1449,7 +1449,7 @@ fn contract_of(trace: &Trace, path: &Path) -> std::result::Result<ModelContract,
 fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::chunk::{SlotKind, SlotRole};
     use engine::fire::{FoldLen, FrameSubmission, KvDelta, RsVerb, Step};
-    use engine::{Engine, load};
+    use engine::{Engine, Pool, load};
     let boot = engine_cuda::DeviceBoot {
         cache_dir: Some(cache.to_path_buf()),
         knobs: buffering(engine_cuda::Knobs::default()),
@@ -1499,7 +1499,7 @@ fn submitted_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         unreachable!("the fixed shape")
     };
     engine
-        .commit_segments(facts.segments.committed.max(1))
+        .commit(facts.segments.committed.max(1))
         .expect("the first segment commits");
     let mut refs = Refs::of(facts.clone(), 1);
     let record: Vec<[u32; 2]> = (0..pieces)

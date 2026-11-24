@@ -5,7 +5,7 @@
 //! submissions into one sequence of steps.
 //!
 //! A step forms when its first frame arrives. It waits for each rank that
-//! has announced a next frame (`Engine::expect_fire`) or brought one to the
+//! has announced a next frame (`Completion::expect_fire`) or brought one to the
 //! step before, and has not yet brought it, up to a deadline from when the
 //! step before is done; any other rank is idle and is not waited for, and a
 //! busy rank that misses the deadline is idle from then on. Without the
@@ -23,7 +23,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, PendingStep};
-use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::DeviceFacts;
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -33,6 +32,7 @@ use engine::load::{LoadRequest, Loaded};
 use engine::placement::Limits;
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, KvHandle};
+use engine::{Channels, Completion, Engine, Peers, Programs, Taps, Tiers};
 
 /// What a rank brings to a step: its frame and the token bucket it asks.
 pub struct Arrival<F> {
@@ -690,13 +690,6 @@ impl Engine for Rank {
         self.facts.as_ref()
     }
 
-    fn export_kv_handle(&self) -> Option<KvHandle> {
-        self.group.ranks[self.rank]
-            .try_lock()
-            .ok()?
-            .export_kv_handle()
-    }
-
     fn bind_thread(&mut self) -> EngineResult<()> {
         self.with(Engine::bind_thread)
     }
@@ -714,50 +707,6 @@ impl Engine for Rank {
                 .poison(&format!("rank {} did not load: {error}", self.rank)),
         }
         loaded
-    }
-
-    fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.with(|cuda| cuda.register_program(registration))
-    }
-
-    fn register_channel(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
-        self.with(|cuda| cuda.register_channel(registration))
-    }
-
-    fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        self.with(|cuda| cuda.bind_instance(binding))
-    }
-
-    fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        self.with(|cuda| cuda.close_instance(id))
-    }
-
-    fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.with(|cuda| cuda.close_channel(id))
-    }
-
-    fn publish_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
-        self.with(|cuda| cuda.publish_channel(instance, channel, cell))
-    }
-
-    fn take_channel(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
-        self.with(|cuda| cuda.take_channel(instance, channel))
-    }
-
-    fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        self.with(|cuda| cuda.register_adapter(registration))
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
@@ -781,78 +730,136 @@ impl Engine for Rank {
         Ok(FrameTicket { id, steps: tickets })
     }
 
-    fn settles_asynchronously(&self) -> bool {
-        true
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
+        self.with(|cuda| cuda.settle_frame(ticket))
     }
 
+    fn completion(&mut self) -> Option<&mut dyn Completion> {
+        Some(self)
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn Programs> {
+        Some(self)
+    }
+
+    fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+        Some(self)
+    }
+
+    fn peers(&mut self) -> Option<&mut dyn Peers> {
+        Some(self)
+    }
+
+    fn taps(&mut self) -> Option<&mut dyn Taps> {
+        Some(self)
+    }
+}
+
+impl Programs for Rank {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        self.with(|cuda| cuda.register(registration))
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+        self.with(|cuda| cuda.bind(binding))
+    }
+
+    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
+        self.with(|cuda| Programs::close(cuda, id))
+    }
+
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        self.with(|cuda| cuda.adapter(registration))
+    }
+}
+
+impl Channels for Rank {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        self.with(|cuda| Channels::open(cuda, registration))
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.with(|cuda| Channels::close(cuda, id))
+    }
+
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
+        self.with(|cuda| cuda.publish(instance, channel, cell))
+    }
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
+        self.with(|cuda| cuda.take(instance, channel))
+    }
+}
+
+impl Taps for Rank {
+    fn groups(&self) -> Option<engine::TapGroups> {
+        self.group.ranks[self.rank].try_lock().ok()?.groups()
+    }
+
+    fn subscribe(&mut self, sink: engine::TapSink) {
+        if let Ok(mut cuda) = self.cuda() {
+            cuda.subscribe(sink);
+        }
+    }
+}
+
+impl Completion for Rank {
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         if let Ok(mut cuda) = self.cuda() {
             cuda.on_complete(sink);
         }
     }
 
-    fn tap_groups(&self) -> Option<engine::TapGroups> {
-        self.group.ranks[self.rank].try_lock().ok()?.tap_groups()
-    }
-
-    fn on_tapped(&mut self, sink: engine::TapSink) {
-        if let Ok(mut cuda) = self.cuda() {
-            cuda.on_tapped(sink);
-        }
-    }
-
-    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
-        self.with(|cuda| cuda.settle_frame(ticket))
-    }
-
     fn publish_landed(&mut self) -> EngineResult<()> {
-        self.with(Engine::publish_landed)
+        self.with(Completion::publish_landed)
     }
 
     fn expect_fire(&mut self, _submission: &Step) {
         self.group.steps.announce(self.rank);
+    }
+}
+
+impl Peers for Rank {
+    fn export(&self) -> Option<KvHandle> {
+        self.group.ranks[self.rank].try_lock().ok()?.export()
+    }
+
+    fn layout(&self) -> Option<state::PageLayout> {
+        self.group.ranks[self.rank].try_lock().ok()?.layout()
+    }
+
+    fn read(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
+        self.with(|cuda| Peers::read(cuda, slots))
+    }
+
+    fn write(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
+        self.with(|cuda| Peers::write(cuda, slots, bytes))
+    }
+}
+
+impl Tiers for Rank {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
+        self.with(|cuda| Tiers::read(cuda, slots))
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.with(|cuda| Tiers::write(cuda, slots, bytes))
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         self.with(|cuda| cuda.copy_kv(copy))
     }
 
-    fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.with(|cuda| cuda.copy_slots(copy))
-    }
-
-    fn host_kv_layout(&self) -> Option<state::PageLayout> {
-        self.group.ranks[self.rank]
-            .try_lock()
-            .ok()?
-            .host_kv_layout()
-    }
-
-    fn read_host_kv(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
-        self.with(|cuda| cuda.read_host_kv(slots))
-    }
-
-    fn write_host_kv(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        self.with(|cuda| cuda.write_host_kv(slots, bytes))
-    }
-
-    fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
-        self.with(|cuda| cuda.read_tier_slots(slots))
-    }
-
-    fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        self.with(|cuda| cuda.write_tier_slots(slots, bytes))
-    }
-
-    fn disconnect(&self, message: &str) {
-        self.group.poison(message);
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.with(|cuda| cuda.copy(copy))
     }
 }
 
