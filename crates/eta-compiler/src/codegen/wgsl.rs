@@ -417,8 +417,7 @@ pub struct Stepwise {
 /// NaN test reads the value's bits (`f32_is_nan`): the compiler took `x != x`
 /// as false, so the sort keyed NaN first.
 /// 12: the runtime's max / min combines (`cmax`, `cmin`) and the pivot's
-/// monotone test read NaN off its bits too (`f32_is_nan`), as the
-/// gpu-nan-poison change (fdc691b25) wrote them.
+/// monotone test read NaN off its bits too (`f32_is_nan`).
 /// 13: every function that returns a value ends on a return statement
 /// after its switch or if chain (FXC, which wgpu's DX12 path compiles
 /// through, sees no other way out of a switch whose cases all return).
