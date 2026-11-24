@@ -1510,13 +1510,17 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 
 **Why later.** Accepted for the new-memory PR (coordinator, 2026-11-24): the boot is fast either way, and only the picks stay on the fallback.
 
-## F80. Dense curves resumable behind serving on bounded platforms
+## F80. Stale rates and curves timed behind serving on the GPU engines
 
-**What.** A stale dense curve on a platform that bounds a submission (Android, Windows) is served by its stale figure and not timed again behind serving (`engine_gpu::rates::stale_curves`), because `measure_shapes` does not resume point by point. The coordinated export round refreshes it, the same contract CUDA's product banks keep.
+**What.** On Vulkan and wgpu a `[rates]` key or dense curve stored under a stale key is served by its stale figure (`StaleRates::Served`) until the export round or `pie tune` measures it in the foreground. A rates or curve step lays device buffers of its own (`Rig::operand`, `Rig::slab`), and nothing is allocated after load and arming, so it cannot run behind serving. The settle alone runs behind serving.
 
-**Idea.** Give `measure_shapes` the rates step's `Resume` (each point memoized with the kernels it fired, frames held to one decode step, a point past it deferred until nothing is live), then state curves `TimedBehind` on bounded platforms too.
+**Design, from the version built and taken out (sc/gpu-behind, 9ed96e195..08f07e4c9).**
+- Per-key resume: each point memoized with the kernels it fired (the stored key stays right), the step's drift and swing kept, a slice resuming at its next unmeasured point and giving back its own points when it overlapped or ran under a moving clock.
+- Frames held to one served step (`BehindServing::step`), the arrival check before every frame and every operand. A single fire past one served step never runs behind serving; its key stays served.
+- No warm-up cube behind serving: the clock settled on a small reference laid at load.
+- What is missing: operands from a scratch region laid at load (sized to the largest point a served step admits), so no point allocates after ready.
 
-**Why later.** Accepted for this round (coordinator, 2026-11-24).
+**Why later.** Taken out for this round (coordinator, 2026-11-24): it allocated after ready, and the export round covers the stale keys.
 
 ## F?? Metal: a yielded rates or curve key behind serving resumes where it stopped
 

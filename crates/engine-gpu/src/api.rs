@@ -275,9 +275,6 @@ pub struct Gpu<B: Host> {
     /// What the work behind serving was last said to be doing
     /// ([`Gpu::behind_state`]).
     said_behind: Option<&'static str>,
-    /// Each stale rate's points completed behind serving so far, by key: a
-    /// slice resumes at its next unmeasured point.
-    rates_resume: std::collections::HashMap<String, crate::rates::Resume>,
 
 }
 
@@ -304,212 +301,6 @@ impl<B: Host> Gpu<B> {
         }
     }
 
-    /// One slice behind serving of a `[rates]` key or a dense kernel's curve
-    /// the load serves by a figure stored under a stale key
-    /// (`profile::fire::Tuned::behind`): the rates step timing that key
-    /// alone over the rates the load serves by, or that curve alone. Each
-    /// frame of it reads whether a request arrived and stops the slice where
-    /// one did (`crate::rates::yielded`), so an arrival waits at most the
-    /// frame in flight; the key is timed again whole at a later idle turn.
-    /// Kept only where it had the device alone at a steady clock (the
-    /// device idle as it starts, no other lane submitting while it runs,
-    /// the device's settled clock before it no faster than after it): stored
-    /// for the next load; else discarded and timed again later. This load
-    /// serves on by the stale figure.
-    fn rate_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
-        use crate::backend::Tactics as _;
-        let Some(shell) = self.shell.as_mut() else {
-            return Ok(false);
-        };
-        let Some(key) = shell.rates_behind() else {
-            return Ok(false);
-        };
-        if !crate::backend::Context::idle(shell.device()) {
-            self.behind_state("waiting: the device is busy");
-            return Ok(false);
-        }
-        self.behind_state("running: the stale rates and curves");
-        let Some(shell) = self.shell.as_mut() else {
-            return Ok(false);
-        };
-        let max_submit = B::submit_bound(&self.boot);
-        // Under a platform's bound, each frame held to one decode step of
-        // this load, until a point is found past it.
-        // Under a platform's bound, each frame held to one decode step of
-        // this load; a key deferred once (a single fire past it) runs its
-        // long fires alone, a frame of one, once nothing is live.
-        let cap = shell
-            .decode_step_ns()
-            .map(|ns| std::time::Duration::from_nanos(ns as u64));
-        let resume = self.rates_resume.entry(key.clone()).or_default();
-        resume.begin();
-        let mut stated = shell.tuning().profile().rates();
-        stated.stale = None;
-        let submitted = (behind.others)();
-        let began = std::time::Instant::now();
-        let Some(probe) = shell.behind_probe() else {
-            return Ok(false);
-        };
-        let Some(before) =
-            crate::rates::clock_warmed_on::<B>(shell.device(), probe, behind.arrived)
-                .map_err(fault)?
-        else {
-            return Ok(true);
-        };
-        let timed: crate::error::Result<profile::fire::Rates> =
-            match key.strip_prefix(crate::rates::CURVE_BEHIND) {
-                Some(curve) => {
-                    let Some(wanted) = shell.curve_behind(curve) else {
-                        tracing::warn!(
-                            curve,
-                            "rates behind serving: the curve names no kernel of this load; not timed"
-                        );
-                        shell.rate_timed(&key);
-                        return Ok(true);
-                    };
-                    stated.kernel_tflops_by_shape = stated.kernel_tflops_by_shape.map(|all| {
-                        all.into_iter().filter(|c| c.name() != curve).collect()
-                    });
-                    B::measure_curves(
-                        shell.device(),
-                        shell.tuning(),
-                        max_submit,
-                        &stated,
-                        &[wanted],
-                        shell.curve_top(),
-                        behind.arrived,
-                    )
-                    .map(|curves| profile::fire::Rates {
-                        kernel_tflops_by_shape: Some(curves),
-                        ..profile::fire::Rates::default()
-                    })
-                }
-                None => {
-                    stated.unstate(&key);
-                    B::measure_rates(
-                        shell.device(),
-                        shell.tuning(),
-                        max_submit,
-                        &stated,
-                        behind.arrived,
-                        crate::rates::Behind { resume, cap },
-                    )
-                    .and_then(|measured| match measured.throttled {
-                        None => Ok(measured.rates),
-                        Some(ratio) => Err(crate::error::Fault::Device {
-                            call: "rates behind serving",
-                            why: format!(
-                                "the device's clock {ratio:.2}x slower at its end than its \
-                                 settled start"
-                            ),
-                        }),
-                    })
-                }
-            };
-        let ms = began.elapsed().as_secs_f64() * 1e3;
-        // A slice that stopped keeps the points it completed, where it had
-        // the device alone at a steady clock; else they are timed again.
-        let kept = |this: &mut Self, why: &str| -> EngineResult<()> {
-            let Some(shell) = this.shell.as_ref() else {
-                return Ok(());
-            };
-            let Some(probe) = shell.behind_probe() else {
-                return Ok(());
-            };
-            let after = crate::rates::read_clock_until::<B>(shell.device(), probe, &|| false)
-                .map_err(fault)?
-                .expect("never stopped");
-            let moved = (behind.others)() != submitted
-                || crate::rates::throttled(before, after).is_some();
-            let resume = this.rates_resume.entry(key.clone()).or_default();
-            if moved {
-                resume.discard();
-            }
-            tracing::info!(
-                key = %key,
-                ms,
-                done = resume.done(),
-                moved,
-                "rates behind serving: `{key}` {why}; {} points kept{}",
-                resume.done(),
-                if moved { " (this slice's taken back: overlapped, or its clock moved)" } else { "" }
-            );
-            Ok(())
-        };
-        let timed = match timed {
-            Ok(rates) => rates,
-            Err(why) if crate::rates::yielded(&why) => {
-                kept(self, "yielded to an arrival, resumed later")?;
-                return Ok(true);
-            }
-            Err(why) if crate::rates::deferred(&why) || cap.is_some() => {
-                // A point whose single fire is past one decode step (or a
-                // step that cannot hold its frames to it): behind serving
-                // never runs such a fire, since an arrival landing on it
-                // would wait for it. The key stays served by its stale
-                // figure; the export round or `pie tune` measures it in the
-                // foreground. A key is stored whole, so the points it
-                // finished are not stored on their own.
-                tracing::info!(
-                    key = %key,
-                    ms,
-                    "rates behind serving: `{key}` stays served by its stale figure: a point's \
-                     single fire is past one decode step of this load, which behind serving \
-                     never runs ({why}); the export round or `pie tune` measures it"
-                );
-                self.rates_resume.remove(&key);
-                if let Some(shell) = self.shell.as_mut() {
-                    shell.rate_timed(&key);
-                }
-                return Ok(true);
-            }
-            Err(why @ crate::error::Fault::Device { call: "rates behind serving", .. }) => {
-                tracing::info!(key = %key, ms, "rates behind serving: `{key}` discarded ({why})");
-                return Ok(true);
-            }
-            Err(why) => return Err(fault(why)),
-        };
-        let after = match shell.behind_probe() {
-            Some(probe) => crate::rates::read_clock_until::<B>(shell.device(), probe, &|| false)
-                .map_err(fault)?
-                .expect("never stopped"),
-            None => before,
-        };
-        let why = if (behind.others)() != submitted {
-            Some("another lane submitted while it ran".to_string())
-        } else {
-            crate::rates::throttled(before, after).map(|ratio| {
-                format!("the device's clock {ratio:.2}x slower after it than its settled start")
-            })
-        };
-        if let Some(why) = why {
-            tracing::info!(
-                key = %key,
-                ms,
-                "rates behind serving: `{key}` discarded ({why}); timed again later"
-            );
-            if let Some(resume) = self.rates_resume.get_mut(&key) {
-                resume.discard();
-            }
-            return Ok(true);
-        }
-        self.rates_resume.remove(&key);
-        let Some(shell) = self.shell.as_mut() else {
-            return Ok(false);
-        };
-        if let Err(why) = B::save_rates(shell.device(), &self.boot, &timed) {
-            tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
-        }
-        let left = shell.rate_timed(&key);
-        tracing::info!(
-            key = %key,
-            ms,
-            left,
-            "rates behind serving: `{key}` timed and stored for the next load (this load serves \
-             on by its stale figure); {left} left"
-        );
-        Ok(true)
-    }
     /// `step` held to the platform's bound on one submission, where the
     /// load states one (`crate::submit`): the shell told to walk it a layer
     /// at a time where it is past the bound whole, and its lanes' refusal,
@@ -648,7 +439,6 @@ impl<B: Host> Gpu<B> {
             warned_in_fire: false,
             vocab: None,
             said_behind: None,
-            rates_resume: std::collections::HashMap::new(),
 
         }
     }
@@ -1848,9 +1638,7 @@ where
     }
 
     fn measures_behind(&self) -> bool {
-        self.shell
-            .as_ref()
-            .is_some_and(|shell| shell.measures_behind() || shell.rates_behind().is_some())
+        self.shell.as_ref().is_some_and(Shell::measures_behind)
     }
 
     fn behind_need(&self) -> Option<engine::BehindNeed> {
@@ -1869,17 +1657,16 @@ where
             return Ok(false);
         };
         shell.set_served_step(behind.step);
-        // The settle's ranges first (decode's rows before the large ones),
-        // where the runtime took the slots its next fire asks for; else,
-        // and after, each rate and curve served by a stale figure (its step
-        // writes no pool slot: it runs on any idle turn).
+        // The settle's ranges, decode's rows before the large ones, where
+        // the runtime took the slots its next fire asks for. Behind serving
+        // is the settle alone: a stale rate or curve needs device buffers
+        // of its own, which nothing lays after ready, and is served by its
+        // stale figure until the export round or `pie tune`.
         let need = shell.behind_need();
         let seats_short = match (need, behind.seats) {
             (Some(need), Some(seats)) => seats.len() < need.lanes as usize,
             _ => false,
         };
-        // A point longer than one decode step runs only with no process
-        // live, so a live request never waits behind it.
         // A point longer than one decode step never runs behind serving
         // (an arrival landing on it would wait for it): the settle ends
         // there, what it decided stored, the rest of its ranges serving
@@ -1887,19 +1674,17 @@ where
         // them.
         if need.is_some_and(|need| need.long) {
             shell.end_behind_settle();
-            return self.rate_behind(behind);
+            return Ok(false);
         }
-        if !shell.measures_behind() || seats_short {
-            if shell.rates_behind().is_none() {
-                if seats_short {
-                    self.behind_state(
-                        "waiting: the pool holds no room for one settle point's slots beyond \
-                         live work (the settle runs on a later idle turn; the fallback picks \
-                         serve)",
-                    );
-                }
-            }
-            return self.rate_behind(behind);
+        if !shell.measures_behind() {
+            return Ok(false);
+        }
+        if seats_short {
+            self.behind_state(
+                "waiting: the pool holds no room for one settle point's slots beyond live work \
+                 (the settle runs on a later idle turn; the fallback picks serve)",
+            );
+            return Ok(false);
         }
         self.behind_state("running: the dense settle");
         let Some(shell) = self.shell.as_mut() else {

@@ -159,34 +159,6 @@ pub trait Serve: Backend {
         rates: &profile::fire::Rates,
     ) -> Result<()>;
 
-    /// The rates of `device` that `stated` lacks, under `tuning`'s tactics,
-    /// each timed frame under `max_submit` (the backend's rates step,
-    /// `crate::rates::measure_yielding`): what a load times behind serving
-    /// of a key it served by a stale figure (`profile::fire::Tuned::behind`).
-    /// `yield_to` is read before each frame: an arrival stops the step
-    /// (`crate::rates::yielded`).
-    fn measure_rates(
-        device: &Self::Context,
-        tuning: &Self::Tuning,
-        max_submit: Option<std::time::Duration>,
-        stated: &profile::fire::Rates,
-        yield_to: &dyn Fn() -> bool,
-        behind: crate::rates::Behind<'_>,
-    ) -> Result<engine::rates::Measured>;
-
-    /// Each of `wanted`'s dense kernel curves to `top` rows on `device`
-    /// (`crate::rates::measure_shapes`), behind serving as
-    /// [`Serve::measure_rates`] is.
-    fn measure_curves(
-        device: &Self::Context,
-        tuning: &Self::Tuning,
-        max_submit: Option<std::time::Duration>,
-        stated: &profile::fire::Rates,
-        wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
-        top: u32,
-        yield_to: &dyn Fn() -> bool,
-    ) -> Result<Vec<profile::fire::KernelCurve>>;
-
     /// `tuning` with each dense kernel's rate curve at each of the model's
     /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
     /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
@@ -1118,13 +1090,13 @@ pub struct Shell<B: Serve> {
     /// The dense settle left to weigh behind serving, where no stored or
     /// committed settle of the load's key decided every range.
     behind: Option<Behind>,
-    /// The `[rates]` keys this load serves by a figure stored under a stale
-    /// key, left to time behind serving (`profile::fire::Tuned::behind`).
-    rates_behind: Vec<String>,
     /// The reference kernel the work behind serving reads the device's
     /// clock by, laid at load where any is left (nothing is laid or
     /// compiled after ready).
     behind_probe: Option<crate::submit::Probe<B>>,
+    /// The arms' timestamps the settle behind serving times its fires by,
+    /// laid at load where the load lays none of its own.
+    behind_stamps: Vec<B::Stamps>,
     /// One served step as the runtime last told it ([`Shell::set_served_step`]).
     served_step_ns: Option<f64>,
 
@@ -2952,10 +2924,6 @@ impl<B: Serve> Shell<B> {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
-        let rates_behind = {
-            use crate::backend::Tactics as _;
-            tuning.profile().tuned().behind.clone()
-        };
         let mut shell = Shell {
             preseated: Vec::new(),
             tuning,
@@ -2975,8 +2943,8 @@ impl<B: Serve> Shell<B> {
             settled: Vec::new(),
             to_store: None,
             behind: None,
-            rates_behind,
             behind_probe: None,
+            behind_stamps: Vec::new(),
             served_step_ns: None,
             built: B::compiled(&pipelines),
             recorded: 0,
@@ -3377,14 +3345,6 @@ impl<B: Serve> Shell<B> {
         kernels
     }
 
-    /// The next `[rates]` key this load serves by a figure stored under a
-    /// stale key, to time behind serving (`profile::fire::Tuned::behind`);
-    /// `None` where none is left.
-    #[must_use]
-    pub fn rates_behind(&self) -> Option<String> {
-        self.rates_behind.first().cloned()
-    }
-
     /// The settle left behind serving ends here: its next point runs longer
     /// than one decode step, which behind serving never runs. What it
     /// decided stays stored; its other ranges serve the fallback picks
@@ -3404,13 +3364,18 @@ impl<B: Serve> Shell<B> {
     }
 
     /// Lays the reference the work behind serving reads the device's clock
-    /// by, where any is left: at load, before ready (nothing is laid or
-    /// compiled after).
+    /// by, and the timestamps its fires are timed by, where a settle is
+    /// left: at load, before ready (nothing is laid or compiled after).
     pub fn lay_behind_probe(&mut self) -> Result<()> {
         use crate::backend::Tactics as _;
-        if self.behind_probe.is_none() && (self.behind.is_some() || !self.rates_behind.is_empty()) {
+        if self.behind_probe.is_none() && self.behind.is_some() {
             let reference = self.tuning.gemm(self.tier, crate::submit::PROBE.0);
             self.behind_probe = Some(crate::submit::Probe::<B>::new(&self.device, reference)?);
+            if self.stamps.is_empty() {
+                self.behind_stamps = (0..self.inputs.len())
+                    .map(|_| B::lay_stamps(&self.device, 1))
+                    .collect::<Result<Vec<_>>>()?;
+            }
         }
         Ok(())
     }
@@ -3420,16 +3385,6 @@ impl<B: Serve> Shell<B> {
     #[must_use]
     pub fn behind_probe(&self) -> Option<&crate::submit::Probe<B>> {
         self.behind_probe.as_ref()
-    }
-
-    /// The kernel and plane the curve `name` (`<kind>/<key> at <n>x<k>`)
-    /// names among this load's dense kernels at its planes, to time behind
-    /// serving.
-    #[must_use]
-    pub fn curve_behind(&self, name: &str) -> Option<(kernels_slang::linear::gemm::Tactic, u32, u32)> {
-        let kernels = crate::rates::dense_kernels(B::TARGET, &self.tuning, self.tier, self.curve_top());
-        let shapes: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
-        crate::rates::curve_named(B::TARGET, &kernels, &shapes, name)
     }
 
     /// One decode step of this load, ns: the settle's first point (at its
@@ -3448,18 +3403,6 @@ impl<B: Serve> Shell<B> {
     /// outlast.
     pub fn set_served_step(&mut self, step: Option<std::time::Duration>) {
         self.served_step_ns = step.map(|s| s.as_nanos() as f64);
-    }
-
-    /// The rows a curve of this load is timed to: its widest rung.
-    #[must_use]
-    pub fn curve_top(&self) -> u32 {
-        self.dense.entries().into_iter().max().unwrap_or(1)
-    }
-
-    /// `key` timed behind serving and stored: how many are left.
-    pub fn rate_timed(&mut self, key: &str) -> usize {
-        self.rates_behind.retain(|k| k != key);
-        self.rates_behind.len()
     }
 
     /// Whether `tactic` has an entry at every dense plane of this load: a
@@ -3514,17 +3457,16 @@ impl<B: Serve> Shell<B> {
         let serving = self.dense.clone();
         let split = (self.split_next, self.split_layers);
         let walk_only = std::mem::replace(&mut self.walk_only, true);
+        // Each fire timed by the arms' timestamps: the load's own where a
+        // bound laid them, else those laid at load for the work behind
+        // serving (nothing is laid after ready).
         let laid = self.stamps.is_empty();
-        let slice = (|| -> Result<bool> {
-            if laid {
-                self.stamps = (0..self.inputs.len())
-                    .map(|_| B::lay_stamps(&self.device, 1))
-                    .collect::<Result<Vec<_>>>()?;
-            }
-            self.behind_slice(&mut behind, others, arrived, seats)
-        })();
         if laid {
-            self.stamps.clear();
+            std::mem::swap(&mut self.stamps, &mut self.behind_stamps);
+        }
+        let slice = self.behind_slice(&mut behind, others, arrived, seats);
+        if laid {
+            std::mem::swap(&mut self.stamps, &mut self.behind_stamps);
         }
         self.spans = None;
         self.walk_only = walk_only;
