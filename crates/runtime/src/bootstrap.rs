@@ -314,8 +314,9 @@ impl BootstrapHandle {
     }
 }
 
-/// Records the memory maps this process holds before its engines load:
-/// what the sandbox pool leaves the rest of the process to grow by. Call
+/// Records the address space and memory maps this process holds before
+/// its engines load: what the sandbox pool leaves the rest of the process
+/// to grow by. Call
 /// it before the engines load; [`bootstrap`] comes after them.
 pub use crate::sandbox_pool::note_maps_before_engines;
 
@@ -1614,13 +1615,15 @@ fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConf
     };
     drop(probe);
     let cost = layout.cost();
-    let instances = sandbox_pool::size_pool(
-        runtime.wasm_max_instances,
-        sandbox_pool::read_address_space(),
-        &cost,
-    )?;
+    let space = sandbox_pool::read_address_space();
+    let has = space.as_ref().ok().map_or_else(
+        || "an address space not read".to_string(),
+        |space| format!("{} and {}", space.bytes_shown(), space.maps_shown()),
+    );
+    let instances = sandbox_pool::size_pool(runtime.wasm_max_instances, space, &cost)?;
     tracing::info!(
-        "sandbox pool: {instances} instances{}, {} of address space ({} each)",
+        "sandbox pool: {instances} instances{}, {} of address space ({} and {} memory maps each); \
+         this process has {has}",
         if runtime.wasm_max_instances.is_some() {
             " as configured"
         } else {
@@ -1628,6 +1631,7 @@ fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConf
         },
         sandbox_pool::show(cost.bytes(u64::from(instances))),
         sandbox_pool::show(cost.instance_bytes),
+        cost.instance_maps,
     );
 
     pooling_config.total_component_instances(instances);

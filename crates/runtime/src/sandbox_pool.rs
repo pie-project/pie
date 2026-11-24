@@ -9,36 +9,60 @@
 //! the count is held to what fits, and a configured count that does not fit
 //! is refused by name.
 //!
-//! The pool leaves the rest of the process as much again as it maps when
-//! the pool is laid (the engines, their drivers and the weights are loaded
-//! by then): what it maps at boot is the measure of what it maps beside the
-//! pool.
-//!
-//! Memory maps are not reckoned so: an engine's maps (a Vulkan engine's
-//! recorded command buffers, tens of thousands of them) are laid at load
-//! and do not grow after, so the rest of the process is left the maps it
-//! held before its engines loaded ([`note_maps_before_engines`]), the part
-//! of it that grows with serving, not a copy of all it holds.
+//! The pool is laid after the engines load, and what an engine maps (its
+//! weights, its driver's ranges, a Vulkan engine's recorded command
+//! buffers, tens of thousands of maps) is laid at load and does not grow
+//! after. So the rest of the process is left what it mapped, in bytes and
+//! in maps, before its engines loaded ([`note_maps_before_engines`]): the
+//! part of it that grows with serving, not a copy of all it holds.
+//! Unrecorded, it is left as much again as it holds.
 
 use anyhow::{Result, bail};
 use std::sync::OnceLock;
 
-/// The memory maps this process held before its engines loaded.
-#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
-static MAPS_BEFORE_ENGINES: OnceLock<u64> = OnceLock::new();
+/// What this process held before its engines loaded.
+#[derive(Debug, Clone, Copy)]
+struct BeforeEngines {
+    /// Address space it mapped.
+    mapped: u64,
+    /// Memory maps it held, where they are counted.
+    maps: Option<u64>,
+}
 
-/// Records the memory maps this process holds now, before its engines
-/// load: what the pool leaves the rest of the process to grow by. The
-/// first record stands; where maps are not read, nothing is recorded.
+static BEFORE_ENGINES: OnceLock<BeforeEngines> = OnceLock::new();
+
+/// Records the address space and memory maps this process holds now,
+/// before its engines load: what the pool leaves the rest of the process
+/// to grow by. The first record stands; where the address space is not
+/// read, nothing is recorded.
 pub fn note_maps_before_engines() {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Some(used) = std::fs::read_to_string("/proc/self/maps")
-        .ok()
-        .and_then(|maps| parse_maps(&maps, None).ok())
-        .and_then(|space| space.maps)
-        .map(|maps| maps.used)
-    {
-        let _ = MAPS_BEFORE_ENGINES.set(used);
+    if BEFORE_ENGINES.get().is_some() {
+        return;
+    }
+    if let Ok(space) = read_address_space() {
+        let _ = BEFORE_ENGINES.set(BeforeEngines {
+            mapped: space.mapped,
+            maps: space.maps.map(|maps| maps.used),
+        });
+    }
+}
+
+/// Keeps for the rest of the process what it held before its engines
+/// loaded, or, unrecorded, all it holds now.
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )),
+    allow(dead_code)
+)]
+fn keep_for_the_rest(space: &mut AddressSpace) {
+    let before = BEFORE_ENGINES.get();
+    space.reserve = before.map_or(space.mapped, |before| before.mapped);
+    if let Some(maps) = &mut space.maps {
+        maps.reserve = before.and_then(|before| before.maps).unwrap_or(maps.used);
     }
 }
 
@@ -122,6 +146,10 @@ pub(crate) struct AddressSpace {
     pub free: u64,
     /// What the process maps now.
     pub mapped: u64,
+    /// What the rest of the process is left to grow by: what it mapped
+    /// before its engines loaded (an engine's mappings are laid at load
+    /// and do not grow), or, unrecorded, all it maps now.
+    pub reserve: u64,
     /// The process's cap on its address space (`RLIMIT_AS`), if any.
     pub limit: Option<u64>,
     /// Memory maps, where the process has a cap on them.
@@ -165,20 +193,61 @@ impl std::fmt::Display for MapCount {
 
 impl AddressSpace {
     /// Address space the pool may take: one range, leaving the rest of
-    /// the process as much again as it maps now.
+    /// the process its reserve ([`AddressSpace::reserve`]).
     pub fn pool_bytes(&self) -> u64 {
-        let rest = self.mapped;
-        let mut bytes = self.largest_free.min(self.free.saturating_sub(rest));
+        let mut bytes = self
+            .largest_free
+            .min(self.free.saturating_sub(self.reserve));
         if let Some(limit) = self.limit {
-            bytes = bytes.min(limit.saturating_sub(self.mapped.saturating_add(rest)));
+            bytes = bytes.min(
+                limit
+                    .saturating_sub(self.mapped)
+                    .saturating_sub(self.reserve),
+            );
         }
         bytes
+    }
+
+    /// The address space the pool may take, with what it is reckoned from.
+    pub fn bytes_shown(&self) -> String {
+        let mut shown = format!(
+            "{} (the largest free range {}; {} free, less {} kept for the rest of the process",
+            brief(self.pool_bytes()),
+            brief(self.largest_free),
+            brief(self.free),
+            brief(self.reserve),
+        );
+        if let Some(limit) = self.limit {
+            shown += &format!(
+                "; RLIMIT_AS {}, less {} mapped and the {} kept",
+                brief(limit),
+                brief(self.mapped),
+                brief(self.reserve),
+            );
+        }
+        shown.push(')');
+        shown
     }
 
     /// Memory maps the pool's instances may split off, leaving the rest of
     /// the process its reserve ([`MapCount::reserve`]).
     pub fn pool_maps(&self) -> Option<u64> {
         self.maps.map(|maps| maps.pool())
+    }
+
+    /// The memory maps the pool may split off, with what they are
+    /// reckoned from.
+    pub fn maps_shown(&self) -> String {
+        match self.maps {
+            Some(maps) => format!(
+                "{} memory maps (the cap {}, less {} held, less {} kept for the rest of the process)",
+                maps.pool(),
+                maps.max,
+                maps.used,
+                maps.reserve
+            ),
+            None => "no cap on memory maps".to_string(),
+        }
     }
 
     /// The most instances a pool laid at `cost` holds here.
@@ -226,7 +295,7 @@ pub(crate) fn size_pool(
                     "[sandbox] max_instances = {n} needs {} of address space; this process has {} \
                      (it holds {fits} instances of {} each)",
                     show(needs),
-                    show(space.pool_bytes()),
+                    space.bytes_shown(),
                     show(cost.instance_bytes),
                 );
             }
@@ -244,12 +313,26 @@ pub(crate) fn size_pool(
              this process has {} and {}",
             show(cost.bytes(1)),
             cost.instance_maps,
-            show(space.pool_bytes()),
-            space
-                .maps
-                .map_or_else(|| "no cap on maps".to_string(), |maps| maps.to_string()),
+            space.bytes_shown(),
+            space.maps_shown(),
         ),
         None => Ok(u32::try_from(fits).unwrap_or(u32::MAX)),
+    }
+}
+
+/// `bytes` in the largest binary unit it reaches.
+pub(crate) fn brief(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
     }
 }
 
@@ -289,8 +372,8 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     space.limit = address_space_limit();
     if let Some(maps) = &mut space.maps {
         maps.max = max_maps;
-        maps.reserve = MAPS_BEFORE_ENGINES.get().copied().unwrap_or(maps.used);
     }
+    keep_for_the_rest(&mut space);
     Ok(space)
 }
 
@@ -344,6 +427,7 @@ pub(crate) fn parse_maps(maps: &str, floor: Option<u64>) -> Result<AddressSpace>
         largest_free,
         free,
         mapped,
+        reserve: 0,
         limit: None,
         maps: Some(MapCount {
             used: ranges.len() as u64,
@@ -386,15 +470,19 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     // What the process maps does not lie in one place (the shared region,
     // the GPU's ranges, the weights), so the range free in one piece is
     // found, not reckoned; and, as `pool_bytes` leaves the rest of the
-    // process as much again as it maps now, that range less what it maps:
-    // the GPU's and the driver's later mappings may land in it.
-    Ok(AddressSpace {
-        largest_free: largest_reservation(free).saturating_sub(mapped),
+    // process its reserve, that range less the reserve: the rest's later
+    // mappings may land in it.
+    let mut space = AddressSpace {
+        largest_free: largest_reservation(free),
         free,
         mapped,
+        reserve: 0,
         limit: address_space_limit(),
         maps: None,
-    })
+    };
+    keep_for_the_rest(&mut space);
+    space.largest_free = space.largest_free.saturating_sub(space.reserve);
+    Ok(space)
 }
 
 /// The largest range, to the GiB and at most `upper`, an address-only
@@ -474,6 +562,7 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
         largest_free: 0,
         free: 0,
         mapped: 0,
+        reserve: 0,
         limit: None,
         maps: None,
     };
@@ -512,6 +601,7 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
         );
     }
     space.largest_free = largest_reservation(space.largest_free);
+    keep_for_the_rest(&mut space);
     Ok(space)
 }
 
@@ -662,6 +752,7 @@ mod tests {
             largest_free: 400 * GIB,
             free: 480 * GIB,
             mapped: 30 * GIB,
+            reserve: 30 * GIB,
             limit: None,
             maps: Some(maps(2_000, 65_530, 2_000)),
         };
@@ -674,7 +765,7 @@ mod tests {
         assert_eq!(size_pool(None, Ok(space), &cost).unwrap(), 99);
         assert_eq!(size_pool(Some(64), Ok(space), &cost).unwrap(), 64);
 
-        // RLIMIT_AS holds it to the cap less twice what is mapped.
+        // RLIMIT_AS holds it to the cap less what is mapped and the reserve.
         let capped = AddressSpace {
             limit: Some(100 * GIB),
             ..space
@@ -701,6 +792,7 @@ mod tests {
             largest_free: 400 * GIB,
             free: 480 * GIB,
             mapped: 30 * GIB,
+            reserve: 30 * GIB,
             limit: None,
             maps: Some(maps(2_000, 65_530, 2_000)),
         };
@@ -744,6 +836,57 @@ mod tests {
         assert_eq!(size_pool(Some(7), unread(), &cost).unwrap(), 7);
     }
 
+    /// The phone after the Vulkan engine's arm walk: the engine's mappings
+    /// (weights, driver ranges, recordings) are laid at load and do not
+    /// grow. The rest of the process is left what it mapped before the
+    /// engine loaded, not a copy of all it maps, free and under RLIMIT_AS.
+    #[test]
+    fn the_bytes_reserve_is_what_the_process_mapped_before_its_engines() {
+        let cost = default_layout().cost();
+        let phone = AddressSpace {
+            largest_free: 120 * GIB,
+            free: 130 * GIB,
+            mapped: 60 * GIB,
+            reserve: 2 * GIB,
+            limit: None,
+            maps: None,
+        };
+        // The largest range binds, not 130 - 2 x 60 = 10 GiB.
+        assert_eq!(phone.pool_bytes(), 120 * GIB);
+        let by = |bytes: u64| (bytes - cost.pool_bytes) / cost.instance_bytes;
+        assert_eq!(phone.fits(&cost), by(120 * GIB));
+        let tight = AddressSpace {
+            largest_free: 200 * GIB,
+            ..phone
+        };
+        assert_eq!(tight.pool_bytes(), 128 * GIB);
+        // RLIMIT_AS: the cap less what is mapped and the reserve.
+        let capped = AddressSpace {
+            limit: Some(100 * GIB),
+            ..phone
+        };
+        assert_eq!(capped.pool_bytes(), 38 * GIB);
+
+        // Unrecorded, the reserve is all it maps; the refusal names the
+        // range, the free total, the reserve and the cap.
+        let unrecorded = AddressSpace {
+            largest_free: 3 * GIB,
+            reserve: 60 * GIB,
+            ..capped
+        };
+        let error = size_pool(None, Ok(unrecorded), &cost)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.ends_with(
+                "this process has 0 B (the largest free range 3.00 GiB; 130.00 GiB free, \
+                 less 60.00 GiB kept for the rest of the process; RLIMIT_AS 100.00 GiB, \
+                 less 60.00 GiB mapped and the 60.00 GiB kept) and no cap on memory maps"
+            ),
+            "{error}"
+        );
+    }
+
     /// The phone after the Vulkan engine's arm walk: ~51k maps held, most
     /// of them the engine's recorded command buffers, laid at load and not
     /// grown after. The rest of the process is left what it held before
@@ -757,6 +900,7 @@ mod tests {
             largest_free: 100_000 * GIB,
             free: 100_000 * GIB,
             mapped: 30 * GIB,
+            reserve: 30 * GIB,
             limit: None,
             maps: Some(maps(51_000, 65_530, 1_200)),
         };
@@ -779,7 +923,7 @@ mod tests {
             .to_string();
         assert!(
             error.ends_with(
-                "and 0 (the cap 65530, less 51000 held, less 51000 kept for the rest of the process)"
+                "and 0 memory maps (the cap 65530, less 51000 held, less 51000 kept for the rest of the process)"
             ),
             "{error}"
         );
