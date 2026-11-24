@@ -89,7 +89,30 @@ pub fn profile_kernels(on: bool) {
 
 #[must_use]
 pub fn profiling() -> bool {
-    PROFILING.load(std::sync::atomic::Ordering::Acquire)
+    PROFILING.load(std::sync::atomic::Ordering::Acquire) || profile_path().is_some()
+}
+
+/// Diagnostic: where `PIE_VK_KERNEL_PROFILE` names a file, every frame is
+/// timed by dispatch, kept ones on every replay, and the totals written there
+/// every 256 frames harvested.
+fn profile_path() -> Option<&'static std::path::Path> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("PIE_VK_KERNEL_PROFILE").map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+#[cfg(feature = "vulkan")]
+pub(crate) fn dump_profile() {
+    static HARVESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(path) = profile_path() else { return };
+    if HARVESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 != 255 {
+        return;
+    }
+    let mut text = String::new();
+    for (name, calls, ns) in KERNEL_PROFILE.rows() {
+        text.push_str(&format!("{name}\t{calls}\t{ns}\n"));
+    }
+    let _ = std::fs::write(path, text);
 }
 
 #[must_use]

@@ -1141,5 +1141,6 @@ fn next_frame(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) {
         .expect("the vector GEMM states its row tiles");
     let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
     let rows: u32 = prepared.seats.iter().map(|seat| seat.rows).sum();
-    shell.device.fixed_next(decode || rows <= tile);
+    let _ = (decode, rows, tile);
+    shell.device.fixed_next(false);
 }

@@ -5207,12 +5207,11 @@ impl<B: Serve> Shell<B> {
     }
 
     /// A fire of a kind the load stated eager (interim): a lane of an
-    /// attachment class, a fed lane, a float lane.
+    /// attachment class, a float lane.
     fn eager_kind(&self, prepared: &Prepared<'_, B>) -> bool {
         prepared.descriptor.classes.present_in_order().any(|class| {
             self.eager_classes.get(class as usize).copied().unwrap_or(false)
-        }) || !prepared.fed_lanes.is_empty()
-            || prepared.lanes.iter().any(|lane| lane.kv_less)
+        }) || prepared.lanes.iter().any(|lane| lane.kv_less)
     }
 
     /// The stated step shapes the load runs eager, by index, ascending: the
@@ -10409,7 +10408,7 @@ impl<B: Serve> Shell<B> {
                 classes = eager_classes.len(),
                 eager = ?eager_classes,
                 "request classes whose lanes carry an attachment run eager, stated at load (their \
-                 commands do not yet read it as data); fed and float fires too"
+                 commands do not yet read it as data); float fires too"
             );
         }
         let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
@@ -10504,8 +10503,7 @@ impl<B: Serve> Shell<B> {
         // the host cannot lay its misses in the arm's stage, and its gather
         // reads the fire's own (`FireBindings::row_ring`): another body.
         // Each shape carrying decode lanes is recorded so too.
-        // A fed fire is stated eager (interim, as attachment classes are).
-        let fed_too = false;
+        let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
         let capturing: Vec<bool> = (0..decoding.len()).map(|class| self.captures(class)).collect();
         // Where the trace buffers a recurrence, a decode lane carries the
         // rows it has not folded (the lagged fold): its scans are the
