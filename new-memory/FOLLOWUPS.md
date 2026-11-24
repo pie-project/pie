@@ -1552,3 +1552,21 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 - Cost: +44 armed compositions (266 from 222) and +114 MiB of bodies on every load.
 
 **Why later.** After the user's ruling (2026-11-24) an SDK pass states its rows final by default (opt-out for inferlets that retract), and compat requests with stop strings fold at fire, so no common path runs a lagged lane that commits what it carries; beam lanes fold none and stay on `~rs`. The body would cost every load for little served benefit. Take it up if lagged non-beam traffic becomes common again; kernels-cuda would mirror it with a branch-free `gdn_step_carried` (c7d47412f's `SPLIT = false` is the analogue) and `RsBody::COMMITS` for cuda.
+
+## F84. Beam host gap on Vulkan / wgpu (Spark)
+
+**What.** Untraced steady state ((t160 − t32) / 128) on dc2434637, beam against greedy at the same width: Vulkan +8 / +5 / +5% at w1 / 4 / 8, wgpu +16 / +9 / +2% (before the device-parents fix, +10–31%). Under firetl tracing (ad96433aa) beam w1 ≈ greedy c1 with no device idle; a beam step adds about 130 µs of guest recording. The fixed per-step cost shrinks with width: a host-latency step.
+
+**Why later.** User ruling (2026-11-24): beam performance no longer gates this PR; it moves to a follow-up PR. Likely fix: cheaper wgpu encoding of a step's dispatches (reuse encoded passes). Diagnostic branch: sc/gpu-firetl-trace.
+
+## F85. Metal Qwen3.5 beam +3% against same-width greedy
+
+**What.** On Metal, Qwen3.5 beam search runs 3% slower a step than greedy at the same width.
+
+**Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F86. Carried / buffered body cost for beams
+
+**What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
+
+**Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
