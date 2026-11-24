@@ -507,6 +507,7 @@ impl Core {
                 // submission naming its sets waited its fence before then.
                 unsafe { self.device.destroy_descriptor_pool(pool, None) };
             }
+            POOLS_FREED.fetch_add(pools.len() as u64, Ordering::Relaxed);
             let mut spares = self.spares.lock().expect("spares lock poisoned");
             spares.lent -= pools.len();
             spares.kept -= pools.len();
@@ -1734,6 +1735,12 @@ impl Context {
         Ok(())
     }
 
+    /// Names the descriptor sets and pools frames allocated so far (as
+    /// every 10,000 sets do).
+    pub fn name_descriptor_sets(&self) {
+        count_sets(&self.core, 0, false);
+    }
+
     /// The descriptor pools free, lent and kept now.
     #[must_use]
     pub fn descriptor_pools(&self) -> (usize, usize, usize) {
@@ -2310,21 +2317,41 @@ const SETS_PER_POOL: u32 = 1024;
 static SETS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static KEPT_SETS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POOLS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Kept frames' pools destroyed with them.
+static POOLS_FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static TUPLES: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes a kept dispatch's binding tuple (diagnostic).
+pub(crate) fn note_tuple(key: u64) {
+    TUPLES
+        .lock()
+        .expect("tuples lock poisoned")
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key);
+}
 
 fn count_sets(core: &Core, sets: u64, kept: bool) {
     if kept {
         KEPT_SETS_MADE.fetch_add(sets, Ordering::Relaxed);
     }
     let before = SETS_MADE.fetch_add(sets, Ordering::Relaxed);
-    if (before + sets) / 10_000 > before / 10_000 {
+    if sets == 0 || (before + sets) / 10_000 > before / 10_000 {
         let spares = core.spares.lock().expect("spares lock poisoned");
         tracing::info!(
             sets = before + sets,
             kept_sets = KEPT_SETS_MADE.load(Ordering::Relaxed),
             pools_made = POOLS_MADE.load(Ordering::Relaxed),
+            pools_freed = POOLS_FREED.load(Ordering::Relaxed),
             pools_free = spares.free.len(),
             pools_lent = spares.lent,
             pools_kept = spares.kept,
+            distinct_kept_tuples = TUPLES
+                .lock()
+                .expect("tuples lock poisoned")
+                .as_ref()
+                .map_or(0, std::collections::HashSet::len),
             "vulkan descriptor sets allocated so far"
         );
     }

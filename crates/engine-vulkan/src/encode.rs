@@ -611,6 +611,15 @@ impl Sink<'_> {
             ));
         }
 
+        // Diagnostic: the distinct binding tuples kept frames' sets carry,
+        // the fire block's place apart (what a shared set would key on).
+        if self.frame.kept() {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            ash::vk::Handle::as_raw(pipeline.set_layout).hash(&mut h);
+            scratch.baked.hash(&mut h);
+            crate::device::ctx::note_tuple(h.finish());
+        }
         // Where in the room each room binding lies, the fire's data.
         for past in scratch.rooms.iter().take(declared).flatten() {
             self.frame.room_past(*past);

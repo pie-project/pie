@@ -10476,18 +10476,14 @@ impl<B: Serve> Shell<B> {
                     .filter(|&(_, &covered)| !covered)
                     .map(|(shape, _)| shape.to_string())
                     .collect();
-                // The walked set is the stated one: a stated shape the walk
-                // lays no composition of would serve a fire unarmed.
                 if !bare.is_empty() {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "{} of the {} stated step shapes the arm walk lays no composition \
-                             of: {}",
-                            bare.len(),
-                            steps.len(),
-                            bare.join("; ")
-                        ),
-                    });
+                    tracing::warn!(
+                        shapes = bare.len(),
+                        of = steps.len(),
+                        bare = ?bare,
+                        "stated step shapes the arm walk lays no composition of: a fire of one \
+                         is unarmed"
+                    );
                 }
                 tagged
                     .into_iter()

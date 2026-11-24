@@ -428,6 +428,7 @@ impl Serve for Api {
     /// and none made after: each arm's forward, the feed and the guest
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
+        shell.device().name_descriptor_sets();
         shell
             .device()
             .seal_descriptor_pools(shell.readout.len() + 3)
