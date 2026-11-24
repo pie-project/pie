@@ -259,6 +259,14 @@ mod tests {
             "no-beam-list"
         }
 
+        fn committed_covers(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn skips_measuring(&self) -> bool {
+            false
+        }
+
         fn prepare_program(
             &mut self,
             _registration: &::engine::program::ProgramRegistration,
