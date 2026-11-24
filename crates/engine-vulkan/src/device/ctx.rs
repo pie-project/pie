@@ -3961,12 +3961,14 @@ impl Kept {
         for (&at, &past) in views.iter().zip(pasts) {
             binds[at].2 = past;
         }
+        // A fire with no room captures nothing: its room bindings are read
+        // by no workgroup, and stand as they are.
+        let Some((buffer, at)) = room else {
+            return Ok(true);
+        };
         if self.inner.room_fixed.load(Ordering::Acquire) {
             return Ok(false);
         }
-        let Some((buffer, at)) = room else {
-            return Ok(false);
-        };
         // A copier binds its source buffer whole, which may hold another
         // plane's rows beside the room's: it follows a room within its
         // buffer, never into another.

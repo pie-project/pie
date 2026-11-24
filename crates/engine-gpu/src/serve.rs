@@ -1280,6 +1280,11 @@ pub struct Shell<B: Serve> {
     /// ([`Shell::fill_once`] before its plan): its walk lays into a frame
     /// that records nothing, and nothing runs.
     pub arm_filled: bool,
+    /// Whether a lane's score capture is its data, not its class: every lane
+    /// of a load that captures fires its class's capturing program, and the
+    /// capture kernels walk the fire's capturing lanes (none: no workgroup).
+    /// Set where the backend records bodies, so the capture splits none.
+    pub folds_scores: bool,
     /// Serving fires that walked for their fill, since the last count.
     filled_in_fire: u64,
     /// Serving fires whose fill a lay-only pass laid, since the last count,
@@ -3179,6 +3184,7 @@ impl<B: Serve> Shell<B> {
             arming: false,
             walk_at: None,
             arm_filled: false,
+            folds_scores: false,
             filled_in_fire: 0,
             laid_at_first_fire: 0,
             lay_ns: 0,
@@ -5350,6 +5356,16 @@ impl<B: Serve> Shell<B> {
         self.voxel_seat.map(|seat| seat.dtype)
     }
 
+    /// The word a lane is classed by: its own, its score capture set where
+    /// the capture is the lane's data ([`Shell::folds_scores`]).
+    fn class_word(&self, word: u64) -> u64 {
+        if self.folds_scores {
+            self.trace.facts.with(word, poem_ir::Builtin::Scores, true)
+        } else {
+            word
+        }
+    }
+
     /// Whether lanes of `class` capture: the class writes a score row.
     fn captures(&self, class: usize) -> bool {
         self.readouts
@@ -5488,10 +5504,23 @@ impl<B: Serve> Shell<B> {
             let mut layers = Vec::with_capacity(plane.values.len());
             let mut buffer = None;
             for value in &plane.values {
+                // A capture's value in a fire none of whose lanes capture
+                // binds the absent buffer: its rows none, copied from the
+                // fire's room all the same (a copy of no region), where it
+                // has one.
                 let Some(rect) = prepared.slots.0[value.0 as usize] else {
                     buffer = None;
                     break;
                 };
+                if rect.buf == crate::NIL {
+                    let Some((room, at)) = prepared.score_room.as_ref() else {
+                        buffer = None;
+                        break;
+                    };
+                    layers.push(*at);
+                    buffer.get_or_insert_with(|| room.clone());
+                    continue;
+                }
                 if rect.width != plane.width {
                     return Err(Fault::Ceiling {
                         what: "elements in one readout row",
@@ -7068,15 +7097,15 @@ impl<B: Serve> Shell<B> {
             .zip(&lane_rows)
             .enumerate()
             .map(|(at, (seated, &rows))| match (media_of[at], clips_of[at]) {
-                (None, None) => FireLane::new(seated.lane.word, rows),
+                (None, None) => FireLane::new(self.class_word(seated.lane.word), rows),
                 (Some(shot), _) => FireLane::with_images(
-                    seated.lane.word,
+                    self.class_word(seated.lane.word),
                     rows,
                     shot.rows.len() as u32,
                     shot.rows.iter().copied().fold(0u32, u32::saturating_add),
                 ),
                 (None, Some(tile)) => FireLane::with_clips(
-                    seated.lane.word,
+                    self.class_word(seated.lane.word),
                     rows,
                     tile.boxes.len() as u32,
                     tile.boxes
@@ -7702,7 +7731,12 @@ impl<B: Serve> Shell<B> {
         // The lanes whose class captures, compacted in lane order: a key row
         // each, and a page row each of those whose program reads pages.
         let scored = Scored::of(composition.lanes().iter().map(|row| {
-            let captures = self.captures(row.class as usize);
+            let captures = self.captures(row.class as usize)
+                && (!self.folds_scores
+                    || self
+                        .trace
+                        .facts
+                        .holds(lanes[row.source as usize].lane.word, poem_ir::Builtin::Scores));
             let pages = captures
                 && lanes[row.source as usize]
                     .reads
@@ -8297,7 +8331,20 @@ impl<B: Serve> Shell<B> {
         }
 
         // A fire's capturing lanes' rows lie in the score room of its first
-        // capturing lane's pair, laid for the most lanes a fire carries.
+        // capturing lane's pair, laid for the most lanes a fire carries. A
+        // fire of a load whose capture is its lanes' data, none of whose
+        // lanes captures, binds the load's standing room (its kernels launch
+        // none and its copy moves none): the commands of a fire whose lanes
+        // capture.
+        let idle_room = if self.folds_scores
+            && !composition.lanes().iter().enumerate().any(|(lane, row)| {
+                scored.row(u32::try_from(lane).unwrap_or(u32::MAX)).is_some()
+                    && lanes[row.source as usize].scores.is_some()
+            }) {
+            self.arming_room()?
+        } else {
+            None
+        };
         let room = composition
             .lanes()
             .iter()
@@ -8308,6 +8355,7 @@ impl<B: Serve> Shell<B> {
                     .is_some()
             })
             .find_map(|(_, row)| lanes[row.source as usize].scores)
+            .or(idle_room.as_ref())
             .map(|cell| (&cell.buffer, cell.at, cell.bytes));
         let score_room = room.map(|(buffer, at, _)| (buffer.clone(), at));
         // A naming walk fires nothing: its capturing classes' rows bind the
@@ -10537,26 +10585,36 @@ impl<B: Serve> Shell<B> {
         // A body binds the pool's segments by place: their places stated
         // before the first is recorded.
         B::rebind(self)?;
+        let classes = self.compiled.classes.classes.len();
+        let mut decoding = vec![false; classes];
+        let mut prefilling = vec![false; classes];
+        // A load that captures scores fires every lane on its class's
+        // capturing program: the capture is the lane's data (a capture table
+        // its kernels walk, none: no workgroup), so it splits no class.
+        self.folds_scores = (0..classes).any(|class| self.captures(class));
         let facts = &self.trace.facts;
         let table = &self.compiled.classes;
-        let mut decoding = vec![false; table.classes.len()];
-        let mut prefilling = vec![false; table.classes.len()];
-        // The walk arms classes without a score capture, an adapter or a
-        // guest input. A class whose lanes carry one binds commands of its
-        // own per attachment, which multiplies the bodies past what a device
-        // holds; it is stated eager at load, by name, until its commands read
-        // the attachment as data. (A mask is armed: every class of a load
-        // that masks carries one.)
+        // The walk arms every class but those whose lanes carry an adapter
+        // or a guest input: such a class binds commands of its own per
+        // attachment, which multiplies the bodies past what a device holds;
+        // it is stated eager at load, by name, until its commands read the
+        // attachment as data. (A mask is armed: every class of a load that
+        // masks carries one.)
         let attached: Vec<bool> = (0..table.classes.len())
             .map(|class| {
                 let lane = self.naming_lane(class, 1).ok();
-                self.captures(class)
-                    || lane.as_ref().is_some_and(|lane| lane.adapter.is_some())
+                lane.as_ref().is_some_and(|lane| lane.adapter.is_some())
                     || lane.as_ref().is_some_and(|lane| !lane.inputs.is_empty())
             })
             .collect();
         for request in facts.requests() {
-            if let Some(class) = table.class_of(facts.word(&request) & table.mask) {
+            let word = facts.word(&request);
+            let word = if self.folds_scores {
+                facts.with(word, poem_ir::Builtin::Scores, true)
+            } else {
+                word
+            };
+            if let Some(class) = table.class_of(word & table.mask) {
                 if attached[class] {
                     continue;
                 }
@@ -10732,10 +10790,11 @@ impl<B: Serve> Shell<B> {
                         forms.push(Buffering::Tail);
                     }
                 }
-                // A capturing class's lanes read their page rows, or their key
-                // rows alone: a fire laying no page row sums none (another
-                // form of commands).
-                let pageless = [false, true];
+                // A capturing class's lanes capturing (reading their page
+                // rows, or their key rows alone: a fire laying no page row
+                // sums none), or not capturing at all: the capture is the
+                // lanes' data, the fills of one body.
+                let pageless = [0u8, 1, 4];
                 let captures = lanes.iter().any(|&(class, _)| capturing[class]);
                 // Its lanes reading out nothing, or every output their class
                 // reads out (a sampler on the host reads its logits): what a
@@ -10748,15 +10807,15 @@ impl<B: Serve> Shell<B> {
                         let lanes = lanes.clone();
                         pageless
                             .into_iter()
-                            .filter(move |&keys_only| !keys_only || captures)
-                            .flat_map(move |keys_only| {
+                            .filter(move |&capture| capture == 0 || captures)
+                            .flat_map(move |capture| {
                                 let lanes = lanes.clone();
                                 [false, true]
                                     .into_iter()
                                     .filter(move |&reads| !reads || reading)
                                     .flat_map(move |reads| {
                                         let lanes = lanes.clone();
-                                        let flags = u8::from(keys_only) | u8::from(reads) << 1;
+                                        let flags = capture | u8::from(reads) << 1;
                                         std::iter::once((lanes.clone(), false, form, flags))
                                             .chain(fed.then_some((lanes, true, form, flags)))
                                     })
@@ -10953,6 +11012,11 @@ impl<B: Serve> Shell<B> {
             .or_else(|| B::max_maps(self));
         let maps_before = map_count().unwrap_or(0);
         let mut dearest_maps = 0u64;
+        // The process's maps as last read: the file lists every map, so a
+        // read costs as many as the process holds (a kgsl map each driver
+        // allocation, on Android). A recording makes them; a shape that
+        // records none reads the count it left, re-read each 64 shapes.
+        let mut maps_seen = map_count();
         let before = rss();
         let mut dearest = 0u64;
         let mut dearest_device = 0u64;
@@ -10967,8 +11031,26 @@ impl<B: Serve> Shell<B> {
             }
         }
         // `flags`: 1 a capturing lane of the pageless form (its key rows
-        // alone), 2 every lane reading out its class's outputs.
+        // alone), 2 every lane reading out its class's outputs, 4 no lane
+        // capturing (a class that captures, fired with none).
+        let mut stride = (std::time::Instant::now(), [0u64; 10]);
         for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
+            // Under the kernel profile, each 64 shapes' time and its phases:
+            // whether the walk slows as it goes.
+            if crate::kernel_profile::phases_timed() && at % 64 == 0 && at > 0 {
+                let now: [u64; 10] = std::array::from_fn(|phase| {
+                    crate::kernel_profile::WALK_PHASES[phase].load(std::sync::atomic::Ordering::Relaxed)
+                });
+                let ms: Vec<u64> = now.iter().zip(&stride.1).map(|(n, b)| (n - b) / 1_000_000).collect();
+                tracing::info!(
+                    at,
+                    of = shapes.len(),
+                    ms = stride.0.elapsed().as_millis() as u64,
+                    phases_ms = ?ms,
+                    "arm walk stride"
+                );
+                stride = (std::time::Instant::now(), now);
+            }
             // A known lattice states eager what its allowance did; every shape
             // short of it is walked, the ones whose family an earlier shape
             // recorded filling it (their fills kept before ready).
@@ -10979,6 +11061,7 @@ impl<B: Serve> Shell<B> {
             }) {
                 break;
             }
+            let probed = std::time::Instant::now();
             let used = rss().saturating_sub(before);
             // The next shape's bodies cost what the dearest so far did, on
             // each arm: on the host (its resident bytes) and on the device
@@ -10993,12 +11076,16 @@ impl<B: Serve> Shell<B> {
             let cmds_short = most_cmds.is_some_and(|most| {
                 live_cmds.saturating_add(dearest_cmds.saturating_mul(depth as u64)) >= most
             });
-            let maps_now = map_count();
+            if at % 64 == 0 {
+                maps_seen = map_count();
+            }
+            let maps_now = maps_seen;
             let maps_short = max_maps.zip(maps_now).is_some_and(|(most, now)| {
                 now.saturating_add(dearest_maps.saturating_mul(depth as u64))
                     .saturating_add(maps_before)
                     >= most
             });
+            crate::kernel_profile::phase_if(9, probed);
             if device_short || host_short || cmds_short || maps_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
@@ -11055,10 +11142,13 @@ impl<B: Serve> Shell<B> {
             }
             let families = self.recorded;
             for arm in 0..depth {
+                let probed = std::time::Instant::now();
                 let ahead = rss();
                 let cmds_ahead = B::command_buffers(self).0;
-                let maps_ahead = map_count();
+                let maps_ahead = maps_seen;
                 let left_ahead = self.device.left();
+                let bodies_ahead = self.recorded;
+                crate::kernel_profile::phase_if(9, probed);
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
@@ -11067,6 +11157,11 @@ impl<B: Serve> Shell<B> {
                         // rows alone: its fire lays no page row.
                         if *flags & 1 != 0 {
                             lane.reads.retain(|read| read != SCORE_PAGES);
+                        }
+                        if *flags & 4 != 0 {
+                            lane.reads.clear();
+                            lane.word =
+                                self.trace.facts.with(lane.word, poem_ir::Builtin::Scores, false);
                         }
                         if *flags & 2 != 0 {
                             lane.reads.extend(readable[class].iter().cloned());
@@ -11096,7 +11191,7 @@ impl<B: Serve> Shell<B> {
                     if *fed && rows == 1 && decoding[class] {
                         lane.feed = Some(&cell);
                     }
-                    if self.captures(class) {
+                    if self.captures(class) && *flags & 4 == 0 {
                         lane.scores = arming_room.as_ref();
                     }
                 }
@@ -11144,14 +11239,23 @@ impl<B: Serve> Shell<B> {
                 // A body's cost: what it took of the host's memory or of the
                 // device's (a driver that keeps its command buffers and
                 // descriptors in device-visible memory), whichever is more.
+                // An arm that recorded no body (its fill derived, laid or
+                // walked into a family recorded before) cost none.
+                if self.recorded == bodies_ahead {
+                    recorded += 1;
+                    continue;
+                }
+                let probed = std::time::Instant::now();
                 let on_device = left_ahead.saturating_sub(self.device.left());
                 let cost = rss().saturating_sub(ahead).max(on_device);
                 dearest = dearest.max(cost);
                 dearest_device = dearest_device.max(on_device);
                 dearest_cmds = dearest_cmds.max(B::command_buffers(self).0.saturating_sub(cmds_ahead));
-                if let (Some(ahead), Some(after)) = (maps_ahead, map_count()) {
+                maps_seen = map_count();
+                if let (Some(ahead), Some(after)) = (maps_ahead, maps_seen) {
                     dearest_maps = dearest_maps.max(after.saturating_sub(ahead));
                 }
+                crate::kernel_profile::phase_if(9, probed);
                 recorded += 1;
             }
             if self.recorded > families {
