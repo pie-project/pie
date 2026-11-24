@@ -2674,15 +2674,34 @@ impl Frame {
         }
         let core = &self.inner.core;
         let d = &core.device;
-        // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
-        // owned by this thread (frames record on the thread that opened
-        // them); the head is recorded here alone and freed with the frame.
+        // A recording's head is its arm's, shared by every recording whose
+        // image fits the bytes it copies (the next power of two): it lives
+        // with the device's pools, not the frame. A frame run once has its
+        // own, freed with it.
+        let mut shared = None;
+        let bytes = if one_time {
+            bytes
+        } else {
+            let size = bytes.next_power_of_two().min(arm.bytes());
+            let heads = arm.heads.lock().expect("heads lock poisoned");
+            if let Some(&head) = heads.get(&size) {
+                return Ok(Some(head));
+            }
+            shared = Some(size);
+            size
+        };
         let head = core.alloc_cmd(self.inner.cmd_pool)?;
-        self.inner
-            .heads
-            .lock()
-            .expect("heads lock poisoned")
-            .push(head);
+        match shared {
+            Some(size) => {
+                arm.heads.lock().expect("heads lock poisoned").insert(size, head);
+            }
+            None => self
+                .inner
+                .heads
+                .lock()
+                .expect("heads lock poisoned")
+                .push(head),
+        }
         let flags = if one_time {
             vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
         } else {

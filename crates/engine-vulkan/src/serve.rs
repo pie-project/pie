@@ -434,6 +434,16 @@ impl Serve for Api {
             .seal_descriptor_pools(shell.readout.len() + 3)
     }
 
+    fn command_buffers(shell: &Shell<Api>) -> (u64, Option<u64>) {
+        let live = u64::try_from(crate::device::held_counts().0).unwrap_or(0);
+        let most = shell
+            .tuning
+            .profile()
+            .get::<crate::tuning::MaxLiveCommandBuffers>()
+            .0;
+        (live, (most > 0).then_some(u64::from(most)))
+    }
+
     fn spent() -> bool {
         crate::device::take_spent()
     }

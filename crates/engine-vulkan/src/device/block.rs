@@ -67,6 +67,10 @@ pub struct ArmBlock {
     /// write being followed by a head that copies the slice, the block),
     /// with their hash: a fire's image that matches both needs no head.
     staged: Mutex<Option<(u64, Vec<u8>)>>,
+    /// The heads recordings of the arm share ([`super::Frame`]'s head), by
+    /// the bytes each copies (a power of two, at most the block's): one
+    /// command buffer for every recording whose image fits, not one each.
+    pub(crate) heads: Mutex<std::collections::HashMap<u64, ash::vk::CommandBuffer>>,
 }
 
 impl ArmBlock {
@@ -84,6 +88,7 @@ impl ArmBlock {
                 Memory::Staging,
                 engine_gpu::books::owners::UNIFORMS,
             )?,
+            heads: Mutex::new(std::collections::HashMap::new()),
             staged: Mutex::new(None),
         }))
     }

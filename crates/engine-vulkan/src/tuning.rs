@@ -17,6 +17,14 @@ pub const FACTS: &[Var] = &[
 
 pub const AXES: &[&str] = &["rows"];
 
+/// The most command buffers the device's driver holds live, a fact of the
+/// device stated in its committed profile where measured (past it a driver
+/// may hand back a dead buffer, with no error, and fault on its first use):
+/// the arm walk stops below it, the rest stated eager. 0: none stated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.max_live_command_buffers", constant(range(0..=1_000_000)), default = 0, tune = never)]
+pub struct MaxLiveCommandBuffers(pub u32);
+
 /// The kernel a dense affine-quantised matmul runs: the first rung whose
 /// shape it fits that can run. `fill` is how full the device is: eighths of
 /// a wave of 32x64 output tiles over its cores, so a rung can say "fills the
@@ -179,7 +187,8 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeSplit>()
         .add::<DecodeSplitMinKeys>()
         .add::<DecodeThreads>()
-        .add::<SdpaTileRows>();
+        .add::<SdpaTileRows>()
+        .add::<MaxLiveCommandBuffers>();
 }
 
 /// The point a dense matmul is chosen at on a device with `cores` cores.

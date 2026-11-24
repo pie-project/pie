@@ -411,6 +411,12 @@ pub trait Serve: Backend {
         false
     }
 
+    /// The command buffers the backend holds live now, and the most its
+    /// device holds (stated in its profile; `None` where none is stated).
+    fn command_buffers(_shell: &Shell<Self>) -> (u64, Option<u64>) {
+        (0, None)
+    }
+
     /// Submits the walked `frame`.
     fn submit(
         shell: &mut Shell<Self>,
@@ -1215,6 +1221,9 @@ pub struct Shell<B: Serve> {
     /// The stated shapes the arm walk lays no composition of: stated eager
     /// at load beside the allowance's tail.
     eager_bare: Vec<usize>,
+    /// The request classes stated eager at load, by class (interim: those
+    /// whose lanes carry an attachment).
+    eager_classes: Vec<bool>,
     /// The stated step compositions ([`Shell::record_bodies`]).
     pub steps: Option<engine::StepShapes>,
     /// The composition of the step being fired, where its caller states it
@@ -3098,6 +3107,7 @@ impl<B: Serve> Shell<B> {
             eager_rows: None,
             eager_from: None,
             eager_bare: Vec::new(),
+            eager_classes: Vec::new(),
             steps: None,
             step: None,
             arming: false,
@@ -5171,6 +5181,15 @@ impl<B: Serve> Shell<B> {
             });
         }
         self.eager_rows.is_some_and(|eager| rows >= eager)
+    }
+
+    /// A fire of a kind the load stated eager (interim): a lane of an
+    /// attachment class, a fed lane, a float lane.
+    fn eager_kind(&self, prepared: &Prepared<'_, B>) -> bool {
+        prepared.descriptor.classes.present_in_order().any(|class| {
+            self.eager_classes.get(class as usize).copied().unwrap_or(false)
+        }) || !prepared.fed_lanes.is_empty()
+            || prepared.lanes.iter().any(|lane| lane.kv_less)
     }
 
     /// The stated step shapes the load runs eager, by index, ascending: the
@@ -9186,6 +9205,13 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 keep: None,
                 split: false,
             }
+        } else if self.armed && !self.arming && B::RECORDS && self.eager_kind(&prepared) {
+            // A fire of a kind the load stated eager walks eagerly.
+            self.eager_next = true;
+            Plan::Walk {
+                keep: None,
+                split: false,
+            }
         } else if self.arming && B::RECORDS {
             // An arm walk whose commands a held family's are fills that
             // family (its fill kept before ready, for the serving fires of
@@ -10301,17 +10327,59 @@ impl<B: Serve> Shell<B> {
         let table = &self.compiled.classes;
         let mut decoding = vec![false; table.classes.len()];
         let mut prefilling = vec![false; table.classes.len()];
+        // Interim: the walk arms plain classes only. A class whose lanes
+        // carry an attachment (a score capture, a mask, an adapter, a guest
+        // input) binds commands of its own per attachment, which multiplies
+        // the bodies past what a device holds; it is stated eager at load
+        // until its commands read the attachment as data.
+        let mut attached = vec![false; table.classes.len()];
         for request in facts.requests() {
-            // Every request the trace serves, plain or not: a class whose
-            // lanes carry a mask, an adapter or a guest input is a body of
-            // its own (its lanes are walked carrying them, `naming_lane`).
             if let Some(class) = table.class_of(facts.word(&request) & table.mask) {
+                if !request.plain() {
+                    attached[class] = true;
+                    continue;
+                }
                 if request.query_len() == 1 {
                     decoding[class] = true;
                 } else {
                     prefilling[class] = true;
                 }
             }
+        }
+        for class in 0..attached.len() {
+            if attached[class] {
+                decoding[class] = false;
+                prefilling[class] = false;
+            }
+        }
+        let eager_classes: Vec<String> = (0..attached.len())
+            .filter(|&class| attached[class])
+            .map(|class| {
+                let lane = self.naming_lane(class, 1).ok();
+                let mut what = Vec::new();
+                if self.captures(class) {
+                    what.push("capture");
+                }
+                if lane.as_ref().is_some_and(|lane| lane.mask.is_some()) {
+                    what.push("mask");
+                }
+                if lane.as_ref().is_some_and(|lane| lane.adapter.is_some()) {
+                    what.push("adapter");
+                }
+                if lane.as_ref().is_some_and(|lane| !lane.inputs.is_empty()) {
+                    what.push("inputs");
+                }
+                format!("class {class} ({})", what.join("+"))
+            })
+            .collect();
+        self.eager_classes = attached;
+        if !eager_classes.is_empty() {
+            tracing::info!(
+                classes = eager_classes.len(),
+                eager = ?eager_classes,
+                "request classes whose lanes carry an attachment run eager, stated at load (their \
+                 commands do not yet read it as data); fed and float fires too"
+            );
         }
         let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
             .last()
@@ -10405,7 +10473,8 @@ impl<B: Serve> Shell<B> {
         // the host cannot lay its misses in the arm's stage, and its gather
         // reads the fire's own (`FireBindings::row_ring`): another body.
         // Each shape carrying decode lanes is recorded so too.
-        let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
+        // A fed fire is stated eager (interim, as attachment classes are).
+        let fed_too = false;
         let capturing: Vec<bool> = (0..decoding.len()).map(|class| self.captures(class)).collect();
         // Where the trace buffers a recurrence, a decode lane carries the
         // rows it has not folded (the lagged fold): its scans are the
@@ -10627,6 +10696,8 @@ impl<B: Serve> Shell<B> {
         let mut dearest = 0u64;
         let mut dearest_device = 0u64;
         let mut spent_at: Option<usize> = None;
+        // The most command buffers one composition's bodies took.
+        let mut dearest_cmds = 0u64;
         let _ = B::spent();
         if let Some(known) = &known {
             match steps {
@@ -10655,7 +10726,11 @@ impl<B: Serve> Shell<B> {
             let next_device = dearest_device.saturating_mul(depth as u64);
             let device_short = next_device > 0 && self.device.left() < next_device;
             let host_short = remaining() < next;
-            if device_short || host_short {
+            let (live_cmds, most_cmds) = B::command_buffers(self);
+            let cmds_short = most_cmds.is_some_and(|most| {
+                live_cmds.saturating_add(dearest_cmds.saturating_mul(depth as u64)) >= most
+            });
+            if device_short || host_short || cmds_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
@@ -10673,6 +10748,8 @@ impl<B: Serve> Shell<B> {
                     used,
                     device_left = self.device.left(),
                     next_bodies = next,
+                    live_command_buffers = live_cmds,
+                    most_command_buffers = ?most_cmds,
                     from_rows = from,
                     eager = ?eager,
                     "the bodies past the allowance run eager: every fire of at least these rows"
@@ -10707,6 +10784,7 @@ impl<B: Serve> Shell<B> {
             let families = self.recorded;
             for arm in 0..depth {
                 let ahead = rss();
+                let cmds_ahead = B::command_buffers(self).0;
                 let left_ahead = self.device.left();
                 let owned = lanes
                     .iter()
@@ -10789,6 +10867,7 @@ impl<B: Serve> Shell<B> {
                 let cost = rss().saturating_sub(ahead).max(on_device);
                 dearest = dearest.max(cost);
                 dearest_device = dearest_device.max(on_device);
+                dearest_cmds = dearest_cmds.max(B::command_buffers(self).0.saturating_sub(cmds_ahead));
                 recorded += 1;
             }
             if self.recorded > families {

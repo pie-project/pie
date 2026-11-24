@@ -11,3 +11,9 @@ qmm = [
   { use = "qmv", vecs = 4 },
 ]
 sdpa.decode.split_min_keys = 128
+
+# Measured on an Adreno TM-840 (Snapdragon 8 Elite Gen 5): past about 4096
+# live command buffers vkAllocateCommandBuffers succeeds with a buffer whose
+# vkBeginCommandBuffer faults in the driver. The arm walk stops below it.
+[engine]
+max_live_command_buffers = 4096
