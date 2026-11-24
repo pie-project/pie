@@ -7,6 +7,8 @@
 // `PIE_<KERNEL>` picks the kernel:
 //
 // - `PIE_COPY`: a flat run of words.
+// - `PIE_COPY_RUNS`: runs of words between the pool's segments and two arena
+//   buffers, the runs in the fire block.
 // - `PIE_COPY_REGIONS`: runs of words, each `(from, to, words)` of a table
 //   that lies in engine-vulkan's fire block, a run a grid row (`y`): a fire's
 //   readout moves by values the host writes, under commands that stay.
@@ -41,6 +43,69 @@ void main(uint3 gid : SV_DispatchThreadID) {
     // them): read from the fire block, so a recording serves every run.
     if (gid.x < uint(max(PIE_FIRE(words), 0))) {
         dst[PIE_FIRE(dst_at) + gid.x] = src[PIE_FIRE(src_at) + gid.x];
+    }
+}
+
+#elif defined(PIE_COPY_RUNS)
+
+// Runs of words between the state pool (its four segments, `pie_seg*`) and
+// two arena buffers (`arena_a`, `arena_b`, each bound whole), each run a grid
+// row (`y`): `(spaces, from, to, words)`, `spaces` the source's space in its
+// high half and the destination's in its low (0..3 a segment, 4 `arena_a`, 5
+// `arena_b`), `from` / `to` words in them. The runs and their count lie in
+// the fire block: a lane's buffered rows move however its pages lie, under
+// one dispatch whose commands stay.
+[[vk::binding(0)]] RWStructuredBuffer<uint> arena_a;
+[[vk::binding(1)]] RWStructuredBuffer<uint> arena_b;
+[[vk::binding(2)]] RWStructuredBuffer<uint> pie_seg0;
+[[vk::binding(3)]] RWStructuredBuffer<uint> pie_seg1;
+[[vk::binding(4)]] RWStructuredBuffer<uint> pie_seg2;
+[[vk::binding(5)]] RWStructuredBuffer<uint> pie_seg3;
+
+#define PIE_RUNS 512
+
+struct Params {
+    uint count;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uint4 runs[PIE_RUNS];
+};
+PIE_PARAMS_FIRE_ONLY(6, Params, params);
+
+uint read_space(uint space, uint at) {
+    switch (space) {
+    case 0u: return pie_seg0[at];
+    case 1u: return pie_seg1[at];
+    case 2u: return pie_seg2[at];
+    case 3u: return pie_seg3[at];
+    case 4u: return arena_a[at];
+    default: return arena_b[at];
+    }
+}
+
+void write_space(uint space, uint at, uint word) {
+    switch (space) {
+    case 0u: pie_seg0[at] = word; break;
+    case 1u: pie_seg1[at] = word; break;
+    case 2u: pie_seg2[at] = word; break;
+    case 3u: pie_seg3[at] = word; break;
+    case 4u: arena_a[at] = word; break;
+    default: arena_b[at] = word; break;
+    }
+}
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    if (gid.y >= PIE_FIRE(count)) {
+        return;
+    }
+    uint4 run = PIE_FIRE(runs[gid.y]);
+    uint from_space = run.x >> 16u;
+    uint to_space = run.x & 0xffffu;
+    for (uint w = gid.x; w < run.w; w += PIE_GROUP_X * 65535u) {
+        write_space(to_space, run.z + w, read_space(from_space, run.y + w));
     }
 }
 
@@ -274,6 +339,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate gather_rows_copy_words PIE_COPY=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_copy_regions_words PIE_COPY_REGIONS=1 PIE_GROUP_X=256 PIE_TARGET=spirv
+// pie:instantiate gather_rows_copy_runs_words PIE_COPY_RUNS=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_words PIE_GATHER=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_scatter_words PIE_SCATTER=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_scatter_live_words PIE_SCATTER_LIVE=1 PIE_GROUP_X=256

@@ -336,7 +336,10 @@ impl<B: Backend> Run<'_, B> {
                 )
             }
             Attn::ScorePages { keys, pages } => {
-                if self.run_index() != 0 || self.scored().page_rows() == 0 {
+                // Every capturing fire sums its pages, a lane reading none
+                // skipped by its table entry (-1): whether a fire's lanes read
+                // pages is its data, never its commands.
+                if self.run_index() != 0 || self.scored().rows() == 0 {
                     return Ok(());
                 }
                 let (table, _) = self.capture_seats("attn.score_pages")?;

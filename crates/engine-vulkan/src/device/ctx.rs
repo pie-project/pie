@@ -2010,6 +2010,7 @@ impl Context {
             }),
             open: true,
             room: self.room_next.lock().expect("room lock poisoned").take(),
+            room_pasts: std::cell::RefCell::new(Vec::new()),
             dry: false,
             kept: !one_time,
             hazards: std::cell::RefCell::new(Hazards::default()),
@@ -2340,6 +2341,8 @@ pub struct Frame {
     /// The score room its capturing lanes lay their rows in: its buffer and
     /// byte ([`Context::room_next`]).
     pub(crate) room: Option<(vk::Buffer, u64)>,
+    /// Each room binding's bytes past the room's byte, in the walk's order.
+    room_pasts: std::cell::RefCell<Vec<u64>>,
     /// A fill walk's frame ([`Context::frame_dry`]): it lays what a fire
     /// writes in its block and hashes what its commands carry, and records
     /// no command; it is never submitted.
@@ -2574,6 +2577,17 @@ impl Frame {
             .push((set, binding, past, bytes));
     }
 
+    /// Notes the next room binding lies `past` bytes past the room's byte.
+    pub(crate) fn room_past(&self, past: u64) {
+        self.room_pasts.borrow_mut().push(past);
+    }
+
+    /// Each room binding's bytes past the room's byte, in order.
+    #[must_use]
+    pub fn room_pasts(&self) -> Vec<u64> {
+        self.room_pasts.borrow().clone()
+    }
+
     /// Whether `buffer` is the frame's score room's.
     pub(crate) fn is_room(&self, buffer: vk::Buffer) -> bool {
         self.room.is_some_and(|(room, _)| room == buffer)
@@ -2600,6 +2614,7 @@ impl Frame {
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             image: self.block.borrow().image().sealed(),
             cuts: self.cuts(),
+            room_pasts: self.room_pasts.borrow().clone(),
         }
     }
 
@@ -3426,6 +3441,7 @@ pub struct Fill {
     pub copies: Vec<[u32; 3]>,
     pub image: super::block::Image,
     pub cuts: usize,
+    pub room_pasts: Vec<u64>,
 }
 
 pub struct Kept {
@@ -3469,12 +3485,25 @@ impl Kept {
     /// flight reads the set. Whether the recording replays at it: one whose
     /// commands name the room it was recorded at (a copy of its rows)
     /// replays only there.
-    pub fn bind_room(&self, room: Option<(&Buffer, u64)>) -> Result<bool> {
-        let binds = self.inner.room_binds.lock().expect("room lock poisoned");
+    pub fn bind_room(&self, room: Option<(&Buffer, u64)>, pasts: &[u64]) -> Result<bool> {
+        let mut binds = self.inner.room_binds.lock().expect("room lock poisoned");
         let mut bound = self.inner.room_bound.lock().expect("room lock poisoned");
         let now = room.map(|(buffer, at)| (buffer.slab().buffer, at));
-        if binds.is_empty() || now == *bound {
+        if binds.is_empty() {
             return Ok(true);
+        }
+        // The kernels' room bindings take the fire's places in the room (a
+        // copier's whole-buffer binding none: its regions are its table).
+        let views: Vec<usize> = (0..binds.len()).filter(|&at| binds[at].3 != u64::MAX).collect();
+        if views.len() != pasts.len() {
+            return Ok(false);
+        }
+        let moved = views.iter().zip(pasts).any(|(&at, &past)| binds[at].2 != past);
+        if now == *bound && !moved {
+            return Ok(true);
+        }
+        for (&at, &past) in views.iter().zip(pasts) {
+            binds[at].2 = past;
         }
         if self.inner.room_fixed.load(Ordering::Acquire) {
             return Ok(false);
@@ -3495,10 +3524,11 @@ impl Kept {
             .map(|&(_, _, past, bytes)| {
                 // `u64::MAX` bytes: the room's buffer whole (a copier's
                 // source, its regions the fire's table).
-                let (offset, bytes) = if bytes == u64::MAX {
-                    (0, buffer.bytes())
-                } else {
-                    (at + past, bytes)
+                let (offset, bytes) = match bytes {
+                    u64::MAX => (0, buffer.bytes()),
+                    // To the buffer's end, as a view of the room binds.
+                    0 => (at + past, buffer.bytes().saturating_sub(at + past)),
+                    bytes => (at + past, bytes),
                 };
                 vk::DescriptorBufferInfo::default()
                     .buffer(buffer.slab().buffer)

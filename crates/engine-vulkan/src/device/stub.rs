@@ -250,9 +250,15 @@ pub struct Fill {
     pub copies: Vec<[u32; 3]>,
     pub image: Image,
     pub cuts: usize,
+    pub room_pasts: Vec<u64>,
 }
 
 impl Frame {
+    #[must_use]
+    pub fn room_pasts(&self) -> Vec<u64> {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn into_fill(self) -> Fill {
         match self.never {}
@@ -372,7 +378,7 @@ impl ArmBlock {
 }
 
 impl Kept {
-    pub fn bind_room(&self, _room: Option<(&Buffer, u64)>) -> Result<bool> {
+    pub fn bind_room(&self, _room: Option<(&Buffer, u64)>, _pasts: &[u64]) -> Result<bool> {
         match self.never {}
     }
 

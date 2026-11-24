@@ -8,6 +8,11 @@ use engine_gpu::serve::{Landed, Launch, Plan, Prepared, ReadSpan, Serve, Shell, 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
 
+/// The tables of runs (a recurrent copy's scalars, [`kernels_slang::gather::rows::copy_runs`])
+/// an arm's fire block holds room for in one fire: a recurrent layer's
+/// extends and lands.
+const RUN_TABLES: u64 = 512;
+
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
 pub struct Shelf {
@@ -339,7 +344,17 @@ impl Serve for Api {
         // group counts and its scalars at the uniform alignment, each with
         // its alignment's slack, and the readout copier's region tables.
         let (uniform, storage) = device.fire_alignments();
-        let scalars = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
+        // A dispatch's scalars at the uniform alignment; the few kernels whose
+        // scalars are a table of runs (a recurrent copy's, read from the block
+        // alone) at their own size, a run of them each fire's recurrent layers
+        // take.
+        let most = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
+        let scalars = most.min(512);
+        let tables = if most > scalars {
+            RUN_TABLES * most.next_multiple_of(uniform)
+        } else {
+            0
+        };
         let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
         // A recording moves every readout copy with the copier (its table,
         // count and group counts laid in the block, each at its alignment):
@@ -348,7 +363,8 @@ impl Serve for Api {
         // Twice the naming walk's widest fire: a fire that buffers its rows
         // copies them a lane at a time, past what the naming walk counted.
         let bytes = 2 * u64::from(fires.dispatches.max(1)) * (per_dispatch + copier)
-            + fires.readout_rows * 16;
+            + fires.readout_rows * 16
+            + tables;
         let arms = (0..readout.len())
             .map(|_| crate::device::ArmBlock::new(device, bytes))
             .collect::<Result<Vec<_>>>()?;
@@ -455,7 +471,7 @@ impl Serve for Api {
                 .score_room
                 .as_ref()
                 .map(|(buffer, at)| (buffer, *at));
-            let roomed = recording.kept.bind_room(room).and_then(|replays| {
+            let roomed = recording.kept.bind_room(room, &fill.room_pasts).and_then(|replays| {
                 if replays {
                     Ok(())
                 } else {
@@ -656,6 +672,7 @@ impl Serve for Api {
                 std::sync::Arc::new(fill.image),
                 layout.to_vec(),
                 launches,
+                std::sync::Arc::new(fill.room_pasts),
             ),
         );
         Ok(true)
@@ -714,6 +731,7 @@ impl Serve for Api {
             });
         match keep {
             Some(shape) => {
+                let room_pasts = frame.room_pasts();
                 let kept = frame.into_kept()?;
                 // Each segment a flush cut must have an expert stage's host
                 // step to replay after it; a flush of anything else would
@@ -821,7 +839,14 @@ impl Serve for Api {
                 let recorder = &mut shell.shelf.recorder;
                 recorder.insert_fill(
                     shape,
-                    crate::record::Fill::new(family, groups, image, layout.to_vec(), launches),
+                    crate::record::Fill::new(
+                        family,
+                        groups,
+                        image,
+                        layout.to_vec(),
+                        launches,
+                        std::sync::Arc::new(room_pasts),
+                    ),
                 );
                 let (recorded, filled) = recorder.counts();
                 tracing::debug!(recorded, filled, "vulkan filled a fire shape");

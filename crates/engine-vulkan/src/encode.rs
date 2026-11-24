@@ -566,8 +566,11 @@ impl Sink<'_> {
                     .take(declared)
                     .filter(|&(at, _)| pipeline.used[at] && Some(at) != params_at)
                     .map(|(at, info)| {
-                        if let Some(past) = scratch.rooms.get(at).copied().flatten() {
-                            return (ROOM_TAG, past, info.range);
+                        // A room's view is the fire's: where the room lies and
+                        // where in it the fire's rows do (the fill's
+                        // [`crate::device::Frame::room_past`]).
+                        if scratch.rooms.get(at).copied().flatten().is_some() {
+                            return (ROOM_TAG, 0, 0);
                         }
                         match scratch.segments.get(at).copied().flatten() {
                             Some((segment, true)) => {
@@ -608,6 +611,10 @@ impl Sink<'_> {
             ));
         }
 
+        // Where in the room each room binding lies, the fire's data.
+        for past in scratch.rooms.iter().take(declared).flatten() {
+            self.frame.room_past(*past);
+        }
         // A fill walk records nothing: what it laid and hashed is its fill.
         if self.frame.dry {
             self.frame.dispatches.set(self.frame.dispatches.get() + 1);
@@ -629,7 +636,8 @@ impl Sink<'_> {
                     continue;
                 }
                 if let Some(past) = scratch.rooms.get(at).copied().flatten() {
-                    self.frame.room_binds(set, at as u32, past, info.range);
+                    // 0 bytes: to the room's buffer's end, as a view binds.
+                    self.frame.room_binds(set, at as u32, past, 0);
                     continue;
                 }
                 let Some((segment, whole)) = scratch.segments.get(at).copied().flatten() else {

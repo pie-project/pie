@@ -796,6 +796,24 @@ impl Seat {
 
     /// Where token `token` of `run`'s plane `plane` lies: the segment's
     /// handle, the byte there, and the rows left in its page.
+    /// [`Seat::locate`] by the segment's place among the pool's: the segment,
+    /// the byte in it, and the rows from there to the page's end.
+    pub fn locate_segment(&self, run: &Run, plane: usize, token: u32) -> Result<(u32, u64, u32)> {
+        let page = token / self.page_tokens;
+        let in_page = token % self.page_tokens;
+        let id = *run.pages.get(page as usize).ok_or(Fault::Ceiling {
+            what: "recurrent buffer pages",
+            need: u64::from(page) + 1,
+            have: run.pages.len() as u64,
+        })?;
+        let row_bytes = self.layout.planes[plane].row_bytes;
+        let at =
+            u64::from(id) * self.stride + self.plane_at[plane] + u64::from(in_page) * row_bytes;
+        let span = u64::from(self.pool.words) * 4;
+        let segment = u32::try_from(at / span).unwrap_or(u32::MAX);
+        Ok((segment, at % span, self.page_tokens - in_page))
+    }
+
     pub fn locate(&self, run: &Run, plane: usize, token: u32) -> Result<(u32, u64, u32)> {
         let page = token / self.page_tokens;
         let in_page = token % self.page_tokens;

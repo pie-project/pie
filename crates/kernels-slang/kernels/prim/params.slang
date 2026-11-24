@@ -11,11 +11,18 @@
 // field read as `PIE_FIRE(field)` (a row count, an element count, a GEMM's
 // M, a split's rows) comes from there, so a recording's commands do not
 // carry it; on WGSL it is the field itself.
+//
+// `PIE_PARAMS_FIRE_ONLY` declares the block in the fire block alone, no push
+// block (a block past a push range's bytes: a table of runs); every field is
+// read as `PIE_FIRE(field)`.
 #ifdef PIE_WGSL
 #define PIE_PARAMS(binding_, type_, name_) [[vk::binding(binding_)]] ConstantBuffer<type_> name_
 #define PIE_PARAMS_FIRED(binding_, type_, name_) PIE_PARAMS(binding_, type_, name_)
+#define PIE_PARAMS_FIRE_ONLY(binding_, type_, name_) PIE_PARAMS(binding_, type_, name_)
 #define PIE_FIRE(field_) params.field_
 #else
+#define PIE_PARAMS_FIRE_ONLY(binding_, type_, name_) \
+    [[vk::binding(binding_)]] ConstantBuffer<type_> pie_fire
 #define PIE_PARAMS(binding_, type_, name_) [[vk::push_constant]] ConstantBuffer<type_> name_
 #define PIE_PARAMS_FIRED(binding_, type_, name_) \
     [[vk::push_constant]] ConstantBuffer<type_> name_; \

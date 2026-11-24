@@ -91,6 +91,11 @@ pub(crate) struct Fill {
     pub(crate) layout: Vec<engine_gpu::serve::ReadSpan>,
     pub(crate) launches: u32,
 
+    /// Each binding of the score room the walk made, its bytes past the
+    /// room's byte, in order: where the fire's rows lie in its room
+    /// ([`crate::device::Kept::bind_room`]).
+    pub(crate) room_pasts: Arc<Vec<u64>>,
+
     used: std::cell::Cell<u64>,
 }
 
@@ -101,6 +106,7 @@ impl Fill {
         image: Arc<Image>,
         layout: Vec<engine_gpu::serve::ReadSpan>,
         launches: u32,
+        room_pasts: Arc<Vec<u64>>,
     ) -> Fill {
         Fill {
             family,
@@ -108,6 +114,7 @@ impl Fill {
             image,
             layout,
             launches,
+            room_pasts,
             used: std::cell::Cell::new(0),
         }
     }
