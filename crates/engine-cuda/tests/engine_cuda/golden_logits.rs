@@ -541,27 +541,19 @@ fn load_declared(
     declared: u32,
 ) -> Result<Shell, String> {
     Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: declared,
-        slots: 1,
         kv_budget: None,
         allowance,
         context_declared: true,
-        ordinal: 0,
         knobs: knobs(),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            declared,
+            1,
+        )
     })
     .map_err(|why| why.to_string())
 }
@@ -1874,27 +1866,17 @@ fn buffered_model() -> String {
 fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     // As a worker boots it: every chunk the fit left the pool backed at
@@ -2045,27 +2027,17 @@ const CARRIED: u32 = 40;
 fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f32>>, u64, u64) {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2192,27 +2164,17 @@ fn served_lagged_over(
 ) -> (Vec<Vec<f32>>, u64) {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, tokens),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, tokens),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2424,27 +2386,17 @@ fn served_pace(fixture: &Fixture, cache: &Path, schedule: &str) -> f64 {
         None => (schedule.parse::<u32>().expect("a lag"), 0),
     };
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2531,27 +2483,17 @@ fn golden_lagged_pace() {
 fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(2, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(engine_cuda::Knobs::default()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(2, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     let page = rs_page(&mut shell);
@@ -3577,27 +3519,17 @@ fn load_lanes(
     kv_budget: Option<u64>,
 ) -> Shell {
     Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(lanes, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: lanes,
         kv_budget: kv_budget.map(engine_cuda::store::KvSize::Bytes),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs,
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(lanes, TOKENS),
+            CONTEXT,
+            lanes,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
 }
@@ -3844,27 +3776,17 @@ fn served_partial_fold(
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     use engine::fire::{FoldLen, RsVerb};
     let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 4,
         kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: buffering(knobs()),
         cache_dir: Some(cache),
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");

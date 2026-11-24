@@ -9,6 +9,7 @@ extern crate kernels_rocm as kernels_cuda;
 pub const POOL: u64 = 256 << 20;
 
 mod bound;
+mod common;
 #[cfg(feature = "device")]
 mod common_dit;
 #[cfg(feature = "device")]

@@ -12,6 +12,7 @@ use engine_cuda::{Lane, Shell};
 use poem::{Dtype, Join, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
+use crate::common::fnv;
 
 /// A dense model whose package states q, k and v apart.
 const ROW: &str = "qwen3-0.6b-bf16-kv-bf16";
@@ -60,15 +61,6 @@ fn scratch_root() -> &'static Path {
         }
         parent.join(std::process::id().to_string())
     })
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// A plane's bf16 values, by its name. A head's q and k norms scale by a

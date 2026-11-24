@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_ir::{TILED_BAND, TILED_STEP, Trace};
+use crate::common::bf16_bits;
 
 const VOCAB: u32 = 1000;
 
@@ -88,12 +89,6 @@ impl Lcg {
     fn unit(&mut self) -> f32 {
         ((self.next() >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     }
-}
-
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding) >> 16) as u16
 }
 
 struct Planes {
@@ -311,29 +306,14 @@ fn logits(arm: Arm, prompt: &[u32]) -> Vec<f32> {
     let src = ztensor::Source::open(&container).expect("the fixture opens");
     let contract = micro.load(&src);
     drop(src);
-    let staged = engine_cuda::Shell::stage(engine_cuda::Boot {
-        trace: trace.clone(),
-        contract: &contract,
-        checkpoint: &container,
-        budget: poem_compiler::Budget::new(1, 256),
-        patches: None,
-        voxels: None,
-        page_size: 16,
-        context: 256,
-        slots: 1,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
-        knobs: engine_cuda::Knobs::default(),
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
-    })
+    let staged = engine_cuda::Shell::stage(crate::common::boot(
+            trace.clone(),
+            &contract,
+            &container,
+            poem_compiler::Budget::new(1, 256),
+            256,
+            1,
+        ))
     .expect("the micro loads");
     let mut shell = staged.finish().expect("the micro arms");
     shell.open(0).unwrap();
