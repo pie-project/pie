@@ -228,7 +228,7 @@ shelved!(
 /// (`profiles/<device>.covers.json`, `pie tune export --engine cuda`), each
 /// listed here: the runtime takes a cover whose key matches where the
 /// home's own cache holds none (`engine::Engine::committed_covers`).
-pub const COVERS: &[&str] = &[];
+pub const COVERS: &[&str] = &[include_str!("../profiles/nvidia-l40s.covers.json")];
 
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
