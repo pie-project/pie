@@ -758,14 +758,18 @@ mod pinned {
         let Ok(device) = crate::jit::cache::current_device() else {
             return;
         };
-        let ring = RINGS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(device, stream as usize));
-        let Some(ring) = ring else {
+        // A poisoned ring's slots are not to be trusted: their events stay
+        // undestroyed rather than read (a teardown never panics).
+        let Ok(mut rings) = RINGS.lock() else {
             return;
         };
-        let mut ring = ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(ring) = rings.remove(&(device, stream as usize)) else {
+            return;
+        };
+        drop(rings);
+        let Ok(mut ring) = ring.lock() else {
+            return;
+        };
         for slot in &mut ring.slots {
             // SAFETY: the slot's own event, recorded only on `stream`, which
             // is live until its caller destroys it after this returns.

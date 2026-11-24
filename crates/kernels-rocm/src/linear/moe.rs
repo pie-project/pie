@@ -1483,7 +1483,7 @@ fn stage_lt(
     ctx.fire(
         op,
         Fire::at(kernel(FILE, &format!("::pie::linear::moe_lt_scatter<{t}>")))
-            .apply(Launch::grid([copy_blocks(rows, k), 1, 1], [256, 1, 1])),
+            .apply(Launch::grid([copy_blocks(rows, k, ctx.multiprocessors(op)?), 1, 1], [256, 1, 1])),
         &[
             x.arg(),
             ArgValue::Ptr(ordered.order),
@@ -1508,11 +1508,12 @@ fn stage_lt(
     })
 }
 
-/// Blocks a 16-byte grid-stride copy of `rows` rows of `width` takes.
+/// Blocks a 16-byte grid-stride copy of `rows` rows of `width` takes, at
+/// most eight on each of the device's `cus` compute units.
 #[cfg(feature = "rocm")]
-fn copy_blocks(rows: u32, width: u32) -> u32 {
+fn copy_blocks(rows: u32, width: u32, cus: u32) -> u32 {
     let pieces = u64::from(rows) * u64::from(width / 8);
-    pieces.div_ceil(256).clamp(1, 304 * 8) as u32
+    pieces.div_ceil(256).clamp(1, u64::from(cus) * 8) as u32
 }
 
 /// One grouped GEMM over the arguments at `args`: `experts` groups and the

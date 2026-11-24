@@ -546,7 +546,6 @@ impl Ctx {
     }
 
     #[allow(clippy::unused_self)]
-    #[must_use]
     /// The device's compute units, which the launchers shape their grids
     /// by: a device that does not answer is refused by name.
     pub fn multiprocessors(&self, op: &'static str) -> Result<u32, Error> {

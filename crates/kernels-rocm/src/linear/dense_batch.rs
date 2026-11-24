@@ -28,9 +28,6 @@ const fn item_rows(m: u32) -> u32 {
     }
 }
 
-/// Blocks a launch wants: one a CU. Past it, slicing K costs a partial and a
-/// sum (and, under SwiGLU, more than the blocks win).
-const WANT_BLOCKS: u32 = 304;
 /// The most slices of K a launch takes, and the fewest stages a slice.
 const MAX_SPLITS: u32 = 8;
 const MIN_STAGES: u32 = 4;
@@ -68,9 +65,12 @@ pub(crate) fn dense_batch_bf16(
     // (the fused SwiGLU slices as its bank's matmul does).
     let stages = ku.div_ceil(if mt >= 32 { 64 } else { 128 });
     let bank_tiles = (rows as u32).div_ceil(TILE);
+    // Blocks a launch wants: one a CU. Past it, slicing K costs a partial
+    // and a sum (and, under SwiGLU, more than the blocks win).
+    let want_blocks = ctx.multiprocessors(OP)?;
     let mut splits = 1;
     while splits < MAX_SPLITS
-        && bank_tiles * items * splits < WANT_BLOCKS
+        && bank_tiles * items * splits < want_blocks
         && stages / (2 * splits) >= MIN_STAGES
         && nu.is_multiple_of(4)
     {

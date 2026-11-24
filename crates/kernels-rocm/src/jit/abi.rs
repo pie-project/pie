@@ -130,10 +130,10 @@ impl Arg for bool {
 
 #[cfg(feature = "rocm")]
 pub(crate) struct Bound {
-    #[allow(dead_code, clippy::vec_box)]
-    cells: Vec<Box<u64>>,
-    #[allow(dead_code)]
-    blobs: Vec<Box<[u64]>>,
+    /// The boxed scalars and blobs `slots` point into, held for the launch.
+    #[allow(clippy::vec_box, reason = "each cell's address is a stable slot")]
+    _cells: Vec<Box<u64>>,
+    _blobs: Vec<Box<[u64]>>,
     slots: Vec<*mut c_void>,
 }
 
@@ -166,8 +166,8 @@ impl Bound {
             }
         }
         Self {
-            cells,
-            blobs,
+            _cells: cells,
+            _blobs: blobs,
             slots,
         }
     }
