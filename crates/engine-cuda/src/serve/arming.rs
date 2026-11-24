@@ -1618,6 +1618,16 @@ impl Shell {
             .and_then(|rung| self.bucket_for(rung))
     }
 
+    /// The bucket a step stamped `shape` composes at where its shape names
+    /// one: a buffering mixed or prompt step's rung ([`Shell::buffered_rung`]);
+    /// `None` for any other (it composes at its rows' own bucket).
+    pub(super) fn stamped_bucket(&self, shape: engine::FireShape) -> Option<u32> {
+        let stated = self.steps.shapes.get(shape.id as usize)?;
+        (stated.treatment == engine::Treatment::Buffers && stated.kind != engine::StepKind::Decode)
+            .then(|| self.bucket_for(stated.rung))
+            .flatten()
+    }
+
     /// The set the arm walk takes its targets from ([`Shell::walk_steps`]).
     pub(crate) fn steps(&self) -> &engine::StepShapes {
         &self.steps

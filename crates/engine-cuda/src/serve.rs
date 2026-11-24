@@ -444,6 +444,7 @@ impl Shell {
                     attachments: &[],
                     media: &[],
                     voxels: &[],
+                    shape: None,
                 },
                 None,
             )?;
@@ -1300,6 +1301,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels,
+                shape: None,
             },
             None,
         )?;
@@ -1325,6 +1327,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels: &[],
+                shape: None,
             },
             None,
         )?;
@@ -1347,6 +1350,7 @@ impl Shell {
             attachments,
             media,
             voxels: &[],
+            shape: None,
         })
     }
 
@@ -1363,6 +1367,7 @@ impl Shell {
             attachments: &[],
             media,
             voxels,
+            shape: None,
         })
     }
 
@@ -1389,6 +1394,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels: &[],
+                shape: None,
             },
             None,
         )?;
@@ -1440,6 +1446,11 @@ pub struct StepView<'a> {
     pub attachments: &'a [Attached],
     pub media: &'a [Media<'a>],
     pub voxels: &'a [Clips<'a>],
+    /// The stated shape the runtime stamped the step with (CONTRACT-BC 24):
+    /// what treatment its body keys and the bucket a buffering step with a
+    /// prompt's rows composes at are read from. `None` on a fire built by
+    /// hand (arming's, a test's): read from its lanes.
+    pub shape: Option<engine::FireShape>,
 }
 
 #[derive(Debug, Default, Clone)]

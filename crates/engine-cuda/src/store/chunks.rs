@@ -1094,9 +1094,12 @@ impl Chunks {
                 chunks: 1,
             }],
             shapes,
+            // Every rung below one fire's tokens, one lending nothing among
+            // them: the stated rungs are the arena's, so the step set the
+            // load states is the one its arm walk took (CONTRACT-BC 24).
             act_chunks: rungs
                 .iter()
-                .filter(|&&(tokens, chunks)| tokens < max_tokens && chunks < self.act)
+                .filter(|&&(tokens, _)| tokens < max_tokens)
                 .copied()
                 .chain(std::iter::once((max_tokens, self.act)))
                 .collect(),

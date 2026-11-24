@@ -824,11 +824,6 @@ impl Engine for Cuda {
             );
         }
 
-        // Expert parallelism seats its buffers in the arena laid at the
-        // span's start: no smaller rung.
-        if self.expert.size > 1 {
-            shell.drop_rungs();
-        }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
         chunk_facts.record_bytes = shell.record_bytes();
         chunk_facts.windowed = shell.windowed_layers();
@@ -933,26 +928,27 @@ impl Engine for Cuda {
             ),
             steps: engine::StatedSteps::default(),
         };
-        // The set as the load states it, from its stated facts (the rungs
-        // its activation lends under, known once arming backed the span),
-        // with those the arm walk left eager (CONTRACT-BC 24).
-        let mut caps = caps;
-        caps.steps = shell.stated_steps(engine::StepShapes::of(
+        // The set as the load states it, from its stated facts, with those
+        // the arm walk left eager (CONTRACT-BC 24). It is the set the walk
+        // took: a fire's stamped shape names the walk's shape.
+        let stated = engine::StepShapes::of(
             &steps,
             &engine::StepFacts::stated(&caps, &readout_facts()),
-        ));
+        );
+        if stated != *shell.steps() {
+            return Err(Error::Load(format!(
+                "the load states the step set {} and its arm walk took {}: a fire's stated \
+                 shape would name another walk's shape",
+                stated.census(),
+                shell.steps().census()
+            )));
+        }
+        let mut caps = caps;
+        caps.steps = shell.stated_steps(stated);
         eprintln!(
-            "engine-cuda: step set: {}; {} stated eager{}",
+            "engine-cuda: step set: {}; {} stated eager",
             caps.steps.shapes.census(),
             caps.steps.eager.len(),
-            if caps.steps.shapes == *shell.steps() {
-                String::new()
-            } else {
-                format!(
-                    " (the walk took the set over the arena's rungs, {})",
-                    shell.steps().census()
-                )
-            },
         );
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
@@ -2083,6 +2079,7 @@ impl Cuda {
                     attachments: &attached,
                     media: &media,
                     voxels: &voxels,
+                    shape: submission.shape,
                 },
                 None,
             )

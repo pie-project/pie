@@ -504,6 +504,7 @@ fn a_decode_envelope_embeds_each_lanes_token_its_epilogue_has_yet_to_put() {
                 attachments: &attached,
                 media: &[],
                 voxels: &[],
+                shape: None,
             };
             let fire = |shell: &mut Shell| {
                 let prepared = FrameShell::prepare(shell, step(), None).expect("the beams prepare");
