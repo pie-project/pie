@@ -672,3 +672,8 @@ impl Pipelines {
         Err(Fault::Deviceless)
     }
 }
+
+#[must_use]
+pub fn held_counts() -> (i64, i64, u64, u64, u64) {
+    (0, 0, 0, 0, 0)
+}

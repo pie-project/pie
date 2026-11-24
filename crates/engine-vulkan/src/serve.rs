@@ -434,6 +434,14 @@ impl Serve for Api {
             .seal_descriptor_pools(shell.readout.len() + 3)
     }
 
+    fn held() -> String {
+        let (cmds, frames, sets, pools_made, pools_freed) = crate::device::held_counts();
+        format!(
+            "{cmds} command buffers, {frames} frames, {sets} shared sets, {} descriptor pools",
+            pools_made.saturating_sub(pools_freed)
+        )
+    }
+
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
         // The kinds no recording holds, which the load states eager
         // (by name, `engine_gpu::api`): the custom-mask buffer grows (a recording
@@ -796,6 +804,11 @@ impl Serve for Api {
                 let arming = shell.arming;
                 let pending = match act {
                     _ if arming => {
+                        // Under PIE_VK_BAKE_TRAIL, what parts a new family
+                        // from the nearest held one.
+                        if matches!(act, Act::Record(_)) && crate::device::ctx::trailing() {
+                            nearest(shell, kept.trail(), prepared);
+                        }
                         if let Act::Record(varying) = act {
                             tracing::debug!(
                                 arm = prepared.arm,

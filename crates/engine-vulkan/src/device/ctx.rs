@@ -454,6 +454,54 @@ pub(crate) struct SharedSets {
     pools: Vec<vk::DescriptorPool>,
 }
 
+/// Command buffers frames hold now, and frames alive (each holding a
+/// fence): named on the arm walk's progress (a driver that caps them fails
+/// past a count, not a size).
+pub(crate) static LIVE_CMDS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub(crate) static LIVE_FRAMES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// What the device holds for frames now: command buffers, frames, shared
+/// descriptor sets, descriptor pools made and freed.
+#[must_use]
+pub fn held_counts() -> (i64, i64, u64, u64, u64) {
+    (
+        LIVE_CMDS.load(Ordering::Relaxed),
+        LIVE_FRAMES.load(Ordering::Relaxed),
+        SHARED_SETS.load(Ordering::Relaxed),
+        POOLS_MADE.load(Ordering::Relaxed),
+        POOLS_FREED.load(Ordering::Relaxed),
+    )
+}
+
+impl Core {
+    /// One primary command buffer from `pool` (this thread's), refused by
+    /// name where the driver gives none, or a null one, back.
+    pub(crate) fn alloc_cmd(&self, pool: vk::CommandPool) -> Result<vk::CommandBuffer> {
+        // SAFETY: `pool` is the calling thread's own pool, which no other
+        // thread allocates from or frees into, so its external sync holds.
+        let got = unsafe {
+            self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| self.fault("vkAllocateCommandBuffers", e))?;
+        match got.first().copied() {
+            Some(cmd) if cmd != vk::CommandBuffer::null() => {
+                LIVE_CMDS.fetch_add(1, Ordering::Relaxed);
+                Ok(cmd)
+            }
+            _ => Err(Fault::Ceiling {
+                what: "command buffers: the driver allocated a null one",
+                need: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0) + 1,
+                have: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0),
+            }),
+        }
+    }
+}
+
 impl Core {
     /// The set shared under `key` of `layout`, allocated where none is yet;
     /// whether it was.
@@ -2007,16 +2055,9 @@ impl Context {
         let pool = core.thread_pool()?;
         // SAFETY: `pool` is this thread's own pool, which no other thread
         // allocates from or frees into, so its external sync holds.
-        let cmd = unsafe {
-            d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        let cmd = core.alloc_cmd(pool)?;
         let fence = core.lend_fence()?;
+        LIVE_FRAMES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `cmd` was just allocated on this thread and is in the
         // initial state, so it may be begun; the barrier below records into it
         // while it is still only this function's.
@@ -2322,6 +2363,9 @@ impl Drop for Inner {
                 self.segments.get_mut().expect("segments lock poisoned"),
             ));
             buffers.push(self.cmd());
+            buffers.retain(|&cmd| cmd != vk::CommandBuffer::null());
+            LIVE_CMDS.fetch_sub(buffers.len() as i64, Ordering::Relaxed);
+            LIVE_FRAMES.fetch_sub(1, Ordering::Relaxed);
             if owned {
                 d.free_command_buffers(self.cmd_pool, &buffers);
             } else {
@@ -2611,15 +2655,7 @@ impl Frame {
         // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
         // owned by this thread (frames record on the thread that opened
         // them); the head is recorded here alone and freed with the frame.
-        let head = unsafe {
-            d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.inner.cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        let head = core.alloc_cmd(self.inner.cmd_pool)?;
         self.inner
             .heads
             .lock()
@@ -3429,15 +3465,7 @@ impl Frame {
             .expect("held lock poisoned")
             .push(cmd);
         // SAFETY: `cmd_pool` is this frame's (this thread's) pool.
-        let next = unsafe {
-            d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.inner.cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        let next = core.alloc_cmd(self.inner.cmd_pool)?;
         self.inner
             .cmd
             .store(vk::Handle::as_raw(next), Ordering::Release);
@@ -3522,15 +3550,7 @@ impl Frame {
             // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
             // owned by this thread (frames record on the thread that opened
             // them).
-            let next = unsafe {
-                d.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(self.inner.cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-            }
-            .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+            let next = core.alloc_cmd(self.inner.cmd_pool)?;
             self.inner
                 .cuts
                 .lock()
