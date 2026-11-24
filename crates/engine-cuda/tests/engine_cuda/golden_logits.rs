@@ -4201,9 +4201,32 @@ fn golden_staged_experts() {
                 .all(|bank| said.contains(&format!("`{bank}`"))),
             "{model}: the refusal names the banks: {said}"
         );
+        // The bytes the refusal names are its own fit's: under a budget that
+        // tight the fit may serve fewer rows a fire than the unbounded load
+        // (on ROCm the context's modules take ~1.5 GiB of it), and the
+        // staging holds one fire's routes. The load at the least budget
+        // stages what the fit a byte under it weighed.
+        let at_least = load_under(
+            &fixture,
+            &cache,
+            staged(),
+            engine::Allowance {
+                budget: Some(least),
+            },
+        )
+        .unwrap_or_else(|why| panic!("{model}: serves under its least budget {least}: {why}"));
+        let least_staging = at_least.expert_staging().clone();
+        drop(at_least);
+        assert_eq!(
+            least_staging.banks(),
+            staging.banks(),
+            "{model}: the same banks stage under the least budget"
+        );
         assert!(
-            said.contains(&format!("{} bytes of staged experts", staging.bytes())),
-            "{model}: and the bytes: {said}"
+            said.contains(&format!("{} bytes of staged experts", least_staging.bytes())),
+            "{model}: and the bytes ({} for {} rows under the least budget): {said}",
+            least_staging.bytes(),
+            least_staging.rows()
         );
     }
 }
