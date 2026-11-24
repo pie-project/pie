@@ -28,6 +28,7 @@ mod split_rows;
 mod settle_bound;
 mod settle_key;
 mod submit_bound;
+mod stale_settle_picks;
 mod swapped_pick;
 mod unplaced;
 mod two_widens;
