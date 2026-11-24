@@ -1028,8 +1028,11 @@ impl Shell {
         // A load told its weights are held streams nothing: every plane
         // lands as the base build lands it, and its programs are the base
         // build's. Else the streamable weights live in the pool, seated
-        // whole at load (`crate::store::streamed`).
-        let mut streamed = if boot.device.stream_weights && !device.is_dry() {
+        // whole at load (`crate::store::streamed`). The stage-only pass's
+        // shell (`sized` false) plans them as the real load does and seats
+        // nothing, so its fires stage what the real load's stage (a streamed
+        // table's row a token is one more per-row table).
+        let mut streamed = if boot.device.stream_weights && (!device.is_dry() || !sized) {
             crate::store::streamed::Streamed::plan(&boot.trace, 0, budgets.tokens.max_tokens)?
         } else {
             crate::store::streamed::Streamed::default()
