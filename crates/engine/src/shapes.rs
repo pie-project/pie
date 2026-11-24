@@ -249,9 +249,11 @@ impl std::fmt::Display for Attachments {
 ///
 /// A folded step runs at the smallest rung its rows fit, so a folded shape's
 /// rows are those past the rung below up to its own. A buffered step runs at
-/// the smallest rung whose replay holds its own and carried rows
-/// ([`crate::fire::rung_holds`]), so a buffered shape's rows start at one
-/// whatever its rung.
+/// the smallest buffered rung ([`StepFacts::buffered_rungs`]) holding its own
+/// and carried rows, padding up to it, so a buffered prompt or mixed shape's
+/// rows start at one whatever its rung (its carried rows may be what lifted
+/// it); a buffered decode lane carries none, so a buffered decode shape's
+/// rows are those past the buffered rung below, as a folded one's.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StepShape {
     pub rung: u32,
@@ -573,9 +575,10 @@ impl StepFacts {
         )
     }
 
-    /// The rungs a step can run at: every stated one up to the first that
-    /// holds a whole fire's tokens; a fire's tokens alone where none is.
-    fn lattice(&self) -> Vec<u32> {
+    /// The rungs a folded step can run at: every stated one up to the first
+    /// that holds a whole fire's tokens; a fire's tokens alone where none is.
+    #[must_use]
+    pub fn lattice(&self) -> Vec<u32> {
         let mut lattice = Vec::new();
         for &rung in &self.rungs {
             lattice.push(rung);
@@ -587,6 +590,71 @@ impl StepFacts {
             lattice.push(self.max_tokens);
         }
         lattice
+    }
+
+    /// The folded lattice's widest spacing, `(upper, lower)`: the largest
+    /// ratio `R_i / R_(i-1)` of two neighbouring rungs ([`Self::lattice`]),
+    /// `(1, 1)` with one rung. A folded step whose rows are just past
+    /// `R_(i-1)` runs at `R_i`: this is the most a step's rung exceeds the
+    /// rung below it that the load already accepts for its folded steps, the
+    /// common ones.
+    #[must_use]
+    pub fn spacing(&self) -> (u32, u32) {
+        let lattice = self.lattice();
+        lattice
+            .windows(2)
+            .map(|pair| (pair[1], pair[0].max(1)))
+            .fold((1, 1), |widest, ratio| {
+                if u64::from(ratio.0) * u64::from(widest.1)
+                    > u64::from(widest.0) * u64::from(ratio.1)
+                {
+                    ratio
+                } else {
+                    widest
+                }
+            })
+    }
+
+    /// The rungs a buffered step can run at: the folded lattice thinned, its
+    /// top always kept. Every rung a step can run at is a set of bodies (one
+    /// per composition, class set and rs body) an engine records or compiles
+    /// before ready, and a buffered step (a lane that may retract: a beam, a
+    /// draft, an inferlet that does not state its rows final) is rare beside
+    /// a folded one, so a buffered rung saves a whole set of bodies at the
+    /// price of padding a rare step. The rule, derived from the load's own
+    /// lattice and no constant: a buffered step pads up from the rung it
+    /// would run at folded (`F`, the smallest folded rung holding it) to its
+    /// buffered rung (`B`) by no more than the lattice's widest spacing
+    /// ([`Self::spacing`]), `B / F <= R_i / R_(i-1)` at its widest: it pays,
+    /// over its folded step, no more than a folded step already pays over
+    /// the rung below it. Rows stand for step time here: a step's time grows
+    /// no faster than its rows (a weight read every step whatever its rows,
+    /// and work per row), so a step at `B` takes at most `B / F` the time of
+    /// one at `F`, and the bound in rows bounds the step-time padding too.
+    /// Greedy from the smallest folded rung `F`: its buffered rung is the
+    /// widest folded rung within `F`'s bound, and the next buffered rung's
+    /// `F` the folded rung after it. A lattice of evenly spaced rungs (each
+    /// twice the one below) keeps every other rung; one with wider gaps
+    /// keeps fewer.
+    #[must_use]
+    pub fn buffered_rungs(&self) -> Vec<u32> {
+        let lattice = self.lattice();
+        let (upper, lower) = self.spacing();
+        let within = |rung: u32, folded: u32| {
+            u64::from(rung) * u64::from(lower) <= u64::from(upper) * u64::from(folded)
+        };
+        let mut rungs = Vec::new();
+        let mut at = 0;
+        while at < lattice.len() {
+            let folded = lattice[at];
+            let mut to = at;
+            while to + 1 < lattice.len() && within(lattice[to + 1], folded) {
+                to += 1;
+            }
+            rungs.push(lattice[to]);
+            at = to + 1;
+        }
+        rungs
     }
 }
 
@@ -613,15 +681,24 @@ impl StepShapes {
             .copied()
             .filter(|&t| t == Treatment::Folds || facts.buffers)
             .collect();
+        let buffered = facts.buffered_rungs();
         let mut shapes = Vec::new();
         let mut below = 0u32;
+        let mut buffered_below = 0u32;
         for rung in facts.lattice() {
             let top = rung.min(facts.max_tokens);
+            let buffers_here = buffered.contains(&rung);
             for &kind in &rules.kinds {
                 for &treatment in &treatments {
-                    let lo = match treatment {
-                        Treatment::Folds => below + 1,
-                        Treatment::Buffers => 1,
+                    if treatment == Treatment::Buffers && !buffers_here {
+                        continue;
+                    }
+                    // A buffered decode lane carries no row (`lane_carried`),
+                    // so a buffered decode step's rung is its rows' alone.
+                    let lo = match (treatment, kind) {
+                        (Treatment::Folds, _) => below + 1,
+                        (Treatment::Buffers, StepKind::Decode) => buffered_below + 1,
+                        (Treatment::Buffers, _) => 1,
                     };
                     let shape = match kind {
                         StepKind::Decode => Span::new(lo, top.min(lanes)).map(|d| StepShape {
@@ -678,6 +755,9 @@ impl StepShapes {
                 }
             }
             below = rung;
+            if buffers_here {
+                buffered_below = rung;
+            }
         }
         shapes.sort_by_key(|shape| (shape.rung, shape.kind, shape.treatment));
         StepShapes { shapes }
@@ -936,11 +1016,12 @@ mod tests {
         // decode past the 64 lanes, mixed and prompt.
         assert_eq!(folded.len(), 3 + 3 + 2 + 2, "{}", folded.census());
         let buffered = StepShapes::of(&StepRules::runtime(), &facts(&rungs, true));
-        assert_eq!(
-            buffered.len(),
-            2 * 10 + 2,
-            "a buffered decode reaches every rung"
-        );
+        // The widest spacing is 8 (8 to 64, 256 to 2048): buffered rungs 64
+        // (8 padded up to 8x) and 2048 (256 up to 8x). At 64 a buffered
+        // decode, mixed and prompt; at 2048 mixed and prompt (no decode
+        // past the 64 lanes).
+        assert_eq!(facts(&rungs, true).buffered_rungs(), vec![64, 2048]);
+        assert_eq!(buffered.len(), 10 + 3 + 2, "{}", buffered.census());
         let keys: Vec<_> = buffered
             .shapes
             .iter()
@@ -956,6 +1037,73 @@ mod tests {
                 .any(|s| s.kind == StepKind::Mixed && s.treatment == Treatment::Buffers),
             "decode lanes buffering beside a prompt are stated"
         );
+    }
+
+    /// Buffered compositions are stated at fewer rungs than folded ones,
+    /// every buffered step pads to a stated buffered rung, and none pads
+    /// past its folded rung by more than the lattice's widest spacing.
+    #[test]
+    fn buffered_steps_pad_to_fewer_rungs_within_the_lattice_s_spacing() {
+        for rungs in [
+            (0..12).map(|k| 1u32 << k).collect::<Vec<_>>(),
+            vec![16, 32, 64, 128, 256, 512, 1024, 2048],
+            vec![8, 64, 256, 2048],
+            vec![4, 16, 64],
+            vec![2048],
+        ] {
+            let f = facts(&rungs, true);
+            let set = StepShapes::of(&StepRules::runtime(), &f);
+            let lattice = f.lattice();
+            let buffered = f.buffered_rungs();
+            let (upper, lower) = f.spacing();
+            assert_eq!(buffered.last(), lattice.last(), "the top is kept");
+            assert!(buffered.iter().all(|rung| lattice.contains(rung)));
+            let count = |t: Treatment| set.shapes.iter().filter(|s| s.treatment == t).count();
+            if lattice.len() > 1 {
+                assert!(
+                    count(Treatment::Buffers) < count(Treatment::Folds),
+                    "{rungs:?}: {}",
+                    set.census()
+                );
+            }
+            for rows in 1..=2048u32 {
+                for prompt in [false, true] {
+                    let lanes: Vec<Lane> = if prompt && rows > 1 {
+                        vec![lane(rows as usize, true)]
+                    } else if rows <= 64 {
+                        vec![lane(1, true); rows as usize]
+                    } else {
+                        continue;
+                    };
+                    let step = StepComposition::of(&lanes);
+                    let at = set.holds(&step).unwrap_or_else(|gap| panic!("{gap}"));
+                    let rung = set.shapes[at].rung;
+                    assert!(buffered.contains(&rung), "{rows}: r{rung} {buffered:?}");
+                    let folded = *lattice.iter().find(|&&r| r >= rows).unwrap();
+                    assert!(
+                        u64::from(rung) * u64::from(lower) <= u64::from(upper) * u64::from(folded),
+                        "{rows} rows: r{rung} over folded r{folded} past {upper}/{lower}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A Qwen3.5-like hybrid load (rungs every power of two from 16 to the
+    /// fire's 2048 tokens, 64 lanes, an rs list): what it states before and
+    /// after buffered rungs were thinned.
+    #[test]
+    fn a_hybrid_load_states_fewer_buffered_compositions() {
+        let f = facts(&[16, 32, 64, 128, 256, 512, 1024, 2048], true);
+        let set = StepShapes::of(&StepRules::runtime(), &f);
+        let count = |t: Treatment| set.shapes.iter().filter(|s| s.treatment == t).count();
+        // Folded: decode, mixed, prompt at 16, 32, 64; mixed, prompt past.
+        assert_eq!(count(Treatment::Folds), 3 * 3 + 2 * 5, "{}", set.census());
+        // Buffered at 32, 128, 512, 2048 (every rung before: 3 * 3 + 2 * 5):
+        // decode, mixed, prompt at 32; decode (33-64 lanes), mixed, prompt at
+        // 128; mixed, prompt at 512 and 2048.
+        assert_eq!(f.buffered_rungs(), vec![32, 128, 512, 2048]);
+        assert_eq!(count(Treatment::Buffers), 3 + 3 + 2 + 2, "{}", set.census());
     }
 
     #[test]

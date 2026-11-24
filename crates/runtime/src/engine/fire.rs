@@ -32,6 +32,12 @@ pub struct FireRequest {
     /// than that rung's replay scratch holds together. `None` on a fire
     /// carrying none.
     pub replay_rungs: Option<crate::store::shared::Replays>,
+    /// Where its lanes buffer recurrent rows, the stated buffered rung its
+    /// step pads up to ([`engine::StepFacts::buffered_rungs`]: buffered steps
+    /// run at a coarser lattice than folded ones), set at admission from the
+    /// load's stated set; 0 where its lanes fold. What it asks its activation
+    /// rung for where that is more than its rows.
+    pub pads_to: u32,
     /// The ring ends this fire moves. Two fires moving one end never share
     /// a step; the engine picks each move's cell from its ring's cursor.
     pub ring_moves: Vec<RingMove>,
@@ -67,10 +73,13 @@ impl FireRequest {
     }
 
     /// What the fire asks its activation rung for: its own rows, or the
-    /// rows it carries where they are more ([`engine::fire::rung_holds`]).
+    /// rows it carries where they are more ([`engine::fire::rung_holds`]),
+    /// or the buffered rung its step pads to ([`Self::pads_to`]).
     #[must_use]
     pub fn rung_rows(&self) -> usize {
-        self.tokens().max(self.carried as usize)
+        self.tokens()
+            .max(self.carried as usize)
+            .max(self.pads_to as usize)
     }
 
     /// The rows the fire reads out: a lane's last row, the rows it names,
