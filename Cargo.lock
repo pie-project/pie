@@ -816,10 +816,13 @@ dependencies = [
 name = "controller-api"
 version = "0.6.0"
 dependencies = [
+ "anyhow",
  "ids",
  "serde",
  "serde_json",
  "tarpc",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
