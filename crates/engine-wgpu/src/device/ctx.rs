@@ -673,7 +673,7 @@ impl Context {
             let sink = Arc::clone(&last_error);
             device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
                 let text = error.to_string();
-                eprintln!("wgpu: {text}");
+                tracing::error!("wgpu: {text}");
                 *sink.lock().expect("sink lock poisoned") = Some(text);
             }));
         }

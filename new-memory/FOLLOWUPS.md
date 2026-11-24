@@ -1625,3 +1625,15 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 **Idea.** One kernel with a `FUSED` flag: rows_carried's body replaced by the fused step's with its conv half compiled out. It changes rows_carried's arithmetic order, so it needs the per-shape rocprofv3 microbench (rows 1 / 8 / 64, carried 0 / 1, commit 1 / 8) and bit-identical outputs and states before it lands.
 
 **Why later.** Not a mechanical merge (the cleanup round took only moves); `ssm_gdn_step_carried` stays the fallback for other head widths either way.
+
+## F96. `ChunkFacts::act_span_chunks` goes once no engine pins its span's bottom at load
+
+**What.** `crates/engine/src/chunk.rs:143` `act_span_chunks`: the chunks from the range's end a rung's activation may take. The end state is `None` on every engine; engine-gpu (`store/layout.rs:412`) and engine-metal (`store/layout.rs:576`) still state it, as they pin their span's bottom at load. The field and the runtime's reads of it (`store/shared.rs`, `store/shared/programs.rs`) go with the last of them.
+
+**Why later.** Each engine's span has to be backed on demand first; the comment that called it interim moved here.
+
+## F97. engine-gpu: arm the request classes whose lanes carry an attachment
+
+**What.** `crates/engine-gpu/src/serve.rs:10420` (`record_bodies`), `:1248` (`eager_classes`), `:5232` (`eager_kind`): a class whose lanes carry a score capture, an adapter or a guest input is stated eager at load, since its commands bind each attachment, which multiplies the bodies past what a device holds. It is armed once its commands read the attachment as data.
+
+**Why later.** Needs the attachment read as data in the recorded commands; until then those classes run eager, stated at load.

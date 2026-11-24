@@ -748,7 +748,7 @@ unsafe extern "system" fn on_validation(
     let message = unsafe { (*data).message_as_c_str() }
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    eprintln!("vulkan validation [{:#x}]: {message}", severity.as_raw());
+    tracing::warn!(severity = severity.as_raw(), "vulkan validation: {message}");
     vk::FALSE
 }
 
@@ -1273,11 +1273,12 @@ impl Context {
         // A recording's pool segment bindings are written as the segments
         // are backed and given back, while it stands: update-after-bind
         // storage buffers. A device without them lays its pool whole
-        // (`Context::resizes_pool`). `PIE_VULKAN_WHOLE_POOL` takes that path
-        // on one that has them, to test it.
-        let update_after_bind = f12.descriptor_binding_storage_buffer_update_after_bind
-            == vk::TRUE
-            && std::env::var_os("PIE_VULKAN_WHOLE_POOL").is_none();
+        // (`Context::resizes_pool`); a test's boot takes that path on one
+        // that has them (`DeviceBoot::whole_pool`).
+        let update_after_bind =
+            f12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE;
+        #[cfg(feature = "test-limits")]
+        let update_after_bind = update_after_bind && !boot.whole_pool;
         if !enabled.shader_int16 || !enabled.storage_16bit {
             bail!(Fault::NoDevice {
                 detail: format!(

@@ -1,7 +1,7 @@
 //! Which classes a load's lattice names and arms before ready, and the room
 //! arming lends a scored fire's capture rows: one rule every engine that
-//! records bodies follows (the ruling: every body is captured before ready,
-//! nothing is built eagerly after it).
+//! records bodies follows: every body is captured before ready, and nothing
+//! is built eagerly after it.
 //!
 //! A class is armed when a plain request lands in it, when a request plain
 //! but for capturing scores does (a scored class: an eviction guest's

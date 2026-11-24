@@ -30,7 +30,7 @@ pub fn counts(trace: &Trace) -> Result<Counts> {
     ))
 }
 
-/// The rungs `(tokens, span bytes)` offers as the ruling
+/// The rungs `(tokens, span bytes)` offers as the fire-top rule
 /// weighs them: a lane a token up to `max_lanes`, a row attending its
 /// fire's tokens, `launches` kernels a fire, a matmul's rows padded by
 /// `padded`, and infeasible for the reason `why` states of its tokens (the
@@ -163,7 +163,7 @@ mod tests {
                 .contains("device Card X has no rates in its profile"),
             "{err}"
         );
-        // No feasible rung at all: the ruling's refusal, with the binding.
+        // No feasible rung at all: the fire-top rule's refusal, with the binding.
         let none = facts(&[(1024, 300 * MIB)], 200 * MIB);
         let rated = profile(
             "api = 1\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 1.0]]]]\nattn_tflops_by_keys = \
@@ -190,7 +190,7 @@ mod tests {
     }
 
     /// The one top-rung rule on an Adreno-shaped phone: 3803136-byte
-    /// chunks, a 1 GiB largest binding, about 1.9 GB of room. The ruling's
+    /// chunks, a 1 GiB largest binding, about 1.9 GB of room. The fire-top rule's
     /// argmax over the rungs alone is the 1024 rung, whose fire binds a
     /// 1253572608-byte reservation; over the feasible ones it is the widest
     /// whose every reservation lies in one binding and whose span and one
@@ -224,7 +224,7 @@ mod tests {
             )
         }
 
-        /// The top the ruling picks of `rooms` beside one working set of
+        /// The top the fire-top rule picks of `rooms` beside one working set of
         /// `least` chunks, each rung infeasible as `why` states.
         fn top(rooms: &[Rung], least: u32, why: &dyn Fn(&Rung) -> Option<&'static str>) -> u32 {
             let spans: Vec<(u32, u64)> =
@@ -254,7 +254,7 @@ mod tests {
         fn the_top_is_one_whose_fire_fits_the_binding() {
             let (room, least) = (1_900_000_000u64, 129u32);
             let rooms = rooms(room);
-            // Over the rungs alone, the ruling would pick the 1024 rung.
+            // Over the rungs alone, the fire-top rule would pick the 1024 rung.
             assert_eq!(top(&rooms, least, &|_| None), 1024);
             assert_eq!(feasible(least)(&rooms[2]), Some(PAST_ONE_BINDING));
             let pick = top(&rooms, least, &feasible(least));
@@ -266,7 +266,7 @@ mod tests {
 
         /// One working set at the declared context takes 564 MiB (156
         /// chunks) of the pool: past the weights the device holds, 600 chunks
-        /// of room make the 512 rung the ruling's pick, and the planes the
+        /// of room make the 512 rung the fire-top rule's pick, and the planes the
         /// load derives past sizing (350 chunks) leave a pool only the 256
         /// rung's span fits beside it: the pick is the 256 rung, not a load
         /// refused at the pool.

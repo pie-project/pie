@@ -1203,8 +1203,8 @@ where
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the walk's own branch
-        // (sc/gpu-arm-before-ready) consumes it before ready.
+        // facts, computed once the caps are: the arm walk keys on them before
+        // ready.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
@@ -1816,8 +1816,10 @@ where
 
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
-        if let Some(shell) = self.shell.as_mut() {
-            let _ = shell.reap();
+        if let Some(shell) = self.shell.as_mut()
+            && let Err(fault) = shell.reap()
+        {
+            tracing::warn!(%fault, "reaping landed frames before a fire");
         }
     }
 
