@@ -1941,6 +1941,8 @@ mod tests {
             slots: None,
             kv_len: None,
             fold: None,
+            parents: None,
+            parents_end: None,
         };
         let refused = Err(UNSHARED_CHECKPOINT.to_string());
         let bind = |context: &mut ProcessCtx, pass: u32, ws: u32| -> anyhow::Result<()> {
@@ -1951,6 +1953,8 @@ mod tests {
                 slots: None,
                 kv_len: None,
                 fold: None,
+                parents: None,
+                parents_end: None,
             });
             Ok(())
         };

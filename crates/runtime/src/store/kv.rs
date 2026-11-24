@@ -1149,7 +1149,7 @@ impl KvStore {
                 let before = freed;
                 freed += self.settle_on_disk(ids, key, &keys, epoch, short - freed);
                 if freed == before {
-                    let ids = ids
+                    let ids: Vec<u64> = ids
                         .iter()
                         .copied()
                         .filter(|id| !self.cache.get(id).is_some_and(|e| self.persisted_whole(e)))
@@ -3848,7 +3848,7 @@ impl KvStore {
     /// what may go ([`pressure::may_drop`](crate::policy::pressure::may_drop)):
     /// a copy by the key it was kept under, an entry by its own key and
     /// every one of its copies'; dropping it gives them all up.
-    fn disk_yield_plan(&self, keys: &impl Keys) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
+    fn disk_yield_plan(&self, _keys: &impl Keys) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
         let Some(persisted) = &self.persisted else {
             return (Vec::new(), Vec::new());
         };

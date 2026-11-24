@@ -3056,7 +3056,7 @@ async fn a_bind_waits_for_what_its_reclaim_freed_to_retire_and_reclaims_no_more(
     planner.register(pid);
     planner.note_admitted(pid);
     let p = planner.clone();
-    let mut waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1).await });
+    let mut waited = crate::rt::spawn(async move { p.wait_bind_room(pid, 3, 1, 0).await });
     for _ in 0..3 {
         planner.plan();
         for _ in 0..16 {

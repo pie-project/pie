@@ -457,12 +457,10 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
     // Passed in this order: none passes a gate ahead of a higher key
-    // waiting at an earlier one.
-    let prewarm = Some(OrderedSemaphore::new(
-        "prewarm",
-        limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
-        true,
-    ));
+    // waiting at an earlier one. Only the first gate, prewarm, holds below
+    // the floor. With no count stated it counts nothing: what a newcomer may
+    // take is the capacity gate's, read at each gate ([`wait_for_room`]).
+    let prewarm = Some(OrderedSemaphore::new("prewarm", limit.unwrap_or(usize::MAX / 2), true));
     const STAGED_COHORTS: usize = 1;
     let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
         gates

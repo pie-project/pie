@@ -982,18 +982,6 @@ fn lanes_frozen(
     Ok(frozen)
 }
 
-/// Whether a pass of a load whose windowed layers are ring + buffer
-/// (`window_state`) keeps a checkpoint at its last page boundary unasked (a
-/// snapshot of its record, the rings, which kv alone cannot rebuild): only
-/// where it costs no fire of its own, the engine landing it inside the
-/// fire (`rs_snapshots`) or the pass ending on the boundary (`reach`, a
-/// page multiple). Elsewhere the checkpoint would cut the prompt's last
-/// rows into a fire of their own (a 2065-row prompt as 2064 rows and 1),
-/// so none is kept, as an rs load keeps none unasked.
-fn window_auto_checkpoint(window_state: bool, rs_snapshots: u32, reach: u64, page: u32) -> bool {
-    window_state && (rs_snapshots > 0 || reach.is_multiple_of(u64::from(page.max(1))))
-}
-
 /// Whether the load's only state is windowed layers served as ring +
 /// buffer (`window_state`, its record the rings alone: no recurrent layer,
 /// whatever buffer lists the engine states): its lanes, a beam group's

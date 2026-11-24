@@ -125,7 +125,7 @@ fn a_beams_finish_waits_out_a_suspend_and_names_each_page_once() {
     let ws = store.create_working_set();
     commit_fresh(&mut store, ws, 4, 1);
     let sets = HashSet::from([ws]);
-    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    let txn = store.prepare_suspend(&sets, floor).unwrap().expect("private pages suspend");
     assert!(matches!(
         store.relist_beam_needs(ws, 1, &[2, 0]).unwrap(),
         super::RelistNeeds::MoveEnd(_)
@@ -176,7 +176,7 @@ fn a_beams_finish_copies_the_chosen_pages_another_reads() {
     assert_eq!(still, read, "the fork reads what it read");
     store.release_working_set(ws, store.current_epoch());
     store.release_working_set(other, store.current_epoch());
-    store.drop_entries_off_device();
+    store.drop_entries_off_device(usize::MAX, &floor, None);
     store.retire_idle();
     let cached = total - store.free_committed();
     assert!(
@@ -192,7 +192,7 @@ fn a_cut_waits_out_a_move() {
     let ws = store.create_working_set();
     commit_fresh(&mut store, ws, 4, 1);
     let sets = HashSet::from([ws]);
-    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    let txn = store.prepare_suspend(&sets, floor).unwrap().expect("private pages suspend");
     assert!(matches!(store.truncate(ws, 0), Err(super::KvStoreError::MoveInFlight)));
     assert_eq!(store.mapped_len(ws).unwrap(), 4, "nothing cut while it moves");
     store.abort_suspend(txn);
@@ -1607,7 +1607,7 @@ fn the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves() {
         store.prepare_demote(16, keys).unwrap().is_none(),
         "B, the lowest, finds no room: nothing above it moves"
     );
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), keys), 4, "B goes");
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keys), 4, "B goes");
     assert_eq!(on_device(&mut store, &b_tokens), 0);
     assert_eq!(on_device(&mut store, &a_tokens), 4, "A stays");
 }
@@ -1630,7 +1630,7 @@ fn a_demote_keeps_off_the_disk_what_its_row_keeps_off_it() {
     assert_eq!(txn.page_count(), 4, "the host's four slots, none of the disk's");
     store.commit_suspend(txn).unwrap();
     assert_eq!(store.host_swap_available(), 0);
-    assert_eq!(store.disk_swap_available(), 8, "the disk untouched");
+    assert_eq!(store.disk_swap_available(floor), 8, "the disk untouched");
 }
 
 /// Rows of one key and one tier set for every owner, as a test's table.

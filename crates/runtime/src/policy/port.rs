@@ -245,7 +245,7 @@ const STORES: Cache = Cache {
                 rooms[1].0 += u64::from(kv.host_swap_capacity());
                 rooms[1].1 += kv.host_swap_available() as u64;
                 rooms[2].0 += u64::from(kv.disk_swap_capacity());
-                rooms[2].1 += kv.disk_swap_available() as u64;
+                rooms[2].1 += kv.disk_swap_available(crate::policy::retention::Installed) as u64;
             });
         }
         rooms
