@@ -1509,3 +1509,11 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **Idea.** Let the settle fire on chunks the runtime lends for the slice (a reservation by refs, sized to one range's fire), or let the quiet check ignore holders whose chunks lie outside the seat runs a settle fire writes.
 
 **Why later.** Accepted for the new-memory PR (coordinator, 2026-11-24): the boot is fast either way, and only the picks stay on the fallback.
+
+## F80. Dense curves resumable behind serving on bounded platforms
+
+**What.** A stale dense curve on a platform that bounds a submission (Android, Windows) is served by its stale figure and not timed again behind serving (`engine_gpu::rates::stale_curves`), because `measure_shapes` does not resume point by point. The coordinated export round refreshes it, the same contract CUDA's product banks keep.
+
+**Idea.** Give `measure_shapes` the rates step's `Resume` (each point memoized with the kernels it fired, frames held to one decode step, a point past it deferred until nothing is live), then state curves `TimedBehind` on bounded platforms too.
+
+**Why later.** Accepted for this round (coordinator, 2026-11-24).

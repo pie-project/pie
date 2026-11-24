@@ -15,6 +15,14 @@ use fire::{PendingFireQueue, PendingFires, PipelineFailure};
 /// closed. What `pipeline.speculation-advised` reads.
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether no process has work outstanding: no pipeline open (each parks
+/// or closes once its process has nothing in flight). What the engines'
+/// work behind serving waits for.
+#[must_use]
+pub fn none_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed) == 0
+}
+
 pub struct Pipeline {
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,
@@ -59,8 +67,10 @@ impl Pipeline {
         if self.active.swap(active, Ordering::Relaxed) != active {
             if active {
                 ACTIVE.fetch_add(1, Ordering::Relaxed);
-            } else {
-                ACTIVE.fetch_sub(1, Ordering::Relaxed);
+            } else if ACTIVE.fetch_sub(1, Ordering::Relaxed) == 1 {
+                // The last one parked or closed: nothing is live, and what
+                // the engines measure behind serving may run now.
+                crate::scheduler::lane::turn_behind();
             }
         }
     }
