@@ -56,6 +56,20 @@ impl Roles {
     /// [`Self::footprint`] of what `holder`'s binds took: its items, and
     /// its binds on their way.
     #[must_use]
+    /// [`Self::footprint_of`]'s share on the device: the items of
+    /// `holder`'s lying there or on their way (a park or an unpark holds
+    /// device slots until it lands), its binds' takes on their way.
+    pub fn device_footprint_of(&self, holder: Holder) -> u64 {
+        let device = self.device.lock().unwrap();
+        self.items
+            .values()
+            .filter(|item| item.holder == Some(holder) && matches!(item.tier, Tier::Device | Tier::Moving))
+            .flat_map(|item| &item.parts)
+            .map(|part| self.part_bytes(&device, part))
+            .sum::<u64>()
+            + self.on_way.0.get(&Some(holder)).copied().unwrap_or(0)
+    }
+
     pub fn footprint_of(&self, holder: Holder) -> u64 {
         let device = self.device.lock().unwrap();
         self.items

@@ -626,38 +626,6 @@ impl ResidencyPlanner {
         let parking_down = !parked.is_empty() && self.park_down(victims.head_pid, parked);
         let (mut picks, unhostable) =
             self.quote_and_pick(candidates, wanted, room, victims.rs_pages, model, engine);
-        // The map named a move for the head's runs, but no candidate it
-        // names qualifies (each chunk of the cheapest holds a slot no pick
-        // moves, or its move found no room below): moving chunks is the
-        // way left, as where the map names none. Left to the policy, the
-        // finisher's bind of adjacent chunks would wait with free chunks a
-        // compaction would lay side by side.
-        // With nothing in flight, whatever the head: no answer of the
-        // policy's comes that the compaction does not.
-        if picks.is_empty()
-            && !parking_down
-            && let Some((run, pieces)) = shape.as_ref().and_then(RunNeed::longest)
-            && self.with_inner(|inner| inner.nothing_in_flight())
-            && self.port.compaction_comes(
-                run,
-                if placement.is_some() {
-                    self.port.guest_free_runs(run).saturating_add(pieces)
-                } else {
-                    pieces
-                },
-            )
-        {
-            self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
-            self.plan_ended(victims.head, "compaction asked", host_short, &[]);
-            tracing::debug!(
-                head = %victims.head_pid,
-                run,
-                pieces,
-                "planner: no pick forms the head's runs; a compaction moves chunks for them"
-            );
-            self.note_short(victims.head, 0, 0);
-            return;
-        }
         // An occupant with no kv or state to move (only guest scratch,
         // given back at its park) quotes nothing and is no pick by pages:
         // it is one all the same, or its chunk does not empty.
@@ -957,6 +925,34 @@ impl ResidencyPlanner {
             let tier_full = (host_short || !unhostable.is_empty() || blocked)
                 && self.with_inner(|inner| inner.truly_wedged())
                 && !self.waits_on_policy();
+            // Before anyone fails, the device's room after a compaction:
+            // where moving chunks stands the head's runs, a compaction is
+            // asked and no one fails (the simulation's Metal seed 44: 445
+            // of 656 pages free, 17 whole chunks, failed for runs of three
+            // a compaction lays).
+            if tier_full
+                && let Some((run, pieces)) = shape.as_ref().and_then(RunNeed::longest)
+                && self.port.compaction_comes(
+                    run,
+                    if placement.is_some() {
+                        self.port.guest_free_runs(run).saturating_add(pieces)
+                    } else {
+                        pieces
+                    },
+                )
+            {
+                self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
+                self.plan_ended(victims.head, "compaction asked", host_short, &[]);
+                tracing::debug!(
+                    head = %victims.head_pid,
+                    run,
+                    pieces,
+                    "planner: every tier full but the device's runs a compaction lays: a compaction \
+                     moves chunks for the head, no one failed"
+                );
+                self.note_short(victims.head, 0, 0);
+                return;
+            }
             if tier_full && self.fail_tiers_full(None) {
                 return;
             }

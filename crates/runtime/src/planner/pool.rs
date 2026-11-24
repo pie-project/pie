@@ -1027,6 +1027,11 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = pid;
         0
     }
+    /// [`Self::guest_pages_of`]'s share still on the device: what a park
+    /// of `pid` moves below (or leaves where it lies, no tier taking it).
+    fn guest_device_pages_of(&self, pid: ProcessId) -> u64 {
+        self.guest_pages_of(pid)
+    }
     /// The kv pages one process may hold at most: the declared context
     /// served ([`crate::store::registry::Stores::context_pages`]), the
     /// capacity gate's end for a process that states none
@@ -1138,6 +1143,23 @@ pub struct RegistryPool {
 const RECLAIMABLE_FRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RegistryPool {
+    /// Guest bytes `of` reads from the roles, as pages counted as
+    /// [`CapacityCensus::held`] counts them; 0 where the pool keeps none.
+    fn guest_bytes_as_pages(&self, of: impl FnOnce(&crate::store::roles::Roles) -> u64) -> u64 {
+        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
+            return 0;
+        };
+        let Some(roles) = stores.roles.as_ref() else {
+            return 0;
+        };
+        let bytes = of(&roles.lock().unwrap());
+        let chunk_bytes = stores
+            .shared
+            .as_ref()
+            .map_or(1, |shared| shared.lock().unwrap().pool().chunk_bytes().max(1));
+        (bytes * u64::from(self.chunks_as_pages(1))).div_ceil(chunk_bytes)
+    }
+
     /// The fewest chunks `pid`'s own state takes on the device, wherever
     /// it lies: per shape, the slots of its kv pages that leave with it,
     /// its state's (records, lists, windows) and its guest state's, packed
@@ -1638,18 +1660,11 @@ impl PoolPort for RegistryPool {
     }
 
     fn guest_pages_of(&self, pid: ProcessId) -> u64 {
-        let Some(stores) = crate::store::registry::try_get(self.model, self.engine) else {
-            return 0;
-        };
-        let Some(roles) = stores.roles.as_ref() else {
-            return 0;
-        };
-        let bytes = roles.lock().unwrap().footprint_of(pid);
-        let chunk_bytes = stores
-            .shared
-            .as_ref()
-            .map_or(1, |shared| shared.lock().unwrap().pool().chunk_bytes().max(1));
-        (bytes * u64::from(self.chunks_as_pages(1))).div_ceil(chunk_bytes)
+        self.guest_bytes_as_pages(|roles| roles.footprint_of(pid))
+    }
+
+    fn guest_device_pages_of(&self, pid: ProcessId) -> u64 {
+        self.guest_bytes_as_pages(|roles| roles.device_footprint_of(pid))
     }
 
     fn context_pages(&self) -> Option<u32> {

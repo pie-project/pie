@@ -126,11 +126,19 @@ impl ResidencyPlanner {
             return Err(error);
         }
         // A newcomer's first ask fits on the device, or below it by the
-        // evictions it would force with room to land: else it is refused
-        // by name at admission, never let in to fill the tiers with work
-        // that cannot finish. Admitted processes wait and move instead.
-        let newcomer = self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| !proc.seated));
-        if newcomer && demand.kv_pages > 0 {
+        // evictions it would force with room to land, or waits for room a
+        // running process frees: over-demand waits and is served. Only
+        // where it fits nowhere and nothing else could run or free room
+        // (the fleet wedged but for it) is it refused by name at
+        // admission, never let in to fill the tiers with work that cannot
+        // finish. Admitted processes wait and move instead.
+        let newcomer = self.with_inner(|inner| {
+            inner.procs.get(&pid).is_some_and(|proc| !proc.seated) && inner.wedged_but(Some(pid))
+        });
+        // A need past the device alone is no admission's: it is refused
+        // as never fitting ([`PlannerError::Impossible`],
+        // [`PlannerError::PastPool`]) by the ask itself.
+        if newcomer && demand.kv_pages > 0 && demand.kv_pages <= self.device_pages_most() {
             let (device, host, disk) = (self.port.device_stats(), self.port.host_stats(), self.port.disk_stats());
             let room = u64::from(device.0) + u64::from(host.0) + u64::from(disk.0);
             if u64::from(demand.kv_pages) > room {

@@ -4040,35 +4040,26 @@ fn sim_field_seeds_863_and_178_end() {
     field_regression(178);
 }
 
-/// The Metal w17 mix's seeds 2 and 6: newcomers arrive while the safe
-/// order has no room at its last place, wait there holding nothing
-/// (`ResidencyPlanner::admitted_to_ask`), and are let in as admitted
-/// processes finish; no admission turns the order short (the run's
-/// `admission` check), and every process ends: admitting never starves one
-/// admitted.
+/// The Metal w17 mix's seeds 2 and 6: newcomers arrive with the device
+/// full of admitted work. Over-demand waits and is served: each newcomer
+/// waits for room as admitted processes move or finish (refused by name
+/// at admission only with the fleet wedged but for it), and every process
+/// ends, finished or failed by name with every tier full.
 #[test]
-fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_ends() {
-    // Seated lanes grow before a waiting prompt on every engine now (PLEX
-    // 1.1's no displacement): seed 6's newcomers no longer reach the gate's
-    // last place, seed 2's still do. Both must end clean.
-    let mut waits = 0;
+fn sim_metal_seeds_2_and_6_every_process_ends() {
     for seed in [2, 6] {
-        let (failures, coverage) = run(&Workload::metal(seed), None);
+        let (failures, _) = run(&Workload::metal(seed), None);
         for failure in &failures {
             eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
         }
         assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
-        waits += coverage.admission_waits;
     }
-    assert!(waits > 0, "no newcomer waited at the gate");
 }
 
 /// The Metal mix's seeds 30, 44 and 131: a restore carrying the bind that
-/// suspended its process lays that bind's fresh chunks, new state, which
-/// the capacity gate weighs as it weighs a bind's ask; ungated, every tier
-/// together fell short of the finisher's headroom (seed 44: a chunk taken
-/// with nothing spare, 14 pages short). Every process ends, the finisher's
-/// headroom kept.
+/// suspended its process lays that bind's fresh chunks, new state (seed
+/// 44: a chunk taken with nothing spare, 14 pages short). Every process
+/// ends, finished or failed by name with every tier full.
 #[test]
 fn sim_metal_seeds_30_44_131_a_restores_bind_waits_on_the_gate() {
     for seed in [30, 44, 131] {
