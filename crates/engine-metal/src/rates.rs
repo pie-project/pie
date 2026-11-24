@@ -121,6 +121,13 @@ struct Bench<'a> {
     /// Behind serving: whether a request arrived, read before each frame;
     /// one did, and the step stops ([`YIELDED`]).
     yield_to: Option<&'a dyn Fn() -> bool>,
+    /// Seconds a dispatch's launch costs ([`Self::launch_ns`]), once
+    /// measured: a fire of `engine::rates::LAUNCH_CHAINS`' longest chain of them or more
+    /// pays one buffer boundary at most that over again, and behind serving
+    /// a frame of such fires is cut between them ([`Self::frame_of`]).
+    launch: std::cell::Cell<Option<f64>>,
+    /// Seconds one fire of the last frame took.
+    last_fire: std::cell::Cell<f64>,
 }
 
 /// Why a step behind serving stopped: a request arrived before a frame of
@@ -171,16 +178,57 @@ impl Bench<'_> {
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
         k: u32,
     ) -> Result<f64, String> {
-        if self.yield_to.is_some_and(|arrived| arrived()) {
+        let Some(arrived) = self.yield_to else {
+            return self.frame_whole(turn, encode, k);
+        };
+        if arrived() {
             return Err(YIELDED.to_string());
         }
+        // Behind serving, a frame of fires each longer than a chain of
+        // launches is cut between them, `arrived` read at each cut: the
+        // same fires, each buffer's GPU time summed (`commit_busy`), the
+        // boundaries costing about a launch a fire, so an arrival waits for
+        // the one fire in flight, not the frame.
+        let long = self.launch.get().is_some_and(|launch| {
+            self.last_fire.get() >= launch * f64::from(engine::rates::LAUNCH_CHAINS[1])
+        });
+        if k < 2 || !long {
+            return self.frame_whole(turn, encode, k);
+        }
+        let frame = self.device.frame().map_err(|e| e.to_string())?;
+        let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
+        for fire in 0..k {
+            if fire > 0 {
+                frame.cut().map_err(|e| e.to_string())?;
+                if arrived() {
+                    frame.commit().map_err(|e| e.to_string())?;
+                    return Err(YIELDED.to_string());
+                }
+            }
+            let at = turn.next(u32::MAX as usize) as u32;
+            encode(&sink, at).map_err(|e| e.to_string())?;
+        }
+        let seconds = frame.commit_busy().map_err(|e| e.to_string())?;
+        self.last_fire.set(seconds / f64::from(k));
+        Ok(seconds)
+    }
+
+    /// [`Self::frame_of`] in one buffer.
+    fn frame_whole(
+        &self,
+        turn: &engine::rates::Rotation,
+        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
+        k: u32,
+    ) -> Result<f64, String> {
         let frame = self.device.frame().map_err(|e| e.to_string())?;
         let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
         for _ in 0..k {
             let at = turn.next(u32::MAX as usize) as u32;
             encode(&sink, at).map_err(|e| e.to_string())?;
         }
-        frame.commit_timed().map_err(|e| e.to_string())
+        let seconds = frame.commit_timed().map_err(|e| e.to_string())?;
+        self.last_fire.set(seconds / f64::from(k.max(1)));
+        Ok(seconds)
     }
 
     /// The workgroups one of what `encode` fills launches, from an encode the
@@ -668,6 +716,8 @@ pub fn clock_rate(device: &Context, profile: profile::Profile, settled: bool) ->
         tuning: &tuning,
         pattern: engine::rates::operand_pattern(),
         yield_to: None,
+        launch: std::cell::Cell::new(None),
+        last_fire: std::cell::Cell::new(0.0),
     };
     let plane = bench.operand(u64::from(SIDE * SIDE) * 2)?;
     let weight = [bench.tensor(&plane, SIDE, SIDE, Dtype::Bf16)?];
@@ -718,6 +768,8 @@ pub fn measure_keys(
         tuning: &tuning,
         pattern: engine::rates::operand_pattern(),
         yield_to,
+        launch: std::cell::Cell::new(None),
+        last_fire: std::cell::Cell::new(0.0),
     };
     // The launch first: every rate below takes its dispatches' launches off
     // (engine::rates::rate_from).
@@ -725,6 +777,7 @@ pub fn measure_keys(
     // (`crate::stored::by`), recorded phase by phase.
     let _ = crate::encode::record_fired(true);
     let (launch, gaps) = bench.launch_ns()?;
+    bench.launch.set(Some(launch as f64 * 1e-9));
     let fired_launch = crate::encode::record_fired(true);
     say(&format!(
         "  launch: {}",
