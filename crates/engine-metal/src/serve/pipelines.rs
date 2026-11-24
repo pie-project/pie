@@ -209,8 +209,8 @@ impl Shell {
         self.warm_pipelines_over(&steps)
     }
 
-    /// Builds, before ready, every pipeline a step of `steps` dispatches
-    /// (CONTRACT-BC 24): each shape in the set's order, smallest first, at
+    /// Builds, before ready, every pipeline a step of `steps` dispatches:
+    /// each shape in the set's order, smallest first, at
     /// its rung, under its treatment's verbs, at the rows its span reaches
     /// (one, every matmul band start inside it, each unrolled few-rows
     /// matmul's top, 2 / 4 / 8, and its top) and at each readout tier inside

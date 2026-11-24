@@ -1,5 +1,4 @@
-//! Beam groups' page lists (`state-geometry.parents`,
-//! `new-memory/designs/BEAM-PAGE-LISTS.md`): planned on the host from what
+//! Beam groups' page lists (`state-geometry.parents`): planned on the host from what
 //! the host knows (each group's working set's reserve and frozen slots, the
 //! slot its beams write, its lanes' staged tables), run on the device from
 //! the group's resident state and the parents its last epilogue wrote
@@ -47,7 +46,7 @@ pub struct GroupLane {
 }
 
 /// The pool pages a group of `lanes` beams can name at the fire whose
-/// beams write `slot` (BEAM-PAGE-LISTS §3): the step hands out the lowest
+/// beams write `slot`: the step hands out the lowest
 /// free pages, so every page named or pending lies below
 /// `B (c + 2) + B F + 1`. Only those are backed and staged.
 #[must_use]
@@ -230,8 +229,7 @@ pub fn plan(
     Ok((records, faults))
 }
 
-/// What [`plan_rs`] reads of a hybrid fire's rs buffer (BEAM-PAGE-LISTS
-/// §11): each seat's buffer base and its set's rs pages (slab slots, every
+/// What [`plan_rs`] reads of a hybrid fire's rs buffer: each seat's buffer base and its set's rs pages (slab slots, every
 /// one of its buffer), each seat's lane plan, the fire's rs page table (its
 /// address and a row's ints), the rows a page holds, an rs page's bytes,
 /// the slab its page ids address and each plane's `(offset, cell)`.
@@ -246,7 +244,7 @@ pub struct RsStaged<'a> {
     pub planes: Vec<kbeam::PagePlane>,
 }
 
-/// A hybrid's beams over the records [`plan`] laid (BEAM-PAGE-LISTS §11):
+/// A hybrid's beams over the records [`plan`] laid:
 /// each group's set's rs entries, each beam's rs page table to resolve over
 /// its list (its row of the fire's rs page table, from the buffer entry the
 /// row's first slot holds) and each beam's rs copy over every rs plane. A
@@ -278,7 +276,7 @@ pub fn plan_rs(
                     "instance {}'s beams buffer recurrent rows {tokens} a page from slot {base}, \
                      and their page lists page kv slots {page} a page: a hybrid's beams need \
                      the rs page's rows to divide the kv page's and its buffer to start on a \
-                     row page (BEAM-PAGE-LISTS.md §11)",
+                     row page",
                     group.instance
                 ),
             ));

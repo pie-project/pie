@@ -1,5 +1,4 @@
-//! A windowed lane's composed page table and its fold (CONTRACT-BC 19, 21;
-//! `chunks::MetalRing`). A windowed layer's folded rows lie in the lane's
+//! A windowed lane's composed page table and its fold (//! `chunks::MetalRing`). A windowed layer's folded rows lie in the lane's
 //! ring, `R` rows laid as pages shaped exactly as a window-buffer slot (`P`
 //! rows of every windowed layer), row `r` at ring row `r mod R`; its unfolded
 //! rows lie in the lane's window-buffer slots, entry `i` the rows

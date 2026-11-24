@@ -30,7 +30,7 @@ use crate::store::Pools;
 
 /// A ring's facts at `channel_slot`-byte `Channel` slots, `per_chunk` a
 /// chunk: cells packed whole a slot, or, where a cell is past a slot, one
-/// contiguous run (STATE-ROLES.md A+D). `None` where the run would not fit
+/// contiguous run. `None` where the run would not fit
 /// a chunk: the engine keeps that ring.
 #[must_use]
 pub fn ring_facts(
@@ -152,7 +152,7 @@ pub struct Plane {
     /// 0 where the load reads out no scores.
     capture: u64,
     /// The pages a beam group's lists span and the frames its pending
-    /// pages wait (BEAM-PAGE-LISTS §3): the context's pages and the frames
+    /// pages wait: the context's pages and the frames
     /// in flight.
     beam_bounds: (u32, u32),
     /// The widest beam group the device's threadgroup memory holds for the
@@ -171,8 +171,8 @@ pub struct Plane {
     claims: Claims,
 }
 
-/// A beam group's resident state, as its instance lays it
-/// (BEAM-PAGE-LISTS §4): its beams, the list width and pool pages it is
+/// A beam group's resident state, as its instance lays it:
+/// its beams, the list width and pool pages it is
 /// laid for, and its ring of pending pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeamLayout {
@@ -791,7 +791,7 @@ impl Plane {
     /// (`Port::Parents`, `[lanes]` u32 in a channel): its pool holds its
     /// beams' pages (each at most a sequence's), the pages a fire hands
     /// out, those pending over the frames in flight and the prompt's own
-    /// page (BEAM-PAGE-LISTS §3). `None` for any other program.
+    /// page. `None` for any other program.
     fn beam_of(&self, program: &Program) -> Option<BeamLayout> {
         let binding = program
             .plan
@@ -832,7 +832,7 @@ impl Plane {
     }
 
     /// Beam `beam`'s page list of instance `id`'s beam group as its last
-    /// fire left it (`BEAM-PAGE-LISTS.md` §6.6): the lists are kept twice by
+    /// fire left it: the lists are kept twice by
     /// the fire count's parity (`runtime/beam.metal`), the last fire's at
     /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. The
     /// caller lands every fire in flight first.
@@ -880,8 +880,8 @@ impl Plane {
             .collect())
     }
 
-    /// The host address of instance `id`'s beam group's common slot word
-    /// (BEAM-PAGE-LISTS §11.3): its header's fourth, below which every live
+    /// The host address of instance `id`'s beam group's common slot word:
+    /// its header's fourth, below which every live
     /// beam's rows are one, as its last head step left it. `None` where it
     /// holds no beam state.
     #[must_use]
@@ -1105,7 +1105,7 @@ impl Plane {
             bound.scratch = scratch;
             bound.beam = beam;
             // A bind's first lay: the group's state starts unprimed
-            // (header zero, BEAM-PAGE-LISTS §5).
+            // (header zero).
             if fresh && let Some(beam) = bound.beam.as_mut() {
                 beam.zero_span(0, beam.bytes())?;
             }
@@ -4986,7 +4986,7 @@ mod tests {
     }
 
     /// A beam group's state is resident in its instance's place
-    /// (`GuestState::resident`, BEAM-PAGE-LISTS §4), first in it, and the
+    /// (`GuestState::resident`), first in it, and the
     /// runtime copies the place byte for byte wherever a park or a move
     /// takes it: a rebind naming a fresh place carries the group's state
     /// there, its bytes as they stood, and one that moves only the tables
@@ -5304,7 +5304,7 @@ mod tests {
         assert_eq!(fire(&mut plane, &mut logits, 654), 654, "after the round trip");
 
         // A role slot asked to the disk tier of a load that seated none is
-        // refused by name (CONTRACT-BC 22: any shape goes to disk, within
+        // refused by name (any shape goes to disk, within
         // the disk chunks the load seats).
         let standing = read(&pools);
         let mut frame = context.frame().expect("a frame");

@@ -851,8 +851,8 @@ pub struct Seat {
     pub pages: Option<Tensor>,
     /// The ints of a lane's row of `pages` ([`page_ints`]).
     pub page_ints: u32,
-    /// The fire's beam groups' folds before each recurrent layer's step
-    /// (BEAM-PAGE-LISTS §11.3), read through `pages`; `None` where no group
+    /// The fire's beam groups' folds before each recurrent layer's step,
+    /// read through `pages`; `None` where no group
     /// folds this fire.
     pub folds: Option<kernels_metal::ssm::GroupFolds>,
     pub ext: RefCell<HashMap<u32, Tensor>>,

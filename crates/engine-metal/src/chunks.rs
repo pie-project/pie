@@ -105,7 +105,7 @@ pub fn recipe_near(
     })
 }
 
-/// Metal's ring hook (CONTRACT-BC 19): a windowed lane's folded rows lie in
+/// Metal's ring hook: a windowed lane's folded rows lie in
 /// its record as pages laid exactly as a window-buffer slot (`P` rows of
 /// every windowed layer's K and V, layer-major), so the attention kernels
 /// read ring pages and buffer pages through one composed page table, at the

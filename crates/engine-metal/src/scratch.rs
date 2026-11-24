@@ -90,7 +90,7 @@ struct Register {
 }
 
 /// Where the plane lies: the pool's buffer, from `base` (the top of the
-/// activation span, REDESIGN 3c), once [`Scratch::seat`] places it.
+/// activation span), once [`Scratch::seat`] places it.
 #[derive(Debug)]
 struct Plane {
     buffer: Buffer,

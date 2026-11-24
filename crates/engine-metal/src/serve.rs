@@ -212,8 +212,7 @@ pub struct Seated<'a> {
     /// (`Lane::fixed`'s cow side); `None`: the seat's.
     pub record: Option<&'a [u32]>,
     /// The record's run side where it differs from `record` (a group's
-    /// copy-on-write): a lane that folds nothing reads its state there
-    /// (CONTRACT-BC 15).
+    /// copy-on-write): a lane that folds nothing reads its state there.
     pub record_run: Option<&'a [u32]>,
     /// The lane's window-list slot refs, one table a window list (the
     /// load's order), each one a `T_w` slot in token order (0 a slot
@@ -222,7 +221,7 @@ pub struct Seated<'a> {
     pub windows: &'a [Vec<u32>],
     /// A windowed load's lane: its record's ring pieces (`layout::RING`
     /// slot refs, `[run, cow]`) and how this fire folds its window
-    /// (`engine::fire::Lane::window`, CONTRACT-BC 19, 21).
+    /// (`engine::fire::Lane::window`).
     pub ring: Option<&'a [[u32; 2]]>,
     pub window: Option<engine::fire::WindowFold>,
     /// The runtime's report tag for this lane (`engine::fire` lane
@@ -1113,7 +1112,7 @@ impl PreparedLoad<'_> {
             }
         });
         let selections = feeds.selections.len();
-        // The activation span (REDESIGN 3c): the range's top, the kernel
+        // The activation span: the range's top, the kernel
         // scratch plane, under it each rung's staged regions (a frame in
         // flight each) and under them its carve, every power of two of
         // tokens from 1, the last the whole arena.
@@ -1315,7 +1314,7 @@ impl PreparedLoad<'_> {
             )
             .with_streamable(weights.filed_bytes())
         };
-        // A windowed load's own-row pages (CONTRACT-BC 19; `store::windowed`):
+        // A windowed load's own-row pages (`store::windowed`):
         // a fire's own rows past what its ring keeps for its queries lie in
         // window-slot pages at the range's very top, whole chunks every
         // rung's carve holds, so the page grid runs from each chunk's start.
@@ -2211,7 +2210,7 @@ impl Shell {
         self.pools.seat_disk(dir, budget)
     }
 
-    /// Seats the shared pool's host tier of `budget` bytes (CONTRACT-BC 22).
+    /// Seats the shared pool's host tier of `budget` bytes.
     pub fn seat_tier(&mut self, budget: u64) {
         self.pools.seat_tier(budget);
     }
@@ -2228,7 +2227,7 @@ impl Shell {
 
     /// A fire's record forks before it (`cow != run`): the state pieces'
     /// slots and, on a windowed load, the rings' (`layout::RING`), copied
-    /// whole run onto cow in one frame (CONTRACT-BC 19's copy-on-first-fold:
+    /// whole run onto cow in one frame (copy on first fold:
     /// the fire then reads and writes the cow side).
     pub fn copy_records(&mut self, state: &[(u32, u32)], rings: &[(u32, u32)]) -> Result<()> {
         let state = if self.pools.has_state() { state } else { &[] };
@@ -2840,7 +2839,7 @@ struct Flight {
     beam_check: Option<(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>)>,
 }
 
-/// The lanes a fire's beam fault words fault (BEAM-PAGE-LISTS §7).
+/// The lanes a fire's beam fault words fault.
 fn beam_faulted(
     check: &(crate::inputs::FaultReader, Vec<(usize, engine::InstanceId)>),
 ) -> Vec<Faulted> {
@@ -2983,7 +2982,7 @@ impl engine::frame::Shell for Shell {
         let lanes = u32::try_from(prepared.lanes.len()).unwrap_or(u32::MAX);
         // What the fire tells its completion sink once its buffer completed:
         // its folds and ends, or why it failed.
-        // Each beam group's common slot word (§11.3), read once the buffer
+        // Each beam group's common slot word (the group fold), read once the buffer
         // completed: what the runtime folds the group's set to.
         let common_words: Vec<(engine::InstanceId, crate::program::held::HostWord)> = {
             let mut words: Vec<(engine::InstanceId, crate::program::held::HostWord)> = Vec::new();

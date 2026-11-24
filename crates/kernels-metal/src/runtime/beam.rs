@@ -1,7 +1,8 @@
-//! A beam group's head step on the device (`new-memory/designs/BEAM-PAGE-LISTS.md`):
-//! `beam_step` (§5-6.3, then §6.5 over the lanes' staged tables) and
-//! `beam_copy_pages` (§6.4), `runtime/beam.metal`. The run records mirror
-//! the MSL structs; every address in them is a GPU virtual address.
+//! A beam group's head step on the device:
+//! `beam_step` (priming, or parents, fresh and returned pages; then each
+//! lane's staged tables) and `beam_copy_pages` (the fire's page copies),
+//! `runtime/beam.metal`. The run records mirror the MSL structs; every
+//! address in them is a GPU virtual address.
 
 use crate::encode::{Arg, Ctx, Fire, Grid};
 use crate::error::Error;
@@ -9,7 +10,7 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "runtime/beam.metal";
 
-/// `BEAM-PAGE-LISTS.md` §7's fault codes, one word a lane.
+/// The head step's fault codes, one word a lane.
 pub const PAGES_PAST_RESERVE: u32 = 1;
 pub const PAGES_SHORT: u32 = 2;
 pub const PAGES_BELOW_FLOOR: u32 = 3;
@@ -61,7 +62,7 @@ const COPY_THREADS: u32 = 128;
 /// over `cap` pool pages and `frames` pending rings: a header of 4, the
 /// lists twice (by the fire count's parity), the free pages, the ring, a
 /// fire's copies `[src, dst, tokens]` a beam, and each pair of lanes' common
-/// ancestor depth (BEAM-PAGE-LISTS §11.4).
+/// ancestor depth.
 #[must_use]
 pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
     beam_copies_word(lanes, cap, frames) + 3 * lanes as u64 + lanes as u64 * lanes as u64
@@ -109,7 +110,7 @@ pub struct BeamStepRun {
     pub rs: u64,
 }
 
-/// A hybrid lane's rs page table to resolve (`BEAM-PAGE-LISTS.md` §11.1):
+/// A hybrid lane's rs page table to resolve:
 /// its row's slot entries from the one holding buffer entry `first`
 /// (`pages`, past the row's in-page header), entry `e` the rows of slot
 /// `base + e * tokens` on, through `entries`, each resolved to the set's
@@ -128,7 +129,7 @@ pub struct BeamRsRun {
     pub bases_len: u32,
 }
 
-/// A beam's rs copy (`BEAM-PAGE-LISTS.md` §11.2): the `[src, dst, tokens]`
+/// A beam's rs copy: the `[src, dst, tokens]`
 /// its group's step left at `copy`, moved row by row of each plane through
 /// the set's rs entries (`bases`: slab slots of `page_bytes` pages in
 /// `slab`); slots below the buffer have no row.
@@ -359,8 +360,7 @@ pub fn beam_copy_pages(
 }
 
 /// Copies `run_count` [`RsCopyRun`]s from `runs` over their planes of
-/// `planes`, a threadgroup a (run, plane); `max_planes` the most a run spans
-/// (`BEAM-PAGE-LISTS.md` §11.2).
+/// `planes`, a threadgroup a (run, plane); `max_planes` the most a run spans.
 pub fn copy_rs_rows(
     ctx: &Ctx<'_>,
     runs: Tensor,
