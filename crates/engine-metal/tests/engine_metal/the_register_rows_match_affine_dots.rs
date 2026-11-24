@@ -5,18 +5,7 @@ use engine_metal::encode::Sink;
 use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
-
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
+use crate::common::{bf16, noise};
 
 #[test]
 fn every_register_row_answers_an_affine_reference() {
@@ -26,7 +15,6 @@ fn every_register_row_answers_an_affine_reference() {
     let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"register\", \"qmv\"]", false);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    let mut checked = 0;
     let cases = [
         (256u32, 64u32),
         (6144, 5120),
@@ -160,13 +148,11 @@ fn every_register_row_answers_an_affine_reference() {
                                 "random M={m} K={k} N={n} row={row} col={col}: {actual_f32} vs {want}"
                             );
                         }
-                        checked += 1;
                     }
                 }
             }
         }
     }
-    eprintln!("checked {checked} register outputs against exact and random affine dots");
 }
 
 /// A 4-bit, 64-group bank of `n` rows of `k` codes, its planes seeded by `seed`.
@@ -229,7 +215,6 @@ fn a_table_one_matmul_laid_feeds_the_next() {
         (2048, 64, 12288),
         (4096, 2048, 1024),
     ];
-    let mut checked = 0;
     for &(k, first_n, second_n) in &cases {
         let (first, _first_planes) = bank_of(&device, &handles, k, first_n, 0x1);
         let (second, _second_planes) = bank_of(&device, &handles, k, second_n, 0x2);
@@ -297,10 +282,8 @@ fn a_table_one_matmul_laid_feeds_the_next() {
                 want == got,
                 "k={k}, {first_n} then {second_n} columns, M={m}: the shared table lands other bits"
             );
-            checked += 1;
         }
     }
-    eprintln!("checked {checked} matmuls reading a table another laid");
 }
 
 /// A residual add and RMS norm that lays the register tile's input table of
@@ -321,7 +304,6 @@ fn a_norm_lays_the_table_its_projections_read() {
         buffer
     };
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
-    let mut checked = 0;
     for &(k, n) in &[(2048u32, 12288u32), (2048, 64), (4096, 2048), (512, 2048)] {
         let (bank, _planes) = bank_of(&device, &handles, k, n, 0x3);
         for m in [1u32, 5, 8] {
@@ -435,10 +417,8 @@ fn a_norm_lays_the_table_its_projections_read() {
                     .all(|&b| b == 0),
                 "k={k} M={m}: the norm left an arrival counter standing"
             );
-            checked += 1;
         }
     }
-    eprintln!("checked {checked} matmuls over a table their norm laid");
 }
 
 /// A swiglu that lays the register tile's input table of its rows lands the
@@ -458,7 +438,6 @@ fn a_swiglu_lays_the_table_its_down_reads() {
         buffer
     };
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
-    let mut checked = 0;
     for &(k, n) in &[(512u32, 2048u32), (1024, 4096), (6144, 2048)] {
         let (bank, _planes) = bank_of(&device, &handles, k, n, 0x4);
         for m in [1u32, 5, 8] {
@@ -537,10 +516,8 @@ fn a_swiglu_lays_the_table_its_down_reads() {
                     .all(|&b| b == 0),
                 "k={k} M={m}: the swiglu left an arrival counter standing"
             );
-            checked += 1;
         }
     }
-    eprintln!("checked {checked} tables a swiglu laid");
 }
 
 /// The table a matmul of `act` (`m` x `k`) over an `n`-column bank lays, byte
@@ -612,7 +589,6 @@ fn a_gate_lays_the_table_its_out_projection_reads() {
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
     let n = 2048u32;
     let counters = n / 64;
-    let mut checked = 0;
     for k in [4096u32, 1024] {
         let table_rows = (17 * k + 4 * counters).div_ceil(2 * k);
         for m in [1u32, 5, 8] {
@@ -666,10 +642,8 @@ fn a_gate_lays_the_table_its_out_projection_reads() {
             .expect("gate and table");
             frame.commit().expect("commit");
             check(plain, laid, th, "gate");
-            checked += 1;
         }
     }
-    eprintln!("checked {checked} tables a gate laid");
 }
 
 /// A plain RMS norm (scaled by its weight or by one plus it) that lays the
@@ -755,17 +729,4 @@ fn a_plain_norm_lays_the_table_its_projections_read() {
             );
         }
     }
-}
-
-/// Every table producer's check on the GPU at hand, run by name with
-/// `--ignored` to read them on another chip.
-#[test]
-#[ignore = "the table producers' checks, run on demand on a named GPU"]
-fn register_tables_on_this_gpu() {
-    a_table_one_matmul_laid_feeds_the_next();
-    a_norm_lays_the_table_its_projections_read();
-    a_plain_norm_lays_the_table_its_projections_read();
-    a_swiglu_lays_the_table_its_down_reads();
-    a_gate_lays_the_table_its_out_projection_reads();
-    eprintln!("every register table producer matched qmm_sg_table on this GPU");
 }

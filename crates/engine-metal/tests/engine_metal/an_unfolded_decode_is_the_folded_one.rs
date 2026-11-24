@@ -3,9 +3,7 @@
 //! A lane that decodes on a hybrid model without folding (beam_search's
 //! decode: `Fold::None`, its recurrent rows buffered and every fire
 //! replaying them from the folded state) answers each step what the same
-//! tokens folded step by step answer. Qwen3.5's served beam went wrong by
-//! its twelfth step at every width while its stage answered exactly: its
-//! logits were the replay's.
+//! tokens folded step by step answer.
 
 use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_metal::serve::Seated;
@@ -33,7 +31,6 @@ fn an_unfolded_decode_is_the_folded_one() {
     let prompt: Vec<u32> = (0..PROMPT).map(|at| (11 + at * 37) % 256).collect();
     let tokens: Vec<u32> = (0..STEPS).map(|at| (5 + at * 53) % 256).collect();
     let per_page = shell.pool_layout().rs_tokens.max(1);
-    eprintln!("buffer page: {per_page} rows");
     let fold = RsVerb::Fold;
     let fire = |shell: &mut engine_metal::Shell, slot: u32, held: u32, toks: &[u32], rs: &RsVerb, reset: RsReset| {
         shell
@@ -91,7 +88,6 @@ fn an_unfolded_decode_is_the_folded_one() {
         let flipped = argmax(&replayed).0 != top && top_logit - runner_up > 0.02;
         let rel = d / scale;
         worst = worst.max(rel);
-        eprintln!("step {k} (replays {} rows): {d:.5} ({rel:.4} of the logits' scale)", k + 1);
         if (rel > 0.05 || flipped) && first.is_none() {
             first = Some(k);
         }

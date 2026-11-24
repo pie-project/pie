@@ -348,7 +348,6 @@ fn the_kv_rotation_is_the_unrotated_forward() {
         Platform::Metal,
     );
     let (off_h, on_h) = (hadamards(&off_trace), hadamards(&on_trace));
-    eprintln!("[trace] rotate_kv=false Hadamard ops = {off_h}; rotate_kv=true = {on_h}");
     assert_eq!(
         off_h, 0,
         "the default path must emit no Hadamard (byte-unchanged deployments)"
@@ -383,15 +382,10 @@ fn the_kv_rotation_is_the_unrotated_forward() {
             "bf16 on step {step} non-finite"
         );
     }
-    let (bf16_max, bf16_mean, spread) = deviation(&bf16_off, &bf16_on);
+    let (bf16_max, _, spread) = deviation(&bf16_off, &bf16_on);
     let rel = bf16_max / spread.max(1e-6);
-    eprintln!(
-        "[bf16] logit spread {spread:.4}; on-vs-off deviation max {bf16_max:.5}, mean {bf16_mean:.6}, \
-         max/spread {rel:.4}"
-    );
     let argmax_off: Vec<usize> = bf16_off.iter().map(|r| argmax(r)).collect();
     let argmax_on: Vec<usize> = bf16_on.iter().map(|r| argmax(r)).collect();
-    eprintln!("[bf16] argmax off {argmax_off:?} vs on {argmax_on:?}");
 
     // The deviation must be small RELATIVE to the logit spread: a rounding floor,
     // not a systematic basis error (which would land near the spread itself).
@@ -418,18 +412,11 @@ fn the_kv_rotation_is_the_unrotated_forward() {
     };
     match (ran(false, 0), ran(true, 1)) {
         (Ok(off), Ok(on)) => {
-            let (f32_max, f32_mean, f32_spread) = deviation(&off, &on);
-            eprintln!(
-                "[f32 ] logit spread {f32_spread:.4}; on-vs-off deviation max {f32_max:.6}, mean {f32_mean:.7}"
-            );
+            let (f32_max, _, _) = deviation(&off, &on);
             assert!(
                 f32_max < bf16_max,
                 "f32 deviation {f32_max:.6} did not shrink below bf16 {bf16_max:.5} — the residual \
                  is not rounding"
-            );
-            eprintln!(
-                "[f32 ] deviation shrank {:.1}x vs bf16 — the residual is rounding, not a bug",
-                bf16_max / f32_max.max(1e-9)
             );
         }
         (off, on) => {
@@ -445,15 +432,9 @@ fn the_kv_rotation_is_the_unrotated_forward() {
                 off.is_ok(),
                 on.is_ok(),
             );
-            let why = off.err().or_else(|| on.err()).unwrap_or_default();
-            eprintln!(
-                "[f32 ] not reached: the Metal forward does not run this text end-to-end in f32 \
-                 ({why}); the bf16 rounding-floor result above stands on its own"
-            );
         }
     }
     let _ = std::fs::remove_dir_all(&f32_dir);
 
-    eprintln!("=== invariant holds: rotate_kv on == off within the bf16 rounding floor ===");
     let _ = std::fs::remove_dir_all(&dir);
 }

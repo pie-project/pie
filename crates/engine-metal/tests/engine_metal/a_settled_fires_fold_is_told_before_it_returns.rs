@@ -91,5 +91,4 @@ fn a_settled_fires_fold_is_told_before_it_returns() {
     assert_eq!(writes.len(), 1, "one reporting lane");
     assert_eq!(writes[0].tag, 7);
     assert_eq!(writes[0].fold, Some(3), "the fold the fire froze");
-    eprintln!("the fold report was in hand, on the settling thread, before the settle returned");
 }

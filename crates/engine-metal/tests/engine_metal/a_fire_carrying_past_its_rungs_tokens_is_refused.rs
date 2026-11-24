@@ -152,11 +152,4 @@ fn a_fire_carrying_past_its_rungs_tokens_is_refused() {
         rung + 1,
     )
     .expect("a decode lane carrying past its rung's tokens fires in place");
-    eprintln!(
-        "rung {rung}: rs scratch {room} B; a two-row fire carrying {} rows is refused and \
-         writes nothing, one carrying {rung} fires, a decode carrying {} fires; every rung \
-         {rooms:?}",
-        rung + 1,
-        rung + 1
-    );
 }

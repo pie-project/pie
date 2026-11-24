@@ -3,14 +3,11 @@
 //! A pass in flight samples the row its own fire gave its lane, whatever the
 //! next pass staged on its other set gives that lane. Frame N fires a plain
 //! lane first and the decode envelope's lane after it (its row 1); frame
-//! N+1, staged while N flies, fires the envelope's lane alone (its row 0).
-//! Before, staging N+1 rebound the output plane in every set's address
-//! table, the one N's epilogue was still to read included: N's argmax came
-//! from row 0 of N's forward, the plain lane's. The envelope's reader ring
-//! is shared with a second, idle envelope, as served instances' rings are:
-//! a member on a shared ring fires alone, from its own address table (a
-//! batch copies its members' seats when it encodes, so a batched member
-//! never showed it). Each pass's argmax
+//! N+1, staged while N flies, fires the envelope's lane alone (its row 0):
+//! staging N+1 must not rebind the output plane in the set N's epilogue is
+//! still to read. The envelope's reader ring is shared with a second, idle
+//! envelope, as served instances' rings are: a member on a shared ring fires
+//! alone, from its own address table. Each pass's argmax
 //! (the envelope's reader channel) equals what the same two fires give when
 //! N lands before N+1 is staged. Frame N is held on the device
 //! (`device::hold_next_frame`) until N+1 is staged, so its epilogue is truly

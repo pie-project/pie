@@ -189,10 +189,6 @@ fn a_bank_past_2_gib_reads_its_last_rows() {
                 u64::from(last) * row,
                 m * TAIL
             );
-            eprintln!(
-                "{ladder:?} m={m}: rows {} bytes into the bank land as the first rows",
-                u64::from(last) * row
-            );
         }
     }
 }

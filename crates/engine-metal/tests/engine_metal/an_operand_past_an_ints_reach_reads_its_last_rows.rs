@@ -108,11 +108,6 @@ fn a_rotary_past_2_pow_31_elements_turns_its_last_rows() {
             "rotary {rotary}: the last rows, {} elements in, turn otherwise than the first",
             u64::from(last) * u64::from(WIDTH)
         );
-        eprintln!(
-            "rotary {rotary}{}: rows {} elements in turn as the first rows",
-            if yarn.is_some() { " (yarn)" } else { "" },
-            u64::from(last) * u64::from(WIDTH)
-        );
     }
 }
 
@@ -204,10 +199,6 @@ fn a_ternary_bank_past_2_gib_reads_its_last_rows() {
             differ,
             0,
             "m={m}: the bank's last rows, {} bytes in, read otherwise than its first",
-            u64::from(tail_row) * ROW
-        );
-        eprintln!(
-            "m={m}: ternary rows {} bytes in read as the first rows",
             u64::from(tail_row) * ROW
         );
     }

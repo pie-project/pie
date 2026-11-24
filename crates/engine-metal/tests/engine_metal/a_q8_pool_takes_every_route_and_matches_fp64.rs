@@ -3,40 +3,8 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
+use crate::common::{bytes, f32s, mask_words, u32s, vals};
 
-/// A row's mask words, one u32 a row (its enable flag, its boundary 0).
-fn mask_words(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
-fn bf(x: f32) -> f32 {
-    let b = x.to_bits();
-    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000)
-}
-fn vals(n: usize, s: u64) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let mut x = (i as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ s;
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
-            bf(((x >> 40) as f32 / 16777216. - 0.5) * 4.)
-        })
-        .collect()
-}
-fn bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-        .collect()
-}
-fn u32s(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-fn f32s(v: &[u8]) -> Vec<f32> {
-    v.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
-        .collect()
-}
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
     routes(true);
@@ -48,12 +16,8 @@ fn a_bf16_pool_takes_every_route_and_the_split_one_matches_fp64() {
     routes(false);
 }
 fn routes(q8: bool) {
-    // `PIE_TEST_MPP=1` lets prompt rows take the MPP kernel.
-    let tuning = if std::env::var("PIE_TEST_MPP").as_deref() == Ok("1") {
-        engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false)
-    } else {
-        engine_metal::chip::tuning("", false)
-    };
+    // Prompt rows on the MPP kernel are mpp_attention_over_a_bf16_pool_matches_fp64's.
+    let tuning = engine_metal::chip::tuning("", false);
     let dev = Context::bind().unwrap();
     let handles = Handles::new();
     let pipes = Pipelines::new();
@@ -389,9 +353,6 @@ fn routes(q8: bool) {
                         assert!(x == *r || (x - r).abs() < 2e-4, "lse{x} vs{r}");
                     }
                 }
-                eprintln!(
-                    "Q8CHECK d={d} m={m} page={page} route={route} mode={mode} causal={causal} rms={rms:.8}"
-                );
             }
         }
     }

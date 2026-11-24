@@ -74,7 +74,6 @@ fn the_adapter_key_is_cudas_digest_of_the_sink() {
     let b: Vec<u8> = (100u8..124).collect();
     let key =
         engine_metal::api::adapter_digest(5, [("lora_a", &a[..]), ("lora_b", &b[..])].into_iter());
-    eprintln!("adapter key {key:#034x}");
     assert_eq!(key, PINNED, "the digest CUDA's adapter_key_of states");
     assert_ne!(
         engine_metal::api::adapter_digest(5, [("lora_a", &a[..]), ("lora_b", &a[..])].into_iter()),
@@ -213,5 +212,4 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
         landed,
         "a fresh landing writes its planes"
     );
-    eprintln!("an adapter in slots is one landing through the table (id {id})");
 }

@@ -13,22 +13,11 @@ use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::linear::gemm;
 use poem_ir::Dtype;
-
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
+use crate::common::{bf16, noise};
 
 fn value(at: u64, scale: f32) -> f32 {
     let v = (f32::from(noise(at)) - 127.5) * scale;
     f32::from_bits(v.to_bits() & 0xffff_0000)
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
 }
 
 fn read_bf16(bytes: &[u8], at: usize) -> f32 {

@@ -3,9 +3,8 @@
 //! The load's walk takes the step set (CONTRACT-BC 24) shape by shape,
 //! smallest first, and fires each at the rows and readout tiers its spans
 //! hold: a step of any row count its set states, reading out any count of
-//! its rows, meets only pipelines built before ready. On an M1 a c64 step
-//! met `dense_gemv_t_rows8_bfloat16` (the 5-8-row gemv) unbuilt after ready
-//! and was refused.
+//! its rows, meets only pipelines built before ready (the few-rows gemvs,
+//! `dense_gemv_t_rows2/4/8`, included).
 
 use engine_metal::serve::Seated;
 use engine_metal::{Lane, Shell};

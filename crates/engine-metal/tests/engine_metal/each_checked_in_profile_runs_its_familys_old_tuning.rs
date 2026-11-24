@@ -1,6 +1,6 @@
-//! Every chip of a family resolves to what `DeviceTuning::of(family)` gave
-//! it before profiles existed, but what was measured on it since; the
-//! functions below are that table, frozen.
+//! Every chip of a family resolves to its family's base tuning, but where
+//! its own profile states a measured value; the functions below are that
+//! base table, frozen.
 
 use engine_metal::chip::{self, AneMlp, AneProjections, WeightsLayout};
 use kernels_metal::Tuning;
@@ -18,8 +18,7 @@ fn old(family: u32) -> (i64, u32, bool, bool, GdnScan) {
     }
 }
 
-/// The old routed tile choice, but the 64-row tile an Apple10 GPU measured
-/// since.
+/// The family's routed tile choice, the 64-row tile on Apple10.
 fn old_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     if experts == 0 || pairs < experts * 2 {
         return 1;
@@ -36,13 +35,13 @@ fn old_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     }
 }
 
-/// The M4 Pro's measured routed tile: 16 rows wherever the old choice was
-/// wider (two simdgroups multiply a 16-row tile side by side, #1034).
+/// The M4 Pro's measured routed tile: 16 rows wherever the family's choice
+/// is wider (two simdgroups multiply a 16-row tile side by side).
 fn m4_pro_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     old_tile(family, pairs, experts).min(16)
 }
 
-/// The kernel the old cascade in `act_x_wt_over` ran a dense matmul on.
+/// The kernel the family's base tuning runs a dense matmul on.
 fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     let (fp16_from, crossover_tg, mpp, ..) = old(family);
     if family == 10
@@ -249,7 +248,7 @@ fn the_m4_pro_runs_its_family_and_names_no_measured_decision() {
     );
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, Some(20), 10, true), None);
     // Its file states the three values its tune picked, and names none
-    // measured: no check model it was tuned with reads them (94e0116a2).
+    // measured: no check model it was tuned with reads them.
     assert!(report.measured.is_empty(), "{:?}", report.measured);
 }
 

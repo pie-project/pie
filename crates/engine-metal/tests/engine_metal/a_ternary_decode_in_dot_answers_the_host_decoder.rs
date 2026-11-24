@@ -2,7 +2,7 @@
 
 //! M1b: the Metal PTQ1_0 (ternary, `g128_t3_f16_n`) decode-in-dot kernel must
 //! match the M1a host decoder — which is itself bit-exact against the fork's own
-//! `dequantize_row_ptq1_0`. This is the C2c-analog: prove the Metal read path
+//! `dequantize_row_ptq1_0`. It proves the Metal read path
 //! reproduces the proven host reference on REAL blocks.
 //!
 //! The oracle is the frozen fixture `checkpoint/src/codec/ptq1_0_fixture.rs`:
@@ -28,6 +28,7 @@ use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::{qmm, qmv};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
+use crate::common::{bf16, noise};
 
 // The M1a oracle: `ForkBlock { tensor, block_index, bytes: [u8;28], expect_bits:
 // [u32;128] }` and `FORK_BLOCKS`, generated from the real GGUF + the fork dequant.
@@ -37,11 +38,6 @@ const PTQ1_0_FILE: &str = "linear/qmv_ptq1_0.metal";
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 const BLOCK_BYTES: usize = 28;
 const BLOCK: usize = 128;
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
 
 fn f32_at(bytes: &[u8], i: usize) -> f32 {
     let b = &bytes[i * 4..i * 4 + 4];
@@ -53,13 +49,6 @@ fn bf16_at(bytes: &[u8], i: usize) -> f32 {
     f32::from_bits((u32::from(b[1]) << 24) | (u32::from(b[0]) << 16))
 }
 
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
 #[test]
 fn a_ternary_decode_in_dot_answers_the_host_decoder_every_case() {
     let Ok(device) = Context::bind() else {
@@ -68,7 +57,6 @@ fn a_ternary_decode_in_dot_answers_the_host_decoder_every_case() {
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    eprintln!("device: {}", device.name());
 
     the_one_hot_probe_reads_back_the_host_decoder_bit_exact(&device, &handles, &pipelines);
     a_random_activation_answers_the_host_decoded_weights(&device, &handles, &pipelines);
@@ -135,12 +123,8 @@ fn the_one_hot_probe_reads_back_the_host_decoder_bit_exact(
     let y = handles.read(hy, (m * n * 4) as u64).expect("read y");
 
     let mut real = 0usize;
-    let mut synthetic = 0usize;
-    let mut checked = 0usize;
     for (r, b) in blocks.iter().enumerate() {
-        if b.tensor.starts_with("synthetic:") {
-            synthetic += 1;
-        } else {
+        if !b.tensor.starts_with("synthetic:") {
             real += 1;
         }
         for i in 0..BLOCK {
@@ -151,14 +135,9 @@ fn the_one_hot_probe_reads_back_the_host_decoder_bit_exact(
                 "{} block {} element {}: metal {:#010x} != host {:#010x}",
                 b.tensor, b.block_index, i, got, want,
             );
-            checked += 1;
         }
     }
     assert!(real >= 20, "want the spread of real blocks, got {real}");
-    eprintln!(
-        "readback: {checked} elements bit-exact vs the host decoder \
-         across {real} real + {synthetic} synthetic blocks"
-    );
 }
 
 /// Check 2: a wider matrix (many blocks per row, so multiple lanes and the
@@ -315,9 +294,5 @@ fn a_random_activation_answers_the_host_decoded_weights(
     assert!(
         worst_bf16 <= 8e-3,
         "dispatched bf16-out ternary matmul drifts {worst_bf16:.2e} from the reference"
-    );
-    eprintln!(
-        "general: f32-out worst {worst_f32:.2e} (<=2e-3), dispatched bf16-out worst \
-         {worst_bf16:.2e} (<=8e-3) over {m}x{n}, K={k}"
     );
 }

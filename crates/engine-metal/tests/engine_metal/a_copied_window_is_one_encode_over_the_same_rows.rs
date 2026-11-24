@@ -468,7 +468,6 @@ fn the_builder_inherits_its_readers_answer() {
     let inherited: Vec<u32> = (0..compiled.template().len() as u32)
         .filter(|at| !owed.contains(at) && split.runs(*at) > 1)
         .collect();
-    eprintln!("{} region(s) split without a `Copy` row of their own", inherited.len());
     for at in inherited {
         let mask = &compiled.template()[at as usize].mask;
         let readers_gather = (0..compiled.template().len() as u32).any(|other| {
