@@ -10826,6 +10826,18 @@ async fn every_tier_full_fails_the_lowest_resident_by_name() {
     };
     assert!(matches!(error, PlannerError::TiersFull { .. }), "{error}");
     assert!(error.to_string().contains("every tier is full"), "{error}");
+    // Its stable code leads its text, read by machine past the worker and
+    // the gateway (`gateway::ingress::compat`'s `coded`).
+    assert_eq!(error.code(), Some(super::TIERS_FULL));
+    assert!(error.to_string().starts_with("[tiers_full] "), "{error}");
+    let refused = PlannerError::AdmissionRefused {
+        need: 9,
+        device: (0, 8),
+        host: (0, 0),
+        disk: (0, 0),
+    };
+    assert_eq!(refused.code(), Some(super::ADMISSION_REFUSED));
+    assert!(refused.to_string().starts_with("[admission_refused] "), "{refused}");
     assert_eq!(planner.wait_resident(younger).await, Err(error), "its waits end with it");
     // The head and the older resident go on.
     assert!(planner.with_inner(|inner| !inner.failed.contains_key(&head) && !inner.failed.contains_key(&older)));

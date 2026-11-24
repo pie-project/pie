@@ -125,6 +125,25 @@ impl ResidencyPlanner {
         if let Some(error) = self.with_inner(|inner| inner.failed.get(&pid).copied()) {
             return Err(error);
         }
+        // A newcomer's first ask fits on the device, or below it by the
+        // evictions it would force with room to land: else it is refused
+        // by name at admission, never let in to fill the tiers with work
+        // that cannot finish. Admitted processes wait and move instead.
+        let newcomer = self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| !proc.seated));
+        if newcomer && demand.kv_pages > 0 {
+            let (device, host, disk) = (self.port.device_stats(), self.port.host_stats(), self.port.disk_stats());
+            let room = u64::from(device.0) + u64::from(host.0) + u64::from(disk.0);
+            if u64::from(demand.kv_pages) > room {
+                let error = PlannerError::AdmissionRefused {
+                    need: demand.kv_pages,
+                    device,
+                    host,
+                    disk,
+                };
+                tracing::warn!(%pid, %error, "planner: a newcomer is refused at admission");
+                return Err(error);
+            }
+        }
         let acquired = self.acquire_inner(pid, quorum_id, demand, false).await;
         if matches!(acquired, Ok(Acquired::Granted(_))) {
             self.note_peak(pid, demand);

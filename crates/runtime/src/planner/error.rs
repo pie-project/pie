@@ -114,8 +114,39 @@ pub enum PlannerError {
         host: (u32, u32),
         disk: (u32, u32),
     },
+    /// A newcomer's first ask that fits nowhere: past what the device has
+    /// free and what the tiers below could take of the evictions it would
+    /// force. Refused by name at admission; admitted processes wait and
+    /// move instead. Its pages, and each tier's free and total pages.
+    AdmissionRefused {
+        need: u32,
+        device: (u32, u32),
+        host: (u32, u32),
+        disk: (u32, u32),
+    },
     Cancelled,
 }
+
+impl PlannerError {
+    /// A stable code a client reads by machine, carried at the head of the
+    /// error's text (`[code] ...`) through the process's result, the
+    /// worker's reply and the gateway's error body (`code`): an admission
+    /// refusal a client retries, a wedge failure it does not. `None` for
+    /// errors with no code of their own.
+    #[must_use]
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            PlannerError::AdmissionRefused { .. } => Some(ADMISSION_REFUSED),
+            PlannerError::TiersFull { .. } => Some(TIERS_FULL),
+            _ => None,
+        }
+    }
+}
+
+/// [`PlannerError::code`] of an admission refusal: retried by the client.
+pub const ADMISSION_REFUSED: &str = "admission_refused";
+/// [`PlannerError::code`] of a wedge failure: every tier full.
+pub const TIERS_FULL: &str = "tiers_full";
 
 impl std::fmt::Display for PlannerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -201,9 +232,16 @@ impl std::fmt::Display for PlannerError {
             ),
             PlannerError::TiersFull { device, host, disk } => write!(
                 f,
-                "every tier is full (device {} of {} pages free, host {} of {}, disk {} of {}) \
+                "[tiers_full] every tier is full (device {} of {} pages free, host {} of {}, disk {} of {}) \
                  and no move frees room for the process waiting: this one, the lowest in the \
                  policy's order, fails so the others proceed",
+                device.0, device.1, host.0, host.1, disk.0, disk.1
+            ),
+            PlannerError::AdmissionRefused { need, device, host, disk } => write!(
+                f,
+                "[admission_refused] refused at admission: the first ask of {need} kv pages fits nowhere \
+                 (device {} of {} pages free, host {} of {}, disk {} of {}): the device \
+                 cannot hold it and the tiers below cannot take the evictions it would force",
                 device.0, device.1, host.0, host.1, disk.0, disk.1
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),

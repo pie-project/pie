@@ -1956,6 +1956,11 @@ struct Log {
     /// Binds suspended for their own room more than once: (process,
     /// program, suspensions).
     bind_thrash: Vec<(ProcessId, u32, u32)>,
+    /// Processes ended (finished or failed by name): what a process
+    /// refused at admission waits on to come back ([`run_process`]).
+    departures: u64,
+    /// Admission refusals retried.
+    retries: u64,
     /// Each process the planner failed ([`super::ResidencyPlanner::fail_tiers_full`])
     /// and the step it was first seen failed: it departs within the next
     /// step, or its failure reached no wait of its own.
@@ -2626,7 +2631,22 @@ async fn seat_to_end(ctx: &Ctx, pid: ProcessId) {
     }
 }
 
+/// A process's life by `script`; refused at admission (its first ask fit
+/// nowhere, [`super::ADMISSION_REFUSED`]) it is the client's to retry: it
+/// leaves, and comes back after the next departure, as a client retries
+/// such a refusal, never counted a failure.
 async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
+    while run_once(ctx.clone(), pid, script.clone()).await {
+        let ended = ctx.log.lock().unwrap().departures;
+        while ctx.log.lock().unwrap().departures == ended {
+            ctx.next_step().await;
+        }
+        ctx.planner.register(pid);
+    }
+}
+
+/// One run of [`run_process`]: whether it was refused at admission.
+async fn run_once(ctx: Arc<Ctx>, pid: ProcessId, script: Script) -> bool {
     let planner = ctx.planner.clone();
     ctx.at(pid, "admit");
     seat_to_end(&ctx, pid).await;
@@ -2702,7 +2722,12 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
         Ok::<(), String>(())
     }
     .await;
-    if let Err(why) = &lived {
+    let retry = lived
+        .as_ref()
+        .is_err_and(|why| why.contains(&format!("[{}]", super::ADMISSION_REFUSED)));
+    if let Err(why) = &lived
+        && !retry
+    {
         ctx.refused(pid, why.clone());
     }
     // Its end, as the runtime's: its instances close (the engine's close
@@ -2727,8 +2752,14 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     }
     let mut log = ctx.log.lock().unwrap();
     log.stages.remove(&pid);
-    log.ended += 1;
+    if retry {
+        log.retries += 1;
+    } else {
+        log.ended += 1;
+        log.departures += 1;
+    }
     log.acts += 1;
+    retry
 }
 
 /// Closes instance `id` as the runtime's lane does: the engine's close,
@@ -3459,6 +3490,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.bind_waits = log.bind_waits;
         coverage.bind_suspends = log.bind_suspends;
         coverage.raises_owed = log.raises_owed;
+        eprintln!("SIM outcome: finished {} refused_at_admission_retried {} failures_named {}", log.finished, log.retries, log.refusals.len());
         coverage.rung_raises = lane_ops[0].load(Ordering::Relaxed);
         coverage.rung_lowers = lane_ops[2].load(Ordering::Relaxed);
         coverage.evacuations = lane_ops[1].load(Ordering::Relaxed);
