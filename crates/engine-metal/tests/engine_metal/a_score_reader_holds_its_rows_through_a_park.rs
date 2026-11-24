@@ -100,6 +100,19 @@ pub(super) fn bind_reader(
     rows: u32,
     chunk: u32,
 ) -> (engine::InstanceId, Vec<u32>, Vec<engine::RingSlots>) {
+    bind_reader_of_pair(shell, program, rows, chunk, 0)
+}
+
+/// [`bind_reader`] as an instance of the `pair`-th pair the test binds: a
+/// reader at other rows than another's is another pair, its state laid
+/// apart (`crate::guest_places_of_pair`).
+pub(super) fn bind_reader_of_pair(
+    shell: &mut Shell,
+    program: engine::ProgramId,
+    rows: u32,
+    chunk: u32,
+    pair: u32,
+) -> (engine::InstanceId, Vec<u32>, Vec<engine::RingSlots>) {
     let facts = shell.program_facts(program).expect("the reader's facts");
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
@@ -129,7 +142,7 @@ pub(super) fn bind_reader(
         query_len: rows,
         ..eta_exec::Extents::default()
     };
-    let (scratch, pair) = crate::guest_places(shell, program, &extents, chunk);
+    let (scratch, pair) = crate::guest_places_of_pair(shell, program, &extents, chunk, pair);
     let id = shell
         .bind_program(
             program,
