@@ -345,7 +345,9 @@ impl Serve for Api {
         // count and group counts laid in the block, each at its alignment):
         // one copier's slack beside each plane's rows.
         let copier = 16 + uniform + storage + 64;
-        let bytes = u64::from(fires.dispatches.max(1)) * (per_dispatch + copier)
+        // Twice the naming walk's widest fire: a fire that buffers its rows
+        // copies them a lane at a time, past what the naming walk counted.
+        let bytes = 2 * u64::from(fires.dispatches.max(1)) * (per_dispatch + copier)
             + fires.readout_rows * 16;
         let arms = (0..readout.len())
             .map(|_| crate::device::ArmBlock::new(device, bytes))

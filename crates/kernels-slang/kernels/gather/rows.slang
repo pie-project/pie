@@ -37,8 +37,10 @@ PIE_PARAMS_FIRED(2, Params, params);
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
-    if (gid.x < uint(max(params.words, 0))) {
-        dst[params.dst_at + gid.x] = src[params.src_at + gid.x];
+    // The run is a fire's (a lane's buffered rows, where its fold leaves
+    // them): read from the fire block, so a recording serves every run.
+    if (gid.x < uint(max(PIE_FIRE(words), 0))) {
+        dst[PIE_FIRE(dst_at) + gid.x] = src[PIE_FIRE(src_at) + gid.x];
     }
 }
 

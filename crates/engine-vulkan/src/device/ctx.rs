@@ -2396,10 +2396,11 @@ impl Frame {
         let mut seen = self.groups.borrow_mut();
         let at = seen.len();
         seen.push(groups);
-        // A kept frame whose rows vary within its body reads every
-        // dispatch's group counts from the block: its first recording serves
-        // every row count of its body.
-        (self.kept && !self.fixed_rows)
+        // A kept frame reads every dispatch's group counts from the block:
+        // what sizes a grid but the fire's rows (a lane's buffered rows, the
+        // fold / buffer split of a prompt) is the fire's data, so one
+        // recording serves every fire of its commands.
+        self.kept
             || self
                 .indirect
                 .as_ref()
@@ -3384,7 +3385,7 @@ impl Frame {
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             indirect: self.indirect.clone(),
-            indirect_all: !self.fixed_rows,
+            indirect_all: true,
         })
     }
 

@@ -114,6 +114,19 @@ fn served(lag: u32) -> Option<Served> {
         fed = end;
         folded += fold;
     }
+    // The same prompt again, fresh, buffering another split of its rows
+    // (half folded): the armed body its first fire replayed replays this
+    // one too, the split the fire's data.
+    if lag > 0 {
+        let verb = RsVerb::Buffer {
+            pages: vec![0; PROMPT.div_ceil(page) as usize],
+            base: 0,
+            folded: 0,
+            fold: FoldLen::Host(PROMPT / 2),
+            lineage: Lineage::Set,
+        };
+        fire(&mut shell, &fixture.trace, &prompt, &verb, RsReset::Fresh, 0);
+    }
     Some(Served {
         steps,
         recorded: shell.recorded_serving(),

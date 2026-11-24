@@ -6,7 +6,7 @@
 /// with [`ENCODER_LAYOUT`] set again, by a change that moves it. It keys what
 /// a load armed beside the kernels' code, so a change elsewhere in the
 /// engine keeps every record.
-pub const ENCODING: u32 = 3;
+pub const ENCODING: u32 = 4;
 
 /// The hash of the encoder's layout files as [`ENCODING`] was set for them
 /// (`build.rs`, `PIE_ENCODER_LAYOUT`): a test holds the two together.

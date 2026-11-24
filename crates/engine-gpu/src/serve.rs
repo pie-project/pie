@@ -9541,6 +9541,17 @@ fn lane_views<B: Serve>(
     (seated, media, clips)
 }
 
+/// How an arm walk's fire buffers its recurrent rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Buffering {
+    /// Folds every row.
+    None,
+    /// Buffers every row (a decode lane carrying one more).
+    All,
+    /// A prompt folds all but its last row and buffers that.
+    Tail,
+}
+
 /// The composition (CONTRACT-BC 24) of an arm walk's fire of `lanes`, each
 /// `(class, rows)` reading its last row, buffering where `buffered` (a decode
 /// lane carrying a row, which a composition counts none of: `lane_carried`),
@@ -9931,7 +9942,7 @@ impl<B: Serve> Shell<B> {
         // carried forms, another body. Each shape carrying decode lanes is
         // recorded so too.
         let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
-        let shapes: Vec<(Vec<(usize, u32)>, bool, bool)> = shapes
+        let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering)> = shapes
             .into_iter()
             .flat_map(|lanes| {
                 let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
@@ -9939,11 +9950,27 @@ impl<B: Serve> Shell<B> {
                 // Every composition buffering its rows too: a decode lane
                 // carrying a row it has not folded, a prompt lane buffering
                 // its own (a buffered step of the stated set).
-                let carried = carried_too;
-                std::iter::once((lanes.clone(), false, false))
-                    .chain(fed.then(|| (lanes.clone(), true, false)))
-                    .chain(carried.then(|| (lanes.clone(), false, true)))
-                    .chain((fed && carried).then_some((lanes, true, true)))
+                // A prompt buffering its rows either buffers them all or
+                // folds what its program accepted and buffers the rest: two
+                // forms of commands (the folding scans run or not), each
+                // serving every split of its form (the split the fire's
+                // data).
+                let prompts = lanes.iter().any(|&(_, rows)| rows >= 2);
+                let mut forms = vec![Buffering::None];
+                if carried_too {
+                    forms.push(Buffering::All);
+                    if prompts {
+                        forms.push(Buffering::Tail);
+                    }
+                }
+                forms
+                    .into_iter()
+                    .flat_map(move |form| {
+                        let lanes = lanes.clone();
+                        std::iter::once((lanes.clone(), false, form))
+                            .chain(fed.then_some((lanes, true, form)))
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         // Where the load states its steps, each composition's shape: those of
@@ -9963,10 +9990,10 @@ impl<B: Serve> Shell<B> {
                 };
                 let attachments: Vec<engine::Attachments> =
                     (0..decoding.len()).map(carries).collect();
-                let mut tagged: Vec<((Vec<(usize, u32)>, bool, bool), usize)> = shapes
+                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering), usize)> = shapes
                     .into_iter()
                     .filter_map(|entry| {
-                        let step = step_of(&entry.0, entry.2, &attachments);
+                        let step = step_of(&entry.0, entry.2 != Buffering::None, &attachments);
                         steps.shape_of(&step).map(|at| (entry, at))
                     })
                     .collect();
@@ -9976,7 +10003,7 @@ impl<B: Serve> Shell<B> {
                         lanes.iter().map(|&(_, rows)| rows).sum::<u32>(),
                         std::cmp::Reverse(lanes.len()),
                         *fed,
-                        *carried,
+                        *carried as u8,
                     )
                 });
                 let mut covered = vec![false; steps.len()];
@@ -10134,9 +10161,19 @@ impl<B: Serve> Shell<B> {
                     .map(|&(class, rows)| {
                         let mut lane = self.naming_lane(class, rows)?;
                         lane.by_ref = Some(self.pools.walk_refs(rows.div_ceil(page).max(1))?);
-                        if *carried {
-                            let carried = u32::from(rows == 1 && decoding[class]);
-                            self.rs_walk_lane(&mut lane, rows, carried)?;
+                        if *carried != Buffering::None {
+                            let carry = u32::from(rows == 1 && decoding[class]);
+                            self.rs_walk_lane(&mut lane, rows, carry)?;
+                            // A tail-buffering prompt folds what its program
+                            // accepted and buffers the rest (the lagged
+                            // fold): all but its last row, its scans the
+                            // folding ones beside the buffer's copy.
+                            if rows >= 2
+                                && *carried == Buffering::Tail
+                                && let engine::fire::RsVerb::Buffer { fold, .. } = &mut lane.rs
+                            {
+                                *fold = engine::fire::FoldLen::Host(rows - 1);
+                            }
                         }
                         Ok(lane)
                     })
