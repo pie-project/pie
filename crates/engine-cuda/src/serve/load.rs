@@ -2234,14 +2234,9 @@ impl Staged {
             // fire has backed yet (`Shell::settle_fit` lifts it). The
             // state's chunks then end where the activation starts, so what
             // a rung lends and what lies under it are one span.
-            let fitted = shell.pools.fit_the_card(
-                shell.bodies_hold(),
-                shell.held_for_fires,
-                false,
-                &resident,
-            )?;
-            shell.pools.state_whole();
-            fitted
+            shell
+                .pools
+                .fit_to_state_whole(shell.bodies_hold(), shell.held_for_fires, &resident)?
         } else {
             // Everything the load puts on the device is there, its bodies
             // among it: the pool is what the card has left, and the range
