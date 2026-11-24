@@ -230,6 +230,7 @@ fn a_view_reshape_broadcasts_by_its_own_shape() {
             }],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");

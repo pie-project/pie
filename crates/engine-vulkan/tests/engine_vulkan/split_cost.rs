@@ -147,6 +147,7 @@ fn a_split_step_costs_its_submits_alone() {
         attachments: Vec::new(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     };
     // One fire of `mode` on `slot` held to `bound`: its wall, ms, and its
     // device time as the bound reads it (its timestamps), ms.

@@ -264,12 +264,33 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       (`StepShape::misses`); a piece past one fire's tokens or lanes is refused, as before, by those bounds. Under the contract check (debug builds or
       `PIE_CHECK_REPLAY`, which gates both cross-checks: the engines' replay check and this one, `shapes::check_on`), every step formed is checked, a gap failing with the composition and
       the nearest stated shapes (`StepGap`).
-    - **Engines, interim.** Each engine computes and states the set after its walk and says what it does with it:
-      CUDA names each shape whose padded buckets its lattice walk records no body of that kind and treatment for
-      (`Shell::walk_gaps`; today mixed and wide targets are folded only, so buffered mixed shapes are named); Metal,
+    - **A fire carries its stated shape; an engine keys its recorded body on it.** The runtime stamps each step
+      it forms with its shape (`Step.shape: Option<FireShape { id, treatment }>`: `id` the index in the stated
+      set's order, `treatment` that shape's, for an engine that keys on the treatment alone), what
+      `StepShapes::shape_of` answers for the composition `StepGroup::accepts` held to the set
+      (`StepShapes::fire_shape`); a step its refused members are stripped from is stated again from its kept
+      lanes. It is always one of the stated set: a formed step outside it is a runtime bug, a debug build
+      stopping on it and a release build failing its fires by name, never posting an unstated shape. `None` only
+      on a fire built by hand (a test, a load stating no set). Engines cross-check the stamp in debug builds
+      (`FrameSubmission::debug_check_shapes`, `StepShapes::agrees`) and switch their body keys from their own
+      computed key to it, each backend's owner in its own branch.
+    - **CUDA.** The walk takes its targets from the set (`Shell::walk_steps`, before arming; `lattice_targets`):
+      each shape at each bucket its rows pad to, crossed with the load's classes whatever its kind (a body keys its
+      bucket, its lanes' classes and their treatment, never a lane's rows: each decoding class alone, each prompting
+      class alone, a tower, a decoding class beside a prompting one, every class at once), each composition recorded as each
+      `RsBody` a serving fire of it keys (buffers; splits where a decoding lane's carry can split; replays where a
+      prompting lane can replay). A buffering decode step composes at its own bucket; a buffering step with a prompt's rows at its stated rung's (`Shell::buffered_rung`, the rung the runtime prices it at), where alone its bodies are recorded (no other coarser rs lattice). The
+      allowance keeps by the set's order (`rule_rank`: shape, then bucket, launches, classes); capture order stays
+      the top bucket's first. The load states the set from its stated facts, eager each shape a bucket of whose
+      treatment arming left a composition unrecorded (`Shell::stated_steps`), and tallies a fire of a key
+      stated eager `live::Tally::Eager`. Misfits: the stated rungs (`act_chunks`) are known only once arming has
+      backed the span (a rung lending no chunk is dropped), so the walk takes the set over the arena's rungs and
+      the load states it over the stated ones; the two cover the same compositions by bucket and treatment,
+      so the eager mapping is exact. A load that arms at its starting weight residency states none eager at load.
+      Attachments key no CUDA body (an adapter lane is its class's adapted twin, outside the plain tier, as before).
+    - **Engines, interim.** Metal,
       engine-gpu (Vulkan, wgpu), XLA log the set and that their walks do not key on it yet; Cerebras computes it and
-      records no bodies. Each walk then takes its targets from the set in its own branch: CUDA records the buffered
-      treatment of mixed / wide targets; Metal arms each readout-row tier inside a shape's `readout_rows` at its
+      records no bodies. Each walk then takes its targets from the set in its own branch: Metal arms each readout-row tier inside a shape's `readout_rows` at its
       rung; engine-gpu records each shape before ready (sc/gpu-arm-before-ready); XLA lays its warm ladder from it
       (its laid mixed rungs, `Capabilities.mixed_lanes`, are narrower than the set's mixed shapes, so it states those
       it cannot lay eager).

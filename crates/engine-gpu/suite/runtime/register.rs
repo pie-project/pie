@@ -162,6 +162,7 @@ fn a_cold_registration_compiles_while_a_lane_fires() {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");

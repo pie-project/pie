@@ -50,7 +50,7 @@ pub use chunk::{
     WeightAtom, WeightKind, WeightResidency, WeightShape, WeightUses, WindowedLayer,
 };
 pub use engine::{
-    CompletionSink, Engine, HostRoom, KvWrites, Landing, LandingSink, LaneFault, Prepared, ProgramCompile,
+    BehindServing, CompletionSink, Engine, HostRoom, KvWrites, Landing, LandingSink, LaneFault, Prepared, ProgramCompile,
     StepDone,
     StepOutcome, TapGroups, TapSink, Tapped,
 };
@@ -67,7 +67,7 @@ pub use load::{
 };
 pub use memory::SAFETY_FLOOR_BYTES;
 pub use shapes::{
-    Attachments, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,
+    Attachments, FireShape, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,
     Treatment,
 };
 pub use program::{

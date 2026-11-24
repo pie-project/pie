@@ -1501,3 +1501,11 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **Idea.** Decide a fire's fold count at launch (or at settle) from `Cursor::accepted` at that moment, staged as data the recorded body reads, so rows read between submit and launch fold too. The carried floor becomes about frames_in_flight × frame_size − 1 ≈ 3, roughly halving replay work on every engine, with no inferlet change.
 
 **Why later.** It moves when fold counts are fixed (a contract change touching every engine's staging). The carried kernels in the dot-product form (O(n·d)) already make n = 7 cost a few % (CUDA 9B, Vulkan). Pull this in only if a backend's kernel can't reach the 2% gate at n = 7.
+
+## F79. Measuring behind serving with weights streaming through the pool
+
+**What.** A load's leftover measuring (the dense settle's ranges, a rate or curve stored under a stale key) runs behind serving only while the runtime holds no slot of the engine's pool (`SlotPool::holds_nothing`), because a settle fire writes the seat-addressed chunks. A model whose weights stream through the pool (a `Weights` holder: experts, token tables) is never quiet, so it serves on the fallback picks and stale figures until a committed settle or profile of its key arrives (the coordinated re-export).
+
+**Idea.** Let the settle fire on chunks the runtime lends for the slice (a reservation by refs), or let the quiet check ignore holders whose chunks lie outside the seat runs a settle fire writes. The rates and curve slices write no pool chunk at all and could run beside a `Weights` holder today.
+
+**Why later.** Accepted for the new-memory PR (coordinator, 2026-11-24): the boot is fast either way, and only the picks stay on the fallback.

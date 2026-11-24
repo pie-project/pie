@@ -91,7 +91,9 @@ __global__ void gdn_chunked_warp_tiled(
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
     bool write_state,
+    const int* __restrict__ commit_len,
     const u8* __restrict__ write_state_mask,
+    const int* __restrict__ begin_at,
     const u32* __restrict__ win)
 {
     constexpr int WARPS = 4;
@@ -110,8 +112,19 @@ __global__ void gdn_chunked_warp_tiled(
 
     const int repeat = V_h / K_h;
     const int qk_h = h / repeat;
-    const int t0 = static_cast<int>(qo_indptr[r]);
-    const int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    int t0 = static_cast<int>(qo_indptr[r]);
+    int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
+    // A segment cut at an interior fold boundary starts at its origin, and a
+    // replay folds only its accepted prefix, as the FLA scan's.
+    if (begin_at != nullptr) {
+        int b = begin_at[rl];
+        if (b > T) b = T;
+        if (b > 0) { t0 += b; T -= b; }
+    }
+    if (commit_len != nullptr) {
+        const int c = commit_len[rl];
+        if (c < T) T = c;
+    }
     if (T <= 0) return;
 
     const i32* rid = rows.row(rl);

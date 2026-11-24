@@ -768,16 +768,17 @@ impl Engine for Metal {
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the warm walk takes
-        // its readout rows per rung from it in its own branch.
+        // facts (CONTRACT-BC 24), computed before the walk, which fires each.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
             &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
         );
+        // Metal records no bodies (its walk builds pipelines): every shape
+        // is walked, none eager.
+        caps.steps.eager.clear();
         tracing::info!(
-            "engine-metal: step set: {}; its arm walk does not key on the set yet, so none \
-             of the {} is checked against what it records",
+            "engine-metal: step set: {}; the walk fires every one of the {}, none eager",
             caps.steps.shapes.census(),
             caps.steps.shapes.len(),
         );
@@ -804,7 +805,7 @@ impl Engine for Metal {
         let (fires, built) = match listed {
             Some(keys) => (0, shell.build_pipelines(&keys).map_err(fault)?),
             None => {
-                let walked = shell.warm_pipelines().map_err(fault)?;
+                let walked = shell.warm_pipelines_over(&caps.steps.shapes).map_err(fault)?;
                 if let Some((key, keys, _archive)) = cache.as_ref() {
                     write_pipeline_keys(keys, key, &shell.pipeline_keys());
                     #[cfg(target_vendor = "apple")]
@@ -948,6 +949,11 @@ impl Engine for Metal {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
         if let Some(shell) = self.shell.as_ref() {
             let facts = &shell.trace().facts;
             for step in &frame.steps {
@@ -1511,23 +1517,6 @@ impl Metal {
                 })
                 .collect();
             window_of.push(windows);
-            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
-                let per = shell.pool_layout().list.map_or(1, |list| list.per_chunk.max(1));
-                let mut chunks: Vec<u32> = pages_of
-                    .last()
-                    .and_then(Option::as_ref)
-                    .map(|refs| refs.iter().filter(|&&r| r != 0).map(|&r| r / per).collect())
-                    .unwrap_or_default();
-                chunks.sort_unstable();
-                chunks.dedup();
-                eprintln!(
-                    "ltrace slot {} list chunks {:?} first refs {:?} slot_copies {:?}",
-                    lane.slot,
-                    chunks,
-                    pages_of.last().and_then(Option::as_ref).map(|r| r.iter().take(3).copied().collect::<Vec<_>>()),
-                    lane.slot_copies
-                );
-            }
             ring_of.push(match &lane.record {
                 engine::fire::LaneRecord::Pieces(pieces) => pieces
                     .iter()

@@ -768,7 +768,7 @@ pub fn warmed_frames<E>(
 pub struct Measured {
     pub rates: profile::fire::Rates,
     pub unsettled: bool,
-    /// The device ran slower than its nominal clock as the step timed
+    /// The device ran slower at the step's end than at its warmed start
     /// (`Some(ratio)`, its reference kernel's time over its fastest seen):
     /// the rates are this load's alone, never stored, and said so.
     pub throttled: Option<f64>,
@@ -1147,7 +1147,8 @@ pub fn rates_at_load(
         room,
         max_submit,
         Measuring::Time,
-        measure,
+        false,
+        |max_submit, _| measure(max_submit),
     )
 }
 
@@ -1189,7 +1190,8 @@ pub fn resolve_at_load(
     room: Option<u64>,
     max_submit: Option<std::time::Duration>,
     measuring: Measuring,
-    measure: impl FnOnce(Option<std::time::Duration>) -> Result<Measured, String>,
+    times_behind: bool,
+    measure: impl FnOnce(Option<std::time::Duration>, &profile::fire::Rates) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
     // A checked-in file this device takes states a rate this pie does not
     // read: it was refused whole, and the load is refused by it.
@@ -1205,6 +1207,50 @@ pub fn resolve_at_load(
         return Ok(chip);
     }
     let lacked = stated.missing(keys);
+    // A key a layer states of this device under a stale key (a kernel's
+    // code or the method changed) is served by that figure, a fair
+    // estimate, and timed again behind serving
+    // (`profile::fire::Tuned::behind`): a load never measures before ready
+    // what it holds a figure for. Only a key no layer states at all is
+    // measured here. An engine that times nothing behind serving
+    // (`times_behind` false) measures them here too.
+    let stale = stated
+        .stale
+        .as_deref()
+        .cloned()
+        .filter(|_| times_behind || measuring == Measuring::Skip)
+        .unwrap_or_default();
+    let estimated: Vec<&'static str> =
+        lacked.iter().copied().filter(|key| stale.states(key)).collect();
+    let (chip, stated, lacked) = if estimated.is_empty() {
+        (chip, stated, lacked)
+    } else {
+        for key in &estimated {
+            tracing::info!(
+                "rates: `[rates] {key}`: served by the figure stored under its stale key (the \
+                 stored measurements' lines say why it is stale){}",
+                if measuring == Measuring::Time {
+                    "; timed again behind serving, stored for the next load"
+                } else {
+                    " (`[engine] measure = false`: not timed again)"
+                }
+            );
+        }
+        let stated = stated.over(stale.only(&estimated));
+        let mut tuned = chip.tuned().clone();
+        tuned.rates = stated.clone();
+        if measuring == Measuring::Time {
+            tuned
+                .behind
+                .extend(estimated.iter().map(|key| (*key).to_string()));
+        }
+        let chip = chip.with_tuned(tuned);
+        let lacked = stated.missing(keys);
+        if lacked.is_empty() {
+            return Ok(chip);
+        }
+        (chip, stated, lacked)
+    };
     if measuring == Measuring::Skip {
         for key in &lacked {
             tracing::info!(
@@ -1235,7 +1281,7 @@ pub fn resolve_at_load(
         rates: measured,
         unsettled,
         throttled,
-    } = measure(max_submit)?;
+    } = measure(max_submit, &stated)?;
     if let Some((key, why)) = unmeasured(&measured) {
         return Err(format!(
             "the device's rates step measured `[rates] {key}` {why}: nothing weighs a fire by \
@@ -1250,7 +1296,7 @@ pub fn resolve_at_load(
         ));
     }
     // The user's file is this load's own output (`save_rates`): rates
-    // timed on a device below its nominal clock serve this load alone.
+    // timed on a device whose clock sagged during them serve this load alone.
     let saved_to = match throttled {
         None => save
             .map(|save| save_rates(&save, &rates.only(&lacked)))
@@ -1258,8 +1304,8 @@ pub fn resolve_at_load(
         Some(ratio) => {
             tracing::warn!(
                 ratio,
-                "rates: timed with the device {ratio:.2}x slower than its nominal clock (its \
-                 reference kernel's fastest): served this load, not stored"
+                "rates: timed with the device {ratio:.2}x slower at the step's end than at its \
+                 warmed start (its reference kernel's fastest): served this load, not stored"
             );
             None
         }
@@ -1270,7 +1316,7 @@ pub fn resolve_at_load(
     tuned.timed.push(match throttled {
         None => format!("rates ({})", lacked.join(", ")),
         Some(ratio) => format!(
-            "rates ({}; device {ratio:.2}x below its nominal clock: not stored)",
+            "rates ({}; device {ratio:.2}x slower at the end than the start: not stored)",
             lacked.join(", ")
         ),
     });
@@ -1483,6 +1529,7 @@ mod tests {
 
     fn all() -> profile::fire::Rates {
         profile::fire::Rates {
+            stale: None,
             landing: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
@@ -1699,10 +1746,21 @@ mod tests {
         build: &Build,
         measuring: Measuring,
     ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
+        load_behind(shelf, dir, build, measuring, false)
+    }
+
+    /// [`load_from`] by an engine that times a stale key behind serving
+    /// where `times_behind`.
+    fn load_behind(
+        shelf: &profile::Shelf,
+        dir: &std::path::Path,
+        build: &Build,
+        measuring: Measuring,
+        times_behind: bool,
+    ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
         let registry = profile::Registry::new("toy", &[], &[]);
         let facts = profile::Facts::of(&registry);
         let (chip, report) = shelf.resolve_keyed(&registry, "Card X", &facts, Some(dir), build);
-        let lacked = chip.rates().missing(&profile::fire::KEYS);
         let measured = std::cell::Cell::new(Vec::new());
         let loaded = resolve_at_load(
             chip,
@@ -1715,7 +1773,9 @@ mod tests {
             None,
             None,
             measuring,
-            |_| {
+            times_behind,
+            |_, stated| {
+                let lacked = stated.missing(&profile::fire::KEYS);
                 measured.set(lacked.clone());
                 Ok(Measured {
                     rates: keyed(build).only(&lacked),
@@ -1726,6 +1786,33 @@ mod tests {
         )
         .unwrap();
         (measured.take(), loaded, report)
+    }
+
+    /// A kernel whose code changed since the committed profile was
+    /// exported, on an engine that times behind serving: nothing is
+    /// measured before ready; the stale figure serves, and the key is left
+    /// to time behind serving.
+    #[test]
+    fn a_changed_kernel_is_served_by_its_stale_figure_and_timed_behind() {
+        let exported = Build {
+            on: "toy 10de:2c31 driver 1",
+            code: vec![("gemm", 7), ("copy", 9)],
+        };
+        let registry = profile::Registry::new("toy", &[], &[]);
+        let committed =
+            profile::export(&registry, "Card X", &stored_text(&exported), "user.toml").unwrap();
+        let shelf = shelf_with(Some(committed));
+        let dir = home("committed-stale-behind");
+        let now = Build {
+            code: vec![("gemm", 8), ("copy", 9)],
+            ..exported
+        };
+        let (measured, loaded, report) = load_behind(shelf, &dir, &now, Measuring::Time, true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(measured, Vec::<&str>::new(), "nothing before ready: {:#?}", report.stored);
+        assert_eq!(loaded.rates().gemm_tflops_by_rows, all().gemm_tflops_by_rows);
+        assert_eq!(loaded.tuned().behind, ["gemm_tflops_by_rows"]);
+        assert!(!loaded.tuned().measured_this_load);
     }
 
     fn home(name: &str) -> std::path::PathBuf {
@@ -1792,7 +1879,7 @@ mod tests {
         assert_eq!(measured, ["gemm_tflops_by_rows"], "{:#?}", report.stored);
         assert!(
             report.stored.iter().any(|l| l.contains(
-                "committed `gemm_tflops_by_rows`: not taken, kernel `gemm`'s code changed"
+                "committed `gemm_tflops_by_rows`: not taken as measured, kernel `gemm`'s code changed"
             )),
             "{:#?}",
             report.stored
@@ -1892,7 +1979,7 @@ mod tests {
             report
                 .stored
                 .iter()
-                .any(|l| l.contains("stored `launch_ns`: not taken, kernel `copy`'s code changed")),
+                .any(|l| l.contains("stored `launch_ns`: not taken as measured, kernel `copy`'s code changed")),
             "{:#?}",
             report.stored
         );
@@ -2875,6 +2962,7 @@ mod tests {
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
+            stale: None,
             landing: None,
             launch_ns: Some(3500),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),

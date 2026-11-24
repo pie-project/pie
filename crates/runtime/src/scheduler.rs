@@ -19,6 +19,7 @@ pub(crate) use dispatch::{
 };
 pub use stats::{AggregateStats, HostSubmitStats};
 pub use worker::BatchScheduler;
+pub(crate) use lane::open_behind;
 use worker::SchedulerHandle;
 
 use crate::engine::EngineId;

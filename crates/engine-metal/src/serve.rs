@@ -364,9 +364,10 @@ pub struct Shell {
     /// ([`Pools::fold_window_rows`]): planned as the fire is prepared,
     /// encoded after its forward in its own frame.
     window_folds: Vec<(usize, Vec<(u64, u64, u32, u32)>)>,
-    /// The boundary own-row pages' fills from their ring pages, `(window
-    /// table, (from, to) bytes)`: encoded before this fire's forward.
-    window_fills: Vec<(usize, Vec<(u64, u64)>)>,
+    /// The boundary pages' fills from their ring pages, `(window table,
+    /// (from, to) bytes, first row, rows)`: encoded before this fire's
+    /// forward.
+    window_fills: Vec<(usize, Vec<(u64, u64, u32, u32)>)>,
     /// Own-row pages this fire's lanes took of `Shell::own_top`.
     own_used: u32,
     /// The first ring piece (cow side) of each ring two lanes of this fire
@@ -381,13 +382,6 @@ pub struct Shell {
     /// fold, after its forward, has read them, while the next fire stages.
     own_arms: u32,
     own_arm: u32,
-    /// `PIE_WINDOW_WATCH`: each complete ring page's hash, by (ring ref, page).
-    page_watch: std::collections::HashMap<(u32, u32), u64>,
-    alt_arm: bool,
-    /// A ring load's frames in order on the GPU: each waits for the one
-    /// before to end (`PIE_WINDOW_CHAIN`, a test of frame overlap).
-    #[cfg(target_vendor = "apple")]
-    chain: Option<(objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLEvent>>, std::cell::Cell<u64>)>,
     landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
     /// Steps let go before they landed ([`Shell::forget`]): their rows are
     /// dropped as they land rather than held.
@@ -1305,8 +1299,6 @@ impl PreparedLoad<'_> {
         // that takes any (only a lane of more than `R - W + 1` rows does),
         // an arm each.
         let own_chunks: u32 = match (&rows.ring, rows.windows.first()) {
-            (Some(_), Some(_)) if std::env::var_os("PIE_WINDOW_NO_SHIFT").is_some() => 0,
-            (Some(_), Some(_)) if std::env::var_os("PIE_WINDOW_NO_OWN").is_some() => 1,
             (Some(_), Some(window)) if window.bytes > 0 => {
                 let page = window.tokens.max(1);
                 let per_chunk = (rows.chunk_bytes / window.bytes).max(1);
@@ -1496,11 +1488,18 @@ impl PreparedLoad<'_> {
             let bytes = [rows.list_bytes, rows.fixed_bytes];
             let chunk = rows.chunk_bytes;
             // A seat's slots of each window list: its context in `T_w`-token
-            // slots.
+            // slots; on a ring load, at least a ring's, which a seat-addressed
+            // lane takes as its ring (`Pools::window_seat_ring`).
             let window_pages: Vec<u32> = rows
                 .windows
                 .iter()
-                .map(|w| seated.context().div_ceil(w.tokens.max(1)).max(1))
+                .map(|w| {
+                    let context = seated.context().div_ceil(w.tokens.max(1)).max(1);
+                    let ring = rows.ring.as_ref().map_or(0, |_| {
+                        crate::chunks::MetalRing::rows(w.rows, w.tokens.max(1)) / w.tokens.max(1)
+                    });
+                    context.max(ring)
+                })
                 .collect();
             let window_chunks: u32 = rows
                 .windows
@@ -1644,11 +1643,6 @@ impl PreparedLoad<'_> {
         let (span_view, span_at, span_bytes) = pools.span_view();
         // The arena ends below the own-row pages at the range's top.
         let own_bytes = u64::from(own_chunks) * pools.chunk_bytes();
-        #[cfg(target_vendor = "apple")]
-        let chain = std::env::var_os("PIE_WINDOW_CHAIN").and_then(|_| {
-            use objc2_metal::MTLDevice as _;
-            device.device().newEvent().map(|event| (event, std::cell::Cell::new(0)))
-        });
         let own_top = (
             pools.layout().total_chunks.saturating_sub(own_chunks),
             own_chunks,
@@ -1703,7 +1697,9 @@ impl PreparedLoad<'_> {
             }
         }
         host_rung(&pools, &mut inputs, &mut readout, arena.current(), true)?;
-        pools.zero_span(pools.bytes() - arena.scratch_room(), scratch.bytes())?;
+        // The kernel scratch plane in the pool's buffer: the arena counts in
+        // the span's view, and ends below a windowed load's own-row pages.
+        pools.zero_span(pools.span().0 + (arena.scratch_at() - span_at), scratch.bytes())?;
         scratch.seat(arena.store().clone(), arena.scratch_at());
         pools.seat_weights(&device, &handles, weight_caches)?;
         weights.lay_banks(&handles, |bytes| pools.run_table(&device, bytes))?;
@@ -1819,10 +1815,6 @@ impl PreparedLoad<'_> {
             own_top,
             own_arms: u32::try_from(arms).unwrap_or(1).max(1),
             own_arm: 0,
-            page_watch: std::collections::HashMap::new(),
-            alt_arm: false,
-            #[cfg(target_vendor = "apple")]
-            chain,
             landed: BTreeMap::new(),
             forgotten: std::collections::BTreeSet::new(),
             host_rows: crate::diag::on().host_rows,
@@ -2663,18 +2655,47 @@ impl Shell {
         self.pipelines.take_unbuilt()
     }
 
+    /// The step set the runtime's builder forms over this load
+    /// ([`engine::StepShapes::of`] of [`engine::StepRules::runtime`] over the
+    /// load's own facts), for a walk the load request did not hand one.
+    #[must_use]
+    pub fn step_shapes(&self) -> engine::StepShapes {
+        engine::StepShapes::of(
+            &engine::StepRules::runtime(),
+            &engine::StepFacts::of(
+                &self.pool_chunk_facts(),
+                self.budgets.tokens.max_lanes,
+                self.budgets.tokens.max_tokens,
+                u32::try_from(poem_compiler::arena::readouts_ceiling(&self.budgets.tokens))
+                    .unwrap_or(u32::MAX),
+                engine::Attachments::default(),
+            ),
+        )
+    }
+
+    /// [`Shell::warm_pipelines_over`] the runtime's set over this load
+    /// ([`Shell::step_shapes`]).
     pub fn warm_pipelines(&mut self) -> Result<(u32, u64)> {
+        let steps = self.step_shapes();
+        self.warm_pipelines_over(&steps)
+    }
+
+    /// Builds, before ready, every pipeline a step of `steps` dispatches
+    /// (CONTRACT-BC 24): each shape in the set's order, smallest first, at
+    /// its rung, under its treatment's verbs, at the rows its span reaches
+    /// (one, every matmul band start inside it, each unrolled few-rows
+    /// matmul's top, 2 / 4 / 8, and its top) and at each readout tier inside
+    /// its `readout_rows` (the same points, every row of the prompt read
+    /// out), so a dense routing a step's rows or readouts reach is built (the
+    /// M1's `dense_gemv_t_rows8` in a c64 step, met after ready and
+    /// refused). Metal records no bodies: every shape is walked, none eager.
+    pub fn warm_pipelines_over(&mut self, steps: &engine::StepShapes) -> Result<(u32, u64)> {
         use engine::frame::Shell as FrameShell;
         let before = self.pipelines.compiled();
-        // The seats the pool lays runs for: a seat-addressed lane past them
-        // names chunks the pool does not hold. A fire's matmul tiles follow
-        // its rows (the prefill fires walk every rung's), its attention one
-        // row a lane (one decode lane reaches it).
-        // One seat: a fire's matmul tiles follow its rows (the prefill fires
-        // walk every rung's), its attention one row a lane, its readout the
-        // rows it reads; no key turns on how many seats carry them, so the
-        // walk backs one seat run, not every seat's.
-        let seats = 1u32;
+        // One lane on seat 0: a fire's matmul tiles follow its rows, its
+        // attention one row a lane (a one-row lane reaches the decode form),
+        // its lm_head the rows it reads out; no key turns on how many lanes
+        // or seats carry them, so the walk backs one seat run.
         let context = self.paging().context().max(1);
         let standing = self.rung;
         self.warming = true;
@@ -2765,102 +2786,130 @@ impl Shell {
         // ones' are the capture's, which no rung's rows key.
         let rungs = self.arena.rung_tokens();
         let octaves = engine::load::armed::scored_buckets(&rungs);
-        // Beside each rung's own rows, every band start of the matmul
-        // routing below it and above the rung before
+        // Every band start of the matmul routing
         // (`kernels_metal::linear::gemm::row_bands`: the fixed bands and
-        // where the profile's `kernel.dense` changes its pick), walked at
-        // that rung: a fire's rows reach every band its rungs span, and each
-        // band's kernel is built here, not refused while serving.
+        // where the profile's `kernel.dense` changes its pick): a shape's
+        // rows, and its readouts, reach every band its span holds.
         let bands = kernels_metal::linear::gemm::row_bands(&self.tuning);
-        let mut below = 0u32;
-        let sized: Vec<(u32, Vec<u32>)> = rungs
-            .iter()
-            .map(|&rung| {
-                let mut sizes = vec![rung];
-                sizes.extend(
-                    bands
-                        .iter()
-                        .copied()
-                        .filter(|&band| band > below && band < rung),
-                );
-                below = rung;
-                (rung, sizes)
-            })
-            .collect();
-        let _ = kernels_metal::linear::gemm::record_shapes(true);
-        let walked = (|| -> Result<u32> {
-            let mut fires = 0u32;
-            for (rung, sizes) in sized {
-                self.set_rung(self.rung, rung)?;
-                for size in sizes {
-                    for &form in forms
-                        .iter()
-                        .filter(|(_, scores)| !scores || octaves.contains(&rung))
-                    {
-                        for (verb, held) in &verbs {
-                            let prompt = size
-                                .min(self.budgets.tokens.max_tokens)
-                                .min(context.saturating_sub(*held))
-                                .max(1);
-                            let lanes = size.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-                            let prompt_tokens = vec![0u32; prompt as usize];
-                            let one = [0u32];
-                            let prefill = [Seated {
-                                replay_stated: None,
-                                held: Some(*held),
-                                rs: verb,
-                                refs: true,
-                                pages: &kv_pages,
-                                record: (!record.is_empty()).then_some(&record[..]),
-                                windows: &windows,
-                                ..Seated::of(Lane {
-                                    slot: 0,
-                                    word: word(prompt, form),
-                                    tokens: &prompt_tokens,
-                                })
-                            }];
-                            let decode: Vec<Seated<'_>> = (0..lanes)
-                                .map(|slot| Seated {
-                                    replay_stated: None,
-                                    held: Some(*held),
-                                    rs: verb,
-                                    refs: true,
-                                    pages: &kv_pages,
-                                    record: (!record.is_empty()).then_some(&record[..]),
-                                    windows: &windows,
-                                    ..Seated::of(Lane {
-                                        slot,
-                                        word: word(1, form),
-                                        tokens: &one,
-                                    })
-                                })
-                                .collect();
-                            for lanes in [&prefill[..], &decode[..]] {
-                                // Each dropped fire's command buffer goes back
-                                // with its own pool: left to the thread's, a
-                                // walk of more fires than the queue holds
-                                // command buffers blocks making the next one.
-                                let walked = pooled(|| -> Result<()> {
-                                    let prepared = FrameShell::prepare(
-                                        self,
-                                        StepView {
-                                            lanes,
-                                            attachments: &[],
-                                            media: &[],
-                                            clips: &[],
-                                            done: None,
-                                        },
-                                        None,
-                                    )?;
-                                    drop(self.walk(&prepared, true)?);
-                                    Ok(())
-                                });
-                                walked?;
-                                fires += 1;
-                            }
+        let inside = |span: engine::shapes::Span, extra: &[u32]| -> Vec<u32> {
+            let mut at: Vec<u32> = bands
+                .iter()
+                .chain(extra)
+                .copied()
+                .chain([span.hi])
+                .filter(|&n| n >= span.lo.max(1) && n <= span.hi)
+                .collect();
+            at.sort_unstable();
+            at.dedup();
+            at
+        };
+        // A treatment's verbs: a folding shape's lanes fold, a buffering
+        // one's buffer (folding nothing, or replaying what they held).
+        let verbs_of = |treatment: engine::Treatment| -> Vec<usize> {
+            match treatment {
+                engine::Treatment::Folds => vec![0],
+                engine::Treatment::Buffers if verbs.len() > 1 => (1..verbs.len()).collect(),
+                engine::Treatment::Buffers => vec![0],
+            }
+        };
+        // What the walk fires, each once: (rung, prompt rows, rows read
+        // out, form, verb), a prompt of one row the decode forms.
+        let mut fired: std::collections::HashSet<(u32, u32, u32, (bool, bool), usize)> =
+            std::collections::HashSet::new();
+        let mut plan: Vec<(u32, u32, u32, (bool, bool), usize)> = Vec::new();
+        for shape in &steps.shapes {
+            // The arena's rung the shape runs at: its own, or the
+            // narrowest past it (a lattice's last rung is one fire's tokens).
+            let rung = rungs
+                .iter()
+                .copied()
+                .find(|&r| r >= shape.rung)
+                .or_else(|| rungs.last().copied())
+                .unwrap_or(shape.rung);
+            let top = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
+            let mut fires: Vec<(u32, u32)> = Vec::new();
+            // A step's rows: one (the decode forms), and as a prompt each
+            // band start inside its rows, each unrolled few-rows matmul's top
+            // (2 / 4 / 8: a decode step of 5-8 lanes runs `rows8`), and its
+            // top; a prompt's matmuls are a decode step's at the same rows.
+            fires.push((1, 1));
+            fires.extend(
+                inside(shape.rows, &[2, 4, 8])
+                    .into_iter()
+                    .filter(|&rows| rows > 1)
+                    .map(|rows| (rows, 1)),
+            );
+            // The readout tiers: a prompt of as many rows reads out every
+            // one of them, the lm_head at that row count.
+            for reads in inside(shape.readout_rows, &[2, 4, 8]) {
+                if reads > 1 {
+                    fires.push((reads, reads));
+                }
+            }
+            for (rows, reads) in fires {
+                let rows = rows.min(top);
+                let reads = reads.min(rows);
+                for &form in forms.iter().filter(|(_, scores)| !scores || octaves.contains(&rung)) {
+                    for verb in verbs_of(shape.treatment) {
+                        let key = (rung, rows, reads, form, verb);
+                        if fired.insert(key) {
+                            plan.push(key);
                         }
                     }
                 }
+            }
+        }
+        // The rows one fire reads logits for at most: a tier past it is no
+        // step's.
+        let readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(&self.budgets.tokens))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let _ = kernels_metal::linear::gemm::record_shapes(true);
+        let walked = (|| -> Result<u32> {
+            let mut fires = 0u32;
+            for (rung, rows, reads, form, verb) in plan {
+                if self.rung != rung {
+                    self.set_rung(self.rung, rung)?;
+                }
+                let (verb, held) = (&verbs[verb].0, verbs[verb].1);
+                let rows = rows.min(context.saturating_sub(held)).max(1);
+                let reads = reads.min(rows).min(readouts).max(1);
+                let tokens = vec![0u32; rows as usize];
+                let tail: Vec<u32> = (rows - reads..rows).collect();
+                let lane = [Seated {
+                    replay_stated: None,
+                    held: Some(held),
+                    rs: verb,
+                    refs: true,
+                    pages: &kv_pages,
+                    record: (!record.is_empty()).then_some(&record[..]),
+                    windows: &windows,
+                    readout: (reads > 1).then_some(&tail[..]),
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: word(rows, form),
+                        tokens: &tokens,
+                    })
+                }];
+                // Each dropped fire's command buffer goes back with its own
+                // pool: left to the thread's, a walk of more fires than the
+                // queue holds command buffers blocks making the next one.
+                pooled(|| -> Result<()> {
+                    let prepared = FrameShell::prepare(
+                        self,
+                        StepView {
+                            lanes: &lane,
+                            attachments: &[],
+                            media: &[],
+                            clips: &[],
+                            done: None,
+                        },
+                        None,
+                    )?;
+                    drop(self.walk(&prepared, true)?);
+                    Ok(())
+                })?;
+                fires += 1;
             }
             Ok(fires)
         })();
@@ -3773,35 +3822,40 @@ impl Shell {
         let window = self.pools.layout().window(k).map_or(0, |list| list.rows);
         let per_chunk = self.pools.window_slots_a_chunk(k)?;
         let ring_rows = crate::chunks::MetalRing::rows(window, page);
-        let pieces = seated
-            .ring
-            .ok_or_else(|| refuse("a windowed lane states no ring pieces in its record".to_string()))?;
-        // A shared ring (`cow != run`) was copied run onto cow before the
-        // fire (`Shell::copy_records`): the fire reads and writes cow.
-        // Ring page j: piece j / per_chunk, the window slot j % per_chunk of
-        // that chunk (a ring piece is one slot of one chunk, its ref the
-        // chunk).
-        let ring_refs: Vec<u32> = (0..ring_rows / page)
-            .map(|j| {
-                pieces
-                    .get((j / per_chunk) as usize)
-                    .map(|&[_, cow]| cow * per_chunk + j % per_chunk)
-                    .ok_or_else(|| {
-                        refuse(format!(
-                            "a ring of {} pages in {} piece(s) of {per_chunk} pages",
-                            ring_rows / page,
-                            pieces.len()
-                        ))
+        let (ring_refs, shared): (Vec<u32>, bool) = match seated.ring {
+            // A shared ring (`cow != run`) was copied run onto cow before the
+            // fire (`Shell::copy_records`): the fire reads and writes cow.
+            // Ring page j: piece j / per_chunk, the window slot j % per_chunk
+            // of that chunk (a ring piece is one slot of one chunk, its ref
+            // the chunk).
+            Some(pieces) => (
+                (0..ring_rows / page)
+                    .map(|j| {
+                        pieces
+                            .get((j / per_chunk) as usize)
+                            .map(|&[_, cow]| cow * per_chunk + j % per_chunk)
+                            .ok_or_else(|| {
+                                refuse(format!(
+                                    "a ring of {} pages in {} piece(s) of {per_chunk} pages",
+                                    ring_rows / page,
+                                    pieces.len()
+                                ))
+                            })
                     })
-            })
-            .collect::<Result<_>>()?;
-        let ring = self.pools.window_pages(k, &ring_refs, None)?;
+                    .collect::<Result<_>>()?,
+                pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow)),
+            ),
+            // A seat-addressed lane: its seat's ring, its own.
+            None if !seated.refs => (self.pools.window_seat_ring(k, seated.lane.slot, ring_rows / page)?, false),
+            None => return Err(refuse("a windowed lane states no ring pieces in its record".to_string())),
+        };
+        let ring = self.pools.window_pages(k, &ring_refs)?;
         let ring_at: Vec<u64> = ring_refs
             .iter()
             .map(|&slot| self.pools.window_slot_offset(k, slot))
             .collect::<Result<_>>()?;
         let buffer_refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
-        let buffer = self.pools.window_pages(k, buffer_refs, None)?;
+        let buffer = self.pools.window_pages(k, buffer_refs)?;
         let buffer_at: Vec<u64> = buffer_refs
             .iter()
             .map(|&slot| self.pools.window_slot_offset(k, slot))
@@ -3809,10 +3863,7 @@ impl Shell {
         let end = have + rows;
         let held = u64::from(fold.base) + buffer.len() as u64 * u64::from(page);
         // The fire's own rows past the buffer: their ring rows, or own pages.
-        let shared = pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow));
-        let direct = (crate::store::windowed::direct_allowed(shared, rows, ring_rows, window)
-            && std::env::var_os("PIE_WINDOW_NO_DIRECT").is_none())
-            || std::env::var_os("PIE_WINDOW_NO_OWN").is_some();
+        let direct = crate::store::windowed::direct_allowed(shared, rows, ring_rows, window);
         // Rows of the fire no buffer slot holds: below the buffer's base (the
         // rows it folds itself) or past its last slot.
         let outside = have < fold.base || u64::from(end) > held;
@@ -3866,18 +3917,28 @@ impl Shell {
             own: &own_ix,
             own_page,
         };
-        let mut fills: Vec<(u64, u64)> = by_index
+        // An own-row page takes its ring page's rows whole: the fire writes
+        // its own rows over them after.
+        let mut fills: Vec<(u64, u64, u32, u32)> = by_index
             .own_fills(seated.folded)
             .into_iter()
-            .map(|(ring, own)| (bytes[ring as usize], bytes[own as usize]))
+            .map(|(ring, own)| (bytes[ring as usize], bytes[own as usize], 0, page))
             .collect();
         // A buffer slot holding rows folded before the fire (its first, from
         // `base` up to `folded`: rows a fire folded itself into the ring and
-        // wrote to no slot) is refilled from its ring page, which holds them.
+        // wrote to no slot) takes those rows from its ring page, and those
+        // alone: its rows from `folded` on are unfolded, held in the slot only.
         for (i, &slot_at) in buffer_at.iter().enumerate() {
             let n = fold.base / page + u32::try_from(i).unwrap_or(u32::MAX);
-            if u64::from(n) * u64::from(page) < u64::from(seated.folded) {
-                fills.push((ring_at[n as usize % ring_at.len().max(1)], slot_at));
+            let first = u64::from(n) * u64::from(page);
+            if first < u64::from(seated.folded) {
+                let rows = (u64::from(seated.folded) - first).min(u64::from(page));
+                fills.push((
+                    ring_at[n as usize % ring_at.len().max(1)],
+                    slot_at,
+                    0,
+                    u32::try_from(rows).unwrap_or(page),
+                ));
             }
         }
         if !fills.is_empty() {
@@ -3896,59 +3957,8 @@ impl Shell {
             })?,
         }
         .min(end.saturating_sub(seated.folded));
-        // A complete ring page (every row two or more behind `have`, past any
-        // frame in flight) never changes; one that does was overwritten.
-        if seated.folded != have || !buffer_refs.is_empty() {
-            eprintln!(
-                "wanomaly slot {} have {have} rows {rows} folded {} base {} fold {:?} buffer {:?} direct {direct} own {}",
-                seated.lane.slot,
-                seated.folded,
-                fold.base,
-                fold.fold,
-                buffer_refs,
-                own.len()
-            );
-        }
-        if std::env::var_os("PIE_WINDOW_WATCH").is_some() {
-            let slot_bytes = self.pools.window_slot_bytes(k)?;
-            let done_pages = have.saturating_sub(8) / page;
-            for n in 0..done_pages.min(ring_at.len() as u32) {
-                let mut bytes = vec![0u8; usize::try_from(slot_bytes).unwrap_or(0)];
-                self.pools.read_span(ring_at[n as usize], &mut bytes)?;
-                let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
-                let key = (ring_refs[n as usize], n);
-                match self.page_watch.insert(key, hash) {
-                    Some(was) if was != hash => eprintln!(
-                        "wwatch CHANGED slot {} ring ref {} page {n} (have {have}, rows {rows}) {was:x} -> {hash:x}",
-                        seated.lane.slot, ring_refs[n as usize]
-                    ),
-                    None => eprintln!("wpage slot {} page {n} hash {hash:x} at have {have}", seated.lane.slot),
-                    _ => {}
-                }
-            }
-        }
-        if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
-            eprintln!(
-                "wtrace slot {} tok {:?} tag {} have {have} rows {rows} folded {} advance {advance} base {} \
-                 buffer {:?} own {} at page {own_page} direct {direct} ring {:?} refs {:?} fills {}",
-                seated.lane.slot,
-                (
-                    seated.lane.tokens.len(),
-                    seated.lane.tokens.iter().fold(0u64, |h, &t| h.wrapping_mul(1_000_003).wrapping_add(u64::from(t))),
-                    seated.lane.tokens.get(5..9)
-                ),
-                seated.reports,
-                seated.folded,
-                fold.base,
-                buffer_refs,
-                own.len(),
-                pieces,
-                ring_refs,
-                by_index.own_fills(seated.folded).len()
-            );
-        }
         if u64::from(end) > held && u64::from(seated.folded) + u64::from(advance) < u64::from(end) {
-            eprintln!(
+            tracing::warn!(
                 "windowed: lane in slot {} keeps rows past its buffer unfolded: have {have} rows \
                  {rows} folded {} advance {advance} base {} buffer {} pages of {page}",
                 seated.lane.slot,
@@ -4314,17 +4324,6 @@ impl Shell {
         #[cfg(target_vendor = "apple")]
         frame.barrier(&self.device)?;
 
-        if std::env::var_os("PIE_EPI_TRACE").is_some() {
-            for attached in prepared.attachments.iter().filter(|a| !a.adapter_only) {
-                eprintln!(
-                    "epitrace instance {:?} in_flight {} ahead_depth {} frames_in_flight {}",
-                    attached.instance,
-                    self.programs.in_flight(attached.instance),
-                    self.programs.ahead_depth(attached.instance),
-                    self.inflight.len()
-                );
-            }
-        }
         let mut owed = Vec::with_capacity(prepared.attachments.len());
         match self.stage_epilogues(frame, prepared, &first_row, &lane_rows, &mut owed) {
             Ok(()) => Ok(owed),
@@ -4730,8 +4729,7 @@ impl Shell {
             done,
         } = step;
 
-        let serial = std::env::var_os("PIE_WINDOW_SERIAL").is_some();
-        while self.inflight.len() >= if serial { 1 } else { self.arms.depth() } {
+        while self.inflight.len() >= self.arms.depth() {
             self.harvest_one()?;
         }
         let arm = self.arms.free().ok_or(Fault::Ceiling {
@@ -4739,23 +4737,6 @@ impl Shell {
             need: self.arms.depth() as u64 + 1,
             have: self.arms.depth() as u64,
         })?;
-        // `PIE_WINDOW_ALT` (with `PIE_WINDOW_SERIAL`): every other fire on
-        // arm 1 though nothing is in flight.
-        let arm = if serial && std::env::var_os("PIE_WINDOW_ALT").is_some() && self.arms.depth() > 1 {
-            self.alt_arm = !self.alt_arm;
-            usize::from(self.alt_arm)
-        } else {
-            arm
-        };
-        if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
-            let current = self.arena.current();
-            let ((inputs_at, inputs_bytes), _) = self.arena.regions(current, arm as u64);
-            eprintln!(
-                "atrace arm {arm} rung {current} tokens {} inputs [{inputs_at}, {})",
-                self.arena.current_tokens(),
-                inputs_at + inputs_bytes
-            );
-        }
 
         let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
         // Each resolved envelope's instance, by the same index.
@@ -5263,12 +5244,19 @@ impl Shell {
             for (k, lists) in window_tables.iter_mut().enumerate() {
                 lists.push(if seated.kv_less {
                     Vec::new()
-                } else if self.pools.ring().is_some()
-                    && let Some(fold) = seated.window
-                {
+                } else if self.pools.ring().is_none() {
+                    // Windowed layers are a lane's ring and window buffer
+                    // (CONTRACT-BC 19, 21), on every load that has them.
+                    return Err(Fault::program(
+                        "serve::windowed",
+                        "a load with window lists and no rings: Metal serves windowed layers \
+                         as ring + buffer only"
+                            .to_string(),
+                    ));
+                } else if let Some(fold) = seated.window {
                     let port_fold = ports.as_ref().and_then(engine::ports::LanePorts::fold);
                     self.windowed_pages(k, seated, fold, port_fold, have, row.rows)?
-                } else if self.pools.ring().is_some() && seated.ring.is_some() {
+                } else if seated.ring.is_some() {
                     // A lane whose record holds rings states how it folds
                     // them; its buffer slots are no whole window.
                     return Err(Fault::program(
@@ -5279,19 +5267,31 @@ impl Shell {
                             lane.slot
                         ),
                     ));
-                } else if self.pools.ring().is_some() {
-                    // A lane with no fold and no ring on a ring + buffer load
-                    // (arming, the load's own fires, the pipeline walk): no
-                    // seat holds a run of window slots, and nothing reads what
-                    // such a fire computes, so every page it names is one
-                    // scratch page, in the own-row region's last chunk (past
-                    // every arm's share).
+                } else if !seated.refs {
+                    // A seat-addressed lane (a caller firing directly, the
+                    // tuner): its seat's ring, every row it writes folded in
+                    // the fire, no buffer.
                     let page_size = self.pools.window_paging(k).page_size.max(1);
-                    let (first, chunks) = if std::env::var_os("PIE_WINDOW_NO_SHIFT").is_some() {
-                        (self.pools.layout().total_chunks - 1, 1)
-                    } else {
-                        self.own_top
+                    let after = have.saturating_add(row.rows);
+                    let fold = engine::fire::WindowFold {
+                        base: after / page_size * page_size,
+                        fold: engine::fire::FoldLen::Host(row.rows),
+                        lineage: engine::fire::Lineage::Set,
                     };
+                    let seat = Seated {
+                        folded: have,
+                        windows: &[],
+                        ..*seated
+                    };
+                    self.windowed_pages(k, &seat, fold, None, have, row.rows)?
+                } else {
+                    // A runtime lane with no fold and no ring (arming, the
+                    // load's own fires, the pipeline walk): nothing reads
+                    // what such a fire computes, so every page it names is
+                    // one scratch page, in the own-row region's last chunk
+                    // (past every arm's share).
+                    let page_size = self.pools.window_paging(k).page_size.max(1);
+                    let (first, chunks) = self.own_top;
                     if chunks == 0 {
                         return Err(Fault::program(
                             "serve::windowed",
@@ -5299,25 +5299,9 @@ impl Shell {
                                 .to_string(),
                         ));
                     }
-                    if seated.refs {
-                        eprintln!(
-                            "windowed: runtime lane in slot {} (have {have}, rows {}, record {:?}) \
-                             states no fold and no ring: the scratch page",
-                            lane.slot,
-                            row.rows,
-                            seated.record.map(|r| r.len())
-                        );
-                    }
                     let (_, id) = self.pools.window_slot_at(k, first + chunks - 1, 0)?;
                     let after = have.saturating_add(row.rows);
                     vec![id; after.div_ceil(page_size).max(1) as usize]
-                } else {
-                    let page_size = u64::from(self.pools.window_paging(k).page_size.max(1));
-                    let after = u64::from(have) + u64::from(row.rows);
-                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
-                    let refs = seated.windows.get(k).map_or(&[][..], Vec::as_slice);
-                    let seat = (!seated.refs || refs.is_empty()).then_some((lane.slot, pages));
-                    self.pools.window_pages(k, refs, seat)?
                 });
             }
             state_top = record
@@ -5597,12 +5581,6 @@ impl Shell {
                 _ => (0, None),
             };
             rs_skips.push(skip);
-            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
-                eprintln!(
-                    "rtrace slot {} have {have} rows {} rs {:?} replay {} commit {} gather {:?} scatter {:?} has_state {}",
-                    lane.slot, row.rows, rs, plan.replay, plan.commit, plan.gather, plan.scatter, self.pools.has_state()
-                );
-            }
             // A reporting lane that buffers tells, where the fire settles,
             // how many slots past its state's frozen length this fire froze
             // (as `LanePlan::of` reckons it) and, where a port places its
@@ -6944,12 +6922,6 @@ impl Shell {
             };
             let (ring, committed, cell_bytes, cell_dtype) =
                 self.programs.feed_cell(feed.instance, feed.channel)?;
-            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
-                eprintln!(
-                    "ftrace lane {} id {} instance {:?} channel {} cell {committed} to {} bytes {} arm {}",
-                    feed.lane, feed.id, feed.instance, feed.channel, at + feed.at, feed.bytes, p.arm
-                );
-            }
             let element = cell_dtype;
             if element == feed.dtype {
                 if cell_bytes < feed.bytes {
@@ -7076,10 +7048,6 @@ impl Shell {
     fn walk(&self, p: &Prepared<'_>, dry: bool) -> Result<Walked> {
         let place = At::new();
         let mut frame = self.device.frame()?;
-        #[cfg(target_vendor = "apple")]
-        if !dry && let Some((event, value)) = self.chain.as_ref() {
-            frame.fence(event, value.get(), false)?;
-        }
         if let Some(plane) = self.nan_flags.as_ref() {
             frame.fill_zero(plane.slab(), 0, plane.bytes())?;
             #[cfg(target_vendor = "apple")]
@@ -7096,7 +7064,7 @@ impl Shell {
         // dry walk encodes for no fire; a fill again is the same bytes).
         if !dry && !self.window_fills.is_empty() {
             for (k, fills) in &self.window_fills {
-                self.pools.copy_window_slots(&mut frame, *k, fills)?;
+                self.pools.fold_window_rows(&mut frame, *k, fills)?;
             }
             #[cfg(target_vendor = "apple")]
             frame.next_pass()?;
@@ -7157,7 +7125,7 @@ impl Shell {
                         .filter(|_| !dry)
                         .map(crate::ane::Ane::handoff),
                 )
-                .flushing_after(if dry || std::env::var_os("PIE_WINDOW_NOFLUSH").is_some() {
+                .flushing_after(if dry {
                     0
                 } else {
                     HEAD_LAUNCHES
@@ -7475,13 +7443,6 @@ impl engine::frame::Shell for Shell {
                 lanes.join(" ")
             )
         });
-        // `PIE_WINDOW_SERIAL_WALK` (a race bisection): the frames in flight
-        // land before this one is encoded, its prepare having overlapped them.
-        if std::env::var_os("PIE_WINDOW_SERIAL_WALK").is_some() {
-            while !self.inflight.is_empty() {
-                self.harvest_one()?;
-            }
-        }
         let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
         let profile = crate::encode::kernel_profile();
@@ -7504,13 +7465,6 @@ impl engine::frame::Shell for Shell {
         }
         let mut frame = walked.frame;
 
-        // `PIE_WINDOW_SERIAL_EPI` (a race bisection): the forward walked while
-        // the frames in flight run; they land before the epilogues encode.
-        if std::env::var_os("PIE_WINDOW_SERIAL_EPI").is_some() {
-            while !self.inflight.is_empty() {
-                self.harvest_one()?;
-            }
-        }
         let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
             let seat = &self.readout[self.arena.current()][prepared.arm];
@@ -7530,11 +7484,6 @@ impl engine::frame::Shell for Shell {
             }
         }
 
-        if std::env::var_os("PIE_WINDOW_SERIAL_EPI2").is_some() {
-            while !self.inflight.is_empty() {
-                self.harvest_one()?;
-            }
-        }
         let attached: Vec<(engine::InstanceId, std::ops::Range<u32>)> = self
             .encode_epilogues(&mut frame, &prepared)?
             .into_iter()
@@ -7634,18 +7583,6 @@ impl engine::frame::Shell for Shell {
         }
         if self.own_used > 0 {
             self.own_arm = (self.own_arm + 1) % self.own_arms;
-        }
-        #[cfg(target_vendor = "apple")]
-        if let Some((event, value)) = self.chain.as_ref() {
-            value.set(value.get() + 1);
-            frame.fence(event, value.get(), true)?;
-        }
-        // `PIE_WINDOW_SERIAL_COMMIT` (a race bisection): encoded while the
-        // frames in flight run, committed only once they landed.
-        if std::env::var_os("PIE_WINDOW_SERIAL_COMMIT").is_some() {
-            while !self.inflight.is_empty() {
-                self.harvest_one()?;
-            }
         }
         let pending = frame.commit_async(Some(Box::new(move |refused: Option<String>| {
             counts.leave();

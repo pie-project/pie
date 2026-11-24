@@ -595,10 +595,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // registers one of them builds nothing. One that cannot be built fails
     // the load, as a rung that cannot be armed does; a backend that builds
     // no guest code keeps the default, which builds nothing.
+    // Registered as a request's are: a per-row channel declared at the rows
+    // one fire binds, `model.max-pass-rows()` (the first engine's).
+    let rows = engine_configs
+        .first()
+        .map_or(u32::MAX, |engine| {
+            u32::try_from(engine.limits.max_forward_tokens).unwrap_or(u32::MAX)
+        });
     for (at, engine) in engine_configs.iter_mut().enumerate() {
         let backend =
             crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
-        let registrations = crate::pipeline::standard::registrations(backend.as_deref())?;
+        let registrations = crate::pipeline::standard::registrations(backend.as_deref(), rows)?;
         engine
             .engine_backend
             .prewarm_programs(&registrations)
@@ -1124,6 +1131,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     }
     active_guard.disarm();
+    // Ready: what an engine left to measure behind serving runs from here,
+    // where its lane idles.
+    crate::scheduler::open_behind();
     Ok(BootstrapHandle {
         port: bound_port,
         shutdown: Some(RuntimeShutdown {

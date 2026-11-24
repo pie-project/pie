@@ -269,6 +269,24 @@ pub(super) fn loaded_bound(
     loaded_boot(tag, model, lanes, boot)
 }
 
+/// What `engine`'s load left to measure behind serving (the dense settle's
+/// ranges, a stale rate), run to its end as the runtime's idle lane runs
+/// it: one slice a call, no other lane submitting. The slices it ran.
+pub(super) fn measure_behind(engine: &mut impl ::engine::Engine) -> usize {
+    let mut slices = 0;
+    let behind = ::engine::BehindServing {
+        others: &|| 0,
+        arrived: &|| false,
+    };
+    while engine
+        .measure_behind(&behind)
+        .expect("measuring behind serving")
+    {
+        slices += 1;
+    }
+    slices
+}
+
 /// [`loaded_lanes`] on `boot`.
 pub(super) fn loaded_boot(
     tag: &str,
@@ -491,6 +509,7 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             }],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");
@@ -575,6 +594,7 @@ fn a_frame_of_many_steps_settles_every_step_one_frame_in_flight() {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         })
         .collect();
     let mut ticket = engine
@@ -649,6 +669,7 @@ fn a_pipeline_built_after_the_load_is_counted() {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         engine.settle_frame(&mut ticket).expect("the frame settles");

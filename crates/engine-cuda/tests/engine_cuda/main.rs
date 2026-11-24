@@ -95,6 +95,7 @@ mod every_op_agrees_with_the_host_interpreter;
 #[cfg(feature = "device")]
 mod every_suite_step_agrees_with_the_host_interpreter;
 mod golden_logits;
+mod two_models_exported_boot_a_clean_home_measuring_nothing;
 mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;

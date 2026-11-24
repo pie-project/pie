@@ -577,10 +577,7 @@ pub fn kda_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(
-            KDA,
-            &format!("::pie::ssm::kda_fold<::pie::bf16, {}>", head_dim / WARP),
-        ))
+        Fire::at(fold_kernel(head_dim))
         .apply(Launch::grid(
             [heads, 1, head_dim.div_ceil(BLOCK_ROWS)],
             [BLOCK, 1, 1],
@@ -597,5 +594,13 @@ pub fn kda_fold(
             folds.arg(),
             stated(OP, groups)?.arg(),
         ],
+    )
+}
+
+/// KDA's group fold kernel for heads `head_dim` wide ([`kda_fold`]).
+pub(super) fn fold_kernel(head_dim: u32) -> &'static crate::jit::Kernel {
+    kernel(
+        KDA,
+        &format!("::pie::ssm::kda_fold<::pie::bf16, {}>", head_dim / WARP),
     )
 }

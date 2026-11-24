@@ -1187,6 +1187,7 @@ pub fn split_lane(
         attachments: Vec::new(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     };
     let mut rest = step.clone();
     rest.lanes[at] = piece(rows, total, readout);
@@ -1634,6 +1635,7 @@ mod tests {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         };
         let (leading, last) = row_pieces(&step, &facts, 4).expect("cut");
         assert_eq!(leading.len(), 2);
@@ -1704,6 +1706,7 @@ mod tests {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         };
         let (leading, last) = row_pieces(&step(lane.clone()), &facts, 4).expect("cut");
         let pieces: Vec<&Lane> = leading.iter().map(|s| &s.lanes[0]).chain([&last.lanes[0]]).collect();
@@ -1784,6 +1787,7 @@ mod tests {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         };
         let b = bound(1.0);
         let (_, per_layer) = b.step_ns(StepRows::of(&step));

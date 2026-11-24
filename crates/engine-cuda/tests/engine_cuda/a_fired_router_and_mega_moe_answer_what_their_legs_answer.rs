@@ -253,6 +253,7 @@ fn logits(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the row loads");
     let mut shell = staged.finish().expect("the row arms");

@@ -1014,6 +1014,7 @@ impl Shell {
     /// collectives.
     pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
+        let rules = boot.steps.clone();
         crate::program::launch::state_queue_masks(&boot.knobs.queue_masks);
         let Baked {
             mut device,
@@ -1303,16 +1304,6 @@ impl Shell {
                 &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
             ),
         };
-        let drafting_words: std::collections::HashSet<u64> = compiled
-            .classes
-            .classes
-            .iter()
-            .enumerate()
-            .filter(|(class, _)| {
-                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
-            })
-            .flat_map(|(_, class)| class.words.iter().copied())
-            .collect();
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
@@ -1706,7 +1697,7 @@ impl Shell {
             keys,
             products,
             routes_measuring: boot.knobs.measuring,
-            measured: std::cell::RefCell::new(timed_at_open.clone()),
+            measured: timed_at_open,
             forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
@@ -1734,7 +1725,6 @@ impl Shell {
             adapter_fact,
             corrected,
             decoding,
-            drafting_words,
             tiers,
             landing,
             armed: None,
@@ -1769,6 +1759,8 @@ impl Shell {
             rearming: false,
             arm_only: None,
             walked_launches: std::collections::HashMap::new(),
+            steps: engine::StepShapes::default(),
+            walked: std::collections::HashMap::new(),
             bodies_took: 0,
             measuring: false,
             workspace: None,
@@ -1908,6 +1900,10 @@ impl Shell {
         // the cache rows take what the walk leaves.
         // The staged inputs' slab is a run of that span as well, past the
         // workspaces: one address every body names, under no rung's carve.
+        // The step compositions the runtime's builder forms over this load
+        // (CONTRACT-BC 24): what the size-only walk and arming take their
+        // targets from.
+        shell.walk_steps(&rules);
         let walked = if shell.pools.fresh() {
             shell.size_arming()?
         } else {
@@ -1977,6 +1973,11 @@ impl Shell {
             fitted => fitted,
         }
         .map_err(|why| shell.expert_staging.short(why))?;
+        // Arming measures what the bodies take where no record (the home's
+        // or a committed one) held it.
+        if shell.records_bodies() && !shell.bodies_from_record {
+            shell.measured.push("bodies".to_string());
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] claim before arming: {} pages, {} chunks, room {} MiB (fresh {})",
@@ -2392,8 +2393,7 @@ impl Shell {
             return Ok(());
         }
         self.measured
-            .borrow_mut()
-            .push(format!("decode products ({})", measured.len()));
+            .push(format!("product_ns ({} decode product times)", measured.len()));
         let saved = crate::rates::save_product_times(
             profiles,
             self.device.name(),

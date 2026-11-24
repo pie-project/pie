@@ -356,6 +356,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             attachments: vec![attach(0, instance)],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect_err("ports stating a lane past the attachment's are refused");
     assert!(
@@ -515,6 +516,7 @@ fn device_fed_tokens_reach_the_next_fire() {
                 attachments: vec![attach(0, instance)],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
     }

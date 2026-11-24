@@ -203,7 +203,31 @@ pub fn traces(
         all.push((format!("{name} (prompt)"), prefill));
         all.push((format!("{name} (decode)"), decode));
     }
+    all.push(("the built-in `prefill`".to_owned(), builtin_prefill(vocab, page_size, outputs)?));
     Ok(all)
+}
+
+/// The built-in `prefill` program's one pass (`builtins/inferlets/prefill`):
+/// its prompt embedded, every row folded, and its end awaited through the
+/// argmax of the last row's logits. Its channels are made in that program's
+/// order; its prompt's length is data ([`super::program::register`]), so
+/// this is the program a prefill of any length registers.
+fn builtin_prefill(vocab: u32, page_size: u32, outputs: &[OutputDecl]) -> Result<Traced, String> {
+    let toks = Channel::from(vec![0i32; PREWARM.prompt]);
+    let indptr = Channel::from([0u32, PREWARM.prompt as u32]);
+    let done = Channel::new([1], dtype::i32);
+    done.note_host_take();
+    let fold = Channel::from(vec![u32::MAX]);
+    let mut pass = Builder::new(vocab, page_size);
+    pass.outputs(vec![outputs.to_vec()]);
+    pass.bind_port(Port::EmbedTokens, &toks);
+    pass.bind_port(Port::EmbedIndptr, &indptr);
+    pass.bind_port(Port::Fold, &fold);
+    pass.stage(Stage::Epilogue, move || {
+        done.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
+    });
+    pass.build()
+        .map_err(|error| format!("the built-in `prefill`: {error}"))
 }
 
 /// The standard samplers as the served model registers them: traced at its
@@ -213,8 +237,14 @@ pub fn traces(
 /// # Errors
 ///
 /// A sampler that does not trace or register, by name: the load fails
-/// rather than build it after ready.
-pub fn registrations(backend: Option<&str>) -> anyhow::Result<Vec<::engine::ProgramRegistration>> {
+/// rather than build it after ready. `rows` is the most rows one fire binds,
+/// which a request's prompt channel is declared at
+/// ([`super::program::register`]): the prompt pass registered here is then
+/// the one a request of any prompt length registers.
+pub fn registrations(
+    backend: Option<&str>,
+    rows: u32,
+) -> anyhow::Result<Vec<::engine::ProgramRegistration>> {
     let model = crate::model::model();
     let lane = model
         .lane(&[])
@@ -237,7 +267,7 @@ pub fn registrations(backend: Option<&str>) -> anyhow::Result<Vec<::engine::Prog
         .map_err(anyhow::Error::msg)?
         .into_iter()
         .map(|(name, traced)| {
-            let registration = registration(traced, &outputs)
+            let registration = registration(traced, &outputs, rows)
                 .map_err(|error| anyhow::anyhow!("the standard sampler `{name}`: {error}"))?;
             Ok(super::program::with_host_codegen(&registration, backend).into_owned())
         })
@@ -247,8 +277,10 @@ pub fn registrations(backend: Option<&str>) -> anyhow::Result<Vec<::engine::Prog
 fn registration(
     traced: Traced,
     outputs: &[OutputDecl],
+    rows: u32,
 ) -> anyhow::Result<::engine::ProgramRegistration> {
-    let program = super::program::register(traced.encode(), vec![outputs.to_vec()], None)?;
+    let program =
+        super::program::register(traced.encode(), vec![outputs.to_vec()], None, Some(rows))?;
     Ok(::engine::ProgramRegistration {
         program_hash: program.hash,
         launch: program.launch().clone(),
@@ -332,6 +364,7 @@ mod tests {
                     submit: None,
                 },
                 None,
+                None,
             )
             .expect("registers");
         if backend == "wgsl" {
@@ -358,6 +391,42 @@ mod tests {
             .collect()
     }
 
+    /// A standard prompt pass and the built-in `prefill` register, at the
+    /// row bound, the one program the prewarm registered, whatever the
+    /// prompt's length: the length is data, not the program's identity.
+    #[test]
+    fn a_prompt_of_any_length_is_the_prewarmed_program() {
+        const ROWS: u32 = 1024;
+        let mut registry =
+            super::super::program::Registry::new(std::num::NonZeroUsize::new(64).unwrap());
+        let mut hash = |traced: &Traced| {
+            registry
+                .register(
+                    traced.encode(),
+                    vec![outputs()],
+                    EngineCaps::default(),
+                    eta_ir::validate::Budget {
+                        room_bytes: u64::MAX,
+                        submit: None,
+                    },
+                    None,
+                    Some(ROWS),
+                )
+                .expect("registers")
+                .hash
+        };
+        let prewarmed = traces(VOCAB, 16, &outputs(), 8).expect("traces");
+        let (_, shape) = &sampler::standard()[0];
+        for prompt in [1, 37, 300, 1500] {
+            let request = Request { prompt, ..PREWARM };
+            let [asked, _] = passes(VOCAB, 16, &outputs(), 8, shape, &request).expect("traces");
+            assert_eq!(hash(&asked), hash(&prewarmed[0].1), "a {prompt}-token prompt");
+        }
+        let builtin = &prewarmed.last().expect("the built-in `prefill`").1;
+        assert_eq!(hash(builtin), hash(builtin));
+        assert_eq!(registry.counts().0, 2, "one program each: the prompt pass and `prefill`");
+    }
+
     /// Every standard shape's prompt and decode programs, traced through
     /// the SDK's own stage bodies (`eta_dsl::sampler`, which the built-in
     /// inferlets run), register the regions the prewarm built, whatever a
@@ -368,7 +437,7 @@ mod tests {
     fn a_standard_request_registers_the_regions_the_prewarm_built() {
         let prewarmed = traces(VOCAB, 16, &outputs(), 8).expect("traces");
         let standard = sampler::standard();
-        assert_eq!(prewarmed.len(), 2 * standard.len());
+        assert_eq!(prewarmed.len(), 2 * standard.len() + 1, "and the built-in `prefill`");
         let requests = [
             Request {
                 temperature: 0.7,

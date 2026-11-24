@@ -165,6 +165,7 @@ fn fire(
             attachments,
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");
@@ -1035,6 +1036,7 @@ impl ScoresRig {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         self.engine

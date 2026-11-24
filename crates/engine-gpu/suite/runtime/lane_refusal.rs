@@ -33,6 +33,7 @@ fn step_of(trace: &poem::Trace, tokens: &[(u32, bool)]) -> Step {
         attachments: Vec::new(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     }
 }
 

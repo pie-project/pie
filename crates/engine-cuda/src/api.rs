@@ -234,6 +234,11 @@ impl Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
         self.validate_captures(frame)?;
         if let Some((replay, shell)) = self.replay.zip(self.shell.as_ref())
             && frame.steps.iter().any(|step| {
@@ -613,7 +618,7 @@ impl Engine for Cuda {
     fn measured_at_load(&self) -> Vec<String> {
         self.shell
             .as_ref()
-            .map(crate::serve::Shell::measured_at_load)
+            .map(|shell| shell.measured_at_load().to_vec())
             .unwrap_or_default()
     }
 
@@ -771,6 +776,7 @@ impl Engine for Cuda {
                 .comm
                 .as_ref()
                 .map_or(core::ptr::null(), Arc::as_ptr),
+            steps: steps.clone(),
         })
         .map_err(fault)?;
         if let Some(hook) = self.before_arming.as_mut() {
@@ -927,21 +933,26 @@ impl Engine for Cuda {
             ),
             steps: engine::StatedSteps::default(),
         };
-        // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are, after
-        // the arm walk, which does not take its targets from them yet; the
-        // shapes it leaves unwalked are stated by name.
+        // The set as the load states it, from its stated facts (the rungs
+        // its activation lends under, known once arming backed the span),
+        // with those the arm walk left eager (CONTRACT-BC 24).
         let mut caps = caps;
-        caps.steps = engine::StatedSteps::of(
+        caps.steps = shell.stated_steps(engine::StepShapes::of(
             &steps,
             &engine::StepFacts::stated(&caps, &readout_facts()),
-        );
-        let gaps = shell.walk_gaps(&caps.steps.shapes);
+        ));
         eprintln!(
-            "engine-cuda: step set: {}; the arm walk leaves {} of them unwalked{}",
+            "engine-cuda: step set: {}; {} stated eager{}",
             caps.steps.shapes.census(),
-            gaps.len(),
-            if gaps.is_empty() { String::new() } else { format!(": {}", gaps.join("; ")) },
+            caps.steps.eager.len(),
+            if caps.steps.shapes == *shell.steps() {
+                String::new()
+            } else {
+                format!(
+                    " (the walk took the set over the arena's rungs, {})",
+                    shell.steps().census()
+                )
+            },
         );
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
@@ -1663,6 +1674,11 @@ impl Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
         self.validate_captures(frame)?;
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);

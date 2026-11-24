@@ -111,6 +111,7 @@ fn step_of(trace: &Trace, tokens: &[(u32, bool)]) -> Step {
         attachments: Vec::new(),
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     }
 }
 

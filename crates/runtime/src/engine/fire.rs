@@ -160,6 +160,11 @@ pub struct StepFire {
     pub fire_stamps: Vec<(u64, std::time::Instant)>,
     /// Each lane's kv set, in lane order, where known.
     pub lane_sets: Vec<Option<crate::store::kv::page_table::WorkingSetId>>,
+    /// The load's stated step set the step's shape (`submission.shape`) is
+    /// an index into: a step its refused members are stripped from states
+    /// its shape again in it (`scheduler::lane`). `None` where the limits
+    /// state no set (a test building them by hand).
+    pub shapes: Option<&'static ::engine::StepShapes>,
 }
 
 #[derive(Default)]

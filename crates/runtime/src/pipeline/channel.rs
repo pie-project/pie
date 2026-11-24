@@ -21,6 +21,10 @@ pub struct ChannelCell {
     pub capacity: u32,
     pub role: Option<HostRole>,
     pub seeded: bool,
+    /// Bound to a program as a row-extent channel: its engine cells are as
+    /// wide as the program's row bound, and a host write lands its own rows
+    /// there cut or padded with `ROW_PAD` bytes to it.
+    pub row_extent: bool,
     taken_seed: Option<Vec<u8>>,
     endpoint: Option<Arc<ChannelEndpoint>>,
     declared_dtype: Option<ChanDType>,
@@ -101,6 +105,7 @@ impl ChannelCell {
             capacity,
             role: None,
             seeded: false,
+            row_extent: false,
             taken_seed: None,
             endpoint: None,
             declared_dtype: None,
@@ -478,7 +483,7 @@ impl ChannelCell {
         } else {
             native.len()
         };
-        if wire_len != cell_bytes {
+        if wire_len != cell_bytes && !self.row_extent {
             return Err(ChannelError::BadLength {
                 expected: cell_bytes,
                 got: wire_len,
@@ -496,7 +501,11 @@ impl ChannelCell {
         if self.dtype == Dtype::Bool {
             pack_bool_into(native, cell);
         } else {
-            cell.copy_from_slice(native);
+            // A row-extent cell is the program's row bound wide: the
+            // instance's rows, cut or padded to it (the host keeps them all).
+            let (rows, pad) = cell.split_at_mut(wire_len.min(cell_bytes));
+            rows.copy_from_slice(&native[..rows.len()]);
+            pad.fill(crate::pipeline::program::ROW_PAD);
         }
         let tail = load_word(binding.word_base, binding.tail_word_index as usize);
         store_word(binding.word_base, binding.tail_word_index as usize, tail);
@@ -535,7 +544,7 @@ impl ChannelCell {
         } else {
             native.len()
         };
-        if wire_len != cell_bytes {
+        if wire_len != cell_bytes && !self.row_extent {
             return Err(ChannelError::BadLength {
                 expected: cell_bytes,
                 got: wire_len,
@@ -552,7 +561,11 @@ impl ChannelCell {
         if self.dtype == Dtype::Bool {
             pack_bool_into(native, cell);
         } else {
-            cell.copy_from_slice(native);
+            // A row-extent cell is the program's row bound wide: the
+            // instance's rows, cut or padded to it (the host keeps them all).
+            let (rows, pad) = cell.split_at_mut(wire_len.min(cell_bytes));
+            rows.copy_from_slice(&native[..rows.len()]);
+            pad.fill(crate::pipeline::program::ROW_PAD);
         }
         self.writer_tail += 1;
         store_word(

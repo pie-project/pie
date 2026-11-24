@@ -533,20 +533,11 @@ pub fn conv1d_fold(
         .and_then(|k| k.checked_mul(dilation))
         .and_then(|cells| cells.checked_add(1))
         .unwrap_or(u32::MAX);
-    if span > CONV_K_MAX {
-        return Err(refuse(
-            OP,
-            format!(
-                "a {conv_width}-tap conv dilated {dilation} keeps {span} cells, past the \
-                 {CONV_K_MAX} a fold holds"
-            ),
-        ));
-    }
     let channels = nonzero(OP, "the conv's channel count", channels)?;
     let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(CONV1D, "::pie::ssm::conv1d_fold<::pie::bf16>"))
+        Fire::at(fold_kernel())
             .apply(Launch::grid([channels.div_ceil(BLOCK), 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
@@ -557,4 +548,9 @@ pub fn conv1d_fold(
             stated(OP, groups)?.arg(),
         ],
     )
+}
+
+/// The conv window's group fold kernel ([`conv1d_fold`]).
+pub(super) fn fold_kernel() -> &'static crate::jit::Kernel {
+    kernel(CONV1D, "::pie::ssm::conv1d_fold<::pie::bf16>")
 }

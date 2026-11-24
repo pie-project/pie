@@ -238,6 +238,7 @@ impl Rig {
                 lanes,
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires")
     }
@@ -598,6 +599,7 @@ fn answers_the_host_path(frames: u8) {
             lanes: vec![device_lanes().remove(0), neighbour],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     rig.engine.settle_frame(&mut ticket).expect("the frame settles");

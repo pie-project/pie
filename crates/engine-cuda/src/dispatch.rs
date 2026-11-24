@@ -19,4 +19,4 @@ mod linear;
 mod probe;
 mod region;
 mod sampling;
-mod ssm;
+pub(crate) mod ssm;

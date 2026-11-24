@@ -210,6 +210,7 @@ fn folded_roots_and_puts_lay_once_in_their_pass() {
                 }],
                 media: Vec::new(),
                 voxels: Vec::new(),
+                shape: None,
             }))
             .expect("the frame fires");
         engine

@@ -315,6 +315,7 @@ fn bf16_values_are_stored_a_word_at_a_time() {
             }],
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");
