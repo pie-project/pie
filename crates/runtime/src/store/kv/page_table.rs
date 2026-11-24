@@ -1934,6 +1934,11 @@ impl KvPageTable {
         self.holds(root, |backing| matches!(backing, KvPageBacking::Swapped(_)))
     }
 
+    /// Whether any page on `root`'s path is held on disk.
+    pub fn holds_on_disk(&self, root: NodeId) -> bool {
+        self.holds(root, |backing| matches!(backing, KvPageBacking::OnDisk(_)))
+    }
+
     fn holds(&self, root: NodeId, backed: impl Fn(&KvPageBacking) -> bool) -> bool {
         self.path_nodes(root).into_iter().any(|node| {
             matches!(

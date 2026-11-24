@@ -1607,16 +1607,10 @@ impl RsStore {
         self.drop_checkpoints(|_, snapshot| droppable.contains(&snapshot))
     }
 
-    /// The rs half of idle reclaim, in the kv half's order.
-    #[cfg(test)]
-    pub fn reclaim_cache(&mut self, keys: impl crate::policy::retention::Keys) -> usize {
-        self.reclaim_droppable(keys)
-    }
-
     /// Drops the idle checkpoints of one group, lowest retention key first,
     /// then least recently used: a checkpoint has no lower tier to move to,
     /// and cached state yields to running work whatever its key.
-    pub fn reclaim_droppable(&mut self, keys: impl crate::policy::retention::Keys) -> usize {
+    pub fn reclaim_cache(&mut self, keys: impl crate::policy::retention::Keys) -> usize {
         if self.checkpoints.is_empty() {
             return 0;
         }

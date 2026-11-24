@@ -628,10 +628,9 @@ pub trait PoolPort: Send + Sync + 'static {
     fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
-    /// The host and disk slots only idle cache its retention keys let go
-    /// holds, `(host, disk)`: below the device what the next demand may take
-    /// by dropping them (cache keyed above the floor is no such room), so the
-    /// pressure report counts them as room, as [`Self::reclaimable_idle`]
+    /// The host and disk slots only idle cache holds, `(host, disk)`: below
+    /// the device what the next demand may take by dropping them (keys only
+    /// order what goes), so the pressure report counts them as room, as [`Self::reclaimable_idle`]
     /// is on the device. Every port states it; a pool with no tier below
     /// the device states `(0, 0)`.
     fn idle_below_device(&self) -> (u32, u32);
@@ -1947,7 +1946,7 @@ impl PoolPort for RegistryPool {
         let (pages, returning) = if short.kv_pages > 0 {
             self.with_kv_tagged("planner-reclaim-idle", |kv| {
                 let epoch = kv.current_epoch();
-                let pages = kv.reclaim_droppable(
+                let pages = kv.reclaim_cache(
                     epoch,
                     short.kv_pages as usize,
                     crate::policy::retention::Installed,
@@ -1961,7 +1960,7 @@ impl PoolPort for RegistryPool {
         // left short, its checkpoints may give.
         let covered = pages.max(returning);
         let slots = if short.rs || (self.shared.is_some() && covered < short.kv_pages as usize) {
-            self.with_rs(|rs| rs.reclaim_droppable(crate::policy::retention::Installed))
+            self.with_rs(|rs| rs.reclaim_cache(crate::policy::retention::Installed))
         } else {
             0
         };

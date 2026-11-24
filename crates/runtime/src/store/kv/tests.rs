@@ -1201,7 +1201,9 @@ fn what_a_decode_folds_seals() {
     assert_eq!(store.sealed_in(ws, 0..3).unwrap(), [0]);
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    let reader = store.create_working_set();
+    // A reader of the set's scope: only a shared set's release seals, and
+    // only a reader sharing it hashes to the keys it left.
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(
         store.cached_run(&keys).len(),
@@ -1607,7 +1609,7 @@ fn the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves() {
         store.prepare_demote(16, keys).unwrap().is_none(),
         "B, the lowest, finds no room: nothing above it moves"
     );
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keys), 4, "B goes");
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keys), 4, "B goes");
     assert_eq!(on_device(&mut store, &b_tokens), 0);
     assert_eq!(on_device(&mut store, &a_tokens), 4, "A stays");
 }
@@ -1662,7 +1664,7 @@ fn idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted() {
     }
     assert_eq!(store.host_swap_available(), 8, "the host is untouched");
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), 1, Rows(100, DEVICE)),
+        store.reclaim_cache(store.current_epoch(), 1, Rows(100, DEVICE)),
         3,
         "it is dropped, however high its key"
     );
@@ -2127,12 +2129,12 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
     assert_eq!(on_device(&mut store, &unkept_tokens), 3);
     // The policy keys one higher: a demand reclaims the lower first.
     let keep = move |owner: Option<ProcessId>| i64::from(owner == Some(kept));
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keep), 3);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keep), 3);
     assert_eq!(on_device(&mut store, &unkept_tokens), 0, "the lower key goes first");
     assert_eq!(on_device(&mut store, &kept_tokens), 3, "the higher stays");
     // No lower tier to move to: cached KV yields to the next demand,
     // whatever its key.
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keep), 3);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keep), 3);
     assert_eq!(on_device(&mut store, &kept_tokens), 0);
 }
 
@@ -2149,7 +2151,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     let busy = store.begin_fire();
     let other = store.begin_fire();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), 1, |_| 0),
+        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
         3,
         "dropped"
     );
@@ -2168,7 +2170,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     store.release_working_set(ws, read);
     store.retire_idle();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), 1, |_| 0),
+        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
         3,
         "dropped"
     );
@@ -2357,24 +2359,48 @@ fn a_reclaim_frees_what_is_short_and_keeps_its_order_until_it_moves() {
     assert!(store.order.is_none());
 }
 
+/// A table of one key and one tiers row per owner.
+struct ByOwner<F>(F);
+
+impl<F: Fn(Option<ProcessId>) -> (i64, u8)> Keys for ByOwner<F> {
+    fn key_at(&self, owner: Option<ProcessId>, _at: u64) -> i64 {
+        (self.0)(owner).0
+    }
+
+    fn tiers_at(&self, owner: Option<ProcessId>, _at: u64) -> u8 {
+        (self.0)(owner).1
+    }
+}
+
 #[test]
-/// A suspend short of host room drops idle cache below the device lowest
-/// key first, then least recently used, only until its room is covered;
-/// cache a key keeps above the floor stays, and the suspend is refused for
-/// want of room rather than have it dropped.
-fn a_suspend_drops_cache_off_the_device_until_covered_and_never_what_a_key_keeps() {
+/// A suspend short of host room takes it from idle cache on the host as
+/// its tiers rows say, never by a key: a set whose row names the disk goes
+/// on down to it (the spill a suspend makes first) and stays cached; one
+/// whose row names no tier below the host is dropped, lowest key first,
+/// then least recently used, only until the room is covered. Cache held on
+/// disk alone frees no host room and is never dropped for it.
+fn a_suspend_moves_host_cache_its_row_lets_on_disk_and_drops_the_rest_until_covered() {
+    use crate::policy::retention::{ALL_TIERS, DEVICE, HOST};
     let mut store = KvStore::new_with_swap(8, 4, 0, h(61));
-    let (kept, old, new) = (
+    // A shared pool's list: host cache may go on down to disk.
+    store.set_tiers(::engine::chunk::ShapeId(0), None, 2);
+    let (disk, high, low) = (
         ProcessId::from_u128(1),
         ProcessId::from_u128(2),
         ProcessId::from_u128(3),
     );
-    let keys = move |owner: Option<ProcessId>| if owner == Some(kept) { 5 } else { 0 };
-    for (seed, owner) in [(80, kept), (81, old), (82, new)] {
+    let keys = || {
+        ByOwner(move |owner: Option<ProcessId>| match owner {
+            Some(o) if o == disk => (0, ALL_TIERS),
+            Some(o) if o == high => (5, DEVICE | HOST),
+            _ => (0, DEVICE | HOST),
+        })
+    };
+    for (seed, owner) in [(80, disk), (81, high), (82, low)] {
         let ws = store.create_working_set();
         sealed(&mut store, ws, &prompt(seed, 1));
         store.keep_checkpoint(ws, 1, Some(owner));
-        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), keys).unwrap() else {
+        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), keys()).unwrap() else {
             panic!("a page to move");
         };
         assert_eq!(store.commit_suspend(txn).unwrap(), 1);
@@ -2383,40 +2409,52 @@ fn a_suspend_drops_cache_off_the_device_until_covered_and_never_what_a_key_keeps
     }
     assert_eq!(store.host_swap_available(), 1);
 
-    // Two pages to park, one slot free: one entry goes, the older at the
-    // lower key, and nothing past it.
+    // Two pages to park, one slot free: the set whose row names the disk
+    // moves there, the oldest at the lowest key, and nothing is dropped.
     let v = store.create_working_set();
     commit_fresh(&mut store, v, 2, 1);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([v]), keys).unwrap() else {
+    let txn = store
+        .prepare_suspend_spill(&HashSet::from([v]), keys())
+        .expect("host cache its row lets on disk goes there");
+    assert_eq!(store.commit_spill(txn), 1);
+    let Some(txn) = store.prepare_suspend(&HashSet::from([v]), keys()).unwrap() else {
         panic!("its pages to move");
     };
     assert_eq!(store.commit_suspend(txn).unwrap(), 2);
-    assert!(!store.owns_cache(old), "the oldest the keys let go");
-    assert!(store.owns_cache(new), "the room was covered");
-    assert!(store.owns_cache(kept));
-    assert_eq!(store.droppable_below_device(keys), (1, 0), "the kept page is no room");
+    assert!(store.owns_cache(disk), "moved down, not dropped");
+    assert!(store.owns_cache(high) && store.owns_cache(low), "the room was covered");
+    assert_eq!(store.host_swap_available(), 0);
 
-    // Two more, none free: the last droppable entry goes, and the kept one
-    // stays with the room it holds.
+    // One more, none free on the host and nothing more its rows let on
+    // disk: the lower key goes though it is newer, and nothing past it; the
+    // set on disk holds no host slot and stays.
     let w = store.create_working_set();
-    commit_fresh(&mut store, w, 2, 1);
-    match store.prepare_suspend(&HashSet::from([w]), keys) {
-        Err(super::KvStoreError::HostSwapFull {
-            requested: 2,
-            available: 1,
-        }) => {}
-        other => panic!("refused for want of room: {other:?}"),
-    }
-    assert!(!store.owns_cache(new));
-    assert!(store.owns_cache(kept), "a key above the floor keeps it");
-    assert_eq!(store.droppable_below_device(keys), (0, 0));
+    commit_fresh(&mut store, w, 1, 1);
+    assert!(store.prepare_suspend_spill(&HashSet::from([w]), keys()).is_none());
+    let Some(txn) = store.prepare_suspend(&HashSet::from([w]), keys()).unwrap() else {
+        panic!("its page to move");
+    };
+    assert_eq!(store.commit_suspend(txn).unwrap(), 1);
+    assert!(!store.owns_cache(low), "the lowest key its row keeps off the disk");
+    assert!(store.owns_cache(high), "the room was covered");
+    assert!(store.owns_cache(disk), "on disk, it was no host room");
+
+    // And a key keeps nothing: the next suspend drops the higher one too.
+    let x = store.create_working_set();
+    commit_fresh(&mut store, x, 1, 1);
+    let Some(txn) = store.prepare_suspend(&HashSet::from([x]), keys()).unwrap() else {
+        panic!("its page to move");
+    };
+    assert_eq!(store.commit_suspend(txn).unwrap(), 1);
+    assert!(!store.owns_cache(high), "a key above the default orders, never keeps");
+    assert!(store.owns_cache(disk));
 }
 
 #[test]
-/// A suspend gives up the disk tier's copies only where their keys let
-/// them go: a copy kept above the floor is no room, and the suspend is
-/// refused for want of it rather than take it.
-fn a_suspend_takes_no_disk_copy_a_key_keeps() {
+/// A suspend short of swap gives up the disk tier's copies, lowest key
+/// first, and no more than it wants: the disk is the last tier, so no row
+/// names one below it, and a copy's key orders what goes but keeps none.
+fn a_suspend_gives_up_disk_copies_lowest_key_first_and_no_more_than_it_wants() {
     use super::hash::{chain_slots, page_hash};
     let seed = h(62);
     let run_of = |first: u32| {
@@ -2446,21 +2484,22 @@ fn a_suspend_takes_no_disk_copy_a_key_keeps() {
         assert_eq!(store.commit_persist(txn), 2);
     }
     assert_eq!(store.disk_pool.available(), 0);
-    assert_eq!(store.disk_swap_available(floor), 2, "the kept copies are no room");
+    assert_eq!(store.disk_swap_available(floor), 4, "every copy is room");
 
     let ws = store.create_working_set();
     commit_fresh(&mut store, ws, 3, 1);
-    match store.prepare_suspend(&HashSet::from([ws]), floor) {
-        Err(super::KvStoreError::HostSwapFull {
-            requested: 3,
-            available: 2,
-        }) => {}
-        other => panic!("refused for want of room: {other:?}"),
-    }
+    let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), floor).unwrap() else {
+        panic!("its pages to move");
+    };
+    assert_eq!(store.commit_suspend(txn).unwrap(), 3);
     let kept: HashSet<Hash256> = store.persisted_keys().into_iter().collect();
-    assert!(high.1.iter().all(|key| kept.contains(key)), "the kept copies stay");
-    assert!(low.1.iter().all(|key| !kept.contains(key)), "the floor's went");
-    assert_eq!(store.make_swap_room(4, &floor), 2, "and nothing more yields");
+    assert!(low.1.iter().all(|key| !kept.contains(key)), "the lower key's went first");
+    assert_eq!(
+        high.1.iter().filter(|key| kept.contains(*key)).count(),
+        1,
+        "and one of the higher's, no more"
+    );
+    assert_eq!(store.disk_swap_available(floor), 1, "the last copy is still room");
 }
 
 #[test]
