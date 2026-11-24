@@ -1279,6 +1279,7 @@ impl FireCtx<'_> {
                 continue;
             }
             let reads = self.programs.reads(attached.instance)?;
+            self.programs.seat_lanes(attached.instance, attached.lanes)?;
             for k in 0..attached.lanes {
                 let at = attached.lane as usize + k as usize;
                 for (index, out) in self.exports.outputs.iter().enumerate() {

@@ -576,6 +576,15 @@ impl Session {
         Ok(())
     }
 
+    /// The instance's fire seats `lanes` lanes: a seat bound at a lane past
+    /// them was a wider fire's, its rows another instance's by now, and
+    /// would still count as bound (`outputs_bound`) and as a row of a row
+    /// set (`take_lane`). Seats are kept across fires otherwise: a fire
+    /// binds only the outputs it writes.
+    pub fn seat_lanes(&mut self, lanes: u32) {
+        self.outputs.retain(|((_, at), _)| *at < lanes);
+    }
+
     /// The instance's score rows moved from `from` to `to` (`bytes` of them,
     /// its own slots rebound): every seat bound inside them moves with
     /// them. A seat is bound only by a fire that writes the output, and
