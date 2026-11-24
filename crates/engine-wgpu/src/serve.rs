@@ -538,7 +538,14 @@ impl Serve for Api {
     }
 }
 
-/// Takes every step the mailbox holds.
+/// Takes every step the mailbox holds, each out of the steps in flight
+/// wherever it stands among them. Steps land out of their order: each
+/// landing is its own chain of buffer maps (the seat, then the fed rows),
+/// and wgpu orders no map's callback against another's, so a narrow step
+/// fired behind a wide one may land first. Taken from the mailbox and left
+/// in flight, that step was waited on by the next harvest with nothing left
+/// to post it (eight lanes of one program, a frame of seven lanes landing
+/// behind the one-lane frame fired after it).
 fn collect(shell: &mut Shell<Api>) {
     let landed = std::mem::take(
         &mut shell
@@ -549,11 +556,11 @@ fn collect(shell: &mut Shell<Api>) {
             .landed,
     );
     for step in landed {
-        if shell
+        if let Some(at) = shell
             .inflight
-            .front()
-            .is_some_and(|flight| flight.seq == step.seq)
-            && let Some(flight) = shell.inflight.pop_front()
+            .iter()
+            .position(|flight| flight.seq == step.seq)
+            && let Some(flight) = shell.inflight.remove(at)
         {
             // Under a stated submit bound, the step's device time, read
             // without waiting once its backend filled it (`Shell::track`).

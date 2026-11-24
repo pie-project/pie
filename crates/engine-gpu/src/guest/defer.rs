@@ -686,11 +686,7 @@ where
     }
     let Some(frame) = frame else {
         if let Some(done) = done {
-            let mut outcome = done.settled();
-            for (lanes, instance, why) in &faults {
-                outcome.fault_lanes(lanes.clone(), Some(*instance), why);
-            }
-            (done.sink)(done.at, outcome);
+            tell_settled(done, faults);
         }
         return Ok(());
     };
@@ -717,16 +713,15 @@ where
                     faults.push((lanes, instance, why));
                 }
             }
-            if let Some(done) = done.as_ref() {
+            if let Some(done) = done {
                 if lost.is_some() {
                     done.tell(lost, "guest pass");
                     return;
                 }
-                let mut outcome = done.settled();
-                for (lanes, instance, why) in &faults {
-                    outcome.fault_lanes(lanes.clone(), Some(*instance), why);
-                }
-                (done.sink)(done.at, outcome);
+                // This runs where the frame's readback landed (the thread
+                // that polls the device): the forward's fed ids, read by its
+                // own landing on that thread, are joined, never waited on.
+                tell_settled(done, faults);
             }
         };
         if refused_now {
@@ -754,6 +749,17 @@ where
         depart(instance, pending.clone());
     }
     Ok(())
+}
+
+/// Tells `done`'s sink the step once its forward's fed ids are checked, the
+/// lanes `faults` names faulted beside what the forward says.
+fn tell_settled(done: crate::settle::Done, faults: Vec<HostFault>) {
+    done.when_settled(move |done, mut outcome| {
+        for (lanes, instance, why) in &faults {
+            outcome.fault_lanes(lanes.clone(), Some(*instance), why);
+        }
+        (done.sink)(done.at, outcome);
+    });
 }
 
 /// What a deferred step's outcome says of one pass's run on the host: the

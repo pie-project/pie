@@ -276,6 +276,18 @@ pub(super) fn loaded_boot(
     lanes: u32,
     boot: crate::backend::DeviceBoot,
 ) -> Option<Loaded> {
+    loaded_flight(tag, model, lanes, boot, 1)
+}
+
+/// [`loaded_boot`] with `frames` frames in flight (a served load's two: the
+/// next fired before the last lands).
+pub(super) fn loaded_flight(
+    tag: &str,
+    model: &impl ForwardHybrid,
+    lanes: u32,
+    boot: crate::backend::DeviceBoot,
+    frames: u8,
+) -> Option<Loaded> {
     let tokens = (lanes * ROWS).next_power_of_two().max(16);
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
@@ -319,7 +331,7 @@ pub(super) fn loaded_boot(
                 ..Residency::default()
             },
             ordinal: 0,
-            frames_in_flight: 1,
+            frames_in_flight: frames,
             steps: Default::default(),
         })
         .expect("the miniature loads");
