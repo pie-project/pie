@@ -1309,6 +1309,19 @@ impl<'a> Walk<'a> {
                 "workgroups_per_core" => &mut rates.workgroups_per_core,
                 crate::fire::SUBMIT_WORST_RATIO => &mut rates.submit_worst_ratio,
                 crate::fire::RESIDENT_WORKGROUPS => &mut rates.resident_workgroups,
+                crate::fire::LOAD_WIDTH => {
+                    match int(v.get_ref()).and_then(|i| u32::try_from(i).ok()).filter(|w| *w > 0) {
+                        Some(width) => rates.load_width = Some(width),
+                        None => self.err(
+                            v.span().start,
+                            format!(
+                                "`rates.load_width` is a whole number of loads, at least one, not {}",
+                                found(v.get_ref())
+                            ),
+                        ),
+                    }
+                    continue;
+                }
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
                         Some(ns) => rates.launch_ns = Some(ns),
@@ -1341,7 +1354,7 @@ impl<'a> Walk<'a> {
                              `attn_tflops_by_keys`, `hbm_gbps`, `cached_gbps`, `elementwise_gbps`, \
                              `scan_gelems`, `few_row_tflops`, `workgroups_per_core`, \
                              `product_ns`, `submit_worst_ratio`, `attn_tflops_by_rows_keys`, \
-                             `resident_workgroups`, `kernel_tflops_by_shape_keyed`, \
+                             `resident_workgroups`, `load_width`, `kernel_tflops_by_shape_keyed`, \
                              `dense_settled_keyed`, `measured_on` and `measured_by`, not `{other}`"
                         ),
                     );

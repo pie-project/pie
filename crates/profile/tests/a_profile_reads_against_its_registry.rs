@@ -956,6 +956,7 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
             few_row_tflops: None,
             workgroups_per_core: None,
             submit_worst_ratio: None,
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,

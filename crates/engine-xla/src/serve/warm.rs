@@ -546,6 +546,7 @@ impl Shell {
         let floor = 2 * queue.iter().map(|q| q.1.need()).max().unwrap_or(0);
         let scope = self.trace_scope.clone();
         let stop = std::sync::Arc::clone(&self.behind.stop);
+        let width = self.load_width.clone();
         let started = std::time::Instant::now();
         let spawned = std::thread::Builder::new()
             .name("xla-load-behind".into())
@@ -610,22 +611,54 @@ impl Shell {
                 // past it (v6e Qwen3.5: 44 at once put a first request at
                 // 13.9-33.3 s, 2-4 at 9.95 s).
                 let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-                let (mut width, mut last) = (1usize, 0f64);
-                let knee = 'grow: loop {
-                    let mut fastest = 0f64;
-                    for _ in 0..LOAD_SAMPLES {
-                        match batch(width) {
-                            Some(rate) => fastest = fastest.max(rate),
-                            None => break 'grow width,
+                let knee = match (width.stated, width.measure) {
+                    (Some(stated), _) => {
+                        tracing::info!(width = stated, "xla loading behind serving: the width the device's profile states");
+                        usize::try_from(stated).unwrap_or(1).max(1)
+                    }
+                    (None, false) => {
+                        tracing::info!(
+                            width = 1,
+                            "xla loading behind serving: skipped measuring its width (`[engine] measure = false`) and no layer states `[rates] load_width` under a matching key; served by the estimate, one load at a time, which delays a fire's own load by one at most"
+                        );
+                        1
+                    }
+                    (None, true) => {
+                        let (mut at, mut last) = (1usize, 0f64);
+                        // the knee, or `None` where the queue ran out first
+                        let found = 'grow: loop {
+                            let mut fastest = 0f64;
+                            for _ in 0..LOAD_SAMPLES {
+                                match batch(at) {
+                                    Some(rate) => fastest = fastest.max(rate),
+                                    None => break 'grow None,
+                                }
+                            }
+                            if fastest <= last {
+                                break 'grow Some(at - 1);
+                            }
+                            if at == cores {
+                                break 'grow Some(at);
+                            }
+                            last = fastest;
+                            at += 1;
+                        };
+                        match found {
+                            Some(knee) => {
+                                tracing::info!(width = knee, cores, "xla loading behind serving: the width the load rate stops rising at");
+                                keep_width(&width, knee);
+                                knee
+                            }
+                            None => {
+                                tracing::info!(
+                                    width = at,
+                                    "xla loading behind serving: the programs ran out before the load rate stopped rising; no width kept"
+                                );
+                                at
+                            }
                         }
                     }
-                    if fastest <= last || width == cores {
-                        break 'grow width.saturating_sub(usize::from(fastest <= last)).max(1);
-                    }
-                    last = fastest;
-                    width += 1;
                 };
-                tracing::info!(width = knee, cores, "xla loading behind serving: the width the load rate stops rising at");
                 while batch(knee).is_some() {}
                 let loaded = loaded.load(SeqCst);
                 tracing::info!(
@@ -1068,3 +1101,40 @@ fn lane_counts(p: u32) -> Vec<u32> {
 /// rate: as many as the rates' curves time a point (engine-gpu
 /// `rates::REPEATS`).
 const LOAD_SAMPLES: usize = 3;
+
+/// The measured loader width `knee`, kept in the user's file `width` names
+/// under its key ([`crate::stored`]), said where it lies; a file that would
+/// not take it is said, and the width serves this load either way.
+fn keep_width(width: &super::LoadWidth, knee: usize) {
+    let Some((path, on)) = &width.keep else {
+        return;
+    };
+    let save = engine::rates::SaveTo {
+        path: path.clone(),
+        provenance: (
+            "rates",
+            format!(
+                "\"a load on {} (pie {}): `load_width`, cached programs loaded from the disk \
+                 cache behind serving, the width grown by one while the fastest of \
+                 {LOAD_SAMPLES} samples of the load rate rose; at {}\"",
+                on.replace('"', "'"),
+                env!("CARGO_PKG_VERSION"),
+                engine::rates::build_commit()
+            ),
+        ),
+        registry: crate::chip::registry(),
+    };
+    let measured = profile::fire::Rates {
+        load_width: u32::try_from(knee).ok(),
+        measured_on: Some(on.clone()),
+        measured_by: Some(vec![(
+            profile::fire::LOAD_WIDTH.to_string(),
+            crate::stored::load_width_by(),
+        )]),
+        ..profile::fire::Rates::default()
+    };
+    match engine::rates::save_rates(&save, &measured) {
+        Ok(saved) => tracing::info!(profile = %saved, width = knee, "xla loader width kept"),
+        Err(why) => tracing::warn!(%why, "xla loader width not kept: measured again next load"),
+    }
+}

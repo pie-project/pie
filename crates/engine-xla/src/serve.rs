@@ -288,6 +288,18 @@ pub(crate) struct Deferred {
     order: (u8, u32, u32),
 }
 
+/// The width a load's cached programs load behind serving at
+/// (`Shell::load_behind`): `stated` by the device's profile under a key
+/// matching this plugin on this device, else measured where the load
+/// measures (`[engine] measure`) and kept in the user's file `keep` names
+/// (its path and the device as the key states it).
+#[derive(Clone, Debug)]
+pub(crate) struct LoadWidth {
+    pub(crate) stated: Option<u32>,
+    pub(crate) measure: bool,
+    pub(crate) keep: Option<(std::path::PathBuf, String)>,
+}
+
 /// The cached programs loading behind serving (`Shell::load_behind`): the
 /// loader's thread, stopped and joined before the shell's other fields drop.
 #[derive(Default)]
@@ -399,6 +411,8 @@ pub struct Shell {
     /// program which of them its trailing outputs hold.
     probes: Vec<ValueId>,
     probed: std::collections::HashMap<[u8; 32], Vec<ValueId>>,
+    /// The width cached programs load behind serving at (`load_behind`).
+    load_width: LoadWidth,
     /// The scope this load's traced fires' records lie in (`trace_scope`),
     /// set as the warm ladder starts; `None`: none kept or read.
     trace_scope: Option<String>,
@@ -626,8 +640,24 @@ impl Shell {
             crate::store::Staging::default()
         };
         let pass_ms = pass.elapsed().as_secs_f64() * 1e3;
-        let (chip, chip_report) =
-            crate::chip::resolve(device.kind(), boot.device.profiles.as_deref());
+        let (chip, chip_report) = crate::chip::resolve_keyed(
+            device.kind(),
+            device.platform(),
+            boot.device.profiles.as_deref(),
+        );
+        // The width cached programs load behind serving at: stated (the
+        // user's measured file, or the device's committed one, its key
+        // matching), else measured as they load and kept in the user's file.
+        let load_width = LoadWidth {
+            stated: chip.rates().load_width,
+            measure: boot.device.measure,
+            keep: boot.device.profiles.as_deref().map(|profiles| {
+                (
+                    crate::chip::SHELF.user_path(profiles, device.kind()),
+                    crate::stored::measured_on(device.kind(), device.platform()),
+                )
+            }),
+        };
         if !device.kind().is_empty() {
             crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
         }
@@ -1264,6 +1294,7 @@ impl Shell {
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
             trace_scope: None,
+            load_width,
             record_checked: false,
             records_hold: true,
             records_used: 0,
