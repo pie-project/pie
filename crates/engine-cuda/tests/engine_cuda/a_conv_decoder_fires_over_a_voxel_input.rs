@@ -410,6 +410,7 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the decoder loads");
     shell.open(0).expect("slot 0 opens");
@@ -687,6 +688,7 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the causal text loads");
     shell.open(0).expect("slot 0 opens");

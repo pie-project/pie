@@ -81,6 +81,7 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");

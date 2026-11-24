@@ -203,6 +203,7 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
 }
 

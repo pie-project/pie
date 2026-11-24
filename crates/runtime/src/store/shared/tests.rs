@@ -774,7 +774,10 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
     let out = window_fire(&mut rs, trimmed, 0..72, None);
     settle(&mut rs, out.txn);
     rs.retire_idle();
-    assert!(!rs.checkpoint_at(trimmed, [1; 32], None, 64).unwrap());
+    assert_eq!(
+        rs.checkpoint_at(trimmed, [1; 32], None, 64),
+        Err(crate::store::rs::RsError::CheckpointRetired { at: 64 })
+    );
     assert!(!rs.has_checkpoint(&[1; 32]));
     rs.release_working_set(trimmed);
     rs.retire_idle();
@@ -789,9 +792,14 @@ fn a_window_checkpoint_behind_the_fire_end_holds_what_its_windows_reach() {
     rs.retire_idle();
     assert_eq!(window_live(&shared), (4, 5), "narrow 5..9, wide 0..5");
     assert!(rs.checkpoint_at(ws, [2; 32], None, 64).unwrap());
-    assert!(!rs.checkpoint_at(ws, [3; 32], None, 80).unwrap(), "ahead");
-    assert!(
-        !rs.checkpoint_at(ws, [3; 32], None, 60).unwrap(),
+    assert_eq!(
+        rs.checkpoint_at(ws, [3; 32], None, 80),
+        Err(crate::store::rs::RsError::CheckpointAhead { at: 80, committed: 72 }),
+        "ahead"
+    );
+    assert_eq!(
+        rs.checkpoint_at(ws, [3; 32], None, 60),
+        Err(crate::store::rs::RsError::CheckpointRetired { at: 60 }),
         "60 reaches narrow 4, which went with the trim at 64"
     );
     // The set goes on; its next fire trims what it no longer reaches.

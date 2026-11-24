@@ -389,26 +389,65 @@ pub fn covers_name(device: &str) -> String {
 /// `None` where it holds none.
 #[must_use]
 pub fn covers_of(cache: &Path, on: &str) -> Option<String> {
+    covers_over(cache, on, &[])
+}
+
+/// What a cover's key names apart from the build it was measured under:
+/// its parts but the kernels' code, the guest emitter's versions and the
+/// tuning. A home's cover of the same deployment replaces a committed one.
+fn cover_identity(key: &str) -> Vec<&str> {
+    key.split('|')
+        .filter(|part| {
+            !part.starts_with("kernels ")
+                && !part.starts_with("emitter ")
+                && !part.starts_with("tuning ")
+        })
+        .collect()
+}
+
+/// [`covers_of`] over `committed` (the backend's committed covers files'
+/// texts): every committed entry of the device carried, but where the
+/// home's cache holds one of the same deployment (its key the same but for
+/// the build it was measured under, [`cover_identity`]), which replaces
+/// it: a re-export never drops a committed cover the home did not measure
+/// again.
+#[must_use]
+pub fn covers_over(cache: &Path, on: &str, committed: &[&str]) -> Option<String> {
+    let names = |entry: &serde_json::Value| {
+        entry
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| key.split('|').any(|part| part == on))
+    };
+    let key_of = |v: &serde_json::Value| v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_owned();
     let mut held: Vec<serde_json::Value> = std::fs::read_dir(cache.join("cover"))
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .filter(|entry| {
-            entry
-                .get("key")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|key| key.split('|').any(|part| part == on))
-        })
+        .filter(names)
         .collect();
+    let mine: Vec<String> = held.iter().map(key_of).collect();
+    for text in committed {
+        let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(text)
+        else {
+            continue;
+        };
+        for entry in entries.into_iter().filter(names) {
+            let key = key_of(&entry);
+            if mine
+                .iter()
+                .all(|m| cover_identity(m) != cover_identity(&key))
+            {
+                held.push(entry);
+            }
+        }
+    }
     if held.is_empty() {
         return None;
     }
-    held.sort_by(|a, b| {
-        let key = |v: &serde_json::Value| v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_owned();
-        key(a).cmp(&key(b))
-    });
+    held.sort_by_key(key_of);
     serde_json::to_string_pretty(&held).ok().map(|text| text + "\n")
 }
 
@@ -469,6 +508,7 @@ pub fn export(
         from,
         cache,
         committed,
+        committed_covers(backend),
         now.as_deref(),
         || device_on(backend, index, &device),
     );
@@ -499,14 +539,17 @@ fn stored_devices(backend: &Backend, profiles: &Path) -> Vec<String> {
 }
 
 /// [`export`] of `device`, its user's file at `from` (read where it is) and
-/// the home's cache `cache`; `on` names the device its covers key where the
-/// file states none.
+/// the home's cache `cache`, over its committed profile (`committed`) and
+/// covers (`committed_covers`); `on` names the device its covers key where
+/// the file states none.
+#[allow(clippy::too_many_arguments)]
 fn held(
     registry: &Registry,
     device: String,
     from: std::path::PathBuf,
     cache: &Path,
     committed: Option<&str>,
+    committed_covers: &[&str],
     now: Option<&dyn profile::fire::Now>,
     on: impl FnOnce() -> Option<String>,
 ) -> Exported {
@@ -563,7 +606,7 @@ fn held(
     })();
     let covers = stored_on
         .or_else(on)
-        .and_then(|on| covers_of(cache, &on))
+        .and_then(|on| covers_over(cache, &on, committed_covers))
         .map(|text| (covers_name(&device), text));
     Exported {
         device,
@@ -592,6 +635,19 @@ fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn pro
             device,
         ))),
         _ => None,
+    }
+}
+
+/// The host covers `backend` carries committed (`<device>.covers.json`,
+/// its chip's `COVERS`): what an export carries where the home measured
+/// none of the same deployment again.
+fn committed_covers(backend: &Backend) -> &'static [&'static str] {
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::COVERS,
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::COVERS,
+        _ => &[],
     }
 }
 
@@ -761,6 +817,37 @@ mod cover_tests {
         assert_eq!(covers_name("NVIDIA RTX PRO 4500 Blackwell"), "nvidia-rtx-pro-4500-blackwell.covers.json");
     }
 
+    /// A re-export carries every committed cover of the device the home did
+    /// not measure again (another model's), and the home's own replaces the
+    /// committed one of the same deployment measured under another build.
+    #[test]
+    fn an_export_keeps_committed_covers_the_home_did_not_measure_again() {
+        let cache = std::env::temp_dir().join(format!("pie-covers-merge-{}", std::process::id()));
+        let dir = cache.join("cover");
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = "vulkan 10de:2c31 driver 1";
+        let key = |kernels: &str, tuning: &str, model: &str| {
+            format!("Spirv|{on}|kernels {kernels}|emitter wgsl 12|tuning {tuning}|{model}|frame 2")
+        };
+        let entry = |key: &str, frame: f64| {
+            serde_json::json!({"key": key, "cover": 1, "frame_us": frame, "turnaround_us": 100.0})
+        };
+        let mine = key("39 0x2", "0x2", "model b");
+        std::fs::write(dir.join("b.json"), entry(&mine, 7000.0).to_string()).unwrap();
+        let other_model = key("24 0x1", "0x1", "model a");
+        let replaced = key("39 0x1", "0x1", "model b");
+        let committed = serde_json::Value::Array(vec![
+            entry(&other_model, 5600.0),
+            entry(&replaced, 6900.0),
+        ])
+        .to_string();
+        let text = covers_over(&cache, on, &[&committed]).expect("covers");
+        std::fs::remove_dir_all(&cache).unwrap();
+        assert!(text.contains(&other_model), "the other model's committed cover is kept: {text}");
+        assert!(text.contains(&mine), "the home's own: {text}");
+        assert!(!text.contains(&replaced), "replaced by the home's of the same deployment: {text}");
+    }
+
     /// A home that stores no measurement of the device (every entry a load
     /// took matched a committed one) and caches its covers: the export
     /// writes the covers, by the device the engine names, and says the
@@ -785,6 +872,7 @@ mod cover_tests {
             home.join("profiles/toy/user/card-x.toml"),
             &cache,
             None,
+            &[],
             None,
             || Some(on.to_string()),
         );

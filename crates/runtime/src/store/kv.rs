@@ -1088,21 +1088,13 @@ impl KvStore {
 
     /// Frees `short` device pages of idle cache, and no more than the last
     /// group it reaches holds: only what no live working set reads, lowest
-    /// key first, then least recently used. Pages the disk tier keeps a copy
-    /// of settle there instead, at no cost, and their entries stay. The
-    /// runtime runs it only as [`Self::reclaim_droppable`]; this drops
-    /// whatever the keys order.
-    #[cfg(test)]
+    /// key first, then least recently used. The runtime runs it once a
+    /// demote had nothing to move (`prepare_demote` goes first where the
+    /// planner demotes): what may sit on a lower tier with room moved there,
+    /// so what is left has none, and cached KV yields to running work,
+    /// whatever its key. Pages the disk tier keeps a copy of settle there
+    /// instead, at no cost, and their entries stay.
     pub fn reclaim_cache(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, short, keys)
-    }
-
-    /// [`Self::reclaim_cache`] as the runtime runs it, once a demote had
-    /// nothing to move (`prepare_demote` goes first where the planner
-    /// demotes): cached KV yields to running work, whatever its key, lowest
-    /// key first, then least recently used, for what is `short` and no more.
-    /// Any may still settle on its disk copy, which drops nothing.
-    pub fn reclaim_droppable(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
         self.reclaim_cache_where(epoch, short, keys)
     }
 
@@ -1452,7 +1444,8 @@ impl KvStore {
     }
 
     /// Idle cache whose row lets it sit nowhere, or not where it is (on
-    /// the host, a row without the host), dropped now. How many entries.
+    /// the host, a row without the host; on disk, a row without the disk),
+    /// dropped now. How many entries.
     pub fn drop_disallowed(&mut self, keys: impl Keys) -> usize {
         self.split_at_steps(&keys);
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
@@ -1462,8 +1455,10 @@ impl KvStore {
             .filter(|(_, entry)| unused.contains(&entry.path.terminal))
             .filter(|(id, entry)| {
                 let tiers = self.tiers_of(**id, &keys);
-                let resident = self.table.holds_resident(entry.path.terminal);
-                tiers == 0 || (!resident && tiers & retention::HOST == 0)
+                let root = entry.path.terminal;
+                tiers == 0
+                    || (tiers & retention::HOST == 0 && self.table.holds_on_host(root))
+                    || (tiers & retention::DISK == 0 && self.table.holds_on_disk(root))
             })
             .map(|(&id, _)| id)
             .collect();
@@ -2214,11 +2209,9 @@ impl KvStore {
         pages
     }
 
-    /// [`Self::below_device_cache_pages`] of what the retention keys let go
-    /// ([`pressure::may_drop`](crate::policy::pressure::may_drop)): the room
-    /// below the device a demand may take by dropping idle cache
-    /// ([`Self::drop_entries_off_device`]). What cache keyed above the floor
-    /// holds is room only the policy gives. A count stands as
+    /// [`Self::below_device_cache_pages`] as a demand may take it by
+    /// dropping idle cache ([`Self::drop_entries_off_device`]): below the
+    /// device no key keeps it, it only orders what goes. A count stands as
     /// [`Self::below_device_cache_pages`]' does, under the keys' revision;
     /// under keys of none it is taken each time.
     pub fn droppable_below_device(&self, keys: impl Keys) -> (u32, u32) {
@@ -3831,9 +3824,9 @@ impl KvStore {
     }
 
     /// Frees swap slots for `wanted` pages, giving up the disk tier's copies
-    /// the retention keys let go if it must ([`Self::disk_yield_plan`]):
-    /// a copy kept above the floor stays, whatever waits on its room.
-    /// Answers the slots free.
+    /// if it must ([`Self::disk_yield_plan`]): the disk is the last tier, so
+    /// what it holds has nowhere lower to go, and yields to running work
+    /// whatever its key. Answers the slots free.
     fn make_swap_room(&mut self, wanted: usize, keys: &impl Keys) -> usize {
         let free = self.host_pool.available() + self.disk_pool.available();
         if free < wanted {
@@ -3843,12 +3836,12 @@ impl KvStore {
     }
 
     /// Copies whose pages are held on the device or the host, lowest
-    /// retention key first; and the unused entries kept only on disk, at
-    /// the lowest key among their pages, then least recently used. Only
-    /// what may go ([`pressure::may_drop`](crate::policy::pressure::may_drop)):
-    /// a copy by the key it was kept under, an entry by its own key and
-    /// every one of its copies'; dropping it gives them all up.
-    fn disk_yield_plan(&self, _keys: &impl Keys) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
+    /// retention key first; and the unused entries kept only on disk: first
+    /// those whose tiers row does not name the disk, then the rest, each at
+    /// the lowest key among their pages, then least recently used. Keys and
+    /// rows only order: everything here may go (the disk has no lower
+    /// tier), and dropping an entry gives up all its copies.
+    fn disk_yield_plan(&self, keys: &impl Keys) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
         let Some(persisted) = &self.persisted else {
             return (Vec::new(), Vec::new());
         };
@@ -3879,7 +3872,7 @@ impl KvStore {
                 })
                 .unwrap_or((0, 0))
         };
-        let mut whole: Vec<(i64, Instant, u64)> = self
+        let mut whole: Vec<(bool, i64, Instant, u64)> = self
             .cache
             .iter()
             .filter(|(_, entry)| {
@@ -3891,13 +3884,14 @@ impl KvStore {
             })
             .filter_map(|(&id, entry)| {
                 let (lowest, _) = copies(entry);
-                Some((lowest, entry.last_use, id))
+                let kept = self.tiers_of(id, keys) & retention::DISK != 0;
+                Some((kept, lowest, entry.last_use, id))
             })
             .collect();
         whole.sort_unstable();
         (
             spare,
-            whole.into_iter().map(|(_, at, id)| (at, id)).collect(),
+            whole.into_iter().map(|(_, _, at, id)| (at, id)).collect(),
         )
     }
 
@@ -4117,10 +4111,14 @@ impl KvStore {
         self.persisted.as_ref().map_or(0, |p| p.slots.len())
     }
 
-    /// Drops idle cache held off the device until the host has `wanted`
-    /// slots free: the lowest retention key first, then the least recently
-    /// used, so the host keeps the higher keys as the device does. No
-    /// lookup hits what goes, and no one will bring it back.
+    /// Drops idle cache held on the host until it has `wanted` slots free:
+    /// the lowest retention key first, then the least recently used, so the
+    /// host keeps the higher keys as the device does. Only what holds host
+    /// slots: an entry held on disk alone frees none, and dropping it lost
+    /// cache for no room. What its row lets on disk went there first, where
+    /// the disk had room (`prepare_suspend_spill`, a demote's spill); the
+    /// rest has no lower tier and is dropped. No lookup hits what goes, and
+    /// no one will bring it back.
     fn drop_entries_off_device(&mut self, wanted: usize, keys: &impl Keys, below: Option<i64>) -> usize {
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
         let mut entries: Vec<(i64, Instant, u64)> = self
@@ -4130,8 +4128,7 @@ impl KvStore {
                 unused.contains(&entry.path.terminal)
                     && !self.table.settled_on_device(entry.path.terminal)
                     && !self.persisted_whole(entry)
-                    // Room made for a demote is host room: only what holds it.
-                    && (below.is_none() || self.table.holds_on_host(entry.path.terminal))
+                    && self.table.holds_on_host(entry.path.terminal)
             })
             .map(|(&id, entry)| {
                 let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));

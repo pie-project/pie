@@ -332,6 +332,7 @@ fn logits(arm: Arm, prompt: &[u32]) -> Vec<f32> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the micro loads");
     let mut shell = staged.finish().expect("the micro arms");

@@ -169,6 +169,13 @@ pub struct Rates {
     /// it was measured by. A rate a user's file states without one is
     /// measured again ([`Rates::sift`]).
     pub measured_by: Option<Vec<(String, MeasuredBy)>>,
+    /// The figures a stored or committed file states of this device under
+    /// a key this build does not match (a kernel's code or the measuring
+    /// method changed; [`Rates::sift_as`]): not taken as measured, but a
+    /// fair estimate, which a load serves by while it times them again
+    /// behind serving (`engine::rates::resolve_at_load`). Read, never
+    /// written.
+    pub stale: Option<Box<Rates>>,
 }
 
 /// What one stored measurement was measured by, beside the device it was
@@ -558,6 +565,10 @@ impl Rates {
                 all
             },
             measured_on: self.measured_on.or(below.measured_on),
+            stale: match (self.stale, below.stale) {
+                (Some(mine), Some(theirs)) => Some(Box::new(mine.over(*theirs))),
+                (mine, theirs) => mine.or(theirs),
+            },
             // Entry by entry: a rate's key goes with its value.
             measured_by: match (self.measured_by, below.measured_by) {
                 (Some(mine), Some(theirs)) => {
@@ -656,7 +667,9 @@ impl Rates {
     /// does not (or that states none) is dropped, by itself. Measured on
     /// another device (or driver), every one is dropped. Each drop is said,
     /// a line each, with why; what is kept is said once the layers are
-    /// joined ([`Rates::whence`]), by the layer that decides it.
+    /// joined ([`Rates::whence`]), by the layer that decides it. A figure
+    /// dropped for its key alone (this device's) is kept as an estimate
+    /// ([`Rates::stale`]).
     pub fn sift_as(&mut self, now: &dyn Now, what: &str) -> Vec<String> {
         let mut said = Vec::new();
         let on = now.on();
@@ -676,6 +689,7 @@ impl Rates {
             *self = Rates::default();
             return said;
         }
+        let mut stale = Rates::default();
         for key in KEYED {
             if !self.states(key) {
                 continue;
@@ -685,7 +699,11 @@ impl Rates {
                 Some(by) => by.stale(key, now),
             };
             if let Some(why) = why {
-                said.push(format!("{what} `{key}`: not taken, {why}"));
+                said.push(format!(
+                    "{what} `{key}`: not taken as measured, {why}; kept as an estimate"
+                ));
+                let figure = self.only(&[key]);
+                stale = figure.over(stale);
                 self.unstate(key);
             }
         }
@@ -702,16 +720,27 @@ impl Rates {
             .filter(|by| !by.is_empty());
         if let Some(curves) = self.kernel_tflops_by_shape.take() {
             let mut kept = Vec::with_capacity(curves.len());
+            let mut estimates = Vec::new();
             for curve in curves {
                 match curve.by.stale(KERNEL_CURVES, now) {
                     None => kept.push(curve),
-                    Some(why) => said.push(format!(
-                        "{what} curve {}: not taken, {why}",
-                        curve.name()
-                    )),
+                    Some(why) => {
+                        said.push(format!(
+                            "{what} curve {}: not taken as measured, {why}; kept as an estimate",
+                            curve.name()
+                        ));
+                        estimates.push(curve);
+                    }
                 }
             }
             self.kernel_tflops_by_shape = (!kept.is_empty()).then_some(kept);
+            if !estimates.is_empty() {
+                stale = Rates {
+                    kernel_tflops_by_shape: Some(estimates),
+                    ..Rates::default()
+                }
+                .over(stale);
+            }
         }
         for settled in std::mem::take(&mut self.dense_settled) {
             match now.method(DENSE_SETTLED) {
@@ -727,6 +756,9 @@ impl Rates {
                 )),
             }
         }
+        stale.measured_on = None;
+        stale.measured_by = None;
+        self.stale = (stale != Rates::default()).then(|| Box::new(stale));
         said
     }
 
@@ -859,6 +891,7 @@ impl Rates {
                 .measured_by
                 .as_ref()
                 .map(|by| by.iter().filter(|(rate, _)| has(rate)).cloned().collect()),
+            stale: None,
         }
     }
 
@@ -1124,6 +1157,10 @@ pub struct Tuned {
     /// `curves (n)`, `resident_workgroups`, `bound probe`, `settle`): what
     /// the load's last line says it measured ("measured 0" where none).
     pub timed: Vec<String>,
+    /// The `[rates]` keys this load serves by a figure stored under a
+    /// stale key ([`Rates::stale`]), each timed again behind serving and
+    /// stored for the next load.
+    pub behind: Vec<String>,
 }
 
 impl Tuned {
@@ -1139,6 +1176,7 @@ impl Tuned {
         }
         self.skipped.extend(upper.skipped.iter().cloned());
         self.timed.extend(upper.timed.iter().cloned());
+        self.behind.extend(upper.behind.iter().cloned());
     }
 
     /// `[rates]` as profile TOML, nothing where nothing is stated or the
@@ -1201,6 +1239,7 @@ mod tests {
     #[test]
     fn the_block_is_a_few_lines() {
         let rates = Rates {
+            stale: None,
             landing: None,
             launch_ns: Some(904),
             gemm_tflops_by_rows: Some(vec![
@@ -1602,7 +1641,7 @@ mod tests {
         );
         assert!(
             said.iter()
-                .any(|l| l.contains("gemm_tflops_by_rows`: not taken, kernel `coopmat`")),
+                .any(|l| l.contains("gemm_tflops_by_rows`: not taken as measured, kernel `coopmat`")),
             "{said:#?}"
         );
         assert_eq!(

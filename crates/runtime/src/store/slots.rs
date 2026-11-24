@@ -1232,6 +1232,21 @@ impl SlotPool {
         self.act_max
     }
 
+    /// The most disjoint runs of `run` adjacent chunks the pool could ever
+    /// hold for state at the smallest rung, each inside one segment past the
+    /// reserved chunks: what a need of runs is fitting against alone.
+    #[must_use]
+    pub fn runs_most(&self, run: u32) -> u32 {
+        let run = run.max(1);
+        let limit = self.total.saturating_sub(self.act_chunks(0));
+        (0..self.segments.count())
+            .map(|segment| {
+                let range = self.segments.range(segment);
+                range.end.min(limit).saturating_sub(range.start.max(self.reserved)) / run
+            })
+            .sum()
+    }
+
     /// The longest run of adjacent chunks any arrangement of the pool lays
     /// for state: inside one segment, past the reserved chunks, below the
     /// narrowest rung's activation. A run longer is never laid, whatever
@@ -2353,6 +2368,12 @@ impl SlotPool {
             state.waiting += slots;
             self.waiters.insert(waiter, (shape, slots));
         }
+    }
+
+    /// Whether no holder holds a slot of the pool: no working set, cache
+    /// entry, snapshot, store table or weight lies in any chunk.
+    pub fn holds_nothing(&self) -> bool {
+        self.holders.is_empty()
     }
 
     /// Whether any waiter is parked short of a slot.

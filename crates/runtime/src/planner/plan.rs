@@ -717,6 +717,21 @@ impl ResidencyPlanner {
         // finisher's one page unserved). Lifted once a stall, as the stall
         // is said. One whose move found nothing to move finds nothing again
         // on the same pool: it stays out.
+        // Forced once on a room: the forced pass's own refused take gives
+        // its room back, and read by the room's gives alone that was a new
+        // stall, forced again at once, a core burned (the simulation's
+        // Metal seed 183: 28,156 forced passes for one head in 20 s, the
+        // chunks free and the fires landed the same). Room freed or a fire
+        // landed forces it again.
+        let room = (key, self.port.free_chunks(), self.stats.fires_landed.load(Ordering::Acquire));
+        let forced_here = self.with_inner(|inner| {
+            let again = inner.stall_forced == Some(room);
+            inner.stall_forced = Some(room);
+            again
+        });
+        if forced_here {
+            return;
+        }
         self.with_inner(|inner| {
             inner.host_swap_blocked.clear();
             if inner.prepare_blocked.is_empty() {

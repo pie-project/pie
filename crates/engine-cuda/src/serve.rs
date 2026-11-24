@@ -135,9 +135,6 @@ pub struct Shell {
     corrected: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
     tiers: record::Tiers,
-    /// The class words of a drafter's classes (`Shell::drafts_only`); none
-    /// on a model without a drafter.
-    drafting_words: std::collections::HashSet<u64>,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
     media: poem_ir::ClassSet,
@@ -192,6 +189,14 @@ pub struct Shell {
     /// over them (`Shell::size_arming`), by its bucket and composition: the
     /// order arming takes within one row count (`lattice_targets`).
     walked_launches: std::collections::HashMap<(u32, String), u64>,
+    /// The step compositions the runtime's builder forms over this load
+    /// (CONTRACT-BC 24), computed from the load request's rules before
+    /// arming: what the arm walk takes its targets from, in its order.
+    steps: engine::StepShapes,
+    /// What the last whole arming recorded, by treatment and bucket:
+    /// whether every body of the compositions it walked there is held.
+    /// What the load states eager is read from it ([`Shell::stated_steps`]).
+    walked: std::collections::HashMap<(engine::Treatment, u32), bool>,
     /// What the last arming's captures took, which a re-arm within the
     /// same load is allowed.
     bodies_took: u64,
@@ -246,9 +251,12 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
-    /// What this load timed, each by name (the device's rates where no
-    /// layer stated them, the decode products' times): its last line's.
-    pub(crate) measured: std::cell::RefCell<Vec<String>>,
+    /// What this load timed, each by name (`engine::Engine::measured_at_load`):
+    /// the device's rates where no layer stated them, the decode products'
+    /// times (`[rates] product_ns`) where the profile held none, and the
+    /// bodies where no record held what they take. Empty: it measured
+    /// nothing.
+    measured: Vec<String>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,
@@ -312,8 +320,8 @@ pub(crate) struct KvReport {
 impl Shell {
     /// What this load timed, each by name: empty where it measured nothing.
     #[must_use]
-    pub fn measured_at_load(&self) -> Vec<String> {
-        self.measured.borrow().clone()
+    pub fn measured_at_load(&self) -> &[String] {
+        &self.measured
     }
 }
 
@@ -1209,31 +1217,6 @@ impl Shell {
             .is_some_and(|class| self.wide.contains(class))
     }
 
-    /// The token buckets a fire whose lanes buffer recurrent rows, or land
-    /// in a drafter's class, composes at: each one up to the lane ceiling
-    /// (every decode width), past it the powers of two and the widest. The
-    /// lattice records those at these alone.
-    /// Whether a lane of `word` lands in a class keyed only for a drafter's
-    /// fires (plain but for reading the drafts): it composes at
-    /// [`Shell::rs_rungs`] too, a verify's lanes being narrow.
-    fn drafts_only(&self, word: u64) -> bool {
-        !self.drafting_words.is_empty()
-            && self
-                .drafting_words
-                .contains(&(word & self.compiled.classes.mask))
-    }
-
-    fn rs_rungs(&self) -> Vec<u32> {
-        let ceiling = self.lane_ceiling();
-        let top = self.budget.buckets.last().copied();
-        self.budget
-            .buckets
-            .iter()
-            .copied()
-            .filter(|&bucket| bucket <= ceiling || bucket.is_power_of_two() || Some(bucket) == top)
-            .collect()
-    }
-
     fn lane_ceiling(&self) -> u32 {
         (self.held.len() as u32)
             .min(self.fire_lanes())
@@ -1355,16 +1338,33 @@ impl Shell {
         attachments: &[Attached],
         media: &[Media<'_>],
     ) -> Result<Vec<Vec<f32>>> {
-        let prepared = FrameShell::prepare(
-            self,
-            StepView {
-                lanes,
-                attachments,
-                media,
-                voxels: &[],
-            },
-            None,
-        )?;
+        self.fire_step(StepView {
+            lanes,
+            attachments,
+            media,
+            voxels: &[],
+        })
+    }
+
+    /// A fire of lanes with their media and voxel clips, no attachments:
+    /// arming's synthetic fires ([`Shell::fire_step`]).
+    pub(crate) fn fire_view(
+        &mut self,
+        lanes: &[Seated<'_>],
+        media: &[Media<'_>],
+        voxels: &[Clips<'_>],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.fire_step(StepView {
+            lanes,
+            attachments: &[],
+            media,
+            voxels,
+        })
+    }
+
+    /// One fire of `step`, its logits read back.
+    fn fire_step(&mut self, step: StepView<'_>) -> Result<Vec<Vec<f32>>> {
+        let prepared = FrameShell::prepare(self, step, None)?;
         let enqueued = FrameShell::enqueue(self, prepared)?;
         let mut settled = FrameShell::settle(self, enqueued)?;
         Shell::read_out(self, &mut settled)?;

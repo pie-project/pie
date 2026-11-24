@@ -610,6 +610,10 @@ struct Rig<'a, B: Serve> {
     /// matmul against one workgroup of it, its operands' place in the cache
     /// moving neither); `None`, every reading's [`weights_at`].
     planes_most: Option<usize>,
+    /// Measuring behind serving: whether a request arrived, read before
+    /// each frame; one that did stops the step ([`YIELDED`]), so an arrival
+    /// waits at most the frame in flight.
+    yield_to: Option<&'a dyn Fn() -> bool>,
 }
 
 /// A sink that fires through `inner` and keeps each kernel it fires: a
@@ -688,6 +692,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             fired: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             quick: false,
             planes_most: None,
+            yield_to: None,
         }
     }
 
@@ -988,6 +993,13 @@ impl<'a, B: Serve> Rig<'a, B> {
         fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
         then: &dyn Fn(&mut B::Frame) -> Result<()>,
     ) -> Result<(Option<u64>, u64)> {
+        // Behind serving, an arrival stops the step before its next frame.
+        if self.yield_to.is_some_and(|arrived| arrived()) {
+            return Err(Fault::Device {
+                call: "measuring behind serving",
+                why: YIELDED.to_string(),
+            });
+        }
         // A frame follows an idle device: re-timed first, under a bound.
         self.retime()?;
         let step = self.step.borrow().clone();
@@ -1473,6 +1485,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     model: Option<u64>,
     top: u32,
     say: &mut dyn FnMut(&str),
+    yield_to: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<profile::fire::KernelCurve>> {
     if wanted.is_empty() {
         return Ok(Vec::new());
@@ -1487,6 +1500,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     };
     let launch = launch_ns as f64;
     let mut rig = Rig::<B>::new(device, max_submit);
+    rig.yield_to = yield_to;
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
     // The clock warmed by the warm-up's cube where one fits the bound at the
@@ -1984,6 +1998,50 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         let (kind, key) = curve_key(B::TARGET, tactic, n, k);
         format!("{kind}/{key} at {n}x{k}")
     };
+    // A curve stored under a stale key (a kernel's code or the method
+    // changed) serves by its old figure, a fair estimate, and is timed
+    // again behind serving (`profile::fire::Tuned::behind`, `curve <name>`):
+    // nothing is timed before ready that a figure exists for. Only a curve
+    // no layer states at all is timed here.
+    let stale_curves = stated
+        .stale
+        .as_ref()
+        .and_then(|stale| stale.kernel_tflops_by_shape.clone())
+        .unwrap_or_default();
+    let (chip, stated, wanted) = if stale_curves.is_empty() || wanted.is_empty() {
+        (chip, stated, wanted)
+    } else {
+        let with = stated.clone().over(Rates {
+            kernel_tflops_by_shape: Some(stale_curves),
+            ..Rates::default()
+        });
+        let still = lacking(B::TARGET, &kernels, &with, shapes, top);
+        let served: Vec<String> = wanted
+            .iter()
+            .filter(|w| !still.contains(w))
+            .map(name)
+            .collect();
+        if served.is_empty() {
+            (chip, stated, wanted)
+        } else {
+            let mut tuned = chip.tuned().clone();
+            for curve in &served {
+                tracing::info!(
+                    "rates: gemm curve {curve}: served by the curve stored under its stale key{}",
+                    if measuring == engine::rates::Measuring::Time {
+                        "; timed again behind serving, stored for the next load"
+                    } else {
+                        " (`[engine] measure = false`: not timed again)"
+                    }
+                );
+                if measuring == engine::rates::Measuring::Time {
+                    tuned.behind.push(format!("{CURVE_BEHIND}{curve}"));
+                }
+            }
+            tuned.rates = with.clone();
+            (chip.with_tuned(tuned), with, still)
+        }
+    };
     if wanted.is_empty() {
         tracing::info!(
             shapes = shapes.len(),
@@ -2024,7 +2082,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         wanted.iter().map(name).collect::<Vec<_>>().join(", ")
     );
     let reference = tactics.gemm(tier, crate::submit::PROBE.0);
-    let clock_before = clock_read::<B>(device, reference)?;
+    let clock_before = clock_warmed::<B>(device, reference)?;
     let curves = measure_shapes::<B, T>(
         device,
         tactics,
@@ -2037,6 +2095,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         model,
         top,
         &mut |_| {},
+        None,
     )?;
     // The user's file gains what this load measured alone: a curve taken
     // from a committed profile stays the committed profile's.
@@ -2051,7 +2110,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     }
     .over(stated.clone());
     let joined = fresh;
-    // Curves timed on a device below its nominal clock serve this load
+    // Curves timed on a device whose clock sagged during them serve this load
     // alone, never stored (a hot or unramped device's curves would steer
     // every later load's picks).
     let throttle = throttled(clock_before, clock_read::<B>(device, reference)?);
@@ -2066,8 +2125,8 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         Some(ratio) => {
             tracing::warn!(
                 ratio,
-                "rates: the dense curves were timed with the device {ratio:.2}x slower than its \
-                 nominal clock: served this load, not stored"
+                "rates: the dense curves were timed with the device {ratio:.2}x slower at their end than \
+                 at their warmed start: served this load, not stored"
             );
             None
         }
@@ -2078,7 +2137,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     tuned.timed.push(match throttle {
         None => format!("dense curves ({})", wanted.len()),
         Some(ratio) => format!(
-            "dense curves ({}; device {ratio:.2}x below its nominal clock: not stored)",
+            "dense curves ({}; device {ratio:.2}x slower at their end than at their start: not stored)",
             wanted.len()
         ),
     });
@@ -2196,16 +2255,65 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     stated: &Rates,
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
+    measure_yielding::<B, T>(device, tactics, tier, timer, max_submit, stated, say, None)
+}
+
+/// The prefix of a `profile::fire::Tuned::behind` entry naming a dense
+/// kernel's curve (`<kind>/<key> at <n>x<k>`) served by a stale figure.
+pub const CURVE_BEHIND: &str = "curve ";
+
+/// The curve `name` (`<kind>/<key> at <n>x<k>`, [`CURVE_BEHIND`]'s) names
+/// among `kernels` at `shapes`: the kernel and plane to time it at.
+#[must_use]
+pub fn curve_named(
+    target: kernels_slang::Target,
+    kernels: &[kernels_slang::linear::gemm::Tactic],
+    shapes: &[(u32, u32)],
+    name: &str,
+) -> Option<(kernels_slang::linear::gemm::Tactic, u32, u32)> {
+    shapes.iter().find_map(|&(n, k)| {
+        kernels.iter().find_map(|&tactic| {
+            let (kind, key) = curve_key(target, tactic, n, k);
+            (format!("{kind}/{key} at {n}x{k}") == name).then_some((tactic, n, k))
+        })
+    })
+}
+
+/// Why a step measuring behind serving stopped: a request arrived
+/// ([`Rig`]'s `yield_to`). Nothing of it is kept; it runs again later.
+pub const YIELDED: &str = "yielded to an arrival";
+
+/// Whether `fault` is a step behind serving yielding to an arrival.
+#[must_use]
+pub fn yielded(fault: &Fault) -> bool {
+    matches!(fault, Fault::Device { why, .. } if why == YIELDED)
+}
+
+/// [`measure_saying`] behind serving: `yield_to` read before each frame,
+/// the step stopping ([`YIELDED`]) where a request arrived.
+#[allow(clippy::too_many_arguments)]
+pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
+    device: &B::Context,
+    tactics: &T,
+    tier: kernels_slang::Tier,
+    timer: Timer<'_, B>,
+    max_submit: Option<std::time::Duration>,
+    stated: &Rates,
+    say: &mut dyn FnMut(&str),
+    yield_to: Option<&dyn Fn() -> bool>,
+) -> Result<engine::rates::Measured> {
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
     // The keys a load asks for at this bound ([`keys_at`]), those `stated`
     // lacks.
     let want = Wanted::of(stated, &keys_at(max_submit));
     // The device's clock before the step: read again after it, the step's
-    // rates are this load's alone where either read is below nominal.
+    // rates are this load's alone where the after read is slower than the
+    // warmed before read.
     let reference = tactics.gemm(tier, crate::submit::PROBE.0);
-    let clock_before = clock_read::<B>(device, reference)?;
+    let clock_before = clock_warmed::<B>(device, reference)?;
     let mut rig = Rig::<B>::new(device, max_submit);
+    rig.yield_to = yield_to;
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
     // The launch first: every rate below takes its dispatches' launches off.
@@ -2605,6 +2713,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     let mut rates = Rates {
         landing: None,
         load_width: None,
+        stale: None,
         launch_ns: want.launch.then_some(launch_ns),
         // A curve with no point measured is stated as none: the load is
         // refused by its key (`rates_at_load`), never weighed by nothing.
@@ -3761,49 +3870,85 @@ pub struct ClockRead {
     pub spread: f64,
 }
 
-/// The reference kernel's fastest time this process has read on any device
-/// phase: the device at its nominal clock, as far as the process has seen
-/// it (f64 bits; 0 before any read).
-static NOMINAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// `device`'s clock now ([`ClockRead`]), its reference kernel under `tactic`.
+/// `device`'s clock now ([`ClockRead`]), its reference kernel under `tactic`:
+/// one read, as a phase's after read is taken.
 pub fn clock_read<B: Serve>(
     device: &B::Context,
     tactic: kernels_slang::linear::gemm::Tactic,
 ) -> Result<ClockRead> {
     let probe = crate::submit::Probe::<B>::new(device, tactic)?;
+    read_clock(device, &probe)
+}
+
+fn read_clock<B: Serve>(device: &B::Context, probe: &crate::submit::Probe<B>) -> Result<ClockRead> {
     let fires = (0..ROUNDS)
         .map(|_| probe.fire(device))
         .collect::<Result<Vec<f64>>>()?;
     let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
     let slowest = fires.iter().copied().fold(0.0, f64::max);
-    let read = ClockRead {
+    Ok(ClockRead {
         fastest_ns: fastest,
         spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
-    };
-    let nominal = f64::from_bits(NOMINAL_NS.load(std::sync::atomic::Ordering::Relaxed));
-    if nominal == 0.0 || fastest < nominal {
-        NOMINAL_NS.store(fastest.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(read)
+    })
 }
 
-/// Whether a measuring phase ran below the device's nominal clock: its
-/// reference kernel read `before` and `after` it, against the fastest the
-/// process has read ([`NOMINAL_NS`]). Throttled where either read is slower
-/// than nominal by more than the reads' own spread (the reference's noise,
-/// no margin chosen): `Some(the slower read over nominal)`.
+/// `device`'s clock as a phase starts ([`warmed`]): its reference kernel
+/// read until the clock settles, so a GPU that scales its clock with its
+/// load is read at the clock the phase runs at: neither off an idle DVFS
+/// clock still ramping as work arrives (a phone's), nor off a brief boost
+/// above the clock it sustains (a desktop's).
+pub fn clock_warmed<B: Serve>(
+    device: &B::Context,
+    tactic: kernels_slang::linear::gemm::Tactic,
+) -> Result<ClockRead> {
+    let probe = crate::submit::Probe::<B>::new(device, tactic)?;
+    warmed(|| read_clock(device, &probe))
+}
+
+/// Reads of `read` taken until two in a row agree within their own spread
+/// (either way: a ramp still rising and a boost still falling both move by
+/// more): the settled clock, the median of the settled pair, at the wider
+/// spread. No process-wide fastest is kept: the reference is the clock
+/// measured right around the phase. A clock settles (a ramp has a top, a
+/// boost a sustained floor), so the reads end.
+pub fn warmed(mut read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
+    let mut last = read()?;
+    loop {
+        let next = read()?;
+        let noise = last.spread.max(next.spread);
+        let low = last.fastest_ns.min(next.fastest_ns);
+        let high = last.fastest_ns.max(next.fastest_ns);
+        if high <= low * (1.0 + noise) {
+            return Ok(ClockRead {
+                fastest_ns: (low + high) / 2.0,
+                spread: noise,
+            });
+        }
+        last = next;
+    }
+}
+
+/// Whether a point's clock moved under it: its own warmed `before` read
+/// and its `after` read differ, either way, by more than their own spread
+/// (a boost ending, a ramp still rising, a sag): `Some(after over
+/// before)`. A point timed across a clock transition measures the
+/// transition, not the kernel, and is discarded.
+#[must_use]
+pub fn clock_moved(before: ClockRead, after: ClockRead) -> Option<f64> {
+    let noise = before.spread.max(after.spread);
+    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
+    (ratio > 1.0 + noise || ratio < 1.0 / (1.0 + noise)).then_some(ratio)
+}
+
+/// Whether a measuring phase ran throttled: its reference kernel read
+/// `before` it (warmed, [`clock_warmed`]) and `after` it. Throttling builds
+/// during a phase: throttled where the after read is slower than the
+/// before by more than the reads' own spread (the reference's noise, no
+/// margin chosen): `Some(after over before)`.
 #[must_use]
 pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
-    let nominal = f64::from_bits(NOMINAL_NS.load(std::sync::atomic::Ordering::Relaxed));
-    let nominal = if nominal > 0.0 {
-        nominal.min(before.fastest_ns).min(after.fastest_ns)
-    } else {
-        before.fastest_ns.min(after.fastest_ns)
-    };
-    let slower = before.fastest_ns.max(after.fastest_ns);
     let noise = before.spread.max(after.spread);
-    let ratio = slower / nominal.max(f64::MIN_POSITIVE);
+    let ratio = after.fastest_ns / before.fastest_ns.max(f64::MIN_POSITIVE);
     (ratio > 1.0 + noise).then_some(ratio)
 }
 
@@ -4026,6 +4171,7 @@ mod wanted_tests {
     #[test]
     fn a_step_times_only_what_the_profile_lacks() {
         let all = Rates {
+            stale: None,
             landing: None,
             load_width: None,
             launch_ns: Some(3000),
@@ -4319,15 +4465,85 @@ mod bound_tests {
 mod clock_tests {
     use super::*;
 
-    /// A phase is throttled where a reference read is slower than the
-    /// fastest the process has seen by more than the reads' own spread.
+    fn read(fastest_ns: f64, spread: f64) -> ClockRead {
+        ClockRead { fastest_ns, spread }
+    }
+
+    /// A phase is throttled where its after read is slower than its warmed
+    /// before read by more than the reads' own spread.
     #[test]
-    fn a_phase_below_the_nominal_clock_is_throttled() {
-        let read = |fastest_ns, spread| ClockRead { fastest_ns, spread };
-        NOMINAL_NS.store(100.0_f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    fn a_phase_whose_clock_sags_is_throttled() {
         assert_eq!(throttled(read(101.0, 0.05), read(103.0, 0.05)), None, "inside the noise");
-        let hot = throttled(read(101.0, 0.02), read(160.0, 0.02)).expect("throttled");
+        let hot = throttled(read(100.0, 0.02), read(160.0, 0.02)).expect("throttled");
         assert!((hot - 1.6).abs() < 1e-9, "{hot}");
-        assert_eq!(throttled(read(90.0, 0.02), read(91.0, 0.02)), None, "a faster read is nominal");
+        assert_eq!(throttled(read(100.0, 0.02), read(91.0, 0.02)), None, "a faster after read");
+    }
+
+    /// A DVFS GPU idling at a low clock (an idle Adreno's 422 of 1300 MHz)
+    /// ramps as the reference runs: the warmed read is the ramped clock, so
+    /// a phase at that clock is stored (not judged throttled off the idle
+    /// read).
+    #[test]
+    fn a_clock_ramping_from_idle_is_read_warmed_and_stores() {
+        let mut reads = [308.0, 210.0, 140.0, 101.0, 100.0].into_iter();
+        let before = warmed(|| Ok(read(reads.next().expect("a read"), 0.02))).unwrap();
+        assert!((before.fastest_ns - 100.5).abs() < 1e-9, "{before:?}");
+        assert_eq!(throttled(before, read(100.4, 0.02)), None, "stored");
+    }
+
+    /// A GPU that boosts briefly, then holds a sustained clock 1.4x lower
+    /// (a desktop's, the Spark's): the warmed read is the sustained clock,
+    /// so a phase at it is stored (not judged throttled off the boost).
+    #[test]
+    fn a_boost_then_a_sustained_clock_is_read_settled_and_stores() {
+        let mut reads = [100.0, 139.0, 140.0].into_iter();
+        let before = warmed(|| Ok(read(reads.next().expect("a read"), 0.02))).unwrap();
+        assert!((before.fastest_ns - 139.5).abs() < 1e-9, "{before:?}");
+        assert_eq!(throttled(before, read(141.0, 0.02)), None, "stored");
+    }
+
+    /// A Spark-style clock (a boost 1.4x faster than the clock it
+    /// sustains, falling back mid-run) under a settle's points: each point
+    /// is a kernel's 1000 ns at the sustained clock, its time scaled by the
+    /// clock it ran at; a point whose own before and after reads straddle
+    /// the transition is discarded. The points kept at the sustained clock
+    /// spread by the kernel's own noise (1.3%), where every point together
+    /// spreads 30%.
+    #[test]
+    fn a_point_across_a_clock_transition_is_discarded() {
+        // The clock over 12 points: boosted, falling mid-point, sustained.
+        let clock = |t: usize| if t < 4 { 1.4 } else { 1.0 };
+        let noise = [1.0, 1.004, 0.998, 1.006, 1.002, 0.999, 1.01, 1.003, 1.0, 0.997, 1.005, 1.001];
+        let (mut all, mut kept) = (Vec::new(), Vec::new());
+        for point in 0..12 {
+            // Read before at the point's start, after at its end (the
+            // transition falls inside point 3).
+            let before = read(100.0 / clock(point), 0.01);
+            let after = read(100.0 / clock(point + 1), 0.01);
+            let ns = 1000.0 * noise[point] / ((clock(point) + clock(point + 1)) / 2.0);
+            all.push(ns);
+            if clock_moved(before, after).is_none() {
+                kept.push(ns);
+            }
+        }
+        let (_, spread_all) = median_spread(&all);
+        assert_eq!(kept.len(), 11, "only the point across the transition is dropped");
+        assert!(spread_all > 0.25, "every point together: {spread_all}");
+        // The boosted points agree among themselves too, but the kept set
+        // spans both clocks: a settle's options are fired interleaved, so
+        // the transition is the one point it drops; the rest each ran at
+        // one clock (its before and after agreeing) and the rounds' median
+        // reads the sustained clock.
+        let sustained: Vec<f64> = kept.iter().copied().filter(|&ns| ns > 900.0).collect();
+        let (_, spread_sustained) = median_spread(&sustained);
+        assert!(spread_sustained < 0.015, "the sustained points: {spread_sustained}");
+    }
+
+    /// A clock that sags during the phase, after the warmed read: refused.
+    #[test]
+    fn a_clock_sagging_during_the_phase_is_refused() {
+        let mut reads = [100.0, 100.5].into_iter();
+        let before = warmed(|| Ok(read(reads.next().expect("a read"), 0.02))).unwrap();
+        assert!(throttled(before, read(181.0, 0.02)).is_some(), "refused");
     }
 }

@@ -93,7 +93,11 @@ fn the_settle_submits_no_fire_past_the_bound() {
     shell.hold_to(tight);
     shell
         .settle_dense()
-        .expect("the settle runs under the bound");
+        .expect("the settle's picks resolve under the bound");
+    while shell
+        .measure_behind(&|| 0)
+        .expect("the settle runs behind serving under the bound")
+    {}
     let settled = shell.settled().to_vec();
     assert!(!settled.is_empty(), "the settle walked no range");
     for range in &settled {

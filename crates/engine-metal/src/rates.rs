@@ -599,7 +599,9 @@ pub fn at_load(
         registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
-    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, |_max_submit| {
+    // Nothing is timed behind serving on Metal yet: a stale key is
+    // measured before ready.
+    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, false, |_max_submit, _| {
         Ok(engine::rates::Measured {
             rates: measure(device, measure_chip, &mut |_| {})?,
             unsettled: false,
@@ -786,6 +788,7 @@ pub fn measure(
     Ok(Rates {
         landing: None,
         load_width: None,
+        stale: None,
         launch_ns: Some(launch),
         gemm_tflops_by_rows: Some(gemm),
         attn_tflops_by_keys: Some(attn),

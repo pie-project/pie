@@ -537,7 +537,7 @@ pub fn conv1d_fold(
     let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(CONV1D, "::pie::ssm::conv1d_fold<::pie::bf16>"))
+        Fire::at(fold_kernel())
             .apply(Launch::grid([channels.div_ceil(BLOCK), 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
@@ -548,4 +548,9 @@ pub fn conv1d_fold(
             stated(OP, groups)?.arg(),
         ],
     )
+}
+
+/// The conv window's group fold kernel ([`conv1d_fold`]).
+pub(super) fn fold_kernel() -> &'static crate::jit::Kernel {
+    kernel(CONV1D, "::pie::ssm::conv1d_fold<::pie::bf16>")
 }

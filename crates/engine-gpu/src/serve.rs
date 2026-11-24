@@ -159,6 +159,33 @@ pub trait Serve: Backend {
         rates: &profile::fire::Rates,
     ) -> Result<()>;
 
+    /// The rates of `device` that `stated` lacks, under `tuning`'s tactics,
+    /// each timed frame under `max_submit` (the backend's rates step,
+    /// `crate::rates::measure_yielding`): what a load times behind serving
+    /// of a key it served by a stale figure (`profile::fire::Tuned::behind`).
+    /// `yield_to` is read before each frame: an arrival stops the step
+    /// (`crate::rates::yielded`).
+    fn measure_rates(
+        device: &Self::Context,
+        tuning: &Self::Tuning,
+        max_submit: Option<std::time::Duration>,
+        stated: &profile::fire::Rates,
+        yield_to: &dyn Fn() -> bool,
+    ) -> Result<engine::rates::Measured>;
+
+    /// Each of `wanted`'s dense kernel curves to `top` rows on `device`
+    /// (`crate::rates::measure_shapes`), behind serving as
+    /// [`Serve::measure_rates`] is.
+    fn measure_curves(
+        device: &Self::Context,
+        tuning: &Self::Tuning,
+        max_submit: Option<std::time::Duration>,
+        stated: &profile::fire::Rates,
+        wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
+        top: u32,
+        yield_to: &dyn Fn() -> bool,
+    ) -> Result<Vec<profile::fire::KernelCurve>>;
+
     /// `tuning` with each dense kernel's rate curve at each of the model's
     /// dense plane shapes (`shapes`, `(n, k)`) to `top_rows`, the most rows a
     /// fire of the load may bring (`profile::fire::Rates::kernel_tflops_by_shape`):
@@ -640,6 +667,84 @@ fn tier_of(number: u32) -> kernels_slang::Tier {
     }
 }
 
+/// A row of a stored settle (`profile::fire::DenseSettled::ranges`) as the
+/// kernel it takes over its range where it replaced the curves' one.
+fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
+    let [_, _, replaced, vector, wide, tier] = row;
+    (replaced != 0).then(|| kernels_slang::linear::gemm::Tactic {
+        tier: tier_of(tier),
+        vector,
+        wide: wide != 0,
+    })
+}
+
+/// The dense settle left to weigh behind serving ([`Shell::measure_behind`]):
+/// what a boot found no stored or committed settle of its key deciding.
+/// Nothing of it changes what this load serves; each range it decides is
+/// stored for the next load of the same key.
+struct Behind {
+    lanes: u32,
+    of: u32,
+    code: u32,
+    /// The rows stored under this key before, and every range weighed
+    /// since whose clock held: what the next load takes.
+    rows: Vec<[u32; 6]>,
+    /// The choice the options stand on: this load's, each range weighed so
+    /// far taking its pick.
+    standing: crate::dense::Dense,
+    /// The ranges left, fewest rows first: decode's rows, which serving
+    /// fires most, settle before the large prompt rows, so a settle cut
+    /// short still stores what helps most.
+    left: std::collections::VecDeque<(u32, u32)>,
+    /// The range being weighed.
+    trial: Option<Trial>,
+    /// The ranges left at the boot.
+    pending: usize,
+    /// The ranges weighed and stored since.
+    stored: usize,
+    /// The points discarded and fired again: overlapped by other work on
+    /// the device, or timed under a clock that sagged.
+    discarded: u64,
+    /// The slices run, and the longest one: what an arrival can wait
+    /// behind.
+    slices: u64,
+    longest: std::time::Duration,
+}
+
+/// One range's weighing behind serving: its options, fired one a slice in
+/// interleaved rounds, the first round untimed.
+struct Trial {
+    bottom: u32,
+    top: u32,
+    options: Vec<crate::dense::Dense>,
+    taking: Vec<Option<kernels_slang::linear::gemm::Tactic>>,
+    estimates: Vec<f64>,
+    samples: Vec<Vec<f64>>,
+    fire_lanes: u32,
+    per_lane: u32,
+    round: usize,
+    limit: usize,
+    last_spread: f64,
+    next: usize,
+    /// The GPU's clock at the range's first fire, where the platform reads
+    /// it.
+    clock: Option<u64>,
+    /// Whether a fire was timed by the host's clock (the device stated no
+    /// span of it).
+    host_clock: bool,
+    built_before: u64,
+    idle_before: bool,
+}
+
+/// What a range's weighing found to open ([`Shell::open_trial`]).
+enum Opened {
+    /// Weighed in whole served steps, a fire a slice.
+    Steps(Trial),
+    /// Not weighed: the curves' kernel kept, said by name; its row (the
+    /// kernel as served) stored where it is the choice's decision.
+    Kept(Option<[u32; 6]>),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Seated<'a, B: Serve> {
     pub lane: Lane<'a>,
@@ -953,9 +1058,12 @@ pub struct Shell<B: Serve> {
     settled: Vec<Settled>,
     /// The settle this load ran, for the engine to keep in the profile.
     to_store: Option<profile::fire::DenseSettled>,
-    /// The times a settle measured kernels at on a plane alone: `((kernel,
-    /// n, k), rows, ns)`, what its next rung's pieces are estimated by.
-    alone: Vec<((kernels_slang::linear::gemm::Tactic, u32, u32), u32, f64)>,
+    /// The dense settle left to weigh behind serving, where no stored or
+    /// committed settle of the load's key decided every range.
+    behind: Option<Behind>,
+    /// The `[rates]` keys this load serves by a figure stored under a stale
+    /// key, left to time behind serving (`profile::fire::Tuned::behind`).
+    rates_behind: Vec<String>,
 
     pipelines: B::Pipelines,
 
@@ -2781,6 +2889,10 @@ impl<B: Serve> Shell<B> {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let adapter_slots = crate::adapter::Slots::new(weights.adapter_seats());
 
+        let rates_behind = {
+            use crate::backend::Tactics as _;
+            tuning.profile().tuned().behind.clone()
+        };
         let mut shell = Shell {
             preseated: Vec::new(),
             tuning,
@@ -2799,7 +2911,8 @@ impl<B: Serve> Shell<B> {
             measuring: B::measuring(boot.device),
             settled: Vec::new(),
             to_store: None,
-            alone: Vec::new(),
+            behind: None,
+            rates_behind,
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -2898,12 +3011,17 @@ impl<B: Serve> Shell<B> {
     /// decode lanes where the load's lanes reach, else one lane's prompt of
     /// them) is fired under the choice as it stands and under each kernel
     /// the choice takes there or a vector kernel it takes anywhere, taken by
-    /// every plane over the range, where that kernel pads no more rows than
-    /// the choice does. Rounds are interleaved, each fire on fresh seats and
-    /// timed to its landing, walked so no option replays another's
-    /// recording; an option replaces the choice over a range only where its
-    /// median beats the choice's by more than their spreads. The seats are
-    /// opened fresh again after.
+    /// every plane over the range. Rounds are interleaved, each fire on
+    /// fresh seats and timed to its landing, walked so no option replays
+    /// another's recording; an option replaces the choice over a range only
+    /// where its median beats the choice's by more than their spreads.
+    ///
+    /// A load never weighs before ready. A stored or committed settle whose
+    /// key matches is taken; where none does, the nearest one's picks serve
+    /// ([`Shell::nearest_settle`]), else the curves'. Every range no
+    /// matching settle decided is left to weigh behind serving
+    /// ([`Shell::measure_behind`]): this load serves its picks as they stand,
+    /// and each range weighed is stored for the next load of the key.
     pub fn settle_dense(&mut self) -> Result<()> {
         let lanes = self
             .budgets
@@ -2914,10 +3032,11 @@ impl<B: Serve> Shell<B> {
             return Ok(());
         }
         self.settled.clear();
+        self.behind = None;
         // The ranges a settle stored as decided under the same key (its
         // method, what it weighed, the code of the kernels its steps fire;
         // the device is the user's file's, `crate::stored`) are taken again
-        // without firing; the rest are settled (again) this load.
+        // without firing; the rest are weighed behind serving.
         let (of, code) = self.settle_key(lanes)?;
         self.settle_keyed = Some((of, code));
         // The user's stored settle first, then a committed profile's: the
@@ -2932,7 +3051,7 @@ impl<B: Serve> Shell<B> {
                 Some(format!(
                     "what its ranges were weighed against changed (the code of the kernels its \
                      steps fire, or the kernel the curves pick at a range: {:#010x} stored, \
-                     {code:#010x} now); settled again, its entry replaced",
+                     {code:#010x} now); weighed again behind serving, its entry replaced",
                     stored.code
                 ))
             } else {
@@ -2981,20 +3100,16 @@ impl<B: Serve> Shell<B> {
             Some((whence, settled)) => (whence, settled.ranges),
             None => ("none", Vec::new()),
         };
-        // Skipped: nothing fires; each range the settle would weigh keeps
-        // the kernel the curves (or the profile path) chose, said by name.
-        if self.measuring == engine::rates::Measuring::Skip {
-            for &[bottom, top, replaced, vector, wide, tier] in &stored {
-                if replaced != 0 {
-                    let tactic = kernels_slang::linear::gemm::Tactic {
-                        tier: tier_of(tier),
-                        vector,
-                        wide: wide != 0,
-                    };
-                    self.dense = self.dense.with_rows(bottom, top, tactic);
-                }
+        for &row in &stored {
+            if let Some(tactic) = row_tactic(row) {
+                self.dense = self.dense.with_rows(row[0], row[1], tactic);
             }
-            let replaced = stored.iter().filter(|r| r[2] != 0).count();
+        }
+        let replaced = stored.iter().filter(|r| r[2] != 0).count();
+        // Skipped: nothing fires, now or behind serving; each range the
+        // settle would weigh keeps the kernel the curves (or the profile
+        // path) chose, said by name.
+        if self.measuring == engine::rates::Measuring::Skip {
             tracing::info!(
                 "skipped: the dense settle (`[engine] measure = false`){}, served by the estimate: \
                  each range it would weigh on the served step keeps the kernel the curves (or the \
@@ -3008,345 +3123,750 @@ impl<B: Serve> Shell<B> {
             self.say_served("settle skipped", replaced);
             return Ok(());
         }
-        for &[bottom, top, replaced, vector, wide, tier] in &stored {
-            if replaced != 0 {
-                let tactic = kernels_slang::linear::gemm::Tactic {
-                    tier: tier_of(tier),
-                    vector,
-                    wide: wide != 0,
+        let decided: Vec<(u32, u32)> = stored.iter().map(|r| (r[0], r[1])).collect();
+        let ranges = self.settle_ranges();
+        for &(bottom, top) in ranges.iter().filter(|range| decided.contains(range)) {
+            self.settled.push(Settled {
+                bottom,
+                top,
+                estimates: Vec::new(),
+                bound_ns: self.submit_bound.as_ref().map(|held| held.bound_ns),
+                checked: false,
+                replaced: false,
+                kernel: None,
+                decided: false,
+            });
+        }
+        let left: std::collections::VecDeque<(u32, u32)> = ranges
+            .into_iter()
+            .filter(|range| !decided.contains(range))
+            .collect();
+        // No settle of this key: the nearest one's picks serve meanwhile,
+        // each where it is a kernel this load weighs at that range (built
+        // at load, as every candidate is).
+        let mut served_by = if stored.is_empty() {
+            "the curves' picks".to_string()
+        } else {
+            format!("the {whence} settle's picks")
+        };
+        if stored.is_empty()
+            && !left.is_empty()
+            && let Some((near, nearest, how)) = self.nearest_settle(of)
+        {
+            let mut took = 0;
+            for &row in &nearest.ranges {
+                let Some(tactic) = row_tactic(row) else {
+                    continue;
                 };
-                self.dense = self.dense.with_rows(bottom, top, tactic);
+                let (bottom, top) = (row[0], row[1]);
+                if left.contains(&(bottom, top))
+                    && self.range_kernels(&self.dense, bottom, top).contains(&tactic)
+                {
+                    self.dense = self.dense.with_rows(bottom, top, tactic);
+                    took += 1;
+                }
+            }
+            served_by = format!(
+                "the nearest {near} settle's picks ({how}, of {:#010x}: {took} of its ranges \
+                 taken), else the curves'",
+                nearest.of
+            );
+        }
+        if left.is_empty() {
+            self.say_served(
+                if stored.is_empty() {
+                    "no range to weigh"
+                } else {
+                    "stored settle, nothing to weigh"
+                },
+                replaced,
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            pending = left.len(),
+            ranges = %left.iter().map(|(b, t)| format!("{b}-{t}")).collect::<Vec<_>>().join(", "),
+            "dense settle: {} ranges left to weigh behind serving, fewest rows first (none \
+             before ready); this load serves {served_by}, and what is weighed is stored for the \
+             next load of this key",
+            left.len()
+        );
+        self.behind = Some(Behind {
+            lanes,
+            of,
+            code,
+            rows: stored,
+            standing: self.dense.clone(),
+            pending: left.len(),
+            left,
+            trial: None,
+            stored: 0,
+            discarded: 0,
+            slices: 0,
+            longest: std::time::Duration::ZERO,
+        });
+        self.say_served("settle pending behind serving", replaced);
+        Ok(())
+    }
+
+    /// The settle nearest this load's key `of` where none matches it: a
+    /// stored settle of the same model (its method or code changed), then a
+    /// committed one; else the settle whose model shares the most planes
+    /// with this one's (the stored first on a tie). `(whence, settle, how
+    /// near)`; `None` where no settle shares a plane.
+    fn nearest_settle(&self, of: u32) -> Option<(&'static str, profile::fire::DenseSettled, String)> {
+        let all: Vec<(&'static str, &profile::fire::DenseSettled)> = self
+            .dense_rates
+            .dense_settled
+            .iter()
+            .map(|s| ("stored", s))
+            .chain(self.committed_settle.iter().map(|s| ("committed", s)))
+            .collect();
+        if let Some(&(whence, same)) = all.iter().find(|(_, s)| s.of == of) {
+            return Some((whence, same.clone(), "the same model's".to_string()));
+        }
+        let mine: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
+        let mut best: Option<(usize, &'static str, &profile::fire::DenseSettled)> = None;
+        for &(whence, settle) in &all {
+            let shared = settle.planes.iter().filter(|p| mine.contains(p)).count();
+            if shared > 0 && best.is_none_or(|(most, ..)| shared > most) {
+                best = Some((shared, whence, settle));
             }
         }
-        let decided: Vec<(u32, u32)> = stored.iter().map(|r| (r[0], r[1])).collect();
-        // Each fire in one submission, as a step admitted whole goes out.
-        self.split_next(None);
-        let walk_only = std::mem::replace(&mut self.walk_only, true);
-        // Each fire timed by its arm's two timestamps around its frames, as
-        // a served step is under a stated bound (laid for the settle where
-        // none is stated): none between its dispatches.
-        let laid = self.stamps.is_empty();
-        if laid {
-            self.stamps = (0..self.inputs.len())
-                .map(|_| B::lay_stamps(&self.device, 1))
-                .collect::<Result<Vec<_>>>()?;
+        best.map(|(shared, whence, settle)| {
+            (
+                whence,
+                settle.clone(),
+                format!("{shared} of this model's {} planes shared", mine.len()),
+            )
+        })
+    }
+
+    /// The ranges a settle weighs: each power of two of rows to the load's
+    /// chunk where a rung of the load lies, fewest rows first.
+    fn settle_ranges(&self) -> Vec<(u32, u32)> {
+        let chunk = self.budgets.tokens.max_tokens.max(1);
+        let entries = self.dense.entries();
+        let mut out = Vec::new();
+        let (mut bottom, mut rows) = (1u32, 1u32);
+        while bottom <= chunk {
+            let top = rows.min(chunk);
+            if entries.iter().any(|&at| (bottom..=top).contains(&at)) {
+                out.push((bottom, top));
+            } else {
+                tracing::info!(
+                    "dense matmul in the served step, {bottom}-{top} rows: unchecked (no rung of \
+                     the load lies in these rows)"
+                );
+            }
+            bottom = top + 1;
+            rows = rows.saturating_mul(2);
         }
-        // The device's clock before and after the weighing: a settle
-        // weighed below its nominal clock serves this load alone.
-        let reference = {
-            use crate::backend::Tactics as _;
-            self.tuning.gemm(self.tier, crate::submit::PROBE.0)
+        out
+    }
+
+    /// Every kernel the settle weighs over `bottom..=top` on `standing`:
+    /// each vector kernel and the path's tiles at the range (the one a load
+    /// picked a whole step by before planes picked their own among them),
+    /// and every kernel the choice takes there or a vector one it takes
+    /// anywhere. Every kernel the plane supports is offered at every range:
+    /// what a neighbouring range took removes none. Each is built at load.
+    fn range_kernels(
+        &self,
+        standing: &crate::dense::Dense,
+        bottom: u32,
+        top: u32,
+    ) -> Vec<kernels_slang::linear::gemm::Tactic> {
+        use crate::backend::Tactics as _;
+        use kernels_slang::linear::gemm::Tactic;
+        let base = self.tuning.gemm(self.tier, top);
+        let paths = crate::dense::tiled_kernels(B::TARGET, base);
+        let weighed = kernels_slang::linear::gemm::VECTOR_ROWS
+            .iter()
+            .map(|&vector| Tactic { vector, ..base })
+            .chain(paths.iter().copied());
+        let mut kernels: Vec<Tactic> = Vec::new();
+        for t in (bottom..=top)
+            .flat_map(|r| standing.tactics_at(r))
+            .chain(standing.vector_kernels())
+            .chain(weighed)
+        {
+            if !kernels.contains(&t) {
+                kernels.push(t);
+            }
+        }
+        kernels
+    }
+
+    /// The next `[rates]` key this load serves by a figure stored under a
+    /// stale key, to time behind serving (`profile::fire::Tuned::behind`);
+    /// `None` where none is left.
+    #[must_use]
+    pub fn rates_behind(&self) -> Option<String> {
+        self.rates_behind.first().cloned()
+    }
+
+    /// The kernel and plane the curve `name` (`<kind>/<key> at <n>x<k>`)
+    /// names among this load's dense kernels at its planes, to time behind
+    /// serving.
+    #[must_use]
+    pub fn curve_behind(&self, name: &str) -> Option<(kernels_slang::linear::gemm::Tactic, u32, u32)> {
+        let kernels = crate::rates::dense_kernels(B::TARGET, &self.tuning, self.tier, self.curve_top());
+        let shapes: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
+        crate::rates::curve_named(B::TARGET, &kernels, &shapes, name)
+    }
+
+    /// The rows a curve of this load is timed to: its widest rung.
+    #[must_use]
+    pub fn curve_top(&self) -> u32 {
+        self.dense.entries().into_iter().max().unwrap_or(1)
+    }
+
+    /// `key` timed behind serving and stored: how many are left.
+    pub fn rate_timed(&mut self, key: &str) -> usize {
+        self.rates_behind.retain(|k| k != key);
+        self.rates_behind.len()
+    }
+
+    /// Whether a dense settle is left to weigh behind serving
+    /// ([`Shell::measure_behind`]).
+    #[must_use]
+    pub fn measures_behind(&self) -> bool {
+        self.behind.is_some()
+    }
+
+    /// One slice of the dense settle left behind serving: one fire of one
+    /// option of the range being weighed (or the device's clock read where
+    /// a range opens or closes). The caller runs it only where no serving
+    /// fire waits and the runtime holds no slot of the pool, so the fire
+    /// may write the seat-addressed chunks; nothing it does changes what
+    /// this load serves, records or builds (every kernel weighed was built
+    /// at load; a slice that built one stops the settle, said). Whether it
+    /// fired: `false` where nothing is left, or the seats' segments are
+    /// not backed now (backing them would drop the recorded bodies).
+    pub fn measure_behind(&mut self, others: &dyn Fn() -> u64) -> Result<bool> {
+        let Some(mut behind) = self.behind.take() else {
+            return Ok(false);
         };
-        let clock_before = crate::rates::clock_read::<B>(&self.device, reference)?;
-        let settled = self.settle_dense_to(lanes, &decided);
-        let throttle = crate::rates::throttled(
-            clock_before,
-            crate::rates::clock_read::<B>(&self.device, reference)?,
-        );
-        if let Some(ratio) = throttle {
-            tracing::warn!(
-                ratio,
-                "dense settle: weighed with the device {ratio:.2}x slower than its nominal clock: \
-                 served this load, not stored"
-            );
-            self.timed
-                .push(format!("settle (device {ratio:.2}x below its nominal clock: not stored)"));
+        if self.pools.has_state()
+            && self.pools.seat_segments() > self.pools.chunk_facts().segments.committed
+        {
+            self.behind = Some(behind);
+            return Ok(false);
         }
+        let began = std::time::Instant::now();
+        // What serving counts of its fires is serving's alone.
+        let counts = (self.recorded, self.unkept, self.walked, self.drained, self.probed);
+        let bound_before = B::bound(&self.pipelines);
+        let built_before = B::compiled(&self.pipelines);
+        let serving = self.dense.clone();
+        let split = (self.split_next, self.split_layers);
+        let walk_only = std::mem::replace(&mut self.walk_only, true);
+        let laid = self.stamps.is_empty();
+        let slice = (|| -> Result<bool> {
+            if laid {
+                self.stamps = (0..self.inputs.len())
+                    .map(|_| B::lay_stamps(&self.device, 1))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            self.behind_slice(&mut behind, others)
+        })();
         if laid {
             self.stamps.clear();
         }
         self.spans = None;
         self.walk_only = walk_only;
-        self.recorded_serving();
-        self.unkept_serving();
-        self.walked_serving();
-        for slot in 0..lanes {
-            self.open(slot)?;
-        }
-        // The kernels the options built are the load's, not a fire's.
-        self.built = B::compiled(&self.pipelines);
-        // Every settle fire walked unkept, and a load records no body before
-        // its first served fire: none recorded stands on a kernel the
-        // settle replaced, so none is recorded again (each served shape
-        // records its body at its first fire, with the settled kernels).
-        let replaced = self.settled.iter().filter(|range| range.replaced).count();
-        tracing::info!(
-            ranges = self.settled.len(),
-            replaced,
-            recorded_before = 0,
-            "dense settle done: {replaced} of {} ranges replaced; no body was recorded before \
-             it, so none is recorded again (each served shape records its body at its first \
-             fire, with the settled kernels)",
-            self.settled.len()
-        );
-        // A settle fire the shell refuses as a program's (a class needing
-        // what no settle lane carries, a voxel clip say) is no fault of the
-        // device:
-        // the settle stops, said, and the curves' kernels serve what it did
-        // not reach; nothing of it is stored. Any other fault stands.
-        if let Err(why) = settled {
-            if !matches!(why, Fault::Program { .. }) {
-                return Err(why);
+        (self.split_next, self.split_layers) = split;
+        self.dense = serving;
+        (self.recorded, self.unkept, self.walked, self.drained, self.probed) = counts;
+        self.bound += B::bound(&self.pipelines) - bound_before;
+        behind.slices += 1;
+        behind.longest = behind.longest.max(began.elapsed());
+        let built = B::compiled(&self.pipelines).saturating_sub(built_before);
+        let more = match slice {
+            Ok(more) => more,
+            // A settle fire the shell refuses as a program's (a class
+            // needing what no settle lane carries, a voxel clip say) is no
+            // fault of the device: the settle stops, said; what it stored
+            // stands.
+            Err(why @ Fault::Program { .. }) => {
+                tracing::warn!(
+                    %why,
+                    "dense settle behind serving: a fire refused; the ranges left keep this \
+                     load's picks and are weighed again by the next load"
+                );
+                false
             }
-            // The refusal names the class and the guest input that blocked it.
+            Err(why) => return Err(why),
+        };
+        if built > 0 {
             tracing::warn!(
-                %why,
-                "dense settle: a fire refused; the curves' kernels serve the ranges it did not \
-                 settle"
+                built,
+                "dense settle behind serving: a slice built pipelines (every kernel it weighs \
+                 should be built at load); the settle stops here"
             );
-            self.say_served("settle stopped short", replaced);
-            return Ok(());
+            return Ok(true);
         }
-        // Stored for a later load under the same key: the ranges stored
-        // before and every range weighed now, an undecided one (no option ran
-        // apart from the rest) with the kernel this load serves it by. A boot
-        // whose stored settle's key matches weighs nothing again: a range is
-        // weighed once per key, never again load after load.
-        let mut ranges = stored.clone();
-        for range in self.settled.iter().filter(|range| range.checked) {
-            let (vector, wide, tier) = range.kernel.map_or((0, 0, 0), |t| {
-                (t.vector, u32::from(t.wide), tier_number(t.tier))
-            });
-            ranges.push([
-                range.bottom,
-                range.top,
-                u32::from(range.replaced),
-                vector,
-                wide,
-                tier,
-            ]);
+        if more {
+            self.behind = Some(behind);
+        } else {
+            tracing::info!(
+                pending = behind.pending,
+                stored = behind.stored,
+                discarded = behind.discarded,
+                slices = behind.slices,
+                longest_ms = behind.longest.as_secs_f64() * 1e3,
+                "dense settle behind serving done: {} of {} ranges stored for the next load ({} \
+                 points discarded and fired again); the longest slice, what an arrival waited \
+                 behind at most, {:.1} ms",
+                behind.stored,
+                behind.pending,
+                behind.discarded,
+                behind.longest.as_secs_f64() * 1e3
+            );
         }
-        let status: Vec<String> = self
-            .settled
-            .iter()
-            .map(|range| {
-                let what = if decided.contains(&(range.bottom, range.top)) {
-                    "stored, decided"
-                } else if !range.checked {
-                    "unchecked"
-                } else if range.decided {
-                    "decided this load"
-                } else {
-                    "undecided (its kernel as served now stored)"
-                };
-                format!("{}-{} {what}", range.bottom, range.top)
-            })
-            .collect();
-        tracing::info!("dense settle ranges: {}", status.join(", "));
-        if ranges.len() > stored.len() {
-            let keep = profile::fire::DenseSettled {
-                method: SETTLE_METHOD,
-                of,
-                code,
-                ranges,
-                planes: {
-                    let mut planes: Vec<(u32, u32)> =
-                        self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
-                    planes.sort_unstable();
-                    planes.dedup();
-                    planes
-                },
-            };
-            self.dense_rates.dense_settled.retain(|s| s.of != of);
-            self.dense_rates.dense_settled.push(keep.clone());
-            if throttle.is_none() {
-                self.to_store = Some(keep);
-            }
-        }
-        let weighed = self.settled.iter().any(|range| range.checked);
-        self.say_served(
-            match (stored.is_empty(), weighed) {
-                (true, _) => "settled this load",
-                (false, false) => "stored settle, nothing weighed this load",
-                (false, true) => "stored settle, the rest settled this load",
-            },
-            replaced,
-        );
-        Ok(())
+        Ok(true)
     }
 
-    /// The range `bottom..=top` weighed on its widest plane alone
-    /// (`Serve::time_kernels`): the choice's kernel there and each of
-    /// `candidates`, one fire a round at `top` rows; the choice replaced
-    /// over the range where a kernel ran apart from it, as a range timed in
-    /// whole steps is.
-    fn settle_alone(
+    /// What the settle behind serving stands at, for a status line:
+    /// `(ranges pending at the boot, stored since, points discarded)`;
+    /// `None` where none is left.
+    #[must_use]
+    pub fn behind_status(&self) -> Option<(usize, usize, u64)> {
+        self.behind
+            .as_ref()
+            .map(|b| (b.pending, b.stored, b.discarded))
+    }
+
+    fn behind_slice(&mut self, behind: &mut Behind, others: &dyn Fn() -> u64) -> Result<bool> {
+        let Some(mut trial) = behind.trial.take() else {
+            let Some((bottom, top)) = behind.left.pop_front() else {
+                return Ok(false);
+            };
+            match self.open_trial(&behind.standing, bottom, top, behind.lanes)? {
+                Opened::Steps(trial) => behind.trial = Some(trial),
+                Opened::Kept(row) => {
+                    if let Some(row) = row {
+                        behind.rows.push(row);
+                        behind.stored += 1;
+                        self.to_store = Some(self.behind_entry(behind));
+                    }
+                }
+            }
+            return Ok(behind.trial.is_some() || !behind.left.is_empty());
+        };
+        if let Some(why) = self.trial_fire(&mut trial, others)? {
+            behind.discarded += 1;
+            tracing::debug!(
+                bottom = trial.bottom,
+                top = trial.top,
+                discarded = behind.discarded,
+                "dense settle behind serving: a point discarded ({why}); fired again later"
+            );
+        }
+        if trial.round <= trial.limit {
+            behind.trial = Some(trial);
+            return Ok(true);
+        }
+        let (row, taken) = self.close_trial(trial);
+        if let Some(tactic) = taken {
+            behind.standing = behind.standing.with_rows(row[0], row[1], tactic);
+        }
+        behind.rows.push(row);
+        behind.stored += 1;
+        self.to_store = Some(self.behind_entry(behind));
+        tracing::info!(
+            pending = behind.pending,
+            stored = behind.stored,
+            discarded = behind.discarded,
+            "dense settle behind serving: {} of {} ranges weighed and stored ({} points \
+             discarded: overlapped by other work on the device, or under a clock that sagged)",
+            behind.stored,
+            behind.pending,
+            behind.discarded
+        );
+        Ok(!behind.left.is_empty())
+    }
+
+    /// The settle entry for the profile as `behind` stands: the rows stored
+    /// before and every range weighed since whose clock held.
+    fn behind_entry(&self, behind: &Behind) -> profile::fire::DenseSettled {
+        let mut planes: Vec<(u32, u32)> =
+            self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
+        planes.sort_unstable();
+        planes.dedup();
+        profile::fire::DenseSettled {
+            method: SETTLE_METHOD,
+            of: behind.of,
+            code: behind.code,
+            ranges: behind.rows.clone(),
+            planes,
+        }
+    }
+
+    /// The options of range `bottom..=top` on `standing`, under a stated
+    /// submit bound each only where serving submits its step whole and the
+    /// option's step (the standing's estimate, lengthened by the option's
+    /// matmul over the standing's by the curves) fits the bound too.
+    fn open_trial(
         &mut self,
+        standing: &crate::dense::Dense,
         bottom: u32,
         top: u32,
-        standing: &crate::dense::Dense,
-        candidates: &[kernels_slang::linear::gemm::Tactic],
-    ) -> Result<()> {
-        let Some(&(n, k, ..)) = self
-            .dense_planes
-            .iter()
-            .max_by_key(|&&(n, k, ..)| u64::from(n) * u64::from(k))
-        else {
-            return Ok(());
-        };
-        let kept = standing.at(top, n, k);
-        let mut kernels = vec![kept];
-        for &t in candidates {
-            if !kernels.contains(&t) {
-                kernels.push(t);
+        lanes: u32,
+    ) -> Result<Opened> {
+        let candidates = self.range_kernels(standing, bottom, top);
+        let mut options = vec![standing.clone()];
+        let mut taking: Vec<Option<kernels_slang::linear::gemm::Tactic>> = vec![None];
+        for &t in &candidates {
+            let option = standing.with_rows(bottom, top, t);
+            if !options.contains(&option) {
+                options.push(option);
+                taking.push(Some(t));
             }
         }
-        // Under a stated bound each kernel's fire is cut into pieces of the
-        // plane's columns, each estimated to fit the bound at the GPU's
-        // least clock: its estimate the larger of its curve's and its time
-        // measured at the rows below (scaled by the rows), at the bound's
-        // stored ratio and floor factor. A kernel whose narrowest piece
-        // (64 columns) cannot fit is not weighed, said by name; the choice's
-        // own kernel not fitting leaves the range on the curves.
-        let mut pieces = vec![1u32; kernels.len()];
-        let mut weighed = vec![true; kernels.len()];
-        if let Some(held) = self.submit_bound.as_ref() {
-            let ratio = held.stored_ratio() * held.floor_factor();
-            for (i, &t) in kernels.iter().enumerate() {
-                let by_curve = crate::dense::plane_ns(B::TARGET, &self.dense_rates, t, (n, k), top);
-                let by_below = self
-                    .alone
-                    .iter()
-                    .filter(|&&(at, _, _)| at == (t, n, k))
-                    .map(|&(_, rows, ns)| ns * f64::from(top) / f64::from(rows))
-                    .fold(None, |most: Option<f64>, ns| {
-                        Some(most.map_or(ns, |m| m.max(ns)))
-                    });
-                let estimate = match (by_curve, by_below) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                };
-                let Some(estimate) = estimate.map(|ns| ns * ratio) else {
-                    weighed[i] = false;
-                    continue;
-                };
-                let narrowest = estimate * 64.0 / f64::from(n);
-                if narrowest > held.bound_ns {
-                    weighed[i] = false;
-                    tracing::info!(
-                        kernel = %crate::dense::name(&t),
-                        rows = top,
-                        n,
-                        k,
-                        estimate_ms = estimate / 1e6,
-                        bound_ms = held.bound_ns / 1e6,
-                        "dense settle: a kernel's narrowest piece of the plane is past the \
-                         submit bound at the least clock; not weighed"
-                    );
-                    continue;
+        // As many decode lanes, else one lane's prompt.
+        let (fire_lanes, per_lane) = if top <= lanes { (top, 1) } else { (1, top) };
+        let bound_ns = self.submit_bound.as_ref().map(|held| held.bound_ns);
+        let mut estimates: Vec<f64> = Vec::new();
+        let offered = options.len();
+        if self.submit_bound.is_some() && options.len() > 1 {
+            self.retime(engine::FrameId(0))?;
+            self.track();
+        }
+        let mut said = false;
+        if let Some(held) = self.submit_bound.clone().filter(|_| options.len() > 1) {
+            let step = crate::submit::StepRows {
+                rows: fire_lanes * per_lane,
+                lanes: fire_lanes,
+                keys: per_lane,
+                prompt: per_lane > 1,
+            };
+            match held.admit(step) {
+                crate::submit::Admitted::Whole { ns } => {
+                    let mut kept = Vec::new();
+                    let mut kept_taking = Vec::new();
+                    for (i, option) in options.into_iter().enumerate() {
+                        let lengthened = if i == 0 {
+                            Some(1.0)
+                        } else {
+                            crate::dense::slower_by(
+                                B::TARGET,
+                                &self.dense_rates,
+                                &self.dense_planes,
+                                standing,
+                                &option,
+                                top,
+                            )
+                        };
+                        match lengthened.map(|by| ns * by.max(1.0)) {
+                            Some(estimate) if estimate <= held.bound_ns => {
+                                estimates.push(estimate);
+                                kept.push(option);
+                                kept_taking.push(taking[i]);
+                            }
+                            _ => {}
+                        }
+                    }
+                    options = kept;
+                    taking = kept_taking;
                 }
-                pieces[i] = u32::try_from((estimate / held.bound_ns).ceil() as u64)
-                    .unwrap_or(u32::MAX)
-                    .max(1);
+                admitted => {
+                    tracing::info!(
+                        "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
+                         unchecked (served {} under the submit bound of {:.0} ms)",
+                        if admitted.split() {
+                            "split by layers"
+                        } else {
+                            "cut by rows"
+                        },
+                        held.bound_ns / 1e6
+                    );
+                    said = true;
+                    options.truncate(1);
+                }
             }
         }
-        if !weighed[0] {
-            tracing::info!(
-                "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
-                 unchecked (the choice's kernel cannot be weighed within the submit bound)"
-            );
-            return Ok(());
-        }
-        let kernels: Vec<kernels_slang::linear::gemm::Tactic> = kernels
-            .into_iter()
-            .zip(&weighed)
-            .filter_map(|(t, &w)| w.then_some(t))
-            .collect();
-        let pieces: Vec<u32> = pieces
-            .into_iter()
-            .zip(&weighed)
-            .filter_map(|(p, &w)| w.then_some(p))
-            .collect();
-        let max_submit = self.submit_bound.as_ref().map(|held| {
-            std::time::Duration::from_nanos((held.bound_ns / held.floor_factor()) as u64)
-        });
-        let launch = self.dense_rates.launch_ns.unwrap_or(0) as f64;
-        let samples = B::time_kernels(
-            &self.device,
-            &self.tuning,
-            self.tier,
-            max_submit,
-            launch,
-            &kernels,
-            &pieces,
-            (n, k),
-            top,
-        )?;
-        // Rounds again, twice more at most, while no kernel separates from
-        // every other by their spreads.
-        let mut samples = samples;
-        for _ in 0..2 {
-            if samples[0].is_empty() || crate::dense::settle_pick(&samples).is_some() {
-                break;
+        if options.len() <= 1 {
+            if !said {
+                tracing::info!(
+                    "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
+                     unchecked ({})",
+                    if offered > 1 {
+                        "no other kernel's step fits the submit bound"
+                    } else {
+                        "no other kernel to weigh"
+                    }
+                );
             }
-            let more = B::time_kernels(
-                &self.device,
-                &self.tuning,
-                self.tier,
-                max_submit,
-                launch,
-                &kernels,
-                &pieces,
-                (n, k),
+            self.settled.push(Settled {
+                bottom,
                 top,
-            )?;
-            for (s, m) in samples.iter_mut().zip(more) {
-                s.extend(m);
-            }
+                estimates: Vec::new(),
+                bound_ns,
+                checked: false,
+                replaced: false,
+                kernel: None,
+                decided: false,
+            });
+            // A range no whole served step weighs keeps the curves' kernel,
+            // stored so the next load does not open it again.
+            return Ok(Opened::Kept(Some([bottom, top, 0, 0, 0, 0])));
         }
-        for (&t, s) in kernels.iter().zip(&samples) {
-            if !s.is_empty() {
-                let (ns, _) = crate::rates::median_spread(s);
-                self.alone.push(((t, n, k), top, ns));
-            }
+        Ok(Opened::Steps(Trial {
+            bottom,
+            top,
+            samples: vec![Vec::new(); options.len()],
+            options,
+            taking,
+            estimates,
+            fire_lanes,
+            per_lane,
+            round: 0,
+            limit: crate::rates::REPEATS,
+            last_spread: f64::INFINITY,
+            next: 0,
+            clock: None,
+            host_clock: false,
+            built_before: B::compiled(&self.pipelines),
+            idle_before: crate::backend::Context::idle(&self.device),
+        }))
+    }
+
+    /// One fire of `trial`'s next option, on fresh seats and timed to its
+    /// landing (the first round warms each option, untimed); the round
+    /// closes after its last option, rounds going on, as many again at
+    /// most twice, while no option's times separate from every other's by
+    /// their spreads and each further set still narrows the widest spread
+    /// (`crate::dense::settle_pick`). A timed point is taken only where it
+    /// had the device alone at a steady clock: the device idle as it
+    /// starts, no other lane submitting while it runs (`others`, the
+    /// runtime's count of every lane's submissions), and the device's
+    /// clock, read warmed before it and again after, not moved either way
+    /// by more than the reads' spread (`crate::rates::clock_moved`: a boost
+    /// ending, a ramp, a sag). Else it is discarded and fired again in
+    /// a later slice, so contention or a DVFS step is never stored as a
+    /// kernel's figure: `Some(why)`.
+    fn trial_fire(&mut self, trial: &mut Trial, others: &dyn Fn() -> u64) -> Result<Option<String>> {
+        use crate::backend::Tactics as _;
+        let timed = trial.round > 0;
+        if timed && !crate::backend::Context::idle(&self.device) {
+            return Ok(Some("the device had other work as it started".to_string()));
         }
-        let pick = if samples[0].is_empty() {
-            None
+        let reference = self.tuning.gemm(self.tier, crate::submit::PROBE.0);
+        let clock_before = if timed {
+            Some(crate::rates::clock_warmed::<B>(&self.device, reference)?)
         } else {
-            crate::dense::settle_pick(&samples)
+            None
         };
+        let submitted = others();
+        let decode = self.trace.facts.word(&poem_ir::Request::new(1, false));
+        let word = if trial.per_lane == 1 {
+            decode
+        } else {
+            self.trace
+                .facts
+                .word(&poem_ir::Request::new(trial.per_lane, false))
+        };
+        let tokens: Vec<u32> = (0..trial.per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
+        // Zeros for every guest input a class reads: a settle lane feeds no
+        // channel, and a class reading one serves the same kernels whatever
+        // the input holds.
+        let zeros: Vec<(engine::fire::InputFeed, InputCell<B>)> = self
+            .feeds
+            .inputs
+            .iter()
+            .filter(|(seat, _)| !seat.voxel())
+            .map(|(seat, _)| {
+                let feed = engine::fire::InputFeed {
+                    id: seat.id,
+                    channel: engine::channel::ChannelId(0),
+                };
+                (feed, InputCell::Zeros)
+            })
+            .collect();
+        // Each fire in one submission, as a step admitted whole goes out.
+        self.split_next(None);
+        self.dense = trial.options[trial.next].clone();
+        let fire_lanes = trial.fire_lanes;
+        for slot in 0..fire_lanes {
+            self.open(slot)?;
+        }
+        let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
+            .map(|slot| Seated {
+                hosts: false,
+                inputs: &zeros,
+                ..Seated::of(Lane {
+                    slot,
+                    word,
+                    tokens: &tokens,
+                })
+            })
+            .collect();
+        self.drain()?;
+        self.spans = Some(Vec::new());
+        let began = std::time::Instant::now();
+        self.fire_seated(&seated)?;
+        let host = began.elapsed().as_secs_f64() * 1e9;
+        let spans = self.spans.take().unwrap_or_default();
+        // The device's times, filled once its steps landed (a backend may
+        // fill one a moment after it saw the landing).
+        let read = std::time::Instant::now();
+        while spans.iter().any(|time| time.get().is_none())
+            && read.elapsed() < std::time::Duration::from_secs(1)
+        {
+            self.reap()?;
+            std::thread::yield_now();
+        }
+        let device: Option<u64> = (!spans.is_empty())
+            .then(|| {
+                spans
+                    .iter()
+                    .map(|time| time.get().flatten())
+                    .sum::<Option<u64>>()
+            })
+            .flatten();
+        // The seats as the runtime finds them: opened fresh.
+        for slot in 0..fire_lanes {
+            self.open(slot)?;
+        }
+        if others() != submitted {
+            return Ok(Some("another lane submitted while it ran".to_string()));
+        }
+        if let Some(before) = clock_before {
+            let after = crate::rates::clock_read::<B>(&self.device, reference)?;
+            if let Some(ratio) = crate::rates::clock_moved(before, after) {
+                return Ok(Some(format!(
+                    "the device's clock moved under it: its reference {ratio:.2}x the time after \
+                     it that it took before"
+                )));
+            }
+        }
+        // The device's span of the fire's frames: a walk's host encode is
+        // not the served step's, which replays its recording. The host's
+        // clock only where the device times nothing.
+        let ns = device.map_or_else(
+            || {
+                trial.host_clock = true;
+                host
+            },
+            |ns| ns as f64,
+        );
+        // At the clock the GPU ran at the range's first fire, where the
+        // platform reads it: a clock that fell between fires slows every
+        // later one alike, not the option it fell on.
+        let ns = match self.submit_bound.as_ref().and_then(|held| held.clock_now()) {
+            Some(hz) => {
+                let first = *trial.clock.get_or_insert(hz);
+                ns * hz as f64 / first as f64
+            }
+            None => ns,
+        };
+        if timed {
+            trial.samples[trial.next].push(ns);
+        }
+        trial.next += 1;
+        if trial.next == trial.options.len() {
+            trial.next = 0;
+            trial.round += 1;
+            // Tied: rounds go on while each further set of them still
+            // narrows the widest spread (the noise is averaging out),
+            // stopping once one does not.
+            if trial.round > trial.limit && crate::dense::settle_pick(&trial.samples).is_none() {
+                let spread = trial
+                    .samples
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| crate::rates::median_spread(s).1)
+                    .fold(0.0, f64::max);
+                if spread < trial.last_spread {
+                    trial.last_spread = spread;
+                    trial.limit += crate::rates::REPEATS;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// What `trial` decided: the option whose times, widened by their
+    /// spread, lie under every other's widened by theirs replaces the
+    /// choice; where none separates (a tie inside the spreads, after the
+    /// further rounds) the choice stands, recorded as tied. Its stored row
+    /// (an undecided range with the kernel as served), and the kernel it
+    /// took where it replaced the standing one.
+    fn close_trial(
+        &mut self,
+        trial: Trial,
+    ) -> ([u32; 6], Option<kernels_slang::linear::gemm::Tactic>) {
+        let Trial {
+            bottom,
+            top,
+            options,
+            taking,
+            estimates,
+            samples,
+            round,
+            host_clock,
+            built_before,
+            idle_before,
+            ..
+        } = trial;
+        let pick = crate::dense::settle_pick(&samples);
         let taken = pick.unwrap_or(0);
-        let decided = pick.is_some();
-        let weighed: Vec<String> = kernels
+        let weighed: Vec<String> = options
             .iter()
             .zip(&samples)
-            .filter(|(_, s)| !s.is_empty())
-            .map(|(t, s)| {
+            .map(|(o, s)| {
                 let (ns, spread) = crate::rates::median_spread(s);
                 format!(
                     "{} {:.1} µs ({:.0}%)",
-                    crate::dense::name(t),
+                    o.runs_at(top).join(" / "),
                     ns / 1e3,
                     spread * 100.0
                 )
             })
             .collect();
         tracing::info!(
-            "dense matmul in the served step, {bottom}-{top} rows: weighed on its widest plane \
-             {n}x{k} alone at {top} rows (no whole step timed): {} ({})",
+            rounds = round.saturating_sub(1),
+            built_during = B::compiled(&self.pipelines).saturating_sub(built_before),
+            idle_at_start = idle_before,
+            "dense matmul in the served step, {bottom}-{top} rows (weighed behind serving): {} \
+             ({}; timed by the {})",
             match pick {
                 None => "tied inside the spreads, kept",
                 Some(0) => "kept",
                 Some(_) => "replaced",
             },
-            weighed.join(" vs ")
+            weighed.join(" vs "),
+            if host_clock {
+                "host's clock (the device stated no span)"
+            } else {
+                "device's spans"
+            }
         );
-        if taken != 0 {
-            self.dense = standing.with_rows(bottom, top, kernels[taken]);
-        }
+        // Decided where the choice stands (no option ran apart from it, so
+        // the options tie with it or lose), or where the kernel taken ran
+        // apart from every other option too; undecided where it beat the
+        // choice but ties another.
+        let kernel = taking.get(taken).copied().flatten();
         self.settled.push(Settled {
             bottom,
             top,
-            estimates: Vec::new(),
+            estimates,
             bound_ns: self.submit_bound.as_ref().map(|held| held.bound_ns),
             checked: true,
             replaced: taken != 0,
-            kernel: (taken != 0).then(|| kernels[taken]),
-            decided,
+            kernel,
+            decided: pick.is_some(),
         });
-        Ok(())
+        let (vector, wide, tier) = kernel.map_or((0, 0, 0), |t| {
+            (t.vector, u32::from(t.wide), tier_number(t.tier))
+        });
+        (
+            [bottom, top, u32::from(taken != 0), vector, wide, tier],
+            kernel,
+        )
     }
-
     /// The settle's key beside its method ([`SETTLE_METHOD`]): `of`, which
     /// model's settle it is (`crate::dense::settle_of`: its planes, the
     /// load's lanes and rows, the backend), one entry a model; and `code`,
@@ -3459,16 +3979,14 @@ impl<B: Serve> Shell<B> {
 
     /// What this load timed, each by name: its profile's (`rates`, the
     /// dense curves, `resident_workgroups`) and the shell's (the bound
-    /// probe, the settle where it weighed a range). Empty: it measured
-    /// nothing.
+    /// probe). Empty: it measured nothing.
     #[must_use]
     pub fn measured_at_load(&self) -> Vec<String> {
         use crate::backend::Tactics as _;
         let mut all = self.tuning.profile().tuned().timed.clone();
         all.extend(self.timed.iter().cloned());
-        if self.settled.iter().any(|range| range.checked) {
-            all.push("settle".to_string());
-        }
+        // The dense settle never weighs at load: what it leaves is weighed
+        // behind serving ([`Shell::measure_behind`]).
         all
     }
 
@@ -3516,383 +4034,6 @@ impl<B: Serve> Shell<B> {
     /// The settle the load ran and the profile should keep, taken once.
     pub fn take_settled(&mut self) -> Option<profile::fire::DenseSettled> {
         self.to_store.take()
-    }
-
-    fn settle_dense_to(&mut self, lanes: u32, decided: &[(u32, u32)]) -> Result<()> {
-        use kernels_slang::linear::gemm::{Tactic, tile_for};
-        // Rounds a range's fires take, interleaved: the shape step's.
-        const ROUNDS: usize = crate::rates::REPEATS;
-        let tile = |t: Tactic| tile_for(B::TARGET, t, 4096, 4096).row_tile();
-        let chunk = self.budgets.tokens.max_tokens.max(1);
-        let vectors = self.dense.vector_kernels();
-        let entries = self.dense.entries();
-        let decode = self.trace.facts.word(&poem_ir::Request::new(1, false));
-        let mut bottom = 1;
-        let mut rows = 1u32;
-        while bottom <= chunk {
-            let top = rows.min(chunk);
-            if decided.contains(&(bottom, top)) {
-                // Decided by a stored settle: not fired again.
-                self.settled.push(Settled {
-                    bottom,
-                    top,
-                    estimates: Vec::new(),
-                    bound_ns: self.submit_bound.as_ref().map(|held| held.bound_ns),
-                    checked: false,
-                    replaced: false,
-                    kernel: None,
-                    decided: false,
-                });
-            } else if entries.iter().any(|&at| (bottom..=top).contains(&at)) {
-                let standing = self.dense.clone();
-                // The most rows any plane's kernel pads a fire to, over the
-                // range: no option pads past it.
-                let widest = (bottom..=top)
-                    .flat_map(|r| standing.tactics_at(r))
-                    .map(tile)
-                    .max()
-                    .unwrap_or(1);
-                let mut kernels: Vec<Tactic> = Vec::new();
-                // Every kernel the choice weighs at these rows (each vector
-                // kernel, the path's tiles: the one a load picked a whole
-                // step by before planes picked their own among them), and
-                // every kernel the choice takes here or a vector one it takes
-                // anywhere; each where it pads no more rows than the choice.
-                let base = self.tuning.gemm(self.tier, top);
-                let paths = crate::dense::tiled_kernels(B::TARGET, base);
-                let weighed = kernels_slang::linear::gemm::VECTOR_ROWS
-                    .iter()
-                    .map(|&vector| Tactic { vector, ..base })
-                    .chain(paths.iter().copied());
-                for t in (bottom..=top)
-                    .flat_map(|r| standing.tactics_at(r))
-                    .chain(vectors.iter().copied())
-                    .chain(weighed)
-                {
-                    // The path's own tiles at the rung (what a load ran a
-                    // whole step by, its fires laid at the rung already) are
-                    // weighed whatever they pad to: every matmul kernel
-                    // guards the rows it is given, so a tile past a fire's
-                    // rows reads and writes none of them.
-                    // Every kernel the plane supports is offered at every
-                    // range: what a neighbouring range took removes none.
-                    let _ = widest;
-                    if !kernels.contains(&t) {
-                        kernels.push(t);
-                    }
-                }
-                let candidates = kernels.clone();
-                let mut options = vec![standing.clone()];
-                let mut taking: Vec<Option<Tactic>> = vec![None];
-                for t in kernels {
-                    let option = standing.with_rows(bottom, top, t);
-                    if !options.contains(&option) {
-                        options.push(option);
-                        taking.push(Some(t));
-                    }
-                }
-                // As many decode lanes, else one lane's prompt.
-                let (fire_lanes, per_lane) = if top <= lanes { (top, 1) } else { (1, top) };
-                // Under a stated submit bound, every fire is admitted as
-                // serving admits its step: the range is checked only where
-                // serving submits the step whole, and each option only where
-                // its step (the standing's estimate, lengthened by the
-                // option's matmul over the standing's by the curves) fits
-                // the bound too. A range serving splits keeps its kernel
-                // from the curves, unchecked.
-                let mut estimates: Vec<f64> = Vec::new();
-                let bound_ns = self.submit_bound.as_ref().map(|held| held.bound_ns);
-                let offered = options.len();
-                let mut said = false;
-                if self.submit_bound.is_some() && options.len() > 1 {
-                    self.retime(engine::FrameId(0))?;
-                    self.track();
-                }
-                if let Some(held) = self.submit_bound.clone().filter(|_| options.len() > 1) {
-                    let step = crate::submit::StepRows {
-                        rows: fire_lanes * per_lane,
-                        lanes: fire_lanes,
-                        keys: per_lane,
-                        prompt: per_lane > 1,
-                    };
-                    match held.admit(step) {
-                        crate::submit::Admitted::Whole { ns } => {
-                            let mut kept = Vec::new();
-                            for (i, option) in options.into_iter().enumerate() {
-                                let lengthened = if i == 0 {
-                                    Some(1.0)
-                                } else {
-                                    crate::dense::slower_by(
-                                        B::TARGET,
-                                        &self.dense_rates,
-                                        &self.dense_planes,
-                                        &standing,
-                                        &option,
-                                        top,
-                                    )
-                                };
-                                match lengthened.map(|by| ns * by.max(1.0)) {
-                                    Some(estimate) if estimate <= held.bound_ns => {
-                                        estimates.push(estimate);
-                                        kept.push(option);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            options = kept;
-                        }
-                        admitted => {
-                            tracing::info!(
-                                "dense matmul in the served step, {bottom}-{top} rows: from the \
-                                 curves, unchecked (served {} under the submit bound of {:.0} ms)",
-                                if admitted.split() {
-                                    "split by layers"
-                                } else {
-                                    "cut by rows"
-                                },
-                                held.bound_ns / 1e6
-                            );
-                            said = true;
-                            options.truncate(1);
-                        }
-                    }
-                }
-                if options.len() <= 1 && offered > 1 {
-                    // A range timed in no whole served step (the bound splits
-                    // it, or no other kernel's step fits) is weighed on its
-                    // widest plane alone: each kernel once a round, at the
-                    // range's top rows, within the bound (the plane's
-                    // columns split where it refuses one), so no stale or
-                    // wrong curve keeps a kernel several times slower.
-                    self.settle_alone(bottom, top, &standing, &candidates)?;
-                    bottom = top + 1;
-                    rows = rows.saturating_mul(2);
-                    continue;
-                }
-                if options.len() <= 1 && !said {
-                    tracing::info!(
-                        "dense matmul in the served step, {bottom}-{top} rows: from the curves, \
-                         unchecked (no other kernel to weigh)"
-                    );
-                }
-                self.settled.push(Settled {
-                    bottom,
-                    top,
-                    estimates: if options.len() > 1 {
-                        estimates.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    bound_ns,
-                    checked: options.len() > 1,
-                    replaced: false,
-                    kernel: None,
-                    decided: false,
-                });
-                if options.len() > 1 {
-                    let word = if per_lane == 1 {
-                        decode
-                    } else {
-                        self.trace
-                            .facts
-                            .word(&poem_ir::Request::new(per_lane, false))
-                    };
-                    let tokens: Vec<u32> = (0..per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
-                    // Zeros for every guest input a class reads: a settle
-                    // lane feeds no channel, and a class reading one serves
-                    // the same kernels whatever the input holds.
-                    let zeros: Vec<(engine::fire::InputFeed, InputCell<B>)> = self
-                        .feeds
-                        .inputs
-                        .iter()
-                        .filter(|(seat, _)| !seat.voxel())
-                        .map(|(seat, _)| {
-                            let feed = engine::fire::InputFeed {
-                                id: seat.id,
-                                channel: engine::channel::ChannelId(0),
-                            };
-                            (feed, InputCell::Zeros)
-                        })
-                        .collect();
-                    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); options.len()];
-                    // Whether a fire was timed by the host's clock (the
-                    // device stated no span of it).
-                    let host_clock = std::cell::Cell::new(false);
-                    // The GPU's clock at the range's first fire.
-                    let mut clock: Option<u64> = None;
-                    // A first round warms each option, untimed. Rounds go
-                    // on, as many again at most twice, while no option's
-                    // times separate from every other's by their spreads
-                    // (`crate::dense::settle_pick`).
-                    let mut limit = ROUNDS;
-                    let mut round = 0;
-                    let mut last_spread = f64::INFINITY;
-                    let widest_spread = |samples: &[Vec<f64>]| {
-                        samples
-                            .iter()
-                            .filter(|s| !s.is_empty())
-                            .map(|s| crate::rates::median_spread(s).1)
-                            .fold(0.0, f64::max)
-                    };
-                    // What else is in flight as the trial times: the
-                    // pipelines built meanwhile and whether the device sat
-                    // idle at its start (a trial timed beside other work
-                    // reads that work's noise).
-                    let built_before = B::compiled(&self.pipelines);
-                    let idle_before = crate::backend::Context::idle(&self.device);
-                    while round <= limit {
-                        for (i, option) in options.iter().enumerate() {
-                            self.dense = option.clone();
-                            let fired = (|| -> Result<f64> {
-                                for slot in 0..fire_lanes {
-                                    self.open(slot)?;
-                                }
-                                let seated: Vec<Seated<'_, B>> = (0..fire_lanes)
-                                    .map(|slot| Seated {
-                                        hosts: false,
-                                        inputs: &zeros,
-                                        ..Seated::of(Lane {
-                                            slot,
-                                            word,
-                                            tokens: &tokens,
-                                        })
-                                    })
-                                    .collect();
-                                self.drain()?;
-                                self.spans = Some(Vec::new());
-                                let began = std::time::Instant::now();
-                                self.fire_seated(&seated)?;
-                                let host = began.elapsed().as_secs_f64() * 1e9;
-                                let spans = self.spans.take().unwrap_or_default();
-                                // The device's times, filled once its steps
-                                // landed (a backend may fill one a moment
-                                // after it saw the landing).
-                                let read = std::time::Instant::now();
-                                while spans.iter().any(|time| time.get().is_none())
-                                    && read.elapsed() < std::time::Duration::from_secs(1)
-                                {
-                                    self.reap()?;
-                                    std::thread::yield_now();
-                                }
-                                let device: Option<u64> = (!spans.is_empty())
-                                    .then(|| {
-                                        spans
-                                            .iter()
-                                            .map(|time| time.get().flatten())
-                                            .sum::<Option<u64>>()
-                                    })
-                                    .flatten();
-                                // The device's span of the fire's frames: a
-                                // walk's host encode is not the served
-                                // step's, which replays its recording. The
-                                // host's clock only where the device times
-                                // nothing.
-                                let ns = device.map_or_else(
-                                    || {
-                                        host_clock.set(true);
-                                        host
-                                    },
-                                    |ns| ns as f64,
-                                );
-                                // At the clock the GPU ran at the range's
-                                // first fire, where the platform reads it: a
-                                // clock that fell between fires slows every
-                                // later one alike, not the option it fell on.
-                                Ok(
-                                    match self
-                                        .submit_bound
-                                        .as_ref()
-                                        .and_then(|held| held.clock_now())
-                                    {
-                                        Some(hz) => {
-                                            let first = *clock.get_or_insert(hz);
-                                            ns * hz as f64 / first as f64
-                                        }
-                                        None => ns,
-                                    },
-                                )
-                            })();
-                            match fired {
-                                Ok(ns) if round > 0 => samples[i].push(ns),
-                                Ok(_) => {}
-                                Err(e) => {
-                                    self.dense = standing;
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        round += 1;
-                        // Tied: rounds go on while each further set of them
-                        // still narrows the widest spread (the noise is
-                        // averaging out), stopping once one does not.
-                        if round > limit && crate::dense::settle_pick(&samples).is_none() {
-                            let spread = widest_spread(&samples);
-                            if spread < last_spread {
-                                last_spread = spread;
-                                limit += ROUNDS;
-                            }
-                        }
-                    }
-                    // The option whose times, widened by their spread, lie
-                    // under every other's widened by theirs replaces the
-                    // choice; where none separates (a tie inside the
-                    // spreads, after the further rounds) the choice stands,
-                    // recorded as tied (`crate::dense::settle_pick`).
-                    let pick = crate::dense::settle_pick(&samples);
-                    let taken = pick.unwrap_or(0);
-                    let weighed: Vec<String> = options
-                        .iter()
-                        .zip(&samples)
-                        .map(|(o, s)| {
-                            let (ns, spread) = crate::rates::median_spread(s);
-                            format!(
-                                "{} {:.1} µs ({:.0}%)",
-                                o.runs_at(top).join(" / "),
-                                ns / 1e3,
-                                spread * 100.0
-                            )
-                        })
-                        .collect();
-                    tracing::info!(
-                        rounds = round.saturating_sub(1),
-                        built_during = B::compiled(&self.pipelines).saturating_sub(built_before),
-                        idle_at_start = idle_before,
-                        "dense matmul in the served step, {bottom}-{top} rows: {} ({}; timed by \
-                         the {})",
-                        match pick {
-                            None => "tied inside the spreads, kept",
-                            Some(0) => "kept",
-                            Some(_) => "replaced",
-                        },
-                        weighed.join(" vs "),
-                        if host_clock.get() {
-                            "host's clock (the device stated no span)"
-                        } else {
-                            "device's spans"
-                        }
-                    );
-                    // Decided where the choice stands (no option ran apart from
-                    // it, so the options tie with it or lose), or where the
-                    // kernel taken ran apart from every other option too;
-                    // undecided where it beat the choice but ties another.
-                    let decided = pick.is_some();
-                    if let Some(range) = self.settled.last_mut() {
-                        range.replaced = taken != 0;
-                        range.kernel = taking.get(taken).copied().flatten();
-                        range.decided = decided;
-                    }
-                    self.dense = options.swap_remove(taken);
-                }
-            } else {
-                tracing::info!(
-                    "dense matmul in the served step, {bottom}-{top} rows: unchecked (no rung of \
-                     the load lies in these rows)"
-                );
-            }
-            bottom = top + 1;
-            rows = rows.saturating_mul(2);
-        }
-        Ok(())
     }
 
     /// Whether the dense settle reads the device time of each step that
@@ -5758,6 +5899,11 @@ impl<B: Serve> Shell<B> {
         &self.pipelines
     }
 
+    pub fn tier(&self) -> kernels_slang::Tier {
+        self.tier
+    }
+
+    #[must_use]
     pub fn device(&self) -> &B::Context {
         &self.device
     }

@@ -69,7 +69,7 @@ fn idle_snapshots_go_in_retention_order() {
     assert!(s.has_checkpoint(&[1; 32]), "the higher-ranked stays");
     // No lower tier for a checkpoint: cached state yields to the next
     // demand, whatever its key.
-    assert_eq!(s.reclaim_droppable(rank), 1);
+    assert_eq!(s.reclaim_cache(rank), 1);
     assert!(!s.has_checkpoint(&[1; 32]));
     assert_eq!(s.discard_cache(high), 0);
     assert_eq!(s.reclaim_cache(rank), 0);
@@ -313,8 +313,9 @@ fn a_checkpoint_resumes_a_fresh_working_set() {
     let ws = s.create_working_set(geom());
     let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
     let published = s.publish_prepared(prepared).unwrap();
-    assert!(
-        !s.checkpoint(ws, key, None).unwrap(),
+    assert_eq!(
+        s.checkpoint(ws, key, None),
+        Err(RsError::CheckpointUnsettled),
         "a fire still writes it"
     );
     s.settle(published);

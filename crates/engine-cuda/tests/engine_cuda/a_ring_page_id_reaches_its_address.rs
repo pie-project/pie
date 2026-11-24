@@ -57,10 +57,17 @@ fn a_ring_page_id_reaches_its_address() {
         256,
     )
     .expect("the pool reserves");
-    let (base, grain) = (pools.pool_base(), pools.window_grain());
-    let reaches = |id: i32, at: u64| u64::try_from(id).expect("a page id") * grain + base == at;
+    let grain = pools.window_grain();
+    // The base is read once a record is seated: a flat pool (ROCm's)
+    // reserves its range at the first seat, so before it the base is 0.
+    let mut seated = Vec::new();
     for key in 0..SLOTS {
-        let pages = pools.ring_pages(key).expect("the record's ring pages");
+        seated.push(pools.ring_pages(key).expect("the record's ring pages"));
+    }
+    let base = pools.pool_base();
+    assert_ne!(base, 0, "a seated pool has a base");
+    let reaches = |id: i32, at: u64| u64::try_from(id).expect("a page id") * grain + base == at;
+    for (key, pages) in seated.into_iter().enumerate() {
         assert!(!pages.is_empty(), "a windowed load's record holds a ring");
         for (page, &(id, at)) in pages.iter().enumerate() {
             assert!(reaches(id, at), "record {key}'s ring page {page}: id {id} at {at:#x}");
