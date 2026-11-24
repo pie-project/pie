@@ -1080,7 +1080,7 @@ __global__ void kda_chunked(
     }
 }
 
-// A beam group's fold of its KDA state (BEAM-PAGE-LISTS §11.3): its fold rows
+// A beam group's fold of its KDA state: its fold rows
 // (forget rows, keys and `u`: planes 0, 2 and 3, through the representative
 // lane's pages) folded in order, `M <- M diag(alpha) + u k^T` as a decode
 // step folds a committed row, and the rows stored once. A block a (head,
