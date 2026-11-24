@@ -347,6 +347,11 @@ impl ResidencyPlanner {
     /// Whether `pid` is a process this planner holds: a request of its that
     /// came back cancelled was dropped under it, not by its departure.
     #[must_use]
+    /// The coded error the planner last handed `pid`, while it is here.
+    pub fn handed(&self, pid: ProcessId) -> Option<super::PlannerError> {
+        self.with_inner(|inner| inner.handed.get(&pid).copied())
+    }
+
     pub fn registered(&self, pid: ProcessId) -> bool {
         self.with_inner(|inner| inner.procs.contains_key(&pid))
     }

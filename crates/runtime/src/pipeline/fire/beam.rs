@@ -79,7 +79,7 @@ pub(super) async fn acquire_grant<C: FireContext>(
         tracing::debug!(%pid, "pipeline: a KV request the planner dropped is asked again");
         return Ok(None);
     }
-    match acquired.map_err(|error| format!("pipeline: KV capacity: {error}"))? {
+    match acquired.map_err(|error| error.lead(format!("pipeline: KV capacity: {error}")))? {
         crate::planner::Acquired::Granted(grant) => Ok(Some(grant)),
         crate::planner::Acquired::Yield => {
             settle_and_wait_resident(ctx).await?;

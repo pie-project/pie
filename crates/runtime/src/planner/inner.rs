@@ -41,6 +41,11 @@ pub(super) struct Inner {
     /// Processes contention failed ([`super::ResidencyPlanner::contend`]),
     /// with why: each of their waits ends with it.
     pub(super) failed: std::collections::HashMap<ProcessId, super::PlannerError>,
+    /// The coded error ([`super::PlannerError::code`]) each process was
+    /// last handed (an admission refusal, a wedge failure): its result
+    /// leads with that code however the guest or the pipeline wrapped
+    /// the text ([`super::lead_result`]).
+    pub(super) handed: std::collections::HashMap<ProcessId, super::PlannerError>,
     pub(super) admitting: BTreeMap<(Rank, ProcessId), Arc<Notify>>,
     pub(super) to_end: super::to_end::ToEnd,
     /// The evicted processes whose parked state is on its way down a tier

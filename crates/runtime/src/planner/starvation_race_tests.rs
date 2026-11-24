@@ -10838,6 +10838,20 @@ async fn every_tier_full_fails_the_lowest_resident_by_name() {
     };
     assert_eq!(refused.code(), Some(super::ADMISSION_REFUSED));
     assert!(refused.to_string().starts_with("[admission_refused] "), "{refused}");
+    // Wrapped in context (a pipeline's, a guest's), the code still leads:
+    // found by type in an error chain, or from the planner's record of
+    // what it handed the process, never by reading the text.
+    let wrapped = anyhow::Error::new(refused).context("fire: acquire 9 pages");
+    let found = wrapped
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<PlannerError>())
+        .expect("found by type");
+    let led = found.lead(format!("{wrapped:#}"));
+    assert!(led.starts_with("[admission_refused] fire: acquire 9 pages: "), "{led}");
+    assert_eq!(found.lead(led.clone()), led, "led once");
+    assert_eq!(planner.handed(younger), Some(error), "the planner keeps what it handed");
+    let led = planner.handed(younger).unwrap().lead(format!("fire: {error}"));
+    assert!(led.starts_with("[tiers_full] fire: [tiers_full] "), "{led}");
     assert_eq!(planner.wait_resident(younger).await, Err(error), "its waits end with it");
     // The head and the older resident go on.
     assert!(planner.with_inner(|inner| !inner.failed.contains_key(&head) && !inner.failed.contains_key(&older)));

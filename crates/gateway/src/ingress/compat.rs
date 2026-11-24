@@ -716,6 +716,16 @@ mod tests {
                 "admission_refused",
             ),
             ("acquire 1 pages: [tiers_full] every tier is full", "tiers_full"),
+            // As the runtime leads a wrapped failure: the code first, the
+            // chain after it.
+            (
+                "[tiers_full] Call error: fire: acquire 1 pages\n\nCaused by:\n    [tiers_full] every tier is full",
+                "tiers_full",
+            ),
+            (
+                "[admission_refused] fire: acquire 9 pages: [admission_refused] refused at admission",
+                "admission_refused",
+            ),
         ] {
             let response = error_response(message);
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

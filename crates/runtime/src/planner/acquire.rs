@@ -141,6 +141,7 @@ impl ResidencyPlanner {
                     disk,
                 };
                 tracing::warn!(%pid, %error, "planner: a newcomer is refused at admission");
+                self.with_inner(|inner| inner.handed.insert(pid, error));
                 return Err(error);
             }
         }

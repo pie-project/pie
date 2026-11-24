@@ -65,6 +65,7 @@ impl ResidencyPlanner {
                 .or_else(|| lowest(false))?;
             inner.killing.insert(victim);
             inner.failed.insert(victim, tiers);
+            inner.handed.insert(victim, tiers);
             // Each of its waits ends with the failure: an allocation's
             // outcome, a bind's or a restore's wait gone from the queue.
             let mut notify = Vec::new();
@@ -98,7 +99,7 @@ impl ResidencyPlanner {
         }) else {
             return false;
         };
-        let reason = format!("planner: {tiers}");
+        let reason = tiers.lead(format!("planner: {tiers}"));
         tracing::warn!(pid = %victim, head = ?head, %reason, "planner: a process fails: every tier is full");
         self.stats.starvations.fetch_add(1, Ordering::Relaxed);
         crate::scheduler::worker::notify_process_resume(victim);

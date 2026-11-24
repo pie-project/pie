@@ -1099,7 +1099,16 @@ impl Process {
                 }
                 Err(call_err) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
-                    Err(trapped(&call_err, store.data().stderr_said()))
+                    let text = trapped(&call_err, store.data().stderr_said());
+                    // A planner error in the trap's chain leads the text
+                    // with its code, found by type.
+                    Err(match call_err
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<crate::planner::PlannerError>())
+                    {
+                        Some(error) => error.lead(text),
+                        None => text,
+                    })
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
@@ -1112,6 +1121,9 @@ impl Process {
             result
         }
         .await;
+        // However the guest or the pipeline wrapped it, a failure the
+        // planner coded leads with its code.
+        let result = result.map_err(|text| crate::planner::lead_result(process_id, text));
         record_process_timing(
             admission_wait_us,
             instantiate_us,

@@ -143,6 +143,19 @@ impl PlannerError {
     }
 }
 
+impl PlannerError {
+    /// `text` led by this error's code (`[code] text`) where it has one:
+    /// a result or reply that wraps the error in context keeps the code
+    /// first, where a client reads it by machine.
+    #[must_use]
+    pub fn lead(&self, text: String) -> String {
+        match self.code() {
+            Some(code) if !text.starts_with(&format!("[{code}] ")) => format!("[{code}] {text}"),
+            _ => text,
+        }
+    }
+}
+
 /// [`PlannerError::code`] of an admission refusal: retried by the client.
 pub const ADMISSION_REFUSED: &str = "admission_refused";
 /// [`PlannerError::code`] of a wedge failure: every tier full.

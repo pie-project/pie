@@ -157,6 +157,17 @@ pub fn release(pid: ProcessId) {
     }
 }
 
+/// A process's failure text led by the code of the error the planner
+/// last handed it ([`PlannerError::lead`]), read from the planner's own
+/// record, not the text: a guest's or a pipeline's wrapping leaves it
+/// first.
+pub fn lead_result(pid: ProcessId, text: String) -> String {
+    match planner_of(pid).and_then(|planner| planner.handed(pid)) {
+        Some(error) => error.lead(text),
+        None => text,
+    }
+}
+
 /// The planner of the engine `pid` runs on.
 pub fn planner_of(pid: ProcessId) -> Option<Arc<ResidencyPlanner>> {
     planner_for(0, engine_of(pid))
