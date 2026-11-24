@@ -70,6 +70,7 @@ fn params() -> Vec<Param> {
         layout: Default::default(),
         placement: Default::default(),
         experts: None,
+        init: None,
     };
     // A codes plane is traced in blocks of sixteen bytes.
     let share = HELD as u64 / u64::from(RANKS);

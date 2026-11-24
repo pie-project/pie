@@ -161,9 +161,16 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         crate::star::forward::dsl("rows", || WeightValue(this.0.clone().rows()))
     }
 
-    /// The weight is a bank the host registers, not one a checkpoint holds.
-    fn registered(this: &WeightValue) -> anyhow::Result<WeightValue> {
-        Ok(WeightValue(this.0.clone().registered()))
+    /// The weight is a bank the host registers, not one a checkpoint holds;
+    /// `init` says how a trainer starts it: `"zeros"`, `"kaiming"` or
+    /// `"normal"`. Serving ignores it.
+    fn registered(
+        this: &WeightValue,
+        #[starlark(require = named, default = NoneOr::None)] init: NoneOr<String>,
+    ) -> anyhow::Result<WeightValue> {
+        let mut w = this.0.clone().registered();
+        w.init = init.into_option();
+        Ok(WeightValue(w))
     }
 
     /// The weight is stored against inputs turned by `H·S`, the blockwise

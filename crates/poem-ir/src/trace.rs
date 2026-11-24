@@ -127,6 +127,11 @@ pub struct Param {
     /// engine's placement of MoE layer `layer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experts: Option<ExpertSlots>,
+    /// How a trainer starts a registered bank, as the model text states it:
+    /// `"zeros"`, `"kaiming"` or `"normal"`. `None` where the text states
+    /// none, which a trainer reads as zeros. Serving never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<String>,
 }
 
 /// How an expert-parallel group holds a routed bank ([`Param::experts`]).

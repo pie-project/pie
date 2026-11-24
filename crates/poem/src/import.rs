@@ -2915,6 +2915,7 @@ mod tests {
                 experts: 4,
                 slots: 3,
             }),
+            init: None,
         };
         let contract =
             own_contract(&src, &[param], 1, Platform::Cuda).expect("the bank's contract");

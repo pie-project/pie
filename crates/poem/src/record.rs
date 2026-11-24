@@ -202,6 +202,7 @@ impl Recorder {
                 plane.dtype,
                 w.source,
                 w.layout,
+                w.init.clone(),
             );
             first.get_or_insert(index);
         }
@@ -434,7 +435,15 @@ fn intern(
     dtype: Dtype,
     source: ParamSource,
     layout: ParamLayout,
+    init: Option<String>,
 ) -> u32 {
+    if let Some(init) = init.as_deref() {
+        assert!(
+            INITS.contains(&init),
+            "`{name}` starts as {init:?}; a registered bank starts as \"zeros\", \"kaiming\" \
+             or \"normal\""
+        );
+    }
     if let Some(i) = p.params.iter().position(|q| q.name == name) {
         let seen = &p.params[i];
         assert!(
@@ -461,9 +470,13 @@ fn intern(
         layout,
         placement: poem_ir::ParamPlacement::Device,
         experts: None,
+        init,
     });
     (p.params.len() - 1) as u32
 }
+
+/// The ways a trainer may start a registered bank ([`Param::init`]).
+const INITS: [&str; 3] = ["zeros", "kaiming", "normal"];
 
 /// Each param's placement, as the ops that read it say
 /// ([`poem_ir::residency::placement`]): nothing an author declares.
