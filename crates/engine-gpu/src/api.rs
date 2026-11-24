@@ -338,6 +338,23 @@ fn adapter_of<B: Host>(
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
 ) -> EngineResult<Option<crate::adapter::Binding>> {
+    if let Some(channel) = engine::bundle::channel_of(package).map_err(|why| fault(why.into()))? {
+        let wire = seeds
+            .iter()
+            .find(|(seeded, _)| *seeded == channel)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| {
+                Error::Load(format!(
+                    "this program's `adapter` sink reads its bundle out of channel \
+                     {channel} and this bind seeded nothing into it"
+                ))
+            })?;
+        let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
+        return shell
+            .bind_adapter(crate::adapter::Source::Bundle { bundle: &bundle })
+            .map(Some)
+            .map_err(fault);
+    }
     let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
         return Ok(None);
     };

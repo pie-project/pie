@@ -709,22 +709,7 @@ impl<B: Serve> Shell<B> {
             }
         }
 
-        let mut corrected = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_correction = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Linear(
-                        poem_ir::Linear::LoraCorrect { .. }
-                    ))
-                )
-            });
-            if runs_correction {
-                for class in region.mask.iter() {
-                    corrected.insert(class);
-                }
-            }
-        }
+        let corrected = poem_exec::feeds::adapted_classes(&boot.trace, &compiled);
 
         let handles = Handles::new();
 
@@ -1868,6 +1853,7 @@ impl<B: Serve> Shell<B> {
             crate::adapter::Source::Shared { name } => {
                 crate::adapter::Key::Shared(self.blobs.stamp(name)?)
             }
+            crate::adapter::Source::Bundle { bundle } => crate::adapter::Key::Content(bundle.key()),
         };
         let shared = matches!(source, crate::adapter::Source::Shared { .. });
         let grant = self.adapters.acquire(key.clone())?;
@@ -1899,6 +1885,30 @@ impl<B: Serve> Shell<B> {
                     }
                     Err(why) => Err(why),
                 }
+            }
+            crate::adapter::Source::Bundle { bundle } => {
+                let seats = self.weights.bank_seats();
+                let banks = crate::adapter::banks(&seats);
+                bundle
+                    .planes(&banks, engine::bundle::Rank::WHOLE)
+                    .map_err(Fault::from)
+                    .and_then(|built| {
+                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
+                            .iter()
+                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
+                                bank: bank.as_str(),
+                                bytes,
+                            })
+                            .collect();
+                        self.weights.register_adapter(grant.slot, &planes)?;
+                        tracing::info!(
+                            slot = grant.slot,
+                            named = planes.len(),
+                            zeroed = seats.len() - planes.len(),
+                            "an adapter bundle was written into its slot"
+                        );
+                        Ok(())
+                    })
             }
         };
         match landed {
