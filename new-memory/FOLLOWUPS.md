@@ -1522,13 +1522,18 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 
 **Why later.** Taken out for this round (coordinator, 2026-11-24): it allocated after ready, and the export round covers the stale keys.
 
-## F81. Metal: a yielded rates or curve key behind serving resumes where it stopped
+## F81. Stale rates and curves timed behind serving on Metal
 
-**What.** On Metal, a `[rates]` key or a `curve <n>x<k>` shape timed behind serving that yields to an arrival starts again whole at the next idle turn (`engine-metal` `rates::YIELDED`, `tune::dense::YIELDED`). engine-gpu keeps its finished points and resumes. The widest keys (`gemm_tflops_by_rows`, `attn_tflops_by_keys`; single fires of 100–345 ms on the M1 Max) take minutes, so under arrivals that keep coming in idle gaps they can restart many times before one finishes. They are stale only between a kernel change and the next export round.
+**What.** On Metal a `[rates]` key or kernel.dense curve stored under a stale key is served by its stale figure (`StaleRates::Served`), named at load, until the export round or `pie tune` measures it in the foreground. A rates or curve step lays MTLBuffers of its own for every operand (`rates::Bench::operand`, `tune::dense::measure_at`), and nothing is allocated after load and arming, so it cannot run behind serving. Metal has no settle behind serving, so it states no behind work at all (`Engine::measures_behind` false).
 
-**Idea.** Keep a key's settled points across yields (per point, as engine-gpu does) and time only the rest at the next turn, with the clock and overlap checks applying to each point's frames.
+**Design, from the version built and taken out (2982a0d18, 7c1cf570a, 31a9d18de, 283cc64a9, a82c38485).**
+- One key or `curve <n>x<k>` shape per slice, timed by the load's own step (`measure_keys` gated to the key, `measure_at` over `LOAD_ROWS`), stored in the user profile.
+- The arrival read before every frame, between fires of a frame of long ones (a frame cut into buffers, their GPU times summed), and inside the settled clock read.
+- Discarded where another lane submitted or the clock read after it was slower than the settled read before it.
+- What is missing: operands from a scratch region laid at load, so no point allocates after ready, and per-point resume across yields (a yielded wide key restarts whole).
+- Under back-to-back c1 a slice still met each next arrival with one ~20 ms frame (the runtime's grace of one served step is shorter than a client's turnaround).
 
-**Why later.** Behind work runs only when no process is live, so yields are rare. Each yield already waits for at most one fire (a frame of long fires is cut between them).
+**Why later.** Taken out for this round (coordinator, 2026-11-24): it allocated after ready, and the export round covers the stale keys.
 
 ## F82. engine-gpu: land a lane's ring snapshots inside the fire (CUDA parity)
 

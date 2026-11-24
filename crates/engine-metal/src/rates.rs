@@ -118,26 +118,6 @@ struct Bench<'a> {
     tuning: &'a Tuning,
     /// `engine::rates::operand_pattern`, made once.
     pattern: Vec<u8>,
-    /// Behind serving: whether a request arrived, read before each frame;
-    /// one did, and the step stops ([`YIELDED`]).
-    yield_to: Option<&'a dyn Fn() -> bool>,
-    /// Seconds a dispatch's launch costs ([`Self::launch_ns`]), once
-    /// measured: a fire of `engine::rates::LAUNCH_CHAINS`' longest chain of them or more
-    /// pays one buffer boundary at most that over again, and behind serving
-    /// a frame of such fires is cut between them ([`Self::frame_of`]).
-    launch: std::cell::Cell<Option<f64>>,
-    /// Seconds one fire of the last frame took.
-    last_fire: std::cell::Cell<f64>,
-}
-
-/// Why a step behind serving stopped: a request arrived before a frame of
-/// it ([`yielded`]). The key is timed again whole at a later idle turn.
-const YIELDED: &str = "a request arrived: the rates step behind serving yields to it";
-
-/// Whether `why` is a step behind serving that yielded to an arrival.
-#[must_use]
-pub fn yielded(why: &str) -> bool {
-    why == YIELDED
 }
 
 impl Bench<'_> {
@@ -178,57 +158,13 @@ impl Bench<'_> {
         encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
         k: u32,
     ) -> Result<f64, String> {
-        let Some(arrived) = self.yield_to else {
-            return self.frame_whole(turn, encode, k);
-        };
-        if arrived() {
-            return Err(YIELDED.to_string());
-        }
-        // Behind serving, a frame of fires each longer than a chain of
-        // launches is cut between them, `arrived` read at each cut: the
-        // same fires, each buffer's GPU time summed (`commit_busy`), the
-        // boundaries costing about a launch a fire, so an arrival waits for
-        // the one fire in flight, not the frame.
-        let long = self.launch.get().is_some_and(|launch| {
-            self.last_fire.get() >= launch * f64::from(engine::rates::LAUNCH_CHAINS[1])
-        });
-        if k < 2 || !long {
-            return self.frame_whole(turn, encode, k);
-        }
-        let frame = self.device.frame().map_err(|e| e.to_string())?;
-        let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
-        for fire in 0..k {
-            if fire > 0 {
-                frame.cut().map_err(|e| e.to_string())?;
-                if arrived() {
-                    frame.commit().map_err(|e| e.to_string())?;
-                    return Err(YIELDED.to_string());
-                }
-            }
-            let at = turn.next(u32::MAX as usize) as u32;
-            encode(&sink, at).map_err(|e| e.to_string())?;
-        }
-        let seconds = frame.commit_busy().map_err(|e| e.to_string())?;
-        self.last_fire.set(seconds / f64::from(k));
-        Ok(seconds)
-    }
-
-    /// [`Self::frame_of`] in one buffer.
-    fn frame_whole(
-        &self,
-        turn: &engine::rates::Rotation,
-        encode: &dyn Fn(&Sink<'_>, u32) -> Result<(), kernels_metal::Error>,
-        k: u32,
-    ) -> Result<f64, String> {
         let frame = self.device.frame().map_err(|e| e.to_string())?;
         let sink = Sink::new(self.device, &frame, &self.pipelines, &self.handles);
         for _ in 0..k {
             let at = turn.next(u32::MAX as usize) as u32;
             encode(&sink, at).map_err(|e| e.to_string())?;
         }
-        let seconds = frame.commit_timed().map_err(|e| e.to_string())?;
-        self.last_fire.set(seconds / f64::from(k.max(1)));
-        Ok(seconds)
+        frame.commit_timed().map_err(|e| e.to_string())
     }
 
     /// The workgroups one of what `encode` fills launches, from an encode the
@@ -663,87 +599,19 @@ pub fn at_load(
         registry: crate::chip::registry(),
     });
     let measure_chip = chip.clone();
-    // A key stored under a stale key serves by its old figure and is timed
-    // again behind serving (`Shell::rates_behind`); only what no layer
-    // states is measured here, those keys alone.
-    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, engine::rates::StaleRates::TimedBehind, |_max_submit, stated| {
+    // A key stored under a stale key serves by its old figure until the
+    // next export round or `pie tune` times it again (nothing is timed
+    // behind serving: a timing lays buffers of its own, and nothing is laid
+    // after ready); only what no layer states is measured here, those keys
+    // alone.
+    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, engine::rates::StaleRates::Served, |_max_submit, stated| {
         let lacked = stated.missing(&KEYS);
         Ok(engine::rates::Measured {
-            rates: measure_keys(device, measure_chip, &lacked, None, &mut |_| {})?,
+            rates: measure_keys(device, measure_chip, &lacked, &mut |_| {})?,
             unsettled: false,
             throttled: None,
         })
     })
-}
-
-/// `rates` kept in the user's profile under `profiles` for `device`, as a
-/// load keeps what it measured (`engine::rates::save_rates`); nothing where
-/// no profiles directory is stated.
-pub fn save_rates(
-    device: &Context,
-    profiles: Option<&std::path::Path>,
-    rates: &Rates,
-) -> Result<(), String> {
-    let Some(profiles) = profiles else {
-        return Ok(());
-    };
-    let name = device.name().to_string();
-    let save = engine::rates::SaveTo {
-        path: crate::chip::SHELF.user_path(profiles, &name),
-        provenance: provenance(&name),
-        registry: crate::chip::registry(),
-    };
-    let rates = Rates {
-        measured_on: Some(crate::stored::measured_on(device.name())),
-        ..rates.clone()
-    };
-    engine::rates::save_rates(&save, &rates).map(drop)
-}
-
-/// The device's clock as a reference matmul's rate (FLOP a ns): a
-/// `1024^3` matmul over one cache-resident plane, compute-bound, so its
-/// rate moves with the clock alone. `settled`: read until two rotations in
-/// a row agree within [`engine::rates::AGREEMENT`] (`engine::rates::warm_up`),
-/// the clock the device holds under load (an idle DVFS clock ramped up, a
-/// brief boost fallen back); else one timed point.
-/// `yield_to`, behind serving: read before each frame of it, an arrival
-/// stopping it with [`YIELDED`] (the settled read's warm-up alone runs
-/// about 120 ms on the M1 Max).
-pub fn clock_rate(
-    device: &Context,
-    profile: profile::Profile,
-    settled: bool,
-    yield_to: Option<&dyn Fn() -> bool>,
-) -> Result<f64, String> {
-    const SIDE: u32 = 1024;
-    let tuning = Tuning::new(profile, false, device.cores()).with_family(device.family());
-    let bench = Bench {
-        device,
-        handles: Handles::new(),
-        pipelines: Pipelines::new(),
-        tuning: &tuning,
-        pattern: engine::rates::operand_pattern(),
-        yield_to,
-        launch: std::cell::Cell::new(None),
-        last_fire: std::cell::Cell::new(0.0),
-    };
-    let plane = bench.operand(u64::from(SIDE * SIDE) * 2)?;
-    let weight = [bench.tensor(&plane, SIDE, SIDE, Dtype::Bf16)?];
-    let touched = Touched::default();
-    let point = || bench.matmul_flops(SIDE, SIDE, SIDE, &weight, &touched, 0.0);
-    if settled {
-        Ok(engine::rates::warm_up(point)?.rate)
-    } else {
-        point()
-    }
-}
-
-/// How much slower the clock read `after` a step is than the settled one
-/// `before` it, where by more than [`engine::rates::AGREEMENT`]: the step
-/// ran under a clock it did not start at, and is discarded.
-#[must_use]
-pub fn throttled(before: f64, after: f64) -> Option<f64> {
-    (after < before * (1.0 - engine::rates::AGREEMENT)).then(|| before / after.max(f64::MIN_POSITIVE))
 }
 
 /// `device`'s rates under the kernel tuning of `profile` (the profile a
@@ -753,18 +621,16 @@ pub fn measure(
     profile: profile::Profile,
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates, String> {
-    measure_keys(device, profile, &KEYS, None, say)
+    measure_keys(device, profile, &KEYS, say)
 }
 
 /// [`measure`] of the keys `wanted` alone (each phase timing none of them
 /// skipped; the launch and the warm-up always run, every rate taking its
-/// launches off), stating only those. `yield_to`, behind serving: read
-/// before each frame, an arrival stopping the step ([`yielded`]).
+/// launches off), stating only those.
 pub fn measure_keys(
     device: &Context,
     profile: profile::Profile,
     wanted: &[&str],
-    yield_to: Option<&dyn Fn() -> bool>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Rates, String> {
     let want = |key: &str| wanted.contains(&key);
@@ -775,9 +641,6 @@ pub fn measure_keys(
         pipelines: Pipelines::new(),
         tuning: &tuning,
         pattern: engine::rates::operand_pattern(),
-        yield_to,
-        launch: std::cell::Cell::new(None),
-        last_fire: std::cell::Cell::new(0.0),
     };
     // The launch first: every rate below takes its dispatches' launches off
     // (engine::rates::rate_from).
@@ -785,7 +648,6 @@ pub fn measure_keys(
     // (`crate::stored::by`), recorded phase by phase.
     let _ = crate::encode::record_fired(true);
     let (launch, gaps) = bench.launch_ns()?;
-    bench.launch.set(Some(launch as f64 * 1e-9));
     let fired_launch = crate::encode::record_fired(true);
     say(&format!(
         "  launch: {}",
