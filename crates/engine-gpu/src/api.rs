@@ -1816,8 +1816,10 @@ where
 
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
-        if let Some(shell) = self.shell.as_mut() {
-            let _ = shell.reap();
+        if let Some(shell) = self.shell.as_mut()
+            && let Err(fault) = shell.reap()
+        {
+            tracing::warn!(%fault, "reaping landed frames before a fire");
         }
     }
 

@@ -748,7 +748,7 @@ unsafe extern "system" fn on_validation(
     let message = unsafe { (*data).message_as_c_str() }
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    eprintln!("vulkan validation [{:#x}]: {message}", severity.as_raw());
+    tracing::warn!(severity = severity.as_raw(), "vulkan validation: {message}");
     vk::FALSE
 }
 
