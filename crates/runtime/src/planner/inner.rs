@@ -294,11 +294,16 @@ impl CapacityGate {
         pages + raised
     }
 
-    /// Whether `waiter` waits on the gate: an allocation's pages, or a
-    /// bind's room (its guest state's fresh chunks), new state either way;
-    /// a restore brings back what is held already, and a rung raise moves
-    /// the requester's own.
-    pub(super) fn holds_waiter(&self, waiter: &Waiter, place: Option<u64>) -> bool {
+    /// Whether `waiter` waits on the gate: an allocation's pages, a bind's
+    /// room (its guest state's fresh chunks), or the room of the bind a
+    /// restore carries (`bind`, the bind that suspended its process: laid
+    /// with the restore, [`super::proc::Proc::bind_room`]), new state each;
+    /// a restore otherwise brings back what is held already, and a rung
+    /// raise moves the requester's own. Ungated, a restore laid its bind's
+    /// fresh chunk past the finisher's headroom (the simulation's Metal
+    /// seed 44: a chunk taken with nothing spare, the finisher 14 pages
+    /// short of its end).
+    pub(super) fn holds_waiter(&self, waiter: &Waiter, place: Option<u64>, bind: u32) -> bool {
         match waiter.kind {
             WaitKind::Allocation { rise: false, .. } => {
                 self.holds(waiter.pid, waiter.kv_need(), place)
@@ -306,6 +311,7 @@ impl CapacityGate {
             WaitKind::BindRoom { rise: None, .. } => {
                 self.holds(waiter.pid, waiter.room_pages(), place)
             }
+            WaitKind::Restore { .. } => self.holds(waiter.pid, bind, place),
             _ => false,
         }
     }
@@ -737,9 +743,7 @@ impl Inner {
             }
             // An allocation past what every tier keeps for the finisher
             // waits on the gate: no head ([`CapacityGate`]).
-            if self.capacity.is_some_and(|gate| {
-                gate.holds_waiter(waiter, self.capacity_allow.get(&waiter.pid).copied())
-            }) {
+            if self.gate_holds_waiter(waiter) {
                 continue;
             }
             match &waiter.kind {
@@ -831,6 +835,11 @@ impl Inner {
                     };
                     key = up;
                 }
+                // The bind it lays is new state: past what the gate spares,
+                // it waits for the finisher as any ask does.
+                if self.queue.get(&key).is_some_and(|waiter| self.gate_holds_waiter(waiter)) {
+                    return None;
+                }
                 key
             }
         };
@@ -921,12 +930,37 @@ impl Inner {
     /// the moves around it kept something in flight for good (the field
     /// mix, seed 178: the finisher's bind of two adjacent chunks unserved
     /// 2,400 steps, one move away).
+    /// The pages of the bind `waiter`'s restore lays (the bind that
+    /// suspended its process): new state the gate weighs. 0 for any other
+    /// wait.
+    pub(super) fn restore_bind_pages(&self, waiter: &Waiter) -> u32 {
+        match waiter.kind {
+            WaitKind::Restore { .. } => self
+                .procs
+                .get(&waiter.pid)
+                .and_then(|proc| proc.bind_room)
+                .map_or(0, |bind| bind.pages),
+            _ => 0,
+        }
+    }
+
+    /// Whether the capacity gate holds `waiter` ([`CapacityGate::holds_waiter`]).
+    pub(super) fn gate_holds_waiter(&self, waiter: &Waiter) -> bool {
+        self.capacity.is_some_and(|gate| {
+            gate.holds_waiter(
+                waiter,
+                self.capacity_allow.get(&waiter.pid).copied(),
+                self.restore_bind_pages(waiter),
+            )
+        })
+    }
+
     pub(super) fn gate_holds(&self, pid: ProcessId) -> bool {
         self.capacity.is_some_and(|gate| {
             let place = self.capacity_allow.get(&pid).copied();
             self.queue
                 .values()
-                .any(|waiter| waiter.pid == pid && waiter.is_unmet() && gate.holds_waiter(waiter, place))
+                .any(|waiter| waiter.pid == pid && waiter.is_unmet() && gate.holds_waiter(waiter, place, self.restore_bind_pages(waiter)))
         })
     }
 
