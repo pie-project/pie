@@ -414,16 +414,42 @@ pub fn declared_context_within(trace: &Trace, page_size: u32, declared: u32, liv
     if one(most)? <= room {
         return Ok(declared);
     }
-    let (mut fits, mut over) = (1u32, most);
+    let mut refused = None;
+    let fits = longest(1, u64::from(most), |pages| match one(pages as u32) {
+        Ok(bytes) => bytes <= room,
+        Err(why) => {
+            refused.get_or_insert(why);
+            false
+        }
+    });
+    if let Some(why) = refused {
+        return Err(why);
+    }
+    Ok((fits as u32).saturating_mul(page_size))
+}
+
+/// The most of `fits ..= over - 1` that `seats` holds, by bisection: `seats`
+/// holds `fits` and no more than it holds below `over`.
+fn longest(mut fits: u64, mut over: u64, seats: impl FnMut(u64) -> bool) -> u64 {
+    let mut seats = seats;
     while over - fits > 1 {
         let mid = fits + (over - fits) / 2;
-        if one(mid)? <= room {
+        if seats(mid) {
             fits = mid;
         } else {
             over = mid;
         }
     }
-    Ok(fits.saturating_mul(page_size))
+    fits
+}
+
+/// The line a load states when it serves a model's declared context cut
+/// to `serving` tokens, `why` the room that cut it.
+pub(crate) fn say_context_cut(declared: u32, serving: u32, why: &str) {
+    eprintln!(
+        "engine-cuda: the model declares a {declared}-token context and {why}; serving \
+         {serving} tokens. State `[engine] max_context` to choose."
+    );
 }
 
 /// The staging ring for a host tier of this rank, known before the load
@@ -1780,24 +1806,16 @@ impl Pools {
                 u64::from(window.tokens / self.paging.page_size.max(1)) + 1
             });
             if shortest < one_slot && !seats(one_slot) && seats(shortest) {
-                let (mut fits, mut over) = (shortest, one_slot);
-                while over - fits > 1 {
-                    let mid = fits + (over - fits) / 2;
-                    if seats(mid) {
-                        fits = mid;
-                    } else {
-                        over = mid;
-                    }
-                }
+                let fits = longest(shortest, one_slot, seats);
                 let declared = self.paging.context();
                 one_slot = fits;
                 self.paging.pages_per_slot = u32::try_from(fits).unwrap_or(u32::MAX);
-                eprintln!(
-                    "engine-cuda: the model declares a {declared}-token context and, with \
-                     everything else this load puts on the device resident, the card does not \
-                     seat one sequence at it beside the guests' programs and the graph bodies' \
-                     record; serving {} tokens. State `[engine] max_context` to choose.",
-                    self.paging.context()
+                say_context_cut(
+                    declared,
+                    self.paging.context(),
+                    "with everything else this load puts on the device resident, the card does \
+                     not seat one sequence at it beside the guests' programs and the graph \
+                     bodies' record",
                 );
             }
         }
@@ -5686,16 +5704,9 @@ fn pages_in(
     floor: u64,
     ceiling: u64,
 ) -> u64 {
-    let (mut fits, mut over) = (floor, ceiling.saturating_add(1));
-    while over - fits > 1 {
-        let mid = fits + (over - fits) / 2;
-        if chunks_at(layout, paging, mid, slots) <= kv_chunks {
-            fits = mid;
-        } else {
-            over = mid;
-        }
-    }
-    fits
+    longest(floor, ceiling.saturating_add(1), |pages| {
+        chunks_at(layout, paging, pages, slots) <= kv_chunks
+    })
 }
 
 /// The guest shapes: `Instance` and `Channel`.

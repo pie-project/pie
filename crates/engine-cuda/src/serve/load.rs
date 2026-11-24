@@ -331,11 +331,11 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             after_weights,
         )?;
         if fits < boot.context {
-            eprintln!(
-                "engine-cuda: the model declares a {}-token context and one sequence at it \
-                 takes more than half of the room the load has past the weights; serving \
-                 {fits} tokens. State `[engine] max_context` to choose.",
-                boot.context
+            crate::store::say_context_cut(
+                boot.context,
+                fits,
+                "one sequence at it takes more than half of the room the load has past the \
+                 weights",
             );
             boot.context = fits;
         }
