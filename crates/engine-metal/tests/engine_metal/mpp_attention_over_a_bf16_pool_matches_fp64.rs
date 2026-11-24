@@ -227,7 +227,6 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
                 .sum::<f64>()
                 / reference.iter().map(|b| b * b).sum::<f64>().max(1e-30))
             .sqrt();
-            eprintln!("d={d} rows={m} window={window:?} mode={mode}: relative rms {rms:.6}");
             assert!(
                 rms < 0.008,
                 "d={d} rows={m} window={window:?} mode={mode}: relative rms {rms}"

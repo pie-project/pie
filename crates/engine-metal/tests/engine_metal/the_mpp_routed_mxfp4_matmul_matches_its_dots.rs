@@ -37,7 +37,6 @@ moe.tile_rows = [{ when = "per_expert >= 64", value = 64 }, { value = 32 }]
 "#,
         false,
     );
-    let mut checked = 0;
     // (experts, tokens, fan-out, K, N, codes as one row an expert): row tiles of 64 and 32.
     let cases = [
         (4u32, 160u32, 2u32, 128u32, 128u32, false),
@@ -198,12 +197,10 @@ moe.tile_rows = [{ when = "per_expert >= 64", value = 64 }, { value = 32 }]
                                     "random experts={experts} bias={biased} token={token} slot={slot} col={col}: {actual_f32} vs {want}"
                                 );
                             }
-                            checked += 1;
                         }
                     }
                 }
             }
         }
     }
-    eprintln!("checked {checked} routed outputs against exact and random mxfp4 dots");
 }

@@ -4,8 +4,8 @@
 //! growth the pool backs a bottom run of segments and the span's segment at
 //! the top for state, not the segments between: a lane whose highest page
 //! lies in the backed top and whose first lies in an unbacked chunk under
-//! it is refused by name before anything is encoded. (The check by the
-//! highest page alone passed it, and the kernels read an unmapped tile.)
+//! it is refused by name before anything is encoded: every page is checked,
+//! not the highest alone.
 //! The same lane with its first page moved into the bottom run fires.
 
 use engine_metal::serve::Seated;
@@ -17,12 +17,9 @@ use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, word};
 
 const CONTEXT: u32 = 256;
 
-/// The pool at a stated size, not the device's free memory: a pool sized
-/// to fill what the device has free counts as many chunks as that holds,
-/// and where its chunks less the activation's fell on a segment boundary
-/// (one load in some, after other tests held memory) the span's segment
-/// held no state under the activation and the test could not lay its page
-/// there.
+/// The pool at a stated size, not the device's free memory, so its layout
+/// (the span's segment holding state under the activation) does not turn
+/// on what else holds memory.
 const KV_BYTES: u64 = 1 << 30;
 
 fn load(fixture: &Fixture) -> Shell {
@@ -105,7 +102,6 @@ fn a_page_in_an_uncommitted_chunk_is_refused_by_name() {
         why.contains("committed chunks of the state pool"),
         "the refusal names the unbacked chunk: {why}"
     );
-    eprintln!("refused: {why}");
     let backed = (bottom * segment - 1) * per;
     fire(&mut shell, &fixture, &[backed, top]).expect("every page backed: the fire lands");
 }

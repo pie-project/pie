@@ -182,7 +182,6 @@ fn compare(what: &str, want: &[f32], got: &[f32], bar: f32) {
             at = i;
         }
     }
-    eprintln!("{what}: worst absolute {worst:.3e} at {at}");
     assert!(
         worst <= bar,
         "{what}: parts from the reference by {worst:.3e} at {at} (want {}, got {})",
@@ -293,7 +292,6 @@ fn both_arms_answer_the_reference_under_every_mask() {
         eprintln!("not asked: no Metal device");
         return;
     };
-    eprintln!("device: {}", rig.device.name());
     for head_dim in [64usize, 128] {
         for mask in ["segments", "bias"] {
             run_case(&rig, head_dim, mask);

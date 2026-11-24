@@ -147,11 +147,6 @@ fn a_lane_with_a_page_in_every_buffer_serves_the_seats_logits() {
     // The prompt reaches the last page; the decodes stay in it.
     let rows = (parts as u32 - 1) * page + 1;
     assert!(rows + STEPS <= parts as u32 * page && rows + STEPS <= CONTEXT);
-    eprintln!(
-        "qwen3-micro-text: {parts} buffers of {segment} chunks, a page id's buffer in {} bits; \
-         one page of {page} tokens in each, chunks {chunks:?}",
-        31 - ids.part_shift
-    );
     let got = serve(&mut shell, &fixture, rows, Some(&pages));
     drop(shell);
     engine_metal::store::pool::cap_parts(0);

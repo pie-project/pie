@@ -2,11 +2,8 @@
 
 //! The load's pipeline walk (`Shell::warm_pipelines`) builds the forms a
 //! request capturing its attention scores fires (the score-capture kernel
-//! beside the plain attention), at a prompt and at one row. The walk fired
-//! plain and drafting words alone before, so trackb-h2o, trackb-snapkv and
-//! snapkv-eviction on Qwen3-0.6B were refused at their first capturing fire
-//! ("`attn_score_capture_bfloat16_d_128` would not enqueue: ... which the
-//! load did not build before ready").
+//! beside the plain attention), at a prompt and at one row, so a capturing
+//! fire after ready meets only pipelines the walk built.
 
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};

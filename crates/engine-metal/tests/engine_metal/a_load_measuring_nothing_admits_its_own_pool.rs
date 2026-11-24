@@ -3,12 +3,9 @@
 //! A load sizes its kv pool from one reading of the device's working set
 //! and admits the pool against that same reading: what the load itself
 //! allocates on the way (the pool layout's host tables, sized by the pool)
-//! is not a shortfall. Admission read the working set again, which the
-//! load's own host allocations had shrunk by a few MB below the pool sized
-//! to fill the first reading, so a load that timed nothing (`measure =
-//! false`, or every curve stored or committed: a clean home's boot under
-//! a committed profile) was refused "the device does not hold this
-//! deployment" by 2.5–3 MB, about one load in a hundred on an M5 Pro.
+//! is not a shortfall. A load that times nothing (`measure = false`, or
+//! every curve stored or committed: a clean home's boot under a committed
+//! profile) is admitted every time.
 
 use engine_metal::{Boot, Shell};
 use poem_compiler::Budget;

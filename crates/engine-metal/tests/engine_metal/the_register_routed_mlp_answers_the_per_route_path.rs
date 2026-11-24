@@ -243,7 +243,6 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
         buffer.write(0, bytes).expect("upload");
         buffer
     };
-    let mut checked = 0;
     for tokens in [2u32, 5, 8] {
         for cut in [
             moe::REGISTER_CUT,
@@ -441,7 +440,6 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                         "tokens {tokens} cut {cut:?} shared {shared}: route {route}'s \
                          down row {row} is {off:.2e} off the per-route path's"
                     );
-                    checked += 1;
                 }
                 // Against f64, for a few routes and the shared rows: the register path is
                 // no further off than the per-route path.
@@ -546,18 +544,9 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                             combine_off.max(spread64(&exact, &got[t * width..(t + 1) * width]));
                     }
                 }
-                eprintln!("tokens {tokens} cut {cut:?} shared {shared}: fold {off:.2e} off");
             }
         }
     }
-    eprintln!(
-        "checked {checked} register routes against the per-route path; against f64 the per-route \
-         path is {route_off:.2e} off and the register tiles {tile_off:.2e}"
-    );
-    eprintln!(
-        "against f64 the gated sums are {sum_off:.2e} off on the per-route path and \
-         {combine_off:.2e} from the tiles' combine"
-    );
     assert!(
         tile_off <= 1.5 * route_off.max(2e-3),
         "the register tiles are {tile_off:.2e} off f64, the per-route path {route_off:.2e}"
@@ -635,7 +624,6 @@ fn the_eight_bit_routed_select_answers_f64() {
             .collect();
         worst = worst.max(spread64(&want, &got[t * N as usize..(t + 1) * N as usize]));
     }
-    eprintln!("routed select at 8 bits: worst spread {worst:.2e}");
     assert!(
         worst < 1e-2,
         "the 8-bit routed select parts from f64 by {worst:.2e}"

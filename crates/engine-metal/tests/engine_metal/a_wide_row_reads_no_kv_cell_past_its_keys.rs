@@ -158,19 +158,12 @@ fn a_wide_row_reads_no_kv_cell_past_its_keys() {
                     requests as u32,
                     &tuning,
                 );
-                if let Err(why) = ran {
-                    eprintln!(
-                        "{form} d={d} page={page} mode={mode} causal={causal}: refused ({why})"
-                    );
+                if let Err(_) = ran {
                     continue;
                 }
                 frame.commit().unwrap();
                 let got = f32s(&handles.read(bind(&y), y.bytes()).unwrap()[..q.len() * 2]);
                 let bad = got.iter().filter(|x| !x.is_finite()).count();
-                eprintln!(
-                    "{form} d={d} page={page} mode={mode} causal={causal}: {bad} non-finite of {}",
-                    got.len()
-                );
                 if bad > 0 {
                     wrong.push(format!(
                         "{form} d={d} page={page} mode={mode} causal={causal}: {bad} non-finite"

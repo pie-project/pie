@@ -4,10 +4,7 @@
 //! a recurrent model: its fires are staged and dropped uncommitted, so they
 //! name seat 0's state record without the pool backing it (seat runs follow
 //! one another shape by shape, a recurrent record past every seat's kv run)
-//! and a prompt after it answers as on a load that never walked. The walk
-//! refused such a load before
-//! (Qwen3.5-0.8B: "this fire wants 13113 committed chunks of the state pool
-//! and the load reserved 58").
+//! and a prompt after it answers as on a load that never walked.
 
 use engine_metal::serve::Seated;
 use engine_metal::{Boot, Lane, Shell};
@@ -93,16 +90,14 @@ fn a_recurrent_load_walks_its_pipelines() {
         .filter(|&at| at > 0)
         .nth(1)
         .unwrap_or(0);
-    eprintln!("segments of {segment} chunks; seat 0's record run starts at chunk {record}");
     assert!(
         record > segment,
         "seat 0's record (chunk {record}) lies inside the segment the walk backs ({segment} \
          chunks), so this load does not reach the case"
     );
-    let (fires, built) = shell
+    let (fires, _) = shell
         .warm_pipelines()
         .expect("the pipeline walk runs on a recurrent load");
-    eprintln!("the walk: {fires} fires, {built} pipelines built");
     assert!(fires > 0, "the walk fired");
     assert_eq!(fire(&mut shell), want, "a prompt after the walk answers as without it");
 }
@@ -111,9 +106,7 @@ fn a_recurrent_load_walks_its_pipelines() {
 /// pipelines sealed (a key met after is refused, not compiled), a recurrent
 /// load serves a plain prompt, a buffering one (`RsVerb::Buffer` folding
 /// nothing: the verify conv), a replay folding what a lane held (the decode
-/// drain), and a drafter's word where the plan has one. The walk fired plain
-/// folds alone before, so MTP and a device fold on Qwen3.5 were refused at
-/// their first fire ("... which the load did not build before ready").
+/// drain), and a drafter's word where the plan has one.
 #[test]
 fn every_form_a_recurrent_load_serves_is_built_by_its_walk() {
     use engine::fire::{FoldLen, RsVerb};
@@ -126,8 +119,8 @@ fn every_form_a_recurrent_load_serves_is_built_by_its_walk() {
     shell.warm_pipelines().expect("the walk runs");
     shell.seal_pipelines().expect("the fixed pipelines build");
     // Every fixed pipeline (a fire names it by its lanes' shape, no rung
-    // keys it) is built at load: `rs_copy_words4`, four row copies side by
-    // side, was refused at a beam's first replay on Qwen3.5 before.
+    // keys it) is built at load, `rs_copy_words4` (four row copies side by
+    // side, a beam's replay) among them.
     let built = shell.pipeline_keys();
     for fire in kernels_metal::runtime::fixed_pipelines(true) {
         assert!(
@@ -202,5 +195,4 @@ fn every_form_a_recurrent_load_serves_is_built_by_its_walk() {
             .fire_seated(&[lane(3, next, drafts, fold, 0)])
             .expect("a drafter's word is served");
     }
-    eprintln!("every form served after the sealed walk (drafter: {drafter})");
 }

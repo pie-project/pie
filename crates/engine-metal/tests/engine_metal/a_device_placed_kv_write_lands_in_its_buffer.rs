@@ -285,8 +285,4 @@ fn a_device_placed_kv_write_lands_in_its_buffer() {
         &spread,
         &one,
     );
-    eprintln!(
-        "a device-placed kv write lands in its buffer ({} rows)",
-        spread.len()
-    );
 }

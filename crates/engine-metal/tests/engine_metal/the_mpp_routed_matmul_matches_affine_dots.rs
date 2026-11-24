@@ -41,7 +41,6 @@ moe.tile_rows = [
 "#,
         false,
     );
-    let mut checked = 0;
     // (experts, tokens, fan-out, K, N): row tiles of 16, 64 (which an affine bank runs
     // at 32), 32 and 8.
     let cases = [
@@ -196,11 +195,9 @@ moe.tile_rows = [
                                 "random experts={experts} token={token} slot={slot} col={col}: {actual_f32} vs {want}"
                             );
                         }
-                        checked += 1;
                     }
                 }
             }
         }
     }
-    eprintln!("checked {checked} routed outputs against exact and random affine dots");
 }

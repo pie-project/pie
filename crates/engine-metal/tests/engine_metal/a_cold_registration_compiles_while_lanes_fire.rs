@@ -90,14 +90,6 @@ fn a_cold_registration_compiles_while_lanes_fire() {
     let (registered, compile_took) = compile.join().expect("the compile runs");
     let program = shell.finish_program(registered).expect("the program is taken in");
     let worst = during.iter().max().copied().unwrap_or_default();
-    eprintln!(
-        "cold compile {:.1} ms off the shell's thread; {} decodes meanwhile, the slowest \
-         {:.2} ms (alone {:.2} ms)",
-        compile_took.as_secs_f64() * 1e3,
-        during.len(),
-        worst.as_secs_f64() * 1e3,
-        alone.as_secs_f64() * 1e3
-    );
     assert!(
         during.len() >= 3,
         "the shell fired {} decodes in a {:?} compile",

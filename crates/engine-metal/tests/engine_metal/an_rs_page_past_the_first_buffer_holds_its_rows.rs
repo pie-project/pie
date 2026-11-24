@@ -130,15 +130,7 @@ fn an_rs_page_past_the_first_buffer_holds_its_rows() {
             .map(|at| rs_chunk * rs_per + (rs_per - 1 - at))
             .collect(),
     };
-    let (ids, parts) = shell.page_ids();
-    eprintln!(
-        "qwen35-tiny: chunk {} B over {parts} buffers, rs slot {} B of {} tokens ({rs_per} \
-         a chunk), a page id's index {} bits; the lane's state from chunk {first}",
-        ids.chunk_bytes,
-        layout.rs.map_or(0, |rs| rs.slot_bytes),
-        layout.rs_tokens,
-        ids.shift.unwrap_or(0)
-    );
+    let (_, _) = shell.page_ids();
     let got = walk(&mut shell, &fixture, rs_pages, Some(&refs));
     drop(shell);
     engine_metal::store::pool::cap_parts(0);

@@ -532,8 +532,7 @@ fn copies_move_every_plane(dev: &Dev) {
 /// sizes the block for the dispatch's widest group and refuses at bind a
 /// group past the device's threadgroup memory) faults every one of its
 /// lanes by name on the device, never a step that returns and leaves its
-/// lists unresolved (the L40S's audit of CUDA's `beam_step`): nine beams
-/// dispatched with a block for eight.
+/// lists unresolved: nine beams dispatched with a block for eight.
 fn a_group_past_its_block_faults_every_lane(dev: &Dev) {
     let lanes = 9u32;
     let mut arena = Arena { at: 0 };
@@ -588,7 +587,7 @@ fn a_beam_step_follows_the_spec() {
     copies_move_every_plane(&dev);
     rs_copies_move_every_plane(&dev);
     a_group_past_its_block_faults_every_lane(&dev);
-    // Past the 64 the arrays were fixed at before: the block sized by the
-    // group, under Apple's 32 KiB (`kbeam::max_lanes`: 86).
+    // Past 64 lanes: the block sized by the group, under Apple's 32 KiB
+    // (`kbeam::max_lanes`: 86).
     search(&dev, 80, 37, 2 * PAGE + 3, 1, 0);
 }

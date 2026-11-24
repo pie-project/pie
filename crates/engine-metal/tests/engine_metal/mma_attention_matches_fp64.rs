@@ -193,7 +193,6 @@ fn mma_attention_matches_fp64() {
                 .sum::<f64>()
                 / reference.iter().map(|b| b * b).sum::<f64>().max(1e-30))
             .sqrt();
-            eprintln!("d={d} rows={m} window={window:?} mode={mode}: relative rms {rms:.6}");
             if mode == 0 {
                 let l = upload(&vec![0u8; m * qh * 4]);
                 let y2 = upload(&vec![0u8; q.len() * 2]);

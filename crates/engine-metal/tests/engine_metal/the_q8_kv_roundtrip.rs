@@ -48,12 +48,8 @@ fn a_bf16_pool_takes_every_route_and_the_split_one_matches_fp64() {
     routes(false);
 }
 fn routes(q8: bool) {
-    // `PIE_TEST_MPP=1` lets prompt rows take the MPP kernel.
-    let tuning = if std::env::var("PIE_TEST_MPP").as_deref() == Ok("1") {
-        engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false)
-    } else {
-        engine_metal::chip::tuning("", false)
-    };
+    // Prompt rows on the MPP kernel are mpp_attention_over_a_bf16_pool_matches_fp64's.
+    let tuning = engine_metal::chip::tuning("", false);
     let dev = Context::bind().unwrap();
     let handles = Handles::new();
     let pipes = Pipelines::new();
@@ -389,9 +385,6 @@ fn routes(q8: bool) {
                         assert!(x == *r || (x - r).abs() < 2e-4, "lse{x} vs{r}");
                     }
                 }
-                eprintln!(
-                    "Q8CHECK d={d} m={m} page={page} route={route} mode={mode} causal={causal} rms={rms:.8}"
-                );
             }
         }
     }

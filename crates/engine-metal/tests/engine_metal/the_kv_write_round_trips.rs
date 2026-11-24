@@ -1,11 +1,11 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2b — the QUANTIZING paged KV write path, end to end.
+//! The QUANTIZING paged KV write path, end to end.
 //!
-//! Where C2a drove the codec math in isolation, this drives the real
+//! `the_kv_codec_round_trips` checks the codec math in isolation; this drives the real
 //! `attention.kv_append` op onto a paged KV pool whose dtype is the new packed
 //! `KvU4` (spelling `g256_u4_f16_n`): the incoming bf16 K/V heads are quantized
-//! in place into the LOCKED v1 KV format (4-bit symmetric absmax, block = 256,
+//! in place into the KvU4 format (4-bit symmetric absmax, block = 256,
 //! one inline fp16 scale, 130 B/block, offset-binary nibbles). Two things are
 //! proven:
 //!
@@ -19,7 +19,7 @@
 //!       FIRST and the codes are quantized against that SAME fp16 scale, so
 //!       re-quantizing the bf16 source against the STORED scale reproduces the
 //!       written codes bit-for-bit — the production self-consistency property.
-//!       (The sdpa READ path is C2c and is not exercised here.)
+//!       (The sdpa READ path is `the_packed_kv_decode_reads` and is not exercised here.)
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
@@ -35,7 +35,7 @@ fn packed_bytes(block: usize) -> usize {
     block / 2 + 2
 }
 
-// --- deterministic outlier-heavy KV data (same mixer as the C2a test) --------
+// --- deterministic outlier-heavy KV data (same mixer as the `the_kv_codec_round_trips` test) --------
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
@@ -194,14 +194,12 @@ const PAGES: u64 = 1;
 
 #[test]
 fn the_kv_write_round_trips() {
-    eprintln!("=== C2b: packed 4-bit KV write (dtype g256_u4_f16_n) ===");
 
     // ---- (A) allocation at head_dim 256 (the shipping flagship) -------------
     // The packed cache is sized per head from the head_dim the trace row now
     // carries (a head packs to `head_dim/2 + 2` bytes), not `width * element`.
     // At head_dim 256 this equals the codec's own 256-block `row_bytes` anchor
-    // (130 B/block), so the estimate is unchanged for the flagship; (C) proves
-    // it now also matches `reserve` at head_dim 128, and (B) exercises the
+    // (130 B/block); (C) checks it matches `reserve` at head_dim 128 too, and (B) exercises the
     // write path at 128 AND 256.
     {
         const HEAD_DIM: usize = 256;
@@ -250,11 +248,6 @@ fn the_kv_write_round_trips() {
         assert_eq!(bf16_bytes_total, want_bf16, "bf16 KV cache sizing");
         assert_eq!(packed_bytes_total, want_packed, "packed KV cache sizing");
         let ratio = packed_bytes_total as f64 / bf16_bytes_total as f64;
-        eprintln!(
-            "[alloc ] bf16 cache = {bf16_bytes_total} B, packed cache = {packed_bytes_total} B, \
-             ratio = {ratio:.4} (expected {:.4} = 130/512)",
-            130.0 / 512.0
-        );
         assert!(
             (ratio - 130.0 / 512.0).abs() < 1e-9,
             "packed cache must be 130/512 of bf16, got {ratio}"
@@ -269,7 +262,6 @@ fn the_kv_write_round_trips() {
     for &head_dim in &[256usize, 128] {
         write_case(&mut rig, head_dim);
     }
-    eprintln!("=== C2b done: the packed write is self-consistent at head_dim 128 & 256 ===");
 }
 
 /// The quantizing-write round-trip at codec block `head_dim`. Seeds bf16 K/V,
@@ -378,11 +370,6 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
         }
     }
     let mse = sse / n as f64;
-    eprintln!(
-        "[write ] head_dim={head_dim:>3} | {n} elems over {TOKENS} tokens x {HEADS} heads (K+V) | \
-         codes self-consistent (bit-exact) | fp16 scale rel-dev {worst_scale_rel:.2e} | recon vs \
-         bf16 src: max={worst_abs:.4} MSE={mse:.5e}"
-    );
     assert!(
         worst_scale_rel < 1.0e-3,
         "head_dim {head_dim}: fp16 scale rel-dev {worst_scale_rel:.2e} exceeds the fp16 half-ulp bound"
@@ -393,19 +380,17 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
     );
 }
 
-/// C2b(C) — the invariant that generalizes the codec: the pre-facts demand
+/// the invariant that generalizes the codec: the pre-facts demand
 /// estimate (`pool_demand`, which sees only the trace) sizes a packed `KvU4`
 /// cache to the EXACT bytes `reserve` later allocates from the stated seat, at
-/// ANY head_dim — not only at the 256 the codec's anchor baked in. Because the
-/// KV row now carries its head_dim, the estimate packs per head just like
-/// `reserve`, so a head_dim-128 model (which the old 256 anchor mis-sized or
-/// outright refused) loads correctly.
+/// ANY head_dim, not only 256. The KV row carries its head_dim, so the
+/// estimate packs per head just like `reserve`, and a head_dim-128 model
+/// loads correctly.
 #[test]
 fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
     use engine_metal::store::Rows;
     use engine_metal::store::kv::{Facts, SpaceFacts};
 
-    eprintln!("=== C2b(C): pool_demand sizes packed KvU4 exactly at any head_dim ===");
 
     let paging = Paging::of(PAGE_SIZE, PAGE_SIZE, 0, PAGES).expect("paging");
 
@@ -441,7 +426,6 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
     //     256-block anchor, and `row_bytes(128)` is not a whole 256-block. With
     //     the head_dim on the row the estimate sizes per head and succeeds.
     let odd = kv_trace(Dtype::KvU4, 1, 128); // width 128 — not a 256 multiple
-    let odd_bytes = pool_demand(&odd, paging).expect("head_dim-128 KvU4 must size, not refuse");
     // The same row with head_dim unknown (0) is the OLD anchor path — it refuses.
     let mut stale = odd.clone();
     if let CacheRow::Kv { head_dim, .. } = &mut stale.caches[0] {
@@ -450,9 +434,6 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
     assert!(
         pool_demand(&stale, paging).is_err(),
         "the pre-schema 256 anchor refuses a 128-wide packed row — the case the fix cures"
-    );
-    eprintln!(
-        "[estim ] head_dim=128 kv_heads=1: sized {odd_bytes} B (the 256 anchor refused this)"
     );
 
     // (ii) With a Metal device, the estimate EQUALS reserve's real allocation at
@@ -483,15 +464,10 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
         let _ = &facts;
         let actual =
             Rows::estimate(&trace, PAGE_SIZE).expect("plan").0 * u64::from(PAGE_SIZE) * PAGES;
-        eprintln!(
-            "[match ] {dtype:?} kv_heads={kv_heads} head_dim={head_dim:>3}: \
-             pool_demand={est} B  laid={actual} B"
-        );
         assert_eq!(
             est, actual,
             "{dtype:?} kv_heads={kv_heads} head_dim={head_dim}: the pre-estimate must equal the \
              real allocation"
         );
     }
-    eprintln!("=== C2b(C) done: pre-estimate == reserve at head_dim 128 & 256 ===");
 }

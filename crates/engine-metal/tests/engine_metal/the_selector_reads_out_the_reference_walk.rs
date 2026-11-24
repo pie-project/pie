@@ -154,7 +154,6 @@ fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
         !indices[2 * K as usize..].contains(&5),
         "the NaN was chosen"
     );
-    eprintln!("topk: three rows of {WIDE} agree with the host sort; tie low, NaN never");
 }
 
 fn the_walk_picks_what_the_reference_picks() {
@@ -270,10 +269,6 @@ fn the_walk_picks_what_the_reference_picks() {
     );
     assert_eq!(picks, want, "the walk parts from the reference");
     assert_ne!(picks, unary_only, "the walk is the unary argmax");
-    eprintln!(
-        "walk: {} rows over two requests agree with the reference; the bilinear decided at least one slot",
-        rows
-    );
 
     let picks = walk(&dev, None, 0);
     let mut want = vec![0i32; rows as usize];
@@ -300,8 +295,4 @@ fn the_walk_picks_what_the_reference_picks() {
         }
     }
     assert_eq!(picks, want, "the bigram walk parts from the reference");
-    eprintln!(
-        "bigram walk: {} rows agree, the anchor row proposing too",
-        rows
-    );
 }

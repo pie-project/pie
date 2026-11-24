@@ -54,7 +54,6 @@ fn the_convolution_matches_the_reference_on_both_sides() {
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    eprintln!("device: {}", device.name());
 
     let rows: u32 = SPANS.iter().sum();
     let indptr: Vec<i32> = {
@@ -155,10 +154,6 @@ fn the_convolution_matches_the_reference_on_both_sides() {
                 }
             }
         }
-        eprintln!(
-            "side {side}: worst {worst:.3} ulp at (row {}, channel {})",
-            worst_at.0, worst_at.1
-        );
         assert!(
             worst <= 1.0,
             "side {side}: the kernel parts from the reference by {worst:.2} bf16 ulp at {worst_at:?}"
@@ -199,5 +194,4 @@ fn the_convolution_matches_the_reference_on_both_sides() {
         &after[last],
         "flipping a row changed nothing, so the check proves nothing"
     );
-    eprintln!("boundary: the second request's rows are unchanged by the first's last row");
 }

@@ -1,17 +1,17 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2c-2 — the TILED sdpa read over a PACKED 4-bit KV cache: prefill, the masked
+//! The TILED sdpa read over a PACKED 4-bit KV cache: prefill, the masked
 //! prefill, and the prefill that also publishes a log-sum-exp (prefill_lse).
 //!
-//! C2b proved the quantizing WRITE path leaves a self-consistent 4-bit cache, and
-//! C2c-1 proved the matching DECODE read. This proves the matching TILED read: the
+//! `the_kv_write_round_trips` checks the quantizing WRITE path and
+//! `the_packed_kv_decode_reads` the DECODE read. This checks the TILED read: the
 //! prefill/masked/prefill_lse sdpa kernels, dispatched on the pool's `KvU4` dtype,
 //! stage each cached (slot, kv_head) into shared memory by byte-indexing its
 //! 130-byte block, unpacking the offset-binary nibbles (`q = nibble - 8`) and
 //! rescaling by the block's inline fp16 scale — then run the SAME tile matmul,
 //! softmax and lse as the bf16 tiled path.
 //!
-//! ISOLATING DEQUANT FROM QUANT LOSS (same discipline as C2c-1). Comparing the
+//! ISOLATING DEQUANT FROM QUANT LOSS (same discipline as `the_packed_kv_decode_reads`). Comparing the
 //! packed read against a bf16 read on the ORIGINAL K/V would fold in the 4-bit
 //! quantization error and could hide a read bug behind it. Instead the reference
 //! is a bf16 read over the K/V UNPACKED FROM THE PACKED CACHE: the exact values
@@ -492,7 +492,7 @@ fn deviation(a: &[f32], b: &[f32]) -> (f64, f64) {
 /// optional lse iso max) for the given op.
 fn run_case(
     rig: &mut Rig,
-    label: &str,
+    _: &str,
     op: Op,
     fires: &Fires,
     k_src: &[f32],
@@ -559,41 +559,18 @@ fn run_case(
         _ => None,
     };
 
-    eprintln!(
-        "[{label:>10} d={head_dim:>3} {:>11} isolate] packed vs bf16-on-unpacked-from-packed: max={:.3e} mean={:.3e}",
-        op.label(),
-        iso.0,
-        iso.1
-    );
-    eprintln!(
-        "[{label:>10} d={head_dim:>3} {:>11} quant  ] packed vs bf16-on-original K/V:         max={:.3e} mean={:.3e}",
-        op.label(),
-        quant.0,
-        quant.1
-    );
-    if let Some(m) = lse_iso {
-        eprintln!(
-            "[{label:>10} d={head_dim:>3} {:>11} lse-iso] packed lse vs bf16-on-unpacked lse:  max={m:.3e}",
-            op.label()
-        );
-    }
     (iso, quant, lse_iso)
 }
 
 #[test]
 fn the_packed_kv_tiled_reads() {
-    eprintln!(
-        "=== C2c-2: dequantizing tiled read (prefill / masked / prefill_lse) for packed 4-bit KV ==="
-    );
     let Some(mut rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");
         return;
     };
-    eprintln!("device: {}", rig.device.name());
 
     // The codec block IS the head_dim; prove the packed tiled read at 256 AND 128.
     for &head_dim in &HEAD_DIMS {
-        eprintln!("--- head_dim {head_dim} (codec block {head_dim}) ---");
         let fires = build_fires(&mut rig, head_dim);
 
         for op in [Op::Prefill, Op::Masked, Op::PrefillLse] {
@@ -648,7 +625,7 @@ fn the_packed_kv_tiled_reads() {
             // two tiled paths run the SAME fp32 body over the SAME inputs, so they must
             // agree to fp32-accumulation noise (expected ~0). A TIGHT max here is a
             // direct proof the dequant (offset, parity, scale, byte-index) is exact.
-            let ((e_iso_max, e_iso_mean), (_e_q_max, _), e_lse_iso) = run_case(
+            let ((e_iso_max, _), (_e_q_max, _), e_lse_iso) = run_case(
                 &mut rig,
                 "bf16-exact",
                 op,
@@ -671,14 +648,7 @@ fn the_packed_kv_tiled_reads() {
                     op.label()
                 );
             }
-            eprintln!(
-                "[{:>11} d={head_dim:>3}] bf16-exact isolate max {e_iso_max:.3e} mean {e_iso_mean:.3e} — dequant is exact on-grid",
-                op.label()
-            );
         }
     }
 
-    eprintln!(
-        "=== C2c-2 done: the packed 4-bit KV tiled read dequantizes + attends correctly (prefill / masked / prefill_lse) at d=128 & 256 ==="
-    );
 }

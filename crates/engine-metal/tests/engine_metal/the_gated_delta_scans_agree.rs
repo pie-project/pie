@@ -82,19 +82,23 @@ fn compare(want: &[f32], got: &[f32]) -> (f64, f64) {
 
 #[test]
 fn the_scans_agree() {
-    // `PIE_GDN_PACKED=1` runs the staged scan, as an Apple10 profile picks.
-    let tuning = if std::env::var("PIE_GDN_PACKED").as_deref() == Ok("1") {
-        engine_metal::chip::tuning("[kernel]\ngdn.scan = \"staged\"", false)
-    } else {
-        engine_metal::chip::tuning("", false)
-    };
+    scans_agree("");
+}
+
+/// The staged scan, as an Apple10 profile picks it.
+#[test]
+fn the_staged_scans_agree() {
+    scans_agree("[kernel]\ngdn.scan = \"staged\"");
+}
+
+fn scans_agree(kernel: &str) {
+    let tuning = engine_metal::chip::tuning(kernel, false);
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    eprintln!("device: {}", device.name());
 
     let mut qkv_b = Buffer::zeroed(&device, u64::from(T) * u64::from(QKV_WIDTH) * 2).expect("qkv");
     {
@@ -397,20 +401,14 @@ fn the_scans_agree() {
         "committed(J) answered the rows past J other bits than the steps"
     );
     assert_eq!(rows(&out(SLOT_NEW_STEPS_J), J), rows(&steps_y, J));
-    eprintln!(
-        "one arithmetic: {T} steps == committed({T}) == scan; committed({J}) bank == {J} steps  (byte for byte)"
-    );
 
     let floor = 1e-5f64;
     for (name, old_slot, new_slot) in [
         ("committed", SLOT_OLD_COMMITTED, SLOT_NEW_COMMITTED),
         ("step", SLOT_OLD_STEPS, SLOT_NEW_STEPS),
     ] {
-        let (bank_rms, bank_worst) = compare(&bank(old_slot), &bank(new_slot));
-        let (y_rms, y_worst) = compare(&out(old_slot), &out(new_slot));
-        eprintln!(
-            "{name:9} old vs new: bank rel rms {bank_rms:.2e} (worst {bank_worst:.2e}), y rel rms {y_rms:.2e} (worst {y_worst:.2e})"
-        );
+        let (bank_rms, _) = compare(&bank(old_slot), &bank(new_slot));
+        let (y_rms, _) = compare(&out(old_slot), &out(new_slot));
         assert!(
             bank_rms <= floor,
             "{name}: the new kernel's bank parts from the old by {bank_rms:.2e} rms"
@@ -420,6 +418,5 @@ fn the_scans_agree() {
             "{name}: the new kernel's output parts from the old by {y_rms:.2e} rms"
         );
     }
-    let (rms, _) = compare(&bank(SLOT_OLD_COMMITTED), &bank(SLOT_OLD_STEPS));
-    eprintln!("old committed vs old steps: bank rel rms {rms:.2e}");
+    let (_, _) = compare(&bank(SLOT_OLD_COMMITTED), &bank(SLOT_OLD_STEPS));
 }

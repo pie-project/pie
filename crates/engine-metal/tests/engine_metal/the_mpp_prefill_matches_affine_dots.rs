@@ -27,7 +27,6 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
     let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"mpp\", \"qmv\"]", false);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    let mut checked = 0;
     let cases = [
         (64u32, 128u32),
         (192, 256),
@@ -232,13 +231,9 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                                 "random M={m} K={k} N={n} row={row} col={col}: {actual_f32} vs {want}"
                             );
                         }
-                        checked += 1;
                     }
                 }
             }
         }
     }
-    eprintln!(
-        "checked {checked} prefill outputs against exact and random affine dots, including row tails and a fallback column width"
-    );
 }

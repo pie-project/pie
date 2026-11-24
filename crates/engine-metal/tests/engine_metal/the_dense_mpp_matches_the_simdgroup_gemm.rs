@@ -60,7 +60,6 @@ fn a_dense_matmul_on_the_tensor_ops_answers_the_simdgroup_product() {
     ];
     let (mut worst_abs, mut worst_rel, mut worst_vs) = (0.0f64, 0.0f64, 0.0f64);
     let mut worst_simdgroup = 0.0f64;
-    let mut checked = 0u64;
     for &(k, n) in &shapes {
         let weights: Vec<u8> = (0..u64::from(n) * u64::from(k))
             .flat_map(|at| bf16(value(at ^ 0x77, 0.0009)))
@@ -128,7 +127,6 @@ fn a_dense_matmul_on_the_tensor_ops_answers_the_simdgroup_product() {
                     worst_rel = worst_rel.max(error / magnitude.max(1e-12));
                     worst_vs = worst_vs.max((got - simd).abs());
                     worst_simdgroup = worst_simdgroup.max((simd - want).abs());
-                    checked += 1;
                 }
             }
         }
@@ -185,13 +183,7 @@ fn a_dense_matmul_on_the_tensor_ops_answers_the_simdgroup_product() {
                     (actual - want).abs() <= allowance,
                     "page-end M={m} row={row} col={col}: {actual} vs {want}"
                 );
-                checked += 1;
             }
         }
     }
-    eprintln!(
-        "tensor ops {on_tensor_ops}: checked {checked} outputs; max |error| {worst_abs:.3e}, \
-         max |error| / sum |terms| {worst_rel:.3e}, max |tensor ops - simdgroup| {worst_vs:.3e}, \
-         the simdgroup kernels' own max |error| {worst_simdgroup:.3e}"
-    );
 }

@@ -2,7 +2,7 @@
 
 //! M1b: the Metal PTQ1_0 (ternary, `g128_t3_f16_n`) decode-in-dot kernel must
 //! match the M1a host decoder — which is itself bit-exact against the fork's own
-//! `dequantize_row_ptq1_0`. This is the C2c-analog: prove the Metal read path
+//! `dequantize_row_ptq1_0`. It proves the Metal read path
 //! reproduces the proven host reference on REAL blocks.
 //!
 //! The oracle is the frozen fixture `checkpoint/src/codec/ptq1_0_fixture.rs`:
@@ -68,7 +68,6 @@ fn a_ternary_decode_in_dot_answers_the_host_decoder_every_case() {
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    eprintln!("device: {}", device.name());
 
     the_one_hot_probe_reads_back_the_host_decoder_bit_exact(&device, &handles, &pipelines);
     a_random_activation_answers_the_host_decoded_weights(&device, &handles, &pipelines);
@@ -135,12 +134,8 @@ fn the_one_hot_probe_reads_back_the_host_decoder_bit_exact(
     let y = handles.read(hy, (m * n * 4) as u64).expect("read y");
 
     let mut real = 0usize;
-    let mut synthetic = 0usize;
-    let mut checked = 0usize;
     for (r, b) in blocks.iter().enumerate() {
-        if b.tensor.starts_with("synthetic:") {
-            synthetic += 1;
-        } else {
+        if !b.tensor.starts_with("synthetic:") {
             real += 1;
         }
         for i in 0..BLOCK {
@@ -151,14 +146,9 @@ fn the_one_hot_probe_reads_back_the_host_decoder_bit_exact(
                 "{} block {} element {}: metal {:#010x} != host {:#010x}",
                 b.tensor, b.block_index, i, got, want,
             );
-            checked += 1;
         }
     }
     assert!(real >= 20, "want the spread of real blocks, got {real}");
-    eprintln!(
-        "readback: {checked} elements bit-exact vs the host decoder \
-         across {real} real + {synthetic} synthetic blocks"
-    );
 }
 
 /// Check 2: a wider matrix (many blocks per row, so multiple lanes and the
@@ -315,9 +305,5 @@ fn a_random_activation_answers_the_host_decoded_weights(
     assert!(
         worst_bf16 <= 8e-3,
         "dispatched bf16-out ternary matmul drifts {worst_bf16:.2e} from the reference"
-    );
-    eprintln!(
-        "general: f32-out worst {worst_f32:.2e} (<=2e-3), dispatched bf16-out worst \
-         {worst_bf16:.2e} (<=8e-3) over {m}x{n}, K={k}"
     );
 }

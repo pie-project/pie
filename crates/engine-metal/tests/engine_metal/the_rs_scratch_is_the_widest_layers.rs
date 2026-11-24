@@ -21,8 +21,6 @@ fn the_rs_scratch_is_the_widest_layers() {
     let fixture = fixture_of("qwen35-tiny", None);
     let mut shell = load_with(&fixture, 256);
     assert!(shell.serves_rs_verbs(), "a recurrent model");
-    let rooms = shell.rs_rooms();
-    eprintln!("each rung's rs scratch: {rooms:?}");
     let a: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
     let b: Vec<u32> = (0..6u32).map(|at| (101 + at * 37) % 256).collect();
     let per_page = shell.pool_layout().rs_tokens.max(1);
@@ -63,6 +61,5 @@ fn the_rs_scratch_is_the_widest_layers() {
         .zip(&replayed)
         .map(|(x, y)| (x - y).abs())
         .fold(0f32, f32::max);
-    eprintln!("B after replay(A) vs B after fold(A): {apart}");
     assert!(apart <= 0.05, "a replay through the shared scratch answers as the fold: {apart}");
 }

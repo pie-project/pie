@@ -261,7 +261,6 @@ fn gated_delta(bench: &Bench, n: u32) {
         .zip(&want)
         .map(|(&g, &w)| (f64::from(g) - w).abs())
         .fold(0f64, f64::max);
-    eprintln!("gated-delta fold of {n} rows: worst {worst:.3e} of a state of magnitude {scale:.3e}");
     assert!(
         worst <= 1e-5 * scale.max(1.0),
         "the group fold of {n} rows is {worst:e} from the sequential recurrence (scale {scale:e})"

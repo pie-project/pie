@@ -1,9 +1,9 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2c-1 — the DECODE sdpa read over a PACKED 4-bit KV cache.
+//! The DECODE sdpa read over a PACKED 4-bit KV cache.
 //!
-//! C2b proved the quantizing WRITE path leaves a self-consistent 4-bit cache.
-//! This proves the matching READ: the decode sdpa kernel, dispatched on the
+//! `the_kv_write_round_trips` checks the quantizing WRITE path. This checks the
+//! matching READ: the decode sdpa kernel, dispatched on the
 //! pool's `KvU4` dtype, byte-indexes each 130-byte block, unpacks the lane's
 //! offset-binary nibbles (`q = nibble - 8`), rescales by the block's inline fp16
 //! scale, and attends with the SAME math as the bf16 decode.
@@ -341,7 +341,7 @@ fn deviation(a: &[f32], b: &[f32]) -> (f64, f64) {
 /// reference). Returns ((isolate max, isolate mean), (quant max, quant mean)).
 fn run_case(
     rig: &mut Rig,
-    label: &str,
+    _: &str,
     head_dim: usize,
     k_src: &[f32],
     v_src: &[f32],
@@ -427,31 +427,18 @@ fn run_case(
     // ---- (FYI) packed read vs bf16 decode on the ORIGINAL K/V = 4-bit quant err
     let quant = deviation(&out_packed, &out_orig);
 
-    eprintln!(
-        "[{label:>10} d={head_dim:>3} isolate] packed decode vs bf16-decode-on-unpacked-from-packed: \
-         max={:.3e} mean={:.3e}",
-        iso.0, iso.1
-    );
-    eprintln!(
-        "[{label:>10} d={head_dim:>3} quant  ] packed decode vs bf16-decode-on-original K/V:         \
-         max={:.3e} mean={:.3e}",
-        quant.0, quant.1
-    );
     (iso, quant)
 }
 
 #[test]
 fn the_packed_kv_decode_reads() {
-    eprintln!("=== C2c-1: dequantizing decode read for packed 4-bit KV ===");
     let Some(mut rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");
         return;
     };
-    eprintln!("device: {}", rig.device.name());
 
     // The codec block IS the head_dim; prove the packed decode at 256 AND 128.
     for &head_dim in &HEAD_DIMS {
-        eprintln!("--- head_dim {head_dim} (codec block {head_dim}) ---");
 
         // ---- CASE 1: realistic random K/V (off-grid) ----------------------------
         // Off-grid Gaussians with modest spikes: quantization is lossy (the FYI quant
@@ -504,7 +491,7 @@ fn the_packed_kv_decode_reads() {
         // lossless, the "quant" reference is ALSO bit-identical here — so its number
         // is ~0 too, and there is no lossy error to separate from (the random case
         // above carries that contrast).
-        let ((e_iso_max, e_iso_mean), (e_q_max, _)) = run_case(
+        let ((e_iso_max, _), (_, _)) = run_case(
             &mut rig,
             "bf16-exact",
             head_dim,
@@ -517,13 +504,6 @@ fn the_packed_kv_decode_reads() {
          (on-grid) K/V by max {e_iso_max:.3e} — the dequant is NOT exact (a real \
          offset/parity/scale/index bug), not a tolerance to loosen"
         );
-        eprintln!(
-            "[bf16-exact d={head_dim:>3}] isolate max {e_iso_max:.3e} mean {e_iso_mean:.3e}, lossless-quant \
-         max {e_q_max:.3e} — dequant is exact on-grid"
-        );
     }
 
-    eprintln!(
-        "=== C2c-1 done: the packed 4-bit KV decode read dequantizes + attends correctly (d=128 & 256) ==="
-    );
 }

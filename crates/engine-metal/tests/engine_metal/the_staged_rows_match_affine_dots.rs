@@ -11,10 +11,6 @@ use poem_ir::Dtype;
 fn apple10() -> Option<Context> {
     let device = Context::bind().ok()?;
     if device.family() < 10 {
-        eprintln!(
-            "skipped: the staged tile runs on Apple10, this GPU is Apple{}",
-            device.family()
-        );
         return None;
     }
     Some(device)
@@ -40,7 +36,6 @@ fn every_staged_row_answers_an_affine_reference() {
     let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"staged\", \"qmv\"]", false);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    let mut checked = 0;
     let cases = [
         (128u32, 64u32),
         (512, 1024),
@@ -165,13 +160,11 @@ fn every_staged_row_answers_an_affine_reference() {
                                 "random M={m} K={k} N={n} row={row} col={col}: {actual_f32} vs {want}"
                             );
                         }
-                        checked += 1;
                     }
                 }
             }
         }
     }
-    eprintln!("checked {checked} staged outputs against exact and random affine dots");
 }
 
 #[test]

@@ -1,10 +1,9 @@
 #![cfg(target_vendor = "apple")]
 
 //! With one frame in flight every stage harvests the step before it, so a
-//! frame's steps have all landed by the time its rows are asked. A frame of
-//! more steps than the settled rows used to be kept for (two frames of the
-//! most a frame takes) lost its first steps' rows and was refused. Every
-//! step's rows are held until they are taken: the first of ten steps taken
+//! frame's steps have all landed by the time its rows are asked. Every
+//! step's rows are held until they are taken, however many steps a frame
+//! carries: the first of ten steps taken
 //! after all ten landed, the first last, and a second ask is refused.
 
 use engine::frame::Shell as FrameShell;
