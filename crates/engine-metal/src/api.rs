@@ -453,23 +453,18 @@ impl Engine for Metal {
         crate::chip::COVERS
     }
 
-    /// Stated by sc/macpro-4c-profiles (its rates and dense crossover);
-    /// until it lands, said as untracked by name.
-    fn measured_at_load(&self) -> Vec<String> {
-        vec!["metal: what it measured is not tracked yet".to_string()]
-    }
-
     fn skips_measuring(&self) -> bool {
         self.boot.measure == engine::rates::Measuring::Skip
     }
 
     /// What the load timed (`Shell::measured_at_load`): the device's rates
     /// and the model's kernel.dense curves, each where it measured them.
-    /// `None` before a load, which has timed nothing yet to say.
-    fn measured_at_load(&self) -> Option<Vec<String>> {
+    /// Nothing before a load, which has timed nothing yet.
+    fn measured_at_load(&self) -> Vec<String> {
         self.shell
             .as_ref()
             .map(|shell| shell.measured_at_load().to_vec())
+            .unwrap_or_default()
     }
 
     fn kind(&self) -> &'static str {

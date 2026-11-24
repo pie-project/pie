@@ -1237,6 +1237,7 @@ mod ensure_tests {
     fn measured() -> Rates {
         Rates {
             landing: None,
+            load_width: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 300.0)]),

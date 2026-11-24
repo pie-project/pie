@@ -7758,6 +7758,7 @@ pub(crate) mod lifecycle_tests {
                     cells: Vec::new(),
                     failure: failure.clone(),
                     retired: None,
+                    lane: None,
                 }));
             advance_cursor(&cursor, Some(start as u32 + 1), None);
             record_writes(

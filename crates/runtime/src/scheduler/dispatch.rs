@@ -270,6 +270,14 @@ mod tests {
             false
         }
 
+        fn measured_at_load(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+            Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+        }
+
         fn prepare_program(
             &mut self,
             _registration: &::engine::program::ProgramRegistration,

@@ -5243,7 +5243,9 @@ impl<B: Serve> Shell<B> {
         let staged = crate::beam::Staged {
             room,
             tables,
-            windowed: self.pools.tables().iter().any(|paged| paged.window().is_some()),
+            // No load keeps window lists now (its windowed layers are
+            // ring + buffer, CONTRACT-BC 19): no staged table is one.
+            windowed: false,
             page: self.pools.paging().page_size,
             planes,
             unit,
@@ -8752,15 +8754,6 @@ impl<B: Serve> Shell<B> {
                 format!(
                     "lane {source} places its rows at working-set slots and is seat-addressed: \
                      a seat has no working set whose pages the slots index"
-                ),
-            ));
-        }
-        if self.pools.tables().iter().any(|paged| paged.window().is_some()) {
-            return Err(program(
-                "serve::stage",
-                format!(
-                    "lane {source} places its rows at slots {slots:?}, off the run its fire \
-                     appends, and this load keeps window lists, which page that run alone"
                 ),
             ));
         }

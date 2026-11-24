@@ -101,12 +101,23 @@ impl Done {
     /// guest frame's, on the thread that polls the device) asks this.
     pub fn when_settled(self, then: impl FnOnce(Done, engine::StepOutcome) + Send + 'static) {
         let outcome = engine::StepOutcome {
+            beam_common: Vec::new(),
             wrote: self.wrote.clone(),
             faulted: self.faulted.clone(),
         };
         match self.fed.clone() {
             None => then(self, outcome),
-            Some(fed) => fed.then(move |faults| then(self, merged(outcome, faults))),
+            Some(fed) => {
+                // Told once the landing read the groups' common slots too.
+                let read = fed.clone();
+                fed.then(move |faults| {
+                    let outcome = engine::StepOutcome {
+                        beam_common: read.commons(),
+                        ..merged(outcome, faults)
+                    };
+                    then(self, outcome);
+                });
+            }
         }
     }
 
