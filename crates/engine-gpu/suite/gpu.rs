@@ -46,6 +46,18 @@ pub fn device_boot() -> DeviceBoot {
     }
 }
 
+/// `boot` for a load whose test fires the lanes and rows its budgets state
+/// straight at the engine, as no runtime does: the load lays its fires to
+/// those rows (`DeviceBoot::fires_stated`) in place of the ruling's fire
+/// top, which for a model with no weight to read is its narrowest rung (one
+/// row, one lane), since every rung is then wholly efficient.
+pub fn fires_stated(boot: DeviceBoot) -> DeviceBoot {
+    DeviceBoot {
+        fires_stated: true,
+        ..boot
+    }
+}
+
 /// The submit bound the process's rates step measures under ([`profiles`]):
 /// the roomy one the bounded loads state (`runtime::fold`), so every key a
 /// bounded load weighs by is measured, and no point is past it.

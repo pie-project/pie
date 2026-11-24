@@ -47,6 +47,13 @@ pub struct DeviceBoot {
     /// or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub submit_bound: Option<std::time::Duration>,
+
+    /// A test's load whose harness states what the test fires: its fires
+    /// laid to the rows its budgets state, in place of the ruling's fire
+    /// top (`engine_gpu::serve::Serve::fires_stated`). Test builds only
+    /// (`test-limits`): no config or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub fires_stated: bool,
 }
 
 impl Default for DeviceBoot {
@@ -62,6 +69,8 @@ impl Default for DeviceBoot {
             max_buffer: None,
             #[cfg(feature = "test-limits")]
             submit_bound: None,
+            #[cfg(feature = "test-limits")]
+            fires_stated: false,
         }
     }
 }

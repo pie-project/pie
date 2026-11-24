@@ -323,7 +323,7 @@ pub(super) fn loaded_flight(
     write(&path, &planes);
 
     let trace = poem::trace_hybrid(NAME, model, backend::PLATFORM);
-    let mut engine = backend::Engine::new(boot, contract_for);
+    let mut engine = backend::Engine::new(crate::gpu::fires_stated(boot), contract_for);
     let caps = engine
         .load(LoadRequest {
             trace: trace.clone(),

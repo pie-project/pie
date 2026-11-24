@@ -1126,7 +1126,8 @@ where
             residency,
             device: &self.boot,
             handed: self.handed.take(),
-            check: None,
+            check: B::fires_stated(&self.boot)
+                .then_some(crate::serve::CheckRungs::To(budgets.max_tokens)),
             places_programs: true,
         })
         .map_err(fault)?;
