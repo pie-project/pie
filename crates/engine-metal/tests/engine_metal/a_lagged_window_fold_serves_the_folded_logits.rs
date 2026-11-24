@@ -185,9 +185,12 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
     // Past the ring's wrap, within the load's context.
     let past = ring_rows + 2 * page;
     let steps = past.saturating_sub(prompt).max(24).min(context - prompt - 1);
-    // The prompt in pieces a fire of both lanes takes, each lane folding
-    // every piece; then the decodes, lane 1 trailing.
-    let piece = (shell.budgets().tokens.max_tokens / 2).max(1);
+    // The prompt in pieces a fire takes, each lane folding every piece
+    // (past `R - W + 1` rows a piece lands in own-row pages, not straight in
+    // the ring); then the decodes, lane 1 trailing. Each lane fires alone: a
+    // routed model's expert batches move with the lanes beside a row, so
+    // two lanes of one fire need not agree to the bf16 unit.
+    let piece = shell.budgets().tokens.max_tokens.max(1);
     let prompt_tokens: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
     let mut pieces = prompt_tokens.chunks(piece as usize).map(<[u32]>::to_vec).collect::<Vec<_>>().into_iter();
     let mut fed: Vec<u32> = pieces.next().expect("a prompt");
@@ -239,7 +242,13 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
                 })
             })
             .collect();
-        let got = shell.fire_seated(&seated).expect("the fire lands");
+        let got: Vec<Vec<f32>> = seated
+            .iter()
+            .map(|lane| {
+                let mut got = shell.fire_seated(std::slice::from_ref(lane)).expect("the fire lands");
+                got.remove(0)
+            })
+            .collect();
         for lane in 0..2 {
             folded[lane] += advance[lane];
             logits[lane].push(got[lane].clone());
