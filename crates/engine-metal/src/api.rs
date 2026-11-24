@@ -37,6 +37,11 @@ pub struct DeviceBoot {
     /// `[metal] measure`: whether a load times what no stored or committed
     /// profile states under a matching key.
     pub measure: engine::rates::Measuring,
+    /// The top rung a load serves: `None` the ruling's (`Top::Ruled`, every
+    /// served load). A test that hand-builds frames wider than a miniature's
+    /// ruled top (which the runtime's step builder never forms) loads every
+    /// rung (`Top::EveryRung`), as the shell tests do.
+    pub top: Option<crate::Top>,
 }
 
 struct PendingStep {
@@ -631,7 +636,7 @@ impl Engine for Metal {
                     runahead: engine::runahead::Runahead::of(frames_in_flight),
                     residency: experts::Plan::default(),
                     profiles: self.boot.profiles.clone(),
-                    top: crate::Top::Ruled,
+                    top: self.boot.top.unwrap_or(crate::Top::Ruled),
                     measure: self.boot.measure,
                 })
                 .map_err(fault)?;
