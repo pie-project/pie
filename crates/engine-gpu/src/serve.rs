@@ -716,9 +716,9 @@ struct Behind {
     /// behind.
     slices: u64,
     longest: std::time::Duration,
-    /// One decode step of this load as the settle met it: the first point
-    /// it fired at its fewest rows (ranges go fewest rows first), ns. A
-    /// point expected to run longer waits for no process to be live.
+    /// One decode step at one lane on this load as the settle met it: its
+    /// 1-row point, ns. No point behind serving runs longer than the
+    /// larger of it and the lane's served step.
     decode_ns: Option<f64>,
     /// The longest fire the last range closed saw, and its top rows: what
     /// the next range's first point is expected from (scaled by its rows).
@@ -3393,9 +3393,14 @@ impl<B: Serve> Shell<B> {
     /// where neither is known yet.
     #[must_use]
     pub fn decode_step_ns(&self) -> Option<f64> {
-        self.served_step_ns
-            .or_else(|| self.behind.as_ref().and_then(|b| b.decode_ns))
-            .or(self.last_landed.map(|ns| ns as f64))
+        // The larger of the lane's served step and the settle's own 1-row
+        // point (one decode step at one lane on this load: never longer
+        // than what a lone request already costs).
+        let own = self.behind.as_ref().and_then(|b| b.decode_ns);
+        match (self.served_step_ns, own) {
+            (Some(served), Some(own)) => Some(served.max(own)),
+            (served, own) => served.or(own).or(self.last_landed.map(|ns| ns as f64)),
+        }
     }
 
     /// One served step as the runtime saw it lately
@@ -3551,10 +3556,12 @@ impl<B: Serve> Shell<B> {
                 .last_range
                 .map(|(top, ns)| ns * f64::from(trial.top) / f64::from(top.max(1)))
         });
-        let long = matches!(
-            (expected, self.decode_step_ns()),
-            (Some(expected), Some(decode)) if expected > decode
-        );
+        // The settle's own 1-row point is the reference itself, never long.
+        let long = trial.top > 1
+            && matches!(
+                (expected, self.decode_step_ns()),
+                (Some(expected), Some(decode)) if expected > decode
+            );
         Some(engine::BehindNeed {
             lanes: trial.fire_lanes,
             tokens: trial.per_lane,
@@ -3599,7 +3606,9 @@ impl<B: Serve> Shell<B> {
             return Ok(true);
         }
         if let Some(seen) = trial.seen_ns {
-            behind.decode_ns.get_or_insert(seen);
+            if trial.top == 1 {
+                behind.decode_ns.get_or_insert(seen);
+            }
             behind.last_range = Some((trial.top, seen));
         }
         let (row, taken) = self.close_trial(trial);
