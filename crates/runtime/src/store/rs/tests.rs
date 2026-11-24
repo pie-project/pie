@@ -69,7 +69,7 @@ fn idle_snapshots_go_in_retention_order() {
     assert!(s.has_checkpoint(&[1; 32]), "the higher-ranked stays");
     // No lower tier for a checkpoint: cached state yields to the next
     // demand, whatever its key.
-    assert_eq!(s.reclaim_droppable(rank), 1);
+    assert_eq!(s.reclaim_cache(rank), 1);
     assert!(!s.has_checkpoint(&[1; 32]));
     assert_eq!(s.discard_cache(high), 0);
     assert_eq!(s.reclaim_cache(rank), 0);

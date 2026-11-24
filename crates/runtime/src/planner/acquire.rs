@@ -221,10 +221,11 @@ impl ResidencyPlanner {
                 };
                 return Err(PlannerError::Impossible { need, total });
             }
-            // Short of state, a resident process quotes again once the idle
-            // cache its keys let go is dropped, or else the snapshots sharing
-            // its own state that may go, instead of parking. What a policy
-            // keeps stays: the waiter parks and asks for room.
+            // Short of state, a resident process quotes again once idle
+            // cache is dropped, or else the snapshots sharing its own state,
+            // instead of parking. Idle kv cache its tiers row lets on a
+            // lower tier with room moves there first and is not dropped: the
+            // waiter parks, and the move's landing wakes the planner.
             let resident = self.with_inner(|inner| {
                 inner.procs.get(&pid).is_some_and(|proc| {
                     proc.state == Residency::Resident && !inner.killing.contains(&pid)
@@ -236,7 +237,14 @@ impl ResidencyPlanner {
                     kv_pages: self.port.rs_as_pages(demand.rs.sub(rs_free)),
                     rs: true,
                 };
-                match self.reclaim_idle_once(short) {
+                // A demote on its way is room on its way back, as a
+                // reclaim's returning pages are.
+                let outcome = if short.kv_pages > 0 && self.demote_idle(short.kv_pages) {
+                    super::residency_planner::IdleOutcome::Returning
+                } else {
+                    self.reclaim_idle_once(short)
+                };
+                match outcome {
                     super::residency_planner::IdleOutcome::Freed => {
                         self.pages_freed();
                         return Ok(Acquired::Requote);

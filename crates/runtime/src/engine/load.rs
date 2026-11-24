@@ -654,54 +654,135 @@ mod tests {
         writer.finish().expect("finish the checkpoint");
     }
 
-    /// Every checkpoint at hand: a stranger no row reads, each directory
-    /// `PIE_IDENTIFY_CHECKPOINTS` lists (`:`-separated), and every snapshot
-    /// in the Hugging Face cache.
-    fn checkpoints_at_hand(scratch: &Path) -> Vec<std::path::PathBuf> {
+    /// The models whose rows the pre-filter test contracts: one it picks
+    /// for the fixture, one whose format takes the fixture's header but
+    /// whose dimensions do not. Contracting every catalog row on both
+    /// platforms costs a trace of each, minutes in a debug build.
+    const PREFILTER_MODELS: [&str; 2] = ["qwen3-0.6b", "qwen3-8b"];
+
+    /// A snapshot directory of `config` and one safetensors file whose
+    /// header names `tensors` (bf16), its data a sparse hole: the pre-filter
+    /// and the contracts read headers and configuration alone.
+    fn a_snapshot_of(dir: &Path, config: &serde_json::Value, tensors: &[(String, Vec<u64>)]) {
+        std::fs::create_dir_all(dir).expect("the snapshot directory");
+        std::fs::write(dir.join("config.json"), config.to_string()).expect("its config");
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        for (name, shape) in tensors {
+            let len = shape.iter().product::<u64>() * 2;
+            header.insert(
+                name.clone(),
+                serde_json::json!({
+                    "dtype": "BF16",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + len],
+                }),
+            );
+            offset += len;
+        }
+        let mut text = serde_json::Value::Object(header).to_string().into_bytes();
+        while text.len() % 8 != 0 {
+            text.push(b' ');
+        }
+        let mut bytes = (text.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&text);
+        let path = dir.join("model.safetensors");
+        std::fs::write(&path, &bytes).expect("the header");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_len(bytes.len() as u64 + offset))
+            .expect("the data, a hole");
+    }
+
+    /// A Qwen3-0.6B as transformers stores it, header and configuration
+    /// only, its MLP `inter` wide.
+    fn a_qwen3_0_6b(dir: &Path, inter: u64) {
+        let (hidden, layers, q, kv, hd, vocab) = (1024u64, 28, 16, 8, 128, 151_936);
+        let mut tensors = vec![
+            ("model.embed_tokens.weight".to_string(), vec![vocab, hidden]),
+            ("model.norm.weight".to_string(), vec![hidden]),
+        ];
+        for l in 0..layers {
+            let at = |what: &str| format!("model.layers.{l}.{what}.weight");
+            tensors.extend([
+                (at("input_layernorm"), vec![hidden]),
+                (at("self_attn.q_proj"), vec![q * hd, hidden]),
+                (at("self_attn.k_proj"), vec![kv * hd, hidden]),
+                (at("self_attn.v_proj"), vec![kv * hd, hidden]),
+                (at("self_attn.o_proj"), vec![hidden, q * hd]),
+                (at("self_attn.q_norm"), vec![hd]),
+                (at("self_attn.k_norm"), vec![hd]),
+                (at("post_attention_layernorm"), vec![hidden]),
+                (at("mlp.gate_proj"), vec![inter, hidden]),
+                (at("mlp.up_proj"), vec![inter, hidden]),
+                (at("mlp.down_proj"), vec![hidden, inter]),
+            ]);
+        }
+        let config = serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "hidden_size": hidden,
+            "intermediate_size": inter,
+            "num_attention_heads": q,
+            "num_key_value_heads": kv,
+            "head_dim": hd,
+            "num_hidden_layers": layers,
+            "vocab_size": vocab,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1_000_000,
+            "max_position_embeddings": 40960,
+            "tie_word_embeddings": true,
+            "torch_dtype": "bfloat16",
+        });
+        a_snapshot_of(dir, &config, &tensors);
+    }
+
+    /// The checkpoints the pre-filter test walks, built here: a stranger no
+    /// row reads, a Qwen3-0.6B, and one whose format is taken but whose
+    /// MLP width no row lands on. Never what the machine holds.
+    fn fixture_checkpoints(scratch: &Path) -> Vec<std::path::PathBuf> {
         let stranger = scratch.join("stranger.zt");
         a_checkpoint_no_row_reads(&stranger);
-        let mut found = vec![stranger];
-        if let Some(listed) = std::env::var_os("PIE_IDENTIFY_CHECKPOINTS") {
-            found.extend(std::env::split_paths(&listed).filter(|p| p.exists()));
-        }
-        let hub = std::env::var_os("HF_HOME")
-            .map(|home| std::path::PathBuf::from(home).join("hub"))
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| std::path::PathBuf::from(home).join(".cache/huggingface/hub"))
-            });
-        let listing = |dir: &Path| -> Vec<std::path::PathBuf> {
-            let mut paths: Vec<_> = std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|entry| entry.path())
-                .collect();
-            paths.sort();
-            paths
-        };
-        for model in hub.as_deref().map(listing).unwrap_or_default() {
-            found.extend(listing(&model.join("snapshots")));
-        }
-        found
+        let picked = scratch.join("qwen3-0.6b");
+        a_qwen3_0_6b(&picked, 3072);
+        let near = scratch.join("qwen3-0.6b-wider");
+        a_qwen3_0_6b(&near, 4096);
+        vec![stranger, picked, near]
     }
 
     /// The header pre-filter drops only deployments whose contract refuses,
     /// so identification picks what contracting every candidate in catalog
-    /// order picks, on every checkpoint at hand.
+    /// order picks, on each fixture checkpoint, among the rows of
+    /// [`PREFILTER_MODELS`].
     #[test]
     fn the_header_prefilter_keeps_every_pick() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let mut identified = 0;
-        for path in checkpoints_at_hand(dir.path()) {
-            let (Ok(source), Ok(metadata)) = (open_source(&path), checkpoint_metadata(&path))
-            else {
-                continue;
-            };
+        for path in fixture_checkpoints(dir.path()) {
+            let source = open_source(&path).unwrap_or_else(|why| panic!("{path:?}: {why:#}"));
+            let metadata =
+                checkpoint_metadata(&path).unwrap_or_else(|why| panic!("{path:?}: {why:#}"));
             for platform in [Platform::Cuda, Platform::Metal] {
-                let candidates = catalog().candidates_of(&source, platform);
+                // `candidates_of` on the named rows alone: it traces every
+                // listed miniature to see whether a cut reads `source`.
+                let (mut candidates, mut cuts) = (Vec::new(), Vec::new());
+                for d in catalog().candidates() {
+                    if !PREFILTER_MODELS.contains(&d.model.id.as_str()) {
+                        continue;
+                    }
+                    match d.cut(&source, platform) {
+                        Some(cut) => cuts.push(cut),
+                        None => candidates.push(d.clone()),
+                    }
+                }
+                candidates.append(&mut cuts);
+                assert!(!candidates.is_empty(), "the named models are listed");
+                let mut kept = Vec::new();
                 for d in &candidates {
-                    if !d.may_read(&source, platform) {
+                    if d.may_read(&source, platform) {
+                        kept.push(d.clone());
+                    } else {
                         assert!(
                             d.contract(&source, platform).is_err(),
                             "{path:?}: the pre-filter drops `{}` on {platform:?}, whose \
@@ -715,13 +796,16 @@ mod tests {
                     (d, read)
                 });
                 let unfiltered = first_fit(&metadata, platform, every).ok();
-                let filtered =
-                    first_fit(&metadata, platform, catalog().fits(&source, platform)).ok();
+                let fits = kept.into_iter().map(|d| {
+                    let read = d.contract(&source, platform);
+                    (d, read)
+                });
+                let filtered = first_fit(&metadata, platform, fits).ok();
                 assert_eq!(filtered, unfiltered, "{path:?} on {platform:?}");
                 identified += usize::from(filtered.is_some());
             }
         }
-        eprintln!("the pre-filter kept the pick on {identified} identifications");
+        assert!(identified > 0, "the Qwen3-0.6B fixture is picked: the walk tests a pick");
     }
 
     #[test]
