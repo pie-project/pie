@@ -90,8 +90,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     .map_err(Fault::Card)?;
     // What the rates step timed (none where every rate was stated).
     let timed_at_open = chip.tuned().timed.clone();
-    // The roofline keys served by a stale figure, timed behind serving.
-    let behind = super::behind::Behind::of(&chip);
     device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
     // The product times the device's profile holds choose between the
     // kernels that can serve a decode product; arming notes the shapes it
@@ -99,7 +97,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let products = chip.rates().product_ns.clone().unwrap_or_default();
     // The product times stored under a stale key (a kernel's code changed)
     // answer what the matching ones lack: a fair estimate, served (and said,
-    // `Shell::queue_behind`) until `pie tune` or a re-export times them
+    // `say_stale_banks`) until `pie tune` or a re-export times them
     // again; never timed before ready.
     let estimates = chip
         .rates()
@@ -647,7 +645,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         ceiling,
         weighed,
         timed_at_open,
-        behind,
     })
 }
 
@@ -1045,7 +1042,6 @@ impl Shell {
             ceiling,
             weighed,
             timed_at_open,
-            behind,
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
@@ -1712,7 +1708,6 @@ impl Shell {
             keys,
             products,
             routes_measuring: boot.knobs.measuring,
-            behind,
             measured: timed_at_open,
             forced_bucket: None,
             budget: budgets.tokens.clone(),
@@ -2188,7 +2183,6 @@ impl Staged {
             shell.ep.is_none() && shell.records_bodies() && !shell.pools.weights_seated_whole();
         if deferred {
             shell.arm_deferred = true;
-            shell.queue_behind(std::collections::BTreeMap::new(), profiles.as_deref());
             eprintln!(
                 "engine-cuda: this load streams its weights; its bodies arm at the starting \
                  weight residency, over the slots the cache holds then"
@@ -2207,7 +2201,7 @@ impl Staged {
                 .map(|routes| routes.behind())
                 .unwrap_or_default();
             shell.routes_measured(profiles.as_deref())?;
-            shell.queue_behind(noted, profiles.as_deref());
+            say_stale_banks(&noted);
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
             }
@@ -2993,8 +2987,6 @@ pub(super) struct Baked {
     pub(super) weighed: Option<crate::top::Weighed>,
     /// What the rates step timed at open (none where every rate was stated).
     pub(super) timed_at_open: Vec<String>,
-    /// The roofline keys served by a stale figure.
-    pub(super) behind: super::behind::Behind,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,
@@ -3097,4 +3089,29 @@ mod tests {
         let rows = widened(3445, 3445, on, |_| panic!("nothing past the top is asked")).unwrap();
         assert_eq!(rows, 3445);
     }
+}
+
+/// The decode product banks a load's picks read a figure stored under a
+/// stale key of (`Routes::behind`, noted by its arming), said: they serve by
+/// those figures, a decode body's times, until `pie tune` or a re-export
+/// times them again; nothing times them before ready or behind serving.
+fn say_stale_banks(
+    noted: &std::collections::BTreeMap<
+        kernels_cuda::linear::routes::Shape,
+        kernels_cuda::linear::routes::Wanted,
+    >,
+) {
+    if noted.is_empty() {
+        return;
+    }
+    let banks: Vec<String> = noted
+        .keys()
+        .map(|s| format!("{:?} {}x{} m{}", s.kind, s.rows, s.k, s.m))
+        .collect();
+    eprintln!(
+        "engine-cuda: rates: `[rates] product_ns`: {} decode product bank(s) served by their \
+         figures stored under a stale key (`pie tune` or a re-export refreshes them): {}",
+        banks.len(),
+        banks.join(", ")
+    );
 }

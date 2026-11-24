@@ -423,27 +423,6 @@ impl Context {
         &self.name
     }
 
-    /// A context on this one's stream and BLAS handle, under its tuning,
-    /// over slabs of its own: what a measurement behind serving launches
-    /// through, so whatever it lays leaves the slabs serving launches
-    /// through untouched. The caller releases the slabs once nothing
-    /// launches through it again (`Slabs::release`).
-    #[cfg(feature = "device")]
-    #[must_use]
-    pub fn apart(&self) -> (Ctx, Slabs) {
-        let slabs = Slabs::open();
-        // SAFETY: the stream and BLAS handle are this context's, live for
-        // its lifetime, which outlives the caller's use of the one made.
-        unsafe {
-            slabs.attach(self.stream);
-            #[cfg(not(feature = "rocm"))]
-            let ctx = Ctx::on(self.stream).with_cublas(self.cublas);
-            #[cfg(feature = "rocm")]
-            let ctx = Ctx::on(self.stream).with_blas(self.cublas);
-            (ctx.with_slabs(slabs).with_tuning(self.ctx.tuning()), slabs)
-        }
-    }
-
     /// Lay a load's kernel decisions on this context, before it opens side
     /// streams.
     pub fn set_tuning(&mut self, tuning: kernels_cuda::tuning::Tuning) {
@@ -670,25 +649,6 @@ pub fn bind_thread(ordinal: i32) -> Result<()> {
     #[cfg(not(feature = "device"))]
     {
         let _ = ordinal;
-        Err(Fault::Runtimeless)
-    }
-}
-
-/// Whether everything `stream` was given has run.
-pub fn idle(stream: *mut c_void) -> Result<bool> {
-    #[cfg(feature = "device")]
-    {
-        use crate::device::rt::cudaError;
-        // SAFETY: the handle is the caller's, live for the call.
-        match unsafe { crate::device::rt::cudaStreamQuery(stream.cast()) } {
-            cudaError::cudaSuccess => Ok(true),
-            cudaError::cudaErrorNotReady => Ok(false),
-            status => check("cudaStreamQuery", status).map(|()| false),
-        }
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        let _ = stream;
         Err(Fault::Runtimeless)
     }
 }
