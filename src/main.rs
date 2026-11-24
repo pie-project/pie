@@ -133,7 +133,7 @@ async fn run() -> anyhow::Result<ExitCode> {
 
         Command::Model { cmd } => {
             let global = cli.global.clone();
-            tokio::task::spawn_blocking(move || ops::model::run(cmd, &global)).await??
+            tokio::task::spawn_blocking(move || ops::model::run(cmd, &global, cli.json)).await??
         }
 
         Command::Cache { cmd } => {

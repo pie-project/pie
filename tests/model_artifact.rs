@@ -187,8 +187,11 @@ fn an_import_that_will_prepare_refuses_a_source_no_deployment_claims() {
             consume_source: false,
             keep_source: false,
             drafter: None,
+            revision: None,
+            parent_stdin: false,
         },
         &global,
+        false,
     );
     let Err(why) = answered else {
         panic!("an import that will prepare wrote an artifact nothing in this build can serve");
