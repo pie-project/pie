@@ -906,11 +906,16 @@ impl Inner {
                     };
                     key = up;
                 }
-                // Not gated here: this is the one that goes when every
-                // waiter is held and nothing is in flight. Held at the gate
-                // too, nothing went, and the finisher's bind waited on moves
-                // no pass made (the wide shape's seeds 7, 104 and 184 among
-                // eleven: liveness at the bind).
+                // The bind it lays is new state: past what the gate spares,
+                // it waits for the finisher as any ask does. Ungated, the
+                // last-resort restore laid eight chunks of a bind past the
+                // finisher's headroom (the Metal mix's seed 44: 25 pages
+                // short). The finisher's room is the gate's to keep
+                // makeable (its claim, `ChunkSpare`), so holding this one
+                // leaves the finisher a step.
+                if self.queue.get(&key).is_some_and(|waiter| self.gate_holds_waiter(waiter)) {
+                    return None;
+                }
                 key
             }
         };

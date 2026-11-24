@@ -1003,6 +1003,10 @@ pub struct Roles {
     disk: Option<Disk>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
+    /// Each holder's largest bind room so far, in runs of whole chunks:
+    /// its scratch and its pair's state laid fresh, and the single chunks
+    /// beside them ([`Self::bind_claim`]).
+    bind_claims: HashMap<Holder, Vec<(u32, u32)>>,
     items: Items,
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
@@ -1097,6 +1101,7 @@ impl Roles {
             disk: None,
             shapes,
             programs: HashMap::new(),
+            bind_claims: HashMap::new(),
             items: Items::new(),
             held: Vec::new(),
             chunk_slots,
@@ -2177,6 +2182,31 @@ impl Roles {
     /// The engine registered `program`, whose instances hold `facts`.
     pub fn program_registered(&mut self, program: ProgramId, facts: ProgramFacts) {
         self.programs.insert(program, facts);
+    }
+
+    /// `holder`'s claim of whole chunks for a bind: the largest room any
+    /// of its binds asked so far, its pair's state counted as laid fresh
+    /// (a bind may lay it so), in runs of whole chunks; none where it has
+    /// bound nothing that takes whole chunks. What the capacity gate
+    /// reserves for the finisher before it asks
+    /// (`planner::ResidencyPlanner::chunk_spare`).
+    #[must_use]
+    pub fn bind_claim(&self, holder: Holder) -> Vec<(u32, u32)> {
+        self.bind_claims.get(&holder).cloned().unwrap_or_default()
+    }
+
+    /// `holder` asked a bind of `runs`: its claim is the larger of the two.
+    fn claim(&mut self, holder: Holder, runs: Vec<(u32, u32)>) {
+        let chunks = |runs: &[(u32, u32)]| runs.iter().map(|&(run, pieces)| u64::from(run) * u64::from(pieces)).sum::<u64>();
+        let claim = self.bind_claims.entry(holder).or_default();
+        if chunks(&runs) > chunks(claim) {
+            *claim = runs;
+        }
+    }
+
+    /// `holder` left: its claim goes.
+    pub fn forget_claim(&mut self, holder: Holder) {
+        self.bind_claims.remove(&holder);
     }
 
     /// Whether `program`'s facts are known here.
@@ -4355,6 +4385,13 @@ pub fn take_bind(
             roles.device.lock().unwrap().pool().runs_most(run) >= pieces
         })
         .or(fresh);
+    if let Some(holder) = holder {
+        let mut runs: Vec<(u32, u32)> = asked.into_iter().filter(|&(_, pieces)| pieces > 0).collect();
+        if beside > 0 {
+            runs.push((1, beside));
+        }
+        roles.claim(holder, runs);
+    }
     let mut taken = roles
         .take_instance(
             binding.program,
