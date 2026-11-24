@@ -310,9 +310,9 @@ mod tests {
     /// Every standard sampler, prompt and decode at Qwen3's vocabulary,
     /// planned with the forms Metal states (`Backend::library_forms`), forms
     /// only library regions Metal's emitter serves: the boot registers them
-    /// all, and a region Metal declines fails the load (the tip after the
-    /// bf16 landing did not boot on Metal: the temperature-scaled draw was
-    /// formed as a `NucleusSample` region). The control: planned with every
+    /// all, and a region Metal declines fails the load (e.g. the
+    /// temperature-scaled draw formed as a `NucleusSample` region). The
+    /// control: planned with every
     /// form, a region Metal declines is formed, so the check bites.
     #[test]
     fn metal_plans_every_standard_sampler_in_forms_it_serves() {
