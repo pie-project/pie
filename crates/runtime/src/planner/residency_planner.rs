@@ -39,10 +39,6 @@ pub struct ResidencyPlanner {
     /// the head and the pages gathered: the step, the map, the wants and
     /// the stall line read it once a pass, not once each.
     pub(super) need_cache: parking_lot::Mutex<Option<(u64, EntryKey, u32, Option<RunNeed>)>>,
-    /// The capacity gate's last place gained room: a newcomer held at a
-    /// gate before its first ask looks again ([`Self::admits`]). Fired on
-    /// every read that raises it and on every departure, never on a clock.
-    pub(super) allowance_rose: Notify,
     /// Events that can change a pass's answer the pool's own counts do not
     /// show: an arrival, a departure, a landing, a policy answer, each a
     /// poke ([`Self::poke`]). Part of [`Self::generation`].
@@ -120,21 +116,6 @@ pub struct ResidencyPlanner {
     weight_shed: Option<WeightShed>,
 }
 
-// How far short the safe order stood at its last read (for tests,
-// `ResidencyPlanner::order_least`).
-#[cfg(test)]
-thread_local! {
-    static ORDER_LEAST: std::cell::Cell<Option<i128>> = const { std::cell::Cell::new(None) };
-}
-
-/// The first's room in the order: what it has free less its need.
-#[cfg(test)]
-fn free_first(order: &[(u64, u64, super::inner::CapacityRead)]) -> i128 {
-    order
-        .first()
-        .map_or(i128::MAX, |&(need, _, read)| read.free() as i128 - need as i128)
-}
-
 /// How long a process waits at admission before it says why, and again
 /// after each such span: what a stall at the gates is read from.
 pub(super) const ADMIT_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
@@ -168,7 +149,6 @@ impl ResidencyPlanner {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             need_cache: parking_lot::Mutex::new(None),
-            allowance_rose: Notify::new(),
             events: AtomicU64::new(0),
             force_moves: AtomicBool::new(false),
             pass_landed: AtomicU64::new(0),
@@ -263,11 +243,13 @@ impl ResidencyPlanner {
         if !self.short.lock().is_short(head.1) {
             return false;
         }
-        // The host is what is short: the policy frees it by letting a set at
-        // rest go, and the head waits until one does.
-        if self.short.lock().host_short(head.1) {
-            return true;
-        }
+        // The host short or the device: the policy frees it by letting a
+        // set at rest go, idle cache or a checkpoint, and the head waits
+        // until one does, where there is one to let go. With none, no
+        // answer of the policy's frees anything: no wait on it (every tier
+        // full and nothing runnable is then a named failure,
+        // [`Self::fail_tiers_full`], never a wait on an answer that
+        // cannot come).
         let (model, engine) = self.port.locus();
         resting
             || self.port.reclaimable_idle() > 0
@@ -323,463 +305,6 @@ impl ResidencyPlanner {
         }
     }
 
-    /// The capacity gate as it stands ([`super::inner::CapacityGate`]): the
-    /// finisher, the oldest admitted process not idle, and what every tier's
-    /// room leaves past what is held (idle cache counted free: the policy
-    /// lets it go) and the finisher's headroom, its end less the kv pages
-    /// it holds on every tier. `None` where the pool states no end or keeps
-    /// no chunks, or nothing is admitted.
-    #[cfg(test)]
-    pub(super) fn capacity_gate(&self) -> Option<super::inner::CapacityGate> {
-        self.capacity_order().map(|(gate, _)| gate)
-    }
-
-    /// The gate and each process's place in its order
-    /// ([`super::inner::CapacityGate`]).
-    pub(super) fn capacity_order(
-        &self,
-    ) -> Option<(super::inner::CapacityGate, std::collections::HashMap<ProcessId, u64>)> {
-        self.capacity_reads().map(|(read, places, last)| {
-            let mut gate = read.gate();
-            // What one not in the order (a new process's first ask) may
-            // take: the place after the last.
-            gate.spare = last;
-            gate.chunks = self.chunk_spare(read.finisher);
-            (gate, places.into_iter().collect())
-        })
-    }
-
-    /// The finisher's need in whole device chunks weighed in chunks
-    /// ([`super::inner::ChunkSpare`]): its bind's room queued, or the bind
-    /// its restore carries, else its claim (the largest bind room it asked
-    /// so far); `None` where it needs none, or where the chunks
-    /// cannot stand even now (the gate keeps a state the finisher can
-    /// finish from; holding every other ask there would stop the
-    /// completions that free the room).
-    ///
-    /// What can stand is read as the eviction pass reads it: the chunk map
-    /// over every other resident and the parked state lying on the device
-    /// ([`Self::occupants`], [`Self::parked_map`]), the cheapest occupants
-    /// of the finisher's runs and `extra` single chunks beside them
-    /// ([`super::pool::ChunkMap::cheapest_need`]), and those occupants'
-    /// whole moves (each moves all its state, as an eviction does) within
-    /// the free room below on the host and disk tiers. The spare is the
-    /// most such single chunks.
-    pub(super) fn chunk_spare(&self, finisher: ProcessId) -> Option<super::inner::ChunkSpare> {
-        let (need, others) = self.with_inner(|inner| {
-            let queued = inner.queue.values().find_map(|waiter| match waiter.kind {
-                WaitKind::BindRoom {
-                    run,
-                    pieces,
-                    singles,
-                    rise: None,
-                    ..
-                } if waiter.pid == finisher && waiter.is_unmet() => {
-                    Some(super::pool::RunNeed::of([(run, pieces), (1, singles)]))
-                }
-                _ => None,
-            });
-            let carried = inner
-                .procs
-                .get(&finisher)
-                .filter(|proc| proc.state != Residency::Resident)
-                .and_then(|proc| proc.bind_room)
-                .map(|bind| bind.runs());
-            let others: Vec<ProcessId> = inner
-                .procs
-                .iter()
-                .filter(|(pid, proc)| **pid != finisher && proc.state == Residency::Resident)
-                .map(|(pid, _)| *pid)
-                .collect();
-            (queued.or(carried), others)
-        });
-        // Before it asks: the largest bind room it asked so far, its
-        // claim. A bind it asks replaces it (the gate reserves the
-        // finisher's claim, not only its asks: by its ask, the chunks it
-        // needed were the others' already, the wide shape's seed 729).
-        let need = need
-            .unwrap_or_else(|| self.port.bind_claim(finisher))
-            .filter_chunks()?;
-        let mut map = self.occupants(&others);
-        map.merge(self.parked_map(finisher));
-        // The pages the planner gathered for its heads: free to the gate,
-        // as the page count reads them (the head they go to asks them
-        // again), so a chunk only they fill stands at no move. Read as
-        // held, gathering for a head left its chunks short, the gate held
-        // the head, the pages went back and were gathered again, for good
-        // (the Metal mix's seed 25: one reservation of 25 pages taken and
-        // given back every pass).
-        let gathered = self.with_inner(|inner| inner.accum.pages().to_vec());
-        let gathered = self.port.kv_pages_by_chunk(&gathered);
-        let planner = ProcessId::nil();
-        for (chunk, used, count) in gathered {
-            match map.held.iter_mut().find(|held| held.chunk == chunk) {
-                Some(held) => held.by.push((planner, count)),
-                None => map.held.push(super::pool::ChunkHeld {
-                    chunk,
-                    used,
-                    by: vec![(planner, count)],
-                }),
-            }
-        }
-        let (model, engine) = self.port.locus();
-        // What one process's move puts below: its kv on the device, its
-        // recurrent state and its guest state, as the census counts them.
-        let move_cost = |pid: ProcessId| -> u64 {
-            if pid == planner {
-                return 0;
-            }
-            let kv = super::holdings::held_page_count(pid, model, engine)
-                .saturating_sub(super::holdings::swapped_page_count(pid, model, engine));
-            let rs = self.port.rs_as_pages(super::holdings::held_rs_units(pid, model, engine));
-            u64::from(kv) + u64::from(rs) + self.port.guest_pages_of(pid)
-        };
-        let below = u64::from(self.port.host_stats().0) + u64::from(self.port.disk_stats().0);
-        // The finisher's runs stand: their cheapest occupants' moves fit
-        // the room below.
-        let movers = map.cheapest_need(&need)?;
-        let laid: u64 = movers.iter().map(|&pid| move_cost(pid)).sum();
-        if laid > below {
-            return None;
-        }
-        // The chunks that can stand in all: the free ones, and those the
-        // moves the room below takes empty, cheapest moves first (each
-        // process moved whole, once). Past the finisher's own, the spare.
-        let mut moved: HashSet<ProcessId> = movers.into_iter().collect();
-        moved.insert(planner);
-        let mut left = below - laid;
-        let mut others: Vec<(u64, ProcessId)> = map
-            .held
-            .iter()
-            .filter(|held| held.emptiable())
-            .flat_map(|held| held.by.iter().map(|&(pid, _)| pid))
-            .collect::<HashSet<ProcessId>>()
-            .into_iter()
-            .filter(|pid| !moved.contains(pid))
-            .map(|pid| (move_cost(pid), pid))
-            .collect();
-        others.sort_unstable();
-        for (cost, pid) in others {
-            if cost > left {
-                break;
-            }
-            left -= cost;
-            moved.insert(pid);
-        }
-        let emptied = map
-            .held
-            .iter()
-            .filter(|held| held.emptiable() && held.by.iter().all(|(pid, _)| moved.contains(pid)))
-            .count() as u64;
-        let standing = map.free.len() as u64 + emptied;
-        let low = u32::try_from(standing.saturating_sub(need.chunks())).unwrap_or(u32::MAX);
-        let per_chunk = self.port.chunks_as_pages(1).max(1);
-        let free_pages = u64::from(self.port.device_stats().0);
-        let list_free = free_pages.saturating_sub(map.free.len() as u64 * u64::from(per_chunk));
-        Some(super::inner::ChunkSpare {
-            spare: low,
-            per_chunk,
-            list_free,
-            kv_used: 0,
-            whole_used: 0,
-        })
-    }
-
-    /// The gate and its order as a pass reads them, set for the pass's
-    /// asks; a read that gives the last place more than the one before
-    /// wakes the newcomers held for it ([`Self::admits`]).
-    pub(super) fn read_capacity(&self) {
-        let order = self.capacity_order();
-        let rose = self.with_inner(|inner| {
-            let was = inner.capacity.map(|gate| gate.allowance(None));
-            inner.set_capacity(order);
-            let now = inner.capacity.map(|gate| gate.allowance(None));
-            match (was, now) {
-                (Some(was), Some(now)) => now > was,
-                (_, None) => true,
-                (None, Some(_)) => false,
-            }
-        });
-        if rose {
-            self.allowance_rose.notify_waiters();
-        }
-    }
-
-    /// Whether a newcomer may go on to its first ask: what it holds at its
-    /// first step is priced there, by the capacity gate at the order's last
-    /// place with the finisher's headroom and margin
-    /// ([`Self::capacity_holds`]), never at the declared context. Held here
-    /// while the last place has no room for any ask, it takes nothing it
-    /// would hold against the order while it waits. One already in the
-    /// order, or with no gate to read (nothing admitted: it alone may
-    /// finish), goes on.
-    pub fn admits(&self, pid: ProcessId) -> bool {
-        if self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| proc.admitted)) {
-            return true;
-        }
-        self.capacity_order()
-            .is_none_or(|(gate, places)| places.contains_key(&pid) || gate.allowance(None) > 0)
-    }
-
-    /// Waits until [`Self::admits`] lets `pid` on: woken by a read that
-    /// raises the last place (a retire, a grant given back, a move landed,
-    /// a segment committed: each plans a pass) or a departure.
-    pub async fn admitted_to_ask(&self, pid: ProcessId) {
-        let mut counted = false;
-        loop {
-            let rose = self.allowance_rose.notified();
-            tokio::pin!(rose);
-            rose.as_mut().enable();
-            if self.admits(pid) {
-                return;
-            }
-            if !std::mem::replace(&mut counted, true) {
-                self.stats.admission_waits.fetch_add(1, Ordering::Relaxed);
-                // Said once a newcomer: how many the gate held, and when.
-                tracing::info!(%pid, "planner: a newcomer waits for room at the capacity gate's last place");
-            }
-            rose.await;
-        }
-    }
-
-    /// The figures the capacity gate is read from ([`Self::capacity_gate`]).
-    #[cfg(test)]
-    pub(super) fn capacity_read(&self) -> Option<super::inner::CapacityRead> {
-        self.capacity_reads().map(|(read, ..)| read)
-    }
-
-    /// [`Self::capacity_read`] and each process's allowance in the gate's
-    /// order: past the first, the least room any process ahead of it would
-    /// be left with to finish in turn.
-    #[allow(clippy::type_complexity)]
-    fn capacity_reads(&self) -> Option<(super::inner::CapacityRead, Vec<(ProcessId, u64)>, u64)> {
-        let end = self.port.context_pages()?;
-        // Pages the planner gathered and holds for its heads are free too:
-        // counted taken, gathering for a head held it at the gate, given
-        // back it went again, a pass that never ended.
-        let (candidates, gathered, residents, priority) = self.with_inner(|inner| {
-            let mut candidates: Vec<(u64, ProcessId, bool, u64)> = inner
-                .procs
-                .iter()
-                .filter(|(_, proc)| proc.admitted && !proc.idle && !proc.held)
-                .map(|(pid, proc)| {
-                    // The room its binds wait for: queued, or the bind that
-                    // suspended it.
-                    let queued: u64 = inner
-                        .queue
-                        .values()
-                        .filter(|waiter| {
-                            waiter.pid == *pid
-                                && matches!(waiter.kind, WaitKind::BindRoom { rise: None, .. })
-                        })
-                        .map(|waiter| u64::from(waiter.room_pages()))
-                        .sum();
-                    let pending = proc.bind_room.map_or(0, |bind| u64::from(bind.pages));
-                    (proc.seq, *pid, proc.state == Residency::Resident, queued.max(pending))
-                })
-                .collect();
-            candidates.sort_unstable_by_key(|&(seq, ..)| seq);
-            let priority: std::collections::HashMap<ProcessId, (i64, i64)> = candidates
-                .iter()
-                .filter_map(|&(_, pid, ..)| Some((pid, inner.procs.get(&pid)?.rank().priority())))
-                .collect();
-            let residents: Vec<ProcessId> = inner
-                .procs
-                .iter()
-                .filter(|(_, proc)| proc.state == Residency::Resident)
-                .map(|(pid, _)| *pid)
-                .collect();
-            (candidates, inner.accum.len() as u64, residents, priority)
-        });
-        if candidates.is_empty() {
-            return None;
-        }
-        let census = self.port.capacity_census()?;
-        let (model, engine) = self.port.locus();
-        // What one eviction of each resident moves below whole: its kv
-        // pages on the device, its recurrent state and its guest state and
-        // tables, as the census counts them. The largest two, read once.
-        let mut moves: Vec<(u64, ProcessId)> = residents
-            .iter()
-            .map(|&pid| {
-                let kv = super::holdings::held_page_count(pid, model, engine)
-                    .saturating_sub(super::holdings::swapped_page_count(pid, model, engine));
-                let rs = self
-                    .port
-                    .rs_as_pages(super::holdings::held_rs_units(pid, model, engine));
-                (u64::from(kv) + u64::from(rs) + self.port.guest_pages_of(pid), pid)
-            })
-            .collect();
-        moves.sort_unstable_by(|a, b| b.cmp(a));
-        // The largest and the second largest move of anyone but `finisher`.
-        let unit = |finisher: ProcessId| {
-            let mut others = moves.iter().filter(|&&(_, pid)| pid != finisher);
-            let largest = others.next().copied();
-            let second = others.next().map_or(0, |&(pages, _)| pages);
-            (largest.map_or(0, |(pages, _)| pages), largest.map(|(_, pid)| pid), second)
-        };
-        let read = |&(_, finisher, resident, binding): &(u64, ProcessId, bool, u64)| {
-            let guest = self.port.guest_pages_of(finisher);
-            let below = u64::from(super::holdings::swapped_page_count(finisher, model, engine))
-                + if resident { 0 } else { guest };
-            super::inner::CapacityRead {
-                finisher,
-                end: u64::from(end),
-                // Every page of its working sets, on every tier.
-                kv: u64::from(super::holdings::held_page_count(finisher, model, engine)),
-                below,
-                binding,
-                guest,
-                whole: census.whole,
-                held: census.held,
-                slack: census.slack,
-                idle: census.idle,
-                moving: census.moving,
-                gathered,
-                unit: unit(finisher),
-            }
-        };
-        // An order every admitted process can finish in, one after another
-        // (a banker's order, one resource: every tier's free pages): each in
-        // turn needs its growth to its end, its restore's state, its binds'
-        // room and the margin a whole move takes, and gives back all it
-        // holds as it ends. Fewest needed first: if any order finishes them
-        // all, that one does. The first is the finisher. An ask of any
-        // other waits while it would leave someone ahead of it unable to
-        // finish in turn; one in the finisher's place never waits. Held to
-        // the first alone, every ask past it would be let in while the next
-        // process in line no longer fits, and once the finisher ends every
-        // other ask is held while nothing can move.
-        let mut order: Vec<(u64, u64, super::inner::CapacityRead)> = candidates
-            .iter()
-            .map(|candidate| {
-                let read = read(candidate);
-                let rs = self.port.rs_as_pages(super::holdings::held_rs_units(
-                    read.finisher,
-                    model,
-                    engine,
-                ));
-                (read.need(), read.kv + read.guest + u64::from(rs), read)
-            })
-            .collect();
-        // Fewest needed first, the oldest first among equals (candidates
-        // come by admission, and the sort is stable).
-        order.sort_by_key(|&(need, ..)| need);
-        let fits = |&(need, _, read): &(u64, u64, super::inner::CapacityRead)| need <= read.free();
-        // The first finisher is the highest-priority candidate whose need
-        // fits now (the policy's `schedule/priority`): finishing it only
-        // raises what is free, so the rest, still in need order, stay
-        // feasible. Ties keep the banker's own order (fewest needed), then
-        // first come, first served. Equal priorities leave it as it was.
-        let priority_of = |read: &super::inner::CapacityRead| {
-            priority.get(&read.finisher).copied().unwrap_or_default()
-        };
-        if let Some(head) = order.first().map(|(_, _, read)| priority_of(read))
-            && let Some(best) = order.iter().filter(|c| fits(c)).map(|(_, _, read)| priority_of(read)).max()
-            && best > head
-            && let Some(at) = order.iter().position(|c| fits(c) && priority_of(&c.2) == best)
-        {
-            let first = order.remove(at);
-            order.insert(0, first);
-        }
-        // The finisher stays first while it still fits, or while no one
-        // else does: it runs to its end. Read afresh each pass, the first
-        // would flip between two processes as a restore moves one's need:
-        // restored as the finisher, the other's next ask evicts it, which
-        // makes it the finisher again, round and round. A move under way
-        // opens chunks below for a step (the slack): read then, no one
-        // fits, and the finisher would pass to whoever needs least for that
-        // step, its own restore's victim among the rest.
-        let kept = self.with_inner(|inner| inner.capacity.map(|gate| gate.finisher));
-        if let Some(at) = order.iter().position(|&(_, _, read)| Some(read.finisher) == kept)
-            && (fits(&order[at]) || !order.iter().any(fits))
-        {
-            let first = order.remove(at);
-            order.insert(0, first);
-        }
-        let (_, _, first) = *order.first()?;
-        let mut free = first.free() as i128;
-        let mut least = i128::MAX;
-        let mut places = Vec::with_capacity(order.len());
-        for &(need, held, read) in &order {
-            places.push((read.finisher, u64::try_from(least.max(0)).unwrap_or(u64::MAX)));
-            least = least.min(free - need as i128);
-            free += held as i128;
-        }
-        // The first's place is the finisher's: it never waits. One not in
-        // the order goes after the last.
-        places.remove(0);
-        #[cfg(test)]
-        ORDER_LEAST.with(|cell| cell.set(Some(least.min(free_first(&order)))));
-        Some((first, places, u64::try_from(least.max(0)).unwrap_or(u64::MAX)))
-    }
-
-    /// How far short the safe order stood when last read: negative where
-    /// some process in it (the first included) cannot finish in turn
-    /// (for tests).
-    #[cfg(test)]
-    pub(super) fn order_least(&self) -> Option<i128> {
-        let _ = self.capacity_reads();
-        ORDER_LEAST.with(std::cell::Cell::get)
-    }
-
-    /// Whether an allocation of `pages` for `pid` waits on the capacity
-    /// gate now, said at debug with the finisher and the bound its end came
-    /// from, and counted.
-    /// Read off the gate the last pass left ([`super::inner::Inner::capacity`]),
-    /// each grant taken past it out of its spare: a fire's grant pays one
-    /// lock, never a read of every tier.
-    pub(super) fn capacity_holds(&self, pid: ProcessId, pages: u32) -> bool {
-        self.capacity_holds_as(pid, pages, false)
-    }
-
-    /// [`Self::capacity_holds`] for kv pages, or (`whole`) whole chunks of
-    /// fresh state.
-    fn capacity_holds_as(&self, pid: ProcessId, pages: u32, whole: bool) -> bool {
-        // No pass has read it yet: read now, before the first grant.
-        if self.with_counts(|inner| inner.capacity.is_none()) {
-            self.read_capacity();
-        }
-        let Some((gate, holds)) = self.with_counts(|inner| {
-            let place = inner.capacity_allow.get(&pid).copied();
-            let gate = inner.capacity.as_mut()?;
-            let holds = gate.holds(pid, pages, place, whole);
-            if !holds {
-                gate.take(pid, pages, whole);
-            }
-            Some((*gate, holds))
-        }) else {
-            return false;
-        };
-        if holds {
-            self.stats.capacity_waits.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                %pid,
-                pages,
-                finisher = %gate.finisher,
-                allowance = gate.allowance(None),
-                free = gate.free,
-                end = "the declared context",
-                "planner: an allocation waits for the finisher's headroom on all tiers"
-            );
-        }
-        holds
-    }
-
-    /// [`Self::capacity_holds`] for a bind's `chunks` of fresh guest state.
-    pub fn capacity_holds_chunks(&self, pid: ProcessId, chunks: u32) -> bool {
-        self.capacity_holds_as(pid, self.port.chunks_as_pages(chunks), true)
-    }
-
-    /// Whether the gate would hold `chunks` of fresh state for `pid` now,
-    /// read without taking them out of its spare.
-    pub fn capacity_would_hold(&self, pid: ProcessId, chunks: u32) -> bool {
-        let pages = self.port.chunks_as_pages(chunks);
-        self.with_inner(|inner| {
-            let place = inner.capacity_allow.get(&pid).copied();
-            inner.capacity.is_some_and(|gate| gate.holds(pid, pages, place, true))
-        })
-    }
 
     /// The error waiter `key` is refused with where its need could never
     /// fit the device pool, even with nothing else resident: its kv pages
@@ -2487,12 +2012,6 @@ impl ResidencyPlanner {
             pages: self.port.chunks_as_pages(chunks),
         };
 
-        // A bind the capacity gate holds waits for the gate in the planner:
-        // suspended, it parked its process for room that was there, and
-        // came back to the same hold.
-        if self.capacity_would_hold(pid, chunks) {
-            return false;
-        }
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
         ptrace!(
             "suspend-for-room pid={} run={} pieces={}",
@@ -2550,7 +2069,6 @@ impl ResidencyPlanner {
                     let proc = inner.procs.get(pid)?;
                     (proc.admitted
                         && proc.state == Residency::Resident
-                        && !inner.is_finisher(*pid)
                         && !inner.host_swap_blocked.contains(pid)
                         && !inner.prepare_blocked.contains(pid))
                     .then(|| (*pid, proc.rank()))
@@ -2646,8 +2164,6 @@ impl ResidencyPlanner {
             self.re_arm_idle_reclaim();
             self.poke();
         }
-        // What it held is back: the last place may hold a newcomer's ask.
-        self.allowance_rose.notify_waiters();
     }
 
     /// `pid` leaves: its client has heard, its seat and asks go now. What
@@ -2657,17 +2173,16 @@ impl ResidencyPlanner {
     /// wedged for pages no one registered holds.
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         crate::store::shared::forget_process(pid);
-        // Out of the order: the newcomers held at its last place look again.
-        let _woken = ScopeNotify(&self.allowance_rose);
-        // What was held for its restore goes back with it, and its claim.
+        // What was held for its restore goes back with it.
         self.port.release_restore(pid);
-        self.port.forget_claim(pid);
         let (model, engine) = self.port.locus();
         let held = held_page_count(pid, model, engine);
         let held_rs = held_rs_units(pid, model, engine);
         // A seat taken again after the process ended goes back.
         crate::inferlet::process::vacate_seat(pid);
         let (signal, removed, charged) = self.with_inner(|inner| {
+            inner.failed.remove(&pid);
+            inner.handed.remove(&pid);
             let departed = inner.procs.remove(&pid);
             inner.arrived(pid);
             if inner.bind_restoring == Some(pid) {
@@ -2847,15 +2362,6 @@ fn holder_head(pid: ProcessId) -> u64 {
         .unwrap_or(0)
 }
 
-/// Wakes every waiter of a [`Notify`] as it drops: at the end of the scope
-/// it guards, whichever way that ends.
-struct ScopeNotify<'a>(&'a Notify);
-
-impl Drop for ScopeNotify<'_> {
-    fn drop(&mut self) {
-        self.0.notify_waiters();
-    }
-}
 
 /// What one idle reclaim came to ([`ResidencyPlanner::reclaim_idle_once`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

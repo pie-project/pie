@@ -338,17 +338,11 @@ impl SchedulerHandle {
                 .map(|roles| roles.lock().unwrap().room_watch())
         };
         // Whether `pieces` runs of `run` chunks and `singles` chunks beside
-        // them stand free for its state, and the capacity gate lets them in.
+        // them stand free for its state.
         let fits = |run: u32, pieces: u32, singles: u32| {
             crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
                 .is_some_and(|roles| roles.lock().unwrap().room_free(run, pieces, singles))
-                && crate::planner::planner_for(0, engine).is_none_or(|planner| {
-                    !planner.capacity_would_hold(
-                        pid,
-                        run.max(1).saturating_mul(pieces).saturating_add(singles),
-                    )
-                })
         };
         // Holding guest state of its own, it is suspended instead: waiting,
         // it would hold room its own bind lacks.

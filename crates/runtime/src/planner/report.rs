@@ -95,18 +95,23 @@ impl ResidencyPlanner {
     /// changed, so the move is taken back and the process stays resident,
     /// said by name, and it is no victim again until the pool moves past
     /// it (its block lapses, [`Self::lapse_blocks`]): moved again at once,
-    /// it would find the tier as full.
+    /// it would find the tier as full. With the fleet stalled on it, every
+    /// tier full, it fails by name instead ([`Self::fail_tiers_full`]).
     pub(super) fn eviction_tier_full(self: &Arc<Self>, pid: ProcessId, error: &str) {
         tracing::warn!(
             pid = %pid,
             %error,
-            "planner: the tier below is full: the eviction is taken back, the process kept \
-             resident, no victim until the pool moves"
+            "planner: the tier below is full: the eviction is taken back"
         );
         self.stats.eviction_tier_full.fetch_add(1, Ordering::Relaxed);
         // Blocked as room below short, which a stall with nothing in flight
         // lifts ([`Self::dump_stall`]).
         self.eviction_failed_inner(pid, true, false);
+        // Every tier full and the fleet stalled: the victim fails by name
+        // and its room frees for the others ([`Self::fail_tiers_full`]).
+        if self.with_inner(|inner| inner.truly_wedged()) && !self.waits_on_policy() {
+            self.fail_tiers_full(Some(pid));
+        }
     }
 
     pub(super) fn eviction_copy_refused(self: &Arc<Self>, pid: ProcessId, error: &str) {

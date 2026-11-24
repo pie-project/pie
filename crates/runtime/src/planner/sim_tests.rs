@@ -2011,19 +2011,11 @@ struct Log {
     bind_suspends: u64,
     idles: u64,
     rescores: u64,
-    /// The safe order stood short at the last settled step.
-    /// The first admission that turned the safe order short: the gate let
-    /// a newcomer in that left someone unable to finish in turn.
-    admitted_short: Option<String>,
-    short: bool,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
     checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
-    /// The capacity gate's figures as the last step with nothing moving
-    /// between tiers read them.
-    capacity: Option<super::inner::CapacityRead>,
     /// Processes that ended their work.
     finished: u64,
     /// Processes back from their client with a new request, in order.
@@ -2035,6 +2027,17 @@ struct Log {
     /// Binds suspended for their own room more than once: (process,
     /// program, suspensions).
     bind_thrash: Vec<(ProcessId, u32, u32)>,
+    /// Processes ended (finished or failed by name): what a process
+    /// refused at admission waits on to come back ([`run_process`]).
+    departures: u64,
+    /// Admission refusals retried.
+    retries: u64,
+    /// Processes failed by name with every tier full.
+    wedged: u64,
+    /// Each process the planner failed ([`super::ResidencyPlanner::fail_tiers_full`])
+    /// and the step it was first seen failed: it departs within the next
+    /// step, or its failure reached no wait of its own.
+    failed_at: BTreeMap<ProcessId, u32>,
     /// Each process's evictions landed.
     evicted_of: std::collections::HashMap<ProcessId, u32>,
 }
@@ -2473,7 +2476,6 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     |_| false,
                     Some(pid),
                     |pid| ctx.planner.is_resident(pid),
-                    |pid, chunks| ctx.planner.capacity_holds_chunks(pid, chunks),
                 )
             })();
             let (roles, engine, binding) = (roles.clone(), engine.clone(), binding.clone());
@@ -2510,10 +2512,6 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
         || Some(roles.lock().unwrap().room_watch()),
         |run, pieces, singles| {
             roles.lock().unwrap().room_free(run, pieces, singles)
-                && !planner.capacity_would_hold(
-                    pid,
-                    run.max(1).saturating_mul(pieces).saturating_add(singles),
-                )
         },
         |run, pieces, singles| {
             roles.lock().unwrap().holds_guest_state(pid)
@@ -2580,7 +2578,7 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true, |_, _| false) {
+    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -2706,23 +2704,27 @@ async fn seat_to_end(ctx: &Ctx, pid: ProcessId) {
     }
 }
 
+/// A process's life by `script`; refused at admission (its first ask fit
+/// nowhere, [`super::ADMISSION_REFUSED`]) it is the client's to retry: it
+/// leaves, and comes back after the next departure, as a client retries
+/// such a refusal, never counted a failure.
 async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
+    while run_once(ctx.clone(), pid, script.clone()).await {
+        let ended = ctx.log.lock().unwrap().departures;
+        while ctx.log.lock().unwrap().departures == ended {
+            ctx.next_step().await;
+        }
+        ctx.planner.register(pid);
+    }
+}
+
+/// One run of [`run_process`]: whether it was refused at admission.
+async fn run_once(ctx: Arc<Ctx>, pid: ProcessId, script: Script) -> bool {
     let planner = ctx.planner.clone();
     ctx.at(pid, "admit");
     seat_to_end(&ctx, pid).await;
     planner.admit(pid).await;
-    // As the runtime's gates hold a newcomer
-    // (`inferlet::process::wait_for_room`): until the capacity gate's last
-    // place has room for its first ask.
-    planner.admitted_to_ask(pid).await;
-    let before = planner.order_least();
     planner.note_admitted(pid);
-    let after = planner.order_least();
-    if before.is_none_or(|least| least >= 0) && after.is_some_and(|least| least < 0) {
-        ctx.log.lock().unwrap().admitted_short.get_or_insert_with(|| {
-            format!("admitting {} turned the safe order short: least {before:?} -> {after:?}", &pid.to_string()[..8])
-        });
-    }
     let residency = Arc::new(Mutex::new(ProcessResidency::default()));
     register_residency(pid, Arc::downgrade(&residency));
     let departure = planner.departure(pid);
@@ -2793,7 +2795,22 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
         Ok::<(), String>(())
     }
     .await;
-    if let Err(why) = &lived {
+    let retry = lived
+        .as_ref()
+        .is_err_and(|why| why.contains(&format!("[{}]", super::ADMISSION_REFUSED)));
+    // Failed by name with every tier full ([`super::TIERS_FULL`]): an
+    // allowed end where the fleet was truly wedged, counted apart; the
+    // run goes on, and every other process must still end.
+    let wedged = lived
+        .as_ref()
+        .is_err_and(|why| why.contains(&format!("[{}]", super::TIERS_FULL)));
+    if wedged {
+        ctx.log.lock().unwrap().wedged += 1;
+    }
+    if let Err(why) = &lived
+        && !retry
+        && !wedged
+    {
         ctx.refused(pid, why.clone());
     }
     // Its end, as the runtime's: its instances close (the engine's close
@@ -2818,8 +2835,14 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     }
     let mut log = ctx.log.lock().unwrap();
     log.stages.remove(&pid);
-    log.ended += 1;
+    if retry {
+        log.retries += 1;
+    } else {
+        log.ended += 1;
+        log.departures += 1;
+    }
     log.acts += 1;
+    retry
 }
 
 /// Closes instance `id` as the runtime's lane does: the engine's close,
@@ -2923,7 +2946,7 @@ const LOST_WAKES_FAIL: bool = false;
 
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
-fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
+fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -2950,21 +2973,6 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         // scratch (a parked one's kept tables and rings). A slot named past
         // its release is read and written as another's (the M1's fires on
         // free logical chunks swapped onto a released segment).
-        // `PIE_SIM_SHORT`: each step the safe order turns short, said with
-        // the gate's read and what the last step granted.
-        if std::env::var_os("PIE_SIM_SHORT").is_some() {
-            let least = ctx.planner.order_least();
-            let was = ctx.log.lock().unwrap().short;
-            let now = least.is_some_and(|least| least < 0);
-            if now && !was {
-                eprintln!(
-                    "SIMSHORT step {step}: least {least:?} read {:?} gate {:?}",
-                    ctx.planner.capacity_read(),
-                    ctx.planner.capacity_gate()
-                );
-            }
-            ctx.log.lock().unwrap().short = now;
-        }
         if let Some(why) = stray_holders(ctx, shared) {
             return Err(fail("stale ref", why));
         }
@@ -3024,42 +3032,23 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
     {
         return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
     }
-    // The capacity gate's invariant: every path that adds state goes
-    // through it, so every tier together keeps the finisher's headroom.
-    // The capacity gate's invariant: every path that adds state goes
-    // through it, so between two steps with nothing moving between tiers
-    // (a move holds its slots on both while its copies land), the same
-    // finisher and the same capacity, the tiers' free pages never fall
-    // further short of the finisher's headroom. A breach is named at the
-    // step it happens.
-    let moving = moving
-        || ctx.planner.with_inner(|inner| {
-            !inner.evicting.is_empty()
-                || inner.procs.values().any(|proc| {
-                    matches!(
-                        proc.state,
-                        super::proc::Residency::Evicting | super::proc::Residency::Restoring
-                    )
-                })
+    // A failed process departs within a step: a failure no wait of its own
+    // reads leaves its kill in flight for good and the fleet quiet (the
+    // Metal mix's seed 42), failed loudly here instead.
+    {
+        let failed: Vec<ProcessId> = ctx.planner.with_inner(|inner| {
+            inner.failed.keys().copied().filter(|pid| inner.procs.contains_key(pid)).collect()
         });
-    if !moving && let Some(read) = ctx.planner.capacity_read() {
-        let before = ctx.log.lock().unwrap().capacity.replace(read);
-        let short = read.others_short();
-        if let Some(before) = before
-            && before.finisher == read.finisher
-            && before.whole == read.whole
-            && short > before.others_short()
-        {
-            return Err(fail(
-                "capacity",
-                format!(
-                    "every tier together holds {} pages free, {short} short of the finisher \
-                     {}'s headroom, {} short the step before: {read:?}; before {before:?}",
-                    read.gate().free,
-                    read.finisher,
-                    before.others_short()
-                ),
-            ));
+        let mut log = ctx.log.lock().unwrap();
+        log.failed_at.retain(|pid, _| failed.contains(pid));
+        for pid in failed {
+            let since = *log.failed_at.entry(pid).or_insert(step);
+            if step > since + 1 {
+                return Err(fail(
+                    "undelivered",
+                    format!("process {pid} failed at step {since} and has not departed"),
+                ));
+            }
         }
     }
     if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
@@ -3505,7 +3494,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
         progress.moved(&ctx, step);
         coverage.live_steps += u64::from(tasks.len() > ctx.log.lock().unwrap().ended);
-        match check(&ctx, step, !pending.is_empty()) {
+        match check(&ctx, step) {
             Ok(refused) => {
                 for failed in refused {
                     if !failures
@@ -3553,18 +3542,10 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 kind: "liveness".to_string(),
                 line: format!(
                     "{} of {total} processes still running {} steps after the last arrival; \
-                     stuck {stuck:?}; capacity gate {:?}; queue {}; evicting/in flight {}; copies \
+                     stuck {stuck:?}; queue {}; evicting/in flight {}; copies \
                      pending {}; free chunks {}",
                     total - ended,
                     step - last_arrival,
-                    planner.capacity_gate().map(|gate| {
-                        let state = planner.with_inner(|inner| {
-                            inner.procs.get(&gate.finisher).map(|proc| {
-                                format!("{:?} unfired={} bind_waiting={}", proc.state, proc.unfired, proc.bind_waiting)
-                            })
-                        });
-                        (gate, state)
-                    }),
                     planner.debug_queue(),
                     planner.with_inner(|inner| inner.evicting.len()),
                     pending.len(),
@@ -3594,6 +3575,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.bind_waits = log.bind_waits;
         coverage.bind_suspends = log.bind_suspends;
         coverage.raises_owed = log.raises_owed;
+        eprintln!("SIM outcome: finished {} refused_at_admission_retried {} failed_wedged {} other_failures {}", log.finished, log.retries, log.wedged, log.refusals.len());
         coverage.rung_raises = lane_ops[0].load(Ordering::Relaxed);
         coverage.rung_lowers = lane_ops[2].load(Ordering::Relaxed);
         coverage.evacuations = lane_ops[1].load(Ordering::Relaxed);
@@ -3610,13 +3592,6 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
         // some suspended 58 to 68 times, unfinished in 45 minutes).
         coverage.most_suspended = u64::from(log.most_suspended);
-        if let Some(line) = log.admitted_short.clone() {
-            failures.push(Failure {
-                step,
-                kind: "admission".to_string(),
-                line,
-            });
-        }
         for &(pid, program, suspended) in &log.bind_thrash {
             progress.again += u64::from(suspended - 1);
             progress.first.get_or_insert_with(|| {
@@ -4131,35 +4106,26 @@ fn sim_field_seeds_863_and_178_end() {
     field_regression(178);
 }
 
-/// The Metal w17 mix's seeds 2 and 6: newcomers arrive while the safe
-/// order has no room at its last place, wait there holding nothing
-/// (`ResidencyPlanner::admitted_to_ask`), and are let in as admitted
-/// processes finish; no admission turns the order short (the run's
-/// `admission` check), and every process ends: admitting never starves one
-/// admitted.
+/// The Metal w17 mix's seeds 2 and 6: newcomers arrive with the device
+/// full of admitted work. Over-demand waits and is served: each newcomer
+/// waits for room as admitted processes move or finish (refused by name
+/// at admission only with the fleet wedged but for it), and every process
+/// ends, finished or failed by name with every tier full.
 #[test]
-fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_ends() {
-    // Seated lanes grow before a waiting prompt on every engine now (PLEX
-    // 1.1's no displacement): seed 6's newcomers no longer reach the gate's
-    // last place, seed 2's still do. Both must end clean.
-    let mut waits = 0;
+fn sim_metal_seeds_2_and_6_every_process_ends() {
     for seed in [2, 6] {
-        let (failures, coverage) = run(&Workload::metal(seed), None);
+        let (failures, _) = run(&Workload::metal(seed), None);
         for failure in &failures {
             eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
         }
         assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
-        waits += coverage.admission_waits;
     }
-    assert!(waits > 0, "no newcomer waited at the gate");
 }
 
 /// The Metal mix's seeds 30, 44 and 131: a restore carrying the bind that
-/// suspended its process lays that bind's fresh chunks, new state, which
-/// the capacity gate weighs as it weighs a bind's ask; ungated, every tier
-/// together fell short of the finisher's headroom (seed 44: a chunk taken
-/// with nothing spare, 14 pages short). Every process ends, the finisher's
-/// headroom kept.
+/// suspended its process lays that bind's fresh chunks, new state (seed
+/// 44: a chunk taken with nothing spare, 14 pages short). Every process
+/// ends, finished or failed by name with every tier full.
 #[test]
 fn sim_metal_seeds_30_44_131_a_restores_bind_waits_on_the_gate() {
     for seed in [30, 44, 131] {
@@ -4292,6 +4258,24 @@ fn replay_one_simulated_seed() {
         "seed {seed}: {} failures",
         failures.len()
     );
+}
+
+/// [`replay_one_simulated_seed`] under the built-in `default` policy's
+/// seat-to-end holds ([`Workload::default_policy`]).
+#[test]
+#[ignore]
+fn replay_one_simulated_seed_under_the_default_policy() {
+    let seed = std::env::var("PIE_SIM_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut workload = Workload::of(seed);
+    workload.default_policy = true;
+    let failures = run(&workload, None).0;
+    for failure in &failures {
+        eprintln!("SIM seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
+    }
+    assert!(failures.is_empty(), "seed {seed}: {} failures", failures.len());
 }
 
 /// A pool of `total` chunks in segments of `segment`, a bind of `run`

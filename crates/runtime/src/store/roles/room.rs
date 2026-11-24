@@ -447,7 +447,10 @@ impl Roles {
             .map(|&(shape, slots)| OwnPiece::Take { shape, slots })
             .chain(self.unpark_pieces(holder))
             .collect();
-        let placement = self.device.lock().unwrap().pool().place(&own);
+        // Its own reservation open to it ([`Self::place_claimed`]): read
+        // without it, the room held for its restore reads as taken, and
+        // the restore waits on room that is its own.
+        let placement = self.place_claimed(holder, &own);
         (own, placement)
     }
 

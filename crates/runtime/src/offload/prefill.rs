@@ -483,7 +483,7 @@ async fn read_in_place(
     let crate::planner::Acquired::Granted(mut grant) = planner
         .acquire(pid, pid, demand)
         .await
-        .map_err(|error| anyhow!("reserving pages to read a peer's into: {error}"))?
+        .map_err(|error| anyhow::Error::new(error).context("reserving pages to read a peer's into"))?
     else {
         bail!("the planner asked the pass to yield before its pages were read");
     };

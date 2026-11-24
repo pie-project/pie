@@ -789,6 +789,9 @@ async fn a_host_swap_full_victim_is_parked_until_host_room_returns() {
         planner.note_admitted(pid);
     }
 
+    // A newcomer whose first ask does not fit now is refused at
+    // admission; asked again as an admitted lane's growth, it waits.
+    refused_at_admission_then_seated(&planner, head, 1);
     let p = planner.clone();
     let head_task = crate::rt::spawn(async move {
         p.acquire(
@@ -4715,12 +4718,11 @@ async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past
     );
 }
 
-/// The ruling "wait with no deadline": twelve requests whose first frames
-/// together ask three times the pool, all at once, beside a policy that
-/// answers every shortfall with nothing freed (Mac's budgeted mix: 64
-/// requests each refused at its first frame, "device memory short ... for
-/// 246µs"). Every one is served as those before it complete; none is
-/// refused.
+/// Twelve requests whose first frames together ask three times the pool,
+/// all at once, beside a policy that answers every shortfall with nothing
+/// freed (Mac's budgeted mix). Those with no room now are refused at
+/// admission by name (the user's ruling) and retried once one ahead of
+/// them leaves; every one is served in the end.
 #[tokio::test(flavor = "current_thread")]
 async fn requests_past_the_pool_together_are_all_served_none_refused() {
     // Alone: it raises the policy's global answer.
@@ -4731,30 +4733,47 @@ async fn requests_past_the_pool_together_are_all_served_none_refused() {
     pool.free.lock().extend((0..16).map(PhysicalKvPageId));
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
     let mut tasks = Vec::new();
+    // Requests that have left: a refused one asks again after the next.
+    let departed = Arc::new(AtomicU32::new(0));
     for _ in 0..REQUESTS {
         let pid = ProcessId::new_v4();
         planner.register(pid);
         planner.note_admitted(pid);
         let p = planner.clone();
+        let departed = departed.clone();
         tasks.push(crate::rt::spawn(async move {
             let demand = Demand {
                 kv_pages: PAGES,
                 rs: RsUnits::default(),
             };
-            let served = match p.acquire(pid, pid, demand).await {
-                Ok(Acquired::Granted(grant)) => {
-                    // Its fires run, then it completes: its pages go back.
-                    for _ in 0..3 {
-                        crate::rt::yield_now().await;
+            // Refused at admission while the pool holds no room for it
+            // now, it is retried as the harness's client does, once a
+            // request ahead of it has left.
+            let mut refusals = 0u32;
+            let served = loop {
+                let departures = departed.load(Ordering::Acquire);
+                match p.acquire(pid, pid, demand).await {
+                    Ok(Acquired::Granted(grant)) => {
+                        // Its fires run, then it completes: its pages go back.
+                        for _ in 0..3 {
+                            crate::rt::yield_now().await;
+                        }
+                        drop(grant);
+                        break Ok(refusals);
                     }
-                    drop(grant);
-                    Ok(())
+                    Ok(_) => break Err("a resident request was not granted".to_string()),
+                    Err(PlannerError::AdmissionRefused { .. }) => {
+                        refusals += 1;
+                        while departed.load(Ordering::Acquire) == departures {
+                            crate::rt::yield_now().await;
+                        }
+                    }
+                    Err(error) => break Err(error.to_string()),
                 }
-                Ok(_) => Err("a resident request was not granted".to_string()),
-                Err(error) => Err(error.to_string()),
             };
             p.unregister(pid);
             p.pages_freed();
+            departed.fetch_add(1, Ordering::Release);
             served
         }));
     }
@@ -4766,9 +4785,11 @@ async fn requests_past_the_pool_together_are_all_served_none_refused() {
     }
     let done = tasks.iter().filter(|task| task.is_finished()).count();
     assert_eq!(done, REQUESTS, "{done} of {REQUESTS} ended");
+    let mut refused = 0;
     for task in tasks {
-        task.await.expect("the task").expect("served, never refused");
+        refused += task.await.expect("the task").expect("served in the end, refused only at admission");
     }
+    assert!(refused > 0, "asks past the room now are refused at admission and retried");
     assert_eq!(pool.free.lock().len(), 16, "every page back");
 }
 
@@ -6203,6 +6224,33 @@ async fn a_rise_whose_room_no_move_frees_waits_and_is_served_once_the_room_retur
     assert!(matches!(rise.await, Ok(Ok(()))));
 }
 
+/// `pid`, a newcomer, asks `pages` with no room for them now (not on the
+/// device, nor there by evictions landing below): refused at admission by
+/// name, at once (the user's ruling: the client retries). Its retry stands
+/// for an admitted lane's growth (seated), which is contention: it waits.
+fn refused_at_admission_then_seated(planner: &Arc<ResidencyPlanner>, pid: ProcessId, pages: u32) {
+    use futures::FutureExt;
+    let refused = planner
+        .acquire(
+            pid,
+            pid,
+            Demand {
+                kv_pages: pages,
+                rs: RsUnits::default(),
+            },
+        )
+        .now_or_never()
+        .expect("refused at once, no wait");
+    match refused {
+        Err(error @ PlannerError::AdmissionRefused { .. }) => {
+            assert_eq!(error.code(), Some(super::ADMISSION_REFUSED));
+        }
+        Err(other) => panic!("refused at admission, not {other}"),
+        Ok(_) => panic!("a newcomer with no room now is refused at admission"),
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&pid).expect("registered").seated = true);
+}
+
 /// A head parked for two pages behind a holder's grant of the whole pool;
 /// `drain` arms the planner's drain task (as `init_planner` does) or
 /// leaves it unarmed (each parked waiter plans for itself).
@@ -6233,6 +6281,9 @@ async fn head_behind_a_held_grant(
             },
         )
         .expect("the pool is free: the holder's grant is taken at once");
+    // A newcomer whose first ask does not fit now is refused at
+    // admission; asked again as an admitted lane's growth, it waits.
+    refused_at_admission_then_seated(&planner, head, 2);
     let p = planner.clone();
     let head_task = crate::rt::spawn(async move {
         p.acquire(
@@ -7006,6 +7057,9 @@ async fn room_that_comes_free_on_any_path_wakes_the_waiter_it_serves() {
             )
             .expect("the pool is free");
         std::mem::forget(held);
+        // A newcomer whose first ask does not fit now is refused at
+        // admission; asked again as an admitted lane's growth, it waits.
+        refused_at_admission_then_seated(&planner, head, 2);
         let p = planner.clone();
         let task = crate::rt::spawn(async move {
             p.acquire(
@@ -7267,6 +7321,9 @@ async fn trickling_frees_short_of_the_head_s_need_plan_nothing() {
         )
         .expect("the pool is free");
     std::mem::forget(held);
+    // A newcomer whose first ask does not fit now is refused at
+    // admission; asked again as an admitted lane's growth, it waits.
+    refused_at_admission_then_seated(&planner, head, 3);
     let p = planner.clone();
     let task = crate::rt::spawn(async move {
         p.acquire(
@@ -7950,6 +8007,9 @@ async fn a_stuck_head_costs_a_bounded_number_of_passes() {
         )
         .expect("the pool is free");
     std::mem::forget(held);
+    // A newcomer whose first ask does not fit now is refused at
+    // admission; asked again as an admitted lane's growth, it waits.
+    refused_at_admission_then_seated(&planner, head, 2);
     let p = planner.clone();
     let task = crate::rt::spawn(async move {
         p.acquire(
@@ -10791,4 +10851,68 @@ fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
 async fn replay_bd4f4ffe7_quiet_refusal_standing_in_its_placement() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     replay(&stall_bd4f4ffe7_quiet_mismatch()).await.unwrap();
+}
+
+/// Every tier full, the head with no move left: the victim (here named,
+/// as an eviction whose copy found the tier below full names it) fails by
+/// name with every tier's room ([`PlannerError::TiersFull`]), its waits
+/// ending with it (its next ask and its wait for residency both), and no
+/// one else fails.
+#[tokio::test(flavor = "current_thread")]
+async fn every_tier_full_fails_the_lowest_resident_by_name() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, older, younger) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, older, younger] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+    });
+    assert!(planner.fail_tiers_full(Some(younger)), "one fails");
+    let Err(error) = planner
+        .acquire(younger, younger, Demand { kv_pages: 1, ..Demand::default() })
+        .await
+    else {
+        panic!("the lowest in the order fails");
+    };
+    assert!(matches!(error, PlannerError::TiersFull { .. }), "{error}");
+    assert!(error.to_string().contains("every tier is full"), "{error}");
+    // Its stable code leads its text, read by machine past the worker and
+    // the gateway (`gateway::ingress::compat`'s `coded`).
+    assert_eq!(error.code(), Some(super::TIERS_FULL));
+    assert!(error.to_string().starts_with("[tiers_full] "), "{error}");
+    let refused = PlannerError::AdmissionRefused {
+        need: 9,
+        device: (0, 8),
+        host: (0, 0),
+        disk: (0, 0),
+    };
+    assert_eq!(refused.code(), Some(super::ADMISSION_REFUSED));
+    assert!(refused.to_string().starts_with("[admission_refused] "), "{refused}");
+    // Wrapped in context (a pipeline's, a guest's), the code still leads:
+    // found by type in an error chain, or from the planner's record of
+    // what it handed the process, never by reading the text.
+    let wrapped = anyhow::Error::new(refused).context("fire: acquire 9 pages");
+    let found = wrapped
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<PlannerError>())
+        .expect("found by type");
+    let led = found.lead(format!("{wrapped:#}"));
+    assert!(led.starts_with("[admission_refused] fire: acquire 9 pages: "), "{led}");
+    assert_eq!(found.lead(led.clone()), led, "led once");
+    assert_eq!(planner.handed(younger), Some(error), "the planner keeps what it handed");
+    let led = planner.handed(younger).unwrap().lead(format!("fire: {error}"));
+    assert!(led.starts_with("[tiers_full] fire: [tiers_full] "), "{led}");
+    assert_eq!(planner.wait_resident(younger).await, Err(error), "its waits end with it");
+    // The head and the older resident go on.
+    assert!(planner.with_inner(|inner| !inner.failed.contains_key(&head) && !inner.failed.contains_key(&older)));
 }

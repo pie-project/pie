@@ -171,7 +171,6 @@ pub fn bind_instance(
         registered,
         holder,
         |_| true,
-        |_, _| false,
     )?;
     bind_taken(roles, engine, binding, holder, taken)
 }

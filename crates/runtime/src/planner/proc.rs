@@ -164,15 +164,18 @@ pub(super) struct Proc {
     pub(super) evicted_for: Option<ProcessId>,
     /// Binds served it so far ([`super::ResidencyPlanner::serve_bind_room`]).
     pub(super) binds_served: u64,
-    /// The head this one was evicted for, its restore served ahead of it
-    /// while that head stood passed over with no move to make
-    /// ([`super::ResidencyPlanner::stuck_head`]): no victim for that
-    /// head until the head arrives ([`super::inner::Inner::arrived`]).
+    /// The heads this one was evicted for, its restore served ahead of
+    /// each while that head stood passed over with no move to make
+    /// ([`super::ResidencyPlanner::stuck_head`]): no victim for any of
+    /// them until that head arrives ([`super::inner::Inner::arrived`]).
+    /// Each is kept until its own head arrives: restored past a second
+    /// head, a mark for the first alone would be overwritten, and the
+    /// first head move it again with no arrival between.
     /// Moved back first, it would go round with the
     /// head, restored past it and evicted for it again, its waits never
     /// served (queued for a page behind the head, so the mark alone does
     /// not hold it).
-    pub(super) restored_past: Option<ProcessId>,
+    pub(super) restored_past: Vec<ProcessId>,
     /// The head the last resort last moved it for, until that head arrives
     /// ([`super::inner::Inner::arrived`]): it moves no victim twice for one
     /// head ([`super::ResidencyPlanner::last_resort_evict`]).
@@ -285,7 +288,7 @@ impl Proc {
             unfired: false,
             evicted_for: None,
             binds_served: 0,
-            restored_past: None,
+            restored_past: Vec::new(),
             last_resort_for: None,
         }
     }

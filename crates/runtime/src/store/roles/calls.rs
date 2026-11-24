@@ -143,7 +143,6 @@ pub fn take_bind(
     registered: impl Fn(ChannelId) -> bool,
     holder: Option<Holder>,
     resident: impl Fn(Holder) -> bool,
-    gated: impl Fn(Holder, u32) -> bool,
 ) -> anyhow::Result<Option<Taken>> {
     let Some(roles) = roles else {
         return Ok(None);
@@ -165,27 +164,10 @@ pub fn take_bind(
         extents: binding.extents,
     };
     let mut roles = roles.lock().unwrap();
-    let free_before = roles.device.lock().unwrap().pool().free_chunks();
     let beside =
         roles.instance_parts_fresh(binding.program, &binding.channels, &registered, adapter);
     let guest = roles.take_guest(&binding.channels, (pair, state), holder, beside)?;
     let fresh = guest.fresh_runs();
-    // The gate's room ask counts the pair it joined, where the pool could
-    // ever hold that many runs: past it, the exact need is asked, so the
-    // over-ask never turns a bind that fits alone into one refused as never
-    // fitting (the simulation's seed 213).
-    let asked = guest
-        .asked_runs()
-        .filter(|&(run, pieces)| roles.device.lock().unwrap().pool().runs_most(run) >= pieces)
-        .or(fresh);
-    if let Some(holder) = holder {
-        let mut runs: Vec<(u32, u32)> =
-            asked.into_iter().filter(|&(_, pieces)| pieces > 0).collect();
-        if beside > 0 {
-            runs.push((1, beside));
-        }
-        roles.claim(holder, runs);
-    }
     let mut taken = roles
         .take_instance(
             binding.program,
@@ -198,54 +180,7 @@ pub fn take_bind(
     taken.holder = holder;
     roles.bind_taken_for(holder);
     roles.on_way_take(&mut taken);
-    let added = free_before.saturating_sub(roles.device.lock().unwrap().pool().free_chunks());
     drop(roles);
-    // What it added: the fresh chunks it opened, its new state
-    // ([`Roles::footprint`]) and the room those chunks hold open past it
-    // ([`Roles::slack`]); slots it took in chunks open already add state
-    // and take as much slack, so none. Past what every tier keeps for the
-    // finisher (`gated`), the take goes back and the bind waits in the
-    // planner for the gate
-    // ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
-    if let Some(holder) = holder
-        && added > 0
-        && gated(holder, added)
-    {
-        roles_handle.lock().unwrap().untake(taken);
-        // The room it waits for is the whole bind's, as a refusal for want
-        // of room asks ([`Roles::take_guest`]): what it opened now (slots
-        // its tables took in chunks open now) may be gone by the time its
-        // process, suspended meanwhile, is restored with that room, and the
-        // bind is short again (the simulation's field mix, seed 80: held
-        // opening 1 chunk, restored with it, short of 4).
-        // Runs of more than a chunk are asked as runs: asked as single
-        // chunks, room was made in chunks that formed no run (the
-        // simulation's seed 189: a victim moved for four single chunks, the
-        // bind's run of two still short).
-        let room = match asked {
-            Some((run, pieces)) if run > 1 => GuestRoom::Runs {
-                run,
-                pieces,
-                free_runs: 0,
-                free_chunks: 0,
-                committable: 0,
-                singles: beside,
-            },
-            asked => GuestRoom::Slots {
-                slots: 0,
-                committable: 0,
-                chunks: added.max(asked.map_or(0, |(_, pieces)| pieces).saturating_add(beside)),
-            },
-        };
-        return Err(RolesError::BindShort(Box::new(RolesError::GuestShort {
-            what: format!(
-                "its {added} new chunks of state, past what every tier keeps for the finisher"
-            ),
-            bytes: 0,
-            room,
-        }))
-        .into());
-    }
     // Read again past the take: a park that began since the first read
     // either saw this bind on its way and waits for it, or parked before
     // it was taken, and then the holder reads parked here and the take

@@ -451,8 +451,8 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
     // Passed in this order: none passes a gate ahead of a higher key
     // waiting at an earlier one. Only the first gate, prewarm, holds below
-    // the floor. With no count stated it counts nothing: what a newcomer may
-    // take is the capacity gate's, read at each gate ([`wait_for_room`]).
+    // the floor. With no count stated it counts nothing: over-demand is the
+    // planner's contention to settle.
     let prewarm = Some(OrderedSemaphore::new("prewarm", limit.unwrap_or(usize::MAX / 2), true));
     const STAGED_COHORTS: usize = 1;
     let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
@@ -560,16 +560,6 @@ pub(crate) fn regrant_admission() {
     }
 }
 
-/// Holds a newcomer before a gate while the capacity gate's last place has
-/// no room for any first ask ([`crate::planner::ResidencyPlanner::admits`]):
-/// it waits there holding nothing it took for that ask, and the read that
-/// raises the room wakes it.
-async fn wait_for_room(pid: ProcessId) {
-    if let Some(planner) = crate::planner::planner_of(pid) {
-        planner.admitted_to_ask(pid).await;
-    }
-}
-
 /// Forgets the boot's gates, seats and processes, for
 /// [`crate::bootstrap::reset`].
 pub(crate) fn reset() {
@@ -611,7 +601,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
     }
-    wait_for_room(ctx.id()).await;
     let permit = match BIND_ADMISSION.get().flatten() {
         Some(semaphore) => Some(semaphore.acquire_owned(ctx.id()).await),
         None => None,
@@ -629,7 +618,6 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         return;
     }
     let started = Instant::now();
-    wait_for_room(ctx.id()).await;
     let seated = match ADMISSION.get().flatten() {
         Some(semaphore) => {
             let _queued = AdmissionQueued::enter(ctx.id());
@@ -1082,7 +1070,6 @@ impl Process {
         if let Some(planner) = crate::planner::planner_of(process_id) {
             planner.admit(process_id).await;
         }
-        wait_for_room(process_id).await;
         let prewarm_permit = match PREWARM_ADMISSION.get().flatten() {
             Some(sem) => Some(sem.acquire_owned(process_id).await),
             None => None,
@@ -1151,7 +1138,16 @@ impl Process {
                 }
                 Err(call_err) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
-                    Err(trapped(&call_err, store.data().stderr_said()))
+                    let text = trapped(&call_err, store.data().stderr_said());
+                    // A planner error in the trap's chain leads the text
+                    // with its code, found by type.
+                    Err(match call_err
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<crate::planner::PlannerError>())
+                    {
+                        Some(error) => error.lead(text),
+                        None => text,
+                    })
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
@@ -1164,6 +1160,9 @@ impl Process {
             result
         }
         .await;
+        // However the guest or the pipeline wrapped it, a failure the
+        // planner coded leads with its code.
+        let result = result.map_err(|text| crate::planner::lead_result(process_id, text));
         record_process_timing(
             admission_wait_us,
             instantiate_us,

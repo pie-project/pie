@@ -749,31 +749,6 @@ impl GuestTaken {
     /// The runs of chunks its fresh parts took, `(run, pieces)` summed at
     /// the longest run: what a bind short of room for its tables beside
     /// them asks with its own chunk ([`Roles::bind_short`]).
-    /// [`Self::fresh_runs`] with the pair it joined in place counted too:
-    /// the room the capacity gate asks for the bind. Suspended for this
-    /// room, the pair's other holders may park meanwhile, and the bind,
-    /// restored, lays the pair fresh: asked without it, the bind came back a
-    /// run short and its process went down again for one bind (the
-    /// simulation's Metal mix, seed 43: a run of three asked, two taken
-    /// after the restore). Over, never under: the room a pair joined in
-    /// place leaves goes back with the take.
-    fn asked_runs(&self) -> Option<(u32, u32)> {
-        let parts: Vec<(u32, u32)> = self
-            .scratch
-            .iter()
-            .chain(self.pair.iter().map(|(_, part, ..)| part))
-            .map(Part::chunk_runs)
-            .collect();
-        let longest = parts.iter().map(|&(run, _)| run).max()?;
-        Some((
-            longest,
-            parts
-                .iter()
-                .map(|&(run, pieces)| run.div_ceil(longest).saturating_mul(pieces))
-                .sum(),
-        ))
-    }
-
     fn fresh_runs(&self) -> Option<(u32, u32)> {
         let parts: Vec<(u32, u32)> = self
             .scratch
@@ -1013,10 +988,6 @@ pub struct Roles {
     disk: Option<Disk>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
-    /// Each holder's largest bind room so far, in runs of whole chunks:
-    /// its scratch and its pair's state laid fresh, and the single chunks
-    /// beside them ([`Self::bind_claim`]).
-    bind_claims: HashMap<Holder, Vec<(u32, u32)>>,
     items: Items,
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
@@ -1111,7 +1082,6 @@ impl Roles {
             disk: None,
             shapes,
             programs: HashMap::new(),
-            bind_claims: HashMap::new(),
             items: Items::new(),
             held: Vec::new(),
             chunk_slots,

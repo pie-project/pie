@@ -117,6 +117,17 @@ impl Placement {
     pub fn free_runs(&self, run: u32) -> u32 {
         self.scratch.free_chunk_runs(run)
     }
+
+    /// Whether `runs` (`(run, pieces)` of whole chunks) are placed by the
+    /// takes themselves once the placed pieces are taken, within the
+    /// budget's headroom: the one reading a restore's reservation
+    /// ([`super::roles::Roles::reserve_restore`]) holds its bind's runs by.
+    #[must_use]
+    pub fn places_runs(&self, runs: &[(u32, u32)]) -> bool {
+        let mut scratch = self.scratch.scratch();
+        runs.iter()
+            .all(|&(run, pieces)| scratch.acquire_chunk_runs(PLACING, 0, run, pieces).is_ok())
+    }
 }
 
 /// Fixed sets each working set holds: the one its fires read. Derived, not

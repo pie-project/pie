@@ -626,40 +626,6 @@ impl ResidencyPlanner {
         let parking_down = !parked.is_empty() && self.park_down(victims.head_pid, parked);
         let (mut picks, unhostable) =
             self.quote_and_pick(candidates, wanted, room, victims.rs_pages, model, engine);
-        // The map named a move for the head's runs, but no candidate it
-        // names qualifies (each chunk of the cheapest holds a slot no pick
-        // moves, or its move found no room below): moving chunks is the
-        // way left, as where the map names none. Left to the policy, the
-        // finisher's bind of adjacent chunks would wait with free chunks a
-        // compaction would lay side by side.
-        // The capacity gate's finisher only: every other head may wait on
-        // the policy's answer, the finisher's room is the mechanism's.
-        if picks.is_empty()
-            && !parking_down
-            && let Some((run, pieces)) = shape.as_ref().and_then(RunNeed::longest)
-            && self.with_inner(|inner| {
-                inner.nothing_in_flight() && inner.is_finisher(victims.head_pid)
-            })
-            && self.port.compaction_comes(
-                run,
-                if placement.is_some() {
-                    self.port.guest_free_runs(run).saturating_add(pieces)
-                } else {
-                    pieces
-                },
-            )
-        {
-            self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
-            self.plan_ended(victims.head, "compaction asked", host_short, &[]);
-            tracing::debug!(
-                head = %victims.head_pid,
-                run,
-                pieces,
-                "planner: no pick forms the head's runs; a compaction moves chunks for them"
-            );
-            self.note_short(victims.head, 0, 0);
-            return;
-        }
         // An occupant with no kv or state to move (only guest scratch,
         // given back at its park) quotes nothing and is no pick by pages:
         // it is one all the same, or its chunk does not empty.
@@ -919,7 +885,7 @@ impl ResidencyPlanner {
                                     proc.unfired,
                                     proc.firing(),
                                     proc.bind_waiting,
-                                    proc.restored_past.is_some(),
+                                    !proc.restored_past.is_empty(),
                                     inner.host_swap_blocked.contains(pid) || inner.prepare_blocked.contains(pid),
                                 ),
                                 None => format!("{pid}: gone"),
@@ -952,6 +918,42 @@ impl ResidencyPlanner {
                 }
             }
             if held_back > 0 {
+                return;
+            }
+            // No move goes below: every candidate's move found no room on
+            // the tiers below and nothing is in flight that frees any.
+            let tier_full = (host_short || !unhostable.is_empty() || blocked)
+                && self.with_inner(|inner| inner.truly_wedged())
+                && !self.waits_on_policy();
+            // Before anyone fails, the device's room after a compaction:
+            // where moving chunks stands the head's runs, a compaction is
+            // asked and no one fails (the simulation's Metal seed 44: 445
+            // of 656 pages free, 17 whole chunks, failed for runs of three
+            // a compaction lays).
+            if tier_full
+                && let Some((run, pieces)) = shape.as_ref().and_then(RunNeed::longest)
+                && self.port.compaction_comes(
+                    run,
+                    if placement.is_some() {
+                        self.port.guest_free_runs(run).saturating_add(pieces)
+                    } else {
+                        pieces
+                    },
+                )
+            {
+                self.stats.compaction_waits.fetch_add(1, Ordering::Relaxed);
+                self.plan_ended(victims.head, "compaction asked", host_short, &[]);
+                tracing::debug!(
+                    head = %victims.head_pid,
+                    run,
+                    pieces,
+                    "planner: every tier full but the device's runs a compaction lays: a compaction \
+                     moves chunks for the head, no one failed"
+                );
+                self.note_short(victims.head, 0, 0);
+                return;
+            }
+            if tier_full && self.fail_tiers_full(None) {
                 return;
             }
             if victims.deficit.pages == 0 {
@@ -1208,24 +1210,18 @@ impl ResidencyPlanner {
                         // would leave it a victim for the next head, back
                         // down before it ran. With nothing in
                         // flight it runs nothing, a victim like any other.
-                        // One whose ask the capacity gate holds cannot fire
-                        // until those ahead of it finish: no spare for it
-                        // ([`Inner::gate_holds`]).
                         && !(proc.unfired
                             && !proc.bind_waiting
-                            && !inner.gate_holds(**pid)
                             && (!queued(*pid) || !quiet()))
                         // Restored past this head while it stood passed
                         // over: it fires before this head moves it again.
-                        && proc.restored_past != Some(waiter.pid)
+                        && !proc.restored_past.contains(&waiter.pid)
                         && !inner.host_swap_blocked.contains(*pid)
                         && !inner.prepare_blocked.contains(*pid)
                         // Being failed: it frees its pages as it ends.
                         && !inner.killing.contains(*pid)
                         // Its pages move under a list compaction.
                         && inner.settled_resident(**pid)
-                        // The finisher is no victim ([`super::inner::CapacityGate`]).
-                        && !inner.is_finisher(**pid)
                         // Served its bind's room, it takes it as it wakes.
                         && !inner.bind_served(**pid)
                         // The head is a restore of one evicted for this
@@ -1321,16 +1317,11 @@ impl ResidencyPlanner {
                 // the victim set chose it (the one rule there).
                 let yields =
                     proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
-                // The finisher is no victim while it is the finisher
-                // ([`super::inner::CapacityGate`]): parked, the tiers'
-                // headroom kept for it serves no one (every other ask is
-                // held at the gate). The policy picks among the others.
                 if proc.state != Residency::Resident
-                    || inner.is_finisher(pid)
                     || inner.bind_served(pid)
                     || inner.evicted_for_by(head_pid, pid)
                     || inner.unfired_protects(pid)
-                    || proc.restored_past == Some(head_pid)
+                    || proc.restored_past.contains(&head_pid)
                     || (proc.rank() <= head_rank && !yields)
                     || inner.keeps_room(pid, head_rank, quiet)
                     || (!proc.progressed && !yields && !e6_relaxed)
@@ -1489,7 +1480,7 @@ impl ResidencyPlanner {
                             // over: the last resort keeps that rule too, or
                             // it goes round with the head, restored past it
                             // and moved for it again.
-                            if proc.restored_past == Some(waiter.pid)
+                            if proc.restored_past.contains(&waiter.pid)
                                 || proc.last_resort_for == Some(waiter.pid)
                                 || (proc.rank() <= head_rank && !proc.idle && !proc.held)
                                 || (proc.holder && !proc.idle)
@@ -1567,11 +1558,6 @@ impl ResidencyPlanner {
             let hoard = inner.accum.len() as u32;
             inner.queue.iter().find_map(|(&key, waiter)| {
                 if key == head_key || !waiter.is_unmet() {
-                    return None;
-                }
-                // Past what every tier keeps for the finisher: it waits
-                // on the gate ([`super::inner::CapacityGate`]).
-                if inner.gate_holds_waiter(waiter) {
                     return None;
                 }
                 match &waiter.kind {
