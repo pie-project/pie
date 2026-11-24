@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::chunk::{Evacuation, Growth};
 use engine_metal::serve::Seated;
-use engine_metal::store::layout::{FIXED, LIST, WINDOWS};
+use engine::fire::{FoldLen, Lineage, WindowFold};
+use engine_metal::store::layout::{FIXED, LIST};
 use engine_metal::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
@@ -427,9 +428,9 @@ enum Placement {
     /// Slot refs the runtime would name: pages strided over chunks
     /// `first .. first + 3` from the top down, the lanes' pages interleaved
     /// in each and scattered over its slots (no two share one), piece `p`
-    /// of lane `l`'s record in chunk `first + 3 + l * pieces + p`, and the
-    /// window list's pages as the kv pages are, over the three chunks above
-    /// the records.
+    /// of lane `l`'s record in chunk `first + 3 + l * pieces + p`, and on a
+    /// ring load lane `l`'s ring piece `p` in chunk
+    /// `first + 3 + 2 * pieces + l * ring_pieces + p`.
     Refs {
         first: u32,
         /// The kv list's slots a chunk; `None` where the load states no kv
@@ -437,9 +438,9 @@ enum Placement {
         per_list: Option<u32>,
         per_fixed: u32,
         pieces: u32,
-        /// The window list's tokens a slot and slots a chunk, where the
-        /// load states one.
-        window: Option<(u32, u32)>,
+        /// The ring's pieces and the window buffer's rows a slot, where the
+        /// load lays rings: each lane folds every fire through its own.
+        ring: Option<(u32, u32)>,
     },
 }
 
@@ -469,15 +470,37 @@ impl Placement {
         }
     }
 
-    fn window_page(&self, lane: u32, page: u32) -> u32 {
+    /// Lane `lane`'s ring pieces, `[run, cow]` chunk refs, where the load
+    /// lays rings.
+    fn ring(&self, lane: u32) -> Option<Vec<[u32; 2]>> {
         match *self {
             Placement::Refs {
                 first,
                 pieces,
-                window: Some((_, per)),
+                ring: Some((ring, _)),
                 ..
-            } => scatter(first + 3 + 2 * pieces, per, lane, page),
-            _ => unreachable!("a window table of a placement with a window list"),
+            } => Some(
+                (0..ring)
+                    .map(|p| first + 3 + 2 * pieces + lane * ring + p)
+                    .map(|chunk| [chunk, chunk])
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// How a lane of `have` rows folds a fire of `rows` through its ring:
+    /// every row, its buffer based past them.
+    fn fold(&self, have: u32, rows: u32) -> Option<WindowFold> {
+        match *self {
+            Placement::Refs {
+                ring: Some((_, tokens)), ..
+            } => Some(WindowFold {
+                base: (have + rows) / tokens * tokens,
+                fold: FoldLen::Host(rows),
+                lineage: Lineage::Set,
+            }),
+            _ => None,
         }
     }
 
@@ -485,21 +508,13 @@ impl Placement {
     fn tables(&self, lane: u32, rows: u32, page: u32) -> (Vec<u32>, Vec<Vec<u32>>) {
         match *self {
             Placement::Seats => (Vec::new(), Vec::new()),
-            Placement::Refs {
-                per_list, window, ..
-            } => (
+            Placement::Refs { per_list, .. } => (
                 per_list.map_or_else(Vec::new, |_| {
                     (0..rows.div_ceil(page))
                         .map(|p| self.page(lane, p))
                         .collect()
                 }),
-                window.map_or_else(Vec::new, |(tokens, _)| {
-                    vec![
-                        (0..rows.div_ceil(tokens))
-                            .map(|p| self.window_page(lane, p))
-                            .collect(),
-                    ]
-                }),
+                Vec::new(),
             ),
         }
     }
@@ -531,13 +546,11 @@ impl Placement {
     }
 
     /// The chunks this placement holds: three of pages, the records, and
-    /// three of window pages where the load states a window list.
+    /// both lanes' rings where the load lays them.
     fn held(&self) -> u32 {
         match *self {
             Placement::Seats => 0,
-            Placement::Refs { pieces, window, .. } => {
-                3 + 2 * pieces + if window.is_some() { 3 } else { 0 }
-            }
+            Placement::Refs { pieces, ring, .. } => 3 + 2 * pieces + 2 * ring.map_or(0, |(ring, _)| ring),
         }
     }
 }
@@ -574,6 +587,7 @@ fn serve(
         "the lanes' pages share no slot"
     );
     let records = [place.record(0), place.record(1)];
+    let rings = [place.ring(0), place.ring(1)];
     let mut rows = Vec::new();
     let tables = |held: [u32; 2], rows: [u32; 2]| -> [(Vec<u32>, Vec<Vec<u32>>); 2] {
         [0, 1].map(|lane| place.tables(lane as u32, held[lane] + rows[lane], page))
@@ -586,6 +600,8 @@ fn serve(
                 replay_stated: None,
                 pages,
                 windows,
+                ring: rings[lane as usize].as_deref(),
+                window: place.fold(have, tokens.len() as u32),
                 held: Some(have),
                 record: refs.then(|| records[lane as usize].as_slice()),
                 refs,
@@ -757,24 +773,17 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles
     let low = layout.free_chunk();
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
     let per_list = facts.shape(LIST).map(|s| s.slots_per_chunk);
-    // The one window list a windowed model here states: its pages by slot
-    // ref too, so the scattered serve moves every row the fire reads.
-    assert!(
-        facts.shape(WINDOWS[1]).is_none(),
-        "{model}: one window list at most"
-    );
-    let window = facts.shape(WINDOWS[0]).map(|w| {
-        let engine::chunk::SlotKind::List { tokens, .. } = w.kind else {
-            panic!("{model}: the window list is a list: {:?}", w.kind);
-        };
-        (tokens, w.slots_per_chunk)
-    });
+    // A windowed model's rings: each lane's by slot ref too, so the
+    // scattered serve moves every row the fire reads.
+    let ring = shell
+        .pool_ring()
+        .map(|ring| (ring.pieces, layout.window(0).expect("a ring load's window buffer").tokens));
     let place = Placement::Refs {
         first: 0,
         per_list,
         per_fixed: per(FIXED),
         pieces: layout.pieces,
-        window,
+        ring,
     };
     let held = place.held();
     let kept = (low + held).div_ceil(segment);
@@ -789,7 +798,7 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles
         per_list,
         per_fixed: per(FIXED),
         pieces: layout.pieces,
-        window,
+        ring,
     };
     shell.commit_segments(commit).expect("the segments commit");
     let sparse = facts.segments.growth == Growth::Bottom;
@@ -852,7 +861,7 @@ fn a_refused_evacuation_moves_nothing() {
             per_list: facts.shape(LIST).map(|s| s.slots_per_chunk),
             per_fixed: per(FIXED),
             pieces: layout.pieces,
-            window: None,
+            ring: None,
         };
         let held = place(0).held();
         let kept = (low + held).div_ceil(segment);
@@ -1105,217 +1114,4 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     // SAFETY: nothing ran on this pool.
     unsafe { pools.release_segments(1) }.expect("one goes back");
     assert_eq!(pools.chunk_facts().segments.committed, 1);
-}
-
-/// A window list the runtime trims (CONTRACT-BC 19, 21): pages wholly behind
-/// the window read the null chunk (ref 0). One lane of a 1-layer windowed
-/// miniature prefills past its 512-row window and decodes on; its logits are
-/// the same bits whether the window list holds every page (seat-addressed)
-/// or only the window's, scattered over chunks by slot ref and trimmed as
-/// the runtime trims, each step.
-#[test]
-fn a_trimmed_window_list_reads_as_the_whole_one() {
-    trimmed_window("gemma4-e4b-mini-l1", None, 1024, 700);
-}
-
-/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a window list of
-/// `T_w` = 16-token slots beside 32-token kv pages (CONTRACT-BC 21): four
-/// layers of a sliding-window decoder past its 2048-row window.
-#[test]
-fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
-    trimmed_window("muse-glimmer-30b-mini-l8", Some(4), 2560, 2200);
-}
-
-/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a latent model's
-/// 128-row window list of 16-token slots beside its 128-token kv pages,
-/// its plans reading the kv list's geometry. Its windowed rows are the ones
-/// a pool gather compresses: the compressor's state lies in their window
-/// slots, read by slot ref as the rows are. (Seven window slots a chunk.)
-#[test]
-fn a_trimmed_window_list_beside_a_compressed_kv_list_reads_as_the_whole_one() {
-    trimmed_window("dsv4-flash-mini", None, 1024, 700);
-}
-
-fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
-    if !engine_metal::device::present() {
-        eprintln!("skipping: no Metal device");
-        return;
-    }
-    trimmed_windows(model, &fixture_of(model, layers), context, prompt, 1);
-}
-
-/// Seat-addressed (every window page held) against slot refs trimmed as the
-/// runtime trims, each of the load's `lists` window lists by its own window
-/// and `T_w`, its slots in chunks of its own.
-fn trimmed_windows(model: &str, fixture: &Fixture, context: u32, prompt: u32, lists: usize) {
-    let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
-    const STEPS: usize = 24;
-    let run = |trimmed: bool| -> Vec<Vec<f32>> {
-        let mut shell = load_with(fixture, context);
-        let facts = shell.pool_chunk_facts();
-        eprintln!(
-            "{model}: shapes {:?}",
-            facts
-                .shapes
-                .iter()
-                .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
-                .collect::<Vec<_>>()
-        );
-        let layout = shell.pool_layout();
-        let mut first = layout.free_chunk().div_ceil(facts.segment_chunks) * facts.segment_chunks;
-        // Each window list: (T_w, window, slots a chunk, first chunk, step).
-        let mut windows = Vec::new();
-        for id in &WINDOWS[..lists] {
-            let window = facts.shape(*id).expect("a window list");
-            let engine::chunk::SlotKind::List {
-                tokens,
-                window: Some(rows),
-                ..
-            } = window.kind
-            else {
-                panic!("the window list states its window: {:?}", window.kind);
-            };
-            let per = window.slots_per_chunk;
-            // Page k of the lane in chunk first + k / per, slots strided in
-            // it by a step prime to `per`, so each page has a slot of its own.
-            let step = [7u32, 11, 13, 17]
-                .into_iter()
-                .find(|step| !per.is_multiple_of(*step))
-                .expect("a step prime to the slots a chunk");
-            windows.push((tokens, rows, per, first, step));
-            first += context.div_ceil(tokens).div_ceil(per);
-        }
-        assert!(
-            facts.shape(WINDOWS[lists]).is_none(),
-            "{model} states more than {lists} window lists"
-        );
-        let mut rows_retained: Vec<u32> = windows.iter().map(|w| w.1).collect();
-        rows_retained.dedup();
-        assert_eq!(rows_retained.len(), lists, "each list its own window");
-        // A kv list beside the window lists: its pages in the chunks above
-        // theirs.
-        let list = facts.shape(LIST).map(|list| {
-            let engine::chunk::SlotKind::List { tokens, .. } = list.kind else {
-                panic!("the kv list is a list: {:?}", list.kind);
-            };
-            (tokens, list.slots_per_chunk)
-        });
-        let list_chunks = list.map_or(0, |(t, per)| context.div_ceil(t).div_ceil(per));
-        let commit = (first + list_chunks + 1).div_ceil(facts.segment_chunks);
-        shell.commit_segments(commit).expect("the segments commit");
-        let list_ref = |k: u32| {
-            let (_, per) = list.expect("a kv list");
-            (first + k / per) * per + (k * 5 + 1) % per
-        };
-        let mut rows_out = Vec::new();
-        let mut held = 0u32;
-        let mut fed: Vec<u32> = prompt.clone();
-        for step in 0..=STEPS {
-            let chunks: Vec<Vec<u32>> = if step == 0 {
-                fed.chunks(256).map(<[u32]>::to_vec).collect()
-            } else {
-                vec![fed.clone()]
-            };
-            let mut last = Vec::new();
-            for tokens_in in chunks {
-                let n = tokens_in.len() as u32;
-                let after = held + n;
-                // Trimmed as the runtime trims: a page whose last row lies
-                // below `committed_end - window` reads the null chunk.
-                let tables: Vec<Vec<u32>> = windows
-                    .iter()
-                    .map(|&(tokens, rows, per, first, step)| {
-                        (0..after.div_ceil(tokens))
-                            .map(|k| {
-                                let last_row = (k + 1) * tokens - 1;
-                                if last_row + rows < held {
-                                    0
-                                } else {
-                                    (first + k / per) * per + (k * step + 3) % per
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let list_pages: Vec<u32> = match list {
-                    Some((t, _)) if trimmed => (0..after.div_ceil(t)).map(list_ref).collect(),
-                    _ => Vec::new(),
-                };
-                let seated = Seated {
-                    replay_stated: None,
-                    held: Some(held),
-                    refs: trimmed,
-                    pages: &list_pages,
-                    windows: if trimmed { &tables } else { &[] },
-                    ..Seated::of(Lane {
-                        slot: 0,
-                        word: word(&fixture.trace, n),
-                        tokens: &tokens_in,
-                    })
-                };
-                last = shell.fire_seated(&[seated]).expect("the fire lands");
-                held = after;
-            }
-            fed = vec![argmax(&last[0])];
-            rows_out.extend(last);
-        }
-        rows_out
-    };
-    let whole = run(false);
-    let trimmed = run(true);
-    same(&format!("{model}: trimmed against whole"), &trimmed, &whole);
-}
-
-/// Two window lists, each trimmed by its own window (CONTRACT-BC 21): a
-/// synthetic miniature, muse-glimmer-30b-mini-l8 with every other windowed
-/// layer's window halved (1024 beside 2048), its catalog copied and patched
-/// for this test alone. Past both windows, the trimmed lists read as the
-/// whole ones bit for bit.
-#[test]
-fn two_trimmed_window_lists_read_as_the_whole_ones() {
-    if !engine_metal::device::present() {
-        eprintln!("skipping: no Metal device");
-        return;
-    }
-    let model = "muse-glimmer-30b-mini-l8";
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
-    let copy = std::env::temp_dir().join(format!("pie-bm-pool-{}-models", std::process::id()));
-    let _ = std::fs::remove_dir_all(&copy);
-    std::fs::create_dir_all(&copy).expect("the catalog copy");
-    for entry in std::fs::read_dir(&root).expect("the catalog") {
-        let entry = entry.expect("a catalog entry");
-        let into = copy.join(entry.file_name());
-        if entry.file_type().expect("its type").is_dir() {
-            let status = std::process::Command::new("cp")
-                .arg("-R")
-                .arg(entry.path())
-                .arg(&into)
-                .status()
-                .expect("cp runs");
-            assert!(status.success());
-        } else {
-            std::fs::copy(entry.path(), &into).expect("the file copies");
-        }
-    }
-    let poem = copy.join("muse_glimmer.poem");
-    let text = std::fs::read_to_string(&poem).expect("the package reads");
-    let patched = text.replace(
-        "        win = windows[reading]\n",
-        "        win = windows[reading]\n        if win and l % 2 == 1:\n            win = m.window // 2\n",
-    );
-    assert_ne!(patched, text, "the patch applies");
-    std::fs::write(&poem, patched).expect("the package writes");
-    let catalog = poem_compiler::catalog::Catalog::from_dir(&copy).expect("the copy reads");
-    let package = catalog.package_of(model).expect("the model is listed");
-    let trace = package
-        .trace(
-            model,
-            &poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16),
-            model,
-            Platform::Metal,
-        )
-        .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
-    std::fs::remove_dir_all(&copy).expect("the copy goes");
-    let fixture = fixture_from(trace, &format!("{model}-two-windows"));
-    trimmed_windows(model, &fixture, 2560, 2200, 2);
 }

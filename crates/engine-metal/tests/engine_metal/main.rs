@@ -7,6 +7,7 @@ mod a_cold_registration_compiles_while_lanes_fire;
 mod a_group_fold_is_the_sequential_fold;
 mod a_carry_past_the_table_is_served;
 mod a_lagged_decode_answers_the_unlagged;
+mod a_lagged_window_fold_serves_the_folded_logits;
 mod the_resident_probe_counts_the_cores;
 mod the_carried_scan_times_as_the_step;
 mod a_mixed_fires_last_rows_are_each_lanes_own;

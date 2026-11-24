@@ -1516,23 +1516,6 @@ impl Metal {
                 })
                 .collect();
             window_of.push(windows);
-            if std::env::var_os("PIE_WINDOW_TRACE").is_some() {
-                let per = shell.pool_layout().list.map_or(1, |list| list.per_chunk.max(1));
-                let mut chunks: Vec<u32> = pages_of
-                    .last()
-                    .and_then(Option::as_ref)
-                    .map(|refs| refs.iter().filter(|&&r| r != 0).map(|&r| r / per).collect())
-                    .unwrap_or_default();
-                chunks.sort_unstable();
-                chunks.dedup();
-                eprintln!(
-                    "ltrace slot {} list chunks {:?} first refs {:?} slot_copies {:?}",
-                    lane.slot,
-                    chunks,
-                    pages_of.last().and_then(Option::as_ref).map(|r| r.iter().take(3).copied().collect::<Vec<_>>()),
-                    lane.slot_copies
-                );
-            }
             ring_of.push(match &lane.record {
                 engine::fire::LaneRecord::Pieces(pieces) => pieces
                     .iter()

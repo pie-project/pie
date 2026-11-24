@@ -270,11 +270,12 @@ impl Arena {
         self.end
     }
 
-    /// The bytes from the span's end a fire of `rows` takes at the current
-    /// rung: the plane, the rung's staged regions and its carve.
+    /// The bytes from the range's end a fire of `rows` takes at the current
+    /// rung: what lies beyond the arena, the plane, the rung's staged
+    /// regions and its carve.
     #[must_use]
     pub fn reach(&self, rows: FireRows) -> u64 {
-        self.scratch + self.over_carve(self.current) + room(self.carve_for(rows).bytes)
+        self.beyond + self.scratch + self.over_carve(self.current) + room(self.carve_for(rows).bytes)
     }
 
     /// The bytes from the span's end a rung of `tokens` takes: the plane,
