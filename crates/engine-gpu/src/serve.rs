@@ -10599,8 +10599,7 @@ impl<B: Serve> Shell<B> {
             // not: a body the device cannot hold faults the driver.
             let next = dearest.saturating_mul(depth as u64);
             let next_device = dearest_device.saturating_mul(depth as u64);
-            let device_short =
-                next_device > 0 && self.device.left() < next_device.saturating_mul(2);
+            let device_short = next_device > 0 && self.device.left() < next_device;
             let host_short = remaining() < next;
             if device_short || host_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();

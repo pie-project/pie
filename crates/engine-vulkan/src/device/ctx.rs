@@ -537,6 +537,7 @@ impl Core {
     /// A descriptor pool of `sets` sets, each binding up to 8 storage
     /// buffers and a uniform on average.
     fn new_descriptor_pool_of(&self, sets: u32) -> Result<vk::DescriptorPool> {
+        POOLS_MADE.fetch_add(1, Ordering::Relaxed);
         // A set binds its kernel's scalars as one uniform (the fire block's).
         let sizes = [
             vk::DescriptorPoolSize::default()
@@ -2302,6 +2303,33 @@ impl Inner {
 
 const SETS_PER_POOL: u32 = 1024;
 
+/// Descriptor sets allocated by frames, all and those kept frames took, and
+/// descriptor pools made, over the process: named every 10,000 sets (a
+/// driver that allocates host memory per set runs out of its allocator's
+/// room for them before the host's).
+static SETS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KEPT_SETS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOLS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn count_sets(core: &Core, sets: u64, kept: bool) {
+    if kept {
+        KEPT_SETS_MADE.fetch_add(sets, Ordering::Relaxed);
+    }
+    let before = SETS_MADE.fetch_add(sets, Ordering::Relaxed);
+    if (before + sets) / 10_000 > before / 10_000 {
+        let spares = core.spares.lock().expect("spares lock poisoned");
+        tracing::info!(
+            sets = before + sets,
+            kept_sets = KEPT_SETS_MADE.load(Ordering::Relaxed),
+            pools_made = POOLS_MADE.load(Ordering::Relaxed),
+            pools_free = spares.free.len(),
+            pools_lent = spares.lent,
+            pools_kept = spares.kept,
+            "vulkan descriptor sets allocated so far"
+        );
+    }
+}
+
 /// A kept frame's pools: a body's sets a few pools of these.
 const KEPT_SETS_PER_POOL: u32 = 64;
 
@@ -2757,6 +2785,7 @@ impl Frame {
             }
         };
         drop(pools);
+        count_sets(core, batch as u64, self.kept);
         let one = sets.pop().expect("a batch of one or more");
         if !sets.is_empty() {
             self.inner
