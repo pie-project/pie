@@ -174,7 +174,7 @@ fn ensure_by(
         measuring,
         // Nothing is timed behind serving on CUDA yet: a stale key is
         // measured before ready.
-        false,
+        engine::rates::StaleRates::Measured,
         |_max_submit, _| {
             Ok(engine::rates::Measured {
                 rates: keys.stamp(measure(&measure_chip)?),

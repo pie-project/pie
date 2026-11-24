@@ -2026,15 +2026,24 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         } else {
             let mut tuned = chip.tuned().clone();
             for curve in &served {
+                let behind = measuring == engine::rates::Measuring::Time
+                    && stale_rates(max_submit) == engine::rates::StaleRates::TimedBehind;
                 tracing::info!(
                     "rates: gemm curve {curve}: served by the curve stored under its stale key{}",
-                    if measuring == engine::rates::Measuring::Time {
-                        "; timed again behind serving, stored for the next load"
-                    } else {
-                        " (`[engine] measure = false`: not timed again)"
+                    match (measuring, behind) {
+                        (engine::rates::Measuring::Time, true) => {
+                            "; timed again behind serving, stored for the next load"
+                        }
+                        (engine::rates::Measuring::Time, false) => {
+                            " (not timed again where the platform bounds one submission: the \
+                             next export round refreshes it)"
+                        }
+                        (engine::rates::Measuring::Skip, _) => {
+                            " (`[engine] measure = false`: not timed again)"
+                        }
                     }
                 );
-                if measuring == engine::rates::Measuring::Time {
+                if behind {
                     tuned.behind.push(format!("{CURVE_BEHIND}{curve}"));
                 }
             }
@@ -2256,6 +2265,21 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
     measure_yielding::<B, T>(device, tactics, tier, timer, max_submit, stated, say, None)
+}
+
+/// What a load on this engine does with a rate or curve stored under a
+/// stale key: served by its figure and timed again behind serving; where
+/// the platform states a bound on one submission (`max_submit`), served
+/// and not timed again (a rates step's frames are sized to that bound, so
+/// one frame would hold a serving request for as long; the next export
+/// round refreshes it).
+#[must_use]
+pub fn stale_rates(max_submit: Option<std::time::Duration>) -> engine::rates::StaleRates {
+    if max_submit.is_some() {
+        engine::rates::StaleRates::Served
+    } else {
+        engine::rates::StaleRates::TimedBehind
+    }
 }
 
 /// The prefix of a `profile::fire::Tuned::behind` entry naming a dense

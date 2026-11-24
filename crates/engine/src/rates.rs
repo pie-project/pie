@@ -1147,9 +1147,23 @@ pub fn rates_at_load(
         room,
         max_submit,
         Measuring::Time,
-        false,
+        StaleRates::Measured,
         |max_submit, _| measure(max_submit),
     )
+}
+
+/// What an engine does with a rate (or curve) a layer states of its device
+/// under a stale key (a kernel's code or the measuring method changed): a
+/// statement of the engine's, by platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRates {
+    /// Served by the stale figure, and timed again behind serving.
+    TimedBehind,
+    /// Served by the stale figure, not timed again by this load (the next
+    /// export round refreshes it).
+    Served,
+    /// Measured again before ready, as a key no layer states.
+    Measured,
 }
 
 /// Whether a load times what no layer states (`[engine] measure`, `pie
@@ -1190,7 +1204,7 @@ pub fn resolve_at_load(
     room: Option<u64>,
     max_submit: Option<std::time::Duration>,
     measuring: Measuring,
-    times_behind: bool,
+    stale_rates: StaleRates,
     measure: impl FnOnce(Option<std::time::Duration>, &profile::fire::Rates) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
     // A checked-in file this device takes states a rate this pie does not
@@ -1212,13 +1226,13 @@ pub fn resolve_at_load(
     // estimate, and timed again behind serving
     // (`profile::fire::Tuned::behind`): a load never measures before ready
     // what it holds a figure for. Only a key no layer states at all is
-    // measured here. An engine that times nothing behind serving
-    // (`times_behind` false) measures them here too.
+    // measured here. What the engine does with such a key is its own
+    // statement ([`StaleRates`]).
     let stale = stated
         .stale
         .as_deref()
         .cloned()
-        .filter(|_| times_behind || measuring == Measuring::Skip)
+        .filter(|_| stale_rates != StaleRates::Measured || measuring == Measuring::Skip)
         .unwrap_or_default();
     let estimated: Vec<&'static str> =
         lacked.iter().copied().filter(|key| stale.states(key)).collect();
@@ -1229,17 +1243,22 @@ pub fn resolve_at_load(
             tracing::info!(
                 "rates: `[rates] {key}`: served by the figure stored under its stale key (the \
                  stored measurements' lines say why it is stale){}",
-                if measuring == Measuring::Time {
-                    "; timed again behind serving, stored for the next load"
-                } else {
-                    " (`[engine] measure = false`: not timed again)"
+                match (measuring, stale_rates) {
+                    (Measuring::Time, StaleRates::TimedBehind) => {
+                        "; timed again behind serving, stored for the next load"
+                    }
+                    (Measuring::Time, _) => {
+                        " (this engine does not time it behind serving here: the next export \
+                         round refreshes it)"
+                    }
+                    (Measuring::Skip, _) => " (`[engine] measure = false`: not timed again)",
                 }
             );
         }
         let stated = stated.over(stale.only(&estimated));
         let mut tuned = chip.tuned().clone();
         tuned.rates = stated.clone();
-        if measuring == Measuring::Time {
+        if measuring == Measuring::Time && stale_rates == StaleRates::TimedBehind {
             tuned
                 .behind
                 .extend(estimated.iter().map(|key| (*key).to_string()));
@@ -1746,17 +1765,16 @@ mod tests {
         build: &Build,
         measuring: Measuring,
     ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
-        load_behind(shelf, dir, build, measuring, false)
+        load_behind(shelf, dir, build, measuring, StaleRates::Measured)
     }
 
-    /// [`load_from`] by an engine that times a stale key behind serving
-    /// where `times_behind`.
+    /// [`load_from`] by an engine that does `stale_rates` with a stale key.
     fn load_behind(
         shelf: &profile::Shelf,
         dir: &std::path::Path,
         build: &Build,
         measuring: Measuring,
-        times_behind: bool,
+        stale_rates: StaleRates,
     ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
         let registry = profile::Registry::new("toy", &[], &[]);
         let facts = profile::Facts::of(&registry);
@@ -1773,7 +1791,7 @@ mod tests {
             None,
             None,
             measuring,
-            times_behind,
+            stale_rates,
             |_, stated| {
                 let lacked = stated.missing(&profile::fire::KEYS);
                 measured.set(lacked.clone());
@@ -1807,7 +1825,7 @@ mod tests {
             code: vec![("gemm", 8), ("copy", 9)],
             ..exported
         };
-        let (measured, loaded, report) = load_behind(shelf, &dir, &now, Measuring::Time, true);
+        let (measured, loaded, report) = load_behind(shelf, &dir, &now, Measuring::Time, StaleRates::TimedBehind);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(measured, Vec::<&str>::new(), "nothing before ready: {:#?}", report.stored);
         assert_eq!(loaded.rates().gemm_tflops_by_rows, all().gemm_tflops_by_rows);

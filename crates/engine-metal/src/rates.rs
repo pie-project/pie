@@ -601,7 +601,7 @@ pub fn at_load(
     let measure_chip = chip.clone();
     // Nothing is timed behind serving on Metal yet: a stale key is
     // measured before ready.
-    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, false, |_max_submit, _| {
+    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, engine::rates::StaleRates::Measured, |_max_submit, _| {
         Ok(engine::rates::Measured {
             rates: measure(device, measure_chip, &mut |_| {})?,
             unsettled: false,
