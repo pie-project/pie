@@ -10643,6 +10643,12 @@ impl<B: Serve> Shell<B> {
                     self.arms.give(before);
                 }
                 if let Err(fault) = fired {
+                    tracing::error!(
+                        %fault,
+                        arm,
+                        lanes = ?lanes,
+                        "the arm walk's fire failed; the load fails with it"
+                    );
                     self.arming = false;
                     return Err(fault);
                 }
