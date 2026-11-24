@@ -1,6 +1,7 @@
 //! `wafer-compile`: the wafer program's compiler. `plan` runs poem's spatial pass over a model's
 //! trace (or a shape stated outright) and writes the plan; `build` writes everything a plan
-//! builds: the program's sources and the artifact the engine runs.
+//! builds: the program's sources and the artifact the engine runs; `stream` writes a stream
+//! reading's program as compile on load chooses it.
 //!
 //! ```text
 //! wafer-compile plan (--model <deployment> | --shape <shape.json>) [--set K=V,...]
@@ -8,15 +9,13 @@
 //! wafer-compile build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <kernels dir>]
 //! wafer-compile link --build <dir> [--fabric simulator|system]
-//! wafer-compile cost --plan <plan.json>
-//! wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]
+//! wafer-compile stream --model <deployment> [--reading R] [--rows N] [--class-rows c=N,..]
+//!                 [--ieee] [--positions N] [--lanes B] [--anneal N [--anneal-seed N]
+//!                 [--anneal-units 1]] --out <dir>
 //! ```
 //!
 //! `--profile <file>` (any subcommand) prices under the chip's calibration a profile file states
 //! (`engine-cerebras/profiles/cs3.toml`), else the defaults.
-//!
-//! `cost` prints a plan's cost features (`cost::Features`) and the bytes it moves on the weight
-//! and head PEs; `search` ranks a deployment's partitions by their predicted step (`search`).
 //!
 //! `plan` writes `<dir>/plan.json` (the [`Plan`]) and names the preset it took.
 //! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--set` pins the search's
@@ -32,7 +31,6 @@
 use std::path::{Path, PathBuf};
 
 use kernels_cerebras::compile::build::{self, EMITS, Fabric};
-use kernels_cerebras::compile::cost::CLOCK_HZ;
 use kernels_cerebras::compile::emit::params::Levers;
 use kernels_cerebras::compile::plan::{Plan, Shape};
 use kernels_cerebras::compile::program::Program;
@@ -42,13 +40,9 @@ use kernels_cerebras::compile::toolchain::{Arch, Cslc, Toolchain};
 const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
      [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
      --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]\n       wafer-compile link \
-     --build <dir> [--fabric simulator|system]\n       wafer-compile cost --plan <plan.json>\n       \
-     wafer-compile search --model <deployment> [--positions N] [--set K=V,...] [--keep N]\n       \
-     wafer-compile stream --model <deployment> [--reading R] [--rows N] [--ieee] --out <dir> \
-     [--regime auto|stream|gemm|tiled] [--gemm C,R,KBM] [--batch B | --batch-most B] [--values <dir>] [--stages N] [--tap v,..] [--py N] [--tile W] [--spill] \
-     [--anneal <moves a block> [--anneal-seed N] [--anneal-units 1]] \
-     [--cut THIN,SUB,WIDEN,HELP] [--fabric-width W] [--class-rows context=512,latents=4096] \
-     [--price context=512,latents=4096 [--parts]] [--clip t,h,w]";
+     --build <dir> [--fabric simulator|system]\n       wafer-compile stream --model <deployment> \
+     [--reading R] [--rows N] [--class-rows c=N,..] [--ieee] [--positions N] [--lanes B] \
+     [--anneal <moves a block> [--anneal-seed N] [--anneal-units 1]] --out <dir>";
 
 fn main() {
     if let Err(e) = run() {
@@ -159,41 +153,6 @@ fn build(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The static check of the program `stream` wrote; `--check-all 1` prints its findings and every
-/// PE kind's line (file, data bytes, code measures).
-fn checked(args: &[String]) -> Result<(), String> {
-    let Some(rep) = kernels_cerebras::compile::check::last() else {
-        return Ok(());
-    };
-    if args.iter().any(|a| a == "--check-all") {
-        for (file, p, d, r) in &rep.kinds {
-            let m = r.measure;
-            println!(
-                "KIND {file} {d} {} {} {} {} {} {p:?}",
-                m.statements, r.functions, m.dsd, m.loops, m.ifs
-            );
-        }
-        for e in rep.errors.iter().take(20) {
-            println!("  error: {e}");
-        }
-        for w in rep.warnings.iter().take(5) {
-            println!("  warning: {w}");
-        }
-        for (f, d, c) in rep.codes.iter().take(8) {
-            println!("  {f}: {d} B data + ~{c} B code");
-        }
-        if !rep.unknown.is_empty() {
-            println!(
-                "  {} array sizes not evaluated, e.g. {}",
-                rep.unknown.len(),
-                rep.unknown[0]
-            );
-        }
-    }
-    println!("{}", rep.line());
-    rep.ok()
-}
-
 /// `link`: a build directory compiled, checked and its artifact put beside it.
 fn link(args: &[String]) -> Result<(), String> {
     let f = flags(args, &["--build", "--fabric"])?;
@@ -209,60 +168,9 @@ fn link(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `cost`: what a plan costs (its features, its step time, its images' memory), as JSON.
-fn cost(args: &[String]) -> Result<(), String> {
-    let f = flags(args, &["--plan"])?;
-    let plan: Plan = read(get(&f, "--plan").ok_or(USAGE)?)?;
-    let features = kernels_cerebras::compile::cost::Features::of(&plan);
-    let moving = kernels_cerebras::compile::cost::memory::Moving::of(&plan);
-    println!(
-        "{} {} {}",
-        serde_json::to_string(&features).map_err(|e| e.to_string())?,
-        moving.weight,
-        moving.head
-    );
-    Ok(())
-}
-
-/// `search`: a deployment's partitions ranked by their predicted step.
-fn search(args: &[String]) -> Result<(), String> {
-    let f = flags(args, &["--model", "--positions", "--set", "--keep"])?;
-    let name = get(&f, "--model").ok_or(USAGE)?;
-    let catalog = poem_compiler::catalog::repository();
-    let d = catalog
-        .parse(name)
-        .ok_or_else(|| format!("--model {name}: no such deployment"))?;
-    let trace = d
-        .try_trace(poem_ir::Platform::Cerebras)
-        .map_err(|e| format!("--model {name}: {e}"))?;
-    let shape = target::shape(&trace)?;
-    let ask = kernels_cerebras::compile::search::Asked {
-        positions: get(&f, "--positions")
-            .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
-            .transpose()?,
-        set: get(&f, "--set").unwrap_or("").to_string(),
-    };
-    let keep = get(&f, "--keep")
-        .map_or(Ok(5), str::parse)
-        .map_err(|e| format!("--keep: {e}"))?;
-    let t0 = std::time::Instant::now();
-    for (i, c) in kernels_cerebras::compile::search::search(&shape, &ask, keep)?
-        .iter()
-        .enumerate()
-    {
-        println!(
-            "{i} {} {:.4} ms {:.0} B {:?}",
-            c.planned.preset.name, c.ms, c.room, c.planned.preset.keys
-        );
-    }
-    println!("search {:.1} s", t0.elapsed().as_secs_f64());
-    Ok(())
-}
-
 /// `stream --model <name> [--reading denoise] [--rows 64] [--class-rows name=N,..] [--ieee]
-/// [--py N] [--tile W] [--fabric-width W] --out <dir> [--values <dir>]`: a stream reading's
-/// wafer program (`stream::compile`); with a step's captured values, the host's files for a run
-/// of it.
+/// --out <dir>`: a stream reading's wafer program as compile on load chooses it; `--reading
+/// decode` (a model without one) the decode step through the units, `--positions` long.
 fn stream(args: &[String]) -> Result<(), String> {
     let get = |k: &str| {
         args.iter()
@@ -297,27 +205,20 @@ fn stream(args: &[String]) -> Result<(), String> {
         .declared("reading")
         .is_some_and(|d| d.values.contains(&reading));
     if reading == "decode" && !declared {
-        // the decode step through the units, its caches `--positions` long
         let positions: u32 = get("--positions")
             .map_or(Ok(4096), |r| r.parse())
             .map_err(|e| format!("--positions: {e}"))?;
         let lanes: u32 = get("--lanes")
             .map_or(Ok(1), |r| r.parse())
             .map_err(|e| format!("--lanes: {e}"))?;
-        // (`--stages N`: its first N stages alone, the last's rows read back: a headless
-        // slice, held to a golden's hidden state on the simulator)
-        let upto = get("--stages")
-            .map(|s| s.parse::<usize>())
-            .transpose()
-            .map_err(|e| format!("--stages: {e}"))?;
         let p = kernels_cerebras::compile::stream::compile_decode(
             &trace,
             positions,
             lanes,
             !ieee,
-            upto,
+            None,
             &anneal,
-            std::path::Path::new(&out),
+            Path::new(&out),
         )?;
         println!(
             "{model} decode: {} units, {} K / V columns of {positions} positions, {} x {} PEs, py {}, {:.3}M cycles a token priced",
@@ -331,163 +232,16 @@ fn stream(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     if kernels_cerebras::compile::stream::grid::is_grid(&trace, &reading) {
-        // a grid reading (a VAE's): its passes over one unit, on the clip `--clip t,h,w` (else
-        // the one `--rows` token rows make)
-        let clip = match get("--clip") {
-            Some(c) => {
-                let v: Vec<u32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
-                let [t, h, w] = v[..] else {
-                    return Err(format!("--clip {c}: t,h,w"));
-                };
-                [t, h, w]
-            }
-            None => kernels_cerebras::compile::stream::grid::clip_of(&trace, &reading, rows),
-        };
-        // `--regime tiled`: the image over the fabric, `--tile H,W` its top tile pinned
-        let tile = match get("--tile") {
-            Some(t) => {
-                let v: Vec<u32> = t.split(',').filter_map(|x| x.parse().ok()).collect();
-                let [a, b] = v[..] else {
-                    return Err(format!("--tile {t}: h,w"));
-                };
-                Some((a, b))
-            }
-            None => None,
-        };
-        if get("--regime").as_deref() == Some("tiled") {
-            let bounds = kernels_cerebras::compile::floorplan::stream::Bounds::system();
-            // `--chunks KC,WB[,S]`: the staged channels and weight block at most, the op table
-            // streamed (S 1) (with `--tile`)
-            let p = match (get("--chunks"), tile) {
-                (Some(c), Some(t)) => {
-                    let v: Vec<u32> = c.split(',').filter_map(|x| x.parse().ok()).collect();
-                    let (kc, wb, stream_ops, tight) = match v[..] {
-                        [kc, wb] => (kc, wb, false, false),
-                        [kc, wb, s] => (kc, wb, s != 0, false),
-                        [kc, wb, s, g] => (kc, wb, s != 0, g != 0),
-                        _ => {
-                            return Err(format!(
-                                "--chunks {c}: kc,wb[,stream ops 0|1[,tight 0|1]]"
-                            ));
-                        }
-                    };
-                    kernels_cerebras::compile::stream::tiled::program_with(
-                        &trace,
-                        &reading,
-                        clip,
-                        !ieee,
-                        t,
-                        kernels_cerebras::compile::stream::tiled::Chunks {
-                            kc,
-                            wb,
-                            stream_ops,
-                            tight,
-                        },
-                        Some((bounds.w, bounds.h)),
-                    )?
-                }
-                // (`--stages N`: its first N ops alone, the last's value read out: a part of the
-                // reading on the simulator)
-                _ => kernels_cerebras::compile::stream::tiled::program_upto(
-                    &trace,
-                    &reading,
-                    clip,
-                    !ieee,
-                    tile,
-                    Some((bounds.w, bounds.h)),
-                    get("--stages")
-                        .map(|s| s.parse::<usize>())
-                        .transpose()
-                        .map_err(|e| format!("--stages: {e}"))?,
-                )?,
-            };
-            let c = kernels_cerebras::compile::cost::tiled::time(&p);
-            let (fw, fh) = p.fabric();
-            println!(
-                "{model} {reading} on {clip:?}: tiled, {} ops over a {} x {} array ({fw} x {fh} PEs, tape {}), arena {} + staging {} + block {} words, {:.1}M cycles ({:.2} ms at 750 MHz)",
-                p.ops.len(),
-                p.gx,
-                p.gy,
-                p.tape,
-                p.arena,
-                p.hx / 2,
-                p.wb,
-                c.cycles / 1e6,
-                c.cycles / CLOCK_HZ * 1e3
-            );
-            if args.iter().any(|a| a == "--parts") {
-                let (by_at, by_what) = c.by();
-                for (at, cy) in by_at {
-                    println!("  {}x{}: {:.2}M", at.0, at.1, cy / 1e6);
-                }
-                for (w, cy) in by_what {
-                    println!("  {w}: {:.2}M", cy / 1e6);
-                }
-                // (each op's words of the weight stream: where its records sit on the tape)
-                for o in &c.ops {
-                    println!(
-                        "  op {} {} {:?}: {:.0} cycles, {} stream words",
-                        o.op,
-                        o.what,
-                        o.at,
-                        o.cycles,
-                        kernels_cerebras::compile::stream::host::span_words(&p.records(o.op))
-                    );
-                }
-                let (at, live) = p.peak();
-                println!("  the arena's peak at op {at}: {live:?}");
-            }
-            if !args.iter().any(|a| a == "--price") {
-                kernels_cerebras::compile::stream::tiled::compile_program(
-                    &p,
-                    std::path::Path::new(&out),
-                )?;
-            }
-            return Ok(());
-        }
-        if args.iter().any(|a| a == "--price") {
-            // the cost model's time for the reading on `clip`, its placement aside
-            let g = kernels_cerebras::compile::stream::grid::program_unfit(
-                &trace, &reading, clip, !ieee,
-            )?;
-            let c = kernels_cerebras::compile::cost::grid::time(&g);
-            println!(
-                "{model} {reading} on {clip:?}: {} passes over {} x {} roots, {:.1}M cycles ({:.1} ms at 750 MHz)",
-                g.passes.len(),
-                g.p,
-                g.p,
-                c.cycles / 1e6,
-                c.cycles / CLOCK_HZ * 1e3
-            );
-            if args.iter().any(|a| a == "--parts") {
-                for q in &c.passes {
-                    println!(
-                        "  pass {} rows {} head {} matvec {:.0} roots {:.0} head row {:.0}: {:.1}M",
-                        q.pass,
-                        q.rows,
-                        q.head_rows,
-                        q.matvec_row,
-                        q.root_row,
-                        q.head_row,
-                        q.cycles / 1e6
-                    );
-                }
-            }
-            return Ok(());
-        }
-        // `--weight-words N`: a weight PE's words for tiles and stores (fewer: weight groups)
-        let budget = get("--weight-words")
-            .map(|w| w.parse::<u32>().map_err(|e| format!("--weight-words: {e}")))
-            .transpose()?
-            .unwrap_or(kernels_cerebras::compile::stream::grid::WEIGHT_WORDS);
+        // a grid reading (a VAE's): its passes over one unit, on the clip `--rows` token rows make
+        let clip = kernels_cerebras::compile::stream::grid::clip_of(&trace, &reading, rows);
         let g = kernels_cerebras::compile::stream::grid::compile_within(
             &trace,
             &reading,
             clip,
             !ieee,
             None,
-            budget,
-            std::path::Path::new(&out),
+            kernels_cerebras::compile::stream::grid::WEIGHT_WORDS,
+            Path::new(&out),
         )?;
         println!(
             "{model} {reading}: a grid reading on {clip:?}, {} passes over {} x {} roots, {} matvecs, {} x {} PEs, {} weight groups",
@@ -501,255 +255,23 @@ fn stream(args: &[String]) -> Result<(), String> {
         );
         return Ok(());
     }
-    let values = get("--values");
-    let taps: Vec<u32> = get("--tap")
-        .map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect())
-        .unwrap_or_default();
-    let upto = get("--stages")
-        .map(|s| s.parse::<usize>())
-        .transpose()
-        .map_err(|e| format!("--stages: {e}"))?;
-    let py = get("--py")
-        .map(|s| s.parse::<u32>())
-        .transpose()
-        .map_err(|e| format!("--py: {e}"))?;
-    let tile = get("--tile")
-        .map(|s| s.parse::<u32>())
-        .transpose()
-        .map_err(|e| format!("--tile: {e}"))?;
     let o = kernels_cerebras::compile::stream::Options {
         reading: reading.clone(),
         rows,
         round16: !ieee,
-        upto,
-        taps,
+        upto: None,
+        taps: Vec::new(),
         anneal,
     };
-    // with nothing pinned, the regime and its every choice the engine's compile on load makes
-    // (`stream::compile_whole`, by the regimes' expected prices); `--regime stream|gemm` and the
-    // levers pin them (debugging)
-    let pins = [
-        "--regime",
-        "--gemm",
-        "--batch",
-        "--batch-most",
-        "--py",
-        "--tile",
-        "--chunks",
-        "--cut",
-        "--spill",
-        "--fabric-width",
-        "--price",
-        "--values",
-        "--emulate",
-    ];
-    if get("--regime").as_deref() == Some("auto")
-        || !args.iter().any(|a| pins.contains(&a.as_str()))
-    {
-        let crow = kernels_cerebras::compile::stream::parse_rows(
-            &get("--class-rows").unwrap_or_default(),
-        )?;
-        let (w, h) = kernels_cerebras::compile::stream::compile_whole(
-            &trace,
-            &o,
-            &crow,
-            std::path::Path::new(&out),
-        )?;
-        let gemm = std::fs::read_to_string(std::path::Path::new(&out).join("stream.json"))
-            .is_ok_and(|t| t.contains("\"regime\": \"gemm\""));
-        println!(
-            "{model} {reading}: the {} regime, {w} x {h} PEs (compile on load's choice)",
-            if gemm { "GEMM" } else { "stream" }
-        );
-        return Ok(());
-    }
-    if get("--regime").as_deref() == Some("gemm") {
-        // the GEMM regime: the reading over the whole fabric, `--gemm C,R,KBM` its array and key
-        // block pinned
-        let pin = match get("--gemm") {
-            Some(g) => {
-                let v: Vec<u32> = g.split(',').filter_map(|x| x.parse().ok()).collect();
-                let [c, r, k] = v[..] else {
-                    return Err(format!("--gemm {g}: C,R,KBM"));
-                };
-                Some((c, r, k))
-            }
-            None => None,
-        };
-        let crow = kernels_cerebras::compile::stream::parse_rows(
-            &get("--class-rows").unwrap_or_default(),
-        )?;
-        let bounds = kernels_cerebras::compile::floorplan::stream::Bounds::system();
-        let p = match get("--batch-most") {
-            // the batch by price, at most so many requests a launch
-            Some(m) if pin.is_none() => kernels_cerebras::compile::stream::gemm::batched(
-                &trace,
-                &o,
-                &crow,
-                (bounds.w, bounds.h),
-                m.parse().map_err(|e| format!("--batch-most: {e}"))?,
-            )?,
-            _ => kernels_cerebras::compile::stream::gemm::program(
-                &trace,
-                &o,
-                &crow,
-                pin,
-                (bounds.w, bounds.h),
-                get("--batch")
-                    .map_or(Ok(1), |b| b.parse::<u32>())
-                    .map_err(|e| format!("--batch: {e}"))?,
-            )?,
-        };
-        let c = kernels_cerebras::compile::cost::gemm::time(&p);
-        let m = kernels_cerebras::compile::cost::gemm::memory(&p);
-        println!(
-            "{model} {reading}: gemm, {} requests a launch, {} ops ({} modules) over {} x {} PEs, {} rows a PE, key blocks of {} rows, stream {} words a column ({} rows of tapes), {} words a PE, {:.2}M cycles ({:.3} ms at 750 MHz)",
-            p.l.batch,
-            p.l.ops.len(),
-            p.modules.len(),
-            p.c,
-            p.r,
-            p.tb,
-            p.kbm,
-            p.wwords,
-            p.tape,
-            m.total,
-            c.cycles / 1e6,
-            c.cycles / CLOCK_HZ * 1e3
-        );
-        if args.iter().any(|a| a == "--parts") {
-            for (w, cy) in c.by() {
-                println!("  {w}: {:.3}M", cy / 1e6);
-            }
-            println!("  memory {m:?}");
-            // (each op's first word of column 0's weight stream: where the tape is during it)
-            for o in &c.ops {
-                println!(
-                    "  op {} {}: {:.0} cycles, from stream word {}, terms {:.0} {:.0} {:.0} {:.0} {:.0}",
-                    o.op,
-                    o.what,
-                    o.cycles,
-                    p.wop.get(o.op).copied().unwrap_or(0),
-                    o.terms[0],
-                    o.terms[1],
-                    o.terms[2],
-                    o.terms[3],
-                    o.terms[4]
-                );
-            }
-        }
-        if args.iter().any(|a| a == "--emulate") {
-            // the program on the host over the capture's values, its outputs against it
-            let dir = values.as_deref().ok_or("--emulate: --values")?;
-            let vals =
-                kernels_cerebras::compile::stream::host::Values::open(std::path::Path::new(dir))?;
-            for (v, got) in kernels_cerebras::compile::stream::gemm::emulate(&p.l, &vals)? {
-                let (_, want) = vals.get(v)?;
-                let (mut a, mut b) = (0f64, 0f64);
-                for (x, y) in got.iter().zip(want.iter()) {
-                    if x.is_finite() && y.is_finite() {
-                        a += f64::from(x - y).powi(2);
-                        b += f64::from(*y).powi(2);
-                    }
-                }
-                println!(
-                    "EMULATE value %{} rel L2 {:.3e}",
-                    v.0,
-                    (a / b.max(1e-30)).sqrt()
-                );
-            }
-        }
-        if !args.iter().any(|a| a == "--price") {
-            kernels_cerebras::compile::stream::gemm::compile_program(
-                &p,
-                std::path::Path::new(&out),
-                values.as_deref().map(std::path::Path::new),
-            )?;
-        }
-        return Ok(());
-    }
-    // `--cut T,S,W,H`: K / V PEs at 1 / T of their entries over S columns a head, W quarters more
-    // rest roots, up to H helper PEs a rest root
-    let kv = get("--cut")
-        .map(|v| -> Result<_, String> {
-            let n: Vec<u32> = v
-                .split(',')
-                .map(|x| x.parse().map_err(|e| format!("--cut {v}: {e}")))
-                .collect::<Result<_, _>>()?;
-            let [thin, sub, widen, help] = n[..] else {
-                return Err(format!("--cut {v}: THIN,SUB,WIDEN,HELP"));
-            };
-            Ok(kernels_cerebras::compile::stream::build::KvSplit {
-                thin,
-                sub,
-                widen,
-                help,
-            })
-        })
-        .transpose()?;
-    let pins = kernels_cerebras::compile::stream::Pins {
-        py,
-        tile,
-        kv,
-        spill: args.iter().any(|a| a == "--spill"),
-        class_rows: kernels_cerebras::compile::stream::parse_rows(
-            &get("--class-rows").unwrap_or_default(),
-        )?,
-        width: get("--fabric-width")
-            .map(|s| s.parse::<u32>())
-            .transpose()
-            .map_err(|e| format!("--fabric-width: {e}"))?,
-    };
-    let p = kernels_cerebras::compile::stream::compile_pinned(
-        &trace,
-        &o,
-        &pins,
-        std::path::Path::new(&out),
-        values.as_deref().map(std::path::Path::new),
-    )?;
-    if let Some(at) = get("--price") {
-        // the program's cost model read at other rows a class (its layout as built)
-        let named = kernels_cerebras::compile::stream::parse_rows(&at)?;
-        let rows: Vec<u32> = p
-            .shape
-            .classes
-            .iter()
-            .map(|(c, r)| named.iter().find(|(n, _)| n == c).map_or(*r, |x| x.1))
-            .collect();
-        let c = kernels_cerebras::compile::cost::stream::time_at(&p, &rows);
-        println!(
-            "priced at {at}: {:.1}M cycles ({:.1} ms at 750 MHz)",
-            c.cycles / 1e6,
-            c.cycles / CLOCK_HZ * 1e3
-        );
-        for u in &c.units {
-            println!(
-                "  {} rows {} early {:.0} late {:.0} matvec {:.0} cycles a row",
-                u.name, u.rows, u.early_row, u.late_row, u.matvec_row
-            );
-            if args.iter().any(|a| a == "--parts") {
-                for q in &u.parts {
-                    println!(
-                        "    step {} {}{} roots {} chunk {}: {:.0}",
-                        q.step,
-                        q.what,
-                        if q.late { " (late)" } else { "" },
-                        q.roots,
-                        q.chunk,
-                        q.cycles
-                    );
-                }
-            }
-        }
-    }
+    let crow =
+        kernels_cerebras::compile::stream::parse_rows(&get("--class-rows").unwrap_or_default())?;
+    let (w, h) =
+        kernels_cerebras::compile::stream::compile_whole(&trace, &o, &crow, Path::new(&out))?;
+    let gemm = std::fs::read_to_string(Path::new(&out).join("stream.json"))
+        .is_ok_and(|t| t.contains("\"regime\": \"gemm\""));
     println!(
-        "{model} {reading}: {} units, {} K / V columns, {} x {} PEs, py {}, {} lane words",
-        p.units.len(),
-        p.stream.kv.len(),
-        p.stream.w,
-        p.stream.h,
-        p.stream.py,
-        p.lane_words
+        "{model} {reading}: the {} regime, {w} x {h} PEs (compile on load's choice)",
+        if gemm { "GEMM" } else { "stream" }
     );
     Ok(())
 }
@@ -767,11 +289,13 @@ fn run() -> Result<(), String> {
         Some("plan") => plan(&args[1..]),
         Some("build") => build(&args[1..]),
         Some("link") => link(&args[1..]),
-        Some("cost") => cost(&args[1..]),
-        Some("search") => search(&args[1..]),
         Some("stream") => {
             kernels_cerebras::compile::check::keep();
-            stream(&args[1..]).and_then(|()| checked(&args[1..]))
+            stream(&args[1..])?;
+            kernels_cerebras::compile::check::last().map_or(Ok(()), |rep| {
+                println!("{}", rep.line());
+                rep.ok()
+            })
         }
         _ => Err(USAGE.to_string()),
     }

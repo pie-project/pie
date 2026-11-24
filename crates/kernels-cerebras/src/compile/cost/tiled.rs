@@ -3,8 +3,6 @@
 //! plus what passes through every PE (stream words, keys). Convolutions, group norms, regions,
 //! upsampling and attention are priced from their words, elements and hops; each op adds `tiled_op`.
 
-use std::collections::BTreeMap;
-
 use serde::Serialize;
 
 use super::stream::RegionFeatures;
@@ -28,23 +26,6 @@ pub struct OpCost {
 pub struct TileCost {
     pub ops: Vec<OpCost>,
     pub cycles: f64,
-}
-
-/// Cycles by output resolution (h, w), and by kind of op.
-pub type By = (BTreeMap<(u32, u32), f64>, BTreeMap<&'static str, f64>);
-
-impl TileCost {
-    /// The cycles by output resolution (h, w), and by kind of op.
-    #[must_use]
-    pub fn by(&self) -> By {
-        let mut a = BTreeMap::new();
-        let mut b = BTreeMap::new();
-        for o in &self.ops {
-            *a.entry(o.at).or_insert(0.0) += o.cycles;
-            *b.entry(o.what).or_insert(0.0) += o.cycles;
-        }
-        (a, b)
-    }
 }
 
 /// An all-reduce of `n` words over the array.

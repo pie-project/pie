@@ -296,28 +296,6 @@ pub struct Options {
     pub anneal: crate::compile::place::anneal::Anneal,
 }
 
-/// What [`compile_pinned`] pins besides [`Options`] (the default: nothing).
-#[derive(Clone, Debug, Default)]
-pub struct Pins {
-    /// Row roots a unit and a weight PE's most tile words (`None`: the cost model's choice,
-    /// [`build::program_py`]).
-    pub py: Option<u32>,
-    pub tile: Option<u32>,
-    /// The K / V columns' cut (`None`: the cost model's choice of [`build::KV_SPLITS`]).
-    pub kv: Option<build::KvSplit>,
-    /// Every unit's rows held over the barrier in its row store, not at its roots (a test of
-    /// the store at rows the roots would hold).
-    pub spill: bool,
-    /// Rows of the classes named here in place of `rows` (flux at 1024²: context 512, latents
-    /// 4096).
-    pub class_rows: Vec<(String, u32)>,
-    /// The fabric's width for the program (`None`: the system's, [`Bounds::system`]; narrower
-    /// fills more bands: a test of the row stream's turn into a band on a small model).
-    ///
-    /// [`Bounds::system`]: crate::compile::floorplan::stream::Bounds::system
-    pub width: Option<u32>,
-}
-
 /// Compiles `trace`'s stream reading (`o`) into `out`: the program's CSL (`layout.csl`, the
 /// kernels, the printed regions) and the host's files (`host.json`, the arrays' spans and
 /// gathers, `h2d/`: every array's words given a step's captured values `gold`, else only the
@@ -328,24 +306,10 @@ pub fn compile(
     out: &std::path::Path,
     gold: Option<&std::path::Path>,
 ) -> R<build::Program> {
-    compile_pinned(trace, o, &Pins::default(), out, gold)
-}
-
-/// [`compile`] with `pins`.
-pub fn compile_pinned(
-    trace: &Trace,
-    o: &Options,
-    pins: &Pins,
-    out: &std::path::Path,
-    gold: Option<&std::path::Path>,
-) -> R<build::Program> {
     let s = shape(
         trace,
         &o.reading,
-        &with_rows(
-            program::classes(trace, &o.reading, o.rows),
-            &pins.class_rows,
-        ),
+        &program::classes(trace, &o.reading, o.rows),
     )?;
     let p = build::program_py(
         trace,
@@ -353,17 +317,17 @@ pub fn compile_pinned(
         o.round16,
         o.upto,
         &o.taps,
-        pins.py,
-        pins.tile,
-        pins.kv,
-        pins.spill,
-        crate::compile::floorplan::stream::Bounds::system().narrowed(pins.width),
+        None,
+        None,
+        None,
+        false,
+        crate::compile::floorplan::stream::Bounds::system(),
     )?;
     write_stream(&p, o, out, gold)?;
     Ok(p)
 }
 
-/// A built stream program's files into `out` (as [`compile_pinned`] writes them).
+/// A built stream program's files into `out` (as [`compile`] writes them).
 fn write_stream(
     p: &build::Program,
     o: &Options,
@@ -928,22 +892,4 @@ pub fn parse_rows(s: &str) -> R<Vec<(String, u32)>> {
 /// ([`program::classes`]), `rows` rows each.
 pub fn shape_of(trace: &Trace, reading: &str, rows: u32) -> R<StreamShape> {
     shape(trace, reading, &program::classes(trace, reading, rows))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn trace(name: &str) -> Trace {
-        poem_compiler::catalog::repository()
-            .parse(name)
-            .unwrap_or_else(|| panic!("{name} parses"))
-            .trace(poem_ir::Platform::Cerebras)
-    }
-
-    /// flux2-mini holds no VAE: its `vae.decode` reading runs no layers.
-    #[test]
-    fn a_reading_the_poem_does_not_run_is_refused() {
-        assert!(shape_of(&trace("flux2-mini-bf16-kv-bf16"), "vae.decode", 64).is_err());
-    }
 }

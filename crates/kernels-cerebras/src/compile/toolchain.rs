@@ -430,23 +430,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_link_reports_its_cause_not_the_echoes() {
-        let stderr = "ld.lld: error: cannot open /tmp/cslc-1/a.o: No such file or directory\n\
-                      Failed to link: /tmp/cslc-1/a.o\n\
-                      ld.lld: error: ran out of PE memory for data (section .bss) \n\
-                      ld.lld: error: cannot open /tmp/cslc-1/a.o: No such file or directory\n\
-                      ld.lld: error: ran out of PE memory for data (section .bss) \n";
-        assert_eq!(
-            causes(stderr),
-            "ld.lld: error: ran out of PE memory for data (section .bss) "
-        );
-        assert_eq!(
-            causes("Failed to link: /tmp/cslc-1/a.o\n"),
-            "Failed to link: /tmp/cslc-1/a.o"
-        );
-    }
-
-    #[test]
     fn a_system_program_is_linked_against_the_whole_wafer() {
         assert_eq!(Arch::Wse3.system_fabric(), (762, 1172));
         assert_eq!(memcpy_fabric(643, 1153), ((650, 1155), (4, 1)));

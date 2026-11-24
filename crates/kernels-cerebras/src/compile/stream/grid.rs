@@ -1409,17 +1409,6 @@ pub fn program_upto(
     build(trace, reading, clip, round16, upto, true, WEIGHT_WORDS)
 }
 
-/// [`program`] whether or not its tiles and stores fit a weight PE (what the cost model prices
-/// a reading at before its placement is chosen).
-pub fn program_unfit(
-    trace: &Trace,
-    reading: &str,
-    clip: [u32; 3],
-    round16: bool,
-) -> R<GridProgram> {
-    build(trace, reading, clip, round16, None, false, WEIGHT_WORDS)
-}
-
 /// What a grid reading's lowering starts from, in either regime ([`build`]'s passes, or the
 /// tiled regime's ops): its one class's word, the nodes it runs, those the host runs (their
 /// inputs all the host's), each grid value's extent on `clip`.

@@ -235,8 +235,6 @@ macro_rules! words {
 
         #[allow(dead_code)]
         impl $N {
-            pub const FIELDS: &'static [&'static str] = &[$(stringify!($f)),*];
-
             pub fn words(&self) -> Vec<u32> {
                 vec![$(self.$f),*]
             }

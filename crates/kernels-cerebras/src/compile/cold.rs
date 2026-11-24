@@ -13,8 +13,7 @@ pub const FABRIC_ROWS: u32 = 1153;
 /// Its columns.
 pub const FABRIC_COLS: u32 = 750;
 
-/// A kernel set's levers and the keys no partition moves: the kernels' defaults (the levers
-/// every measured program of the set ran with).
+/// A kernel set's levers and the keys no partition moves: the kernels' defaults.
 #[must_use]
 pub fn defaults(set: KernelSet) -> (&'static str, &'static [(&'static str, f64)]) {
     match set {

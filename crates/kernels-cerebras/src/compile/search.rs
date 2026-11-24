@@ -28,12 +28,11 @@ const COLD_EACH: usize = 2;
 /// Keys that are not the partition's (the contract's levels and loop, the head's scale).
 const FIXED: &[&str] = &["CTX", "LOOP", "NLV", "HSCALE", "RLV", "RBITS", "CAP", "WL"];
 
-/// A partition the search kept: its plan, its predicted step (ms) and least stack room (B).
+/// A partition the search kept: its plan and its predicted step (ms).
 #[derive(Clone, Debug)]
 pub struct Scored {
     pub planned: Planned,
     pub ms: f64,
-    pub room: f64,
 }
 
 /// What a search is asked: the positions to serve (else 4096) and overrides set over every
@@ -159,7 +158,6 @@ impl Search<'_> {
         }
         Some(Scored {
             ms: time::step(&plan, self.layer),
-            room,
             planned: Planned {
                 plan,
                 preset: p.clone(),
@@ -386,12 +384,4 @@ fn key(p: &Preset) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",")
-}
-
-impl Scored {
-    /// The plan.
-    #[must_use]
-    pub fn plan(&self) -> &Plan {
-        &self.planned.plan
-    }
 }

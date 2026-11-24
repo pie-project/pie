@@ -52,12 +52,6 @@ impl PeBytes {
         self.data + self.code
     }
 
-    /// It fits whatever the estimate's miss (its estimate [`UNDER`] within [`PE_BYTES`]).
-    #[must_use]
-    pub fn fits(self) -> bool {
-        self.total() + UNDER <= PE_BYTES
-    }
-
     /// It cannot fit whatever the estimate's miss (past [`PE_BYTES`] by more than [`OVER`]).
     #[must_use]
     pub fn overflows(self) -> bool {
@@ -151,20 +145,6 @@ pub fn kind_code(files: &BTreeMap<String, String>, file: &str) -> i64 {
 #[must_use]
 pub fn miss(file: &str, text: Option<&str>) -> i64 {
     kind_of(file, text).map_or(UNDER, |k| k.miss)
-}
-
-/// A PE's memory: `file`'s at `params`, its imports read from `files` (what the check finds of
-/// each kind of PE, for a search to price a candidate's PEs alike).
-#[must_use]
-pub fn pe_bytes(
-    files: &BTreeMap<String, String>,
-    file: &str,
-    params: &BTreeMap<String, i64>,
-) -> PeBytes {
-    PeBytes {
-        data: held(files, file, params, 0).data,
-        code: code_bytes(&code::reached(files, file, params)) + kind_code(files, file),
-    }
 }
 
 /// The DSD descriptors a PE image's low data holds at most: cslc keeps every constant DSD value
@@ -840,9 +820,6 @@ fn held(
     h
 }
 
-/// A kind of PE: its file, parameters, data bytes and what its code reaches.
-pub type Kind = (String, Vec<(String, i64)>, i64, code::Reached);
-
 /// A check's findings.
 #[derive(Clone, Debug, Default)]
 pub struct Report {
@@ -859,8 +836,6 @@ pub struct Report {
     /// A regime's own memory model's least room a PE leaves (a decode program's,
     /// `cost::memory::room`), in place of the estimate's margin.
     pub model_room: Option<i64>,
-    /// Each distinct PE code: its file, parameters, data bytes and what its code reaches.
-    pub kinds: Vec<Kind>,
 }
 
 impl Report {
@@ -1069,7 +1044,6 @@ fn placed_with(
         }
         let reached = code::reached(files, f, &params);
         let code = code_bytes(&reached) + kind_code(files, f);
-        rep.kinds.push((f.clone(), p.clone(), h.data, reached));
         if rep
             .fullest
             .as_ref()

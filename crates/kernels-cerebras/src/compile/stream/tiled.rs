@@ -107,12 +107,6 @@ impl Lay {
     pub fn px(&self) -> u32 {
         self.th * self.tw
     }
-
-    /// Busy PEs.
-    #[must_use]
-    pub fn busy(&self) -> u32 {
-        self.nrb * self.ncb
-    }
 }
 
 /// What an arena slot holds: a value, or an op's scratch.
@@ -902,49 +896,6 @@ impl TileProgram {
         out
     }
 
-    /// The op at which the arena's slots reach furthest, and what is live there (its slots'
-    /// words, by key).
-    #[must_use]
-    pub fn peak(&self) -> (usize, Vec<(Key, u32)>) {
-        let mut life: BTreeMap<Key, (usize, usize)> = BTreeMap::new();
-        for i in 0..self.ops.len() {
-            let (ins, outs) = self.io(i);
-            for v in outs {
-                life.insert(Key::Val(v), (i, i));
-            }
-            for v in ins {
-                if let Some(e) = life.get_mut(&Key::Val(v)) {
-                    e.1 = i;
-                }
-            }
-            if self.temp(i) > 0 {
-                life.insert(Key::Temp(i), (i, i));
-            }
-        }
-        let size = |k: &Key| match k {
-            Key::Val(v) => self.words(*v),
-            Key::Temp(i) => self.temp(*i),
-        };
-        let mut best = (0, 0u32);
-        for i in 0..self.ops.len() {
-            let top = life
-                .iter()
-                .filter(|(_, (s, e))| *s <= i && i <= *e)
-                .map(|(k, _)| self.slots.get(k).copied().unwrap_or(0) + size(k))
-                .max()
-                .unwrap_or(0);
-            if top > best.1 {
-                best = (i, top);
-            }
-        }
-        let live = life
-            .iter()
-            .filter(|(_, (s, e))| *s <= best.0 && best.0 <= *e)
-            .map(|(k, _)| (*k, size(k)))
-            .collect();
-        (best.0, live)
-    }
-
     /// The program's fabric: the spine column, the image array, the hub east of its last row;
     /// the tape's rows below.
     #[must_use]
@@ -961,12 +912,6 @@ impl TileProgram {
         let x = if r % 2 == 0 { c } else { self.gx - c };
         (x, self.gy + r)
     }
-}
-
-/// The program at a top tile of `th0 x tw0` pixels (the image array the top grid over it):
-/// its slots, buffers and tape, or why it does not fit.
-pub fn place(p: &mut TileProgram, th0: u32, tw0: u32, bounds: Option<(u32, u32)>) -> R<()> {
-    place_with(p, th0, tw0, bounds, Chunks::default())
 }
 
 /// A convolution's staged channels and weight block at most: a point's choice (smaller, a PE
@@ -997,7 +942,9 @@ impl Default for Chunks {
     }
 }
 
-/// [`place`] with `chunks` for the staged channels and the weight block.
+/// The program at a top tile of `th0 x tw0` pixels (the image array the top grid over it), with
+/// `chunks` for the staged channels and the weight block: its slots, buffers and tape, or why it
+/// does not fit.
 pub fn place_with(
     p: &mut TileProgram,
     th0: u32,
@@ -1319,7 +1266,7 @@ pub fn program_upto(
     let mut why = String::new();
     for (a, b) in tiles {
         let mut p = base.clone();
-        match place(&mut p, a, b, bounds) {
+        match place_with(&mut p, a, b, bounds, Chunks::default()) {
             Ok(()) => {
                 let c = crate::compile::cost::tiled::time(&p).cycles;
                 if best.as_ref().is_none_or(|(bc, _)| c < *bc) {

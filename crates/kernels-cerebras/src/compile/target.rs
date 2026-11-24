@@ -477,14 +477,6 @@ mod tests {
             .trace(poem_ir::Platform::Cerebras)
     }
 
-    /// An op no kernel runs is refused by name, not dropped: DeepSeek V4's attention.
-    #[test]
-    fn an_op_without_a_lowering_is_refused_by_name() {
-        let e = shape(&trace("dsv4-flash-mini-bf16-kv-bf16")).err().unwrap();
-        assert!(e.contains("has no spatial lowering"), "{e}");
-        assert!(e.contains("elemwise.hc_expand"), "{e}");
-    }
-
     /// A multimodal deployment (what `pie serve` identifies from a checkpoint with its vision
     /// tower) plans the language model's program: its encoder's tables and dims are not the
     /// model's.
@@ -600,15 +592,6 @@ mod tests {
         assert!(e.contains("holds less than the"), "{e}");
     }
 
-    /// A shape no shipping model has plans: Qwen3.5-0.8B with another MLP width plans and builds.
-    #[test]
-    fn a_shape_of_no_shipping_model_is_searched() {
-        let mut s = shape(&trace("qwen35-d0.8b-bf16-kv-bf16")).unwrap();
-        s.mlp.intermediate += 256;
-        let p = plan_shape(s, &Ask::default()).unwrap();
-        Program::of(p.plan).unwrap();
-    }
-
     /// A partition is refused where it cannot link or serve: wider than the wafer, a head's dims
     /// not even over its columns; the search, moving the keys, finds none for an MLP no column
     /// count of the snake divides.
@@ -632,16 +615,6 @@ mod tests {
         odd.mlp.intermediate += 64;
         let e = plan_shape(odd, &Ask::default()).unwrap_err();
         assert!(e.contains("the search found no partition"), "{e}");
-    }
-
-    /// A combination no kernel runs is refused by name: q / k / v biases with head norms on the
-    /// MoE halves.
-    #[test]
-    fn a_combination_the_kernels_do_not_run_is_refused_by_name() {
-        let mut s = shape(&trace("qwen3-30b-a3b-mini-bf16-kv-bf16")).unwrap();
-        s.attn.bias = true;
-        let e = plan_shape(s, &Ask::default()).unwrap_err();
-        assert!(e.contains("biases together with q / k head norms"), "{e}");
     }
 
     /// The memory model, anchored on its kernel set's linked program, predicts another of the

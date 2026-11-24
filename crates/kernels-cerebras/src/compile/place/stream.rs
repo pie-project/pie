@@ -121,56 +121,6 @@ pub fn relay(prog: &Program, s: Stream) -> R<Program> {
     })
 }
 
-/// `prog` with every K / V column moved `dy` rows down, the fabric grown to hold it and its links
-/// routed: a placement differing in its K / V columns alone (for the link term's calibration).
-pub fn kv_moved(prog: &Program, dy: u32) -> R<Program> {
-    let w = prog.stream.wiring();
-    let p = problem(&prog.stream, &w)?;
-    let mut sol = Solution::pinned(&p);
-    for (i, b) in p.blocks.iter().enumerate() {
-        if matches!(b.kind, BlockKind::KvColumn(_)) {
-            sol.at[i].y += dy;
-        }
-    }
-    sol.h = (0..p.blocks.len())
-        .map(|i| {
-            let r = sol.rect(&p, i);
-            r.y + r.h
-        })
-        .max()
-        .unwrap_or(0)
-        .max(prog.stream.h);
-    relay(prog, stream(&p, &prog.stream, &sol)?)
-}
-
-/// `prog`'s files into `out` as `stream::compile` writes a reading's (its CSL, `fabric.txt`,
-/// `stream.json`, the host's files), its static check run.
-pub fn write(prog: &Program, out: &std::path::Path) -> R<()> {
-    let e = crate::compile::emit::stream::emit(prog)?;
-    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    for (name, text) in &e.files {
-        std::fs::write(out.join(name), text).map_err(|e| format!("{name}: {e}"))?;
-    }
-    crate::compile::check::written(&e.placed, &e.files, None);
-    std::fs::write(
-        out.join("fabric.txt"),
-        format!("{} {} {}\n", e.w, e.h, u8::from(prog.round16)),
-    )
-    .map_err(|e| e.to_string())?;
-    let meta = serde_json::json!({
-        "fabric": [e.w, e.h],
-        "py": prog.stream.py,
-        "cost": crate::compile::cost::stream::time(prog),
-        "links": super::cost::stream(prog)?,
-    });
-    std::fs::write(
-        out.join("stream.json"),
-        serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    crate::compile::stream::host::write(prog, &e.arrays, None, out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::Solution;
@@ -241,44 +191,6 @@ mod tests {
             .and_then(|q| crate::compile::emit::stream::emit(&q).map(|_| ()));
         let e = got.expect_err("an overlap laid");
         assert!(e.contains("two blocks overlap"), "{e}");
-    }
-
-    /// flux2-mini's denoise with its K / V columns 300 rows below their roots' units: every link
-    /// routed, the program checked, the link term longer by the hops moved.
-    #[test]
-    fn k_v_columns_placed_apart_route_and_check() {
-        let t = trace("flux2-mini-bf16-kv-bf16");
-        let s = crate::compile::stream::shape_of(&t, "denoise", 16).unwrap();
-        let p = crate::compile::stream::build::program(&t, s, true).unwrap();
-        let q = super::kv_moved(&p, 300).unwrap_or_else(|e| panic!("{e}"));
-        assert!(q.stream.h >= p.stream.h + 300);
-        let (a, b) = (
-            super::super::cost::stream(&p).unwrap(),
-            super::super::cost::stream(&q).unwrap(),
-        );
-        assert_eq!(a.fill_hops, b.fill_hops);
-        assert_eq!(a.trips.len(), b.trips.len());
-        for (x, y) in a.trips.iter().zip(&b.trips) {
-            assert!(y.hops >= x.hops + 2 * 300, "{x:?} {y:?}");
-        }
-        let e = crate::compile::emit::stream::emit(&p).unwrap();
-        let base = crate::compile::check::placed(&e.placed, &e.files, None);
-        let e = crate::compile::emit::stream::emit(&q).unwrap();
-        let rep = crate::compile::check::placed(&e.placed, &e.files, None);
-        // (the warnings the program had where it was, and no new kind)
-        let kind = |w: &String| w.replace(|c: char| c.is_ascii_digit(), "");
-        let had: std::collections::BTreeSet<String> = base.warnings.iter().map(kind).collect();
-        for w in &rep.warnings {
-            assert!(had.contains(&kind(w)), "a new warning: {w}");
-        }
-        eprintln!("as laid: {}", base.line());
-        eprintln!(
-            "{}; links {:.0} -> {:.0} cycles",
-            rep.line(),
-            a.cycles,
-            b.cycles
-        );
-        rep.ok().unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// The placer pinned to a stream program's own placement reproduces it: flux2-mini's
