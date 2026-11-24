@@ -264,7 +264,10 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       (`StepShape::misses`); a piece past one fire's tokens or lanes is refused, as before, by those bounds. Under the contract check (debug builds or
       `PIE_CHECK_REPLAY`, which gates both cross-checks: the engines' replay check and this one, `shapes::check_on`), every step formed is checked, a gap failing with the composition and
       the nearest stated shapes (`StepGap`).
-    - **A fire carries its stated shape; an engine keys its recorded body on it.** The runtime stamps each step
+    - **A fire carries its stated shape; an engine keys its recorded body on what that shape states (its
+      treatment and rung), never re-deriving them from the lanes.** An engine may share one body across several
+      stated shapes that state the same treatment and rung for the same lane classes, and must not duplicate
+      identical bodies per shape id. The runtime stamps each step
       it forms with its shape (`Step.shape: Option<FireShape { id, treatment }>`: `id` the index in the stated
       set's order, `treatment` that shape's, for an engine that keys on the treatment alone), what
       `StepShapes::shape_of` answers for the composition `StepGroup::accepts` held to the set
