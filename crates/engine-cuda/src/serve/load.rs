@@ -1014,6 +1014,7 @@ impl Shell {
     /// collectives.
     pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
+        let rules = boot.steps.clone();
         crate::program::launch::state_queue_masks(&boot.knobs.queue_masks);
         let Baked {
             mut device,
@@ -1303,16 +1304,6 @@ impl Shell {
                 &Exports::of(&boot.trace, &compiled, boot.context, boot.page_size)?.outputs,
             ),
         };
-        let drafting_words: std::collections::HashSet<u64> = compiled
-            .classes
-            .classes
-            .iter()
-            .enumerate()
-            .filter(|(class, _)| {
-                tiers.plain.contains(*class) && !landing[*class].iter().any(poem_ir::Request::plain)
-            })
-            .flat_map(|(_, class)| class.words.iter().copied())
-            .collect();
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
@@ -1734,7 +1725,6 @@ impl Shell {
             adapter_fact,
             corrected,
             decoding,
-            drafting_words,
             tiers,
             landing,
             armed: None,
@@ -1769,6 +1759,8 @@ impl Shell {
             rearming: false,
             arm_only: None,
             walked_launches: std::collections::HashMap::new(),
+            steps: engine::StepShapes::default(),
+            walked: std::collections::HashMap::new(),
             bodies_took: 0,
             measuring: false,
             workspace: None,
@@ -1908,6 +1900,10 @@ impl Shell {
         // the cache rows take what the walk leaves.
         // The staged inputs' slab is a run of that span as well, past the
         // workspaces: one address every body names, under no rung's carve.
+        // The step compositions the runtime's builder forms over this load
+        // (CONTRACT-BC 24): what the size-only walk and arming take their
+        // targets from.
+        shell.walk_steps(&rules);
         let walked = if shell.pools.fresh() {
             shell.size_arming()?
         } else {

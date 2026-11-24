@@ -86,6 +86,7 @@ fn load(trace: &Trace, contract: &ModelContract, container: &Path) -> Shell {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .expect("the micro trace loads")
 }

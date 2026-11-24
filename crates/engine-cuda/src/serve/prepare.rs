@@ -774,15 +774,15 @@ impl Shell {
                 ),
             })
             .collect();
-        // A buffering fire, or one of a drafter's class, pads to a bucket the
-        // lattice records it at (`Shell::rs_rungs`).
-        let buffering = lanes.iter().any(|seated| {
-            matches!(seated.rs, RsVerb::Buffer { .. }) || self.drafts_only(seated.lane.word)
-        });
+        // A buffering step with a prompt's rows composes at its stated rung
+        // (`Shell::buffered_rung`), where the walk recorded it.
+        let buffers = lanes
+            .iter()
+            .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
+        let prompts = lane_rows.iter().any(|&rows| rows > 1);
         let at = self.forced_bucket.take().or_else(|| {
-            let rows: u32 = lane_rows.iter().sum();
-            buffering
-                .then(|| self.rs_rungs().into_iter().find(|&bucket| bucket >= rows))
+            (buffers && prompts)
+                .then(|| self.buffered_rung(lane_rows.iter().sum()))
                 .flatten()
         });
         let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;

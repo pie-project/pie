@@ -1,6 +1,33 @@
 mod dyn_conv;
 pub use dyn_conv::dyn_conv;
 
+/// The kernel of a beam group's fold (`BEAM-PAGE-LISTS.md` §11.3) by the step it folds
+/// for: launched eagerly ahead of a fire's body, so no arming fire reaches
+/// it, and a load makes its kernel beforehand ([`FoldKernel::load`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldKernel {
+    Conv1d,
+    GatedDelta,
+    Mamba2,
+    Kda { head_dim: u32 },
+}
+
+impl FoldKernel {
+    /// Compiles (or reads from the disk cache) and loads this fold's kernel
+    /// on the current device, so that no serving fire does.
+    pub fn load(self) -> Result<(), Error> {
+        let name = match self {
+            FoldKernel::Conv1d => "::pie::attn::ssm_conv1d_fold<::pie::bf16>".to_string(),
+            FoldKernel::GatedDelta => "::pie::attn::ssm_gdn_fold<16>".to_string(),
+            FoldKernel::Mamba2 => "::pie::attn::ssm_mamba2_fold".to_string(),
+            FoldKernel::Kda { head_dim } => {
+                format!("::pie::attn::ssm_kda_fold<{head_dim}, {KDA_TILE_ROWS}>")
+            }
+        };
+        kernel(FILE, &name).load()
+    }
+}
+
 use crate::error::Error;
 use dtype::Dtype;
 

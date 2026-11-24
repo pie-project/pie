@@ -214,6 +214,7 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<(Vec<f32>, Vec<u
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })?;
     shell.open(0).expect("slot 0 opens");
     let prompt: Vec<u32> = (0..TOKENS).map(|t| (t * 7 + 11) % VOCAB).collect();
