@@ -772,30 +772,19 @@ impl Inner {
     /// ([`super::ResidencyPlanner::fail_tiers_full`]); short of it, an ask
     /// waits for the departure, free or landing that comes.
     pub(super) fn truly_wedged(&self) -> bool {
-        self.wedged_but(None)
-    }
-
-    /// [`Self::truly_wedged`] but for `asker`'s own ask, not yet queued:
-    /// nothing else could run or free room.
-    pub(super) fn wedged_but(&self, asker: Option<ProcessId>) -> bool {
         self.nothing_in_flight()
             && self.parked_moving.is_empty()
             && !self.queue.values().any(Waiter::untaken)
             && !self.queue.values().any(Waiter::rise_untaken)
-            && !self.runnable_but(asker)
+            && !self.runnable()
     }
 
     /// Whether a process could fire as it stands: resident, admitted, not
     /// idle or held, with no wait of its own in the queue. Its fire and
     /// what it frees as it ends are the event a waiting head waits on.
     pub(super) fn runnable(&self) -> bool {
-        self.runnable_but(None)
-    }
-
-    fn runnable_but(&self, asker: Option<ProcessId>) -> bool {
         self.procs.iter().any(|(pid, proc)| {
-            Some(*pid) != asker
-                && proc.state == Residency::Resident
+            proc.state == Residency::Resident
                 && proc.admitted
                 && !proc.idle
                 && !proc.held
