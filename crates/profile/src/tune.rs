@@ -26,6 +26,39 @@ pub struct Sample {
     pub at: Vec<i64>,
     pub weight: f64,
     pub times: Vec<Option<f64>>,
+    /// How far the point's times can be trusted: its candidates' median
+    /// errors ([`median_and_error`]) pooled ([`pooled`]), relative.
+    pub spread: f64,
+}
+
+/// The median of `rounds` and its standard error relative to it:
+/// `sqrt(pi / 2)` times the rounds' standard deviation over the root of
+/// their count (the median of normal noise). The error is zero where fewer
+/// than two rounds say nothing of their spread.
+#[must_use]
+pub fn median_and_error(rounds: &[f64]) -> (f64, f64) {
+    let mut sorted = rounds.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted.get(sorted.len() / 2).copied().unwrap_or(f64::NAN);
+    if rounds.len() < 2 || median <= 0.0 {
+        return (median, 0.0);
+    }
+    let n = rounds.len() as f64;
+    let mean = rounds.iter().sum::<f64>() / n;
+    let sd = (rounds.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+    (
+        median,
+        (std::f64::consts::PI / 2.0).sqrt() * sd / n.sqrt() / median,
+    )
+}
+
+/// Relative errors pooled: their root mean square, zero for none.
+#[must_use]
+pub fn pooled(errors: impl IntoIterator<Item = f64>) -> f64 {
+    let (sum, n) = errors
+        .into_iter()
+        .fold((0.0, 0usize), |(sum, n), e| (sum + e * e, n + 1));
+    if n == 0 { 0.0 } else { (sum / n as f64).sqrt() }
 }
 
 impl Sample {
@@ -102,24 +135,18 @@ impl Fit {
     }
 }
 
-/// What the fit may spend to describe the data.
-#[derive(Clone, Copy, Debug)]
+/// What the fit may spend to describe the data; each derived from the
+/// samples where `None` (the default).
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
-    /// A rung is added only if it saves this fraction of the floor.
-    pub min_gain: f64,
+    /// A rung is added only if it saves this fraction of the floor; `None`
+    /// for twice the samples' pooled spread, weighted as they are: a rung
+    /// that saves less saves what the measurements cannot tell from noise.
+    pub min_gain: Option<f64>,
     /// The most rungs a ladder holds, its tail with them; `None` for as
     /// many as the samples lie at distinct points: a rung past those lands
     /// no point another does not, and saves nothing measured.
     pub max_rungs: Option<usize>,
-}
-
-impl Default for Options {
-    fn default() -> Options {
-        Options {
-            min_gain: 0.01,
-            max_rungs: None,
-        }
-    }
 }
 
 /// Why a decision could not be fitted.
@@ -363,9 +390,18 @@ pub fn fit(
         points.dedup();
         points.len()
     });
+    let min_gain = options.min_gain.unwrap_or_else(|| {
+        let spread = (samples
+            .iter()
+            .map(|s| s.weight * s.spread * s.spread)
+            .sum::<f64>()
+            / floor)
+            .sqrt();
+        2.0 * spread
+    });
     let options = Options {
         max_rungs: Some(max_rungs),
-        ..options
+        min_gain: Some(min_gain),
     };
     // rel[s][c]: the weighted relative time, infinite where c did not run.
     let rel: Vec<Vec<f64>> = samples
@@ -475,7 +511,7 @@ pub fn fit(
             }
         }
         match best {
-            Some((new, (i, j), c, t)) if total - new >= options.min_gain * floor => {
+            Some((new, (i, j), c, t)) if total - new >= min_gain * floor => {
                 for s in 0..samples.len() {
                     if landed[s].is_none()
                         && holds[i][s]
@@ -507,7 +543,7 @@ pub fn fit(
         0.0,
         true,
     );
-    let lambda = options.min_gain * floor;
+    let lambda = min_gain * floor;
     let (ladder, tail) = search(
         &rel,
         &holds,
@@ -581,6 +617,7 @@ mod tests {
                     at: vec![rows, bits],
                     weight: 1.0,
                     times: vec![Some(rows as f64), (rows >= 4).then_some(7.0)],
+                    spread: 0.005,
                 });
             }
         }
@@ -664,6 +701,7 @@ mod tests {
                     at: vec![rows, n],
                     weight: 1.0,
                     times: vec![Some(rows as f64), (rows >= 4).then_some(tile)],
+                    spread: 0.005,
                 });
             }
         }

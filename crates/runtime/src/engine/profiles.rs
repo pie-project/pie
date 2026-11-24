@@ -43,6 +43,8 @@ pub type BenchOf = for<'a> fn(
 /// `pie tune` for one backend.
 pub type Tune = fn(&TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String>;
 
+pub use profile::search::Mix;
+
 /// What `pie tune` asks of a backend.
 pub struct TuneRequest<'a> {
     /// Measure the whole grid rather than the quick one.
@@ -67,6 +69,8 @@ pub struct TuneRequest<'a> {
     pub dissect: &'a [u32],
     /// Run the `[rates]` step alone.
     pub rates: bool,
+    /// The serving mix the search judges a candidate by (`--mix`).
+    pub mix: Mix,
 }
 
 impl<'a> TuneRequest<'a> {
@@ -88,6 +92,7 @@ impl<'a> TuneRequest<'a> {
             check_estimate: false,
             dissect: &[],
             rates: false,
+            mix: Mix::default(),
         }
     }
 }
@@ -264,7 +269,7 @@ macro_rules! tune_grid {
             use $engine::tune::{Depth, run};
             let depth = if req.full { Depth::Full } else { Depth::Quick };
             let models = pick_models($backend, req)?;
-            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
+            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, req.mix, say)?;
             Ok(tuned!(out, wrong: out.wrong))
         }
     };
@@ -333,7 +338,7 @@ fn bench_metal<'a>(
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
-    let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
+    let out = engine_cuda::tune::run(Some(req.profiles), &models, req.mix, say)?;
     Ok(tuned!(out, wrong: Vec::new()))
 }
 

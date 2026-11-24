@@ -253,6 +253,9 @@ struct Point {
     times: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     baseline: Option<usize>,
+    /// The timed candidates' median errors pooled, relative
+    /// ([`profile::tune::Sample::spread`]).
+    spread: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -281,7 +284,7 @@ impl Measured {
                 .collect();
             let _ = writeln!(
                 out,
-                "point {} {} {} {} {} {} {} {}",
+                "point {} {} {} {} {} {} {} {} {:e}",
                 p.rows,
                 p.n,
                 p.k,
@@ -290,7 +293,8 @@ impl Measured {
                 u8::from(p.bank.fp16),
                 p.baseline
                     .map_or_else(|| "-".to_string(), |b| b.to_string()),
-                times.join(",")
+                times.join(","),
+                p.spread
             );
         }
         out
@@ -339,6 +343,9 @@ impl Measured {
                     },
                     baseline: f.get(6).and_then(|b| b.parse().ok()),
                     times,
+                    spread: f.get(8).and_then(|v| v.parse().ok()).ok_or(format!(
+                        "`{line}` states no spread (measured by an older pie); measure again"
+                    ))?,
                 });
             }
         }
@@ -444,6 +451,7 @@ fn fit(
             ],
             weight: weight(grid, p.rows, p.n, p.k, p.bank, fp16_on),
             times: p.times.clone(),
+            spread: p.spread,
         })
         .collect();
     let baseline: Vec<Option<usize>> = measured.points.iter().map(|p| p.baseline).collect();
@@ -664,6 +672,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         readout,
         read,
         refused,
+        layers: trace.decoder_layers(),
     })
 }
 
@@ -716,9 +725,18 @@ struct Metal<'a> {
     base: &'a Profile,
     facts: &'a profile::Facts,
     cores: Option<u32>,
+    mix: search::Mix,
 }
 
 impl Bench for Metal<'_> {
+    fn mix(&self) -> search::Mix {
+        self.mix
+    }
+
+    fn agreement(&self) -> f64 {
+        engine::rates::AGREEMENT
+    }
+
     fn models(&self) -> Vec<String> {
         self.models.iter().map(|(_, d)| d.clone()).collect()
     }
@@ -887,6 +905,7 @@ pub fn run(
     cache: &Path,
     refit: bool,
     models: &[(PathBuf, String)],
+    mix: search::Mix,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -966,6 +985,7 @@ pub fn run(
         base: &base,
         facts: &facts,
         cores,
+        mix,
     };
     if models.is_empty() {
         chosen = fitted;
@@ -1218,9 +1238,10 @@ fn measure(
                     launch(sink, &forced[c][format], copy)
                 })?;
                 let mut row = vec![None; candidates.len()];
-                for (c, t) in live.iter().zip(times) {
-                    row[*c] = Some(t);
+                for (c, (t, _)) in live.iter().zip(&times) {
+                    row[*c] = Some(*t);
                 }
+                let spread = profile::tune::pooled(times.iter().map(|&(_, e)| e));
                 // Today's ladder: the first of its rungs that ran.
                 let at = today[format].qmm_at(m, n, k, bank.bits, bank.group);
                 let baseline = today[format]
@@ -1235,6 +1256,7 @@ fn measure(
                     bank: *bank,
                     times: row,
                     baseline,
+                    spread,
                 });
             }
             say(&format!(
@@ -1289,29 +1311,30 @@ fn wrong(
 }
 
 /// Seconds per launch for each of `live`, timed round-robin so drift lands
-/// on every candidate alike.
+/// on every candidate alike, each with its median's relative error.
 fn time(
     device: &Context,
     pipelines: &Pipelines,
     handles: &Handles,
     live: &[usize],
     launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
-) -> Result<Vec<f64>, String> {
+) -> Result<Vec<(f64, f64)>, String> {
     Ok(time_spread(device, pipelines, handles, live, launch)?
         .into_iter()
-        .map(|(median, ..)| median)
+        .map(|(median, .., error)| (median, error))
         .collect())
 }
 
 /// [`time`]'s medians with the fastest and slowest of each candidate's
-/// rounds: what a dense curve states as its spread.
+/// rounds (what a dense curve states as its spread) and the median's
+/// relative error ([`profile::tune::median_and_error`]).
 fn time_spread(
     device: &Context,
     pipelines: &Pipelines,
     handles: &Handles,
     live: &[usize],
     launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
-) -> Result<Vec<(f64, f64, f64)>, String> {
+) -> Result<Vec<(f64, f64, f64, f64)>, String> {
     time_rounds(device, pipelines, handles, live, 7, launch)
 }
 
@@ -1323,7 +1346,7 @@ fn time_rounds(
     live: &[usize],
     rounds: usize,
     launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
-) -> Result<Vec<(f64, f64, f64)>, String> {
+) -> Result<Vec<(f64, f64, f64, f64)>, String> {
     let rounds = rounds.max(3);
     const FRAME_S: f64 = 0.002;
     const SLOWER: f64 = 3.0;
@@ -1361,8 +1384,9 @@ fn time_rounds(
     Ok(seen
         .into_iter()
         .map(|mut s| {
+            let (median, error) = profile::tune::median_and_error(&s);
             s.sort_by(f64::total_cmp);
-            (s[s.len() / 2], s[0], s[s.len() - 1])
+            (median, s[0], s[s.len() - 1], error)
         })
         .collect())
 }
@@ -1655,6 +1679,7 @@ mod tests {
                         bank: *bank,
                         times,
                         baseline: Some(1),
+                        spread: 0.005,
                     });
                 }
             }
@@ -1760,6 +1785,7 @@ mod tests {
                 },
                 times,
                 baseline: Some(3),
+                spread: 0.005,
             }],
             wrong: vec![(
                 "use = \"qmv\", rows_max = 8, packs = 2, crossover_tg = 160".into(),

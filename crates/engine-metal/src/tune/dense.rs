@@ -103,7 +103,7 @@ struct Point {
     /// Seconds per launch for each candidate; `None` where it did not run.
     times: Vec<Option<f64>>,
     /// Each candidate's spread over its timed rounds, `(slowest - fastest)
-    /// / median` (not kept in the measurements' text).
+    /// / median`.
     spread: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     baseline: Option<usize>,
@@ -133,15 +133,21 @@ impl Measured {
                 .iter()
                 .map(|t| t.map_or_else(|| "-".to_string(), |t| format!("{t:e}")))
                 .collect();
+            let spread: Vec<String> = p
+                .spread
+                .iter()
+                .map(|s| s.map_or_else(|| "-".to_string(), |s| format!("{s:e}")))
+                .collect();
             let _ = writeln!(
                 out,
-                "point {} {} {} {} {}",
+                "point {} {} {} {} {} {}",
                 p.rows,
                 p.n,
                 p.k,
                 p.baseline
                     .map_or_else(|| "-".to_string(), |b| b.to_string()),
-                times.join(",")
+                times.join(","),
+                spread.join(",")
             );
         }
         out
@@ -179,7 +185,14 @@ impl Measured {
                     n: num(1)?,
                     k: num(2)?,
                     baseline: f.get(3).and_then(|b| b.parse().ok()),
-                    spread: Vec::new(),
+                    spread: f
+                        .get(5)
+                        .ok_or(format!(
+                            "`{line}` states no spread (measured by an older pie); measure again"
+                        ))?
+                        .split(',')
+                        .map(|s| s.parse().ok())
+                        .collect(),
                     times: f
                         .get(4)
                         .ok_or("times")?
@@ -202,6 +215,12 @@ impl Measured {
 /// The timed rounds a curve's point takes, and a point slower than both its
 /// neighbours takes again.
 const ROUNDS: usize = 7;
+
+/// A point's relative range over [`ROUNDS`] rounds as its median's relative
+/// error: `ROUNDS` normal draws span 2.704 standard deviations on average
+/// (Tippett's `d_n` at n = 7), and their median's error is `sqrt(pi / 2)`
+/// deviations over `sqrt(ROUNDS)` ([`profile::tune::median_and_error`]).
+const RANGE_TO_ERROR: f64 = 1.253_314 / (2.704 * 2.645_751);
 const RETIME_ROUNDS: usize = 21;
 
 /// More than any Apple GPU's system-level cache.
@@ -355,7 +374,7 @@ fn measure_at(
             })?;
             let mut row = vec![None; candidates.len()];
             let mut spread = vec![None; candidates.len()];
-            for (c, (t, lo, hi)) in live.iter().zip(times) {
+            for (c, (t, lo, hi, _)) in live.iter().zip(times) {
                 row[*c] = Some(lo);
                 spread[*c] = Some((hi - lo) / t.max(1e-12));
             }
@@ -393,7 +412,7 @@ fn measure_at(
                 let again = time_rounds(device, &pipelines, &handles, &[c], RETIME_ROUNDS, |sink, c, copy| {
                     launch(sink, &forced[c], copy)
                 })?;
-                if let (Some(&(_, lo, _)), Some(old)) = (again.first(), out.points[at].times[c]) {
+                if let (Some(&(_, lo, ..)), Some(old)) = (again.first(), out.points[at].times[c]) {
                     out.points[at].times[c] = Some(old.min(lo));
                 }
             }
@@ -469,6 +488,9 @@ fn fit_at(
             at: vec![i64::from(p.rows), i64::from(p.n), i64::from(p.k)],
             weight: weight(grid, shapes, p.rows),
             times: p.times.clone(),
+            spread: profile::tune::pooled(
+                p.spread.iter().flatten().map(|range| range * RANGE_TO_ERROR),
+            ),
         })
         .collect();
     let baseline: Vec<Option<usize>> = measured.points.iter().map(|p| p.baseline).collect();

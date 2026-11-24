@@ -59,7 +59,7 @@ pub struct Line {
     pub id: &'static str,
     pub text: String,
     /// The run measured it: compared it on a model that reads it, and
-    /// changed it or kept it under a bar of [`crate::AGREEMENT`] or less. A
+    /// changed it or kept it under a bar of [`Bench::agreement`] or less. A
     /// tuned file's `[provenance] measured` lists these alone.
     pub measured: bool,
 }
@@ -77,11 +77,57 @@ pub struct Serving {
     /// Why a co-processor refused its programs, if it did: the load then
     /// served without it.
     pub refused: Option<String>,
+    /// The model's decoder layers, which its readout's rounding accumulates
+    /// over ([`same`]).
+    pub layers: u32,
+}
+
+/// How much each measure of a serving counts in the time a candidate is
+/// judged by: the prompt, then the 1-, 4- and 8-lane decode steps. Which mix
+/// matters is the operator's (`pie tune --mix`): a chat server lives on
+/// one-lane steps, a batch service on its widest; equal weights where none
+/// is stated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mix(pub [f64; 4]);
+
+impl Default for Mix {
+    fn default() -> Mix {
+        Mix([0.25; 4])
+    }
+}
+
+impl Mix {
+    /// `prompt,1,4,8` as four non-negative numbers, scaled to sum to one.
+    pub fn parse(text: &str) -> Result<Mix, String> {
+        let said = || {
+            format!(
+                "a serving mix is four non-negative weights, `prompt,1,4,8` (the prompt, then \
+                 the 1-, 4- and 8-lane steps), not `{text}`"
+            )
+        };
+        let values: Vec<f64> = text
+            .split(',')
+            .map(|v| v.trim().parse::<f64>())
+            .collect::<Result<_, _>>()
+            .map_err(|_| said())?;
+        let weights: [f64; 4] = values.try_into().map_err(|_| said())?;
+        let total: f64 = weights.iter().sum();
+        if weights.iter().any(|w| !w.is_finite() || *w < 0.0) || total <= 0.0 {
+            return Err(said());
+        }
+        Ok(Mix(weights.map(|w| w / total)))
+    }
 }
 
 /// What a backend gives the search.
 pub trait Bench {
     fn models(&self) -> Vec<String>;
+    /// The serving mix a candidate is judged by ([`Mix`]).
+    fn mix(&self) -> Mix;
+    /// The tolerance two candidates' times tie within, the backend's rates
+    /// agreement (`engine::rates::AGREEMENT`): fixed, so two tunes of one
+    /// device take the same of a near tie and write the same profile.
+    fn agreement(&self) -> f64;
     /// The complete profile `entries` lay over today's, checked against
     /// the device.
     fn file(&self, entries: &[(String, String)]) -> Result<String, String>;
@@ -437,10 +483,6 @@ fn median(mut v: Vec<f64>) -> f64 {
     v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
-/// What a serving's time is weighed by: the prompt and the one-lane step
-/// 0.3 each, the 4- and 8-lane steps 0.2 ([`Serving::measures`]'s order).
-const WEIGHTS: [f64; 4] = [0.3, 0.3, 0.2, 0.2];
-
 impl Serving {
     /// The prompt's timings, then each lane count's steps.
     fn measures(&self) -> [&[f64]; 4] {
@@ -448,30 +490,16 @@ impl Serving {
     }
 }
 
-/// One serving's weighted time against another's ([`WEIGHTS`]).
-fn relative(got: &Serving, against: &Serving) -> f64 {
+/// One serving's time against another's, each measure weighed by `mix`.
+fn relative(got: &Serving, against: &Serving, mix: Mix) -> f64 {
     let m = |v: &[f64]| median(v.to_vec());
     let (g, a) = (got.measures(), against.measures());
-    (0..4).map(|i| WEIGHTS[i] * m(g[i]) / m(a[i])).sum()
+    (0..4).map(|i| mix.0[i] * m(g[i]) / m(a[i])).sum()
 }
 
-/// A median's standard error relative to it, from the timings it is the
-/// median of: `sqrt(pi / 2)` times the timings' standard deviation over
-/// the root of their count (the median of normal noise). Zero where fewer
-/// than two timings say nothing of their spread.
+/// A median's standard error relative to it ([`crate::tune::median_and_error`]).
 fn median_error(v: &[f64]) -> f64 {
-    if v.len() < 2 {
-        return 0.0;
-    }
-    let n = v.len() as f64;
-    let mean = v.iter().sum::<f64>() / n;
-    let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
-    let m = median(v.to_vec());
-    if m > 0.0 {
-        (std::f64::consts::PI / 2.0).sqrt() * sd / n.sqrt() / m
-    } else {
-        0.0
-    }
+    crate::tune::median_and_error(v).1
 }
 
 /// What two servings' own timings can tell apart, as a relative error of
@@ -479,13 +507,13 @@ fn median_error(v: &[f64]) -> f64 {
 /// noise is independent), `(of the weighted time, of the worst measure)`.
 /// A comparison holds a change to this at the least, where the incumbent's
 /// drift between two servings says less.
-fn resolution(got: &Serving, against: &Serving) -> (f64, f64) {
+fn resolution(got: &Serving, against: &Serving, mix: Mix) -> (f64, f64) {
     let (g, a) = (got.measures(), against.measures());
     let each: Vec<f64> = (0..4)
         .map(|i| median_error(g[i]).hypot(median_error(a[i])))
         .collect();
     let weighted = (0..4)
-        .map(|i| (WEIGHTS[i] * each[i]).powi(2))
+        .map(|i| (mix.0[i] * each[i]).powi(2))
         .sum::<f64>()
         .sqrt();
     (weighted, each.iter().copied().fold(0.0, f64::max))
@@ -521,19 +549,29 @@ fn top(r: &[f32]) -> usize {
     (0..r.len()).fold(0, |b, i| if r[i] > r[b] { i } else { b })
 }
 
-/// Whether two readouts say the same: a cosine of 0.999 or more, or 0.99
-/// or more with the same top token. A change of arithmetic (an fp16 format,
-/// another accumulation order) can flip a near tie at the top; it cannot
-/// move the whole row.
-fn same(cosine: f64, same_top: bool) -> bool {
-    cosine >= 0.999 || (cosine >= 0.99 && same_top)
+/// Whether two readouts of a model of `layers` decoder layers say the same.
+///
+/// A change of arithmetic (another kernel, another accumulation order)
+/// rounds each layer's bf16 activations apart by up to its unit, `u =
+/// 2^-8`, each layer's independently: over `L` layers the readout moves a
+/// relative `e = u sqrt(L)`, and two rows that far apart have a cosine of
+/// `1 - e^2 / 2 = 1 - 2^-17 L`. A readout within that reads the same.
+///
+/// Past it, with the same top token, a cosine of 0.99 or more still reads
+/// the same: the tolerance rule, since serving is not batch invariant (a
+/// row's arithmetic follows the batch it rides in) and a near tie at the
+/// top can flip while the row stays put. A change that moves the whole row
+/// past 0.99 reads differently whatever its top.
+fn same(cosine: f64, same_top: bool, layers: u32) -> bool {
+    let rounding = 1.0 - f64::from(layers.max(1)) / f64::from(1u32 << 17);
+    cosine >= rounding || (cosine >= 0.99 && same_top)
 }
 
 /// Why two readouts disagree, or `None` ([`same`]).
-fn disagrees(a: &[f32], b: &[f32]) -> Option<String> {
+fn disagrees(a: &[f32], b: &[f32], layers: u32) -> Option<String> {
     let c = cosine(a, b);
     let (ta, tb) = (top(a), top(b));
-    (!same(c, ta == tb)).then(|| format!("cosine {c:.4}, top token {tb} for {ta}"))
+    (!same(c, ta == tb, layers)).then(|| format!("cosine {c:.4}, top token {tb} for {ta}"))
 }
 
 /// One model served under today's profile and under the tuned one.
@@ -548,6 +586,8 @@ pub struct Check {
     pub decode_ms: Vec<(usize, f64, f64)>,
     pub cosine: f64,
     pub same_top: bool,
+    /// The model's decoder layers ([`same`]).
+    pub layers: u32,
     /// How much slower the tuned file may read and still pass: today's own
     /// drift between its two servings, or what the servings' timings can
     /// resolve where that is more, twice over.
@@ -560,7 +600,7 @@ impl Check {
         let ok = |a: f64, b: f64| b <= a * self.allowance;
         ok(self.prefill_ms.0, self.prefill_ms.1)
             && self.decode_ms.iter().all(|(_, a, b)| ok(*a, *b))
-            && same(self.cosine, self.same_top)
+            && same(self.cosine, self.same_top, self.layers)
     }
 
     #[must_use]
@@ -598,7 +638,8 @@ pub fn check(
     let a = bench.serve(model, today)?;
     let b = bench.serve(model, tuned)?;
     let c = bench.serve(model, today)?;
-    let noise = (relative(&c, &a) - 1.0).abs();
+    let mix = bench.mix();
+    let noise = (relative(&c, &a, mix) - 1.0).abs();
     let both = |x: &[f64], y: &[f64]| 0.5 * (median(x.to_vec()) + median(y.to_vec()));
     Ok(Check {
         model: bench.models()[model].clone(),
@@ -614,7 +655,12 @@ pub fn check(
             .collect(),
         cosine: cosine(&a.readout, &b.readout),
         same_top: top(&a.readout) == top(&b.readout),
-        allowance: 1.0 + 2.0 * noise.max(resolution(&b, &a).1).max(resolution(&b, &c).1),
+        layers: a.layers,
+        allowance: 1.0
+            + 2.0
+                * noise
+                    .max(resolution(&b, &a, mix).1)
+                    .max(resolution(&b, &c, mix).1),
     })
 }
 
@@ -633,14 +679,14 @@ fn shown(label: &str) -> String {
 /// file, what each model it moved served, and the mean it must beat.
 type Best = (f64, String, String, Vec<(usize, Serving)>, f64);
 
-/// Of `served`, the lowest candidate within [`crate::AGREEMENT`] of the
+/// Of `served`, the lowest candidate within `agreement` of the
 /// fastest: by its value where every tied label reads as a number, else the
 /// first served. `None` where none served.
-fn pick_tied(served: Vec<Best>) -> Option<Best> {
+fn pick_tied(served: Vec<Best>, agreement: f64) -> Option<Best> {
     let fastest = served.iter().map(|b| b.0).fold(f64::INFINITY, f64::min);
     let tied: Vec<Best> = served
         .into_iter()
-        .filter(|b| b.0 <= fastest * (1.0 + crate::AGREEMENT))
+        .filter(|b| b.0 <= fastest * (1.0 + agreement))
         .collect();
     let numbers: Option<Vec<f64>> = tied
         .iter()
@@ -670,6 +716,7 @@ pub fn search(
     say: &mut dyn FnMut(&str),
 ) -> Result<(Entries, Vec<Line>), String> {
     let names = bench.models();
+    let (mix, agreement) = (bench.mix(), bench.agreement());
     let mut incumbent_text = bench.file(&chosen)?;
     // Each model's last serving of the incumbent; `None` where it did not
     // serve at all.
@@ -803,7 +850,7 @@ pub fn search(
                         }
                     };
                     let last = incumbent[m].as_ref().expect("movable models served");
-                    noise[m] = (relative(&again, last) - 1.0).abs();
+                    noise[m] = (relative(&again, last, mix) - 1.0).abs();
                     incumbent[m] = Some(again);
                     fresh[m] = true;
                 }
@@ -822,14 +869,14 @@ pub fn search(
                         continue 'candidate;
                     }
                 };
-                if let Some(why) = disagrees(&base.readout, &served.readout) {
+                if let Some(why) = disagrees(&base.readout, &served.readout, base.layers) {
                     notes.push(format!("{seen} reads differently on {} ({why})", names[m]));
                     continue 'candidate;
                 }
-                let rm = relative(&served, base);
+                let rm = relative(&served, base, mix);
                 // What this pair's timings resolve, where the incumbent's
                 // drift says less.
-                let (mean_floor, worst_floor) = resolution(&served, base);
+                let (mean_floor, worst_floor) = resolution(&served, base, mix);
                 floor[m] = mean_floor;
                 // No measure of any model may lose more than its noise twice
                 // over: the final check holds the file to the same.
@@ -872,14 +919,14 @@ pub fn search(
         // the lowest is taken: a near-tie between two runs of a tune lands
         // on the same value, and two tunes write the same profile.
         if best.is_some() {
-            best = pick_tied(served_all);
+            best = pick_tied(served_all, agreement);
         }
         // A keep says the incumbent holds only where a change had to beat
         // no more than the agreement tolerance: past it, the run's noise
         // hid any difference, and nothing was measured.
         let measured = best
             .as_ref()
-            .is_some_and(|(r, .., bar)| r < bar || 1.0 - bar <= crate::AGREEMENT);
+            .is_some_and(|(r, .., bar)| r < bar || 1.0 - bar <= agreement);
         let text = match best {
             Some((r, label, text, got, bar)) if r < bar => {
                 chosen = with_entry(&chosen, knob.id, &label);
@@ -945,15 +992,15 @@ mod tests {
     fn a_near_tie_takes_the_lowest_candidate() {
         let b = |r: f64, label: &str| (r, label.to_string(), String::new(), Vec::new(), 1.0);
         // 0.96, 0.97 and 1.00 sit within 5% of the fastest: the lowest value.
-        let got = super::pick_tied(vec![b(1.00, "128"), b(0.97, "64"), b(0.96, "256")]);
+        let got = super::pick_tied(vec![b(1.00, "128"), b(0.97, "64"), b(0.96, "256")], 0.05);
         assert_eq!(got.map(|g| g.1).as_deref(), Some("64"));
         // A clear winner is taken whatever its value.
-        let got = super::pick_tied(vec![b(1.00, "64"), b(0.90, "256")]);
+        let got = super::pick_tied(vec![b(1.00, "64"), b(0.90, "256")], 0.05);
         assert_eq!(got.map(|g| g.1).as_deref(), Some("256"));
         // Labels that are not numbers: the first served of the tied.
-        let got = super::pick_tied(vec![b(0.99, "\"walk\""), b(0.98, "\"flash\"")]);
+        let got = super::pick_tied(vec![b(0.99, "\"walk\""), b(0.98, "\"flash\"")], 0.05);
         assert_eq!(got.map(|g| g.1).as_deref(), Some("\"walk\""));
-        assert!(super::pick_tied(Vec::new()).is_none());
+        assert!(super::pick_tied(Vec::new(), 0.05).is_none());
     }
 
     use super::*;
@@ -988,6 +1035,12 @@ mod tests {
     }
 
     impl Bench for Toy {
+        fn mix(&self) -> Mix {
+            Mix::default()
+        }
+        fn agreement(&self) -> f64 {
+            0.05
+        }
         fn models(&self) -> Vec<String> {
             vec!["toy".into()]
         }
@@ -1006,6 +1059,7 @@ mod tests {
                 readout: vec![1.0, 0.0],
                 read: vec!["kernel.fast", "kernel.n"],
                 refused: None,
+                layers: 28,
             })
         }
         fn plan(&self, _: usize, _: &str) -> Option<u64> {
@@ -1052,6 +1106,12 @@ mod tests {
     struct Noisy(bool);
 
     impl Bench for Noisy {
+        fn mix(&self) -> Mix {
+            Mix::default()
+        }
+        fn agreement(&self) -> f64 {
+            0.05
+        }
         fn models(&self) -> Vec<String> {
             vec!["noisy".into()]
         }
@@ -1067,6 +1127,7 @@ mod tests {
                 readout: vec![1.0, 0.0],
                 read: vec!["kernel.n"],
                 refused: None,
+                layers: 28,
             })
         }
         fn plan(&self, _: usize, _: &str) -> Option<u64> {
@@ -1096,6 +1157,12 @@ mod tests {
     struct Planned(usize);
 
     impl Bench for Planned {
+        fn mix(&self) -> Mix {
+            Mix::default()
+        }
+        fn agreement(&self) -> f64 {
+            0.05
+        }
         fn models(&self) -> Vec<String> {
             vec!["toy".into()]
         }
@@ -1117,6 +1184,7 @@ mod tests {
                 readout: vec![1.0, 0.0],
                 read: vec!["kernel.noop"],
                 refused: None,
+                layers: 28,
             })
         }
         fn plan(&self, _: usize, _: &str) -> Option<u64> {

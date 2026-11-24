@@ -224,6 +224,9 @@ pub struct Point {
     pub times: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     pub baseline: Option<usize>,
+    /// The timed candidates' median errors pooled, relative
+    /// ([`profile::tune::Sample::spread`]).
+    pub spread: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -253,7 +256,7 @@ impl Measured {
                 .collect();
             let _ = writeln!(
                 out,
-                "point {} {} {} {} {} {} {}",
+                "point {} {} {} {} {} {} {} {:e}",
                 p.rows,
                 p.n,
                 p.k,
@@ -261,7 +264,8 @@ impl Measured {
                 p.bank.group,
                 p.baseline
                     .map_or_else(|| "-".to_string(), |b| b.to_string()),
-                times.join(",")
+                times.join(","),
+                p.spread
             );
         }
         out
@@ -308,6 +312,9 @@ impl Measured {
                         .split(',')
                         .map(|t| t.parse().ok())
                         .collect(),
+                    spread: f.get(7).and_then(|v| v.parse().ok()).ok_or(format!(
+                        "`{line}` states no spread (measured by an older pie); measure again"
+                    ))?,
                 });
             }
         }
@@ -344,6 +351,7 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
             at: coords(p, cores),
             weight: weight(grid, p.rows, p.n, p.k, p.bank),
             times: p.times.clone(),
+            spread: p.spread,
         });
         baseline.push(p.baseline);
     }
@@ -672,9 +680,10 @@ pub(super) mod device {
                         launch(sink, &forced[c], copy)
                     })?;
                     let mut row = vec![None; kept.len()];
-                    for (c, t) in live.iter().zip(times) {
-                        row[*c] = Some(t);
+                    for (c, (t, _)) in live.iter().zip(&times) {
+                        row[*c] = Some(*t);
                     }
+                    let spread = profile::tune::pooled(times.iter().map(|&(_, e)| e));
                     let at = today.qmm_at(m, n, k, bank.bits, bank.group);
                     let baseline = today
                         .qmm(&at)
@@ -688,6 +697,7 @@ pub(super) mod device {
                         bank: *bank,
                         times: row,
                         baseline,
+                        spread,
                     });
                 }
                 say(&format!(
@@ -739,14 +749,15 @@ pub(super) mod device {
     }
 
     /// Seconds per launch for each of `live`, timed round-robin so drift
-    /// lands on every candidate alike.
+    /// lands on every candidate alike, each with its median's relative
+    /// error ([`profile::tune::median_and_error`]).
     pub(in crate::tune) fn time(
         device: &Context,
         pipelines: &Pipelines,
         handles: &Handles<Api>,
         live: &[usize],
         launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
-    ) -> Result<Vec<f64>, String> {
+    ) -> Result<Vec<(f64, f64)>, String> {
         const ROUNDS: usize = 7;
         const FRAME_S: f64 = 0.002;
         /// A candidate this much slower than the fastest is timed once.
@@ -785,11 +796,8 @@ pub(super) mod device {
             }
         }
         Ok(seen
-            .into_iter()
-            .map(|mut s| {
-                s.sort_by(f64::total_cmp);
-                s[s.len() / 2]
-            })
+            .iter()
+            .map(|s| profile::tune::median_and_error(s))
             .collect())
     }
 }
@@ -843,6 +851,7 @@ mod tests {
             bank: grid.banks[0],
             times,
             baseline: Some(1),
+            spread: 0.005,
         };
         let measured = Measured {
             candidates: candidates.clone(),

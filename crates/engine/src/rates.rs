@@ -227,11 +227,16 @@ pub const ATTN_DISPATCHES: u32 = 1;
 pub const SCAN_DISPATCHES: u32 = 2;
 pub const COPY_DISPATCHES: u32 = 1;
 
-/// The tolerance two runs of a rates step agree within, and a check's
-/// estimate within the measured best: what [`rate_from`] allows a burst to
-/// fall below its launches before it calls the two a measurement fault.
-/// Defined once, in the profile crate, whose search breaks ties by it.
-pub use profile::AGREEMENT;
+/// The tolerance two measurements of one thing agree within: two runs of a
+/// rates step, a check's estimate against the measured best (what
+/// [`rate_from`] allows a burst to fall below its launches before it calls
+/// the two a measurement fault), and two candidates of `pie tune`'s search
+/// (the lowest of those within it of the fastest is taken). Fixed, not
+/// drawn from a run's own spread, so two tunes of one device take the same
+/// of a near tie and write the same profile; 5% is the run-to-run spread of
+/// the rates steps on the noisiest device measured (Adreno 840: a scan's
+/// rate repeats within 5-10% in a session).
+pub const AGREEMENT: f64 = 0.05;
 
 /// What a backend's rates step (`pie tune --rates`) produced.
 #[derive(Debug, Clone, PartialEq)]
