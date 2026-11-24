@@ -18,10 +18,11 @@ impl Shell {
     /// What the load states beside its chunk facts.
     #[must_use]
     pub fn pool_facts(&self) -> PoolFacts {
-        let paging = self.paging();
+        // (no window list: windowed layers are served as ring + buffer,
+        // `Shell::serves_windowed_state`)
         PoolFacts {
             adapter_banks: u32::try_from(self.bank_seats().len()).unwrap_or(u32::MAX),
-            window_tokens: paging.window.map_or(0, |window| window.tokens),
+            ..PoolFacts::default()
         }
     }
 
