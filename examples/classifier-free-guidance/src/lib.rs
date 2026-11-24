@@ -110,7 +110,6 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = model::output_vocab_size();
     let gamma = input.guidance;
-    let stop_tokens = chat::stop_tokens();
 
     let mut cond_prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     cond_prompt.extend(chat::cue());
@@ -202,7 +201,7 @@ async fn main(input: Input) -> Result<Output> {
         shifts += row[1] as u64;
         kl_total += row[2] as f64;
         scored += 1;
-        if stop_tokens.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         generated.push(token);

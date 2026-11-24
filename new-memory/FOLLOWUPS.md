@@ -1571,8 +1571,14 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
 
-## F??. CUDA: Muse's joined projection apart
+## F88. CUDA: Muse's joined projection apart
 
 **What.** `muse-glimmer-30b-mini-l8-bf16-kv-bf16`'s projection legs served apart answer 0.17 off over a spread of 3.2 against the joined projection, as its joined trace does with its qkv write unfused: its unit-RMS q and k heads, unscaled, score keys 3.9 apart under its softmax scale, and its eight layers carry a last-place rounding 5% of the spread. The apart form serves only where the compiler cannot join the legs, so no served load reaches it. The ignored check (`the_open_rows_answer_apart_what_they_answer_joined` in engine-cuda's `a_joined_projection_answers_what_its_legs_answer`) was removed in the cleanup; add the row back to that test's `ROWS` once the apart form agrees.
 
 **Why later.** No served path takes it.
+
+## F87. Rollback cost models (`flush_free` / `ckpt_sync` / `stop_wait`) left the examples
+
+**What.** beam-search, cacheback- and mtp-speculative-decoding took a `rollback_mode`: `ckpt_sync` forked the set before each fire and, on a rejection, replayed the kept rows on a fork of that checkpoint; `stop_wait` replayed twice (mtp, beam) or verified one row a fire (cacheback). Each restored fork's result was discarded, so the modes priced a checkpoint rollback beside the flush-free one and changed no output. They are removed; the examples run flush-free only, and a request naming them is refused as an unknown key.
+
+**Why later.** Examples cleanup (2026-11-24): a cost model of a rollback no backend runs. If checkpoint rollback is measured again, it belongs in one bench, not copied into three examples.

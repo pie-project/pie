@@ -73,7 +73,6 @@ async fn main(input: Input) -> Result<String> {
 
     let start = Instant::now();
     let vocab = model::output_vocab_size();
-    let stop = chat::stop_tokens();
 
     // Shared prefix: system + question via the deferred-system `system_user`
     // form, plus the assistant cue. The cue is identical for every candidate so
@@ -146,7 +145,7 @@ async fn main(input: Input) -> Result<String> {
         let mut done = vec![false; num_candidates];
         for (c, &t) in g0s.iter().enumerate().take(num_candidates) {
             let t = t as u32;
-            if stop.contains(&t) {
+            if chat::is_stop(t) {
                 done[c] = true;
             } else {
                 cand_tokens[c].push(t);
@@ -199,7 +198,7 @@ async fn main(input: Input) -> Result<String> {
                     continue; // lane keeps firing; its output is ignored
                 }
                 let t = t as u32;
-                if stop.contains(&t) {
+                if chat::is_stop(t) {
                     done[c] = true;
                 } else {
                     cand_tokens[c].push(t);

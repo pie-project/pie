@@ -267,8 +267,7 @@ async fn main(input: Input) -> Result<Output> {
     let b0 = s2_out_p.take_host::<f32>().await?;
     // A stop token ends the text and is not part of it, as every chat
     // inferlet here ends its text.
-    let stop_tokens = inferlet::chat::stop_tokens();
-    let stopped = stop_tokens.contains(&(g0 as u32));
+    let stopped = inferlet::chat::is_stop(g0 as u32);
     if !stopped {
         if stream {
             inferlet::session::send("t:1");
@@ -313,7 +312,7 @@ async fn main(input: Input) -> Result<Output> {
                 .with_context(|| format!("@{}", generated.len()))?;
             let a = s1_out.take_host::<f32>().await?;
             let b = s2_out.take_host::<f32>().await?;
-            if stop_tokens.contains(&(t as u32)) {
+            if inferlet::chat::is_stop(t as u32) {
                 return Ok(ControlFlow::Break(()));
             }
             if stream {
