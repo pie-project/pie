@@ -512,7 +512,38 @@ mod tests {
                 u64::from(h.rows.max(h.cols)) * u64::from(h.vocab_rows) >= u64::from(p.shape.vocab),
                 "{name}"
             );
-            assert_eq!(p.contract.positions, 4096, "{name}");
+            // (E4B's KV of a unit count its layer kinds divide holds 3584)
+            let positions = if name.starts_with("gemma4-e4b") {
+                3584
+            } else {
+                4096
+            };
+            assert_eq!(p.contract.positions, positions, "{name}");
+            // every unit runs unit 0's kernels: its layers of unit 0's kinds
+            let k = p.partition.layers_per_unit as usize;
+            let kinds = |u: usize| -> Vec<(bool, bool, u32)> {
+                (u * k..(u + 1) * k)
+                    .map(|l| {
+                        let kind = &p.shape.layers[l];
+                        (
+                            matches!(
+                                kind,
+                                LayerKind::Global | LayerKind::SharedKv { sliding: false, .. }
+                            ),
+                            matches!(kind, LayerKind::SharedKv { .. }),
+                            p.shape.mlp.width(l as u32),
+                        )
+                    })
+                    .collect()
+            };
+            for u in 1..p.partition.units as usize {
+                let (a, b) = (kinds(0), kinds(u));
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.0 == y.0)
+                        && b.iter().all(|y| y.1 == b[0].1 && y.2 == b[0].2),
+                    "{name}: unit {u}'s layers {b:?}, unit 0's {a:?}"
+                );
+            }
         }
     }
 

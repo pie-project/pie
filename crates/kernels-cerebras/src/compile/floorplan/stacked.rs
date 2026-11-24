@@ -25,6 +25,27 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         return Err(format!("stacked: {n} layers on {nu} units"));
     }
     let k = n / nu;
+    // the kernels take one unit's layer kinds for every unit: unit 0's global mask (`KM`), a
+    // sharer's whole unit (`SH`) and its first layer's MLP width (`Ic`)
+    let global = |l: &LayerKind| {
+        matches!(
+            l,
+            LayerKind::Global | LayerKind::SharedKv { sliding: false, .. }
+        )
+    };
+    let shared = |l: &LayerKind| matches!(l, LayerKind::SharedKv { .. });
+    let first = &s.layers[..k as usize];
+    if let Some(u) = (0..nu).find(|&u| {
+        let (a, b) = ((u * k) as usize, ((u + 1) * k) as usize);
+        let unit = &s.layers[a..b];
+        unit.iter().map(global).ne(first.iter().map(global))
+            || unit.iter().any(|l| shared(l) != shared(&unit[0]))
+            || (a..b).any(|l| s.mlp.width(l as u32) != s.mlp.width(a as u32))
+    }) {
+        return Err(format!(
+            "stacked: unit {u}'s {k} layers differ in kind from unit 0's or among themselves"
+        ));
+    }
     if !s.hidden.is_multiple_of(py) || !py.is_multiple_of(2) {
         return Err(format!("stacked: {} hidden over {py} rows", s.hidden));
     }
@@ -217,11 +238,11 @@ impl Arrangement {
 
 #[cfg(test)]
 mod tests {
-    /// A Gemma 4 model plans by the search, on the derived arrangement: the six-layer E4B mini;
+    /// A Gemma 4 model plans by the search, on the derived arrangement: the 24-layer E4B mini;
     /// the one-layer one, whose second unit column would store no per-layer inputs, finds none.
     #[test]
     fn a_shape_with_a_derived_arrangement_plans() {
-        let p = crate::compile::target::searched("gemma4-e4b-mini-l6-bf16-kv-bf16").plan;
+        let p = crate::compile::target::searched("gemma4-e4b-mini-l24-bf16-kv-bf16").plan;
         crate::compile::program::Program::of(p).unwrap();
         let t = poem_compiler::catalog::repository()
             .parse("gemma4-e4b-mini-l1-bf16-kv-bf16")
@@ -229,5 +250,26 @@ mod tests {
             .trace(poem_ir::Platform::Cerebras);
         let e = crate::compile::target::plan(&t, &crate::compile::target::Ask::default());
         assert!(e.is_err_and(|e| e.contains("the search found no partition")));
+    }
+
+    /// Units run unit 0's layer kinds: E4B's 42 layers (a global layer in six, 18 sharing their
+    /// KV) on six units of seven would mix them (the chip hung on that pick); seven of six plan.
+    #[test]
+    fn units_of_mixed_layer_kinds_are_refused() {
+        let t = poem_compiler::catalog::repository()
+            .parse("gemma4-e4b-bf16-kv-bf16")
+            .unwrap()
+            .trace(poem_ir::Platform::Cerebras);
+        let s = crate::compile::target::shape(&t).unwrap();
+        let keys = |nu: u32| {
+            crate::compile::plan::Preset::default()
+                .set(&format!(
+                    "PX=256,PY=160,NU={nu},NEG=28,HR=1130,G2=12,G2W=24,LOOP=64"
+                ))
+                .unwrap()
+        };
+        let e = super::plan(&s, &keys(6)).unwrap_err();
+        assert!(e.contains("differ in kind"), "{e}");
+        super::plan(&s, &keys(7)).unwrap();
     }
 }

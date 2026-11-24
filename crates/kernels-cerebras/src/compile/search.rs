@@ -35,7 +35,7 @@ pub struct Scored {
     pub ms: f64,
 }
 
-/// What a search is asked: the positions to serve (else 4096) and overrides set over every
+/// What a search is asked: the positions to serve (else the most it finds up to 4096) and overrides set over every
 /// preset.
 #[derive(Clone, Debug, Default)]
 pub struct Asked {
@@ -43,10 +43,30 @@ pub struct Asked {
     pub set: String,
 }
 
-/// The candidates `shape` searched to, fastest first (at most `keep`), each built.
+/// The positions a search serves where none are asked: the most of these a partition holds.
+const POSITIONS: u32 = 4096;
+const POSITIONS_STEP: u32 = 512;
+
+/// The candidates `shape` searched to, fastest first (at most `keep`), each built: at the
+/// positions asked, else at the most up to [`POSITIONS`] (a [`POSITIONS_STEP`] less at a time)
+/// some partition serves.
 pub fn search(shape: &Shape, ask: &Asked, keep: usize) -> R<Vec<Scored>> {
+    if let Some(n) = ask.positions {
+        return search_at(shape, ask, n, keep);
+    }
+    let first = search_at(shape, ask, POSITIONS, keep);
+    let mut n = POSITIONS;
+    while first.is_err() && n > POSITIONS_STEP {
+        n -= POSITIONS_STEP;
+        if let Ok(found) = search_at(shape, ask, n, keep) {
+            return Ok(found);
+        }
+    }
+    first
+}
+
+fn search_at(shape: &Shape, ask: &Asked, positions: u32, keep: usize) -> R<Vec<Scored>> {
     crate::compile::compose::refuse(shape)?;
-    let positions = ask.positions.unwrap_or(4096);
     let layer = time::kinds_layer(shape);
     let pinned: Vec<String> = ask
         .set
