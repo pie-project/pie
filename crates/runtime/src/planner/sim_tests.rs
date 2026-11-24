@@ -1956,6 +1956,10 @@ struct Log {
     /// Binds suspended for their own room more than once: (process,
     /// program, suspensions).
     bind_thrash: Vec<(ProcessId, u32, u32)>,
+    /// Each process the planner failed ([`super::ResidencyPlanner::fail_tiers_full`])
+    /// and the step it was first seen failed: it departs within the next
+    /// step, or its failure reached no wait of its own.
+    failed_at: BTreeMap<ProcessId, u32>,
     /// Each process's evictions landed.
     evicted_of: std::collections::HashMap<ProcessId, u32>,
 }
@@ -2913,6 +2917,25 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         .next()
     {
         return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
+    }
+    // A failed process departs within a step: a failure no wait of its own
+    // reads leaves its kill in flight for good and the fleet quiet (the
+    // Metal mix's seed 42), failed loudly here instead.
+    {
+        let failed: Vec<ProcessId> = ctx.planner.with_inner(|inner| {
+            inner.failed.keys().copied().filter(|pid| inner.procs.contains_key(pid)).collect()
+        });
+        let mut log = ctx.log.lock().unwrap();
+        log.failed_at.retain(|pid, _| failed.contains(pid));
+        for pid in failed {
+            let since = *log.failed_at.entry(pid).or_insert(step);
+            if step > since + 1 {
+                return Err(fail(
+                    "undelivered",
+                    format!("process {pid} failed at step {since} and has not departed"),
+                ));
+            }
+        }
     }
     if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
         .into_iter()

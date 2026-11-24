@@ -243,11 +243,13 @@ impl ResidencyPlanner {
         if !self.short.lock().is_short(head.1) {
             return false;
         }
-        // The host is what is short: the policy frees it by letting a set at
-        // rest go, and the head waits until one does.
-        if self.short.lock().host_short(head.1) {
-            return true;
-        }
+        // The host short or the device: the policy frees it by letting a
+        // set at rest go, idle cache or a checkpoint, and the head waits
+        // until one does, where there is one to let go. With none, no
+        // answer of the policy's frees anything: no wait on it (every tier
+        // full and nothing runnable is then a named failure,
+        // [`Self::fail_tiers_full`], never a wait on an answer that
+        // cannot come).
         let (model, engine) = self.port.locus();
         resting
             || self.port.reclaimable_idle() > 0

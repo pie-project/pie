@@ -762,6 +762,33 @@ impl Inner {
                     .any(|waiter| waiter.pid == pid && waiter.is_unmet()))
     }
 
+    /// Nothing in flight (no fire, no landing, no move) and no process
+    /// that could fire if served: every resident waits in the queue, is
+    /// idle or held, or is not admitted, and no ask stands served and not
+    /// taken. Only so is a full set of tiers a reason to fail a process
+    /// ([`super::ResidencyPlanner::fail_tiers_full`]); short of it, an ask
+    /// waits for the departure, free or landing that comes.
+    pub(super) fn truly_wedged(&self) -> bool {
+        self.nothing_in_flight()
+            && self.parked_moving.is_empty()
+            && !self.queue.values().any(Waiter::untaken)
+            && !self.queue.values().any(Waiter::rise_untaken)
+            && !self.runnable()
+    }
+
+    /// Whether a process could fire as it stands: resident, admitted, not
+    /// idle or held, with no wait of its own in the queue. Its fire and
+    /// what it frees as it ends are the event a waiting head waits on.
+    pub(super) fn runnable(&self) -> bool {
+        self.procs.iter().any(|(pid, proc)| {
+            proc.state == Residency::Resident
+                && proc.admitted
+                && !proc.idle
+                && !proc.held
+                && !self.queue.values().any(|waiter| waiter.pid == *pid && waiter.is_unmet())
+        })
+    }
+
     pub(super) fn eviction_unfundable(&self) -> bool {
         !self.host_swap_blocked.is_empty()
     }

@@ -542,6 +542,12 @@ impl ResidencyPlanner {
             if self.port.compaction_under_way() {
                 return None;
             }
+            // A process that can fire as it stands is the step to come: its
+            // fire lands, or it ends and frees what it holds. Over-demand
+            // waits on it; no stall.
+            if inner.runnable() {
+                return None;
+            }
             // A frame held for a raise the walk has since taken (the cap up
             // to it): its fire goes on the scheduler's next turn, and lands.
             // Read as nothing in flight, the pass between the raise and that
@@ -603,6 +609,19 @@ impl ResidencyPlanner {
         else {
             return;
         };
+        // Every tier full with nothing runnable: no step can come, and the
+        // lowest in the policy's order fails by name so the others proceed
+        // ([`Self::fail_tiers_full`]): never read as a planner bug. Short
+        // of that the head waits on the next event.
+        if self.with_inner(|inner| {
+            inner.truly_wedged()
+                && (!inner.host_swap_blocked.is_empty()
+                    || inner.last_plan.as_ref().is_some_and(|end| end.host_short || !end.unhostable.is_empty()))
+        }) && !self.waits_on_policy()
+            && self.fail_tiers_full(None)
+        {
+            return;
+        }
         // What the head's step takes, read as the map and the step read it.
         let need = self.head_room(key);
         self.stats.stall_dumps.fetch_add(1, Ordering::Relaxed);

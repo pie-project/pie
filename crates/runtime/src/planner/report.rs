@@ -109,7 +109,7 @@ impl ResidencyPlanner {
         self.eviction_failed_inner(pid, true, false);
         // Every tier full and the fleet stalled: the victim fails by name
         // and its room frees for the others ([`Self::fail_tiers_full`]).
-        if self.is_wedged() && !self.waits_on_policy() {
+        if self.with_inner(|inner| inner.truly_wedged()) && !self.waits_on_policy() {
             self.fail_tiers_full(Some(pid));
         }
     }

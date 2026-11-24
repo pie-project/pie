@@ -28,6 +28,21 @@ impl ResidencyPlanner {
             host: self.port.host_stats(),
             disk: self.port.disk_stats(),
         };
+        // Who holds room a failure frees: device kv or guest state. A
+        // process holding none (one not admitted yet, at a gate before its
+        // first ask) frees nothing failed, and its wait is no planner wait
+        // a failure reaches (the simulation's Metal seed 42: one failed at
+        // admission never departed, its kill in flight for good).
+        let (model, engine) = self.port.locus();
+        let pids: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
+        let holding: std::collections::HashSet<ProcessId> = pids
+            .into_iter()
+            .filter(|&pid| {
+                held_page_count(pid, model, engine)
+                    > super::holdings::swapped_page_count(pid, model, engine)
+                    || self.port.guest_pages_of(pid) > 0
+            })
+            .collect();
         let Some((victim, head, signal, notify)) = self.with_inner(|inner| {
             let head = inner.unmet_head().map(|(_, head)| head.pid);
             let lowest = |resident: bool| {
@@ -36,6 +51,8 @@ impl ResidencyPlanner {
                     .iter()
                     .filter(|(pid, proc)| {
                         Some(**pid) != head
+                            && proc.admitted
+                            && holding.contains(*pid)
                             && !inner.killing.contains(*pid)
                             && (proc.state == Residency::Resident) == resident
                     })

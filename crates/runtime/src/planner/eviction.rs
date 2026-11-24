@@ -955,7 +955,7 @@ impl ResidencyPlanner {
             // No move goes below: every candidate's move found no room on
             // the tiers below and nothing is in flight that frees any.
             let tier_full = (host_short || !unhostable.is_empty() || blocked)
-                && self.is_wedged()
+                && self.with_inner(|inner| inner.truly_wedged())
                 && !self.waits_on_policy();
             if tier_full && self.fail_tiers_full(None) {
                 return;
