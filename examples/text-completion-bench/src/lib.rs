@@ -80,6 +80,12 @@ struct Input {
     /// replay at a steady lag). 0 folds all it writes.
     #[serde(default)]
     fold_lag: u32,
+    /// Whether the decode states its sampled rows final
+    /// (`ForwardPass::final_rows`): the bench never takes a row back, so it
+    /// does unless asked not to (`false`: the lagged fold, for an A/B
+    /// against it) or a `fold_lag` holds rows unfolded on purpose.
+    #[serde(default = "stated_final")]
+    final_rows: bool,
     /// For a plane whose channel rings belong to the pass instance, not the channel.
     #[serde(default)]
     host_first_token: bool,
@@ -429,6 +435,7 @@ async fn run_one(
 
     // Built before the prefill submits, so its `tok_in` claim precedes the prefill's build.
     let ws_ref = &ws;
+    let final_rows = input.final_rows && lag == 0;
     let build_decode = move |tok_in: Channel| -> std::result::Result<Option<ForwardPass>, String> {
         Ok(if budget > 0 {
             let fwd = ForwardPass::new();
@@ -436,6 +443,9 @@ async fn run_one(
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], geometry(lag, &decode_fold))
                 .context("bind decode state")?;
+            if final_rows {
+                fwd.final_rows().context("state the decode's rows final")?;
+            }
             let knobs = SampleKnobs::new(temperature, top_p, top_k);
             fwd.epilogue(move || {
                 sampler::decode(
@@ -653,6 +663,11 @@ async fn run_one(
         token_monotonic_ns,
         prologue_us,
     })
+}
+
+/// The bench's decode only appends: its rows are final unless asked.
+fn stated_final() -> bool {
+    true
 }
 
 /// The decode fires after the prefill's sample, which is the first token:

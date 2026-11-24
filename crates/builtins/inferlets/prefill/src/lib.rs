@@ -44,6 +44,8 @@ async fn main(input: String) -> std::result::Result<String, String> {
     fwd.embed(&toks, &indptr).map_err(|e| e.to_string())?;
     fwd.state(&[&ws], StateGeometry::folding())
         .map_err(|e| e.to_string())?;
+    // A prefill only appends: its rows are final.
+    fwd.final_rows().map_err(|e| e.to_string())?;
     // The run's end is awaited through one token: nothing is sampled.
     fwd.epilogue(move || {
         done.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));

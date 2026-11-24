@@ -273,3 +273,59 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       rung; engine-gpu records each shape before ready (sc/gpu-arm-before-ready); XLA lays its warm ladder from it
       (its laid mixed rungs, `Capabilities.mixed_lanes`, are narrower than the set's mixed shapes, so it states those
       it cannot lay eager).
+25. **Final rows: an inferlet states that its sampled rows are final; only its statement counts (user ruling).**
+    The lagged fold (`designs/lagged-fold.md`, e4853eb48) holds a run-ahead decode's fold at the rows the program
+    has accepted, so a lane on a recurrent or windowed set carries up to `W - 1` rows and its step is buffered
+    (`Treatment::Buffers`, the carried kernels). A lane whose program will never take a row back needs none of it.
+    - **Where the statement lives.** A property of a forward pass: `forward-pass.final-rows: func() -> result<_,
+      error>` (`forward.wit`), set before `program`; the SDK's `ForwardPass::final_rows()` (Rust) states it for
+      every lane of the pass and every fire of it. Compat inferlets state it per request: a request whose decode
+      takes back nothing (no stop sequences, no speculation, no beams) runs its decode pass final; one with stop
+      sequences, a draft or a beam search does not. **Default: not final.** A pass that states nothing keeps the
+      lagged fold. The runtime never infers finality: not from the absence of a beam, of stop strings, of a
+      retract, nor from anything else; only the statement counts. Refused by name on a pass binding `parents` (a
+      beam search keeps its rows buffered, §11.3).
+    - **What it promises.** Once a fire of a final pass samples a row, the program never retracts, truncates,
+      rolls back or rewinds the working sets it wrote below that row (nor any row before it). A stop after a
+      final fire leaves the rows run past it in the set. If the program asks anyway, `pipeline.retract` over a
+      final fire is refused by name, an error naming the final rows (`final rows: ...`), before anything is
+      cut: no silent fallback, no partial cut, the pipeline not failed. A later pass writing a slot below a
+      final row meets the folded rule (a slot at or above `folded`), as any write under a fold does. The SDK's
+      `run_ahead` keeps a final pass's rows past a break instead of retracting them.
+    - **A stop is still a stop.** A final lane still stops: at EOS, at its budget, at a grammar's end. What it
+      ran ahead past the stop stays in its set, which is harmless only where nothing reads that set's tail as
+      the continuation of what the program kept:
+      - *Budget.* A run ahead never samples past its budget: the SDK's `run_ahead` submits no fire past it
+        (`frame_fires`, tested over every frame, window, budget and stop), so a lane stopping at its budget
+        holds no overrun at all; only a stop the program reads (EOS, a grammar's end) leaves one.
+      - *Continuing a set.* The statement is the program's promise, so the mechanism is the program's: a
+        program that continues a set after a stop (a next turn on the same set) does not state final the
+        pass that may run past that stop; or it forks the set at the end it kept before running ahead and
+        continues the fork. No case is the runtime's to special-case. The compat inferlets need neither:
+        each request makes its own set and releases it when the request ends; a next turn reaches it only
+        through the shared prefix (below).
+      - *Publishing, prefix cache, checkpoints.* A run-ahead decode's rows are logged with the tokens the
+        device sampled into them and seal as they fold, so a final set's overrun is published keyed by the
+        tokens it really holds: a reader maps a row only where every token before it, and its own, match, so
+        the overrun is a correct cache of a sequence nobody kept and never the continuation of one that
+        differs (what 7bb8ff574 published too). A checkpoint lands only where the program asks one
+        (`checkpoint_rows`: the runtime keeps none unasked), and the compat inferlets ask only at the
+        prompt's message ends, below every sampled row. No publish range is cut, and none needs to be: a
+        cut by publish range would not break the promise, since it takes back nothing the set holds.
+    - **The runtime's job.** A final lane folds at fire every row it holds: the fold its run-ahead fire is sent
+      with is every row (the stated count unlagged, `u32::MAX` for the folding geometry every appending inferlet
+      binds), its set's run-ahead rows are accepted as it is submitted (as a host-placed fire's are), and none
+      of its rows is recorded unaccepted. Its next fire therefore starts where its state is folded: carried rows
+      0, `RsVerb::Fold`, and the step builder classes it folded (`StepComposition::add`, `Treatment::Folds`). A
+      fire may mix final and lagged lanes: each lane's verb is its own (a final lane `Fold`, a lagged lane
+      `Buffer` with its carried rows), and the step is classed by StepShapes' rule (any buffering lane makes the
+      step buffered), a composition item 24 already states. So a mixed step runs the buffered (carried)
+      kernel for all its lanes, its final lanes with 0 carried rows: speed parity with 7bb8ff574 holds for
+      steps of final lanes only, and a step that mixes in a lagged lane pays the buffered step for all.
+    - **Engines.** Nothing new: the folded path, and mixed fires of folded and buffered lanes, which StepShapes
+      already states. The capture rule holds: every composition is stated and recorded before ready, nothing
+      after; a serving step of only final lanes is the plain fused step of 7bb8ff574.
+    - **Replay and rung pricing.** A final lane's carried rows are 0 (`lane_rows` / `device_lane_rows` see its
+      state folded through its first row), so it adds nothing to `ReplayRows.carried`, the step's replayed rows,
+      `ScratchBytes`' carried term or `rung_holds`' carried bound. The one exception is the first final fire on
+      a set a lagged fire left rows buffered in: it carries those, folds them, and carries none after.

@@ -182,3 +182,10 @@ One pass a recurrent layer, inside the ordinary decode body:
   drawn a token at a time (`working-set-handles` `stop_after`).
 - A window model's cut (gemma-4-E2B), same check.
 - The L = 0 / 1 / 2 bench: L = 1 / 2 within ~2% of L = 0, c1 and c64.
+
+## Final rows (CONTRACT-BC 25)
+
+A pass whose program states its sampled rows final (`forward-pass.final-rows`)
+takes no lag: its run-ahead fires fold every row at fire, carry nothing, and
+run the folded step. Only the statement counts; without it, the lag above.
+A retract over a final fire is refused by name.
