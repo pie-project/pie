@@ -11,11 +11,20 @@ use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use kernels_slang::Tensor;
 
+/// Staging slots a gather cycles through: one filled on the host while the
+/// other's copy is in flight; a third would wait on the same flush.
 const RING: usize = 2;
 
+/// Route entries one gather writes at most: an i32 table of 1 MiB, a
+/// 16384-token fire at top-16 routing.
 const MAX_ROUTES: u64 = 1 << 18;
 
-const COPY_THREADS: usize = 16;
+/// The host threads a gather's rows are copied by: the cores this process
+/// may run on.
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Mapping {
@@ -366,7 +375,9 @@ impl<B: Backend> HostTier<B> {
         map: Mapping,
         planes: Vec<HostPlane>,
     ) -> Result<(HostTier<B>, Vec<u32>)> {
-        const STRIDE: u64 = 256;
+        // Each plane's handle a view of its own on the phantom buffer, at the
+        // binding alignment every device accepts.
+        const STRIDE: u64 = crate::arena::ALIGN;
         let phantom = B::Buffer::host(
             device,
             STRIDE * planes.len().max(1) as u64,
@@ -605,7 +616,6 @@ fn copy_row_at(map: &Mapping, plane: &HostPlane, seat: usize, row: i32, into: us
 
 #[cfg(target_arch = "wasm32")]
 fn copy_rows(map: &Mapping, plane: &HostPlane, unique: &[i32], into: usize) -> Result<()> {
-    let _ = COPY_THREADS;
     for (seat, &row) in unique.iter().enumerate() {
         copy_row_at(map, plane, seat, row, into)?;
     }
@@ -617,7 +627,7 @@ fn copy_rows(map: &Mapping, plane: &HostPlane, unique: &[i32], into: usize) -> R
     if unique.is_empty() {
         return Ok(());
     }
-    let threads = COPY_THREADS.min(unique.len());
+    let threads = copy_threads().min(unique.len());
     let chunk = unique.len().div_ceil(threads);
     let faults: Vec<Result<()>> = std::thread::scope(|scope| {
         unique
