@@ -1493,3 +1493,11 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 - Not compared directly: attn.prefill against attn.decode (their outputs take other value ids; the
   projections after them agree to 0.8-1.5%) and the final matmul_softcap (the one-fire run reads it
   out through gather.rows).
+
+## F78. Fold a run-ahead fire's accepted rows at launch, not at submit
+
+**What.** Under the lagged fold (e4853eb48) a recurrent / windowed fire folds only rows the program has accepted, and the count is frozen when the guest submits the fire (`submit_pass_stamped`, `fold_at`: "frozen as the fire is prepared"). Acceptance itself is at read time (`ChannelCell::take` → `HostRead::taken` → `Cursor::accepted`). With the run-ahead window W = (frames_in_flight + host_cover) × frame_size (8 at the defaults with cover 2), a steady-state decode lane therefore carries about W − 1 = 7 unfolded rows at every width; only ~4 of them are device in-flight depth, and the other ~3 have landed (or are queued) but weren't read when the fire was submitted.
+
+**Idea.** Decide a fire's fold count at launch (or at settle) from `Cursor::accepted` at that moment, staged as data the recorded body reads, so rows read between submit and launch fold too. The carried floor becomes about frames_in_flight × frame_size − 1 ≈ 3, roughly halving replay work on every engine, with no inferlet change.
+
+**Why later.** It moves when fold counts are fixed (a contract change touching every engine's staging). The carried kernels in the dot-product form (O(n·d)) already make n = 7 cost a few % (CUDA 9B, Vulkan). Pull this in only if a backend's kernel can't reach the 2% gate at n = 7.
