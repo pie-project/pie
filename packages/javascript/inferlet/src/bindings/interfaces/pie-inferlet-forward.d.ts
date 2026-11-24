@@ -45,9 +45,11 @@ export function submit(on: Pipeline, slots: Array<ForwardPass | undefined>): voi
  * While its guest waits on input from outside (a session receive, a
  * timer, an HTTP response), the host parks it, and its next submit
  * rejoins. `park` is how a pipeline that stops for any other reason
- * says so: it leaves the wait-set for as long as you like. An awaited
- * pipeline silent past the runtime's silence timeout reads as
- * abandoned, and its instance is terminated.
+ * says so: it leaves the wait-set for as long as you like. A pipeline
+ * whose guest computes without submitting is held for only while
+ * another frame covers the device: once holding for it would leave the
+ * device idle, the frame seals past it and its next submit rejoins. No
+ * pipeline is terminated for being silent.
  * 
  * Ordered against this pipeline's own submits, not against the call: it
  * takes effect once every frame submitted before it has sealed, so it is
@@ -104,6 +106,11 @@ export interface MediaSpanAudio {
  *   (`new-memory/designs/BEAM-PAGE-LISTS.md`). Computed on the device by
  *   the epilogue before; the first fire ignores it. A parent past the
  *   lanes faults its lane. Default: none.
+ *   A search owns its set's state: the rows every live beam shares
+ *   (below the group's common ancestor) fold into the set as the search
+ *   runs (`BEAM-PAGE-LISTS.md` §11.3), so a search left without adopting
+ *   a beam leaves the set folded past its prompt. A guest that wants the
+ *   prompt state back forks the set before the search.
  */
 export interface StateGeometry {
   positions?: Channel,
@@ -111,6 +118,12 @@ export interface StateGeometry {
   kvLen?: Channel,
   fold?: Channel,
   parents?: Channel,
+  /**
+   * With `parents`: the slot past the search's last row (its folded
+   * slots and its fires), which its page lists are laid for
+   * (`BEAM-PAGE-LISTS.md` §3); required there, absent otherwise.
+   */
+  parentsEnd?: number,
 }
 
 export class ForwardPass {
@@ -123,13 +136,24 @@ export class ForwardPass {
   state(lanes: Array<WorkingSet>, geom: StateGeometry): void;
   /**
   * Slots at which a recurrent state is kept, so a later pass over the
-  * same tokens resumes there. Nothing on a model without one.
+  * same tokens resumes there: one in the scope its working set shares
+  * in (`working-set.share`). Nothing on a model without one. Refused
+  * on a lane whose set shares nothing, which no pass could resume.
   */
   checkpoints(slots: Uint32Array): void;
   /**
-  * States that this pass's sampled rows are final: the program never
-  * retracts, truncates, rolls back or rewinds below a row once sampled.
-  * Its lanes fold every row at fire. Unstated, a pass is not final.
+  * States that this pass's sampled rows are final: once a fire of it
+  * samples a row, the program never retracts, truncates, rolls back
+  * or rewinds the working sets it writes below that row. Its lanes
+  * then fold every row at fire and carry none into the next.
+  * Unstated a pass is not final: on a set with a
+  * recurrent state or windows its run-ahead fires fold only what the
+  * program has accepted, so a stop can take the rest back. The
+  * runtime never infers this; only the statement counts. The SDKs
+  * state it on every pass the program does not declare retractable
+  * (`ForwardPass::retractable`), so final is the inferlet's default.
+  * `pipeline.retract` over a final fire is refused by name. Set
+  * before `program`; refused on a pass binding `parents`.
   */
   finalRows(): void;
   /**
@@ -143,7 +167,7 @@ export class ForwardPass {
   * `value`; an unset switch takes its first declared value. Set
   * before `program`.
   */
-  'switch'(lane: number, name: string, value: string): void;
+  "switch"(lane: number, name: string, value: string): void;
   /**
   * Bind lane `lane`'s model input `name` (`model.lane`) to `ch`, whose
   * committed cell is read at every submit: `[width]`, `[rows, width]`
@@ -157,9 +181,23 @@ export class ForwardPass {
   */
   group(lane: number, id: number): void;
   /**
-  * `[rows, n]` bools: per row, the slots `[0, kv-len)` it attends when
-  * lanes read kv, else its attention group's rows in lane order. Set
-  * before `program`.
+  * A beam search's finish (`BEAM-PAGE-LISTS.md` §6.6): once the
+  * pass's last fire has landed, its working set holds beam `beam`'s
+  * hypothesis at its slots `[folded, end)` in its own order, as its
+  * page list names them (its recurrent rows too, on a hybrid); the
+  * other beams' pages are let go. Later passes bind the set as any
+  * (no `parents`). The pass must bind `parents`.
+  */
+  adoptBeam(beam: number, end: number): void;
+  /**
+  * `[rows, n]` bools. Where lanes read kv: per row, which slots of its
+  * working set's buffer and of the pass's own rows it attends. Column
+  * `c` is slot `folded + c`, `folded` the set's frozen length when the
+  * pass runs; `n` covers the buffer and the lane's rows. The frozen
+  * part is not the mask's: every row attends it under the model's own
+  * bounds. A row attends no row of its lane after it, whatever its
+  * bits say. Where lanes read no kv: per row, its attention group's
+  * rows in lane order. Set before `program`.
   */
   mask(rows: Channel): void;
   /**

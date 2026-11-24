@@ -25,7 +25,7 @@ export type Shape = Uint32Array;
  * 
  * ## `"bool"`
  */
-export type Dtype = 'f32' | 'i32' | 'u32' | 'bool';
+export type Dtype = "f32" | "i32" | "u32" | "bool";
 /**
  * Packed little-endian tensor payload. The runtime validates byte length
  * against the tensor shape/dtype.
