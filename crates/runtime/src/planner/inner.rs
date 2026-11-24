@@ -127,8 +127,9 @@ pub(super) struct Inner {
 /// fungible pages alone, the free room lay below in pieces smaller than
 /// every resident, and nobody could move (the field mix's stalls).
 ///
-/// The finisher is the oldest admitted process whose need fits, resident
-/// or not: preferred resident, an evicted old process never became the
+/// The finisher is the highest-priority admitted process whose need fits
+/// (the policy's `schedule/priority`; among equals, the fewest needed, then
+/// the oldest), resident or not: preferred resident, an evicted old process never became the
 /// finisher while any resident fitted, and its restore waited behind every
 /// younger one (the field mix: a decode evicted at step 131 restored at
 /// 607, the L40S's decodes unfinished while beams verified).
@@ -690,20 +691,21 @@ impl Inner {
                 .is_some_and(|head| head.state == Residency::Resident && head.bind_waiting)
         };
         // Evicted while it waited in the queue: held while any process
-        // ahead of it (older) has an entry in the queue.
+        // ahead of it has an entry in the queue. Ahead is the policy's
+        // priority, the engine's own tie (older first) among equals.
         let behind_queue = |pid: ProcessId| {
-            let Some(seq) = self
+            let Some(rank) = self
                 .procs
                 .get(&pid)
                 .filter(|proc| proc.evicted_queued)
-                .map(|proc| proc.seq)
+                .map(Proc::rank)
             else {
                 return false;
             };
             self.queue.values().any(|other| {
                 other.pid != pid
                     && !matches!(other.kind, WaitKind::Restore { .. })
-                    && self.procs.get(&other.pid).is_some_and(|proc| proc.seq < seq)
+                    && self.procs.get(&other.pid).is_some_and(|proc| proc.rank() < rank)
             })
         };
         // The oldest restore passed over for the head it was evicted for:

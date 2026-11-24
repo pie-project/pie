@@ -22,10 +22,6 @@ impl Shell {
         PoolFacts {
             adapter_banks: u32::try_from(self.bank_seats().len()).unwrap_or(u32::MAX),
             window_tokens: paging.window.map_or(0, |window| window.tokens),
-            seated_first: self.seats()[0],
-            seat_to_end: self.seats()[1],
-            seat_spread: self.seats()[2],
-            ..PoolFacts::default()
         }
     }
 

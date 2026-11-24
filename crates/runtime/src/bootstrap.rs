@@ -174,15 +174,6 @@ pub struct EngineConfig {
     pub windowed_state: bool,
     /// The disk tier is kept for the next run (`disk_kv_persistent`).
     pub disk_kept: Option<KeptDisk>,
-    /// The engine asks the planner to serve a decoding lane's pages before a
-    /// prompt waiting to be seated (`PoolFacts::seated_first`).
-    pub seated_first: bool,
-    /// The engine asks the planner to start a process only while the pools
-    /// hold the started ones to the end (`PoolFacts::seat_to_end`).
-    pub seat_to_end: bool,
-    /// The engine asks the planner to spread the starts the pools do not hold
-    /// to the end at once over a life (`PoolFacts::seat_spread`).
-    pub seat_spread: bool,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
@@ -718,9 +709,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             d.chunks.kv_host_pages() > 0 || d.chunks.kv_disk_pages() > 0
         }
     });
-    let seated_first = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seated_first);
-    let seat_to_end = !engine_configs.is_empty() && engine_configs.iter().all(|d| d.seat_to_end);
-    let seat_spread = seat_to_end && engine_configs.iter().all(|d| d.seat_spread);
     if let Some(d) = engine_configs.first() {
         // What the planner admits against on a shared pool (its total,
         // `SharedPool::room`), beside the facts' count: the two count the
@@ -918,9 +906,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             arena_model_idx,
             engine,
             crate::planner::ResidencyPlanner::new(std::sync::Arc::new(pool))
-                .seated_first(seated_first)
-                .seat_to_end(seat_to_end)
-                .seat_spread(seat_spread)
                 .weight_shed(steered.shed_hook()),
         );
         governed.push(steered);

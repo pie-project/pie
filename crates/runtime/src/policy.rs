@@ -14,6 +14,8 @@ pub mod share;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod port;
+#[cfg(test)]
+mod seat_to_end_tests;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use port::{LoadError, reload, start};
@@ -68,13 +70,11 @@ pub struct Arrival {
 /// A resting handle, for the worker policy to read.
 #[derive(Debug, Clone)]
 pub(crate) struct Resting {
-    pub client: crate::server::ClientId,
     pub tenant: String,
     pub session: Option<String>,
     pub props: Props,
     pub tokens: u64,
     pub folded: u64,
-    pub slots: u32,
 }
 
 /// Each is a no-op when no policy is loaded.

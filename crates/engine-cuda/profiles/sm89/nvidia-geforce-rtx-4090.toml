@@ -59,14 +59,9 @@ gemm.fp8_wide_from = 257
 # 128 lanes; at 65% pf16-512 15.9k to 22.5k tok/s and c256 5.7k to 6.1k.
 [engine]
 working_set_percent = 65
-# A process starts only while the pools hold the started ones to the end, a
-# decoding lane's pages before a waiting prompt's, as the A40, H100, H200 and
-# RTX PRO 6000 profiles: gemma-4-31b mini12 c256 2.01k -> 2.70k,
-# gemma-4-26b-a4b mini c256 1.82k -> 2.59k tok/s. Graph bodies keep their
-# quarter: held to 512 MiB, gpt-oss-20b armed 12 of its 106 compositions,
-# and at 640-768 MiB a guest program's scratch found no room mid-run.
-seated_first = true
-seat_to_end = true
+# Graph bodies keep their quarter: held to 512 MiB, gpt-oss-20b armed 12 of
+# its 106 compositions, and at 640-768 MiB a guest program's scratch found no
+# room mid-run.
 # Eight lattice buckets a doubling past 256 rows, as the L40S: a fire of a
 # batch's prompts pads less (gemma-4-E4B pf16-512 at 4480-row fires 16.6k ->
 # 17.1k tok/s).
@@ -125,7 +120,6 @@ measured = [
   "engine.lattice_steps",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
-  "engine.seated_first",
   "engine.working_set_percent",
   "compiler.branches",
   "compiler.cond_fixed_us",

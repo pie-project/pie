@@ -189,10 +189,6 @@ pub(crate) struct WaitEpisode {
 }
 
 impl WaitEpisode {
-    pub(crate) const fn new() -> Self {
-        Self { since: None }
-    }
-
     /// The wait is seen now: true the first time in its episode, the one
     /// said at INFO.
     pub(crate) fn seen(&mut self) -> bool {
@@ -1392,7 +1388,7 @@ mod tests {
     /// and once as it ends; the next wait is a new episode.
     #[test]
     fn a_wait_is_said_once_as_it_starts_and_once_as_it_ends() {
-        let mut episode = WaitEpisode::new();
+        let mut episode = WaitEpisode::default();
         assert!(episode.end().is_none(), "no episode: nothing to end");
         assert!(episode.seen(), "the first sight is said");
         assert!(!episode.seen(), "a repeat is not");

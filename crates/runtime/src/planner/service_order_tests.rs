@@ -439,3 +439,32 @@ fn a_roles_short_head_with_a_bind_waiting_behind_it_is_funded_while_a_decoder_fi
         }
     );
 }
+
+/// A12: a process evicted while it waited in the queue is held behind the
+/// processes ahead of it, and ahead is the policy's priority, arrival only
+/// among equals. An older process of lower priority holds it no longer; a
+/// younger one of higher priority does.
+#[test]
+fn a_restore_evicted_queued_waits_behind_higher_priority_not_older_arrival() {
+    let restore_head = |other_key: i64, other_seq: u64| {
+        let (mut inner, pids) = fleet(&[
+            (5, Residency::Evicted, true),
+            (other_seq, Residency::Resident, true),
+        ]);
+        let (evicted, other) = (pids[0], pids[1]);
+        inner.procs.get_mut(&evicted).unwrap().evicted_queued = true;
+        inner.procs.get_mut(&other).unwrap().key = other_key;
+        park_restore(&mut inner, evicted, 4);
+        park_allocation(&mut inner, other, 4);
+        let (_, waiter) = inner.unmet_head().expect("a head");
+        waiter.pid == evicted
+    };
+    assert!(
+        restore_head(-1, 1),
+        "an older process of lower priority does not hold the restore"
+    );
+    assert!(
+        !restore_head(1, 9),
+        "a younger process of higher priority goes first"
+    );
+}

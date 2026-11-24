@@ -4048,14 +4048,19 @@ fn sim_field_seeds_863_and_178_end() {
 /// admitted.
 #[test]
 fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_ends() {
+    // Seated lanes grow before a waiting prompt on every engine now (PLEX
+    // 1.1's no displacement): seed 6's newcomers no longer reach the gate's
+    // last place, seed 2's still do. Both must end clean.
+    let mut waits = 0;
     for seed in [2, 6] {
         let (failures, coverage) = run(&Workload::metal(seed), None);
         for failure in &failures {
             eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
         }
         assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
-        assert!(coverage.admission_waits > 0, "metal seed {seed}: no newcomer waited at the gate");
+        waits += coverage.admission_waits;
     }
+    assert!(waits > 0, "no newcomer waited at the gate");
 }
 
 /// What a run did, as a string two runs of one seed must agree on.

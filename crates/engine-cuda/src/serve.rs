@@ -159,12 +159,6 @@ pub struct Shell {
     exports: Exports,
     graphs: Graphs,
     copies: bool,
-    /// `engine.seated_first`.
-    seated_first: bool,
-    /// `engine.seat_to_end`.
-    seat_to_end: bool,
-    /// `engine.seat_spread`.
-    seat_spread: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
     /// `engine.fire_lanes` (`Shell::fire_lanes`).
@@ -507,27 +501,6 @@ impl Shell {
 
     pub fn on_tapped(&mut self, sink: engine::TapSink) {
         self.tap_sink = Some(sink);
-    }
-
-    /// Whether this load asks the planner to serve a decoding lane's pages
-    /// before a prompt waiting to be seated (`engine.seated_first`).
-    #[must_use]
-    pub fn seated_first(&self) -> bool {
-        self.seated_first
-    }
-
-    /// Whether this load asks the planner to start a process only while the
-    /// pools hold the started ones to the end (`engine.seat_to_end`).
-    #[must_use]
-    pub fn seat_to_end(&self) -> bool {
-        self.seat_to_end
-    }
-
-    /// Whether this load asks the planner to spread the starts the pools do
-    /// not hold to the end at once over a life (`engine.seat_spread`).
-    #[must_use]
-    pub fn seat_spread(&self) -> bool {
-        self.seat_spread
     }
 
     #[must_use]

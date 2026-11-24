@@ -66,22 +66,6 @@ pub struct PoolFacts {
     /// layer's window is [`crate::chunk::WindowedLayer::window`]).
     #[serde(default)]
     pub window_tokens: u32,
-    /// The engine would rather a lane already decoding claim its next pages
-    /// before a prompt waiting to be seated does, and a prompt wait for a
-    /// lane to finish rather than suspend one. False keeps the runtime's
-    /// order of arrival, a waiting prompt older than a lane preempting it.
-    #[serde(default)]
-    pub seated_first: bool,
-    /// The engine would rather a process wait to start until the pools hold
-    /// the started ones to the pages a finished one held, than start each at
-    /// once and evict lanes the pools then run short for.
-    #[serde(default)]
-    pub seat_to_end: bool,
-    /// With `seat_to_end`, the engine would rather the starts the pools do
-    /// not hold to the end at once be spread over a life, so they finish
-    /// apart, than a wave start together and run to its end together.
-    #[serde(default)]
-    pub seat_spread: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
