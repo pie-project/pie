@@ -1219,7 +1219,7 @@ fn short_record_floats(k_heads: u32, v_heads: u32) -> u64 {
         u64::from(GDN_CARRIED_INLINE),
         u64::from(GDN_VERIFY_DIM),
     );
-    (2 + r) * k * d + r * v * d + r * v + 4 * v + 8
+    (2 + r) * k * d + r * v * d + r * v + 4 * v + v * d + 8
 }
 
 /// The pipelines [`gated_delta_carried`] dispatches whatever its lanes
@@ -1227,11 +1227,12 @@ fn short_record_floats(k_heads: u32, v_heads: u32) -> u64 {
 /// per-head table's prepass. A load that buffers recurrent rows builds them
 /// before ready, a beam's long carry being one its warm walk does not reach.
 #[must_use]
-pub fn carried_pipelines() -> [Fire; 9] {
+pub fn carried_pipelines() -> [Fire; 10] {
     [
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_short_bfloat16_s_8_v_4"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prep_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prepped_bfloat16_s_8_v_4"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_land_bfloat16"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16"),
@@ -1646,9 +1647,14 @@ pub fn gated_delta_carried(
                     .apply(Grid::of([GDN_SCAN_LANES, 1, z], [GDN_SCAN_LANES, 1, 1])),
                 &args(table.table.arg_mut())?,
             )?;
-            return ctx.fire(
+            ctx.fire(
                 Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prepped_bfloat16_s_8_v_4")
                     .apply(gated_delta_verify_grid(sg, vrows, z)),
+                &args(table.table.arg_mut())?,
+            )?;
+            return ctx.fire(
+                Fire::at(GDN_SCAN_FILE, "gated_delta_carried_land_bfloat16")
+                    .apply(Grid::of([GDN_SCAN_LANES, 1, z], [GDN_SCAN_LANES, 1, 1])),
                 &args(table.table.arg())?,
             );
         }

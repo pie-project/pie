@@ -1691,7 +1691,7 @@ template <typename T, int SG, int VROWS>
 // head by `gated_delta_carried_prep`, so the scan reads dense planes as the
 // scan step reads `gdn_prep`'s. Offsets in floats from the lane's record.
 struct GdnShortRecord {
-  size_t qn, kn, kc, uc, g, own, facts, end;
+  size_t qn, kn, kc, uc, g, own, uown, facts, end;
 };
 
 inline GdnShortRecord gdn_short_record(int k_heads, int v_heads) {
@@ -1704,7 +1704,8 @@ inline GdnShortRecord gdn_short_record(int k_heads, int v_heads) {
   at.uc = at.kc + R * K * D;
   at.g = at.uc + R * V * D;
   at.own = at.g + R * V;
-  at.facts = at.own + 4 * V;
+  at.uown = at.own + 4 * V;
+  at.facts = at.uown + V * D;
   at.end = at.facts + 8;
   return at;
 }
@@ -1996,7 +1997,13 @@ template <typename T, int SG, int VROWS>
   const float g_own = metal::exp(own_glog);
   const size_t vbase = size_t(begin + t_own) * pitch + 2 * keys + size_t(hv) * D;
   const size_t row_out = (size_t(own + t_own) * vh + size_t(hv)) * D;
-  device float* urow = lands ? reinterpret_cast<device float*>(u_slab + uoff) : nullptr;
+  // The own row's corrected value lands through the record: a scalar store
+  // a lane into the buffer's page cost the scan as much as its carried
+  // steps; `gated_delta_carried_land` copies it whole, a row at a time.
+  device float* urow = lands ? reinterpret_cast<device float*>(table) +
+                                   size_t(lane0 + r) * size_t(k_heads) * size_t(table_rows) * 4 + at.uown
+                             : nullptr;
+  (void)uoff;
   for (int v = 0; v < VROWS; ++v) {
     float pa = 0.0f, po = 0.0f;
     for (int i = 0; i < PER; ++i) {
@@ -2035,6 +2042,76 @@ template [[host_name("gated_delta_carried_prepped_bfloat16_s_8_v_4")]]
     device uchar*, const constant uint&, const device ulong*, const constant uint&,
     device float4*, const constant uint&, const device int*, device uchar*,
     const constant uint&, uint3, uint, uint);
+
+// The own row's corrected value, from the scan's record into the lane's
+// buffer page: a simdgroup a (lane, value head), its 128 values a row.
+template <typename T>
+[[kernel]] void gated_delta_carried_land(
+
+    const device T* qkv         [[buffer(0)]],
+    const device int* indptr    [[buffer(1)]],
+    const device int* replay    [[buffer(2)]],
+    const device int* commit    [[buffer(3)]],
+    const device int* slots     [[buffer(4)]],
+    const constant int& lane0   [[buffer(5)]],
+    const device T* ba          [[buffer(6)]],
+    const device float* a_log   [[buffer(7)]],
+    const device T* dt_bias     [[buffer(8)]],
+    device float* rstate        [[buffer(9)]],
+    device float* y             [[buffer(10)]],
+    device float* gates         [[buffer(11)]],
+    const constant int& k_heads [[buffer(12)]],
+    const constant int& v_heads [[buffer(13)]],
+    device uchar* ba_slab       [[buffer(14)]],
+    const device int* page_table [[buffer(15)]],
+    const constant uint& page_tokens [[buffer(16)]],
+    const constant uint& page_bytes [[buffer(17)]],
+    const constant uint& ba_row_bytes [[buffer(18)]],
+    device uchar* key_slab      [[buffer(19)]],
+    const constant uint& key_row_bytes [[buffer(20)]],
+    device uchar* u_slab        [[buffer(21)]],
+    const constant uint& u_row_bytes [[buffer(22)]],
+    const device ulong* map     [[buffer(23)]],
+    const constant uint& page_ints [[buffer(24)]],
+    device float4* table        [[buffer(25)]],
+    const constant uint& table_rows [[buffer(26)]],
+    const device int* ext_replay [[buffer(27)]],
+    device uchar* scalar_slab   [[buffer(28)]],
+    const constant uint& scalar_row_bytes [[buffer(29)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane_u [[thread_index_in_simdgroup]]) {
+  constexpr int D = 128;
+  constexpr int PER = D / 32;
+  const int lane = int(lane_u);
+  const int hv = int(group.z) % v_heads;
+  const int r = int(group.z) / v_heads;
+  const device int* ids = slots + size_t(lane0 + r) * pie_state_pieces(map);
+  if (indptr[r + 1] - indptr[r] != 1 || ids[0] < 0) {
+    return;
+  }
+  const GdnShortRecord at = gdn_short_record(k_heads, v_heads);
+  const device float* rec = reinterpret_cast<const device float*>(table) +
+                            size_t(lane0 + r) * size_t(k_heads) * size_t(table_rows) * 4;
+  const device int* facts = reinterpret_cast<const device int*>(rec + at.facts);
+  if (facts[3] == 0) {
+    return;
+  }
+  const ulong uoff = ulong(uint(facts[4])) | (ulong(uint(facts[5])) << 32);
+  device float* urow = reinterpret_cast<device float*>(u_slab + uoff);
+  *reinterpret_cast<device float4*>(urow + size_t(hv) * D + size_t(PER * lane)) =
+      *reinterpret_cast<const device float4*>(rec + at.uown + size_t(hv) * D + size_t(PER * lane));
+}
+
+template [[host_name("gated_delta_carried_land_bfloat16")]]
+[[kernel]] void gated_delta_carried_land<bfloat>(
+    const device bfloat*, const device int*, const device int*, const device int*,
+    const device int*, const constant int&, const device bfloat*, const device float*,
+    const device bfloat*, device float*, device float*, device float*, const constant int&,
+    const constant int&, device uchar*, const device int*, const constant uint&,
+    const constant uint&, const constant uint&, device uchar*, const constant uint&,
+    device uchar*, const constant uint&, const device ulong*, const constant uint&,
+    device float4*, const constant uint&, const device int*, device uchar*,
+    const constant uint&, uint3, uint);
 
 #define PIE_GDN_CARRIED_SHORT(sg, vrows)                                      \
   template [[host_name("gated_delta_carried_short_bfloat16_s_" #sg "_v_" #vrows)]] \
