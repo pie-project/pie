@@ -143,34 +143,29 @@ impl Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadConfig {
-    /// Shortest uncached suffix worth a peer's prefill; `0`: 2048 tokens.
+    /// Shortest uncached suffix worth a helper's prefill. Unset, this
+    /// worker's passes stay home whatever helpers the cluster names
+    /// (`placement/helpers`).
     #[serde(default)]
-    pub prefill_min_suffix_tokens: usize,
+    pub prefill_min_suffix_tokens: Option<usize>,
     /// How KV pages cross between workers — see [`OffloadTransfer`].
     #[serde(default)]
     pub transfer: OffloadTransfer,
     /// Where this worker serves other workers' passes (`host:port`); omit to
-    /// serve none.
+    /// serve none. The cluster reads it as the worker's `pie/prefill-listen`:
+    /// the default cluster policy names every such worker a helper. Which
+    /// workers prefill this one's passes, and which pools keep its runs, are
+    /// the cluster policy's (`placement/helpers`, `replication/workers`).
     #[serde(default)]
     pub listen: Option<String>,
-    /// Workers to prefill this worker's passes on, by their `listen`
-    /// address. The first that serves this model in this class is taken.
-    #[serde(default)]
-    pub peers: Vec<String>,
-    /// Pool workers (`pie-pool`) to send every run this worker keeps to, by
-    /// their bulk address.
-    #[serde(default)]
-    pub pools: Vec<String>,
 }
 
 impl Default for OffloadConfig {
     fn default() -> Self {
         Self {
-            prefill_min_suffix_tokens: 0,
+            prefill_min_suffix_tokens: None,
             transfer: OffloadTransfer::Auto,
             listen: None,
-            peers: Vec::new(),
-            pools: Vec::new(),
         }
     }
 }
@@ -211,11 +206,12 @@ pub enum OffloadTransfer {
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// The cluster-plane policies, run by the controller: each a built-in
-    /// policy's name or a component path, no two granted the same write;
-    /// omit to run none. Single-node only: a distributed worker's controller
-    /// states its own. The worker plane's is `[runtime] worker_policy`.
+    /// policy's name or a component path, no two granted the same write.
+    /// Omitted, `["default-cluster"]` ([`Self::policies`]); `[]` runs none.
+    /// Single-node only: a distributed worker's controller states its own.
+    /// The worker plane's is `[runtime] worker_policy`.
     #[serde(default)]
-    pub cluster_policies: Vec<String>,
+    pub cluster_policies: Option<Vec<String>>,
     /// Controller endpoint (`tcp://host:port`, a bare `host:port`, or
     /// `unix:/path`); set ⇒ this worker joins a distributed cluster.
     #[serde(default)]
@@ -229,6 +225,14 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// The cluster policies this file states, or the default.
+    #[must_use]
+    pub fn policies(&self) -> Vec<String> {
+        self.cluster_policies
+            .clone()
+            .unwrap_or_else(|| vec![builtins::DEFAULT_CLUSTER_POLICY.to_string()])
+    }
+
     fn validate(&self) -> Result<()> {
         if self.controller.is_some() {
             ensure!(
@@ -236,7 +240,7 @@ impl ClusterConfig {
                 "[cluster] role is required when controller is set"
             );
             ensure!(
-                self.cluster_policies.is_empty(),
+                self.cluster_policies.is_none(),
                 "[cluster] cluster_policies is the controller's to run: a worker that \
                  joins one (`controller` set) runs none, so state them in the \
                  controller's file"
@@ -807,14 +811,20 @@ pub struct RuntimeConfig {
     /// engine's fire lanes, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
-    /// The worker-plane PLEX 1.1 policy: a built-in policy's name (`noop`)
-    /// or a component path; omit to run none. The cluster
-    /// plane's are `[cluster] cluster_policies`.
-    #[serde(default)]
-    pub worker_policy: Option<String>,
+    /// The worker-plane PLEX 1.1 policy: a built-in policy's name or a
+    /// component path. Omitted, `default`: idle cache a process left is kept
+    /// on the device alone, decoded tail before prompt; `noop` writes no
+    /// rows, so the columns' own defaults apply. The cluster plane's are
+    /// `[cluster] cluster_policies`.
+    #[serde(default = "default_worker_policy")]
+    pub worker_policy: String,
     /// What handle snapshots may take on disk; past it a save is refused.
     #[serde(default = "default_snapshot_budget")]
     pub snapshot_budget: ByteSize,
+}
+
+fn default_worker_policy() -> String {
+    builtins::DEFAULT_WORKER_POLICY.to_string()
 }
 
 fn default_snapshot_budget() -> ByteSize {
@@ -827,7 +837,7 @@ impl Default for RuntimeConfig {
             frame_size: default_frame_size(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
-            worker_policy: None,
+            worker_policy: default_worker_policy(),
             snapshot_budget: default_snapshot_budget(),
         }
     }
@@ -978,11 +988,12 @@ pub struct MemoryConfig {
     /// states unified memory (Metal, phones, DGX Spark: the pool and the
     /// host share one RAM) and `0` on separate device memory.
     ///
-    /// Idle cache is not timed out by the runtime: with no worker policy
-    /// installed it stays until a demand needs its room, and is then
-    /// reclaimed in retention-key, then least-recently-used, order. How
-    /// long it is kept past that is the policy's to state, with its
-    /// retention keys.
+    /// Idle cache is not timed out by the runtime: it stays until a demand
+    /// needs its room, and then goes in retention-priority, then
+    /// least-recently-used, order, down a tier where its `retention/tiers`
+    /// row lets it sit (under `noop`, every tier), else dropped (what an
+    /// exited process left, under `default`). How long it is kept past
+    /// that is the policy's to state.
     #[serde(rename = "yield")]
     pub yield_share: Option<f64>,
 }
@@ -1246,6 +1257,8 @@ device = ["metal:0"]
     fn config_every_case() {
         an_unknown_key_is_refused();
         a_distributed_worker_states_no_cluster_policies();
+        the_policies_default_to_the_built_in_defaults();
+        offload_peers_and_pools_are_unknown_keys();
         a_submit_deadline_is_an_unknown_key();
         the_diag_flag_states_the_engines_diagnostics_key();
         measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere();
@@ -1471,6 +1484,40 @@ device = ["metal:0"]
         let alone =
             format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"persist-prefix\"]\n");
         Config::parse(&alone).expect("single-node runs them in its own controller");
+    }
+
+    /// Unstated, a worker runs `default` and its controller
+    /// `default-cluster`; `noop` and `[]` are how a file asks for no rows.
+    fn the_policies_default_to_the_built_in_defaults() {
+        let cfg = Config::parse(MINIMAL_METAL).unwrap();
+        assert_eq!(cfg.runtime.worker_policy, "default");
+        assert_eq!(cfg.cluster.policies(), ["default-cluster"]);
+        assert_eq!(
+            cfg.offload.prefill_min_suffix_tokens, None,
+            "passes stay home"
+        );
+        let none = format!(
+            "{MINIMAL_METAL}\n[runtime]\nworker_policy = \"noop\"\n\
+             [cluster]\ncluster_policies = []\n"
+        );
+        let cfg = Config::parse(&none).unwrap();
+        assert_eq!(cfg.runtime.worker_policy, "noop");
+        assert!(cfg.cluster.policies().is_empty());
+        let distributed = format!(
+            "{MINIMAL_METAL}\n[cluster]\ncontroller = \"10.0.0.1:7000\"\nrole = \"decode\"\n"
+        );
+        Config::parse(&distributed)
+            .expect("a distributed worker states none, and takes no default");
+    }
+
+    /// Which workers prefill a worker's passes and which pools keep its
+    /// runs are the cluster policy's: the keys that named them are gone.
+    fn offload_peers_and_pools_are_unknown_keys() {
+        for key in ["peers = [\"10.0.0.2:7100\"]", "pools = [\"10.0.0.3:7201\"]"] {
+            let toml = format!("{MINIMAL_METAL}\n[offload]\n{key}\n");
+            let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
+            assert!(err.contains("unknown field"), "{key}: {err}");
+        }
     }
 
     /// The leash is gone, and its key with it: a config that sets it is

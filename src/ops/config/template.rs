@@ -88,8 +88,9 @@ const MEMORY: &str = r#"
 #                                   #   floor = one lane at max_context + reserved + activation
 #                                   #   + dense weights: a long max_context raises it, so yield
 #                                   #   can press less
-# Idle cache has no time-based expiry: with no worker policy it stays until a
-# demand needs its room, then goes in retention-key / least-recently-used order.
+# Idle cache has no time-based expiry: it stays until a demand needs its room.
+# Under the default worker policy, what a process left is then dropped (decoded
+# tail first, then least recently used); under `noop` it moves down a tier.
 "#;
 
 const RUNTIME: &str = r#"
@@ -114,7 +115,8 @@ frame_dispatch_depth     = 15    # ahead, so every lane rides each wafer loop
 "#;
 
 const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's fire lanes
-# worker_policy            = "noop"  # a PLEX worker policy: built-in name or .wasm path
+# worker_policy            = "default"  # a PLEX worker policy: built-in name or
+#                                       # .wasm path; "noop" writes no rows
 # snapshot_budget          = "64GiB"  # what handle snapshots may take on disk
 
 [sandbox]
@@ -130,7 +132,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # warm_slots      = 100
 
 # [cluster]
-# cluster_policies = []        # cluster policies: built-in names or .wasm paths,
+# cluster_policies = ["default-cluster"]  # built-in names or .wasm paths; [] runs none;
 #                              # no two granted the same write (`publish`
 #                              # excepted: each writes under its own name).
 #                              # SIGHUP reloads this and `[runtime] worker_policy`.
@@ -143,15 +145,14 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 
 # [offload]
 # Other workers' part in this one's passes, and its in theirs. Omit to serve
-# and send none.
+# and send none. Which workers prefill this one's passes and which pools keep
+# its runs are the cluster policy's (`placement/helpers`, `replication/workers`;
+# `default-cluster` names every worker with a `listen`, and every pool).
 # listen = "10.0.0.1:7100"     # where this worker serves peers' passes; their
 #                              # pages' bytes ride one port above
-# peers  = ["10.0.0.2:7100"]   # workers to prefill this worker's passes on
-# pools  = ["10.0.0.3:7201"]   # pool workers (`pie-pool`) to keep its runs on,
-#                              # by their bulk address
 # transfer = "auto"            # the bulk link; "nixl" reads peers' kv in place
-# prefill_min_suffix_tokens = 0  # shortest uncached suffix worth a peer's
-#                                # prefill; 0: 2048 tokens
+# prefill_min_suffix_tokens = 2048  # shortest uncached suffix worth a helper's
+#                                   # prefill; unset, passes stay home
 "#;
 
 #[cfg(any(feature = "engine-cuda", test))]

@@ -396,7 +396,7 @@ async def main():
     t = re.sub(r'^listen = "[^"]*"', f'listen = "127.0.0.1:{port}"', t, flags=re.M)
     if args.budget_device: t = t.replace('# budget_device         = "20GiB"', f'budget_device = "{args.budget_device}"')
     if args.host_budget: t = t.replace('# budget_host           = "32GiB"', f'budget_host = "{args.host_budget}"')
-    if args.policy: t = t.replace('# worker_policy            = "noop"', f'worker_policy = "{args.policy}"')
+    if args.policy: t = t.replace('# worker_policy            = "default"', f'worker_policy = "{args.policy}"')
     if args.ctx: t = t.replace("# max_context     = 32768", f"max_context = {args.ctx}\n#")
     cfg.write_text(t)
     log = open(args.log, "w")

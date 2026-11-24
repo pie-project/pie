@@ -209,6 +209,9 @@ pub struct DirectoryView {
     pub pools: Vec<WorkerId>,
     /// Where each worker serves its pages' bytes.
     pub peers: Vec<(WorkerId, String)>,
+    /// Where each worker that serves other workers' passes listens
+    /// (`offload.listen`).
+    pub links: Vec<(WorkerId, String)>,
     /// What each worker's policy published about it, as `(name, JSON
     /// value)`.
     pub published: Vec<(WorkerId, Vec<(String, String)>)>,

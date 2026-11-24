@@ -45,21 +45,14 @@ pub use link::pool::{PoolStore, run as run_pool};
 #[cfg(feature = "net")]
 pub use serve::{WorkerHandle, run, run_with};
 
-/// Swaps the worker policy for the one `config`'s `[runtime] worker_policy` names,
-/// or for none (a SIGHUP's reload): it loads whole or the running one goes
-/// on ([`runtime::policy::reload`]).
+/// Swaps the worker policy for the one `config`'s `[runtime] worker_policy` names
+/// (a SIGHUP's reload): it loads whole or the running one goes on
+/// ([`runtime::policy::reload`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn reload_policy(config: &Config) -> anyhow::Result<()> {
-    let next = match config.runtime.worker_policy.as_deref() {
-        Some(spec) => Some((
-            spec.to_string(),
-            builtins::policy_component(spec)?.into_owned(),
-        )),
-        None => None,
-    };
-    tokio::task::spawn_blocking(move || {
-        runtime::policy::reload(next.as_ref().map(|(name, c)| (name.as_str(), c.as_slice())))
-    })
-    .await?
-    .map_err(|why| anyhow::anyhow!("reload the worker policy: {why}"))
+    let name = config.runtime.worker_policy.clone();
+    let component = builtins::policy_component(&name)?.into_owned();
+    tokio::task::spawn_blocking(move || runtime::policy::reload(&name, &component))
+        .await?
+        .map_err(|why| anyhow::anyhow!("reload the worker policy: {why}"))
 }
