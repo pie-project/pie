@@ -62,7 +62,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(4)]] RWStructuredBuffer<uint> pie_seg2;
 [[vk::binding(5)]] RWStructuredBuffer<uint> pie_seg3;
 
+#ifndef PIE_RUNS
 #define PIE_RUNS 512
+#endif
 
 struct Params {
     uint count;
@@ -339,7 +341,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate gather_rows_copy_words PIE_COPY=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_copy_regions_words PIE_COPY_REGIONS=1 PIE_GROUP_X=256 PIE_TARGET=spirv
-// pie:instantiate gather_rows_copy_runs_words PIE_COPY_RUNS=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_copy_runs_16_words PIE_COPY_RUNS=1 PIE_RUNS=16 PIE_GROUP_X=256
+// pie:instantiate gather_rows_copy_runs_128_words PIE_COPY_RUNS=1 PIE_RUNS=128 PIE_GROUP_X=256
+// pie:instantiate gather_rows_copy_runs_1024_words PIE_COPY_RUNS=1 PIE_RUNS=1024 PIE_GROUP_X=256
 // pie:instantiate gather_rows_words PIE_GATHER=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_scatter_words PIE_SCATTER=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_scatter_live_words PIE_SCATTER_LIVE=1 PIE_GROUP_X=256

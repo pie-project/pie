@@ -232,6 +232,7 @@ fn every_dense_matmul_launches_a_workgroup_a_tile() {
                         t(0, m, k, Dtype::Bf16),
                         t(1, n, k, Dtype::Bf16),
                         t(2, m, n, Dtype::Bf16),
+                        crate::ssm::RowSpan::whole(t(0, m, k, Dtype::Bf16)),
                     )
                     .unwrap();
                     let what = format!(

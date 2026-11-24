@@ -458,11 +458,6 @@ pub mod rt {
         // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipStreamDestroy(stream) })
     }
-    pub unsafe fn cudaStreamQuery(stream: cudaStream_t) -> cudaError {
-        // SAFETY: `hipStreamQuery` takes the same arguments with the same
-        // contract, which the caller of this fn upholds.
-        cudaError::of(unsafe { hip::hipStreamQuery(stream) })
-    }
     pub unsafe fn cudaStreamSynchronize(stream: cudaStream_t) -> cudaError {
         // SAFETY: `hipStreamSynchronize` takes the same arguments with the same
         // contract, which the caller of this fn upholds.

@@ -8080,10 +8080,12 @@ pub(crate) mod lifecycle_tests {
         Ok(())
     }
 
-    /// A retract reaching a fire whose pass stated its rows final is
-    /// refused by name before anything is cut: the set keeps every row,
-    /// the pipeline is not failed. One stopping short of it takes back the
-    /// lagged fires after it as before.
+    /// A retract reaching a fire whose pass stated its rows final (a
+    /// default pass: the SDK states it unless the program declared the pass
+    /// retractable) is refused by name before anything is cut: the set
+    /// keeps every row, the pipeline is not failed. This is the loud failure
+    /// of an inferlet that retracts without opting out. One stopping short
+    /// of it takes back the lagged fires after it as before.
     #[tokio::test(flavor = "current_thread")]
     async fn a_retract_over_a_final_fire_is_refused_by_name() -> anyhow::Result<()> {
         let mut run = run_ahead_stating(5, Some(20), &[2])?;
@@ -12883,8 +12885,9 @@ mod unfolded_tests {
     }
 
     /// A decode run ahead four fires on two recurrent sets, the host's read
-    /// of every output still to come: one pass stated its rows final
-    /// (CONTRACT-BC 25), the other did not (a stop string's). The final
+    /// of every output still to come: one pass stated its rows final (a
+    /// default pass: the SDK states it, CONTRACT-BC 25), the other did not
+    /// (a pass the program declared retractable). The final
     /// lane folds its row at each fire and carries none into the next: its
     /// verb is `Fold` and its step alone is classed folded. The lagged
     /// lane folds nothing it has not read: it carries one more row each

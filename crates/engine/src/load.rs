@@ -134,7 +134,8 @@ pub struct Residency {
     /// Bytes of slot files under `disk_kv_dir` kv pages may be suspended
     /// into below host memory, shared by the ranks; zero: no disk tier.
     /// `None`: the engine derives it from what can be parked, within the
-    /// free disk under `disk_kv_dir` ([`crate::disk::derived_budget`]).
+    /// free disk under `disk_kv_dir` less the platform's reserve
+    /// ([`crate::disk::derived_budget`], [`crate::disk::room`]).
     #[serde(default)]
     pub disk_kv_budget: Option<u64>,
     #[serde(default)]

@@ -690,7 +690,9 @@ fn w4a8_select_timing() {
         let r = t(b.up(&routes), tokens, top, I32);
         let mut y = b.out(tokens * top, n);
         for _ in 0..5 {
-            assert!(moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, 128, RES).expect("fires"));
+            // Its scratch sized by a walk of the fire, as every select here.
+            let fired = b.laid(&ctx, |ctx| moe::select_mxfp4_w4a8(ctx, x, mx, sc, r, &mut y, 128, RES));
+            assert!(fired.expect("fires"));
         }
         b.sync();
     }

@@ -1522,13 +1522,36 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 
 **Why later.** Taken out for this round (coordinator, 2026-11-24): it allocated after ready, and the export round covers the stale keys.
 
-## F?? Metal: a yielded rates or curve key behind serving resumes where it stopped
+## F81. Stale rates and curves timed behind serving on Metal
 
-**What.** On Metal, a `[rates]` key or a `curve <n>x<k>` shape timed behind serving that yields to an arrival starts again whole at the next idle turn (`engine-metal` `rates::YIELDED`, `tune::dense::YIELDED`). engine-gpu keeps its finished points and resumes. The widest keys (`gemm_tflops_by_rows`, `attn_tflops_by_keys`; single fires of 100–345 ms on the M1 Max) take minutes, so under arrivals that keep coming in idle gaps they can restart many times before one finishes. They are stale only between a kernel change and the next export round.
+**What.** On Metal a `[rates]` key or kernel.dense curve stored under a stale key is served by its stale figure (`StaleRates::Served`), named at load, until the export round or `pie tune` measures it in the foreground. A rates or curve step lays MTLBuffers of its own for every operand (`rates::Bench::operand`, `tune::dense::measure_at`), and nothing is allocated after load and arming, so it cannot run behind serving. Metal has no settle behind serving, so it states no behind work at all (`Engine::measures_behind` false).
 
-**Idea.** Keep a key's settled points across yields (per point, as engine-gpu does) and time only the rest at the next turn, with the clock and overlap checks applying to each point's frames.
+**Design, from the version built and taken out (2982a0d18, 7c1cf570a, 31a9d18de, 283cc64a9, a82c38485).**
+- One key or `curve <n>x<k>` shape per slice, timed by the load's own step (`measure_keys` gated to the key, `measure_at` over `LOAD_ROWS`), stored in the user profile.
+- The arrival read before every frame, between fires of a frame of long ones (a frame cut into buffers, their GPU times summed), and inside the settled clock read.
+- Discarded where another lane submitted or the clock read after it was slower than the settled read before it.
+- What is missing: operands from a scratch region laid at load, so no point allocates after ready, and per-point resume across yields (a yielded wide key restarts whole).
+- Under back-to-back c1 a slice still met each next arrival with one ~20 ms frame (the runtime's grace of one served step is shorter than a client's turnaround).
 
-**Why later.** Behind work runs only when no process is live, so yields are rare. Each yield already waits for at most one fire (a frame of long fires is cut between them).
+**Why later.** Taken out for this round (coordinator, 2026-11-24): it allocated after ready, and the export round covers the stale keys.
+
+## F82. engine-gpu: land a lane's ring snapshots inside the fire (CUDA parity)
+
+**What.** engine-cuda states `rs_snapshots` for a load of rings alone and lands each asked checkpoint's ring snapshot inside the fire (`serve::ring`, before the fold), so the runtime cuts no pass at a checkpoint. engine-gpu states none and takes the runtime's cut at each one (the pipelined-cut take keeps it). The machinery is on `sc/window-ring-snapshots` (3df710d6c and two follow-ups): `ring::stage` stages each snapshot's jobs (the last ring's rows before its row, from the lane's ring, buffer or fire slots, onto the snapshot record's rings, its record an entry past the lanes'), and the fold kernel runs a snapshot phase before the fold over one table, its workgroups striding over the jobs. Stated, served gemma-4-E2B on Vulkan reused nothing (warm 550 ms against 554 cold at 2050 rows): the snapshot is not kept end to end, where it drops not found.
+
+**Why later.** Gemma's reuse works through the cut today; this saves the cut's extra fire on a pass ending past its checkpoint. Find where the served snapshot drops (the lane's `rs_snapshots` reaching `ring::stage`, the snapshot record's units, the runtime's keep of a snapshot taken inside a fire), state it, and land it with a served warm-TTFT check on Vulkan and wgpu.
+
+## F83. ROCm: a buffered fire whose lanes each commit what they carry, in a body without the rows-past-commit branch
+
+**What.** A buffered Qwen3.5 decode fire runs `ssm_gdn_step_fused_carried`, whose rows-past-commit branch (the linear attention over rows a lane carries beyond its commit) holds the kernel at 226 VGPRs, 2 waves a SIMD, though a lagged lane at its natural lag commits all it carries and never runs it.
+
+**Built and measured (parked, not merged: sc/amd-ns-carried-commits 9ac200787).**
+- kernels-rocm: `ssm_gdn_step_fused_carried<…, PAST>`; `PAST = false` compiles without the branch (166 VGPRs, 3 waves) and traps a lane that would run it.
+- engine-cuda: `RsBody::Commits` (`~rsc`), engine-cuda's own body split like `~rss` / `~rsx` (the step's `Treatment` unchanged): prepare classifies a buffered fire whose every lane carries none or folds at least as many rows as it replays; arming arms it beside `~rs` for each decoding shape; the dispatch launches `past = false`. `RsBody::COMMITS` keeps it to ROCm.
+- MI300X, Qwen3.5-9B shape: −9.9 µs a GDN layer at r64 with one carried row (100.25 → 90.31 µs), −4.3 at none; r1 / r8 unchanged. arm-bench c64 decode bodies: `~rs` 10092 / 11157 → `~rsc` 9824 / 10866 µs (classes c1 / c9). Bit-identical to the full kernel wherever both apply.
+- Cost: +44 armed compositions (266 from 222) and +114 MiB of bodies on every load.
+
+**Why later.** After the user's ruling (2026-11-24) an SDK pass states its rows final by default (opt-out for inferlets that retract), and compat requests with stop strings fold at fire, so no common path runs a lagged lane that commits what it carries; beam lanes fold none and stay on `~rs`. The body would cost every load for little served benefit. Take it up if lagged non-beam traffic becomes common again; kernels-cuda would mirror it with a branch-free `gdn_step_carried` (c7d47412f's `SPLIT = false` is the analogue) and `RsBody::COMMITS` for cuda.
 
 ## F?? XLA decode: a page walk whose cost does not follow the page bound, so the bound can be data (v6e, 2026-11-25)
 

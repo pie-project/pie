@@ -998,59 +998,6 @@ impl Frame {
         }
     }
 
-    /// Commits what the frame holds as the next buffer of it ([`Self::flush`])
-    /// and waits until the buffer ahead of that one completed: the device
-    /// is then on what was just committed, nothing queued behind it. A
-    /// caller reading something between fires of a frame of long ones
-    /// waits for at most the one fire in flight.
-    pub(crate) fn cut(&self) -> Result<()> {
-        #[cfg(target_vendor = "apple")]
-        {
-            if !self.flush()? {
-                return Err(Fault::Device {
-                    call: "flush",
-                    why: "a frame cut between fires holds an open blit pass".to_string(),
-                });
-            }
-            let flushed = self.flushed.borrow();
-            if let Some(ahead) = flushed.len().checked_sub(2).map(|at| &flushed[at]) {
-                ahead.waitUntilCompleted();
-            }
-            Ok(())
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            Err(Fault::Deviceless)
-        }
-    }
-
-    /// [`Self::commit_timed`] of a frame [`Self::cut`] between its fires:
-    /// the GPU seconds each of its buffers ran, summed, the gaps between
-    /// them (the device waiting on the next commit) not counted.
-    pub fn commit_busy(mut self) -> Result<f64> {
-        #[cfg(target_vendor = "apple")]
-        {
-            let buffer = self.commit_buffer();
-            buffer.waitUntilCompleted();
-            let mut busy = 0.0;
-            for buffer in self.flushed.get_mut().iter().chain([&buffer]) {
-                if let Some(error) = buffer.error() {
-                    return Err(Fault::Device {
-                        call: "waitUntilCompleted",
-                        why: error.localizedDescription().to_string(),
-                    });
-                }
-                busy += buffer.GPUEndTime() - buffer.GPUStartTime();
-            }
-            Ok(busy)
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            let _ = self.encoder.take();
-            Err(Fault::Deviceless)
-        }
-    }
-
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     pub fn commit_async(
         mut self,

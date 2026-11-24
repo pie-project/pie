@@ -102,10 +102,14 @@ pub enum Tally {
     /// and the step ran the buffered body. What a served run read this
     /// against [`Tally::FiresFolds`] says without a trace; no fault.
     FiresBuffers,
+    /// A serving fire walked (recording nothing) for the data its body's
+    /// replay reads, which the load laid for none of its shape: arming
+    /// after ready, so 0 on a load whose arm walk laid every fill.
+    FilledInFire,
 }
 
 impl Tally {
-    pub const ALL: [Tally; 14] = [
+    pub const ALL: [Tally; 15] = [
         Tally::Compiled,
         Tally::Fallback,
         Tally::Unrecorded,
@@ -120,6 +124,7 @@ impl Tally {
         Tally::LoadedInFire,
         Tally::FiresFolds,
         Tally::FiresBuffers,
+        Tally::FilledInFire,
     ];
 
     /// Its name in the model status.
@@ -140,6 +145,7 @@ impl Tally {
             Tally::LoadedInFire => "loaded_in_fire",
             Tally::FiresFolds => "fires_folds",
             Tally::FiresBuffers => "fires_buffers",
+            Tally::FilledInFire => "filled_in_fire",
         }
     }
 }

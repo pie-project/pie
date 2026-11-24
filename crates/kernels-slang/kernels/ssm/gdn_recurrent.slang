@@ -120,12 +120,18 @@ struct Params {
     uint u_row;
 #endif
 };
-PIE_PARAMS(PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PARAMS_AT, Params, params);
+
+// The window's fields, read from the fire block once at the top of `main`,
+// ahead of the address math they feed.
+static uint fired_row0;
+static uint fired_indptr_at;
+static uint fired_lane0;
 
 #if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
 // The window's CSR boundary `i`.
 int csr(uint i) {
-    return indptr[uint(params.indptr_at) + i];
+    return indptr[fired_indptr_at + i];
 }
 #endif
 #if defined(PIE_DK_REG)
@@ -182,7 +188,7 @@ static float st[PIE_DK_REG];
 
 // Token `t` of value head `hv` (key head `hk`), its state at `state_base`.
 void token(uint tid, uint window_t, uint hv, uint hk, uint state_base) {
-    uint t = params.row0 + window_t;
+    uint t = fired_row0 + window_t;
     uint dk = uint(params.k_dim);
     uint dv = uint(params.v_dim);
     uint keys = uint(params.k_heads) * dk;
@@ -354,6 +360,13 @@ void snap_cells(uint tid, uint from, int snap, uint n, uint hv, uint head) {
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    fired_row0 = uint(PIE_FIRE(row0));
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+    fired_indptr_at = uint(PIE_FIRE(indptr_at));
+#endif
+#if defined(PIE_COMMITTED)
+    fired_lane0 = uint(PIE_FIRE(lane0));
+#endif
     uint tid = local.x;
     uint hv = group.y;
     uint hk = hv / (uint(params.v_heads) / uint(params.k_heads));
@@ -367,11 +380,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     uint r = group.z;
 #if defined(PIE_COMMITTED)
-    uint lane = uint(params.lane0) + r;
+    uint lane = fired_lane0 + r;
     if (tid == 0u) {
         int begin = csr(r);
         for (uint j = 0; j < r; j++) {
-            begin += replay[uint(params.lane0) + j];
+            begin += replay[fired_lane0 + j];
         }
         int span = (csr(r + 1) - csr(r)) + replay[lane];
         gdn_lo = begin;
@@ -398,7 +411,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #if defined(PIE_DK_REG)
     reg_load(tid, bank);
     for (int t = 0; t < span; t++) {
-        land_at(cl, rep, t, tid, params.row0 + uint(begin + t), hv, hk);
+        land_at(cl, rep, t, tid, fired_row0 + uint(begin + t), hv, hk);
         token(tid, uint(begin + t), hv, hk, 0u);
         if (t + 1 == keep) {
             reg_store(tid, bank);
@@ -427,7 +440,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     GroupMemoryBarrierWithGroupSync();
     for (int t = 0; t < span; t++) {
-        land_at(cl, rep, t, tid, params.row0 + uint(begin + t), hv, hk);
+        land_at(cl, rep, t, tid, fired_row0 + uint(begin + t), hv, hk);
         token(tid, uint(begin + t), hv, hk, state_base);
         if (t + 1 == keep) {
             for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
@@ -461,7 +474,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (end <= begin) {
         return;
     }
-    uint state_base = state_at(params.row0 + uint(begin), hv, head);
+    uint state_base = state_at(fired_row0 + uint(begin), hv, head);
 #if defined(PIE_SNAPS)
     int snap = pie_snap_lane(r);
     uint snapped = 0u;
@@ -489,10 +502,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
 #else
     // A padding row holds no record (its slot -1): it folds nothing.
-    if (pie_state_none(params.row0 + r)) {
+    if (pie_state_none(fired_row0 + r)) {
         return;
     }
-    uint state_base = state_at(params.row0 + r, hv, head);
+    uint state_base = state_at(fired_row0 + r, hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, state_base);
 #endif

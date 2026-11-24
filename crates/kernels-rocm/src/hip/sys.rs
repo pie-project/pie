@@ -98,7 +98,6 @@ table!(Hip from "libamdhip64.so" {
     fn hipStreamCreate(stream: *mut Stream) -> HipError;
     fn hipStreamDestroy(stream: Stream) -> HipError;
     fn hipStreamSynchronize(stream: Stream) -> HipError;
-    fn hipStreamQuery(stream: Stream) -> HipError;
     fn hipModuleLoadData(module: *mut Module, image: *const c_void) -> HipError;
     fn hipModuleUnload(module: Module) -> HipError;
     fn hipModuleGetFunction(function: *mut Function, module: Module, name: *const c_char) -> HipError;

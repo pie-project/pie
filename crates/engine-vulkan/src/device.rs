@@ -14,7 +14,7 @@ pub use alloc::{Buffer, FileWriter, Memory};
 #[cfg(feature = "vulkan")]
 pub use block::{ArmBlock, Image};
 #[cfg(feature = "vulkan")]
-pub use ctx::{Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations};
+pub use ctx::{Context, Enabled, Frame, Kept, Pending, Stamps, held_counts, present, reservations, take_spent};
 #[cfg(feature = "vulkan")]
 pub use pipelines::{Pipeline, Pipelines};
 
@@ -39,7 +39,7 @@ pub mod pipelines {
 #[cfg(not(feature = "vulkan"))]
 pub use stub::{
     ArmBlock, Buffer, Context, Enabled, FileWriter, Frame, Image, Kept, Memory, Pending, Pipeline,
-    Pipelines, Stamps, present, reservations,
+    Pipelines, Stamps, held_counts, present, reservations, take_spent,
 };
 
 /// The shared engine's view of this API.

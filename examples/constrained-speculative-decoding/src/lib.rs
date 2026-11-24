@@ -377,6 +377,9 @@ impl Target {
         let target_out = Channel::new([rows], dtype::i32);
 
         let fwd = ForwardPass::new();
+        // The next window writes the rejected draft rows' slots again: the
+        // verify takes rows back (CONTRACT-BC 25).
+        fwd.retractable()?;
         fwd.embed(&tokens, &embed_indptr)?;
         fwd.readout(&readout)?;
         fwd.state(

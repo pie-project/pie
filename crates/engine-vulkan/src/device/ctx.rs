@@ -172,6 +172,9 @@ pub(crate) struct Core {
     /// and gives them back once its fence passed; serving makes none
     /// ([`Context::seal_descriptor_pools`]).
     spares: Mutex<Spares>,
+    /// Descriptor sets shared for the device's life ([`Frame::shared_set`],
+    /// [`Frame::fire_set`]), from pools of their own.
+    shared: Mutex<SharedSets>,
     /// Woken as pools come back.
     given: std::sync::Condvar,
 
@@ -291,6 +294,16 @@ impl Core {
     }
 
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
+        if matches!(
+            code,
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                | vk::Result::ERROR_OUT_OF_POOL_MEMORY
+                | vk::Result::ERROR_FRAGMENTED_POOL
+                | vk::Result::ERROR_FRAGMENTATION
+        ) {
+            SPENT.store(true, Ordering::Release);
+        }
         Fault::Vulkan {
             what: call,
             code: code.as_raw(),
@@ -442,6 +455,118 @@ impl Core {
 /// one-time frame (every frame a served step submits) takes only these and
 /// a kept one (a recording, built and counted as one) makes its own, with
 /// `stock` the pools the load laid.
+/// Descriptor sets the device shares for its life: a kept frame's set by
+/// its layout and what it binds, the fire block's set by its layout and
+/// buffer.
+#[derive(Debug, Default)]
+pub(crate) struct SharedSets {
+    sets: std::collections::HashMap<(u64, u64), vk::DescriptorSet>,
+    pools: Vec<vk::DescriptorPool>,
+}
+
+/// Command buffers frames hold now, and frames alive (each holding a
+/// fence): named on the arm walk's progress (a driver that caps them fails
+/// past a count, not a size).
+pub(crate) static LIVE_CMDS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub(crate) static LIVE_FRAMES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The driver ran out of what frames take (memory, pool room, command
+/// buffers) since the last [`take_spent`]: set where the call failed, read by
+/// the caller whatever its error became on the way up.
+static SPENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the driver ran out of what frames take since the last call.
+pub fn take_spent() -> bool {
+    SPENT.swap(false, Ordering::AcqRel)
+}
+
+/// What the device holds for frames now: command buffers, frames, shared
+/// descriptor sets, descriptor pools made and freed.
+#[must_use]
+pub fn held_counts() -> (i64, i64, u64, u64, u64) {
+    (
+        LIVE_CMDS.load(Ordering::Relaxed),
+        LIVE_FRAMES.load(Ordering::Relaxed),
+        SHARED_SETS.load(Ordering::Relaxed),
+        POOLS_MADE.load(Ordering::Relaxed),
+        POOLS_FREED.load(Ordering::Relaxed),
+    )
+}
+
+impl Core {
+    /// One primary command buffer from `pool` (this thread's), refused by
+    /// name where the driver gives none, or a null one, back.
+    pub(crate) fn alloc_cmd(&self, pool: vk::CommandPool) -> Result<vk::CommandBuffer> {
+        // SAFETY: `pool` is the calling thread's own pool, which no other
+        // thread allocates from or frees into, so its external sync holds.
+        let got = unsafe {
+            self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| self.fault("vkAllocateCommandBuffers", e))?;
+        match got.first().copied() {
+            Some(cmd) if cmd != vk::CommandBuffer::null() => {
+                LIVE_CMDS.fetch_add(1, Ordering::Relaxed);
+                Ok(cmd)
+            }
+            _ => Err({
+                SPENT.store(true, Ordering::Release);
+                Fault::Ceiling {
+                what: "command buffers: the driver allocated a null one",
+                need: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0) + 1,
+                have: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0),
+            }}),
+        }
+    }
+}
+
+impl Core {
+    /// The set shared under `key` of `layout`, allocated where none is yet;
+    /// whether it was.
+    fn shared_set(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        key: u64,
+    ) -> Result<(vk::DescriptorSet, bool)> {
+        use ash::vk::Handle;
+        let mut shared = self.shared.lock().expect("shared lock poisoned");
+        let at = (layout.as_raw(), key);
+        if let Some(&set) = shared.sets.get(&at) {
+            return Ok((set, false));
+        }
+        let layouts = [layout];
+        let mut got = None;
+        if let Some(&pool) = shared.pools.last() {
+            let info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            // SAFETY: the `shared` lock is the pool's external sync; `layout`
+            // is a live layout of this device.
+            got = unsafe { self.device.allocate_descriptor_sets(&info) }.ok();
+        }
+        let set = match got {
+            Some(sets) => sets[0],
+            None => {
+                let pool = self.new_descriptor_pool_of(SETS_PER_POOL)?;
+                shared.pools.push(pool);
+                let info = vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(&layouts);
+                // SAFETY: as above, from the fresh pool.
+                unsafe { self.device.allocate_descriptor_sets(&info) }
+                    .map_err(|e| self.fault("vkAllocateDescriptorSets", e))?[0]
+            }
+        };
+        SHARED_SETS.fetch_add(1, Ordering::Relaxed);
+        shared.sets.insert(at, set);
+        Ok((set, true))
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Spares {
     free: Vec<vk::DescriptorPool>,
@@ -507,6 +632,7 @@ impl Core {
                 // submission naming its sets waited its fence before then.
                 unsafe { self.device.destroy_descriptor_pool(pool, None) };
             }
+            POOLS_FREED.fetch_add(pools.len() as u64, Ordering::Relaxed);
             let mut spares = self.spares.lock().expect("spares lock poisoned");
             spares.lent -= pools.len();
             spares.kept -= pools.len();
@@ -537,6 +663,7 @@ impl Core {
     /// A descriptor pool of `sets` sets, each binding up to 8 storage
     /// buffers and a uniform on average.
     fn new_descriptor_pool_of(&self, sets: u32) -> Result<vk::DescriptorPool> {
+        POOLS_MADE.fetch_add(1, Ordering::Relaxed);
         // A set binds its kernel's scalars as one uniform (the fire block's).
         let sizes = [
             vk::DescriptorPoolSize::default()
@@ -544,6 +671,9 @@ impl Core {
                 .descriptor_count(sets * 8),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(sets),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
                 .descriptor_count(sets),
         ];
         // A recording's pool segments are written after it binds them: its
@@ -593,6 +723,9 @@ impl Drop for Core {
             for pool in
                 std::mem::take(&mut self.spares.get_mut().expect("spares lock poisoned").free)
             {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
+            for pool in std::mem::take(&mut self.shared.get_mut().expect("shared lock poisoned").pools) {
                 self.device.destroy_descriptor_pool(pool, None);
             }
             // The instance is the process's (`shared_instance`).
@@ -1287,6 +1420,7 @@ impl Context {
             )])),
             spare_fences: Mutex::new(Vec::new()),
             spares: Mutex::new(Spares::default()),
+            shared: Mutex::new(SharedSets::default()),
             given: std::sync::Condvar::new(),
             watcher: Mutex::new(None),
             last: Mutex::new(Last::None),
@@ -1733,6 +1867,12 @@ impl Context {
         Ok(())
     }
 
+    /// Names the descriptor sets and pools frames allocated so far (as
+    /// every 10,000 sets do).
+    pub fn name_descriptor_sets(&self) {
+        count_sets(&self.core, 0, false);
+    }
+
     /// The descriptor pools free, lent and kept now.
     #[must_use]
     pub fn descriptor_pools(&self) -> (usize, usize, usize) {
@@ -1937,16 +2077,9 @@ impl Context {
         let pool = core.thread_pool()?;
         // SAFETY: `pool` is this thread's own pool, which no other thread
         // allocates from or frees into, so its external sync holds.
-        let cmd = unsafe {
-            d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        let cmd = core.alloc_cmd(pool)?;
         let fence = core.lend_fence()?;
+        LIVE_FRAMES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `cmd` was just allocated on this thread and is in the
         // initial state, so it may be begun; the barrier below records into it
         // while it is still only this function's.
@@ -2252,6 +2385,9 @@ impl Drop for Inner {
                 self.segments.get_mut().expect("segments lock poisoned"),
             ));
             buffers.push(self.cmd());
+            buffers.retain(|&cmd| cmd != vk::CommandBuffer::null());
+            LIVE_CMDS.fetch_sub(buffers.len() as i64, Ordering::Relaxed);
+            LIVE_FRAMES.fetch_sub(1, Ordering::Relaxed);
             if owned {
                 d.free_command_buffers(self.cmd_pool, &buffers);
             } else {
@@ -2301,6 +2437,56 @@ impl Inner {
 }
 
 const SETS_PER_POOL: u32 = 1024;
+
+/// Descriptor sets allocated by frames, all and those kept frames took, and
+/// descriptor pools made, over the process: named every 10,000 sets (a
+/// driver that allocates host memory per set runs out of its allocator's
+/// room for them before the host's).
+static SETS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KEPT_SETS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOLS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Sets shared for the device's life ([`SharedSets`]).
+static SHARED_SETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Kept frames' pools destroyed with them.
+static POOLS_FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static TUPLES: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes a kept dispatch's binding tuple (diagnostic).
+pub(crate) fn note_tuple(key: u64) {
+    TUPLES
+        .lock()
+        .expect("tuples lock poisoned")
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key);
+}
+
+fn count_sets(core: &Core, sets: u64, kept: bool) {
+    if kept {
+        KEPT_SETS_MADE.fetch_add(sets, Ordering::Relaxed);
+    }
+    let before = SETS_MADE.fetch_add(sets, Ordering::Relaxed);
+    if sets == 0 || (before + sets) / 10_000 > before / 10_000 {
+        let spares = core.spares.lock().expect("spares lock poisoned");
+        tracing::info!(
+            sets = before + sets,
+            kept_sets = KEPT_SETS_MADE.load(Ordering::Relaxed),
+            pools_made = POOLS_MADE.load(Ordering::Relaxed),
+            pools_freed = POOLS_FREED.load(Ordering::Relaxed),
+            shared_sets = SHARED_SETS.load(Ordering::Relaxed),
+            pools_free = spares.free.len(),
+            pools_lent = spares.lent,
+            pools_kept = spares.kept,
+            distinct_kept_tuples = TUPLES
+                .lock()
+                .expect("tuples lock poisoned")
+                .as_ref()
+                .map_or(0, std::collections::HashSet::len),
+            "vulkan descriptor sets allocated so far"
+        );
+    }
+}
 
 /// A kept frame's pools: a body's sets a few pools of these.
 const KEPT_SETS_PER_POOL: u32 = 64;
@@ -2488,23 +2674,34 @@ impl Frame {
         }
         let core = &self.inner.core;
         let d = &core.device;
-        // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
-        // owned by this thread (frames record on the thread that opened
-        // them); the head is recorded here alone and freed with the frame.
-        let head = unsafe {
-            d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.inner.cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
+        // A recording's head is its arm's, shared by every recording whose
+        // image fits the bytes it copies (the next power of two): it lives
+        // with the device's pools, not the frame. A frame run once has its
+        // own, freed with it.
+        let mut shared = None;
+        let bytes = if one_time {
+            bytes
+        } else {
+            let size = bytes.next_power_of_two().min(arm.bytes());
+            let heads = arm.heads.lock().expect("heads lock poisoned");
+            if let Some(&head) = heads.get(&size) {
+                return Ok(Some(head));
+            }
+            shared = Some(size);
+            size
+        };
+        let head = core.alloc_cmd(self.inner.cmd_pool)?;
+        match shared {
+            Some(size) => {
+                arm.heads.lock().expect("heads lock poisoned").insert(size, head);
+            }
+            None => self
+                .inner
+                .heads
+                .lock()
+                .expect("heads lock poisoned")
+                .push(head),
         }
-        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
-        self.inner
-            .heads
-            .lock()
-            .expect("heads lock poisoned")
-            .push(head);
         let flags = if one_time {
             vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
         } else {
@@ -2655,14 +2852,16 @@ impl Frame {
     /// commands would carry, each dispatch's group counts, each readout
     /// copy's regions hashed, the block's image, and the cuts it made.
     #[must_use]
-    pub fn into_fill(self) -> Fill {
+    pub fn into_fill(mut self) -> Fill {
         use std::hash::Hasher;
+        // A fill walk's buffer recorded nothing: it goes unended, as meant.
+        self.open = false;
         Fill {
             baked: self.baked.borrow().finish(),
             trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
-            image: self.block.borrow().image().sealed(),
+            image: self.block.borrow_mut().take_image().seal(),
             cuts: self.cuts(),
             room_pasts: self.room_pasts.borrow().clone(),
         }
@@ -2670,12 +2869,18 @@ impl Frame {
 
     /// Folds `what`, a command the frame records, into its hash.
     pub(crate) fn bake(&self, what: &(impl std::hash::Hash + std::fmt::Debug)) {
+        self.bake_named("", what);
+    }
+
+    /// [`Self::bake`], the trail naming the command `name` (a kernel's
+    /// entry point): what reads a parting as more than a key.
+    pub(crate) fn bake_named(&self, name: &str, what: &(impl std::hash::Hash + std::fmt::Debug)) {
         if tracing::enabled!(target: "vkbakeall", tracing::Level::TRACE) {
             tracing::trace!(target: "vkbakeall", what = ?what, "bake");
         }
         what.hash(&mut *self.baked.borrow_mut());
         if trailing() {
-            self.trail.borrow_mut().push(format!("{what:?}"));
+            self.trail.borrow_mut().push(format!("{what:?} {name}"));
         }
     }
 
@@ -2712,6 +2917,95 @@ impl Frame {
             .lock()
             .expect("keep lock poisoned")
             .push(Arc::clone(slab));
+    }
+
+    /// A kept frame's set for a dispatch whose layout and bindings hash to
+    /// `key`: one set for every recording that binds the same, for the
+    /// device's life; whether it is new (its bindings to write). Its
+    /// bindings are written again by each frame that takes it, alike but for
+    /// a pool segment's or a score room's, which a rebind or a replay writes
+    /// in any case.
+    pub(crate) fn shared_set(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        key: u64,
+    ) -> Result<vk::DescriptorSet> {
+        self.inner.core.shared_set(layout, key).map(|(set, _)| set)
+    }
+
+    /// [`Self::shared_set`], and whether it is new: a held one's bindings
+    /// are the ones its key hashes (a pool segment's and a score room's
+    /// written by a rebind or a replay), written when it was made.
+    pub(crate) fn shared_set_fresh(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        key: u64,
+    ) -> Result<(vk::DescriptorSet, bool)> {
+        self.inner.core.shared_set(layout, key)
+    }
+
+    /// The fire block's set of `layout` over `buffer` (its uniform at the
+    /// buffer's start, `range` bytes, a dispatch's place its dynamic
+    /// offset): one for every dispatch of the kernel over that buffer.
+    pub(crate) fn fire_set(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        binding: u32,
+        buffer: vk::Buffer,
+        range: u64,
+    ) -> Result<vk::DescriptorSet> {
+        use ash::vk::Handle;
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (buffer.as_raw(), range, binding).hash(&mut h);
+        let core = &self.inner.core;
+        let (set, fresh) = core.shared_set(layout, h.finish())?;
+        if fresh {
+            let info = vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .offset(0)
+                .range(range);
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(binding)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .buffer_info(std::slice::from_ref(&info));
+            // SAFETY: the set was just allocated and no command binds it yet;
+            // `buffer` is the arm's fire block, live for the device.
+            unsafe { core.device.update_descriptor_sets(&[write], &[]) };
+        }
+        Ok(set)
+    }
+
+    /// The frame lays in an arm's fire block (live for the device), not
+    /// chunks of its own.
+    pub(crate) fn arms_block(&self) -> bool {
+        self.block.borrow().arm().is_some()
+    }
+
+    /// [`Frame::fire_set`] for an arm-less frame, whose chunks go with it:
+    /// a set of the frame's own.
+    pub(crate) fn own_fire_set(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        binding: u32,
+        buffer: vk::Buffer,
+        range: u64,
+    ) -> Result<vk::DescriptorSet> {
+        let set = self.descriptor_set(layout)?;
+        let info = vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(range);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(binding)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .buffer_info(std::slice::from_ref(&info));
+        // SAFETY: the set was handed to this dispatch alone; `buffer` is a
+        // chunk the frame retains.
+        unsafe { self.inner.core.device.update_descriptor_sets(&[write], &[]) };
+        Ok(set)
     }
 
     pub(crate) fn descriptor_set(
@@ -2757,6 +3051,7 @@ impl Frame {
             }
         };
         drop(pools);
+        count_sets(core, batch as u64, self.kept);
         let one = sets.pop().expect("a batch of one or more");
         if !sets.is_empty() {
             self.inner
@@ -2978,7 +3273,28 @@ impl Frame {
         if self.dry {
             return Ok(());
         }
-        let set = self.descriptor_set(self.copier.set_layout)?;
+        // A recording's copier set is the device's for every recording that
+        // copies alike on the arm (its table lies in the arm's block); a
+        // score room's source by its tag, a replay writing it.
+        let set = if self.kept {
+            use ash::vk::Handle;
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let source = if room_src && self.copier.rooms & 1 != 0 { 0 } else { src.buffer.as_raw() };
+            (
+                source,
+                src_range,
+                dst.buffer.as_raw(),
+                dst_range,
+                table_buffer.as_raw(),
+                table_place.1,
+                table.len(),
+            )
+                .hash(&mut h);
+            self.shared_set(self.copier.set_layout, h.finish())?
+        } else {
+            self.descriptor_set(self.copier.set_layout)?
+        };
         if room_src && self.kept && self.copier.rooms & 1 != 0 {
             self.room_binds(set, 0, 0, u64::MAX);
         } else if room_src && self.kept {
@@ -2997,27 +3313,33 @@ impl Frame {
                 .buffer(table_buffer)
                 .offset(table_place.1)
                 .range(table.len() as u64),
-            vk::DescriptorBufferInfo::default()
-                .buffer(params_buffer)
-                .offset(params_place.1)
-                .range(u64::from(fire.bytes)),
         ];
         let writes: Vec<vk::WriteDescriptorSet<'_>> = infos
             .iter()
             .enumerate()
             .map(|(at, info)| {
-                let ty = if at as u32 == fire.binding {
-                    vk::DescriptorType::UNIFORM_BUFFER
-                } else {
-                    vk::DescriptorType::STORAGE_BUFFER
-                };
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(at as u32)
-                    .descriptor_type(ty)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(std::slice::from_ref(info))
             })
             .collect();
+        // Its count at its place in the fire block, the set 1 offset.
+        let fire_layout = self
+            .copier
+            .fire_layout
+            .expect("the copier reads its count from the fire block");
+        let fire_set = if self.arms_block() {
+            self.fire_set(fire_layout, fire.binding, params_buffer, u64::from(fire.bytes))?
+        } else {
+            self.own_fire_set(fire_layout, fire.binding, params_buffer, u64::from(fire.bytes))?
+        };
+        let fire_at = u32::try_from(params_place.1).map_err(|_| Fault::Ceiling {
+            what: "the fire block's place of a copy's count, as a dynamic offset",
+            need: params_place.1,
+            have: u64::from(u32::MAX),
+        })?;
         let host = into.is_host();
         let d = &core.device;
         let cmd = self.inner.cmd();
@@ -3047,8 +3369,8 @@ impl Frame {
                 vk::PipelineBindPoint::COMPUTE,
                 self.copier.layout,
                 0,
-                &[set],
-                &[],
+                &[set, fire_set],
+                &[fire_at],
             );
             if self.copier.push_bytes > 0 {
                 d.cmd_push_constants(
@@ -3201,15 +3523,7 @@ impl Frame {
             .expect("held lock poisoned")
             .push(cmd);
         // SAFETY: `cmd_pool` is this frame's (this thread's) pool.
-        let next = unsafe {
-            d.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.inner.cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }
-        .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+        let next = core.alloc_cmd(self.inner.cmd_pool)?;
         self.inner
             .cmd
             .store(vk::Handle::as_raw(next), Ordering::Release);
@@ -3294,15 +3608,7 @@ impl Frame {
             // SAFETY: `cmd_pool` is the pool this frame's buffers came from,
             // owned by this thread (frames record on the thread that opened
             // them).
-            let next = unsafe {
-                d.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(self.inner.cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-            }
-            .map_err(|e| core.fault("vkAllocateCommandBuffers", e))?[0];
+            let next = core.alloc_cmd(self.inner.cmd_pool)?;
             self.inner
                 .cuts
                 .lock()
@@ -3483,8 +3789,7 @@ impl Drop for Frame {
         // buffer may be in no state to end (a driver that failed an
         // allocation inside it, or a flush that ended it and failed before
         // the next began), and ending it there faults in the driver.
-        if self.open {
-            self.open = false;
+        if std::mem::take(&mut self.open) && !self.dry {
             tracing::warn!(
                 recording = self.inner.recording.load(Ordering::Acquire),
                 "vulkan: an open frame dropped uncommitted; its buffer freed unended"
@@ -4061,7 +4366,8 @@ impl Inner {
         if timing.harvested || timing.names.is_empty() {
             return;
         }
-        timing.harvested = true;
+        // A kept frame's timestamps are written again on every replay.
+        timing.harvested = self.one_time;
         let n = timing.names.len() as u32;
         let mut ticks = vec![0u64; (n * 2) as usize];
         // SAFETY: the caller waited on the fence, so every written query is
@@ -4090,6 +4396,7 @@ impl Inner {
             let ns = (span as f64 * period) as u64;
             crate::encode::credit(name, ns);
         }
+        crate::encode::dump_profile();
     }
 }
 

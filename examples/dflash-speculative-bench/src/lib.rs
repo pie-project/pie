@@ -723,6 +723,8 @@ async fn main(input: Input) -> Result<Output> {
             let want_sure = input.verify_budget;
 
             let fwd = ForwardPass::new();
+            // The verify writes these draft slots again (CONTRACT-BC 25).
+            fwd.retractable()?;
             fwd.switch(0, "block_draft", "on")
                 .map_err(|why| format!("stating the draft block: {why}"))?;
             fwd.embed(&toks, &indptr)?;
@@ -800,6 +802,11 @@ async fn main(input: Input) -> Result<Output> {
         let truth = Channel::new([verify], dtype::i32).capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
+        // A drafting round's verify leaves its rejected tail for the next
+        // round to write again: it takes rows back (CONTRACT-BC 25).
+        if drafting {
+            fwd.retractable()?;
+        }
         fwd.embed(&toks, &indptr)?;
         fwd.readout(&readout)?;
         fwd.state(

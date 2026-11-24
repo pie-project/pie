@@ -99,6 +99,9 @@ async fn draw_ahead(
     let rng = Channel::from([input.seed, input.drawn + 1]);
     let out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
     let fwd = ForwardPass::new();
+    // The set is given back holding only what was drawn: the rows run past
+    // the stop are taken back, so the pass is not final (CONTRACT-BC 25).
+    fwd.retractable()?;
     fwd.embed(&tok, &indptr)?;
     fwd.state(&[ws], StateGeometry::folding())?;
     let (tok_in, sampled) = (tok.clone(), out.clone());

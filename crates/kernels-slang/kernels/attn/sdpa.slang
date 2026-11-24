@@ -229,6 +229,10 @@ struct Params {
     // whatever window a fire cuts; a dispatch's `row` is the window's.
     // Fired: it moves with the rows of the classes before the window.
     uint row0;
+    // The row of the position, owner and mask-word tables the window's row
+    // 0 is (the tables bound whole too): `row0`, but for a query of the
+    // fire's readouts, whose rows are not the window's tokens. Fired.
+    uint table0;
 #if defined(PIE_SELECTED)
     int top_k;
     int ratio;
@@ -259,9 +263,22 @@ struct Params {
 PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
 
+// The window's first rows, read from the fire block once at the top of
+// `main` (`HOIST_FIRE`), ahead of the address math they feed.
+static uint fired_row0;
+static uint fired_table0;
+#define HOIST_FIRE() \
+    fired_row0 = uint(PIE_FIRE(row0)); \
+    fired_table0 = uint(PIE_FIRE(table0))
+
 // The fire row a window's row `row` is.
 uint fire_row(uint row) {
-    return uint(PIE_FIRE(row0)) + row;
+    return fired_row0 + row;
+}
+
+// The tables' row a window's row `row` is.
+uint table_row(uint row) {
+    return fired_table0 + row;
 }
 
 // The bf16 element key `kp` of request `req` starts at in its plane: its
@@ -378,7 +395,7 @@ void ring_find(uint w, out uint seg, out uint local) {
 
 // Row `row`'s boundary, read once a row: `MASK_NONE` where it states no mask.
 uint mask_origin(uint row) {
-    return attention_mask_words[2u * fire_row(row)];
+    return attention_mask_words[2u * table_row(row)];
 }
 
 // Whether row `row`'s mask admits key `kp`, `origin` its boundary. A row's
@@ -391,7 +408,7 @@ bool mask_admits(uint row, uint origin, uint kp) {
     if (kp < origin) {
         return true;
     }
-    return mask_byte(attention_mask_words[2u * fire_row(row) + 1u] + (kp - origin)) != 0u;
+    return mask_byte(attention_mask_words[2u * table_row(row) + 1u] + (kp - origin)) != 0u;
 }
 
 bool keeps(uint row, uint origin, int kp, int q_pos, int start) {
@@ -449,6 +466,7 @@ groupshared int sdpa_first;
 [shader("compute")]
 [numthreads(PIE_TILE_LANES, PIE_TILE_ROWS, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint lane = local.x;
     uint slot_y = local.y;
@@ -456,11 +474,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint row = tile * uint(PIE_TILE_ROWS) + slot_y;
     bool live = row < uint(PIE_FIRE(n_rows));
 
-    int req = live ? req_of_token[fire_row(row)] : 0;
+    int req = live ? req_of_token[table_row(row)] : 0;
 #if defined(PIE_RING)
     Keys ring = keys_of(req);
 #endif
-    int q_pos = live ? position_ids[fire_row(row)] : -1;
+    int q_pos = live ? position_ids[table_row(row)] : -1;
     uint origin = live ? mask_origin(row) : MASK_NONE;
 #if defined(PIE_RING)
     int start = live ? ring_start(ring, q_pos) : 0;
@@ -479,10 +497,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         for (uint r = 0u; r < uint(PIE_TILE_ROWS); r++) {
             uint at = tile * uint(PIE_TILE_ROWS) + r;
             if (at < uint(PIE_FIRE(n_rows))) {
-                int pos = position_ids[fire_row(at)];
+                int pos = position_ids[table_row(at)];
                 last = max(last, pos);
 #if defined(PIE_RING)
-                first = min(first, ring_start(keys_of(req_of_token[fire_row(at)]), pos));
+                first = min(first, ring_start(keys_of(req_of_token[table_row(at)]), pos));
 #else
                 first = min(first, window_start(pos));
 #endif
@@ -673,7 +691,7 @@ float bf16_of(uint16_t h) {
 // `subgroups`-th step from its own and reduces within itself.
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint subgroups) {
-    int req = req_of_token[fire_row(row)];
+    int req = req_of_token[table_row(row)];
 #if defined(PIE_RING)
     Keys ring = keys_of(req);
 #endif
@@ -812,12 +830,13 @@ float decode_fold(uint d, float merged_max, uint subgroups) {
 [shader("compute")]
 [numthreads(PIE_DECODE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint row = group.y;
     uint tid = local.x;
-    int q_pos = position_ids[fire_row(row)];
+    int q_pos = position_ids[table_row(row)];
 #if defined(PIE_RING)
-    int start = ring_start(keys_of(req_of_token[fire_row(row)]), q_pos);
+    int start = ring_start(keys_of(req_of_token[table_row(row)]), q_pos);
 #else
     int start = window_start(q_pos);
 #endif
@@ -897,7 +916,7 @@ groupshared int sdpa_start;
 // `walkers`-th step from its own.
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint walkers) {
-    int req = req_of_token[fire_row(row)];
+    int req = req_of_token[table_row(row)];
 #if defined(PIE_RING)
     Keys ring = keys_of(req);
 #endif
@@ -1049,15 +1068,16 @@ float2 folded_pair(uint d, float merged_max, float merged_sum, uint walkers) {
 [shader("compute")]
 [numthreads(PIE_DECODE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint row = group.y;
     uint tid = local.x;
     // Every lane reads the same row; staged and read uniformly, as the key
     // bound below decides loops of barriers and an early return.
     if (tid == 0u) {
-        sdpa_pos = position_ids[fire_row(row)];
+        sdpa_pos = position_ids[table_row(row)];
 #if defined(PIE_RING)
-        sdpa_start = ring_start(keys_of(req_of_token[fire_row(row)]), sdpa_pos);
+        sdpa_start = ring_start(keys_of(req_of_token[table_row(row)]), sdpa_pos);
 #endif
     }
     GroupMemoryBarrierWithGroupSync();

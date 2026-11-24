@@ -10,6 +10,7 @@ use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Target, Tier, dtype_dispatch, refuse, stated};
 use crate::error::Error;
+use crate::ssm::RowSpan;
 use crate::tensor::Tensor;
 
 const GEMM: &str = "linear/gemm.slang";
@@ -61,8 +62,9 @@ pub fn matmul(
     act: Tensor,
     w: Tensor,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, tactic, "linear.matmul", act, w, y)
+    act_x_wt(ctx, tactic, "linear.matmul", act, w, y, window)
 }
 
 pub fn lm_head(
@@ -71,8 +73,9 @@ pub fn lm_head(
     act: Tensor,
     w: Tensor,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
-    act_x_wt(ctx, tactic, "linear.matmul", act, w, y)
+    act_x_wt(ctx, tactic, "linear.matmul", act, w, y, window)
 }
 
 /// `y = act * w^T` on bf16.
@@ -185,13 +188,17 @@ pub fn act_x_wt(
     act: Tensor,
     w: Tensor,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
-    let (m, n, k) = extent(op, act, w, y)?;
+    let (_, n, k) = extent(op, act, w, y)?;
     let target = ctx.target();
     if let Some(names) = ctx.naming() {
         return names.either(&kernels(target, tactic, op, n, k)?);
     }
+    // The rows are bound whole and the window's first row is the fire's
+    // data (each kernel's `row0`): one body serves every window of a fire.
+    let m = window.rows.min(y.rows.saturating_sub(window.row0));
     if m == 0 {
         return Ok(());
     }
@@ -200,17 +207,19 @@ pub fn act_x_wt(
     // (`linear/gemm.slang`'s kernels; the others carry their rows).
     let fixed = if ctx.fixed_rows() { m } else { 0 };
     let fire = kernel(target, tactic, op, m, n, k)?;
-    let args = [
+    let mut args = vec![
         act.arg(),
         w.arg(),
         y.arg_mut(),
         stated(op, m)?.arg(),
         stated(op, n)?.arg(),
         stated(op, k)?.arg(),
-        stated(op, fixed)?.arg(),
     ];
-    let takes = if fire.file == GEMM { args.len() } else { args.len() - 1 };
-    ctx.fire(fire, &args[..takes])
+    if fire.file == GEMM {
+        args.push(stated(op, fixed)?.arg());
+    }
+    args.push(window.row0.arg());
+    ctx.fire(fire, &args)
 }
 
 /// Every kernel a projection of `n` columns over a contraction of `k`

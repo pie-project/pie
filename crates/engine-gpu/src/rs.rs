@@ -524,6 +524,12 @@ pub struct Seat {
     pub work: Tensor,
     pub rows_ext: u32,
 
+    /// The most runs a recurrent copy of the fire moves
+    /// ([`kernels_slang::gather::rows::copy_runs`]): every lane's rows over
+    /// the most pages its rung's rows span, twice, and a run of its own
+    /// each. The rung's, so every fire of a body copies alike.
+    pub run_most: usize,
+
     pub ext: RefCell<HashMap<u32, Tensor>>,
 
     /// The fire's beam groups' folds (`BEAM-PAGE-LISTS.md` §11.3): their
@@ -656,6 +662,8 @@ impl Seat {
         rows_ext: u32,
         folds: Option<Folds>,
         fold_lanes: Vec<u32>,
+        max_lanes: u32,
+        rung_rows: u32,
     ) -> Result<Seat> {
         // The planes lie where the load's reservation lays them for the top
         // rung's rows, bound at their room: one view whatever the fire.
@@ -703,6 +711,7 @@ impl Seat {
             u32::try_from(layout.work_elems).unwrap_or(u32::MAX),
             Dtype::F32,
         );
+        let run_most = run_most(rung_rows, buffers.page_tokens, max_lanes);
         Ok(Seat {
             lanes,
             carried,
@@ -719,6 +728,7 @@ impl Seat {
             ext_out,
             work,
             rows_ext,
+            run_most,
             ext: RefCell::new(HashMap::new()),
             folds,
             fold_lanes,
@@ -939,6 +949,57 @@ mod pack_tests {
                 total < sum,
                 "{rows} rows: {total} bytes, no sharing of {sum}"
             );
+        }
+    }
+}
+
+/// The most runs a recurrent copy of a fire at a rung of `rung_rows` moves,
+/// its rows in pages of `page_tokens` and at most `max_lanes` lanes: a
+/// lane's gathered and scattered rows each split at the pages they span (at
+/// most the rung's rows over a page, and one more a run), and its own rows.
+#[must_use]
+pub fn run_most(rung_rows: u32, page_tokens: u32, max_lanes: u32) -> usize {
+    let pages = u64::from(rung_rows.div_ceil(page_tokens.max(1)));
+    let lanes = u64::from(max_lanes.max(1)).min(u64::from(rung_rows.max(1)));
+    usize::try_from(2 * (pages + lanes) + lanes).unwrap_or(usize::MAX)
+}
+
+/// The run tables (each one copy dispatch's scalars) the widest fire of a
+/// load lays: every recurrent extend and land of a fire (`copies`) at the
+/// top rung's bound, pages of one row at the most (any page size lays no
+/// more), and the bytes of the largest. What a fire block is sized by.
+#[must_use]
+pub fn run_tables(copies: usize, top_rows: u32, max_lanes: u32) -> (u64, u64) {
+    let most = run_most(top_rows, 1, max_lanes);
+    let (runs, _, dispatches) = kernels_slang::gather::rows::copy_runs_plan(most);
+    let tables = u64::try_from(copies.saturating_mul(dispatches)).unwrap_or(u64::MAX);
+    (tables, 16 + 16 * runs as u64)
+}
+
+#[cfg(test)]
+mod run_bound {
+    use super::{run_most, run_tables};
+    use kernels_slang::gather::rows::copy_runs_plan;
+
+    /// The widest fire a load sizes its block for holds every fire's run
+    /// tables: any rung up to the top, any page size, the widest decode (the
+    /// most lanes, one row each) among them.
+    #[test]
+    fn the_widest_decode_fits_the_tables_a_block_is_sized_for() {
+        for top in [16u32, 64, 256, 512, 2048, 8192] {
+            for lanes in [1u32, 4, 64, 256, 1024] {
+                let (tables, bytes) = run_tables(1, top, lanes);
+                for rung in [1u32, top / 4, top / 2, top] {
+                    for page in [1u32, 8, 16, 64] {
+                        let (runs, _, dispatches) = copy_runs_plan(run_most(rung.max(1), page, lanes));
+                        assert!(
+                            dispatches as u64 <= tables && 16 + 16 * runs as u64 <= bytes,
+                            "top {top}, lanes {lanes}, rung {rung}, page {page}: {dispatches} \
+                             table(s) of {runs} runs past {tables} of {bytes} bytes"
+                        );
+                    }
+                }
+            }
         }
     }
 }

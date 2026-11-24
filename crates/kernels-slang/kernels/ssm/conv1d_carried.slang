@@ -44,7 +44,7 @@ struct Params {
     uint x_at;
     uint x_row;
 };
-PIE_PARAMS(9, Params, params);
+PIE_PARAMS_FIRED(9, Params, params);
 
 PIE_POOL_READ(uint, params.seg_words)
 PIE_POOL_WRITE(uint, params.seg_words)
@@ -75,8 +75,8 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
     // A workgroup's lanes are one lane's channels: none returns before its
     // barrier.
     bool active = c < chans;
-    uint lane = uint(params.lane0) + r;
-    uint row = params.row0 + r;
+    uint lane = uint(PIE_FIRE(lane0)) + r;
+    uint row = PIE_FIRE(row0) + r;
     int width = params.conv_width;
     int dil = params.dilation;
     int hist = (width - 1) * dil + 1;

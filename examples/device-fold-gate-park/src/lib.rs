@@ -134,6 +134,9 @@ async fn main(input: Input) -> Result<Output> {
         let turn = Channel::from([0u32]);
 
         let fwd = ForwardPass::new();
+        // A witness of the lagged, device-counted fold: the decode states
+        // itself retractable so its fold lags (CONTRACT-BC 25).
+        fwd.retractable()?;
         fwd.embed(&tok_in, &embed_indptr)?;
         fwd.state(
             &[&ws],

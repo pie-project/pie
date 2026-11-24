@@ -188,6 +188,8 @@ impl Context {
         match self.never {}
     }
 
+    pub fn name_descriptor_sets(&self) {}
+
     pub fn frame_dry(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -251,6 +253,12 @@ pub struct Fill {
     pub image: Image,
     pub cuts: usize,
     pub room_pasts: Vec<u64>,
+}
+
+impl Frame {
+    pub fn is_dry(&self) -> bool {
+        false
+    }
 }
 
 impl Frame {
@@ -358,6 +366,16 @@ impl Image {
     #[must_use]
     pub fn sealed(&self) -> Image {
         Image
+    }
+
+    #[must_use]
+    pub fn same(&self, _other: &Image) -> bool {
+        true
+    }
+
+    #[must_use]
+    pub fn layout(&self) -> Vec<usize> {
+        Vec::new()
     }
 }
 
@@ -663,4 +681,14 @@ impl Pipelines {
     pub fn hold(_device: &Context, _file: &'static str, _key: &'static str) -> Result<()> {
         Err(Fault::Deviceless)
     }
+}
+
+#[must_use]
+pub fn held_counts() -> (i64, i64, u64, u64, u64) {
+    (0, 0, 0, 0, 0)
+}
+
+#[must_use]
+pub fn take_spent() -> bool {
+    false
 }

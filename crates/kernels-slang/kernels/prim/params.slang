@@ -6,7 +6,9 @@
 // are the scalars in the order the host passes them.
 //
 // `PIE_PARAMS_FIRED` declares the same block, and on SPIR-V the same fields
-// again as a uniform at `binding_`, which engine-vulkan backs with the fire
+// again as a uniform at `binding_` of descriptor set 1 (a set of its own,
+// bound at the dispatch's place by a dynamic offset, so every dispatch of an
+// arm binds one), which engine-vulkan backs with the fire
 // block: the per-fire memory a recording reads what a fire changes from. A
 // field read as `PIE_FIRE(field)` (a row count, an element count, a GEMM's
 // M, a split's rows) comes from there, so a recording's commands do not
@@ -22,10 +24,10 @@
 #define PIE_FIRE(field_) params.field_
 #else
 #define PIE_PARAMS_FIRE_ONLY(binding_, type_, name_) \
-    [[vk::binding(binding_)]] ConstantBuffer<type_> pie_fire
+    [[vk::binding(binding_, 1)]] ConstantBuffer<type_> pie_fire
 #define PIE_PARAMS(binding_, type_, name_) [[vk::push_constant]] ConstantBuffer<type_> name_
 #define PIE_PARAMS_FIRED(binding_, type_, name_) \
     [[vk::push_constant]] ConstantBuffer<type_> name_; \
-    [[vk::binding(binding_)]] ConstantBuffer<type_> pie_fire
+    [[vk::binding(binding_, 1)]] ConstantBuffer<type_> pie_fire
 #define PIE_FIRE(field_) pie_fire.field_
 #endif

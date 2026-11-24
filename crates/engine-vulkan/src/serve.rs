@@ -8,10 +8,6 @@ use engine_gpu::serve::{Landed, Launch, Plan, Prepared, ReadSpan, Serve, Shell, 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
 
-/// The tables of runs (a recurrent copy's scalars, [`kernels_slang::gather::rows::copy_runs`])
-/// an arm's fire block holds room for in one fire: a recurrent layer's
-/// extends and lands.
-const RUN_TABLES: u64 = 512;
 
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
@@ -32,6 +28,108 @@ pub struct Shelf {
     /// ([`engine_gpu::guest::ring`]): laid here, before the pool is sized.
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(crate) guest: GuestRing,
+
+    /// The arm walk's fill on the first arm of the composition in hand (the
+    /// walk lays a composition on every arm before the next): what an arm
+    /// past it lays without a walk ([`Serve::derive_fill`]). Only the one:
+    /// a fill's image is the fire's whole block.
+    derived: Option<(usize, Derived)>,
+
+    /// Each first-arm family's on every other arm, as the walk recorded it.
+    arm_families: std::collections::HashMap<(crate::record::Key, usize), crate::record::Key>,
+
+    /// Fills laid without a walk; fills a verification walk found other
+    /// than its derived one (`PIE_VK_VERIFY_ARMS`).
+    derived_fills: u64,
+    derived_checked: u64,
+    derived_mismatches: u64,
+    /// The first arm's fills' image bytes, and how many.
+    image_bytes: (u64, u64),
+}
+
+/// A first-arm fill, as an arm past it lays it.
+struct Derived {
+    family: crate::record::Key,
+    groups: std::sync::Arc<Vec<[u32; 3]>>,
+    image: std::sync::Arc<crate::device::Image>,
+    layout: Vec<ReadSpan>,
+    launches: u32,
+    room_pasts: std::sync::Arc<Vec<u64>>,
+}
+
+/// Whether the arm walk walks every arm and checks each fill against the
+/// one it would derive (`PIE_VK_VERIFY_ARMS`), deriving none.
+fn verifying_arms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_VK_VERIFY_ARMS").is_some())
+}
+
+/// The arm walk filled composition `walk_at` on `arm` into `family`: the
+/// first arm's fill is kept to derive the others' from; another arm's
+/// family is kept as the first's on it, and, verifying, its fill is held
+/// to what it would have derived.
+#[allow(clippy::too_many_arguments)]
+fn note_fill(
+    shell: &mut Shell<Api>,
+    arm: usize,
+    family: crate::record::Key,
+    groups: &std::sync::Arc<Vec<[u32; 3]>>,
+    image: &std::sync::Arc<crate::device::Image>,
+    layout: &[ReadSpan],
+    launches: u32,
+    room_pasts: &std::sync::Arc<Vec<u64>>,
+) {
+    let Some(at) = shell.walk_at.filter(|_| shell.arming) else {
+        return;
+    };
+    if arm == 0 {
+        let bytes: usize = image.layout().iter().sum();
+        shell.shelf.image_bytes.0 += bytes as u64;
+        shell.shelf.image_bytes.1 += 1;
+        shell.shelf.derived = Some((
+            at,
+            Derived {
+                family,
+                groups: std::sync::Arc::clone(groups),
+                image: std::sync::Arc::clone(image),
+                layout: layout.to_vec(),
+                launches,
+                room_pasts: std::sync::Arc::clone(room_pasts),
+            },
+        ));
+        return;
+    }
+    let Some((_, first)) = shell.shelf.derived.as_ref().filter(|(held, _)| *held == at) else {
+        return;
+    };
+    let first_family = first.family;
+    if verifying_arms() {
+        shell.shelf.derived_checked += 1;
+        let mut parts = Vec::new();
+        if shell.shelf.arm_families.get(&(first_family, arm)).is_some_and(|&held| held != family) {
+            parts.push("family");
+        }
+        if first.groups != *groups {
+            parts.push("groups");
+        }
+        if !first.image.same(image) {
+            parts.push("image");
+        }
+        if format!("{:?}", first.layout) != format!("{layout:?}") {
+            parts.push("layout");
+        }
+        if first.launches != launches {
+            parts.push("launches");
+        }
+        if first.room_pasts != *room_pasts {
+            parts.push("room_pasts");
+        }
+        if !parts.is_empty() {
+            shell.shelf.derived_mismatches += 1;
+            tracing::warn!(at, arm, parts = ?parts, "an arm's fill is not the one the first arm's derives");
+        }
+    }
+    shell.shelf.arm_families.insert((first_family, arm), family);
 }
 
 /// The guest plane's ring of host room, a berth a pass in flight.
@@ -360,11 +458,10 @@ impl Serve for Api {
         // take.
         let most = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
         let scalars = most.min(512);
-        let tables = if most > scalars {
-            RUN_TABLES * most.next_multiple_of(uniform)
-        } else {
-            0
-        };
+        // The recurrent copies' run tables, each its own place in the block
+        // at the uniform alignment, as many as the widest fire lays
+        // (`engine_gpu::rs::run_tables`, the bound a fire's seat copies by).
+        let tables = fires.run_tables * (fires.run_table_bytes.next_multiple_of(uniform) + uniform);
         let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
         // A recording moves every readout copy with the copier (its table,
         // count and group counts laid in the block, each at its alignment):
@@ -407,6 +504,12 @@ impl Serve for Api {
             landed_seats: BTreeMap::new(),
             generation: 0,
             guest,
+            derived: None,
+            arm_families: std::collections::HashMap::new(),
+            derived_fills: 0,
+            derived_checked: 0,
+            derived_mismatches: 0,
+            image_bytes: (0, 0),
         })
     }
 
@@ -428,9 +531,60 @@ impl Serve for Api {
     /// and none made after: each arm's forward, the feed and the guest
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
+        crate::encode::profile_ready();
+        if shell.shelf.derived_fills > 0 || verifying_arms() {
+            tracing::info!(
+                derived = shell.shelf.derived_fills,
+                checked = shell.shelf.derived_checked,
+                image_bytes = ?shell.shelf.image_bytes,
+                mismatches = shell.shelf.derived_mismatches,
+                verifying = verifying_arms(),
+                "vulkan arm walk: fills laid from the first arm's"
+            );
+        }
+        shell.shelf.derived = None;
+        if crate::encode::profiling() {
+            tracing::info!(
+                encode_ms = crate::encode::host_encode_ns() / 1_000_000,
+                between_ms = crate::encode::between_fires_ns() / 1_000_000,
+                phases_ms = ?engine_gpu::kernel_profile::WALK_PHASES
+                    .iter()
+                    .map(|ns| ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000)
+                    .collect::<Vec<_>>(),
+                "vulkan host encode before ready (the arm walk's dispatches)"
+            );
+        }
+        shell.device().name_descriptor_sets();
         shell
             .device()
             .seal_descriptor_pools(shell.readout.len() + 3)
+    }
+
+    fn command_buffers(shell: &Shell<Api>) -> (u64, Option<u64>) {
+        let live = u64::try_from(crate::device::held_counts().0).unwrap_or(0);
+        let most = shell
+            .tuning
+            .profile()
+            .get::<crate::tuning::MaxLiveCommandBuffers>()
+            .0;
+        (live, (most > 0).then_some(u64::from(most)))
+    }
+
+    fn max_maps(shell: &Shell<Api>) -> Option<u64> {
+        let most = shell.tuning.profile().get::<crate::tuning::MaxMapCount>().0;
+        (most > 0).then_some(u64::from(most))
+    }
+
+    fn spent() -> bool {
+        crate::device::take_spent()
+    }
+
+    fn held() -> String {
+        let (cmds, frames, sets, pools_made, pools_freed) = crate::device::held_counts();
+        format!(
+            "{cmds} command buffers, {frames} frames, {sets} shared sets, {} descriptor pools",
+            pools_made.saturating_sub(pools_freed)
+        )
     }
 
     fn plan(shell: &mut Shell<Api>, prepared: &mut Prepared<'_, Api>) -> Result<Plan<Api>> {
@@ -463,7 +617,9 @@ impl Serve for Api {
             }
             None => None,
         };
-        if let Some((rows, launches)) = replayable {
+        // The arm walk runs nothing: a fire it filled walks into a frame that
+        // records nothing (`Shell::arm_filled`) and lands empty.
+        if let Some((rows, launches)) = replayable.filter(|_| !shell.arming) {
             let key = key.expect("a fill was found under a key");
             let pixels = shell.pixel_spans(prepared)?;
             shell.shelf.generation = shell.shelf.generation.wrapping_add(1);
@@ -581,27 +737,53 @@ impl Serve for Api {
                 Plan::Fill
             }
         };
-        // The walk lays in its arm's fire block, and its capturing lanes'
-        // rows in the fire's score room, which a recording binds by place.
-        shell
-            .device
-            .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
-        shell.device.room_next(
-            prepared
-                .score_room
-                .as_ref()
-                .map(|(buffer, at)| (buffer, *at)),
-        );
-        // A decode (padded to its bucket) or a fire no wider than the vector
-        // GEMM's widest row tile carries its rows in its commands; a wider
-        // one reads them from the fire block, one body for every row count
-        // of its rung.
-        let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
-            .last()
-            .expect("the vector GEMM states its row tiles");
-        let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
-        shell.device.fixed_next(decode || rows <= tile);
+        next_frame(shell, prepared);
         Ok(plan)
+    }
+
+    /// The arm walk fills a held family before it plans: its fill frame is
+    /// laid as a serving fill's is.
+    fn ready_fill(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) {
+        shell.device.indirect_next(None);
+        next_frame(shell, prepared);
+    }
+
+    /// The first arm's fill of the composition in hand, laid for this arm
+    /// into the family this arm recorded for the first's, where it did and
+    /// its recording serves the fill's counts.
+    fn derive_fill(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) -> bool {
+        if prepared.arm == 0 || !shell.arming || verifying_arms() {
+            return false;
+        }
+        let Some((_, first)) = shell
+            .shelf
+            .derived
+            .as_ref()
+            .filter(|(held, _)| Some(*held) == shell.walk_at)
+        else {
+            return false;
+        };
+        let Some(&family) = shell.shelf.arm_families.get(&(first.family, prepared.arm)) else {
+            return false;
+        };
+        let Some(held) = shell.shelf.recorder.family(family) else {
+            return false;
+        };
+        if !held.recording.cuts.is_empty() || !held.recording.serves(&first.groups) {
+            return false;
+        }
+        let fill = crate::record::Fill::new(
+            family,
+            std::sync::Arc::clone(&first.groups),
+            std::sync::Arc::clone(&first.image),
+            first.layout.clone(),
+            first.launches,
+            std::sync::Arc::clone(&first.room_pasts),
+        );
+        let shape = record_key(shell, prepared);
+        shell.shelf.recorder.insert_fill(shape, fill);
+        shell.shelf.derived_fills += 1;
+        true
     }
 
     fn fill_frame(device: &Context, _arm: usize) -> Result<Frame> {
@@ -620,12 +802,19 @@ impl Serve for Api {
         layout: &[ReadSpan],
         launches: u32,
     ) -> Result<bool> {
+        let t = std::time::Instant::now();
         let fill = frame.into_fill();
+        engine_gpu::kernel_profile::phase(2, t);
         let shape = record_key(shell, prepared);
         let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
         if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
             nearest(shell, &fill.trail, prepared);
         }
+        engine_gpu::kernel_profile::family_log(&format!(
+            "family {family:?} held {} rung {}",
+            shell.shelf.recorder.family(family).is_some(),
+            prepared.rung
+        ));
         let Some(held) = shell.shelf.recorder.family(family) else {
             tracing::debug!(
                 arm = prepared.arm,
@@ -674,15 +863,23 @@ impl Serve for Api {
             }
             return Ok(false);
         }
+        let (groups, image, room_pasts) = (
+            std::sync::Arc::new(fill.groups),
+            std::sync::Arc::new(fill.image),
+            std::sync::Arc::new(fill.room_pasts),
+        );
+        if fill.cuts == 0 {
+            note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+        }
         shell.shelf.recorder.insert_fill(
             shape,
             crate::record::Fill::new(
                 family,
-                std::sync::Arc::new(fill.groups),
-                std::sync::Arc::new(fill.image),
+                groups,
+                image,
                 layout.to_vec(),
                 launches,
-                std::sync::Arc::new(fill.room_pasts),
+                room_pasts,
             ),
         );
         Ok(true)
@@ -739,6 +936,13 @@ impl Serve for Api {
                 }
                 counts.leave();
             });
+        if frame.is_dry() {
+            // An arm walk that filled a held family: nothing recorded, nothing
+            // run.
+            drop(frame);
+            shell.kept_none();
+            return shell.device.frame()?.commit_async(Some(on_done));
+        }
         match keep {
             Some(shape) => {
                 let room_pasts = frame.room_pasts();
@@ -761,6 +965,14 @@ impl Serve for Api {
                     (!cuts.is_empty()).then_some(shape),
                 );
                 let groups = std::sync::Arc::new(kept.groups().to_vec());
+                let fresh = shell.shelf.recorder.family(family).is_none();
+                if shell.arming {
+                    engine_gpu::kernel_profile::family_log(&format!(
+                        "family {family:?} held {} rung {}",
+                        !fresh,
+                        prepared.rung
+                    ));
+                }
                 enum Act {
                     Fill,
                     Record(std::sync::Arc<Vec<bool>>),
@@ -784,8 +996,15 @@ impl Serve for Api {
                 // lands on an empty submission, and its block is written by
                 // the first serving fire's head.
                 let arming = shell.arming;
+                let alone = matches!(act, Act::Alone);
+                let uncut = cuts.is_empty();
                 let pending = match act {
                     _ if arming => {
+                        // Under PIE_VK_BAKE_TRAIL, what parts a new family
+                        // from the nearest held one.
+                        if fresh && crate::device::ctx::trailing() {
+                            nearest(shell, kept.trail(), prepared);
+                        }
                         if let Act::Record(varying) = act {
                             tracing::debug!(
                                 arm = prepared.arm,
@@ -846,6 +1065,10 @@ impl Serve for Api {
                         kept.replay(Some(on_done))?
                     }
                 };
+                let room_pasts = std::sync::Arc::new(room_pasts);
+                if uncut && !alone {
+                    note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+                }
                 let recorder = &mut shell.shelf.recorder;
                 recorder.insert_fill(
                     shape,
@@ -855,7 +1078,7 @@ impl Serve for Api {
                         image,
                         layout.to_vec(),
                         launches,
-                        std::sync::Arc::new(room_pasts),
+                        room_pasts,
                     ),
                 );
                 let (recorded, filled) = recorder.counts();
@@ -960,23 +1183,49 @@ fn nearest(shell: &Shell<Api>, trail: &[String], prepared: &Prepared<'_, Api>) {
         .map(|(_, recording)| {
             let held = recording.kept.trail();
             let alike = held.iter().zip(trail).take_while(|(a, b)| a == b).count();
-            (alike, held)
+            // Among the families alike as far, the one whose next command is
+            // the walk's kind: the field that parts them is the telling one.
+            let kind = |list: &[String]| {
+                list.get(alike)
+                    .and_then(|entry| entry.split(',').next())
+                    .map(str::to_string)
+            };
+            let same_kind = kind(held) == kind(trail);
+            ((alike, same_kind), held)
         })
-        .max_by_key(|(alike, _)| *alike);
+        .max_by_key(|(rank, _)| *rank)
+        .map(|((alike, _), held)| (alike, held));
     let at = |list: &[String], i: usize| list.get(i).cloned().unwrap_or_else(|| "<end>".into());
     match best {
         Some((alike, held)) => eprintln!(
             "[vk-bake] arm {} rung {} rows {:?}: the fill walk parts from the nearest armed family \
-             after {alike} of {} commands ({} held)\n  walk: {}\n  held: {}",
+             after {alike} of {} commands ({} held)\n  before: {}\n  walk: {}\n  held: {}",
             prepared.arm,
             prepared.rung,
             prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
             trail.len(),
             held.len(),
+            alike.checked_sub(1).map_or_else(|| "<start>".into(), |i| at(trail, i)),
             at(trail, alike),
             at(held, alike),
         ),
         None => eprintln!("[vk-bake] no family is armed"),
+    }
+    // Where the nearest family is as long, every command past the parting
+    // that differs, by kernel: what else parts them.
+    if let Some((alike, held)) = best
+        && held.len() == trail.len()
+    {
+        let mut kinds: Vec<&str> = trail
+            .iter()
+            .zip(held)
+            .skip(alike)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a.rsplit(' ').next().unwrap_or(""))
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        eprintln!("  also: {kinds:?}");
     }
 }
 
@@ -1004,6 +1253,13 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 }
 
 fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
+    let t = std::time::Instant::now();
+    let key = keyed_inner(shell, p, reads);
+    engine_gpu::kernel_profile::phase(7, t);
+    key
+}
+
+fn keyed_inner(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
     key.hashed(&reads);
     key.bytes(&p.descriptor.pack());
@@ -1083,4 +1339,30 @@ impl Seats for Shell<Api> {
     fn forget_seat(&mut self, landed: &Landed) {
         self.shelf.landed_seats.remove(&landed.seq);
     }
+}
+
+/// What the next frame of `prepared`'s fire lays in: its arm's fire block,
+/// its capturing lanes' score room (a recording binds it by place), and
+/// whether its rows are its commands' own.
+fn next_frame(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) {
+    shell
+        .device
+        .arm_next(shell.shelf.arms.get(prepared.arm).cloned());
+    shell.device.room_next(
+        prepared
+            .score_room
+            .as_ref()
+            .map(|(buffer, at)| (buffer, *at)),
+    );
+    // A decode (padded to its bucket) or a fire no wider than the vector
+    // GEMM's widest row tile carries its rows in its commands; a wider
+    // one reads them from the fire block, one body for every row count
+    // of its rung.
+    let tile = *kernels_slang::linear::gemm::VECTOR_ROWS
+        .last()
+        .expect("the vector GEMM states its row tiles");
+    let decode = prepared.seats.iter().all(|seat| seat.rows == 1);
+    let rows: u32 = prepared.seats.iter().map(|seat| seat.rows).sum();
+    let _ = (decode, rows, tile);
+    shell.device.fixed_next(false);
 }

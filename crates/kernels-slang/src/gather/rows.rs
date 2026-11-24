@@ -86,9 +86,28 @@ pub fn copy_words(
     )
 }
 
-/// The most runs one [`copy_runs`] dispatch moves (`PIE_RUNS`,
-/// `kernels/gather/rows.slang`).
-pub const COPY_RUNS: usize = 512;
+/// The tables of runs a [`copy_runs`] dispatch takes, by their runs
+/// (`PIE_RUNS`, `kernels/gather/rows.slang`), each its own kernel: a fire
+/// lays the smallest that holds what its rung can move, so a decode's copy
+/// stages a few hundred bytes, not a prompt's table.
+pub const COPY_RUNS: [(usize, &str); 3] = [
+    (16, "gather_rows_copy_runs_16_words"),
+    (128, "gather_rows_copy_runs_128_words"),
+    (1024, "gather_rows_copy_runs_1024_words"),
+];
+
+/// The table (its runs and its kernel) and the dispatches a copy of at most
+/// `most` runs takes: the smallest table that holds them, else the largest
+/// as many times as they take.
+#[must_use]
+pub fn copy_runs_plan(most: usize) -> (usize, &'static str, usize) {
+    let (runs, entry) = COPY_RUNS
+        .iter()
+        .copied()
+        .find(|&(runs, _)| runs >= most)
+        .unwrap_or(COPY_RUNS[COPY_RUNS.len() - 1]);
+    (runs, entry, most.div_ceil(runs).max(1))
+}
 
 /// Where a run of [`copy_runs`] reads or writes: a segment of the state
 /// pool, or one of the two arena buffers the dispatch binds whole.
@@ -119,28 +138,50 @@ pub struct CopyRun {
 }
 
 /// `runs` moved between the state pool's segments (`pool`) and two arena
-/// buffers bound whole (`arena_a`, `arena_b`), a dispatch for every
-/// [`COPY_RUNS`] of them: the runs and their count are the dispatch's fired
-/// scalars, so its commands are the same however many runs a fire moves
-/// and wherever they lie.
+/// buffers bound whole (`arena_a`, `arena_b`), in the dispatches a copy of
+/// at most `most` runs takes ([`copy_runs_plan`]; a dispatch past the runs
+/// moves none): the runs and their count are the dispatches' fired scalars,
+/// so the commands are the same however many runs a fire moves and wherever
+/// they lie. More runs than `most` is refused by name.
 pub fn copy_runs(
     ctx: &Ctx<'_>,
     arena_a: Tensor,
     arena_b: Tensor,
     pool: crate::Segments,
     runs: &[CopyRun],
+    most: usize,
 ) -> Result<(), Error> {
     const OP: &str = "gather.rs_copy_runs";
-    if runs.is_empty() {
+    let (table, entry, dispatches) = copy_runs_plan(most);
+    // A naming walk names every table width a fire's plan may take, so the
+    // load builds them all: a fire of another rung or lane count picks
+    // another, after ready.
+    if let Some(names) = ctx.naming() {
+        let widths: Vec<Fire> = COPY_RUNS.iter().map(|&(_, entry)| Fire::at(ROWS, entry)).collect();
+        for _ in 0..dispatches {
+            names.either(&widths)?;
+        }
         return Ok(());
     }
-    for chunk in runs.chunks(COPY_RUNS) {
+    if runs.len() > dispatches.saturating_mul(table) {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} runs, past the {most} the fire's rung states for its recurrent copy",
+                runs.len()
+            ),
+        ));
+    }
+    for at in 0..dispatches {
+        let chunk = runs.get(at * table..).map_or(&[][..], |rest| {
+            &rest[..rest.len().min(table)]
+        });
         let longest = chunk.iter().map(|run| run.words).max().unwrap_or(0).max(1);
         let count = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
         let mut args = vec![arena_a.arg_mut(), arena_b.arg_mut()];
         args.extend(pool.args(true));
         args.extend([count.arg(), 0u32.arg(), 0u32.arg(), 0u32.arg()]);
-        for at in 0..COPY_RUNS {
+        for at in 0..table {
             let [spaces, from, to, words] = chunk.get(at).map_or([0; 4], |run| {
                 [
                     run.from.0.code() << 16 | run.to.0.code(),
@@ -152,8 +193,8 @@ pub fn copy_runs(
             args.extend([spaces.arg(), from.arg(), to.arg(), words.arg()]);
         }
         ctx.fire(
-            Fire::at(ROWS, "gather_rows_copy_runs_words")
-                .threads([longest, count, 1], [GROUP, 1, 1]),
+            Fire::at(ROWS, entry)
+                .threads([longest, count.max(1), 1], [GROUP, 1, 1]),
             &args,
         )
         .map_err(|why| match why {

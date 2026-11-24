@@ -14,6 +14,10 @@ pub struct Pipeline {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) layout: vk::PipelineLayout,
     pub(crate) set_layout: vk::DescriptorSetLayout,
+    /// The fire block's set (set 1): its one uniform, bound with the
+    /// dispatch's place in the block as a dynamic offset, so every dispatch
+    /// of the kernel binds the one set an arm's block has.
+    pub(crate) fire_layout: Option<vk::DescriptorSetLayout>,
 
     pub bindings: u32,
 
@@ -44,6 +48,9 @@ impl Drop for Pipeline {
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
+            if let Some(fire) = self.fire_layout {
+                d.destroy_descriptor_set_layout(fire, None);
+            }
         }
     }
 }
@@ -174,19 +181,28 @@ pub(crate) fn build(
     };
     let words = spirv::words(code).map_err(shader)?;
     let declared = spirv::declared(&words).map_err(shader)?;
+    // Set 0 the buffers; the fire block's uniform its own set 1
+    // (`kernels/prim/params.slang`).
+    let fire_binding = declared.fire.as_ref().map(|fire| fire.binding);
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..declared.bindings)
+        .filter(|&i| Some(i) != fire_binding)
         .map(|i| {
-            let ty = if declared.fire.as_ref().is_some_and(|fire| fire.binding == i) {
-                vk::DescriptorType::UNIFORM_BUFFER
-            } else {
-                vk::DescriptorType::STORAGE_BUFFER
-            };
             vk::DescriptorSetLayoutBinding::default()
                 .binding(i)
-                .descriptor_type(ty)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         })
+        .collect();
+    let fire_bindings: Vec<vk::DescriptorSetLayoutBinding> = fire_binding
+        .map(|i| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(i)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        })
+        .into_iter()
         .collect();
     // A pool segment's bindings are written after a recording binds them:
     // laid update-after-bind where the device lets them be, and only those
@@ -197,6 +213,7 @@ pub(crate) fn build(
         (0, 0)
     };
     let flags: Vec<vk::DescriptorBindingFlags> = (0..declared.bindings)
+        .filter(|&i| Some(i) != fire_binding)
         .map(|i| {
             if i < 64 && (segments | rooms) & (1 << i) != 0 {
                 vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
@@ -223,7 +240,28 @@ pub(crate) fn build(
         let set_layout = d
             .create_descriptor_set_layout(&layout_info, None)
             .map_err(|e| core.fault("vkCreateDescriptorSetLayout", e))?;
-        let set_layouts = [set_layout];
+        let fire_layout = if fire_bindings.is_empty() {
+            None
+        } else {
+            match d.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&fire_bindings),
+                None,
+            ) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    d.destroy_descriptor_set_layout(set_layout, None);
+                    return Err(core.fault("vkCreateDescriptorSetLayout", e));
+                }
+            }
+        };
+        let drop_layouts = || {
+            d.destroy_descriptor_set_layout(set_layout, None);
+            if let Some(fire) = fire_layout {
+                d.destroy_descriptor_set_layout(fire, None);
+            }
+        };
+        let set_layouts: Vec<vk::DescriptorSetLayout> =
+            std::iter::once(set_layout).chain(fire_layout).collect();
         let ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -235,7 +273,7 @@ pub(crate) fn build(
         let layout = match d.create_pipeline_layout(&info, None) {
             Ok(l) => l,
             Err(e) => {
-                d.destroy_descriptor_set_layout(set_layout, None);
+                drop_layouts();
                 return Err(core.fault("vkCreatePipelineLayout", e));
             }
         };
@@ -245,7 +283,7 @@ pub(crate) fn build(
             Ok(m) => m,
             Err(e) => {
                 d.destroy_pipeline_layout(layout, None);
-                d.destroy_descriptor_set_layout(set_layout, None);
+                drop_layouts();
                 return Err(core.fault("vkCreateShaderModule", e));
             }
         };
@@ -272,6 +310,7 @@ pub(crate) fn build(
                 pipeline: pipelines[0],
                 layout,
                 set_layout,
+                fire_layout,
                 bindings: declared.bindings,
                 used: declared.used,
                 writable: declared.writable,
@@ -283,7 +322,7 @@ pub(crate) fn build(
             }),
             Err((_, e)) => {
                 d.destroy_pipeline_layout(layout, None);
-                d.destroy_descriptor_set_layout(set_layout, None);
+                drop_layouts();
                 Err(core.fault("vkCreateComputePipelines", e))
             }
         }

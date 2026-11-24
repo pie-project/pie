@@ -49,3 +49,33 @@ impl Default for KernelProfile {
         KernelProfile::new()
     }
 }
+
+/// Diagnostic: where `PIE_VK_FAMILY_LOG` names a file, the arm walk's
+/// compositions and the family each landed in, a line each, appended.
+pub fn family_log(line: &str) {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("PIE_VK_FAMILY_LOG").map(std::path::PathBuf::from))
+        .as_deref()
+    else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// The arm walk's host time by phase (prepare, enqueue, settle, read back,
+/// the fill walk, the backend's fill, its plan), in ns: a diagnostic the
+/// load logs at ready under `PIE_VK_KERNEL_PROFILE`.
+pub static WALK_PHASES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Credits `since`'s elapsed time to phase `phase`.
+pub fn phase(phase: usize, since: std::time::Instant) {
+    WALK_PHASES[phase].fetch_add(
+        u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}

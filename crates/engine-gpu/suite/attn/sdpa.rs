@@ -248,6 +248,7 @@ fn paged_attention_answers_the_reference() {
                 mask: t(mb, 1, rows * MASK_STRIDE, Dtype::U8),
                 mask_words: t(eb, rows, 2, Dtype::U32),
                 row0: 0,
+                table0: 0,
                 rows: rows as u32,
             };
             let n = rows * QH * hd;
@@ -393,6 +394,7 @@ fn paged_attention_answers_the_reference() {
                                 for &(row0, span) in spans.iter() {
                                     let window = sdpa::Tables {
                                         row0,
+                                        table0: row0,
                                         rows: span,
                                         ..tables
                                     };

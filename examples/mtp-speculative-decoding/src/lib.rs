@@ -342,6 +342,10 @@ async fn main(input: Input) -> Result<Output> {
             .capacity(channel_capacity() as u32);
 
         let fwd = ForwardPass::new();
+        // The next window overwrites the slots of the drafts this one
+        // rejected, rows it already sampled: the pass takes rows back, so it
+        // is not final (CONTRACT-BC 25).
+        fwd.retractable()?;
         fwd.embed(&win, &indptr_d)?;
         fwd.readout(&readout_d)?;
         fwd.state(

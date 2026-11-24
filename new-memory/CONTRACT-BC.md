@@ -300,25 +300,46 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       rung; engine-gpu records each shape before ready (sc/gpu-arm-before-ready); XLA lays its warm ladder from it
       (its laid mixed rungs, `Capabilities.mixed_lanes`, are narrower than the set's mixed shapes, so it states those
       it cannot lay eager).
-25. **Final rows: an inferlet states that its sampled rows are final; only its statement counts (user ruling).**
+25. **Final rows: a forward pass is final by default; an inferlet opts out only where it really retracts; only its statement counts (user rulings).**
     The lagged fold (`designs/lagged-fold.md`, e4853eb48) holds a run-ahead decode's fold at the rows the program
     has accepted, so a lane on a recurrent or windowed set carries up to `W - 1` rows and its step is buffered
     (`Treatment::Buffers`, the carried kernels). A lane whose program will never take a row back needs none of it.
     - **Where the statement lives.** A property of a forward pass: `forward-pass.final-rows: func() -> result<_,
-      error>` (`forward.wit`), set before `program`; the SDK's `ForwardPass::final_rows()` (Rust) states it for
-      every lane of the pass and every fire of it. Declaring inferlets state it on every pass that only appends,
-      the prompt's prefill as well as the decode (a prefill left unstated hands its first decode a buffered
-      row, and a steady step that catches one runs the buffered body): the compat inferlets on every request's
-      prompt-scoring, prefill and decode passes, stop sequences or none (each request makes its own set and
-      releases it, so a stop sequence only cuts the output: nothing is retracted, truncated or rewound, and the
-      rows run past it are published keyed by their tokens, as past an EOS); text-completion-bench on its
-      prefill and decode (unless a fold lag or `final_rows: false` asks otherwise); the prefill builtin on its
-      one pass. The compat speculative path rewrites a rejected draft's slots, so its passes state nothing.
-      The served census reads it back: the model status counts the steps fired by their stated treatment
-      (`engine.fires_folds`, `engine.fires_buffers`, beside `built_in_fire`). **Default: not final.** A pass that states nothing keeps the
-      lagged fold. The runtime never infers finality: not from the absence of a beam, of stop strings, of a
-      retract, nor from anything else; only the statement counts. Refused by name on a pass binding `parents` (a
-      beam search keeps its rows buffered, §11.3).
+      error>` (`forward.wit`, unchanged), set before `program`; it covers every lane of the pass and every fire
+      of it. **Default: final (user ruling, 2026-11-24).** The SDKs (Rust `inferlet`, JS and Python `inferlet`)
+      state `final-rows` on every pass when its program is attached, unless the program called the one opt-out,
+      `ForwardPass::retractable()` (Rust) / `retractable()` (JS, Python), before it. The default is the SDK's,
+      so it is still the inferlet's own statement on the wire: the runtime never infers finality, not from the
+      absence of a beam, of stop strings, of a retract, nor from anything else; a guest that drives the WIT
+      directly and calls nothing keeps the lagged fold. The WIT keeps the statement (not a WIT-level default)
+      for exactly that reason: a runtime default would be the runtime deciding, and the rows a program may
+      take back are the program's to name. `is_final()` / `isFinal()` reads the statement back.
+    - **Who opts out (`retractable`).** Only a program that really takes rows back: one that calls
+      `pipeline.retract`, truncates, rolls back or rewinds a set below a row it sampled, or continues a set
+      after cutting it. The cases: a stop-string (or any) rollback in a set the program continues (a next turn
+      on the same set: it opts out, or forks the set at the end it kept, below); drafts and speculative decoding
+      whose verify rewrites a rejected draft's slots (the compat speculative path; the speculative examples
+      that do); beams (a pass binding `parents` is refused final by name, `final rows: a beam search's rows
+      are not final ...`, and the Rust SDK's refusal names `ForwardPass::retractable`); any rollback. Every
+      other pass (prompt-scoring, prefill and decode of the compat inferlets, stop sequences or none, since
+      each request makes its own set and releases it; the prefill builtin; text-completion-bench unless a
+      fold lag or `final_rows: false` asks for the lagged A/B) is final by default and states nothing in its
+      source. The examples that opt out, each where it takes rows back: beam-search's decode (binds `parents`,
+      adopts a beam); mtp-speculative-decoding's window decode, constrained-speculative-decoding's verify,
+      cacheback-speculative-decoding's verify windows, dflash-speculative-bench's draft block and drafting
+      verify (each rewrites a rejected draft's slots); diffusion-baseline's denoise (rewrites its canvas
+      slots every step); snapkv-eviction's haystack prefill (the answer rewrites the question's slots below
+      its sampled row); working-set-handles' run-ahead draw (gives the set back holding only what was
+      drawn, so the rows past the stop are retracted); device-fold-gate, -fork and -park's decode (witnesses
+      of the lagged, device-counted fold). Every other example (the JS and Python ones included: their
+      geometry binds no `parents`, their sets are dropped after a stop) is final by default. The served census
+      reads it back: the model status counts the steps fired by their stated treatment
+      (`engine.fires_folds`, `engine.fires_buffers`, beside `built_in_fire`). Refused by name on a pass binding
+      `parents` (a beam search keeps its rows buffered, §11.3).
+    - **A forgotten opt-out fails loudly.** A program that retracts without opting out gets the named
+      refusal (below), never a silent fallback; the SDK's `run_ahead` keeps a final pass's rows past a break
+      instead of retracting them, so a program that continues such a set without opting out reads past its
+      stop: it must opt out (or fork), as the *Continuing a set* rule says.
     - **What it promises.** Once a fire of a final pass samples a row, the program never retracts, truncates,
       rolls back or rewinds the working sets it wrote below that row (nor any row before it). A stop after a
       final fire leaves the rows run past it in the set. If the program asks anyway, `pipeline.retract` over a
@@ -333,7 +354,7 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
         (`frame_fires`, tested over every frame, window, budget and stop), so a lane stopping at its budget
         holds no overrun at all; only a stop the program reads (EOS, a grammar's end) leaves one.
       - *Continuing a set.* The statement is the program's promise, so the mechanism is the program's: a
-        program that continues a set after a stop (a next turn on the same set) does not state final the
+        program that continues a set after a stop (a next turn on the same set) states `retractable` the
         pass that may run past that stop; or it forks the set at the end it kept before running ahead and
         continues the fork. No case is the runtime's to special-case. The compat inferlets need neither:
         each request makes its own set and releases it when the request ends; a next turn reaches it only

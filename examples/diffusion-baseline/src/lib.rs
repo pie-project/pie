@@ -201,6 +201,9 @@ async fn main(input: Input) -> Result<Output> {
             Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize]);
 
         let fwd = ForwardPass::new();
+        // Every step writes the same canvas slots again: not final
+        // (CONTRACT-BC 25).
+        fwd.retractable()?;
         fwd.switch(0, "mode", "denoise")?;
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(

@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-use super::{SlotFile, geometry};
+use super::{Room, SlotFile, geometry};
 
 impl SlotFile {
     /// `dir/<name>` (`r<rank>.kv`, `r<rank>.rs`) with as many slots of
@@ -114,26 +114,81 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Zero when the filesystem does not say.
+/// The room under `dir` (its nearest existing ancestor): the free space
+/// and the platform's own reserve within it ([`Room`]). Nothing when the
+/// filesystem does not say.
 #[must_use]
-pub fn free_space(dir: &Path) -> u64 {
-    dir.ancestors()
-        .find(|path| path.exists())
-        .and_then(available_bytes)
-        .unwrap_or(0)
+pub fn room(dir: &Path) -> Room {
+    let Some(at) = dir.ancestors().find(|path| path.exists()) else {
+        return Room::unstated(&format!("no part of {} exists", dir.display()));
+    };
+    read_room(at).unwrap_or_else(|why| Room::unstated(&why))
 }
 
-#[cfg(unix)]
-fn available_bytes(at: &Path) -> Option<u64> {
-    let stat = rustix::fs::statvfs(at).ok()?;
-    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+#[cfg(all(unix, not(target_os = "android")))]
+fn read_room(at: &Path) -> Result<Room, String> {
+    let stat = rustix::fs::statvfs(at).map_err(|error| format!("statvfs: {error}"))?;
+    Ok(Room::statvfs(
+        stat.f_bfree.saturating_mul(stat.f_frsize),
+        stat.f_bavail.saturating_mul(stat.f_frsize),
+    ))
 }
 
-/// Windows states free space only through an unsafe call this crate
-/// forbids.
-#[cfg(not(unix))]
-fn available_bytes(_at: &Path) -> Option<u64> {
-    None
+/// The global settings as the settings provider keeps them; readable only
+/// to a process the platform lets read them (a text file before Android
+/// 12, binary ABX since), else AOSP's defaults stand.
+#[cfg(target_os = "android")]
+const ANDROID_GLOBAL_SETTINGS: &str = "/data/system/users/0/settings_global.xml";
+
+#[cfg(target_os = "android")]
+fn read_room(at: &Path) -> Result<Room, String> {
+    let stat = rustix::fs::statvfs(at).map_err(|error| format!("statvfs: {error}"))?;
+    let settings = std::fs::read_to_string(ANDROID_GLOBAL_SETTINGS).ok();
+    Ok(Room::android(
+        stat.f_blocks.saturating_mul(stat.f_frsize),
+        stat.f_bfree.saturating_mul(stat.f_frsize),
+        stat.f_bavail.saturating_mul(stat.f_frsize),
+        &super::LowStorage::from_settings(settings.as_deref()),
+    ))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn read_room(at: &Path) -> Result<Room, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            available_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = at.as_os_str().encode_wide().chain([0]).collect();
+    let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call;
+    // the three out-parameters are plain integers owned here.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut available,
+            &raw mut total,
+            &raw mut free,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "GetDiskFreeSpaceExW: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(Room::windows(free, available))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_room(_at: &Path) -> Result<Room, String> {
+    Err("this platform states no free space".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -174,6 +229,16 @@ fn open_direct(path: &Path) -> io::Result<File> {
 mod tests {
     use super::super::{Aligned, SlotFile};
     use super::*;
+
+    /// The reader names a reserve the platform states and never offers
+    /// more than is free; a path not yet made reads its nearest ancestor.
+    #[test]
+    fn the_room_under_a_path_is_read_from_its_nearest_existing_ancestor() {
+        let room = room(&std::env::temp_dir().join("pie-room-not-made/kv"));
+        assert!(room.free > 0, "{room}");
+        assert!(room.for_us() <= room.free, "{room}");
+        assert!(!room.reserve_is.starts_with("nothing"), "{room}");
+    }
 
     #[test]
     fn a_slot_reads_back_what_was_written_and_each_server_has_its_own_file() {

@@ -20,11 +20,19 @@ struct Params {
     int m;
     int n;
     int k;
+    // The window's first row in the bound rows of x and the landing (both
+    // the fire's whole): the fire's data.
+    uint row0;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
+
+// A window row's row in the bound rows.
+uint bound_row(uint row) {
+    return PIE_FIRE(row0) + row;
+}
 
 float load_x(uint row, uint kk) {
-    return bf16_at(x, row * uint(params.k) + kk);
+    return bf16_at(x, bound_row(row) * uint(params.k) + kk);
 }
 
 float load_w(uint col, uint kk) {
@@ -35,7 +43,7 @@ void write_pair(uint row, uint col, float lo, float hi) {
     if (row >= uint(params.m) || col >= uint(params.n)) {
         return;
     }
-    out_[(row * uint(params.n) + col) >> 1] = pack_bf16(lo, hi);
+    out_[(bound_row(row) * uint(params.n) + col) >> 1] = pack_bf16(lo, hi);
 }
 
 #if defined(PIE_GEMV)
@@ -86,7 +94,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local
             uint w3 = w[wa + 3u];
             [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
                 if (r < rows) {
-                    uint xa = (row0 + r) * words + wi;
+                    uint xa = bound_row(row0 + r) * words + wi;
                     acc[r] += pair_dot(x[xa], w0);
                     acc[r] += pair_dot(x[xa + 1u], w1);
                     acc[r] += pair_dot(x[xa + 2u], w2);
@@ -193,7 +201,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             [ForceUnroll] for (uint j = 0u; j < 4u; j++) {
                 uint row = tile_row + rq * 4u + j;
                 if (row < m) {
-                    float2 pair = pair_of(x, row, kb + kk, k, k_even);
+                    float2 pair = pair_of(x, bound_row(row), kb + kk, k, k_even);
                     lo[j] = pair.x;
                     hi[j] = pair.y;
                 }

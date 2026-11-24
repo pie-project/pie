@@ -1346,24 +1346,6 @@ impl Engine for Cuda {
         true
     }
 
-    fn measures_behind(&self) -> bool {
-        self.shell.as_ref().is_some_and(Shell::measures_behind)
-    }
-
-    /// One roofline key the load serves from a stale figure, timed on the
-    /// shell's own stream where nothing of a frame is pending and the
-    /// stream is idle, yielding to an arrival between its bursts
-    /// ([`Shell::measure_behind`]).
-    fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
-        if self.pending.is_some() {
-            return Ok(false);
-        }
-        match self.shell.as_mut() {
-            Some(shell) => shell.measure_behind(behind).map_err(fault),
-            None => Ok(false),
-        }
-    }
-
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         self.sink = Some(sink);
     }

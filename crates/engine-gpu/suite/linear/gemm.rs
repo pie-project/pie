@@ -108,7 +108,14 @@ fn the_dense_matmuls_answer_the_reference() {
             std::slice::from_ref(&want),
             &|g, o| {
                 let y = t(o[0].0, m, n, Dtype::Bf16);
-                g.run(|c| gemm::matmul(c, Tactic { tier, vector, wide }, xt, wt, y));
+                g.run(|c| gemm::matmul(
+                    c,
+                    Tactic { tier, vector, wide },
+                    xt,
+                    wt,
+                    y,
+                    kernels_slang::ssm::RowSpan::whole(xt),
+                ));
             },
         );
     }
@@ -172,7 +179,14 @@ fn the_vector_kernels_agree_bit_for_bit_and_with_the_reference() {
             let run = |gpu: &mut Gpu, vector: u32, wide: bool| {
                 let y = gpu.zeros(m * n);
                 let yt = t(y, m, n, Dtype::Bf16);
-                gpu.run(|c| gemm::matmul(c, Tactic { tier, vector, wide }, xt, wt, yt));
+                gpu.run(|c| gemm::matmul(
+                    c,
+                    Tactic { tier, vector, wide },
+                    xt,
+                    wt,
+                    yt,
+                    kernels_slang::ssm::RowSpan::whole(xt),
+                ));
                 gpu.down(y, m * n)
             };
             let worst = |got: &[f32]| {

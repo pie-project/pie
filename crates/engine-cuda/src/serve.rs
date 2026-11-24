@@ -1,5 +1,4 @@
 mod arming;
-mod behind;
 mod boot;
 pub(crate) mod btrace;
 pub mod diag;
@@ -246,9 +245,6 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
-    /// What this load serves from figures stored under a stale key and
-    /// times again behind serving (`Engine::measure_behind`).
-    behind: behind::Behind,
     /// What this load timed, each by name (`engine::Engine::measured_at_load`):
     /// the device's rates where no layer stated them, the decode products'
     /// times (`[rates] product_ns`) where the profile held none, and the
@@ -698,7 +694,8 @@ impl Shell {
                 // tier (a host budget below one chunk seated no disk tier)
                 // nor a quarter of the disk. One that cannot be seated is
                 // refused by name.
-                let free = engine::disk::free_space(dir).saturating_add(kept);
+                let room = engine::disk::room(dir);
+                let free = room.for_us().saturating_add(kept);
                 let paging = self.pools.paging();
                 let pages = u64::from(seats)
                     * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
@@ -713,20 +710,26 @@ impl Shell {
                 // The guest state the device can hold live (the room a
                 // guest program binds within): evicted, it has a home.
                 let guest = self.chunk_facts()?.guest_room_bytes();
-                let bytes = engine::disk::derived_budget(
-                    0,
-                    0,
-                    pages.div_ceil(per_chunk) + state,
-                    chunk,
-                    guest,
-                    free / ranks,
-                );
+                let need =
+                    engine::disk::derived_need(0, 0, pages.div_ceil(per_chunk) + state, chunk, guest);
+                let bytes = need.min(free / ranks);
                 // Its inputs, stated at load: what the field rules on.
                 eprintln!(
-                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), and {guest} B of guest state the device holds live, chunks of {chunk} B, within {} bytes free a rank",
+                    "engine-cuda: the unstated disk tier: {bytes} bytes of a derived need of \
+                     {need} bytes ({seats} seats x {context} tokens: {pages} kv pages in {} \
+                     chunks and {state} chunks of state ({} B a seat), and {guest} B of guest \
+                     state the device holds live, chunks of {chunk} B), within {} bytes a rank \
+                     of {} under {}: {room}{}",
                     pages.div_ceil(per_chunk),
                     self.state_row_bytes(),
                     free / ranks,
+                    free,
+                    dir.display(),
+                    if kept > 0 {
+                        format!(", and the {kept} bytes its kept files take")
+                    } else {
+                        String::new()
+                    },
                 );
                 self.pools.seat_disk(dir, world.rank, bytes, keep)?;
                 Some(bytes)

@@ -221,8 +221,9 @@ impl HostOps {
 /// ([`MixedLanes::Any`]), or the prompt-lane rungs it lays, each with the
 /// decode lanes beside it ([`MixedLanes::Laid`], ascending by
 /// `prompt_lanes`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MixedLanes {
+    #[default]
     Any,
     Laid(Vec<MixedRung>),
 }
@@ -230,7 +231,7 @@ pub enum MixedLanes {
 /// One laid mixed shape: at most `prompt_lanes - 1` prompts (the engine
 /// adds one lane of its own, the rest of the rows) beside at most
 /// `decode_lanes` decodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MixedRung {
     pub prompt_lanes: u32,
     pub decode_lanes: u32,
