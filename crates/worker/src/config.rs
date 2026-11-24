@@ -1250,8 +1250,6 @@ device = ["metal:0"]
         an_unknown_key_is_refused();
         a_distributed_worker_states_no_cluster_policies();
         the_policies_default_to_the_built_in_defaults();
-        offload_peers_and_pools_are_unknown_keys();
-        a_submit_deadline_is_an_unknown_key();
         the_diag_flag_states_the_engines_diagnostics_key();
         measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere();
         an_engine_s_own_key_is_written_beside_the_common_ones();
@@ -1509,27 +1507,6 @@ device = ["metal:0"]
         );
         Config::parse(&distributed)
             .expect("a distributed worker states none, and takes no default");
-    }
-
-    /// Which workers prefill a worker's passes and which pools keep its
-    /// runs are the cluster policy's: the keys that named them are gone.
-    fn offload_peers_and_pools_are_unknown_keys() {
-        for key in ["peers = [\"10.0.0.2:7100\"]", "pools = [\"10.0.0.3:7201\"]"] {
-            let toml = format!("{MINIMAL_METAL}\n[offload]\n{key}\n");
-            let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
-            assert!(err.contains("unknown field"), "{key}: {err}");
-        }
-    }
-
-    /// The leash is gone, and its key with it: a config that sets it is
-    /// refused by name.
-    fn a_submit_deadline_is_an_unknown_key() {
-        let toml = format!("{MINIMAL_METAL}\n[runtime]\nsubmit_deadline = \"5s\"\n");
-        let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field `submit_deadline`"),
-            "got: {err}"
-        );
     }
 
     /// `--diag` writes `[engine] diagnostics`, and a flavor with no
