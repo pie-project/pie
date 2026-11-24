@@ -1,7 +1,7 @@
 //! Where a guest instance's state lives: its bind-time launch tables and its rings,
 //! in pool slots of role `Instance` and `Channel` the runtime took for it.
-//! The one exception the contract states is a ring larger than a chunk: no
-//! slots, a buffer of the engine's own.
+//! A ring larger than a chunk has no run of slots to lie in and is refused
+//! at bind, by name: the engine keeps no buffer of its own for it.
 //!
 //! A pooled [`Held`] is one slot ref's bytes, addressed through the pool's
 //! view (a placement-sparse buffer) and written on the host through the
@@ -513,8 +513,7 @@ impl<'a> Tables<'a> {
 }
 
 /// Where a ring's cells go: `cells` cells of `stride` bytes, `per_span` of
-/// them in each region (one a slot for cells packed a slot; one for a run,
-/// or for a ring larger than a chunk in a buffer of its own).
+/// them in each region (one a slot for cells packed a slot; one for a run).
 #[derive(Debug, Clone)]
 pub struct Cells {
     spans: Vec<Held>,
@@ -604,7 +603,7 @@ impl Cells {
                 "program::held",
                 format!(
                     "a ring of {bytes} bytes is larger than a chunk of {per_chunk} \
-                     {slot_bytes}-byte channel slots, and is the engine's to keep"
+                     {slot_bytes}-byte channel slots: no run of slots holds it"
                 ),
             )
         })?;
