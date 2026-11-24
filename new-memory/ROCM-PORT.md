@@ -89,7 +89,7 @@ Each item mirrors a kernels-cuda change; the CUDA commit is the reference.
    pitch, stride)` in place of `(page * page_size + off) * pitch`.
 3. **Recurrent rows through pieces and a segment table** (`2fd2b2c20`,
    `c474e3d29`; `Segments`, `StateRows`, `prim/state_rows.cuh`). Sites:
-   `ssm/mixers.hip`, `conv/cache.hip`, `gather/ngram.hip`, `attn/replay.hip`
+   `ssm/{conv,gdn,kda,mamba2}.hip`, `conv/cache.hip`, `gather/ngram.hip`, `attn/replay.hip`
    and their wrappers in `ssm.rs`, `conv/cache.rs`, `gather/ngram.rs`. A row
    is `pieces` pieces, each in a chunk named by its own id, `piece_off`
    elements in; `piece_atoms` where the last piece is padded.
