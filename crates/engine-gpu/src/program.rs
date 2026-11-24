@@ -575,8 +575,8 @@ pub fn decode(
 /// recorded to land later lands their puts rather than keeping them on the
 /// device: a `fold` count and an `attn_mask` for every class, and the
 /// descriptor ports the engine resolves ([`engine::ports::engine_resolves`])
-/// past a decode envelope's tokens, which stay on the device for the next
-/// forward to copy in.
+/// past a decode envelope's tokens and its beams' parents, which stay on the
+/// device for the next forward to copy in.
 #[must_use]
 pub fn read_at_fire(
     geometry: eta_ir::registry::GeometryClass,
@@ -589,7 +589,12 @@ pub fn read_at_fire(
         .filter(|&port| {
             matches!(port, Port::Fold | Port::AttnMask)
                 || (engine::ports::engine_resolves(geometry, device, port)
-                    && !(geometry == GeometryClass::DecodeEnvelope && port == Port::EmbedTokens))
+                    && !(geometry == GeometryClass::DecodeEnvelope && port == Port::EmbedTokens)
+                    // Each beam's parent stays on the device: the next fire
+                    // copies the kept cell into its beam step's record
+                    // behind the pass (`crate::beam::Parents::Cell`), with
+                    // no wait on the host.
+                    && port != Port::Parents)
         })
         .fold(PortMask::NONE, PortMask::with)
 }
@@ -937,5 +942,21 @@ mod tests {
         let refused = placed(3).expect_err("slot 3 is below the fold");
         let why = refused.to_string();
         assert!(why.contains("kv slot 3") && why.contains("frozen prefix"), "{why}");
+    }
+
+    /// A deferred pass keeps a decode envelope's beam parents on the device
+    /// (the next fire copies the kept cell in, waiting on no landing), and
+    /// lands its fold count and mask, which the host reads at the fire.
+    #[test]
+    fn a_deferred_pass_keeps_its_parents_on_the_device() {
+        use eta_ir::registry::{GeometryClass, Port, PortMask};
+        let device = PortMask::DECODE_ENVELOPE
+            .with(Port::Fold)
+            .with(Port::AttnMask)
+            .with(Port::Parents);
+        let reads = read_at_fire(GeometryClass::DecodeEnvelope, device);
+        assert!(!reads.contains(Port::Parents), "{reads:?}");
+        assert!(!reads.contains(Port::EmbedTokens), "{reads:?}");
+        assert!(reads.contains(Port::Fold) && reads.contains(Port::AttnMask), "{reads:?}");
     }
 }
