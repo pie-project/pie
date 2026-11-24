@@ -407,8 +407,17 @@ fn model(source: &str, dir: &Path, context: u32) -> Checked {
         Ok(matched(&source, &metadata, platform))
     });
     let (deployment, verdict) = match matched {
-        Ok(Some(matched)) => matched,
-        Ok(None) => return unsupported(checked, &no_deployment(&config)),
+        Ok(Ok(matched)) => matched,
+        Ok(Err(Some(deployment))) => {
+            return unsupported(
+                checked,
+                &format!(
+                    "only `{deployment}` reads it, and that deployment quantizes activations, \
+                     which Pie's Metal engine does not"
+                ),
+            );
+        }
+        Ok(Err(None)) => return unsupported(checked, &no_deployment(&config)),
         Err(why) => return unsupported(checked, &format!("{why:#}")),
     };
     let catalog = runtime::catalog::catalog();
@@ -441,13 +450,15 @@ fn model(source: &str, dir: &Path, context: u32) -> Checked {
 /// The deployment an import builds from `source`, in the order
 /// `conversion_contract` tries them: the first that reads it as stored, else
 /// the first that reads it only by quantizing it again, which an import
-/// builds when it is named.
+/// builds when it is named. None names, if there is one, the deployment
+/// that would read it but quantizes activations, which Metal does not.
 fn matched(
     source: &ztensor::Source,
     metadata: &checkpoint::file::Metadata,
     platform: runtime::engine::load::Platform,
-) -> Option<(String, Verdict)> {
+) -> Result<(String, Verdict), Option<String>> {
     let mut convert = None;
+    let mut activations = None;
     for deployment in runtime::catalog::catalog().candidates_of(source, platform) {
         let Ok((name, contract)) = runtime::engine::load::conversion_contract_named(
             source,
@@ -457,12 +468,21 @@ fn matched(
         ) else {
             continue;
         };
+        // Metal multiplies activations as they are, as `identify` holds.
+        if platform == runtime::engine::load::Platform::Metal
+            && deployment.deploy.weights.iter().any(|w| w.act.is_some())
+        {
+            activations.get_or_insert(name);
+            continue;
+        }
         if runtime::catalog::requantizes(&contract).is_none() {
-            return Some((name, Verdict::Ready));
+            return Ok((name, Verdict::Ready));
         }
         convert.get_or_insert(name);
     }
-    convert.map(|name| (name, Verdict::Convert))
+    convert
+        .map(|name| (name, Verdict::Convert))
+        .ok_or(activations)
 }
 
 /// Why no deployment reads a checkpoint whose configuration is `config`.
@@ -471,9 +491,14 @@ fn no_deployment(config: &serde_json::Value) -> String {
         .get("model_type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let known = runtime::catalog::catalog()
-        .models()
-        .any(|(_, model)| !model.arch.is_empty() && model.arch == model_type);
+    // A package's architecture names a checkpoint's `model_type`, or the
+    // family its variants (`_moe`, `_vl`) extend.
+    let plain = |word: &str| word.replace('_', "");
+    let known = runtime::catalog::catalog().models().any(|(_, model)| {
+        !model.arch.is_empty()
+            && (plain(&model.arch) == plain(model_type)
+                || model_type.starts_with(&format!("{}_", model.arch)))
+    });
     if !known {
         return format!("no package in this build holds a `{model_type}` architecture");
     }
