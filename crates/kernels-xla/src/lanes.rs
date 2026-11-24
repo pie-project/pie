@@ -302,10 +302,14 @@ pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<
             )?;
             return f.reshape(got, &[l, per * width]);
         }
-        // Past a few lanes, the lanes in a loop: unrolled, each lane's slice
-        // is in the program, in every layer (a buffered fire's 130 lanes of
-        // a 2048-row state: 47,608 ops of Qwen3.5's program).
-        if l > SLICED_LANES {
+        // More than one lane: the lanes in a loop, one body in the program
+        // whatever their count. Unrolled, each lane's slice is in the
+        // program, in every layer (a buffered fire's 130 lanes of a 2048-row
+        // state: 47,608 ops of Qwen3.5's program; a 16-lane prefill's slot
+        // moves, half its ops), and its code is the device's to hold: the
+        // loop costs no device time (v6e Qwen3.5, a 512-row prefill over 1 to
+        // 16 lanes and decodes of 4 and 16, within 1%).
+        if l > 1 {
             let el = f.elem(slab);
             let none = if el.is_int() {
                 f.const_i(el, 0, &[l, per * width])
@@ -408,10 +412,10 @@ pub(crate) fn land_slots(
         // a pool view lands whole blocks (see `take_slots`)
         if f.is_view(slab) {
             let mut out = f.reshape(slab, &[blocks, per, width])?;
-            // Past a few lanes, the lanes in a loop (see `take_slots`): a
+            // More than one lane: the lanes in a loop (see `take_slots`); a
             // buffered fire's recurrence lands every lane's block through a
-            // pool view, 130 lanes a layer in Qwen3.5.
-            if l > SLICED_LANES {
+            // pool view.
+            if l > 1 {
                 let landed = f.for_loop(l, &[out, rows, slot, write], |f, c, a| {
                     let zero = ci(f, 0);
                     let at = f.dynamic_slice(a[2], &[c], &[1])?;
@@ -444,8 +448,8 @@ pub(crate) fn land_slots(
             }
             return f.reshape(out, &[n, width]);
         }
-        // Past a few lanes, the lanes in a loop (see `take_slots`).
-        if l > SLICED_LANES {
+        // More than one lane: the lanes in a loop (see `take_slots`).
+        if l > 1 {
             let out = f.for_loop(l, &[slab, rows, slot, write], |f, c, a| {
                 let zero = ci(f, 0);
                 let at = f.dynamic_slice(a[2], &[c], &[1])?;
