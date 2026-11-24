@@ -50,6 +50,10 @@ pub(super) struct Inner {
     /// dump per head and room change, and again each
     /// [`super::plan::STALL_SAYS_AGAIN`] while it stays unserved.
     pub(super) stall_dumped: Option<(super::wait::EntryKey, u64, crate::rt::Instant)>,
+    /// The head a stall last forced a pass for, with the chunks free and
+    /// the fires landed then: forced once on that room
+    /// ([`super::ResidencyPlanner::dump_stall`]).
+    pub(super) stall_forced: Option<(super::wait::EntryKey, u32, u64)>,
     /// The head and room the policy was last asked for with no pick
     /// ([`super::eviction`]): asked once a head and room.
     pub(super) policy_asked: Option<(super::wait::EntryKey, u64)>,
