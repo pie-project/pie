@@ -1509,3 +1509,11 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **Idea.** Let the settle fire on chunks the runtime lends for the slice (a reservation by refs, sized to one range's fire), or let the quiet check ignore holders whose chunks lie outside the seat runs a settle fire writes.
 
 **Why later.** Accepted for the new-memory PR (coordinator, 2026-11-24): the boot is fast either way, and only the picks stay on the fallback.
+
+## F?? Metal: a yielded rates or curve key behind serving resumes where it stopped
+
+**What.** On Metal, a `[rates]` key or a `curve <n>x<k>` shape timed behind serving that yields to an arrival starts again whole at the next idle turn (`engine-metal` `rates::YIELDED`, `tune::dense::YIELDED`). engine-gpu keeps its finished points and resumes. The widest keys (`gemm_tflops_by_rows`, `attn_tflops_by_keys`; single fires of 100–345 ms on the M1 Max) take minutes, so under arrivals that keep coming in idle gaps they can restart many times before one finishes. They are stale only between a kernel change and the next export round.
+
+**Idea.** Keep a key's settled points across yields (per point, as engine-gpu does) and time only the rest at the next turn, with the clock and overlap checks applying to each point's frames.
+
+**Why later.** Behind work runs only when no process is live, so yields are rare. Each yield already waits for at most one fire (a frame of long fires is cut between them).
