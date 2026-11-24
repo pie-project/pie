@@ -65,6 +65,19 @@ impl Session {
                             serde_json::Value::from(each),
                         );
                     }
+                    // Programs registered anew since boot (the standard
+                    // samplers' at load among them), and registrations that
+                    // found one held: a request of a kind already served
+                    // registers none, whatever its prompt's length.
+                    let (registered, found) = crate::pipeline::program::counts();
+                    stats.insert(
+                        format!("{}.programs.registered", model_name),
+                        serde_json::Value::from(registered),
+                    );
+                    stats.insert(
+                        format!("{}.programs.found", model_name),
+                        serde_json::Value::from(found),
+                    );
                     // The rungs each engine stated eager at load: where an
                     // `engine.eager` fire is as stated, and no bug.
                     stats.insert(
