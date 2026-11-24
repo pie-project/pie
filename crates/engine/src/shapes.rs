@@ -755,8 +755,13 @@ impl StepShapes {
                             // step at (its prompts and their rest lane), with
                             // the decodes beside it; any counts within the
                             // lanes where it states none.
-                            let bands: Vec<(u32, u32, u32)> = match &facts.mixed {
-                                crate::MixedLanes::Any => vec![(1, lanes - 1, lanes - 1)],
+                            // (fewest prompts, most prompts, decodes, the
+                            // padding lanes a padded layout adds: the
+                            // prompts' pad and rest lanes, the fewest prompts
+                            // leaving the most, and the decodes' lanes, as
+                            // MixedLanes::fits counts them)
+                            let bands: Vec<(u32, u32, u32, u32)> = match &facts.mixed {
+                                crate::MixedLanes::Any => vec![(1, lanes - 1, lanes - 1, 0)],
                                 crate::MixedLanes::Laid(rungs) => {
                                     let mut from = 1;
                                     rungs
@@ -766,6 +771,7 @@ impl StepShapes {
                                                 from,
                                                 r.prompt_lanes.saturating_sub(1),
                                                 r.decode_lanes,
+                                                (r.prompt_lanes - from) + r.decode_lanes,
                                             );
                                             from = r.prompt_lanes;
                                             band
@@ -773,7 +779,9 @@ impl StepShapes {
                                         .collect()
                                 }
                             };
-                            for (p_lo, p_hi, d_hi) in bands {
+                            for (p_lo, p_hi, d_hi, padding) in bands {
+                                // a padded layout's rows fit the fire's
+                                let prompt_top = facts.max_tokens.saturating_sub(padding).max(2);
                                 let shape = Span::new(lo.max(3), top).and_then(|rows| {
                                     Some(StepShape {
                                         rung,
@@ -788,8 +796,8 @@ impl StepShapes {
                                             p_lo,
                                             p_hi.min(lanes - 1).min((rows.hi - 1) / 2),
                                         )?,
-                                        prompt_rows: Span::new(2, rows.hi - 1)?,
-                                        lane_rows: Span::new(2, rows.hi - 1)?,
+                                        prompt_rows: Span::new(2, (rows.hi - 1).min(prompt_top))?,
+                                        lane_rows: Span::new(2, (rows.hi - 1).min(prompt_top))?,
                                         readout_rows: Span {
                                             lo: 0,
                                             hi: reads(rows.hi),
