@@ -114,6 +114,7 @@ fn tests_every_case() {
     a_beams_finish_copies_the_chosen_pages_another_reads();
     a_cut_waits_out_a_move();
     new_weights_find_no_page_the_old_ones_sealed();
+    new_weights_free_the_lower_tiers_copies();
 }
 
 /// A beam search's finish while its set is suspending waits for the move
@@ -200,6 +201,37 @@ fn a_cut_waits_out_a_move() {
     store.abort_suspend(txn);
     store.truncate(ws, 0).unwrap();
     assert_eq!(store.mapped_len(ws).unwrap(), 0);
+}
+
+/// A reload in place drops the cache the old weights sealed on every tier:
+/// what was demoted to the host and to the disk goes with what stayed on
+/// the device, and their slots come back.
+fn new_weights_free_the_lower_tiers_copies() {
+    let mut store = KvStore::new_with_swap(8, 1, 4, h(52));
+    let owner = ProcessId::from_u128(52);
+    let tokens = kept_and_gone(&mut store, 52, 3, owner);
+    let (host, disk) = (store.host_swap_available(), store.disk_swap_available(floor));
+    let txn = store
+        .prepare_demote(8, |_| 1)
+        .unwrap()
+        .expect("three cache-only pages");
+    store.commit_suspend(txn).unwrap();
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0, "demoted off the device");
+    assert!(
+        store.host_swap_available() + store.disk_swap_available(floor) < host + disk,
+        "held below the device"
+    );
+
+    store.rekey(h(53));
+    store.retire_idle();
+    assert!(store.cached_working_sets().is_empty());
+    assert_eq!(
+        (store.host_swap_available(), store.disk_swap_available(floor)),
+        (host, disk),
+        "the host and disk slots come back"
+    );
+    assert_eq!(store.available_pages(), 8);
 }
 
 /// A reload in place rekeys the cache: what the old weights sealed is

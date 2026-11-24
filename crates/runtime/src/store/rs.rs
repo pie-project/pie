@@ -1909,6 +1909,13 @@ impl RsStore {
         )
     }
 
+    /// Drops every checkpoint, its rows on the device or parked on the
+    /// host tier alike: what the weights a reload replaces computed, which
+    /// no later set may resume from. How many went.
+    pub fn drop_cache(&mut self) -> usize {
+        self.drop_checkpoints(|_, _| true)
+    }
+
     /// Whether any checkpoint is kept: cache a policy could let go.
     pub fn holds_checkpoints(&self) -> bool {
         !self.checkpoints.is_empty()

@@ -38,6 +38,8 @@ pub struct Reloaded {
     pub planes: u32,
     pub bytes: u64,
     pub dropped_pages: usize,
+    /// The recurrent-state checkpoints the old weights computed, dropped.
+    pub dropped_states: usize,
 }
 
 pub async fn reload(checkpoint: &Path, version: Option<u64>) -> Result<Reloaded> {
@@ -96,14 +98,22 @@ pub async fn reload(checkpoint: &Path, version: Option<u64>) -> Result<Reloaded>
             }
         }
     }
-    let dropped_pages = if written.planes > 0 {
+    // Everything the old weights computed goes, on every tier: the kv
+    // cache (its host and disk copies, and a persistent tier's, with it)
+    // and every recurrent-state checkpoint.
+    let (dropped_pages, dropped_states) = if written.planes > 0 {
         let domain: crate::store::kv::hash::Hash256 = rand::random();
-        stores
+        let pages = stores
             .iter()
             .map(|stores| with_kv_lock(&stores.kv, "reload-rekey", |kv| kv.rekey(domain)))
-            .sum()
+            .sum();
+        let states = stores
+            .iter()
+            .map(|stores| stores.rs.lock().unwrap().drop_cache())
+            .sum();
+        (pages, states)
     } else {
-        0
+        (0, 0)
     };
     if let Some(why) = failed {
         return Err(why);
@@ -116,6 +126,7 @@ pub async fn reload(checkpoint: &Path, version: Option<u64>) -> Result<Reloaded>
         planes: written.planes,
         bytes: written.bytes,
         dropped_pages,
+        dropped_states,
     };
     tracing::info!(
         checkpoint = %checkpoint.display(),
@@ -124,6 +135,7 @@ pub async fn reload(checkpoint: &Path, version: Option<u64>) -> Result<Reloaded>
         planes = reloaded.planes,
         bytes = reloaded.bytes,
         dropped_pages,
+        dropped_states,
         "reloaded the model's weights"
     );
     Ok(reloaded)
