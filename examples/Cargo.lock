@@ -37,7 +37,6 @@ version = "0.1.0"
 dependencies = [
  "inferlet",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -147,38 +146,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "device-fold-gate"
-version = "0.3.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "device-fold-gate-fork"
-version = "0.3.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "device-fold-gate-park"
-version = "0.3.0"
-dependencies = [
- "inferlet",
- "serde",
-]
-
-[[package]]
-name = "device-fold-give"
-version = "0.3.0"
-dependencies = [
- "inferlet",
- "serde",
 ]
 
 [[package]]

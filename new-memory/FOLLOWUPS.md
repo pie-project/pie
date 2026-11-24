@@ -1570,3 +1570,9 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F87. Rollback cost models (`flush_free` / `ckpt_sync` / `stop_wait`) left the examples
+
+**What.** beam-search, cacheback- and mtp-speculative-decoding took a `rollback_mode`: `ckpt_sync` forked the set before each fire and, on a rejection, replayed the kept rows on a fork of that checkpoint; `stop_wait` replayed twice (mtp, beam) or verified one row a fire (cacheback). Each restored fork's result was discarded, so the modes priced a checkpoint rollback beside the flush-free one and changed no output. They are removed; the examples run flush-free only, and a request naming them is refused as an unknown key (cacheback, mtp) or ignored (beam-search reads no unknown-key list).
+
+**Why later.** Examples cleanup (2026-11-24): a cost model of a rollback no backend runs. If checkpoint rollback is measured again, it belongs in one bench, not copied into three examples.

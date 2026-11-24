@@ -48,12 +48,11 @@ async fn generate(
         return Ok(Vec::new());
     }
 
-    let stop_tokens = chat::stop_tokens();
     let mut generated = Vec::with_capacity(max_tokens);
-    if !stop_tokens.contains(&(first_token as u32)) {
+    if !chat::is_stop(first_token as u32) {
         generated.push(first_token as u32);
     }
-    if generated.len() >= max_tokens || stop_tokens.contains(&(first_token as u32)) {
+    if generated.len() >= max_tokens || chat::is_stop(first_token as u32) {
         return Ok(generated);
     }
 
@@ -73,7 +72,7 @@ async fn generate(
     let budget = max_tokens.saturating_sub(generated.len());
     run_ahead(pipeline, &fwd, budget, async || {
         let token = token_out.take_host::<i32>().await? as u32;
-        if stop_tokens.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         generated.push(token);

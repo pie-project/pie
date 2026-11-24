@@ -97,7 +97,6 @@ async fn main(input: Input) -> Result<String> {
     let window = input.amateur_window.min(span);
     span.checked_add(window)
         .ok_or("amateur attention geometry exceeds the u32 range")?;
-    let stop_tokens = chat::stop_tokens();
     let lambda = input.lambda;
     let alpha = input.alpha;
 
@@ -138,10 +137,10 @@ async fn main(input: Input) -> Result<String> {
     let first = read_expert_token(&first_out).await?;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
+    if !chat::is_stop(first) {
         generated.push(first);
     }
-    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
+    if generated.len() >= input.max_tokens || chat::is_stop(first) {
         return model::decode(&generated);
     }
 
@@ -184,7 +183,7 @@ async fn main(input: Input) -> Result<String> {
     let budget = input.max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &decode, budget, async || {
         let token = read_expert_token(&out).await?;
-        if stop_tokens.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         generated.push(token);

@@ -330,8 +330,7 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       verify (each rewrites a rejected draft's slots); diffusion-baseline's denoise (rewrites its canvas
       slots every step); snapkv-eviction's haystack prefill (the answer rewrites the question's slots below
       its sampled row); working-set-handles' run-ahead draw (gives the set back holding only what was
-      drawn, so the rows past the stop are retracted); device-fold-gate, -fork and -park's decode (witnesses
-      of the lagged, device-counted fold). Every other example (the JS and Python ones included: their
+      drawn, so the rows past the stop are retracted). Every other example (the JS and Python ones included: their
       geometry binds no `parents`, their sets are dropped after a stop) is final by default. The served census
       reads it back: the model status counts the steps fired by their stated treatment
       (`engine.fires_folds`, `engine.fires_buffers`, beside `built_in_fire`). Refused by name on a pass binding

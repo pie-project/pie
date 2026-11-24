@@ -127,7 +127,6 @@ async fn main(input: Input) -> Result<Output> {
         ));
     }
     let vocab = model::output_vocab_size();
-    let stop_tokens = inferlet::chat::stop_tokens();
     let max_tokens = input.max_tokens.unwrap_or(length as usize);
     if max_tokens == 0 {
         return Ok(Output {
@@ -329,7 +328,7 @@ async fn main(input: Input) -> Result<Output> {
         let mut finished = false;
         for &id in &argmax_canvas {
             let id = id as u32;
-            if stop_tokens.contains(&id) {
+            if inferlet::chat::is_stop(id) {
                 finished = true;
                 break;
             }

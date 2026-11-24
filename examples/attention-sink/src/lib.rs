@@ -127,7 +127,6 @@ async fn main(input: Input) -> Result<Output> {
             visible_kv: 0,
         });
     }
-    let stop_tokens = chat::stop_tokens();
     let span = n + input.max_tokens as u32 + 1;
 
     let ws = WorkingSet::new();
@@ -156,10 +155,10 @@ async fn main(input: Input) -> Result<Output> {
     let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
+    if !chat::is_stop(first) {
         generated.push(first);
     }
-    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
+    if generated.len() >= input.max_tokens || chat::is_stop(first) {
         pipeline.close();
         return report(&generated, n, sink, window, 0);
     }
@@ -192,7 +191,7 @@ async fn main(input: Input) -> Result<Output> {
     run_ahead(&pipeline, &decode, budget, async || {
         let token = token_out.take_host::<i32>().await? as u32;
         fires += 1;
-        if stop_tokens.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         generated.push(token);
