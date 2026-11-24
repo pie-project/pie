@@ -119,3 +119,13 @@ pub(crate) fn const_port(port: Port, words: &[u32]) -> PortBinding {
         },
     }
 }
+
+/// One shell at a time for tests whose loads each take much of the device's
+/// working set: held for as long as the test's shells live. Tests run on
+/// parallel threads of one process, and a load beside others that hold the
+/// working set is refused for state-pool room it would have alone. A test
+/// that panicked under it leaves it usable.
+pub(crate) fn one_heavy_load() -> std::sync::MutexGuard<'static, ()> {
+    static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    HEAVY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
