@@ -1131,10 +1131,7 @@ where
             // Windowed layers are ring + buffer (CONTRACT-BC 19, 21).
             windowed_state: shell.pools().rings().is_some(),
             // The prompt scans land the state as of rows inside a lane, a
-            // record a snapshot in pieces (CONTRACT-BC 16); a fire lands a
-            // lane's ring snapshots beside them (`ring::stage`). A load of
-            // rings alone states none yet: the runtime cuts its passes at
-            // each checkpoint.
+            // record a snapshot in pieces (CONTRACT-BC 16).
             rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: false,
             adapter_attachments: false,

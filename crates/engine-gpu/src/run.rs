@@ -210,10 +210,7 @@ pub struct FireBindings {
     /// The fold's job table of the fire's windowed rows and the most jobs
     /// its grid takes (`kernels_slang::attn::ring::fold`), where the load
     /// has them.
-    /// The fold's table, the most fold jobs its rung dispatches, where its
-    /// fold's count lies, and the most snapshot jobs (none on a rung of one
-    /// row a lane) ([`crate::inputs::Handles::ring_jobs`]).
-    pub ring_jobs: Option<(Tensor, u32, u32, u32)>,
+    pub ring_jobs: Option<(Tensor, u32)>,
 
     pub tables: FireTables,
 

@@ -164,10 +164,7 @@ pub struct Handles {
     /// lane (folded, base, first, folded after; `kernels_slang::Ring::lanes`), and the
     /// fold's job table, bound whole (`kernels_slang::attn::ring::fold`).
     pub ring_lanes: Tensor,
-    /// The fold's table (its rings' entries, the snapshots' jobs, the
-    /// fold's), where the fold's count lies, the most fold jobs and the
-    /// most snapshot jobs it holds.
-    pub ring_jobs: Option<(Tensor, u32, u32, u32)>,
+    pub ring_jobs: Option<(Tensor, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -241,8 +238,6 @@ pub struct Fire<'a> {
     /// empty where the load has none.
     pub ring_lanes: &'a [i32],
     pub ring_jobs: &'a [i32],
-    /// The snapshots' jobs ([`crate::ring::Staged::snaps`]).
-    pub ring_snaps: &'a [i32],
     /// Each ring's geometry the fold table opens with
     /// (`Pools::ring_layers`), as many entries as the load has rings.
     pub ring_layers: &'a [i32],
@@ -315,7 +310,7 @@ pub struct Laid {
     /// The windowed rows' lane table, the fold's table (its rings'
     /// entries, then its jobs) and the most jobs it holds, and its rings,
     /// where the load has windowed rows.
-    ring: Option<(u64, u64, u32, u32, u32)>,
+    ring: Option<(u64, u64, u32, u32)>,
     /// The store's bytes.
     total: u64,
 }
@@ -396,7 +391,7 @@ impl Laid {
         pieces: u32,
         capture: bool,
         rs_page_tokens: Option<u32>,
-        rings: Option<(u32, u32)>,
+        rings: Option<u32>,
         binding: u64,
         beams: Option<BeamFacts>,
     ) -> Laid {
@@ -571,17 +566,12 @@ impl Laid {
                 rs_bases: word(rs_appends),
             }
         });
-        let ring = rings.map(|(rings, ring_rows)| {
+        let ring = rings.map(|rings| {
             let most = crate::ring::most_jobs(budget.max_tokens, budget.max_tokens);
-            let snaps =
-                crate::ring::most_snapshot_jobs(budget.max_lanes, budget.max_tokens, ring_rows);
-            // A lane's entry, and its snapshots' records' where it lands any.
-            let entries = lanes * (1 + u64::from(kernels_slang::ssm::RS_SNAPSHOTS * u32::from(snaps > 0)));
-            let lanes_at = take(entries * (crate::ring::LANE_INTS as u64 + u64::from(pieces)) * 4);
+            let lanes_at = take(lanes * (crate::ring::LANE_INTS as u64 + u64::from(pieces)) * 4);
             let layer_ints = u64::from(rings) * u64::from(kernels_slang::attn::ring::LAYER_INTS);
-            let jobs_at =
-                take((layer_ints + 1 + 4 * u64::from(snaps) + 1 + 4 * u64::from(most)) * 4);
-            (lanes_at, jobs_at, most, rings, snaps)
+            let jobs_at = take((layer_ints + 1 + 4 * u64::from(most)) * 4);
+            (lanes_at, jobs_at, most, rings)
         });
         let total = at;
 
@@ -874,26 +864,18 @@ impl<B: Backend> Inputs<B> {
             )?)
         };
         let ring_jobs = match self.laid.ring {
-            Some((lanes_at, jobs_at, most, rings, snaps)) => {
+            Some((lanes_at, jobs_at, most, rings)) => {
                 let layer_ints = rings as usize * kernels_slang::attn::ring::LAYER_INTS as usize;
-                let entry_ints = (crate::ring::LANE_INTS as u32 + self.laid.pieces) as usize;
-                let entries = lanes as usize
-                    * (1 + kernels_slang::ssm::RS_SNAPSHOTS as usize * usize::from(snaps > 0));
-                if fire.ring_lanes.len() > entry_ints * entries
+                if fire.ring_lanes.len() > (crate::ring::LANE_INTS as u32 + self.laid.pieces) as usize * lanes as usize
                     || fire.ring_jobs.len() > 1 + 4 * most as usize
-                    || fire.ring_snaps.len() > 1 + 4 * snaps as usize
                     || fire.ring_layers.len() != layer_ints
                 {
                     return Err(Fault::Ceiling {
                         what: "ints of a fire's windowed lane and fold tables",
-                        need: (fire.ring_lanes.len()
-                            + fire.ring_jobs.len()
-                            + fire.ring_snaps.len()
-                            + fire.ring_layers.len()) as u64,
+                        need: (fire.ring_lanes.len() + fire.ring_jobs.len() + fire.ring_layers.len()) as u64,
                         have: u64::from(crate::ring::LANE_INTS as u32 + self.laid.pieces) * u64::from(lanes)
                             + layer_ints as u64
-                            + 2
-                            + 4 * u64::from(snaps)
+                            + 1
                             + 4 * u64::from(most),
                     });
                 }
@@ -904,16 +886,8 @@ impl<B: Backend> Inputs<B> {
                 } else {
                     fire.ring_jobs
                 };
-                let snap_jobs = if fire.ring_snaps.is_empty() {
-                    &none[..]
-                } else {
-                    fire.ring_snaps
-                };
-                // The rings' entries, the snapshots' jobs, then the fold's.
-                let fold_at = layer_ints + 1 + 4 * snaps as usize;
                 self.store.write(jobs_at, bytes_of(fire.ring_layers))?;
-                self.store.write(jobs_at + 4 * layer_ints as u64, bytes_of(snap_jobs))?;
-                self.store.write(jobs_at + 4 * fold_at as u64, bytes_of(jobs))?;
+                self.store.write(jobs_at + 4 * layer_ints as u64, bytes_of(jobs))?;
                 let room = self.laid.room(jobs_at)?;
                 Some((
                     i32s(
@@ -924,21 +898,16 @@ impl<B: Backend> Inputs<B> {
                         room,
                     )?,
                     most,
-                    u32::try_from(fold_at).unwrap_or(u32::MAX),
-                    snaps,
                 ))
             }
             None => None,
         };
         let ring_lanes = match self.laid.ring {
-            Some((lanes_at, _, _, _, snaps)) => i32s(
+            Some((lanes_at, _, _, _)) => i32s(
                 handles,
                 &self.store,
                 lanes_at,
-                ((crate::ring::LANE_INTS as u32 + self.laid.pieces)
-                    * lanes
-                    * (1 + kernels_slang::ssm::RS_SNAPSHOTS * u32::from(snaps > 0)))
-                    .max(1),
+                ((crate::ring::LANE_INTS as u32 + self.laid.pieces) * lanes).max(1),
                 self.laid.room(lanes_at)?,
             )?,
             None => Tensor::new(kernels_slang::ABSENT, 0, 1, Dtype::I32),
@@ -1686,7 +1655,7 @@ mod tests {
             2,
             true,
             Some(16),
-            Some((2, 64)),
+            Some(2),
             1 << 30,
             Some(BeamFacts {
                 planes: 4,

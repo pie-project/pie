@@ -54,10 +54,6 @@ pub struct Lane<'a> {
     /// Whether the lane keeps its rows: a kv-less lane's rows land in its
     /// fire slots and fold nowhere.
     pub keeps: bool,
-    /// The snapshots the fire lands of the lane's rings (`Lane::rs_snapshots`):
-    /// after its row `at` of the fire, onto the rings of a record of these
-    /// units (CONTRACT-BC 16, the rings as of that row).
-    pub snapshots: &'a [(u32, Vec<i32>)],
 }
 
 /// A lane of a fire as the shell seats it, before its fire slots are
@@ -73,7 +69,6 @@ pub struct Seat {
     pub reads: Vec<Range<u32>>,
     pub record: u32,
     pub keeps: bool,
-    pub snapshots: Vec<(u32, Vec<i32>)>,
 }
 
 impl Seat {
@@ -92,7 +87,6 @@ impl Seat {
             record: self.record,
             units,
             keeps: self.keeps,
-            snapshots: &self.snapshots,
         }
     }
 }
@@ -115,9 +109,6 @@ pub struct Staged {
     pub write_offset: Vec<i32>,
     /// The fold's job table: its count, then four ints a job.
     pub jobs: Vec<i32>,
-    /// The snapshots' jobs, landed before the fold (its count, then four
-    /// ints a job); their records' entries follow the lanes' in `lanes`.
-    pub snaps: Vec<i32>,
 }
 
 /// The fire's slots its lanes' rows take, `tokens` rows a slot: a lane's
@@ -126,20 +117,6 @@ pub struct Staged {
 pub fn fire_slots(rows: &[u32], tokens: u32) -> u32 {
     rows.iter().map(|&r| r.div_ceil(tokens.max(1))).sum()
 }
-
-/// The most snapshot jobs a fire takes: a lane landing snapshots runs
-/// two rows or more, [`kernels_slang::ssm::RS_SNAPSHOTS`] of them at most,
-/// each the last `ring_rows` rows before its row.
-#[must_use]
-pub fn most_snapshot_jobs(lanes: u32, rows: u32, ring_rows: u32) -> u32 {
-    lanes
-        .min(rows / 2)
-        .saturating_mul(kernels_slang::ssm::RS_SNAPSHOTS)
-        .saturating_mul(ring_rows)
-}
-
-/// The rows of workgroups a fire's snapshot phase strides its jobs over.
-pub const SNAPSHOT_ROWS: u32 = 64;
 
 /// The most fold jobs a fire of `rows` rows (summed over its lanes, its
 /// carried rows among them) takes: a row folds into the ring or lands in a
@@ -167,12 +144,8 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, windows: &[u32]) -
     let mut out = Staged {
         indptr: vec![0],
         jobs: vec![0],
-        snaps: vec![0],
         ..Staged::default()
     };
-    // The snapshots' records, entries of the lane table after the lanes'.
-    let mut snap_lanes: Vec<i32> = Vec::new();
-    let snap_entry = |k: usize| lanes.len() + k;
     // Each destination ring row once: lanes of a group naming one record
     // fold it once.
     let mut landed: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
@@ -278,44 +251,6 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, windows: &[u32]) -
         if !lane.keeps {
             continue;
         }
-        // Its snapshots: the last `ring_rows` rows before each one's row,
-        // from where they lie as the fire leaves them before its fold (the
-        // ring below its folded index, its buffer, its fire slots), onto
-        // the snapshot record's rings. Its lineage is its set's own: a
-        // lane sharing its set with siblings lands none.
-        if !lane.snapshots.is_empty() && admitted != lane.first - lane.folded {
-            return Err(bad(format!(
-                "lane {at} snapshots its rings and reads {admitted} of the {} buffered rows \
-                 its set holds",
-                lane.first - lane.folded
-            )));
-        }
-        for (row, units) in lane.snapshots {
-            if *row == 0 || *row >= lane.rows || units.len() != lane.units.len() {
-                return Err(bad(format!(
-                    "lane {at} snapshots after its row {row} of {} onto a record of {} \
-                     pieces, its own of {}",
-                    lane.rows,
-                    units.len(),
-                    lane.units.len()
-                )));
-            }
-            let to = lane.first + row;
-            let entry_at = snap_entry(snap_lanes.len() / (LANE_INTS + lane.units.len()));
-            snap_lanes.extend([0, 0, 0, to as i32, 0, 0]);
-            snap_lanes.extend_from_slice(units);
-            for r in to.saturating_sub(ring_rows)..to {
-                let (unit, at_row) = if r < lane.folded {
-                    (-1 - lane.record as i32, r)
-                } else if r < lane.first {
-                    (entry(r)? as i32, (r - lane.base) % tokens)
-                } else {
-                    let (unit, at_row) = fire(r)?;
-                    (unit as i32, at_row)
-                };
-                out.snaps.extend([unit, at_row as i32, -1 - entry_at as i32, r as i32]);
-            }
-        }
         // The set's slot lineage position `l` lies at.
         let slot_of = |l: u32| -> u32 {
             let mut rank = l - lane.folded;
@@ -368,8 +303,6 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, windows: &[u32]) -
         }
     }
     out.jobs[0] = ((out.jobs.len() - 1) / 4) as i32;
-    out.snaps[0] = ((out.snaps.len() - 1) / 4) as i32;
-    out.lanes.extend(snap_lanes);
     Ok(out)
 }
 
@@ -394,7 +327,6 @@ mod tests {
             record: 0,
             units: &[4],
             keeps: true,
-            snapshots: &[],
         };
         let s = stage(&[lane], 16, 40, &[32]).unwrap();
         assert_eq!(s.lanes, [50, 48, 55, 56, 0, 50, 4]);
@@ -424,7 +356,6 @@ mod tests {
             record: 2,
             units: &[4],
             keeps: true,
-            snapshots: &[],
         };
         let s = stage(&[lane], 16, 40, &[32]).unwrap();
         assert_eq!(s.indices, [10, 11, 12, 13, 14, 15, 16]);
@@ -450,7 +381,6 @@ mod tests {
             record: 0,
             units: &[4],
             keeps: true,
-            snapshots: &[],
         };
         let s = stage(&[lane(&[1]), lane(&[2])], 16, 40, &[32]).unwrap();
         let ring_jobs = s.jobs[1..].chunks(4).filter(|j| j[2] < 0).count();
@@ -477,7 +407,6 @@ mod tests {
             record: 0,
             units: &[4],
             keeps: true,
-            snapshots: &[],
         };
         let s = stage(&[lane.clone()], 16, 40, &[32]).unwrap();
         assert_eq!(&s.lanes[..6], &[50, 48, 56, 54, 3, 50]);
@@ -495,46 +424,4 @@ mod tests {
     fn a_ring_of_no_rows_is_refused() {
         assert!(stage(&[], 16, 0, &[]).is_err());
     }
-
-    /// A snapshot after row 10 of a fire past its folded index 20: the
-    /// ring's 16 rows before row 30, those below 20 from the lane's ring,
-    /// the rest from its fire slots, onto the snapshot record's ring, whose
-    /// entry follows the lane's with its fold at 30.
-    #[test]
-    fn a_snapshot_lands_the_rows_before_its_row_from_where_they_lie() {
-        let snaps = [(10u32, vec![9i32])];
-        let lane = Lane {
-            folded: 20,
-            fold: 30,
-            base: 48,
-            first: 20,
-            rows: 30,
-            buffer: &[],
-            reads: &[],
-            fire: &[5, 6],
-            record: 0,
-            units: &[4],
-            keeps: true,
-            snapshots: &snaps,
-        };
-        let s = stage(&[lane.clone()], 16, 16, &[16]).unwrap();
-        assert_eq!(s.lanes[7..], [0, 0, 0, 30, 0, 0, 9]);
-        assert_eq!(s.snaps[0], 16);
-        let jobs: Vec<&[i32]> = s.snaps[1..].chunks(4).collect();
-        assert_eq!(jobs[0], [-1, 14, -2, 14]);
-        assert_eq!(jobs[5], [-1, 19, -2, 19]);
-        assert_eq!(jobs[6], [5, 0, -2, 20]);
-        assert_eq!(jobs[15], [5, 9, -2, 29]);
-        // A lane reading part of its set's buffered rows lands none.
-        let sibling = Lane {
-            folded: 20,
-            first: 24,
-            base: 16,
-            buffer: &[3, 4],
-            reads: &[20..22],
-            ..lane
-        };
-        assert!(stage(&[sibling], 16, 16, &[16]).is_err());
-    }
-
 }

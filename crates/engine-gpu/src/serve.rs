@@ -1526,18 +1526,9 @@ impl<B: Serve> Shell<B> {
                 rows.pieces,
                 capture,
                 rows.rs.as_ref().map(|rs| rs.tokens),
-                // A load landing snapshots inside a fire lays its rings'
-                // snapshot jobs too (their widest ring's rows), else none.
-                rows.buffer.is_some().then(|| {
-                    (
-                        u32::try_from(rows.windowed.len()).unwrap_or(u32::MAX),
-                        if crate::rs::snapshots(&boot.trace) > 0 {
-                            rows.windowed.iter().map(|layer| layer.window).max().unwrap_or(0)
-                        } else {
-                            0
-                        },
-                    )
-                }),
+                rows.buffer
+                    .is_some()
+                    .then(|| u32::try_from(rows.windowed.len()).unwrap_or(u32::MAX)),
                 binding,
                 // Every load lays a fire's beam groups (`crate::beam`): the
                 // kv planes a page holds (each kv row's keys and values) and
@@ -6498,7 +6489,6 @@ impl<B: Serve> Shell<B> {
                     reads: Vec::new(),
                     record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
                     keeps: false,
-                    snapshots: Vec::new(),
                 });
             } else if self.pools.rings().is_some() {
                 let tokens = self.pools.paging().page_size.max(1);
@@ -6562,7 +6552,6 @@ impl<B: Serve> Shell<B> {
                     // The lane's entry of the fire's record table.
                     record: u32::try_from(seats.len().saturating_sub(1)).unwrap_or(u32::MAX),
                     keeps: true,
-                    snapshots: Vec::new(),
                 });
             }
 
@@ -6661,17 +6650,6 @@ impl<B: Serve> Shell<B> {
                     for (p, &unit) in units.iter().enumerate() {
                         entry[MAX + n * pieces + p] = crate::store::slot_entry(unit)?;
                         snap_units = snap_units.max(unit.saturating_add(1));
-                    }
-                    // The lane's rings as of the snapshot's row land on the
-                    // snapshot record's (`ring::stage`), before the fold.
-                    if self.pools.rings().is_some()
-                        && let Some(seat) = ring_lanes.last_mut()
-                    {
-                        let entries = units
-                            .iter()
-                            .map(|&unit| crate::store::slot_entry(unit))
-                            .collect::<Result<Vec<i32>>>()?;
-                        seat.snapshots.push((snap.row, entries));
                     }
                 }
                 if !snaps.is_empty() && !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -7353,7 +7331,6 @@ impl<B: Serve> Shell<B> {
                 capture: &capture_table,
                 ring_lanes: ring.as_ref().map_or(&[], |staged| staged.lanes.as_slice()),
                 ring_jobs: ring.as_ref().map_or(&[], |staged| staged.jobs.as_slice()),
-                ring_snaps: ring.as_ref().map_or(&[], |staged| staged.snaps.as_slice()),
                 ring_layers: &ring_layers,
             },
         )?;
@@ -7515,16 +7492,13 @@ impl<B: Serve> Shell<B> {
             geometry,
             window_tables: self.pools.window_tables(),
             // The fold's grid a rung's: its own rows and as many carried.
-            // The fold's grid a rung's: its own rows and as many carried; a
-            // rung of one row a lane lands no snapshot (its row is no lane's
-            // interior), so its fires dispatch no snapshot phase.
-            ring_jobs: bound.ring_jobs.map(|(jobs, most, fold_at, snaps)| {
-                let tokens = self.span.rung_tokens(rung);
+            ring_jobs: bound.ring_jobs.map(|(jobs, most)| {
                 (
                     jobs,
-                    most.min(crate::ring::most_jobs(tokens, tokens)),
-                    fold_at,
-                    if tokens > 1 { snaps } else { 0 },
+                    most.min(crate::ring::most_jobs(
+                        self.span.rung_tokens(rung),
+                        self.span.rung_tokens(rung),
+                    )),
                 )
             }),
             tables: FireTables {

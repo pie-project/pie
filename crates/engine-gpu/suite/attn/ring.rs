@@ -607,7 +607,7 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
     padded.resize(ring::LAYER_INTS as usize + 1 + most as usize * 4, 0);
     let jt = gpu.up_i32(&padded);
     let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
-    gpu.run(|c| ring::fold(c, &[&pool], job_table, ring::LAYER_INTS, most, most));
+    gpu.run(|c| ring::fold(c, &[&pool], job_table, most));
     let after = gpu.down(staged.pool_buf, g.elems);
     let mut want: Vec<f64> = laid.pool.iter().map(|x| f64::from(*x)).collect();
     for (l, lane) in lanes.iter().enumerate() {
