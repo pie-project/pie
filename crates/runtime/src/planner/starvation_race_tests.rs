@@ -10792,3 +10792,41 @@ async fn replay_bd4f4ffe7_quiet_refusal_standing_in_its_placement() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     replay(&stall_bd4f4ffe7_quiet_mismatch()).await.unwrap();
 }
+
+/// Every tier full, the head with no move left: the would-be victim, the
+/// lowest of the residents but the head in the policy's order, fails by
+/// name with every tier's room ([`PlannerError::TiersFull`]), its waits
+/// ending with it (its next ask and its wait for residency both), and the
+/// head is never the one failed.
+#[tokio::test(flavor = "current_thread")]
+async fn every_tier_full_fails_the_lowest_resident_by_name() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, older, younger) = (ProcessId::new_v4(), ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, older, younger] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        inner.enqueue(
+            head,
+            WaitKind::Restore {
+                demand: Demand::default(),
+            },
+        );
+        inner.procs.get_mut(&head).unwrap().state = Residency::Evicted;
+    });
+    assert!(planner.fail_tiers_full(None), "one fails");
+    let Err(error) = planner
+        .acquire(younger, younger, Demand { kv_pages: 1, ..Demand::default() })
+        .await
+    else {
+        panic!("the lowest in the order fails");
+    };
+    assert!(matches!(error, PlannerError::TiersFull { .. }), "{error}");
+    assert!(error.to_string().contains("every tier is full"), "{error}");
+    assert_eq!(planner.wait_resident(younger).await, Err(error), "its waits end with it");
+    // The head and the older resident go on.
+    assert!(planner.with_inner(|inner| !inner.failed.contains_key(&head) && !inner.failed.contains_key(&older)));
+}

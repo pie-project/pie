@@ -1940,19 +1940,11 @@ struct Log {
     bind_suspends: u64,
     idles: u64,
     rescores: u64,
-    /// The safe order stood short at the last settled step.
-    /// The first admission that turned the safe order short: the gate let
-    /// a newcomer in that left someone unable to finish in turn.
-    admitted_short: Option<String>,
-    short: bool,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
     checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
-    /// The capacity gate's figures as the last step with nothing moving
-    /// between tiers read them.
-    capacity: Option<super::inner::CapacityRead>,
     /// Processes that ended their work.
     finished: u64,
     /// Processes back from their client with a new request, in order.
@@ -2402,7 +2394,6 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
                     |_| false,
                     Some(pid),
                     |pid| ctx.planner.is_resident(pid),
-                    |pid, chunks| ctx.planner.capacity_holds_chunks(pid, chunks),
                 )
             })();
             let (roles, engine, binding) = (roles.clone(), engine.clone(), binding.clone());
@@ -2439,10 +2430,6 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
         || Some(roles.lock().unwrap().room_watch()),
         |run, pieces, singles| {
             roles.lock().unwrap().room_free(run, pieces, singles)
-                && !planner.capacity_would_hold(
-                    pid,
-                    run.max(1).saturating_mul(pieces).saturating_add(singles),
-                )
         },
         |run, pieces, singles| {
             roles.lock().unwrap().holds_guest_state(pid)
@@ -2509,7 +2496,7 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true, |_, _| false) {
+    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -2640,18 +2627,7 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     ctx.at(pid, "admit");
     seat_to_end(&ctx, pid).await;
     planner.admit(pid).await;
-    // As the runtime's gates hold a newcomer
-    // (`inferlet::process::wait_for_room`): until the capacity gate's last
-    // place has room for its first ask.
-    planner.admitted_to_ask(pid).await;
-    let before = planner.order_least();
     planner.note_admitted(pid);
-    let after = planner.order_least();
-    if before.is_none_or(|least| least >= 0) && after.is_some_and(|least| least < 0) {
-        ctx.log.lock().unwrap().admitted_short.get_or_insert_with(|| {
-            format!("admitting {} turned the safe order short: least {before:?} -> {after:?}", &pid.to_string()[..8])
-        });
-    }
     let residency = Arc::new(Mutex::new(ProcessResidency::default()));
     register_residency(pid, Arc::downgrade(&residency));
     let departure = planner.departure(pid);
@@ -2852,7 +2828,7 @@ const LOST_WAKES_FAIL: bool = false;
 
 /// The checks after a settled step: the processes refused since the last
 /// (the run goes on), or `Err`, the failure that ends it.
-fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
+fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     let fail = |kind: &str, line: String| Failure {
         step,
         kind: kind.to_string(),
@@ -2879,21 +2855,6 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         // scratch (a parked one's kept tables and rings). A slot named past
         // its release is read and written as another's (the M1's fires on
         // free logical chunks swapped onto a released segment).
-        // `PIE_SIM_SHORT`: each step the safe order turns short, said with
-        // the gate's read and what the last step granted.
-        if std::env::var_os("PIE_SIM_SHORT").is_some() {
-            let least = ctx.planner.order_least();
-            let was = ctx.log.lock().unwrap().short;
-            let now = least.is_some_and(|least| least < 0);
-            if now && !was {
-                eprintln!(
-                    "SIMSHORT step {step}: least {least:?} read {:?} gate {:?}",
-                    ctx.planner.capacity_read(),
-                    ctx.planner.capacity_gate()
-                );
-            }
-            ctx.log.lock().unwrap().short = now;
-        }
         if let Some(why) = stray_holders(ctx, shared) {
             return Err(fail("stale ref", why));
         }
@@ -2952,44 +2913,6 @@ fn check(ctx: &Ctx, step: u32, moving: bool) -> Result<Vec<Failure>, Failure> {
         .next()
     {
         return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
-    }
-    // The capacity gate's invariant: every path that adds state goes
-    // through it, so every tier together keeps the finisher's headroom.
-    // The capacity gate's invariant: every path that adds state goes
-    // through it, so between two steps with nothing moving between tiers
-    // (a move holds its slots on both while its copies land), the same
-    // finisher and the same capacity, the tiers' free pages never fall
-    // further short of the finisher's headroom. A breach is named at the
-    // step it happens.
-    let moving = moving
-        || ctx.planner.with_inner(|inner| {
-            !inner.evicting.is_empty()
-                || inner.procs.values().any(|proc| {
-                    matches!(
-                        proc.state,
-                        super::proc::Residency::Evicting | super::proc::Residency::Restoring
-                    )
-                })
-        });
-    if !moving && let Some(read) = ctx.planner.capacity_read() {
-        let before = ctx.log.lock().unwrap().capacity.replace(read);
-        let short = read.others_short();
-        if let Some(before) = before
-            && before.finisher == read.finisher
-            && before.whole == read.whole
-            && short > before.others_short()
-        {
-            return Err(fail(
-                "capacity",
-                format!(
-                    "every tier together holds {} pages free, {short} short of the finisher \
-                     {}'s headroom, {} short the step before: {read:?}; before {before:?}",
-                    read.gate().free,
-                    read.finisher,
-                    before.others_short()
-                ),
-            ));
-        }
     }
     if let Some(refusal) = std::mem::take(&mut ctx.engine.lock().unwrap().refusals)
         .into_iter()
@@ -3432,7 +3355,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         quiesce(&ctx, &mut lane, &mut pending, step, workload.late).await;
         progress.moved(&ctx, step);
         coverage.live_steps += u64::from(tasks.len() > ctx.log.lock().unwrap().ended);
-        match check(&ctx, step, !pending.is_empty()) {
+        match check(&ctx, step) {
             Ok(refused) => {
                 for failed in refused {
                     if !failures
@@ -3480,18 +3403,10 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 kind: "liveness".to_string(),
                 line: format!(
                     "{} of {total} processes still running {} steps after the last arrival; \
-                     stuck {stuck:?}; capacity gate {:?}; queue {}; evicting/in flight {}; copies \
+                     stuck {stuck:?}; queue {}; evicting/in flight {}; copies \
                      pending {}; free chunks {}",
                     total - ended,
                     step - last_arrival,
-                    planner.capacity_gate().map(|gate| {
-                        let state = planner.with_inner(|inner| {
-                            inner.procs.get(&gate.finisher).map(|proc| {
-                                format!("{:?} unfired={} bind_waiting={}", proc.state, proc.unfired, proc.bind_waiting)
-                            })
-                        });
-                        (gate, state)
-                    }),
                     planner.debug_queue(),
                     planner.with_inner(|inner| inner.evicting.len()),
                     pending.len(),
@@ -3537,13 +3452,6 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
         // some suspended 58 to 68 times, unfinished in 45 minutes).
         coverage.most_suspended = u64::from(log.most_suspended);
-        if let Some(line) = log.admitted_short.clone() {
-            failures.push(Failure {
-                step,
-                kind: "admission".to_string(),
-                line,
-            });
-        }
         for &(pid, program, suspended) in &log.bind_thrash {
             progress.again += u64::from(suspended - 1);
             progress.first.get_or_insert_with(|| {

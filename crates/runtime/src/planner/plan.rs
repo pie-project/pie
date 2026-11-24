@@ -797,13 +797,6 @@ impl ResidencyPlanner {
                 return None;
             };
             let pid = waiter.pid;
-            // The capacity gate's finisher is never passed over: the heads
-            // behind it (others' restores) would take the room its moves
-            // made, keep something in flight, and go round, each restored
-            // and evicted for the other while its bind waits.
-            if inner.is_finisher(pid) {
-                return None;
-            }
             (inner.nothing_in_flight()
                 && inner.parked_moving.is_empty()
                 && !inner.queue.values().any(Waiter::rise_untaken)
@@ -818,11 +811,6 @@ impl ResidencyPlanner {
 
     fn plan_heads(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
-            // A hold may have named the finisher the last pass read: the
-            // gate is read again, without the held, before any is paused.
-            // Read stale, the held finisher would never be paused.
-            let order = self.capacity_order();
-            self.with_inner(|inner| inner.set_capacity(order));
             self.pause_held();
         }
         self.reseat_released();
@@ -832,9 +820,6 @@ impl ResidencyPlanner {
         // pass: what it asks past its kv stands.
         let mut room_stood: Option<EntryKey> = None;
         loop {
-            // The capacity gate as this step reads it: a waiter it holds is
-            // no head ([`super::inner::CapacityGate`]).
-            self.read_capacity();
             // Each step reads the head's need afresh (the cache spans one
             // step's reads: its own, the map's, the eviction's).
             *self.need_cache.lock() = None;
@@ -910,9 +895,7 @@ impl ResidencyPlanner {
                 if missing > 0 {
                     return Step::Absorb {
                         count: missing,
-                        fund_by_eviction: !is_restore
-                            || inner.nothing_in_flight()
-                            || inner.is_finisher(pid),
+                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
                     };
                 }
                 // rs slots are taken whole when the head is served; a short
@@ -923,9 +906,7 @@ impl ResidencyPlanner {
                     return Step::ShortRs {
                         need: seated.sub(rs_free),
                         ask: seated,
-                        fund_by_eviction: !is_restore
-                            || inner.nothing_in_flight()
-                            || inner.is_finisher(pid),
+                        fund_by_eviction: !is_restore || inner.nothing_in_flight(),
                         surplus: (inner.accum.len() as u32).saturating_sub(waiter.kv_need()),
                     };
                 }
@@ -1073,16 +1054,6 @@ impl ResidencyPlanner {
                                 .port
                                 .guest_room_free(1, run.saturating_mul(pieces).saturating_add(singles)))
                     {
-                        let pid = self.with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid));
-                        if pid.is_some_and(|pid| {
-                            self.capacity_would_hold(
-                                pid,
-                                run.saturating_mul(pieces).saturating_add(singles),
-                            )
-                        }) {
-                            self.plan_stopped("bind room: its runs stand, held at the capacity gate");
-                            return false;
-                        }
                         self.serve_bind_room(key);
                         continue;
                     }
@@ -1668,9 +1639,8 @@ impl ResidencyPlanner {
                                             )
                                         });
                                         Some(format!(
-                                            "head {head} queued={queued} passed={} finisher={} {state:?}",
-                                            inner.passed.iter().any(|&(_, passed)| passed == head),
-                                            inner.is_finisher(pid)
+                                            "head {head} queued={queued} passed={} {state:?}",
+                                            inner.passed.iter().any(|&(_, passed)| passed == head)
                                         ))
                                     })
                                 })

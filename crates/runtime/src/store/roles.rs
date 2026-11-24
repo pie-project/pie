@@ -738,31 +738,6 @@ impl GuestTaken {
     /// The runs of chunks its fresh parts took, `(run, pieces)` summed at
     /// the longest run: what a bind short of room for its tables beside
     /// them asks with its own chunk ([`Roles::bind_short`]).
-    /// [`Self::fresh_runs`] with the pair it joined in place counted too:
-    /// the room the capacity gate asks for the bind. Suspended for this
-    /// room, the pair's other holders may park meanwhile, and the bind,
-    /// restored, lays the pair fresh: asked without it, the bind came back a
-    /// run short and its process went down again for one bind (the
-    /// simulation's Metal mix, seed 43: a run of three asked, two taken
-    /// after the restore). Over, never under: the room a pair joined in
-    /// place leaves goes back with the take.
-    fn asked_runs(&self) -> Option<(u32, u32)> {
-        let parts: Vec<(u32, u32)> = self
-            .scratch
-            .iter()
-            .chain(self.pair.iter().map(|(_, part, ..)| part))
-            .map(Part::chunk_runs)
-            .collect();
-        let longest = parts.iter().map(|&(run, _)| run).max()?;
-        Some((
-            longest,
-            parts
-                .iter()
-                .map(|&(run, pieces)| run.div_ceil(longest).saturating_mul(pieces))
-                .sum(),
-        ))
-    }
-
     fn fresh_runs(&self) -> Option<(u32, u32)> {
         let parts: Vec<(u32, u32)> = self
             .scratch
@@ -1002,10 +977,6 @@ pub struct Roles {
     disk: Option<Disk>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
-    /// Each holder's largest bind room so far, in runs of whole chunks:
-    /// its scratch and its pair's state laid fresh, and the single chunks
-    /// beside them ([`Self::bind_claim`]).
-    bind_claims: HashMap<Holder, Vec<(u32, u32)>>,
     items: Items,
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
@@ -1100,7 +1071,6 @@ impl Roles {
             disk: None,
             shapes,
             programs: HashMap::new(),
-            bind_claims: HashMap::new(),
             items: Items::new(),
             held: Vec::new(),
             chunk_slots,
@@ -2179,31 +2149,6 @@ impl Roles {
     /// The engine registered `program`, whose instances hold `facts`.
     pub fn program_registered(&mut self, program: ProgramId, facts: ProgramFacts) {
         self.programs.insert(program, facts);
-    }
-
-    /// `holder`'s claim of whole chunks for a bind: the largest room any
-    /// of its binds asked so far, its pair's state counted as laid fresh
-    /// (a bind may lay it so), in runs of whole chunks; none where it has
-    /// bound nothing that takes whole chunks. What the capacity gate
-    /// reserves for the finisher before it asks
-    /// (`planner::ResidencyPlanner::chunk_spare`).
-    #[must_use]
-    pub fn bind_claim(&self, holder: Holder) -> Vec<(u32, u32)> {
-        self.bind_claims.get(&holder).cloned().unwrap_or_default()
-    }
-
-    /// `holder` asked a bind of `runs`: its claim is the larger of the two.
-    fn claim(&mut self, holder: Holder, runs: Vec<(u32, u32)>) {
-        let chunks = |runs: &[(u32, u32)]| runs.iter().map(|&(run, pieces)| u64::from(run) * u64::from(pieces)).sum::<u64>();
-        let claim = self.bind_claims.entry(holder).or_default();
-        if chunks(&runs) > chunks(claim) {
-            *claim = runs;
-        }
-    }
-
-    /// `holder` left: its claim goes.
-    pub fn forget_claim(&mut self, holder: Holder) {
-        self.bind_claims.remove(&holder);
     }
 
     /// Whether `program`'s facts are known here.
@@ -4326,7 +4271,7 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let taken = take_bind(roles, engine, binding, registered, holder, |_| true, |_, _| false)?;
+    let taken = take_bind(roles, engine, binding, registered, holder, |_| true)?;
     bind_taken(roles, engine, binding, holder, taken)
 }
 
@@ -4345,7 +4290,6 @@ pub fn take_bind(
     registered: impl Fn(ChannelId) -> bool,
     holder: Option<Holder>,
     resident: impl Fn(Holder) -> bool,
-    gated: impl Fn(Holder, u32) -> bool,
 ) -> anyhow::Result<Option<Taken>> {
     let Some(roles) = roles else {
         return Ok(None);
@@ -4362,27 +4306,9 @@ pub fn take_bind(
         extents: binding.extents,
     };
     let mut roles = roles.lock().unwrap();
-    let free_before = roles.device.lock().unwrap().pool().free_chunks();
     let beside = roles.instance_parts_fresh(binding.program, &binding.channels, &registered, adapter);
     let guest = roles.take_guest(&binding.channels, (pair, state), holder, beside)?;
     let fresh = guest.fresh_runs();
-    // The gate's room ask counts the pair it joined, where the pool could
-    // ever hold that many runs: past it, the exact need is asked, so the
-    // over-ask never turns a bind that fits alone into one refused as never
-    // fitting (the simulation's seed 213).
-    let asked = guest
-        .asked_runs()
-        .filter(|&(run, pieces)| {
-            roles.device.lock().unwrap().pool().runs_most(run) >= pieces
-        })
-        .or(fresh);
-    if let Some(holder) = holder {
-        let mut runs: Vec<(u32, u32)> = asked.into_iter().filter(|&(_, pieces)| pieces > 0).collect();
-        if beside > 0 {
-            runs.push((1, beside));
-        }
-        roles.claim(holder, runs);
-    }
     let mut taken = roles
         .take_instance(
             binding.program,
@@ -4395,54 +4321,7 @@ pub fn take_bind(
     taken.holder = holder;
     roles.bind_taken_for(holder);
     roles.on_way_take(&mut taken);
-    let added = free_before.saturating_sub(roles.device.lock().unwrap().pool().free_chunks());
     drop(roles);
-    // What it added: the fresh chunks it opened, its new state
-    // ([`Roles::footprint`]) and the room those chunks hold open past it
-    // ([`Roles::slack`]); slots it took in chunks open already add state
-    // and take as much slack, so none. Past what every tier keeps for the
-    // finisher (`gated`), the take goes back and the bind waits in the
-    // planner for the gate
-    // ([`crate::planner::ResidencyPlanner::capacity_holds_chunks`]).
-    if let Some(holder) = holder
-        && added > 0
-        && gated(holder, added)
-    {
-        roles_handle.lock().unwrap().untake(taken);
-        // The room it waits for is the whole bind's, as a refusal for want
-        // of room asks ([`Roles::take_guest`]): what it opened now (slots
-        // its tables took in chunks open now) may be gone by the time its
-        // process, suspended meanwhile, is restored with that room, and the
-        // bind is short again (the simulation's field mix, seed 80: held
-        // opening 1 chunk, restored with it, short of 4).
-        // Runs of more than a chunk are asked as runs: asked as single
-        // chunks, room was made in chunks that formed no run (the
-        // simulation's seed 189: a victim moved for four single chunks, the
-        // bind's run of two still short).
-        let room = match asked {
-            Some((run, pieces)) if run > 1 => GuestRoom::Runs {
-                run,
-                pieces,
-                free_runs: 0,
-                free_chunks: 0,
-                committable: 0,
-                singles: beside,
-            },
-            asked => GuestRoom::Slots {
-                slots: 0,
-                committable: 0,
-                chunks: added.max(asked.map_or(0, |(_, pieces)| pieces).saturating_add(beside)),
-            },
-        };
-        return Err(RolesError::BindShort(Box::new(RolesError::GuestShort {
-            what: format!(
-                "its {added} new chunks of state, past what every tier keeps for the finisher"
-            ),
-            bytes: 0,
-            room,
-        }))
-        .into());
-    }
     // Read again past the take: a park that began since the first read
     // either saw this bind on its way and waits for it, or parked before
     // it was taken, and then the holder reads parked here and the take

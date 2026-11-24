@@ -10,6 +10,92 @@ use super::wait::{EntryKey, WaitKind};
 use super::{ProcessId, ResidencyPlanner};
 
 impl ResidencyPlanner {
+    /// Every tier full, the stall's head with no move left (its victims'
+    /// moves found no room below, nothing in flight): the would-be victim,
+    /// the lowest of the residents but the head in the policy's order
+    /// (priority, then first come), fails by name with every tier's room
+    /// ([`PlannerError::TiersFull`]), its room freed for the others; with
+    /// none resident, the lowest of the parked (their room below frees for
+    /// the moves). Over-demand with room below waits and moves; only no
+    /// room anywhere ends a process (the simulation's Metal seed 74 and
+    /// field seed 401: the disk full of the evicted, every candidate's move
+    /// refused below, all processes stalled for good). `chosen`: the victim
+    /// already named (an eviction whose copy below found the tier full).
+    /// Whether one was failed.
+    pub(super) fn fail_tiers_full(self: &Arc<Self>, chosen: Option<ProcessId>) -> bool {
+        let tiers = PlannerError::TiersFull {
+            device: self.port.device_stats(),
+            host: self.port.host_stats(),
+            disk: self.port.disk_stats(),
+        };
+        let Some((victim, head, signal, notify)) = self.with_inner(|inner| {
+            let head = inner.unmet_head().map(|(_, head)| head.pid);
+            let lowest = |resident: bool| {
+                inner
+                    .procs
+                    .iter()
+                    .filter(|(pid, proc)| {
+                        Some(**pid) != head
+                            && !inner.killing.contains(*pid)
+                            && (proc.state == Residency::Resident) == resident
+                    })
+                    .max_by_key(|(pid, proc)| (proc.rank(), proc.seq, **pid))
+                    .map(|(pid, _)| *pid)
+            };
+            let victim = chosen
+                .filter(|pid| !inner.killing.contains(pid))
+                .or_else(|| lowest(true))
+                .or_else(|| lowest(false))?;
+            inner.killing.insert(victim);
+            inner.failed.insert(victim, tiers);
+            // Each of its waits ends with the failure: an allocation's
+            // outcome, a bind's or a restore's wait gone from the queue.
+            let mut notify = Vec::new();
+            let keys: Vec<EntryKey> = inner
+                .queue
+                .iter()
+                .filter(|(_, waiter)| waiter.pid == victim)
+                .map(|(&key, _)| key)
+                .collect();
+            for key in keys {
+                let Some(waiter) = inner.queue.get_mut(&key) else {
+                    continue;
+                };
+                match &mut waiter.kind {
+                    WaitKind::Allocation { outcome, notify: wake, .. } if outcome.is_none() => {
+                        *outcome = Some(Err(tiers));
+                        notify.push(wake.clone());
+                    }
+                    WaitKind::BindRoom { notify: wake, .. } => {
+                        notify.push(wake.clone());
+                        inner.queue.remove(&key);
+                    }
+                    WaitKind::Restore { .. } => {
+                        inner.queue.remove(&key);
+                    }
+                    WaitKind::Allocation { .. } => {}
+                }
+            }
+            let signal = inner.procs.get(&victim).map(|proc| proc.signal.clone());
+            Some((victim, head, signal, notify))
+        }) else {
+            return false;
+        };
+        let reason = format!("planner: {tiers}");
+        tracing::warn!(pid = %victim, head = ?head, %reason, "planner: a process fails: every tier is full");
+        self.stats.starvations.fetch_add(1, Ordering::Relaxed);
+        crate::scheduler::worker::notify_process_resume(victim);
+        if let Some(signal) = signal {
+            signal.notify_waiters();
+        }
+        for wake in notify {
+            wake.notify_waiters();
+        }
+        crate::inferlet::process::terminate_by(victim, Err(reason), crate::policy::By::Host);
+        self.poke();
+        true
+    }
+
     pub(super) fn check_rs_starvation(self: &Arc<Self>, key: EntryKey) {
         if !self.is_wedged() || self.waits_on_policy() {
             return;

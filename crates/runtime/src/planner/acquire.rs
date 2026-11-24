@@ -63,11 +63,6 @@ impl ResidencyPlanner {
             }
             return Some(AllocationGrant::empty());
         }
-        // Past what every tier keeps for the finisher, it queues and waits
-        // there, named ([`super::inner::CapacityGate`]).
-        if self.capacity_holds(pid, demand.kv_pages) {
-            return None;
-        }
         let uncontended = self.returns.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
         if uncontended {
@@ -127,6 +122,9 @@ impl ResidencyPlanner {
         quorum_id: ProcessId,
         demand: Demand,
     ) -> Result<Acquired, PlannerError> {
+        if let Some(error) = self.with_inner(|inner| inner.failed.get(&pid).copied()) {
+            return Err(error);
+        }
         let acquired = self.acquire_inner(pid, quorum_id, demand, false).await;
         if matches!(acquired, Ok(Acquired::Granted(_))) {
             self.note_peak(pid, demand);
@@ -486,6 +484,9 @@ impl ResidencyPlanner {
         loop {
             let (signal, asked) = {
                 let mut inner = self.lock_inner();
+                if let Some(&error) = inner.failed.get(&pid) {
+                    return Err(error);
+                }
                 if !inner.procs.contains_key(&pid) {
                     return Err(PlannerError::Cancelled);
                 }
@@ -527,7 +528,9 @@ impl ResidencyPlanner {
             // Waiting its restore turn: its owner is parked here.
             let _parked = crate::inferlet::process::parks_here();
             Self::await_residency_change(&signal, || {
-                self.is_resident(pid) || self.restore_never_fits_now(pid)
+                self.is_resident(pid)
+                    || self.restore_never_fits_now(pid)
+                    || self.with_inner(|inner| inner.failed.contains_key(&pid))
             })
             .await;
         }
@@ -772,7 +775,11 @@ impl ResidencyPlanner {
                 }
             });
             match served {
-                None => return Err(PlannerError::Cancelled),
+                None => {
+                    return Err(self
+                        .with_inner(|inner| inner.failed.get(&pid).copied())
+                        .unwrap_or(PlannerError::Cancelled));
+                }
                 Some((_, true)) => return Ok((BindRoomWait::Withdrawn, Some(registration))),
                 Some((true, false)) => return Ok((BindRoomWait::Served, Some(registration))),
                 Some((false, false)) if self.returns.epoch() != seen => self.wake_planner(),

@@ -2050,10 +2050,6 @@ impl Lane {
                         crate::planner::planner_for(0, engine_idx)
                             .is_none_or(|planner| planner.is_resident(pid))
                     },
-                    |pid, chunks| {
-                        crate::planner::planner_for(0, engine_idx)
-                            .is_some_and(|planner| planner.capacity_holds_chunks(pid, chunks))
-                    },
                 )
                 .and_then(|taken| {
                     match crate::store::roles::take_rings(roles.as_ref(), &mut **engine, &plans) {

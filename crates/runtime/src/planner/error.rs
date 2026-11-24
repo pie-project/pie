@@ -105,6 +105,15 @@ pub enum PlannerError {
         own: u32,
         total: u32,
     },
+    /// Contention found every tier full with no move left to free the
+    /// head's room: this process, the lowest in the policy's order, fails
+    /// so the others proceed ([`super::ResidencyPlanner::fail_tiers_full`]). Each
+    /// tier's free and total pages.
+    TiersFull {
+        device: (u32, u32),
+        host: (u32, u32),
+        disk: (u32, u32),
+    },
     Cancelled,
 }
 
@@ -189,6 +198,13 @@ impl std::fmt::Display for PlannerError {
                  chunks and the {own} chunks the process's own state takes beside it, it \
                  takes {need} chunks of a {total}-chunk pool, even with every other \
                  process moved off it"
+            ),
+            PlannerError::TiersFull { device, host, disk } => write!(
+                f,
+                "every tier is full (device {} of {} pages free, host {} of {}, disk {} of {}) \
+                 and no move frees room for the process waiting: this one, the lowest in the \
+                 policy's order, fails so the others proceed",
+                device.0, device.1, host.0, host.1, disk.0, disk.1
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }

@@ -973,18 +973,6 @@ pub trait PoolPort: Send + Sync + 'static {
         let _ = pid;
         RunNeed::default()
     }
-    /// `pid`'s claim of whole chunks for a bind: the largest room its binds
-    /// asked so far ([`crate::store::roles::Roles::bind_claim`]). Empty
-    /// where it has bound nothing taking whole chunks, or the pool keeps no
-    /// guest state.
-    fn bind_claim(&self, pid: ProcessId) -> RunNeed {
-        let _ = pid;
-        RunNeed::default()
-    }
-    /// `pid` left: its claim goes.
-    fn forget_claim(&self, pid: ProcessId) {
-        let _ = pid;
-    }
     /// The physical chunks the kv `pages` lie in: each chunk, the slots it
     /// holds in all, and how many of `pages` lie there. Empty where the
     /// pool keeps no chunks.
@@ -1575,38 +1563,6 @@ impl PoolPort for RegistryPool {
         });
     }
 
-    fn bind_claim(&self, pid: ProcessId) -> RunNeed {
-        crate::store::registry::try_get(self.model, self.engine)
-            .and_then(|stores| stores.roles)
-            .map_or_else(RunNeed::default, |roles| RunNeed::of(roles.lock().unwrap().bind_claim(pid)))
-    }
-
-    fn kv_pages_by_chunk(
-        &self,
-        pages: &[crate::store::kv::page_table::PhysicalKvPageId],
-    ) -> Vec<(u32, u32, u32)> {
-        let Some(shared) = crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.shared) else {
-            return Vec::new();
-        };
-        let pool = shared.lock().unwrap();
-        let Some(list) = pool.list() else {
-            return Vec::new();
-        };
-        let mut by: std::collections::BTreeMap<u32, (u32, u32)> = std::collections::BTreeMap::new();
-        for page in pages {
-            let slot = pool.slot(list.pool, page.0);
-            if let Some(physical) = pool.pool().physical(slot.chunk) {
-                by.entry(physical).or_insert((pool.pool().chunk_used(slot.chunk), 0)).1 += 1;
-            }
-        }
-        by.into_iter().map(|(chunk, (used, count))| (chunk, used, count)).collect()
-    }
-
-    fn forget_claim(&self, pid: ProcessId) {
-        if let Some(roles) = crate::store::registry::try_get(self.model, self.engine).and_then(|stores| stores.roles) {
-            roles.lock().unwrap().forget_claim(pid);
-        }
-    }
 
     fn unpark_need(&self, pid: ProcessId) -> RunNeed {
         crate::store::registry::try_get(self.model, self.engine)

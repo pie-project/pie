@@ -632,14 +632,12 @@ impl ResidencyPlanner {
         // way left, as where the map names none. Left to the policy, the
         // finisher's bind of adjacent chunks would wait with free chunks a
         // compaction would lay side by side.
-        // The capacity gate's finisher only: every other head may wait on
-        // the policy's answer, the finisher's room is the mechanism's.
+        // With nothing in flight, whatever the head: no answer of the
+        // policy's comes that the compaction does not.
         if picks.is_empty()
             && !parking_down
             && let Some((run, pieces)) = shape.as_ref().and_then(RunNeed::longest)
-            && self.with_inner(|inner| {
-                inner.nothing_in_flight() && inner.is_finisher(victims.head_pid)
-            })
+            && self.with_inner(|inner| inner.nothing_in_flight())
             && self.port.compaction_comes(
                 run,
                 if placement.is_some() {
@@ -954,6 +952,14 @@ impl ResidencyPlanner {
             if held_back > 0 {
                 return;
             }
+            // No move goes below: every candidate's move found no room on
+            // the tiers below and nothing is in flight that frees any.
+            let tier_full = (host_short || !unhostable.is_empty() || blocked)
+                && self.is_wedged()
+                && !self.waits_on_policy();
+            if tier_full && self.fail_tiers_full(None) {
+                return;
+            }
             if victims.deficit.pages == 0 {
                 self.check_rs_starvation(victims.head);
             } else if !unhostable.is_empty() {
@@ -1208,12 +1214,8 @@ impl ResidencyPlanner {
                         // would leave it a victim for the next head, back
                         // down before it ran. With nothing in
                         // flight it runs nothing, a victim like any other.
-                        // One whose ask the capacity gate holds cannot fire
-                        // until those ahead of it finish: no spare for it
-                        // ([`Inner::gate_holds`]).
                         && !(proc.unfired
                             && !proc.bind_waiting
-                            && !inner.gate_holds(**pid)
                             && (!queued(*pid) || !quiet()))
                         // Restored past this head while it stood passed
                         // over: it fires before this head moves it again.
@@ -1224,8 +1226,6 @@ impl ResidencyPlanner {
                         && !inner.killing.contains(*pid)
                         // Its pages move under a list compaction.
                         && inner.settled_resident(**pid)
-                        // The finisher is no victim ([`super::inner::CapacityGate`]).
-                        && !inner.is_finisher(**pid)
                         // Served its bind's room, it takes it as it wakes.
                         && !inner.bind_served(**pid)
                         // The head is a restore of one evicted for this
@@ -1321,12 +1321,7 @@ impl ResidencyPlanner {
                 // the victim set chose it (the one rule there).
                 let yields =
                     proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
-                // The finisher is no victim while it is the finisher
-                // ([`super::inner::CapacityGate`]): parked, the tiers'
-                // headroom kept for it serves no one (every other ask is
-                // held at the gate). The policy picks among the others.
                 if proc.state != Residency::Resident
-                    || inner.is_finisher(pid)
                     || inner.bind_served(pid)
                     || inner.evicted_for_by(head_pid, pid)
                     || inner.unfired_protects(pid)
@@ -1567,11 +1562,6 @@ impl ResidencyPlanner {
             let hoard = inner.accum.len() as u32;
             inner.queue.iter().find_map(|(&key, waiter)| {
                 if key == head_key || !waiter.is_unmet() {
-                    return None;
-                }
-                // Past what every tier keeps for the finisher: it waits
-                // on the gate ([`super::inner::CapacityGate`]).
-                if inner.gate_holds_waiter(waiter) {
                     return None;
                 }
                 match &waiter.kind {
