@@ -163,12 +163,6 @@ pub(crate) fn hear_handles_settled(
     hears
 }
 
-/// The worker policy dropped the handle it knows as `id`.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) fn discard_handle(client_id: ClientId, id: ProcessId, why: String) {
-    let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::DiscardHandle(id, why));
-}
-
 /// The turn behind `corr_id` is cancelled before it had a process.
 pub fn forget_frame(client_id: ClientId, corr_id: u32) {
     let _ = CLIENT_SERVICES.send(&client_id, SessionMessage::Forget(corr_id));
@@ -237,8 +231,6 @@ enum SessionMessage {
     },
     ClientRequest(ClientMessage),
     HandlesSettled(Vec<(client_api::HandleName, crate::handle::Landing)>),
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    DiscardHandle(ProcessId, String),
     /// A turn was cancelled: if its frame is still waiting, it never runs.
     Forget(u32),
     ReceiveFile {
@@ -282,7 +274,7 @@ impl Session {
         tenant: String,
         username: String,
     ) -> Self {
-        let handles = crate::handle::Table::new(id, tenant.clone());
+        let handles = crate::handle::Table::new(tenant.clone());
         Session {
             id,
             username,
@@ -346,7 +338,6 @@ impl ServiceHandler for Session {
                 self.handles.settle(settled);
                 self.run_waiting().await;
             }
-            SessionMessage::DiscardHandle(id, why) => self.handles.discard(id, why),
             SessionMessage::Forget(corr_id) => {
                 self.waiting
                     .retain(|frame| frame.corr_id() != Some(corr_id));

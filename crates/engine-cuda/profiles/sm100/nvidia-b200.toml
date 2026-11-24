@@ -17,14 +17,12 @@ sdpa.selected_mma = true
 sdpa.selected_cluster = 8
 moe.mxfp4_f16 = true
 
-# Host-mapped `host` planes, a decoding
-# lane's pages before a waiting prompt, a lattice bucket between powers of
-# two (four from 4096 rows), and a gated delta fire at most 4096 rows.
+# Host-mapped `host` planes, a lattice bucket between powers of two (four
+# from 4096 rows), and a gated delta fire at most 4096 rows.
 [engine]
 lattice_steps = 2
 prefill_lattice_from = 4096
 host_planes = true
-seated_first = true
 walk_fire_rows = 4096
 
 [provenance]
@@ -48,7 +46,6 @@ measured = [
   "engine.copies",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.seated_first",
   "engine.walk_fire_rows",
   "engine.working_set_percent",
 ]

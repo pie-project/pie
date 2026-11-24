@@ -104,16 +104,10 @@ pub struct ResidencyPlanner {
     pub(super) swap_bound: AtomicBool,
     pub(super) port: Arc<dyn PoolPort>,
     pub(super) stats: PlannerStats,
-    /// `PoolFacts::seated_first`: a seated lane's growth before a prompt
-    /// waiting to be seated, which waits for a lane to finish.
-    pub(super) seated_first: bool,
     /// Held while an uncontended claim reads the rings' free room, weighs it
     /// against the seated lanes' growth and takes its grant, so prompts seated
     /// at once each see the others' pages gone.
     pub(super) seating: parking_lot::Mutex<()>,
-    /// `PoolFacts::seat_to_end`: see [`super::to_end::ToEnd`].
-    seat_to_end: bool,
-    to_end_notify: Notify,
     /// Told when the state pool may seat more: a charged process left, a
     /// set was let go, or the pool backed more slots.
     seat_room: Notify,
@@ -198,10 +192,7 @@ impl ResidencyPlanner {
             swap_bound: AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
-            seated_first: false,
             seating: parking_lot::Mutex::new(()),
-            seat_to_end: false,
-            to_end_notify: Notify::new(),
             seat_room: Notify::new(),
             short: parking_lot::Mutex::new(Shortfall::default()),
             sink,
@@ -429,7 +420,7 @@ impl ResidencyPlanner {
         // Pages the planner gathered and holds for its heads are free too:
         // counted taken, gathering for a head held it at the gate, given
         // back it went again, a pass that never ended.
-        let (candidates, gathered, residents) = self.with_inner(|inner| {
+        let (candidates, gathered, residents, priority) = self.with_inner(|inner| {
             let mut candidates: Vec<(u64, ProcessId, bool, u64)> = inner
                 .procs
                 .iter()
@@ -451,13 +442,17 @@ impl ResidencyPlanner {
                 })
                 .collect();
             candidates.sort_unstable_by_key(|&(seq, ..)| seq);
+            let priority: std::collections::HashMap<ProcessId, (i64, i64)> = candidates
+                .iter()
+                .filter_map(|&(_, pid, ..)| Some((pid, inner.procs.get(&pid)?.rank().priority())))
+                .collect();
             let residents: Vec<ProcessId> = inner
                 .procs
                 .iter()
                 .filter(|(_, proc)| proc.state == Residency::Resident)
                 .map(|(pid, _)| *pid)
                 .collect();
-            (candidates, inner.accum.len() as u64, residents)
+            (candidates, inner.accum.len() as u64, residents, priority)
         });
         if candidates.is_empty() {
             return None;
@@ -534,6 +529,23 @@ impl ResidencyPlanner {
         // Fewest needed first, the oldest first among equals (candidates
         // come by admission, and the sort is stable).
         order.sort_by_key(|&(need, ..)| need);
+        let fits = |&(need, _, read): &(u64, u64, super::inner::CapacityRead)| need <= read.free();
+        // The first finisher is the highest-priority candidate whose need
+        // fits now (the policy's `schedule/priority`): finishing it only
+        // raises what is free, so the rest, still in need order, stay
+        // feasible. Ties keep the banker's own order (fewest needed), then
+        // first come, first served. Equal priorities leave it as it was.
+        let priority_of = |read: &super::inner::CapacityRead| {
+            priority.get(&read.finisher).copied().unwrap_or_default()
+        };
+        if let Some(head) = order.first().map(|(_, _, read)| priority_of(read))
+            && let Some(best) = order.iter().filter(|c| fits(c)).map(|(_, _, read)| priority_of(read)).max()
+            && best > head
+            && let Some(at) = order.iter().position(|c| fits(c) && priority_of(&c.2) == best)
+        {
+            let first = order.remove(at);
+            order.insert(0, first);
+        }
         // The finisher stays first while it still fits, or while no one
         // else does: it runs to its end. Read afresh each pass, the first
         // flipped between two processes as a restore moved one's need:
@@ -544,7 +556,6 @@ impl ResidencyPlanner {
         // no one fitted, and the finisher passed to whoever needed least
         // for that step, its own restore's victim among the rest.
         let kept = self.with_inner(|inner| inner.capacity.map(|gate| gate.finisher));
-        let fits = |&(need, _, read): &(u64, u64, super::inner::CapacityRead)| need <= read.free();
         if let Some(at) = order.iter().position(|&(_, _, read)| Some(read.finisher) == kept)
             && (fits(&order[at]) || !order.iter().any(fits))
         {
@@ -774,39 +785,13 @@ impl ResidencyPlanner {
         (need > total).then_some(super::PlannerError::PastDevice { need, total, runs })
     }
 
-    /// With `PoolFacts::seat_to_end`, a process starts only while the pools
-    /// hold the started ones to the end (see [`super::to_end::ToEnd`]).
-    #[must_use]
-    pub fn seat_to_end(mut self, on: bool) -> Self {
-        self.seat_to_end = on;
-        self
-    }
-
-    /// With `PoolFacts::seat_spread`, the starts the pools do not hold to the
-    /// end at once are spread over a life (see [`super::to_end::ToEnd`]).
-    #[must_use]
-    pub fn seat_spread(mut self, on: bool) -> Self {
-        self.inner.get_mut().to_end.spread = on;
-        self
-    }
-
-    /// With `PoolFacts::seated_first`, seated growth doesn't park behind a waiting
-    /// prompt, which is seated only within the rings' growth room
-    /// (`PoolPort::rs_growth`) and suspends only an idle lane.
-    #[must_use]
-    pub fn seated_first(mut self, on: bool) -> Self {
-        self.seated_first = on;
-        self
-    }
-
-    /// The rs units a seated lane may still claim, when the planner keeps
-    /// them for it.
+    /// The rs units a seated lane may still claim: a prompt is seated only
+    /// beside them. A seated lane's growth goes before a prompt waiting to
+    /// be seated, and the prompt waits for a lane to finish rather than
+    /// suspend one: PLEX 1.1's no-displacement rule (spec §4.1), the one
+    /// rule on every engine.
     pub(super) fn rs_growth(&self) -> RsUnits {
-        if self.seated_first {
-            self.port.rs_growth()
-        } else {
-            RsUnits::default()
-        }
+        self.port.rs_growth()
     }
 
     pub fn arm_drain_task(self: &Arc<Self>) {
@@ -846,9 +831,7 @@ impl ResidencyPlanner {
 
     /// The drain task's beat while anyone waits, once a
     /// [`crate::policy::pressure::AGAIN`] for the whole planner, never one
-    /// per waiter: a shortfall that stands is said again (the default
-    /// responder looks again when its last discard freed too little),
-    /// fires stood unsettled past their window are noted (a fleet that
+    /// per waiter: a shortfall that stands is said again, fires stood unsettled past their window are noted (a fleet that
     /// stalls so is planned for), a waiter whose need the pool shrank under
     /// is woken to be refused, and a stall that goes on is said again. It
     /// plans nothing on the clock: events plan.
@@ -1176,6 +1159,26 @@ impl ResidencyPlanner {
             Some(notify) => notify.notify_one(),
             None => self.plan(),
         }
+    }
+
+    /// The device is short of `pages` with no waiter to plan for (its
+    /// governor's target fell under what the pool holds): idle cache yields
+    /// for it as it does to a waiter, moved down the tiers its retention
+    /// rows name, else dropped where they name none, lowest retention
+    /// first, least recently used among equals. Live state stays; what
+    /// cannot move waits for the next report.
+    pub fn yield_idle(self: &Arc<Self>, pages: u32) {
+        if pages == 0 {
+            return;
+        }
+        self.re_arm_idle_reclaim();
+        if self.demote_idle(pages) {
+            return;
+        }
+        let _ = self.reclaim_idle_once(super::pool::IdleShort {
+            kv_pages: pages,
+            rs: true,
+        });
     }
 
     /// Drops idle cache for what the head is `short` of, past what earlier
@@ -2029,9 +2032,6 @@ impl ResidencyPlanner {
             }
         }
         self.admit_state(pid).await;
-        if self.seat_to_end {
-            self.admit_to_end(pid).await;
-        }
     }
 
     /// The processes the state pool runs at once: each holds
@@ -2124,9 +2124,6 @@ impl ResidencyPlanner {
 
     /// What `pid` holds once `demand` lands, kept as its peak.
     pub fn note_peak(&self, pid: ProcessId, demand: Demand) {
-        if !self.seat_to_end {
-            return;
-        }
         let (model, engine) = self.port.locus();
         let kv = held_page_count(pid, model, engine) + demand.kv_pages;
         let rs = super::holdings::held_rs_units(pid, model, engine).add(demand.rs);
@@ -2146,56 +2143,18 @@ impl ResidencyPlanner {
     }
 
     /// What this planner has learned of its processes' footprints: the
-    /// lanes its pools hold to their end at once, and a process's life past
-    /// the gate. `None` until one has finished.
-    pub fn to_end_facts(&self) -> Option<(u64, Option<std::time::Duration>)> {
+    /// lanes its pools hold to their end at once (`None` until one has
+    /// finished), and whether its pool has no host tier, so a lane run
+    /// short restarts its process rather than parking below
+    /// (`pie/starts-spread`). Facts a policy paces starts by; the planner
+    /// gates nothing on them.
+    pub fn to_end_facts(&self) -> (Option<u64>, bool) {
         let (_, kv_total) = self.port.device_stats();
         let (_, rs_total) = self.port.rs_stats();
-        self.with_inner(|inner| {
-            Some((inner.to_end.lanes_to_end(kv_total, rs_total)?, inner.to_end.life()))
-        })
-    }
-
-    /// Holds `pid` back, oldest first, until the pools hold it to the end
-    /// beside the processes already started.
-    async fn admit_to_end(&self, pid: ProcessId) {
-        loop {
-            let notified = self.to_end_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let (_, kv_total) = self.port.device_stats();
-            let (_, rs_total) = self.port.rs_stats();
-            let now = std::time::Instant::now();
-            let passed = self.with_inner(|inner| {
-                let Some(rank) = inner.procs.get(&pid).map(Proc::rank) else {
-                    return Ok(());
-                };
-                inner.to_end.waiting.insert((rank, pid));
-                // By pid: a reschedule may have moved its rank since it queued.
-                if inner
-                    .to_end
-                    .waiting
-                    .first()
-                    .is_none_or(|(_, first)| *first != pid)
-                {
-                    return Err(None);
-                }
-                inner.to_end.room(&inner.procs, kv_total, rs_total, now)?;
-                inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
-                inner.to_end.live.insert(pid, now);
-                Ok(())
-            });
-            match passed {
-                Ok(()) => {
-                    self.to_end_notify.notify_waiters();
-                    return;
-                }
-                Err(None) => notified.await,
-                Err(Some(spread)) => {
-                    let _ = crate::rt::time::timeout(spread, notified).await;
-                }
-            }
-        }
+        let (_, host_total) = self.port.host_stats();
+        let (_, rs_host_total) = self.port.rs_host_stats();
+        let lanes = self.with_inner(|inner| inner.to_end.lanes_to_end(kv_total, rs_total));
+        (lanes, host_total == 0 && rs_host_total.is_zero())
     }
 
     /// Queues the restore of a parked `pid` because a message for it is on
@@ -2266,9 +2225,6 @@ impl ResidencyPlanner {
                 // A tiers row may keep its working set off the device while
                 // it waits.
                 crate::policy::retention::idle_cache_appeared();
-            }
-            if self.seat_to_end {
-                self.to_end_notify.notify_waiters();
             }
             let parked = if idle || proc.held || proc.seatless {
                 None
@@ -2596,18 +2552,12 @@ impl ResidencyPlanner {
             if departed.is_some() {
                 inner.admitting.retain(|(_, waiting), _| *waiting != pid);
             }
-            if self.seat_to_end {
-                if let Some(passed) = inner.to_end.live.remove(&pid)
-                    && let Some(proc) = departed.as_ref().filter(|proc| {
-                        proc.admitted
-                            && proc.state == Residency::Resident
-                            && !proc.respawn
-                            && proc.peak.0 > 0
-                    })
-                {
-                    inner.to_end.learn(proc.peak, proc.first, passed.elapsed());
-                }
-                inner.to_end.waiting.retain(|(_, waiting)| *waiting != pid);
+            // What a finished process held at most and at its prompt: the
+            // footprint `pie/lanes-to-end` is read from.
+            if let Some(proc) = departed.as_ref().filter(|proc| {
+                proc.admitted && proc.state == Residency::Resident && !proc.respawn && proc.peak.0 > 0
+            }) {
+                inner.to_end.learn(proc.peak, proc.first);
             }
             if departed.as_ref().is_some_and(|proc| {
                 proc.admitted && !proc.holder && proc.state == Residency::Resident
@@ -2660,9 +2610,6 @@ impl ResidencyPlanner {
             signal.notify_waiters();
         }
         drop(removed);
-        if self.seat_to_end {
-            self.to_end_notify.notify_waiters();
-        }
         self.re_arm_idle_reclaim();
         self.poke();
     }

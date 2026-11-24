@@ -71,7 +71,6 @@ fn idle_snapshots_go_in_retention_order() {
     // demand, whatever its key.
     assert_eq!(s.reclaim_cache(rank), 1);
     assert!(!s.has_checkpoint(&[1; 32]));
-    assert_eq!(s.discard_cache(high), 0);
     assert_eq!(s.reclaim_cache(rank), 0);
 }
 

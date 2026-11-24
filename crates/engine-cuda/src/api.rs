@@ -865,9 +865,6 @@ impl Engine for Cuda {
                     .min()
                     .unwrap_or(0),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
-                seated_first: shell.seated_first(),
-                seat_to_end: shell.seat_to_end(),
-                seat_spread: shell.seat_spread(),
             },
             chunks: chunk_facts,
             limits: FireLimits {

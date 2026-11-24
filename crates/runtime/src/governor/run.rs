@@ -472,7 +472,7 @@ impl Steer {
                         held_segments = held,
                         target_segments = segments,
                         draining_segments = mapped.draining,
-                        "the pool maps more than its target and has no room to evacuate into: what is left is live or idle cache only the policy can shed; tier pressure to the policy"
+                        "the pool maps more than its target and has no room to evacuate into: what is left is live or idle cache; the stores let idle cache go by its retention rows"
                     );
                 }
                 // Said every turn it stands, not only as it changes: what
@@ -480,9 +480,9 @@ impl Steer {
                 // sets still use and give back no segment, so the
                 // shortfall stands at the same `held`. The gauge reports a
                 // standing shortfall again on its own period
-                // ([`crate::policy::pressure::AGAIN`]), and the default
-                // responder looks again, next lowest key first, until the
-                // pool can give the segments back.
+                // ([`crate::policy::pressure::AGAIN`]), and the stores
+                // let more idle cache go each time, lowest retention
+                // first, until the pool can give the segments back.
                 self.short = Some(held);
                 signal(Signal::TierPressure {
                     held_bytes: held.saturating_mul(limits.segment_bytes),
@@ -1105,7 +1105,7 @@ mod tests {
         );
         // What it holds stays: nothing was dropped, nothing failed.
         assert_eq!(pool.segments(), 700);
-        // Once the policy has shed, the shrink lands and the pressure eases.
+        // Once the stores have shed, the shrink lands and the pressure eases.
         pool.pinned = 0;
         assert_eq!(tick(&mut steer, &mut pool), vec![Signal::Eased]);
         assert_eq!(pool.segments(), 500);
@@ -1113,27 +1113,13 @@ mod tests {
 
     /// One episode end to end: the host's room drops below what the pool
     /// holds, the governor raises tier pressure for exactly the shortfall,
-    /// PLEX's default responder sheds lowest retention key first (a pinned
-    /// set never), the shrink lands with no retarget failing, and once the
+    /// the stores shed idle cache in retention order (no runtime responder
+    /// chooses), the shrink lands with no retarget failing, and once the
     /// room recovers the pool grows back to its limit with nothing raised.
     #[test]
-    fn a_room_under_the_pool_sheds_in_plex_order_and_recovers() {
+    fn a_room_under_the_pool_sheds_and_recovers() {
         use crate::governor::steered::short_bytes;
-        use crate::policy::pressure::{Candidate, PINNED, choose};
 
-        let set = |id: &str, key: i64, last_use_ms: u64, mib: u64| Candidate {
-            id: id.into(),
-            key,
-            last_use_ms,
-            bytes: Some(mib * MIB),
-        };
-        let sets = vec![
-            set("kept", 5, 10, 200),
-            set("droppable", -1, 30, 150),
-            set("older", 2, 10, 100),
-            set("newer", 2, 20, 100),
-            set("pinned", PINNED, 0, 300),
-        ];
         let live: u64 = 850;
 
         let host = Host::new(1000);
@@ -1160,25 +1146,12 @@ mod tests {
         let short = short_bytes(signals[0]);
         assert_eq!(short, 350 * MIB);
 
-        // The same reading again says the same shortfall: it stands, and
-        // the gauge reports it again on its period for the responder to
-        // look again.
+        // The same reading again says the same shortfall: it stands.
         assert_eq!(tick(&mut steer, &mut pool), signals);
 
-        // PLEX order: the droppable key first, then key 2 least recently
-        // used first, stopping once the shortfall is covered; key 5 and the
-        // pinned set stay.
-        let chosen = choose(sets.clone(), short);
-        assert_eq!(chosen, ["droppable", "older", "newer"]);
-        let freed: u64 = sets
-            .iter()
-            .filter(|c| chosen.contains(&c.id))
-            .map(|c| c.bytes.unwrap() / MIB)
-            .sum();
-        assert!(freed * MIB >= short);
-
-        // The stores discard them; the shrink lands and the pressure eases.
-        pool.pinned = live - freed;
+        // The stores let idle cache go for it (`ResidencyPlanner::yield_idle`);
+        // the shrink lands and the pressure eases.
+        pool.pinned = live - short / MIB;
         assert_eq!(tick(&mut steer, &mut pool), vec![Signal::Eased]);
         assert_eq!(pool.segments(), 500);
 

@@ -362,9 +362,14 @@ pub fn tell(engine: usize, signal: Signal, raise: &mut impl FnMut(Tier, usize, u
     }
 }
 
-/// [`tell`], to the policy's gauge.
+/// [`tell`], to the policy's gauge; and the stores answer the shortfall:
+/// the engine's planner lets idle cache go for it, down the tiers its
+/// retention rows name or dropped where they name none
+/// ([`crate::planner::ResidencyPlanner::yield_idle`]). No runtime responder
+/// chooses what goes.
 pub fn signal(engine: usize, signal: Signal) {
     tracing::debug!(engine, ?signal, "governor pool short of its target");
+    let short = short_bytes(signal);
     tell(engine, signal, &mut |tier, from, bytes| {
         if bytes == 0 {
             pressure::relieve(tier, from);
@@ -372,4 +377,10 @@ pub fn signal(engine: usize, signal: Signal) {
             pressure::raise(tier, from, bytes);
         }
     });
+    if short > 0
+        && let Some(planner) = crate::planner::planner_for(0, engine)
+    {
+        let page = pressure::scale_of(engine).kv_page_bytes.max(1);
+        planner.yield_idle(u32::try_from(short.div_ceil(page)).unwrap_or(u32::MAX));
+    }
 }

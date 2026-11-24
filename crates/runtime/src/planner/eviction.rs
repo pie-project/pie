@@ -52,7 +52,7 @@ impl ResidencyPlanner {
                 (pid, rank, quiescent)
             })
             .collect();
-        ordered.sort_by_key(|&(_, rank, quiescent)| (!quiescent, std::cmp::Reverse(rank)));
+        ordered.sort_by_key(|&(_, rank, quiescent)| victim_order(rank, quiescent));
         let pids: Vec<ProcessId> = ordered.iter().map(|(pid, ..)| *pid).collect();
         // On a shared pool the state a victim parks frees chunks kv takes:
         // it is worth that many kv pages to a head short of kv.
@@ -776,9 +776,11 @@ impl ResidencyPlanner {
             return;
         }
         if picks.is_empty() {
-            // Nothing the planner may move covers the head: it parks, and
-            // the policy is asked for room (`tier-pressure`). The host is
-            // short too where a victim's move found no room there.
+            // Nothing the planner may move covers the head: it parks, its
+            // shortfall reported (`pie/{tier}-band`), and waits for room a
+            // completion, a move or a commit gives back: no deadline, and
+            // no runtime responder chooses what goes. The host is short
+            // too where a victim's move found no room there.
             let host = if host_short || !unhostable.is_empty() {
                 deficit
             } else {
@@ -1294,7 +1296,7 @@ impl ResidencyPlanner {
         })?;
         // State the head lacks on a shared pool is kv to move: the chunks it
         // frees open for the state's shapes. Without this the planner moves
-        // nothing for it and the policy is asked to discard instead.
+        // nothing for it and it waits on the shortfall instead.
         let as_pages = self.port.rs_as_pages(victims.deficit.rs);
         if as_pages > 0 {
             victims.rs_short = victims.deficit.rs;
@@ -1537,7 +1539,7 @@ impl ResidencyPlanner {
                             }
                         })
                         .collect();
-                    legal.sort_by_key(|&(_, rank, fresh, _)| (!fresh, std::cmp::Reverse(rank)));
+                    legal.sort_by_key(|&(_, rank, fresh, _)| victim_order(rank, fresh));
                     let mut picks = Vec::new();
                     let mut covered = 0u32;
                     for (pid, _, _, frees) in legal {
@@ -1656,6 +1658,15 @@ impl ResidencyPlanner {
     }
 }
 
+/// The order victims go in: the lowest priority first (the policy's
+/// `schedule/priority`, a holder's retention key after it; PLEX 1.1 §4.1).
+/// `first` (quiescent, or fresh) only orders equal priorities, ahead of the
+/// engine's own tie: first come, first served, reversed for victims, so the
+/// youngest goes first.
+pub(super) fn victim_order(rank: Rank, first: bool) -> impl Ord {
+    (rank.priority(), !first, std::cmp::Reverse(rank))
+}
+
 /// The candidates a plan quotes, and what it covers: for a bind short of
 /// whole chunks (`shape`, its run and pieces), the occupants of the
 /// cheapest chunks it could take ([`super::pool::ChunkMap::cheapest_runs`]),
@@ -1667,9 +1678,19 @@ fn chunk_picks(
     shape: Option<&RunNeed>,
     map: Option<&super::pool::ChunkMap>,
 ) -> (Vec<(ProcessId, super::rank::Rank)>, Reclaim, Vec<ProcessId>) {
+    // Of the runs that serve it, those whose highest-priority occupant is
+    // lowest (the policy's order), then the cheapest.
+    let priority: std::collections::HashMap<ProcessId, (i64, i64)> = candidates
+        .iter()
+        .map(|&(pid, rank)| (pid, rank.priority()))
+        .collect();
     let occupants = shape
         .zip(map)
-        .and_then(|(need, map)| map.cheapest_need(need))
+        .and_then(|(need, map)| {
+            map.cheapest_need_by(need, &|pid| {
+                priority.get(&pid).copied().unwrap_or((i64::MIN, i64::MIN))
+            })
+        })
         .filter(|occupants| !occupants.is_empty());
     // Short of whole chunks with the map read and no runs its candidates
     // could empty: no one is moved by pages counted anywhere, which frees
@@ -1914,5 +1935,64 @@ mod chunk_picks_tests {
         };
         assert_eq!(map.cheapest_runs(4, 1), None, "6..10 crosses chunk 8's segment edge");
         assert_eq!(map.cheapest_runs(2, 2), Some(vec![]), "6..8 and 8..10 each lie in one");
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::super::pool::{ChunkHeld, ChunkMap, RunNeed};
+    use super::*;
+
+    fn pid(n: u128) -> ProcessId {
+        ProcessId::from_u128(n)
+    }
+
+    /// A8: the policy's priority orders victims; quiescence only orders
+    /// equal priorities, and the youngest goes first among equals.
+    #[test]
+    fn a_victim_is_the_lowest_priority_and_quiescence_only_breaks_ties() {
+        let low_busy = Rank::of(-1, 5);
+        let high_quiet = Rank::of(3, 9);
+        let mut order = vec![(high_quiet, true), (low_busy, false)];
+        order.sort_by_key(|&(rank, quiet)| victim_order(rank, quiet));
+        assert_eq!(order[0].0, low_busy, "a lower priority goes first, quiescent or not");
+        let (older_busy, younger_busy, older_quiet) = (Rank::of(0, 1), Rank::of(0, 2), Rank::of(0, 0));
+        let mut ties = vec![(older_busy, false), (older_quiet, true), (younger_busy, false)];
+        ties.sort_by_key(|&(rank, quiet)| victim_order(rank, quiet));
+        assert_eq!(
+            ties.iter().map(|&(rank, _)| rank).collect::<Vec<_>>(),
+            vec![older_quiet, younger_busy, older_busy],
+            "among equals: the quiescent, then the youngest (FCFS reversed)"
+        );
+    }
+
+    /// A15: of the runs that serve a bind, those whose highest-priority
+    /// occupant is lowest, then the cheapest; equal priorities leave the
+    /// cheapest.
+    #[test]
+    fn a_run_is_emptied_of_its_lowest_priority_occupants_before_its_cheapest() {
+        let held = |chunk: u32, by: u128, pages: u32| ChunkHeld {
+            chunk,
+            used: pages,
+            by: vec![(pid(by), pages)],
+        };
+        let map = ChunkMap {
+            held: vec![held(1, 1, 1), held(2, 2, 5)],
+            free: vec![],
+            headroom: None,
+            segment_chunks: 0,
+        };
+        let need = RunNeed::one(1, 1);
+        assert_eq!(map.cheapest_need(&need), Some(vec![pid(1)]), "no priorities: the cheapest");
+        let priority = |p: ProcessId| if p == pid(1) { (5, 0) } else { (0, 0) };
+        assert_eq!(
+            map.cheapest_need_by(&need, &priority),
+            Some(vec![pid(2)]),
+            "the low-priority occupant moves, though its chunk holds more"
+        );
+        // Both chunks wanted: whatever their priority, both move.
+        let mut both = map.cheapest_need_by(&RunNeed::one(1, 2), &priority).unwrap();
+        both.sort_unstable();
+        assert_eq!(both, vec![pid(1), pid(2)]);
     }
 }
