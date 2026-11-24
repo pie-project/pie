@@ -72,22 +72,42 @@ impl Shell {
                     }
                     vec![rung]
                 } else {
-                    // A masked load's mixed fire (prompts beside decodes)
-                    // stages the mask plane over as many lanes as the rung
-                    // seats, past a prefill's (`Shell::fire_full`): the
-                    // rung's rows over its most lanes, each at the page
-                    // bound, bound it.
-                    let mixed = with_mask.then(|| rung.min(lanes_cap));
                     buckets
                         .iter()
                         .copied()
                         .filter(|&n| n <= lanes_cap && n * 2 <= rung)
                         .chain(std::iter::once(1))
-                        .chain(mixed)
                         .collect()
                 };
                 for lanes in counts {
-                    match self.stage_widest(word, rung, lanes, decode, with_mask, context) {
+                    match self.stage_widest(word, rung, lanes, decode, with_mask, context, None) {
+                        Ok(rows) => most = most.max(rows),
+                        Err(fault) => {
+                            out = Err(fault);
+                            break 'rungs;
+                        }
+                    }
+                }
+            }
+            // A masked load's mixed fire stages the mask plane whatever its
+            // lanes' masks (`Shell::fire_full`): its decodes beside a prompt,
+            // over the most lanes the rung seats, each at the page bound.
+            let masked_words = (
+                words.iter().find(|w| w.1 && w.2).map(|w| w.0),
+                words.iter().find(|w| !w.1 && w.2).map(|w| w.0),
+            );
+            if let (Some(decode_word), Some(prompt_word)) = masked_words {
+                let lanes = rung.min(lanes_cap);
+                if lanes > 1 {
+                    match self.stage_widest(
+                        prompt_word,
+                        rung,
+                        lanes,
+                        false,
+                        true,
+                        context,
+                        Some(decode_word),
+                    ) {
                         Ok(rows) => most = most.max(rows),
                         Err(fault) => {
                             out = Err(fault);
@@ -114,13 +134,18 @@ impl Shell {
         decode: bool,
         with_mask: bool,
         context: u32,
+        beside: Option<u64>,
     ) -> Result<u32> {
         let slots = self.held.len().max(1) as u32;
         let page = self.paging().page_size.max(1);
+        // A mixed fire (`beside`: its decodes' word): every lane but the
+        // last a decode of one row, the last the rung's other rows.
         let rows: Vec<u32> = (0..lanes)
             .map(|at| {
-                if decode {
+                if decode || (beside.is_some() && at + 1 < lanes) {
                     1
+                } else if beside.is_some() {
+                    rung.saturating_sub(lanes - 1).max(1)
                 } else {
                     rung / lanes + u32::from(at < rung % lanes)
                 }
@@ -217,6 +242,10 @@ impl Shell {
             .enumerate()
             .zip(verbs.iter().zip(&feeds))
             .map(|((at, (tokens, readout, scratch, mask)), (verb, inputs))| {
+                let word = match beside {
+                    Some(decode_word) if at + 1 < lanes as usize => decode_word,
+                    _ => word,
+                };
                 let mut seated = Seated::of(Lane {
                     slot: at as u32 % slots,
                     word,
