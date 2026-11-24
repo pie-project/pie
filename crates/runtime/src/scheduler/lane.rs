@@ -734,8 +734,9 @@ pub(crate) struct BehindTaken {
 /// lowest claim on the pool there is: none is taken while a waiter is
 /// short of a slot (any arrival or parked process comes first), and where
 /// the free slots fall short, idle cache yields what is short of it, the
-/// way it yields to running work (`KvStore::reclaim_cache`, its
-/// retention keys' order and tiers; the rs checkpoints after), never a live, parked
+/// way it yields to running work (`KvStore::reclaim_cache`: its rows' order
+/// and tiers, a set at a time, no more than what is short; the rs
+/// checkpoints after), never a live, parked
 /// or suspended set. Taken in full, or none (empty seats: the slice that
 /// fires waits for a later idle turn). Nothing is waited on: the planner
 /// never sees it.
