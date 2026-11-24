@@ -459,15 +459,19 @@ pub fn spawn_control_tasks<C: ControlLink>(
                 continue;
             }
             last = Some((status, Instant::now()));
-            if runtime::planner::trace_enabled() {
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 let (free, idle, held, total) = runtime::store::kv_census();
-                println!(
-                    "[report] kv_bucket={} pages free={free} idle={idle} held={held} of {total} inflight={} queue=[{}]",
-                    status.kv_pressure_bucket,
-                    status.inflight,
-                    runtime::planner::planner()
+                tracing::debug!(
+                    kv_bucket = status.kv_pressure_bucket,
+                    free,
+                    idle,
+                    held,
+                    total,
+                    inflight = status.inflight,
+                    queue = %runtime::planner::planner()
                         .map(|p| p.debug_queue())
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    "worker report"
                 );
             }
             if let Err(e) = report_ctrl.report_worker(worker_id, status).await {
