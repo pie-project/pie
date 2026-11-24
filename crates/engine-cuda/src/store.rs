@@ -575,7 +575,7 @@ pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
         );
     }
     let (free, total) = device_memory()?;
-    let held = (total - free).saturating_sub(crate::device::own::before_loads(latch));
+    let held = (total - free).saturating_sub(crate::device::own::before_loads(latch)?);
     Ok(elastic::ceiling_of(total, held, allowance))
 }
 
@@ -2654,12 +2654,6 @@ impl Pools {
             .fixed
             .as_ref()
             .map_or(1, |fixed| fixed.ids_a_lane().max(1))
-    }
-
-    /// Lets go of the name [`Pools::name_record`] gave `key`.
-    pub fn forget_record(&mut self, key: u32) {
-        self.records.remove(&key);
-        self.record_names.retain(|_, named| *named != key);
     }
 
     /// The whole chunks of the span under a carve that leaves `under`

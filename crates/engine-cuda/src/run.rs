@@ -2958,8 +2958,8 @@ impl<'c> Run<'c> {
 
     /// Whether the fire can be recorded: not where a select stages a
     /// host-resident bank's experts, which reads the fire's routes back to
-    /// the host (`experts::staging`), nor where a prefill plan refused its
-    /// graph form.
+    /// the host (`experts::staging`), nor where a prefill plan was planned
+    /// for no graph.
     pub(crate) fn capturable(&self) -> bool {
         self.fire.tables.expert_staging.is_none()
             && self.structs.iter().flatten().all(|(_, slot)| match slot {
@@ -2983,10 +2983,8 @@ impl<'c> Run<'c> {
                 self.structs
                     .iter()
                     .flatten()
-                    .filter_map(|(_, slot)| match slot {
-                        StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
-                        _ => None,
-                    }),
+                    .any(|(_, slot)| matches!(slot, StructSlot::Prefill(plan) if !plan.graph_capturable))
+                    .then(|| "a prefill schedule was planned for no graph".to_string()),
             )
             .collect()
     }
