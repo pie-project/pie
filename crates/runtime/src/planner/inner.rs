@@ -835,11 +835,11 @@ impl Inner {
                     };
                     key = up;
                 }
-                // The bind it lays is new state: past what the gate spares,
-                // it waits for the finisher as any ask does.
-                if self.queue.get(&key).is_some_and(|waiter| self.gate_holds_waiter(waiter)) {
-                    return None;
-                }
+                // Not gated here: this is the one that goes when every
+                // waiter is held and nothing is in flight. Held at the gate
+                // too, nothing went, and the finisher's bind waited on moves
+                // no pass made (the wide shape's seeds 7, 104 and 184 among
+                // eleven: liveness at the bind).
                 key
             }
         };
