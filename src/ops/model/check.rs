@@ -255,9 +255,15 @@ pub fn run(args: CheckArgs) -> Result<Answer> {
                     let Some(line) = next.lock().expect("sources poisoned").next() else {
                         return;
                     };
-                    let mut words = line.split_whitespace();
-                    let source = words.next().unwrap_or_default();
-                    let line = match check(source, words.next(), args.context) {
+                    // A folder's name may hold spaces; a commit is the last word.
+                    let line = line.trim();
+                    let (source, commit) = match line.rsplit_once(' ') {
+                        Some((source, commit)) if commit.len() == 40 => {
+                            (source.trim(), Some(commit))
+                        }
+                        _ => (line, None),
+                    };
+                    let line = match check(source, commit, args.context) {
                         Ok(checked) => serde_json::to_string(&checked),
                         Err(why) => serde_json::to_string(&Failed {
                             repo: source,
