@@ -278,6 +278,19 @@ pub struct Gpu<B: Host> {
 }
 
 impl<B: Host> Gpu<B> {
+    /// The pending frame's numbers, each step's rows read back from its
+    /// readout seats where not read yet ([`Engine::settle_frame`] takes
+    /// them from here): what frees the seats on an idle turn.
+    fn take_pending_rows(&mut self) -> EngineResult<()> {
+        let (Some((_, pending)), Some(shell)) = (self.pending.as_mut(), self.shell.as_mut()) else {
+            return Ok(());
+        };
+        for step in pending.iter_mut().filter(|step| step.rows.is_none()) {
+            step.rows = Some(shell.rows_of(&step.landed).map_err(fault)?);
+        }
+        Ok(())
+    }
+
     /// What the work left behind serving is doing now, said once each time
     /// it changes: running, or why it does not run.
     fn behind_state(&mut self, state: &'static str) {
@@ -1758,10 +1771,12 @@ where
     }
 
     fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
-        // A frame whose numbers are not yet taken holds its readout seats.
+        // A frame whose numbers are not yet taken holds its readout seats,
+        // which a settle fire would write: on an idle turn they are taken
+        // now (they are due anyway; the frame's settle reads them back from
+        // here), so the seats are free for what runs behind serving.
         if self.pending.is_some() {
-            self.behind_state("waiting: a frame's numbers are not taken yet");
-            return Ok(false);
+            self.take_pending_rows()?;
         }
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
