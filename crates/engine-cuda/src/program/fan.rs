@@ -124,7 +124,7 @@ impl Drop for Fan {
             // SAFETY: opened by `open_stream` and destroyed once; the shell
             // synchronizes before it tears the plane down.
             unsafe {
-                let _ = crate::device::rt::cudaStreamDestroy(side.cast());
+                crate::device::held::destroy_unadopted_stream(side);
             }
         }
     }

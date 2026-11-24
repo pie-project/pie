@@ -6,13 +6,18 @@
 //! from a checkpoint seeded by plane name over a fixed script of prefills
 //! and greedy decodes, and each step's logits hashed bit for bit. A change
 //! that must not move a logit (a memory layout, an address) is proven by
-//! the same hashes before and after it.
+//! the same hashes before and after it. Every model is served once first,
+//! so the cache's profile holds every product shape the set meets before
+//! any logit is hashed; the hashes are then taken under that profile held
+//! fixed, and the output names its md5 (`golden profile md5 <md5>`): a run
+//! under another profile may pick other kernels, which a check says.
 //!
 //! A dense product's kernel is chosen by its shape alone (a streaming
 //! skeleton for few rows, else cuBLASLt's first heuristic); nothing is timed
 //! at load, so every run sums each product in the same order. The cache is
-//! shared across runs (`PIE_GOLDEN_CACHE`, by default `pie-golden-cache`
-//! under the system's temp dir). Each model is served twice in its process,
+//! shared across runs (`PIE_GOLDEN_CACHE`, which must be set: a run without
+//! it is refused rather than rebuilding every fixture), each fixture named by
+//! its model and a hash of the planes it holds. Each model is served twice in its process,
 //! and the second serving is the one hashed.
 //!
 //! Run by hand (both are ignored in the suite): first `golden_fixtures`,
@@ -30,7 +35,16 @@
 //! `golden <model> all <hash>` line a model. `PIE_GOLDEN_MODELS` (a comma
 //! list) picks and orders the models; `PIE_GOLDEN_OUT` writes the lines to a
 //! file; `PIE_GOLDEN_CHECK` compares them with such a file and fails on the
-//! first model whose hash moved.
+//! first model whose hash moved, unless `PIE_GOLDEN_AGAINST` names the
+//! earlier run's `PIE_GOLDEN_LOGITS` rows and each of this run's lies within
+//! the tolerance of its own ([`within_tolerance`]).
+//!
+//! The decode products' kernels are held across builds: every golden load
+//! keeps the product times it chose its kernels by in the cache's `picks`,
+//! and every later one is served with them as they stand (`Knobs::chip`,
+//! a test's pinned profile), so a build whose kernel crate changed picks
+//! what the earlier build picked and its hashes answer for its code, not for
+//! a re-timing. Only a candidate whose own code changed is timed again.
 
 use std::path::{Path, PathBuf};
 
@@ -351,11 +365,15 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     });
     let serving = serving || encoded;
     let suffix = if serving { "serving.zt" } else { "zt" };
-    let container = dir.join(format!("{model}.{suffix}"));
+    // Named by the planes it holds as well as the model: a fixture seeded
+    // for another trace (a plane renamed or reshaped, another drafter, a
+    // seeding changed) is another file, never served for this one.
+    let key = fixture_key(&trace, serving);
+    let container = dir.join(format!("{model}-{key:016x}.{suffix}"));
     if !container.exists() {
         let partial = dir.join(format!("{model}.{suffix}.{}", std::process::id()));
         if encoded {
-            let floats = dir.join(format!("{model}.floats.zt"));
+            let floats = dir.join(format!("{model}-{key:016x}.floats.zt"));
             if !floats.exists() {
                 let seeded = dir.join(format!("{model}.floats.zt.{}", std::process::id()));
                 write_checkpoint(&seeded, &trace);
@@ -387,6 +405,11 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
         }
         std::fs::rename(&partial, &container)
             .unwrap_or_else(|why| panic!("{}: {why}", container.display()));
+        if encoded {
+            // The seeded floats are the import's input alone: the artifact
+            // is what every later run reads.
+            let _ = std::fs::remove_file(dir.join(format!("{model}-{key:016x}.floats.zt")));
+        }
     }
     let source = ztensor::Source::open(&container).expect("the fixture opens");
     let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
@@ -400,9 +423,41 @@ fn fixture_as(model: &str, cache: &Path, serving: bool) -> Fixture {
     }
 }
 
+/// The version of the bytes a fixture is seeded with: bumped whenever
+/// [`seeded_planes`], [`write_checkpoint`], [`write_serving`] or the
+/// artifact import write other bytes for the same planes, so no fixture of
+/// the old seeding is read again.
+const SEEDING: u32 = 1;
+
+/// The name a fixture is cached under past its model's: the seeding's
+/// version, the form (serving or not) and each checkpoint plane's name,
+/// shape, dtype and layout, hashed.
+fn fixture_key(trace: &Trace, serving: bool) -> u64 {
+    let mut key = fnv_bytes(FNV, &SEEDING.to_le_bytes());
+    key = fnv_bytes(key, &[u8::from(serving)]);
+    for param in trace
+        .params
+        .iter()
+        .filter(|p| p.source == ParamSource::Checkpoint)
+    {
+        key = fnv_bytes(key, param.name.as_bytes());
+        key = fnv_bytes(key, &[0]);
+        for &extent in &param.shape {
+            key = fnv_bytes(key, &extent.to_le_bytes());
+        }
+        key = fnv_bytes(
+            key,
+            format!("{:?} {:?};", param.dtype, param.layout).as_bytes(),
+        );
+    }
+    key
+}
+
+/// The fixture cache, `PIE_GOLDEN_CACHE`: refused unset, since a default
+/// in a run's own temp dir rebuilds every fixture (tens of GB) each run.
 fn cache_dir() -> PathBuf {
     std::env::var_os("PIE_GOLDEN_CACHE").map_or_else(
-        || std::env::temp_dir().join("pie-golden-cache"),
+        || panic!("set PIE_GOLDEN_CACHE to the fixture cache; unset would rebuild every fixture"),
         PathBuf::from,
     )
 }
@@ -473,6 +528,7 @@ fn load_under(
         comm: core::ptr::null_mut(),
     })
     .map_err(|why| why.to_string())
+    .inspect(|shell| record_picks(cache, shell))
 }
 
 /// A load of `fixture` under `allowance` at the model's declared context
@@ -545,7 +601,10 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
             }
         }
     }
-    assert!(served > 0, "no budget served the declared context cut to its room");
+    assert!(
+        served > 0,
+        "no budget served the declared context cut to its room"
+    );
 }
 
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
@@ -564,6 +623,7 @@ fn knobs() -> engine_cuda::Knobs {
     }
     // `PIE_GOLDEN_ONE_WINDOW`: every windowed row in one window list.
     knobs.diagnostics.one_window = std::env::var_os("PIE_GOLDEN_ONE_WINDOW").is_some();
+    knobs.diagnostics.windowed_state = std::env::var_os("PIE_GOLDEN_WINDOWED_STATE").is_some();
     knobs.diagnostics.arm_trace = std::env::var_os("PIE_GOLDEN_ARM_TRACE").is_some();
     // `PIE_GOLDEN_TIER_INLINE`: tier copies ride the compute stream.
     knobs.diagnostics.tier_inline = std::env::var_os("PIE_GOLDEN_TIER_INLINE").is_some();
@@ -571,7 +631,81 @@ fn knobs() -> engine_cuda::Knobs {
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
     knobs.dense_weights = true;
+    knobs.chip = picked(&cache_dir(), knobs.profiles.as_deref());
     knobs
+}
+
+/// The cache's product picks ([`record_picks`]): the decode products' times
+/// an earlier golden load chose their kernels by, one `kind rows k m kernel
+/// ns spread` line each.
+fn picks_path(cache: &Path) -> PathBuf {
+    cache.join("picks")
+}
+
+fn read_picks(cache: &Path) -> Vec<profile::fire::ProductTime> {
+    let text = std::fs::read_to_string(picks_path(cache)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let w: Vec<&str> = line.split_whitespace().collect();
+            let [kind, rows, k, m, kernel, ns, spread] = w[..] else {
+                return None;
+            };
+            Some(profile::fire::ProductTime {
+                kind: kind.parse().ok()?,
+                rows: rows.parse().ok()?,
+                k: k.parse().ok()?,
+                m: m.parse().ok()?,
+                kernel: kernel.parse().ok()?,
+                ns: ns.parse().ok()?,
+                spread: spread.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Keeps what `shell` chose its decode products' kernels by in the cache's
+/// picks, beside those already kept (a kept entry stays; a shape no load
+/// met before joins). A golden load served after takes them as they stand
+/// ([`picked`]), so its logits answer for the code, not for a re-timing.
+fn record_picks(cache: &Path, shell: &Shell) {
+    let mut picks = read_picks(cache);
+    let before = picks.len();
+    for time in shell.product_times() {
+        if picks.iter().all(|kept| kept.key() != time.key()) {
+            picks.push(*time);
+        }
+    }
+    if picks.len() == before {
+        return;
+    }
+    let text: String = picks
+        .iter()
+        .map(|t| {
+            format!(
+                "{} {} {} {} {} {} {}\n",
+                t.kind, t.rows, t.k, t.m, t.kernel, t.ns, t.spread
+            )
+        })
+        .collect();
+    std::fs::write(picks_path(cache), text)
+        .unwrap_or_else(|why| panic!("{}: {why}", picks_path(cache).display()));
+}
+
+/// The device's profile with the cache's product picks laid over its
+/// rates, as a pinned profile (`Knobs::chip`): a golden load serves each
+/// product shape an earlier one met with the kernel it chose then, whatever
+/// this build's stored measurements say, and times only the shapes (or the
+/// changed kernels) none met. `None` while the cache keeps no picks.
+fn picked(cache: &Path, profiles: Option<&Path>) -> Option<profile::Profile> {
+    let picks = read_picks(cache);
+    if picks.is_empty() {
+        return None;
+    }
+    let (name, facts) = engine_cuda::chip::probe(0)?;
+    let (profile, _) = engine_cuda::chip::resolve(&name, &facts, profiles);
+    let mut tuned = profile::fire::Tuned::default();
+    tuned.rates.product_ns = Some(picks);
+    Some(profile.with_tuned(tuned))
 }
 
 /// The buffered probes' knobs: a load that buffers recurrent rows arms
@@ -615,6 +749,19 @@ fn fire(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> Vec<f32> {
 /// The model served over [`SCRIPT`]: each step's logits' hash and top token.
 fn served(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
     let mut shell = load(fixture, cache);
+    if std::env::var_os("PIE_GOLDEN_FACTS").is_some() {
+        let facts = shell.chunk_facts().expect("the pool states its chunks");
+        eprintln!(
+            "golden-facts {} chunk {} shapes {:?}",
+            fixture.model,
+            facts.chunk_bytes,
+            facts
+                .shapes
+                .iter()
+                .map(|s| (s.id.0, s.role, s.slot_bytes, s.slots_per_chunk, s.kind.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
     shell.open(0).expect("slot 0 opens");
     let mut fed = 0u32;
     let mut last = None;
@@ -1030,8 +1177,6 @@ fn served_offloaded(fixture: &Fixture, cache: &Path, offload: bool) -> Vec<(u64,
             Some(256 << 20),
             Some(dir.path()),
             false,
-            1,
-            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -1250,8 +1395,6 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
             Some(budget),
             Some(dir.path()),
             false,
-            1,
-            1,
             engine_cuda::World::default(),
         )
         .expect("the disk tier seats");
@@ -1260,8 +1403,15 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
     facts.validate().expect("the engine's chunk facts hold");
     // The budget divides into disk chunks of a pool chunk each, on the
     // direct I/O boundary, laid out as the device's.
-    assert_eq!(facts.disk_chunks, chunks, "{model}: the facts state the disk chunks");
-    assert_eq!(u64::from(chunks), budget / disk_chunk, "{model}: disk chunks of the budget");
+    assert_eq!(
+        facts.disk_chunks, chunks,
+        "{model}: the facts state the disk chunks"
+    );
+    assert_eq!(
+        u64::from(chunks),
+        budget / disk_chunk,
+        "{model}: disk chunks of the budget"
+    );
     let parked: Vec<engine::chunk::SlotShape> = facts
         .shapes
         .iter()
@@ -1424,7 +1574,12 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
         }
         println!("{}: every round trip bit-exact", what("parks"));
         let held = match (shape.role, &shape.kind) {
-            (_, engine::chunk::SlotKind::List { window: Some(_), .. }) => "window".to_string(),
+            (
+                _,
+                engine::chunk::SlotKind::List {
+                    window: Some(_), ..
+                },
+            ) => "window".to_string(),
             (engine::chunk::SlotRole::State, engine::chunk::SlotKind::List { .. }) => {
                 "kv".to_string()
             }
@@ -1476,7 +1631,20 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
         return;
     }
     let cache = cache_dir();
-    let mut lines = Vec::new();
+    // The measuring pass: every model served once, so each product shape any
+    // of them meets is measured and kept in the cache's profile before a
+    // logit is hashed. A model hashed while a later model still measured
+    // shapes it shares would hash picks the next run no longer makes.
+    for model in models() {
+        let fixture = fixture(&model, &cache);
+        let _ = served(&fixture, &cache);
+    }
+    // The profile the hashes are taken under, held fixed from here: its
+    // md5 names the picks, so a change of them shows as a new profile, not
+    // as a moved logit.
+    let profile = profile_md5(&cache);
+    let mut lines = vec![format!("golden profile md5 {profile}")];
+    println!("{}", lines[0]);
     for model in models() {
         let fixture = fixture(&model, &cache);
         // The warming serving: every product's algorithm picked and kept.
@@ -1510,7 +1678,17 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
             })
             .collect();
         let mut moved = Vec::new();
-        for line in &lines {
+        let wanted_profile = text
+            .lines()
+            .find_map(|line| line.strip_prefix("golden profile md5 "))
+            .unwrap_or("not stated");
+        if wanted_profile != profile {
+            eprintln!(
+                "golden: the profile the hashes were taken under is {profile}, the file's \
+                 {wanted_profile}: the picks may differ, and with them the logits"
+            );
+        }
+        for line in lines.iter().filter(|line| !line.starts_with("golden profile ")) {
             let words: Vec<&str> = line.split_whitespace().collect();
             let key = (words[1].to_string(), words[2].to_string());
             match want.get(&key) {
@@ -1521,8 +1699,118 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
                 None => moved.push(format!("{} step {}: not in the golden file", key.0, key.1)),
             }
         }
+        if !moved.is_empty() && within_tolerance() {
+            eprintln!(
+                "golden: hashes moved, every row within tolerance of the earlier run's:\n  {}",
+                moved.join("\n  ")
+            );
+            return;
+        }
         assert!(moved.is_empty(), "logits moved:\n  {}", moved.join("\n  "));
     }
+}
+
+/// A step's logits within this share of their spread of the earlier run's
+/// (the bf16 rule the synthesized-region tests hold a reordered sum to).
+const TOLERANCE: f32 = 2e-2;
+
+/// Whether this run's rows (`PIE_GOLDEN_LOGITS`) each lie within
+/// [`TOLERANCE`] of an earlier run's (`PIE_GOLDEN_AGAINST`, that run's
+/// `PIE_GOLDEN_LOGITS`), row for row, with the same top token unless the
+/// earlier row's top two are that close: what a moved hash is judged by
+/// where the picks could not be held (a product kernel whose code changed is
+/// timed again). Unset either, and a moved hash fails as it stands.
+fn within_tolerance() -> bool {
+    let (Some(ours), Some(theirs)) = (
+        std::env::var_os("PIE_GOLDEN_LOGITS"),
+        std::env::var_os("PIE_GOLDEN_AGAINST"),
+    ) else {
+        return false;
+    };
+    let read = |dir: &std::ffi::OsStr, at: usize| -> Option<Vec<f32>> {
+        let bytes = std::fs::read(Path::new(dir).join(format!("{at}.f32"))).ok()?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        )
+    };
+    let mut rows = 0usize;
+    while let Some(want) = read(&theirs, rows) {
+        let Some(got) = read(&ours, rows) else {
+            eprintln!("golden: row {rows} of the earlier run has none of this run's");
+            return false;
+        };
+        let (lo, hi) = want
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let deviation = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0f32, f32::max);
+        let bound = TOLERANCE * (hi - lo);
+        let (top, picked) = (argmax(&want), argmax(&got));
+        let gap = want[top as usize] - want[picked as usize];
+        if got.len() != want.len() || deviation > bound || (top != picked && gap > 2.0 * deviation)
+        {
+            eprintln!(
+                "golden: row {rows} {deviation} apart over a spread of {} (bound {bound}); top \
+                 {picked}, the earlier run's {top}",
+                hi - lo
+            );
+            return false;
+        }
+        rows += 1;
+    }
+    rows > 0
+}
+
+/// The md5 of every stored input a load selects its kernels and bodies by:
+/// the profile its measurements are kept in (`knobs`: the cache's
+/// `profiles`), the bodies records and the host covers, every file in path
+/// order, by `md5sum`; "none" where there is no file. A cold cache reads as
+/// another configuration.
+fn profile_md5(cache: &Path) -> String {
+    let mut files = vec![picks_path(cache)].into_iter().filter(|p| p.is_file()).collect::<Vec<_>>();
+    let mut dirs = vec![cache.join("profiles"), cache.join("bodies"), cache.join("cover")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return "none".to_string();
+    }
+    let mut bytes = Vec::new();
+    for file in &files {
+        bytes.extend(std::fs::read(file).unwrap_or_default());
+    }
+    let mut child = std::process::Command::new("md5sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("md5sum runs");
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .expect("md5sum's stdin")
+        .write_all(&bytes)
+        .expect("the profile reaches md5sum");
+    let out = child.wait_with_output().expect("md5sum answers");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("none")
+        .to_string()
 }
 
 /// The rows a page of the load's rs buffer holds: the rs list's tokens.
@@ -3110,7 +3398,10 @@ fn golden_measuring_refit() {
         };
         let recorded = {
             let mut shell = load_with(&fixture, &own, told());
-            shell.chunk_facts().expect("the pool states its chunks").total_chunks
+            shell
+                .chunk_facts()
+                .expect("the pool states its chunks")
+                .total_chunks
         };
         let _ = std::fs::remove_dir_all(&own);
         let slack = u32::try_from(took.div_ceil(chunk.max(1))).unwrap_or(u32::MAX);
@@ -3942,7 +4233,11 @@ fn read_set(model: &str, cache: &Path) -> Vec<&'static str> {
 }
 
 /// A kernel decision only a routed, recurrent, MLA, indexed or NVFP4 model
-/// can reach.
+/// can reach. The compiler's prices (`compiler.cost.*`) and fusion rules
+/// (`fuse.*`) are not among them though every load reads them: `pie tune`
+/// serves a candidate of those only where it changes the compiled plan
+/// (`profile::search`'s `plan_only`), and a dense model's plan never moves
+/// with an ssm price or an MoE fusion.
 fn family_only(id: &str) -> bool {
     [
         "kernel.moe.",
@@ -3969,7 +4264,13 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
     println!("reads qwen3-0.6b {dense:?}");
     let stray: Vec<&str> = dense.iter().copied().filter(|id| family_only(id)).collect();
     assert!(stray.is_empty(), "qwen3-0.6b reads {stray:?}");
-    assert!(dense.contains(&"kernel.gemm.skinny_rows"), "{dense:?}");
+    // The control: a dense model reads its products' decisions, whichever
+    // a backend's dense dispatch consults (CUDA's skinny rows, ROCm's turn
+    // and live tiles).
+    assert!(
+        dense.iter().any(|id| id.starts_with("kernel.gemm.")),
+        "qwen3-0.6b reads no dense product decision: {dense:?}"
+    );
     let routed = read_set("gptoss-20b-mini-u4g64-mxfp4-kv-bf16", &cache);
     println!("reads gptoss-20b-mini-u4g64-mxfp4-kv-bf16 {routed:?}");
     assert!(
@@ -3980,5 +4281,46 @@ fn a_dense_model_reads_no_routed_or_recurrent_decision() {
         for model in models() {
             println!("reads {model} {:?}", read_set(&model, &cache));
         }
+    }
+}
+
+/// CONTRACT-BC 19: a load serving its windowed rows as ring + buffer arms
+/// every composition it fires, as its window lists do (the arming pass's
+/// synthetic lanes fold on records of their own): `PIE_GOLDEN_MODELS`
+/// (default the mini Gemma and MiMo, windowed beside full attention, MiMo's
+/// routed), many seats.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_windowed_arms() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
+        |_| vec!["gemma4-e4b-mini-l6".to_string(), "mimo26-flash-mini".to_string()],
+        |_| models(),
+    );
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        let mut knobs = knobs();
+        knobs.diagnostics.windowed_state = true;
+        let shell = load_lanes(&fixture, &cache, knobs, 16, None);
+        assert!(
+            !shell.windowed_layers().is_empty(),
+            "{model}: the load keeps rings"
+        );
+        let armed = shell.armed().expect("the load armed its lattice");
+        println!(
+            "windowed arms {model}: {} of {} compositions",
+            armed.armed, armed.wanted
+        );
+        assert!(
+            armed.wanted > 0 && armed.armed == armed.wanted,
+            "{model}: {} of {} compositions armed ({:?})",
+            armed.armed,
+            armed.wanted,
+            armed.last_refusal
+        );
     }
 }

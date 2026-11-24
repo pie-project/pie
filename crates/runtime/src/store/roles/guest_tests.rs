@@ -223,6 +223,21 @@ impl GuestEngine {
 }
 
 impl Engine for GuestEngine {
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn measured_at_load(&self) -> Vec<String> {
+
+        Vec::new()
+
+    }
+
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     /// A test engine's copies land inside the call: nothing to wait for.
     fn settle_copies(&mut self) -> ::engine::Result<()> {
         Ok(())
@@ -241,6 +256,10 @@ impl Engine for GuestEngine {
 
     fn kind(&self) -> &'static str {
         "fake-guests"
+    }
+
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
     }
 
     fn prepare_program(

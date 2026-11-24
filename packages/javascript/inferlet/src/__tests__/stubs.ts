@@ -131,6 +131,7 @@ export class WorkingSetStub {
   fork() {
     return new WorkingSetStub();
   }
+  share() {}
 }
 
 export class ForwardPassStub {

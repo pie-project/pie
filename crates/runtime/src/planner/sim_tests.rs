@@ -944,6 +944,21 @@ impl SimEngine {
 }
 
 impl Engine for SimEngine {
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn measured_at_load(&self) -> Vec<String> {
+
+        Vec::new()
+
+    }
+
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn settle_copies(&mut self) -> ::engine::Result<()> {
         Ok(())
     }
@@ -959,6 +974,10 @@ impl Engine for SimEngine {
 
     fn kind(&self) -> &'static str {
         "sim"
+    }
+
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(self.unsupported("chunk_table"))
     }
 
     fn prepare_program(
@@ -1622,6 +1641,9 @@ impl Workload {
 #[derive(Clone, Debug, Default)]
 struct Coverage {
     seeds: u64,
+    /// Newcomers held for room at the gate's last place before their first
+    /// ask.
+    admission_waits: u64,
     steps: u64,
     processes: u64,
     fires: u64,
@@ -1684,6 +1706,7 @@ impl Coverage {
         self.quiet_waits += other.quiet_waits;
         self.lost_wakes += other.lost_wakes;
         self.restores += other.restores;
+        self.admission_waits += other.admission_waits;
         self.eviction_tier_full += other.eviction_tier_full;
         self.tier_full_refused += other.tier_full_refused;
         self.host_swap_full += other.host_swap_full;
@@ -1882,7 +1905,7 @@ struct Log {
     /// Bumped on every act of a task: the run is settled once it stops.
     acts: u64,
     /// Where each running process is, for a liveness failure.
-    stages: std::collections::HashMap<ProcessId, &'static str>,
+    stages: BTreeMap<ProcessId, &'static str>,
     fires: u64,
     forks: u64,
     shared_pages: u64,
@@ -1892,6 +1915,9 @@ struct Log {
     idles: u64,
     rescores: u64,
     /// The safe order stood short at the last settled step.
+    /// The first admission that turned the safe order short: the gate let
+    /// a newcomer in that left someone unable to finish in turn.
+    admitted_short: Option<String>,
     short: bool,
     /// Bytes found not as written: (process, what).
     corrupt: Vec<(ProcessId, String)>,
@@ -2513,18 +2539,20 @@ fn new_set(
 /// lifts to it, as the scheduler holds the frame out unsealed. A pool with
 /// one rung, or no walk, has nothing to raise. Its owner parks and comes
 /// back meanwhile as any process: the raise's moves carry its parked
-/// state.
-async fn owe_raise(ctx: &Ctx, pid: ProcessId) {
+/// state. A raise refused by name (it never fits beside the owner's own
+/// state) fails the frame with it, as the scheduler fails the fires held
+/// for it.
+async fn owe_raise(ctx: &Ctx, pid: ProcessId) -> Result<(), String> {
     let Some(shared) = ctx.stores.shared.clone() else {
-        return;
+        return Ok(());
     };
     let rungs = shared.lock().unwrap().rungs();
     let (Some(&widest), true) = (rungs.last(), rungs.len() > 1 && ctx.walks) else {
-        return;
+        return Ok(());
     };
     // Cut no wider than the cap: its frame goes as it is.
     if crate::store::shared::fire_cap(0) >= widest {
-        return;
+        return Ok(());
     }
     ctx.at(pid, "raise owed");
     ctx.log.lock().unwrap().raises_owed += 1;
@@ -2533,7 +2561,13 @@ async fn owe_raise(ctx: &Ctx, pid: ProcessId) {
         if crate::store::shared::owed_by(0).is_none_or(|by| by == pid) {
             crate::store::shared::owe_cut_rows(0, widest, Some(pid));
             if crate::store::shared::fire_cap(0) >= widest {
-                return;
+                return Ok(());
+            }
+        }
+        if let Some((by, why)) = crate::store::shared::take_refused_owed(0) {
+            if by == pid {
+                crate::store::shared::owe_cut_rows(0, 0, None);
+                return Err(format!("raise: {why}"));
             }
         }
         ctx.next_step().await;
@@ -2545,7 +2579,18 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
     let planner = ctx.planner.clone();
     ctx.at(pid, "admit");
     planner.admit(pid).await;
+    // As the runtime's gates hold a newcomer
+    // (`inferlet::process::wait_for_room`): until the capacity gate's last
+    // place has room for its first ask.
+    planner.admitted_to_ask(pid).await;
+    let before = planner.order_least();
     planner.note_admitted(pid);
+    let after = planner.order_least();
+    if before.is_none_or(|least| least >= 0) && after.is_some_and(|least| least < 0) {
+        ctx.log.lock().unwrap().admitted_short.get_or_insert_with(|| {
+            format!("admitting {} turned the safe order short: least {before:?} -> {after:?}", &pid.to_string()[..8])
+        });
+    }
     let residency = Arc::new(Mutex::new(ProcessResidency::default()));
     register_residency(pid, Arc::downgrade(&residency));
     let departure = planner.departure(pid);
@@ -2606,7 +2651,7 @@ async fn run_process(ctx: Arc<Ctx>, pid: ProcessId, script: Script) {
             }
             let pages = u64::from((at + 1) % script.grow_every == 0);
             if script.raise == Some(at) {
-                owe_raise(&ctx, pid).await;
+                owe_raise(&ctx, pid).await?;
             }
             fire(&ctx, pid, &mut sets, &instances, pages).await?;
             if script.raise == Some(at) {
@@ -3417,6 +3462,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     coverage.quiet_waits = stats.quiet_waits.load(Ordering::Relaxed);
     coverage.lost_wakes = stats.lost_wakes.load(Ordering::Relaxed);
     coverage.restores = stats.restores.load(Ordering::Relaxed);
+    coverage.admission_waits = stats.admission_waits.load(Ordering::Relaxed);
     coverage.eviction_tier_full = stats.eviction_tier_full.load(Ordering::Relaxed);
     coverage.host_swap_full = stats.host_swap_exhaustions.load(Ordering::Relaxed);
     {
@@ -3444,6 +3490,13 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
         // some suspended 58 to 68 times, unfinished in 45 minutes).
         coverage.most_suspended = u64::from(log.most_suspended);
+        if let Some(line) = log.admitted_short.clone() {
+            failures.push(Failure {
+                step,
+                kind: "admission".to_string(),
+                line,
+            });
+        }
         for &(pid, program, suspended) in &log.bind_thrash {
             progress.again += u64::from(suspended - 1);
             progress.first.get_or_insert_with(|| {
@@ -3987,6 +4040,24 @@ fn sim_field_seeds_863_and_178_end() {
     field_regression(178);
 }
 
+/// The Metal w17 mix's seeds 2 and 6: newcomers arrive while the safe
+/// order has no room at its last place, wait there holding nothing
+/// (`ResidencyPlanner::admitted_to_ask`), and are let in as admitted
+/// processes finish; no admission turns the order short (the run's
+/// `admission` check), and every process ends: admitting never starves one
+/// admitted.
+#[test]
+fn sim_metal_seeds_2_and_6_newcomers_wait_at_the_last_place_and_every_process_ends() {
+    for seed in [2, 6] {
+        let (failures, coverage) = run(&Workload::metal(seed), None);
+        for failure in &failures {
+            eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
+        }
+        assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
+        assert!(coverage.admission_waits > 0, "metal seed {seed}: no newcomer waited at the gate");
+    }
+}
+
 /// What a run did, as a string two runs of one seed must agree on.
 fn fingerprint(workload: &Workload) -> String {
     let (failures, coverage) = run(workload, None);
@@ -4018,6 +4089,17 @@ fn unreproduced(seeds: std::ops::Range<u64>) -> Vec<u64> {
 fn a_simulated_seed_reproduces_exactly() {
     let differ = unreproduced(0..24);
     assert!(differ.is_empty(), "seeds that ran differently: {differ:?}");
+}
+
+/// The Metal mix's seed 103 runs the same twice: a sweep and a parked
+/// move down that take a process's sets in turn until they have what they
+/// want walked them in a hash set's order, which differs between runs, and
+/// moved another beam's pages each time.
+#[test]
+fn a_metal_seed_whose_sweeps_take_sets_in_turn_reproduces_exactly() {
+    let workload = Workload::metal(103);
+    let (first, second) = (fingerprint(&workload), fingerprint(&workload));
+    assert_eq!(first, second, "Metal seed 103 ran differently");
 }
 
 /// [`a_simulated_seed_reproduces_exactly`] over `PIE_SIM_SEEDS` seeds (500).
@@ -4264,6 +4346,129 @@ fn binds_of_two_runs_beside_singles_restore_and_end() {
     }
     eprintln!("SIM pieces: {failed} failures, binds {}, bind waits {}, suspends {}, restores {}", coverage.binds, coverage.bind_waits, coverage.bind_suspends, coverage.restores);
     assert_eq!(failed, 0);
+}
+
+/// A pool that holds a bind beside the pair it joins in place (one run of
+/// five for its scratch, the pair's run already laid) but not beside a
+/// fresh pair as well: the bind is served, never refused as never fitting
+/// (the simulation's seed 213).
+#[test]
+fn a_bind_beside_a_pair_in_place_is_served_where_a_fresh_pair_would_not_fit() {
+    for seed in 0..20 {
+        let mut workload = run_pieces_workload(seed, 14, 6, 5, 1, seed % 2 == 0);
+        if let Some(program) = workload.pool.programs.last_mut() {
+            program.per_pair = program.scratch;
+        }
+        // Two binds of the program, the second joining the first's pair.
+        let bind = workload.scripts.last().cloned().expect("a bind");
+        let mut second = bind.clone();
+        second.at += 1;
+        workload.scripts.push(second);
+        let (failures, _) = run(&workload, None);
+        for failure in &failures {
+            eprintln!(
+                "SIM pair in place seed {seed} step {}: [{}] {}",
+                failure.step, failure.kind, failure.line
+            );
+        }
+        assert!(
+            failures
+                .iter()
+                .all(|failure| !failure.line.contains("never")),
+            "seed {seed}: a bind refused as never fitting: {failures:?}"
+        );
+    }
+}
+
+/// A pool of 18 chunks with rungs of 1 and 5 activation chunks (12 for
+/// kv and state below the widest rung's span), its segment walk moving
+/// the rung, and `scripts`: kv past the 12 is held while the rung is
+/// down, a frame then owed the raise back to the widest rung (the L40S's
+/// sweeper at kv_device_tokens 16384: a prompt that fills the pool, then
+/// its raise).
+fn raise_beside_own_workload(scripts: Vec<Script>) -> Workload {
+    let pool = PoolShape {
+        total: 18,
+        segment: 3,
+        host_chunks: 0,
+        disk_chunks: 64,
+        // An instance's state held across fires: a chunk beside its kv.
+        programs: vec![Program {
+            run: 1,
+            scratch: 0,
+            resident: MIB,
+            per_pair: 0,
+        }],
+        // The segment walk moves the rung (no target: the pool whole), and
+        // a lowered rung lends its span to state.
+        governed: true,
+        span_on_demand: true,
+        act: vec![(16, 1), (256, 5)],
+    };
+    Workload {
+        seed: 0,
+        pool,
+        scripts,
+        tier_full: Vec::new(),
+        late: 0,
+        target: Vec::new(),
+        ring: None,
+        landing_fails: None,
+    }
+}
+
+/// A decoder from step `at`: a prompt of `prompt` chunks of kv, a page a
+/// step for `decode` steps, a raise owed at decode step `raise`.
+fn raise_script(at: u32, prompt: u32, decode: u32, raise: Option<u32>, bound: bool) -> Script {
+    Script {
+        at,
+        prompt: prompt * PAGES_PER_CHUNK,
+        decode,
+        grow_every: 1,
+        beams: 1,
+        bind: if bound { vec![(0, false)] } else { Vec::new() },
+        idle: None,
+        rescore: None,
+        raise,
+        verify: None,
+    }
+}
+
+/// A raise whose rung, beside the raising process's own kv at that rung,
+/// is past the pool: with every other process gone it still never fits,
+/// and it is refused by name, never waited on. One that fits beside its
+/// own is served, and the process ends.
+#[test]
+fn a_raise_past_the_pool_beside_its_own_kv_is_refused_by_name() {
+    // 11 chunks of prompt and 60 pages: 15 chunks of kv, the reserved
+    // chunk and the rung's 5, 21 of 18.
+    let (failures, coverage) = run(&raise_beside_own_workload(vec![raise_script(0, 10, 70, Some(68), false)]), None);
+    for failure in &failures {
+        eprintln!("SIM raise past step {}: [{}] {}", failure.step, failure.kind, failure.line);
+    }
+    eprintln!("SIM raise past: {coverage:?}");
+    assert!(coverage.raises_owed > 0, "the raise was owed: {coverage:?}");
+    assert!(
+        failures.iter().all(|failure| failure.kind == "refused" && failure.line.contains("rung")),
+        "only its refusal, by name: {failures:?}"
+    );
+    assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
+    // Beside another whose kv has the rung lowered and which then ends: 8
+    // chunks of kv beside the rung's 5 and the reserved chunk, 14 of 18.
+    // It fits alone: it waits, and is served.
+    let (failures, coverage) = run(
+        &raise_beside_own_workload(vec![raise_script(0, 6, 30, Some(28), false), raise_script(0, 7, 8, None, true)]),
+        None,
+    );
+    for failure in &failures {
+        eprintln!("SIM raise fits step {}: [{}] {}", failure.step, failure.kind, failure.line);
+    }
+    eprintln!("SIM raise fits: {coverage:?}");
+    assert!(failures.is_empty(), "fits alone: served, {failures:?}");
+    assert!(
+        coverage.raises_owed > 0 && coverage.rung_raises > 0,
+        "owed and raised: {coverage:?}"
+    );
 }
 
 /// A bind of a run of seven adjacent chunks in a pool of segments of six:

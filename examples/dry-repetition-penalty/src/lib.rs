@@ -396,12 +396,18 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
-    if stream {
-        inferlet::session::send("t:1");
-    }
     let c0 = cnt_out_p.take_host::<f32>().await?;
     let k0 = peak_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
+    // A stop token ends the text and is not part of it, as every chat
+    // inferlet here ends its text.
+    let stop_tokens = inferlet::chat::stop_tokens();
+    let stopped = stop_tokens.contains(&(g0 as u32));
+    if !stopped {
+        if stream {
+            inferlet::session::send("t:1");
+        }
+        generated.push(g0 as u32);
+    }
     // The per-step statistics accumulate on the device — a running sum of
     // penalized counts and a running peak — and ride out beside the token in
     // one `[3]` cell, so a token costs one host round trip, not three.
@@ -411,7 +417,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut peak = k0;
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
+    if !stopped && generated.len() < max_tokens {
         // The decode pass owns fresh channels, so the history has to be handed
         // over explicitly, already carrying the prefill's token.
         history[n as usize] = g0;
@@ -459,6 +465,9 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
+            if stop_tokens.contains(&(v[0] as u32)) {
+                return Ok(ControlFlow::Break(()));
+            }
             if stream {
                 inferlet::session::send("t:1");
             }
@@ -490,7 +499,7 @@ async fn main(input: Input) -> Result<Output> {
         base: cfg.base,
         allowed_length: cfg.allowed_length,
         max_ngram: cfg.max_ngram,
-        mean_penalized: total_penalized / generated.len() as f32,
+        mean_penalized: total_penalized / generated.len().max(1) as f32,
         peak_penalty: peak,
         longest_repeat: longest_repeat(&full),
     })

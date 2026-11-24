@@ -323,6 +323,23 @@ impl<I: PoolId> ShapePool<I> {
         }
     }
 
+    /// Keeps of `ids` those let go and still waiting on a fire's
+    /// retirement.
+    pub fn retain_pending(&self, ids: &mut std::collections::HashSet<I>)
+    where
+        I: std::hash::Hash + Eq,
+    {
+        if ids.is_empty() {
+            return;
+        }
+        let pending: std::collections::HashSet<I> = self
+            .pending
+            .iter()
+            .flat_map(|(_, batch)| batch.iter().copied())
+            .collect();
+        ids.retain(|id| pending.contains(id));
+    }
+
     /// `ids`, which no fire has touched, go back now.
     pub fn release_reserved(&mut self, ids: Vec<I>) {
         self.give_back(&ids);
@@ -796,8 +813,21 @@ impl StorePools {
             match shape.kind {
                 // The rs buffer's list (CONTRACT-BC 18): its tokens are
                 // the rs store's, not the kv page size.
+                // The window buffer (CONTRACT-BC 21) is the rs store's
+                // buffer as the rs list is: a load states one of them.
                 SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::RsBuffer => {
                     pools.buffer = run;
+                }
+                // A hybrid's window buffer is a pool beside its rs list,
+                // which stays the buffer here.
+                SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::WindowBuffer => {
+                    if !facts
+                        .shapes
+                        .iter()
+                        .any(|s| s.role == ::engine::chunk::SlotRole::RsBuffer)
+                    {
+                        pools.buffer = run;
+                    }
                 }
                 SlotKind::List {
                     tokens,
@@ -807,6 +837,8 @@ impl StorePools {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
+                // Window lists: removed by the windowed-state change (the
+                // integration commit deletes this arm).
                 SlotKind::List {
                     tokens,
                     window: Some(window),

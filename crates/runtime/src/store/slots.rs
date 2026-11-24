@@ -1444,8 +1444,11 @@ impl SlotPool {
     /// the pool, even with all state moved off it: the chunks they take
     /// and the pool's total.
     #[must_use]
-    pub fn rung_past(&self, rung: u32) -> Option<(u32, u32)> {
-        let need = self.reserved.saturating_add(self.act_chunks(rung));
+    pub fn rung_past(&self, rung: u32, own: u32) -> Option<(u32, u32)> {
+        let need = self
+            .reserved
+            .saturating_add(self.act_chunks(rung))
+            .saturating_add(own);
         (need > self.total).then_some((need, self.total))
     }
 
@@ -4896,6 +4899,54 @@ mod tests {
     /// top segment's activation aside).
     fn run_pool() -> SlotPool {
         SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1024)], &[(16, 4)]))
+    }
+
+    /// A compaction moves a held chunk out of segment 1, swapping a free
+    /// logical id onto its physical there; once the move's fence lifts, a
+    /// take opens that free logical where it now lies, in segment 1. The
+    /// segment is no longer empty, whatever logical ids it holds: its
+    /// release is refused, by its physical chunks, never by logical ids
+    /// (the M1: logical 43 swapped onto physical 420 of segment 12, taken
+    /// there, and the segment released under it).
+    #[test]
+    fn a_segment_holding_a_logical_swapped_onto_it_is_not_released() {
+        let mut pool = SlotPool::new(facts_with(16, 4, 4, &[(ShapeKind::Fixed, 1)], &[]));
+        let holder = Holder::WorkingSet(1);
+        // Hold chunks 1..=7; segment 1 is 4..8.
+        let held = pool.acquire(holder, 0, 7).unwrap();
+        let in_segment: Vec<Slot> = held
+            .iter()
+            .copied()
+            .filter(|slot| pool.logical_to_physical[slot.chunk as usize] >= 4)
+            .collect();
+        // Free chunks 8.. lie in segments 2 and 3: move segment 1's held
+        // chunks there by a compaction, as a run's window would.
+        let moves: Vec<ChunkMove> = in_segment
+            .iter()
+            .zip(8u32..)
+            .map(|(slot, to)| ChunkMove {
+                logical: slot.chunk,
+                from: pool.logical_to_physical[slot.chunk as usize],
+                to,
+            })
+            .collect();
+        pool.apply_compaction(&moves, 1).unwrap();
+        pool.retire_through(u64::MAX);
+        assert_eq!(pool.segments.used(1), 0, "segment 1 emptied");
+        // A take opens the lowest free chunk: one of segment 1's, its
+        // logical a free id the moves swapped there.
+        let taken = pool.acquire(Holder::WorkingSet(2), 0, 1).unwrap();
+        let physical = pool.logical_to_physical[taken[0].chunk as usize];
+        assert!(
+            (4..8).contains(&physical),
+            "taken where the swap left it: {physical}"
+        );
+        assert_eq!(pool.segments.used(1), 1);
+        assert!(
+            pool.release_segment(1).is_err(),
+            "a segment holding a chunk at one of its physicals is not released"
+        );
+        pool.check();
     }
 
     /// Two runs of thirty asked where one free run of thirty stands among

@@ -1,0 +1,20 @@
+[
+  {
+    "key": "metal|metal Apple M5 Pro macOS 27|emitter 76|kernels 40c1e254bbe3ae6e|tuning fe1c14ed667aa71b|picks 8224a7f1f1356617|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 12159.25,
+    "turnaround_us": 38.5
+  },
+  {
+    "key": "metal|metal Apple M5 Pro macOS 27|emitter 76|kernels 40c1e254bbe3ae6e|tuning fe1c14ed667aa71b|picks a8061bb3a9065f2d|gemma4-e4b-vision-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 70080.5,
+    "turnaround_us": 24.25
+  },
+  {
+    "key": "metal|metal Apple M5 Pro macOS 27|emitter 76|kernels 40c1e254bbe3ae6e|tuning fe1c14ed667aa71b|picks ff1e0dbb028e74a4|qwen3-0.6b-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 10288.25,
+    "turnaround_us": 20.75
+  }
+]

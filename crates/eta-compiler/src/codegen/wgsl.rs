@@ -419,7 +419,10 @@ pub struct Stepwise {
 /// 12: the runtime's max / min combines (`cmax`, `cmin`) and the pivot's
 /// monotone test read NaN off its bits too (`f32_is_nan`), as the
 /// gpu-nan-poison change (fdc691b25) wrote them.
-pub const WGSL_STEP_EMITTER_VERSION: u16 = 12;
+/// 13: every function that returns a value ends on a return statement
+/// after its switch or if chain (FXC, which wgpu's DX12 path compiles
+/// through, sees no other way out of a switch whose cases all return).
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 13;
 
 /// The binding of the record a step module reads its node, rung, selector
 /// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a

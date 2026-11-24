@@ -47,7 +47,7 @@ use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, GatherDims, Ty, Val};
 use crate::linear::quant::{
-    Codes, TILE, code_values, e8m0, grouped_dot, materialize, offset_dot, read_codes, tile_factor,
+    Codes, TILE, code_values, e8m0, grouped_dot, materialize, read_codes, tile_factor,
 };
 use crate::tensor::{Bank, Landing, Operand, Stored};
 use crate::tuning::{MoePath, Tuning};
@@ -1050,12 +1050,7 @@ fn against_all(f: &mut Func, x: Val, bank: &Read, groups: i64) -> Result<Val, Er
     let q = f.reshape(q, &[rows, groups, k / groups])?;
     let r = f.dims(x)[0];
     let xg = f.reshape(x, &[r, groups, k / groups])?;
-    let mut out = grouped_dot(f, xg, q, factor)?;
-    if let Some(b) = bank.bias {
-        let o = offset_dot(f, x, b)?;
-        out = f.add(out, o)?;
-    }
-    Ok(out)
+    grouped_dot(f, xg, q, factor, bank.bias)
 }
 
 /// `chlo.ragged_dot`: `x [P, K]` rows grouped contiguously by `sizes [E]`

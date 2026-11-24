@@ -175,9 +175,13 @@ pub(crate) fn act_x_wt(
                 cudarc::cublas::sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
             )
         };
-        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return Ok(());
+        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(refuse(
+                op,
+                format!("`cublasGemmEx` answered {status:?} at M={m} N={n} K={k}"),
+            ));
         }
+        return Ok(());
     }
     let (plan, lt_handle, want) = with_device(|device| {
         device.configure((tuning.gemm_workspace_mb() as usize) << 20);
@@ -187,14 +191,16 @@ pub(crate) fn act_x_wt(
             device.lt.workspace_bytes,
         )
     });
-    let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
-        Ok(ws) if !ws.is_null() => (ws, want),
-        _ => (std::ptr::null_mut(), 0),
-    };
+    let (ws, ws_bytes) = lt_workspace(ctx, op, want);
+    // cuBLASLt's first heuristic where it offers one this context's
+    // workspace holds, else cuBLAS's own algorithm: chosen up front, its
+    // failure refused by name.
     if let Some(plan) = plan.as_deref()
         && let Some(heuristic) = plan.heuristics.first()
         && !lt_handle.is_null()
-        && run_lt(
+        && heuristic.workspaceSize <= ws_bytes
+    {
+        if !run_lt(
             lt_handle,
             plan,
             &heuristic.algo,
@@ -202,12 +208,15 @@ pub(crate) fn act_x_wt(
             call,
             ws,
             ws_bytes,
-        )
-    {
+        ) {
+            clear_error();
+            return Err(refuse(
+                op,
+                format!("cuBLASLt's first heuristic failed at M={m} N={n} K={k}"),
+            ));
+        }
         return Ok(());
     }
-    clear_error();
-    // No cuBLASLt algorithm for the shape: cuBLAS's own.
     // SAFETY: `handle` is this context's live cuBLAS handle, bound to its
     // stream; `ws` is a device slab of `ws_bytes` the context owns.
     unsafe {
@@ -218,15 +227,25 @@ pub(crate) fn act_x_wt(
         call,
         cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
     );
-    if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        return Ok(());
+    if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        return Err(refuse(
+            op,
+            format!(
+                "cuBLASLt has no algorithm and `cublasGemmEx` answered {status:?} at M={m} N={n} K={k}"
+            ),
+        ));
     }
-    Err(refuse(
-        op,
-        format!(
-            "cuBLASLt has no algorithm and `cublasGemmEx` answered {status:?} at M={m} N={n} K={k}"
-        ),
-    ))
+    Ok(())
+}
+
+/// The cuBLASLt workspace a product runs with: the stream's slab of `want`
+/// bytes, or none on a context that lays no such slab (a heuristic that
+/// needs one is then not chosen).
+fn lt_workspace(ctx: &Ctx, op: &'static str, want: usize) -> (*mut c_void, usize) {
+    match ctx.scratch_stream(op, LT_WORKSPACE, want) {
+        Ok(ws) if !ws.is_null() => (ws, want),
+        _ => (std::ptr::null_mut(), 0),
+    }
 }
 
 /// `outs = epi(act . w^T)`, an anchored region over a dense bf16 bank of
@@ -264,9 +283,10 @@ pub(crate) fn anchored(
 }
 
 /// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone, at cuBLASLt's
-/// first heuristic algorithm for the product with that epilogue. False,
-/// landing nothing, where the epilogue is none of cuBLASLt's or cuBLASLt
-/// offers no algorithm for it.
+/// first heuristic algorithm for the product with that epilogue within the
+/// workspace the context holds. False, landing nothing, where the epilogue
+/// is none of cuBLASLt's or cuBLASLt offers no algorithm for it; the chosen
+/// one failing is a fault.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_lt(
     ctx: &Ctx,
@@ -306,12 +326,9 @@ pub(crate) fn on_lt(
     if lt_handle.is_null() {
         return Ok(false);
     }
-    let (ws, ws_bytes) = match ctx.scratch_stream(op, LT_WORKSPACE, want) {
-        Ok(ws) if !ws.is_null() => (ws, want),
-        _ => (std::ptr::null_mut(), 0),
-    };
+    let (ws, ws_bytes) = lt_workspace(ctx, op, want);
     let bias = ins.first().map_or(0, |b| b.base());
-    Ok(run_lt_epilogue(
+    run_lt_epilogue(
         lt_handle,
         &plan,
         ctx.stream(),
@@ -320,7 +337,8 @@ pub(crate) fn on_lt(
         bias,
         ws,
         ws_bytes,
-    ))
+    )
+    .map_err(|why| refuse(op, format!("cuBLASLt's epilogue {why} at M={m} N={n} K={k}")))
 }
 
 /// `outs = epi(act . w^T)` on the unfused leg: the plain product into
@@ -821,8 +839,10 @@ fn run_lt(
 }
 
 /// [`run_lt`] with cuBLASLt's own `epilogue` landing `y`: a bias (`bias`,
-/// bf16, one a column of `y`, where the epilogue reads one) or a ReLU, through a descriptor of its own for the call. False where the
-/// algorithm refuses the epilogue.
+/// bf16, one a column of `y`, where the epilogue reads one) or a ReLU,
+/// through a descriptor of its own for the call. False, landing nothing,
+/// where no bias is given for a biased epilogue or cuBLASLt offers no
+/// algorithm for it; the why where the chosen one fails.
 #[allow(clippy::too_many_arguments)]
 fn run_lt_epilogue(
     lt_handle: lt::cublasLtHandle_t,
@@ -833,9 +853,9 @@ fn run_lt_epilogue(
     bias: u64,
     ws: *mut c_void,
     ws_bytes: usize,
-) -> bool {
+) -> Result<bool, String> {
     if epilogue.biased() && bias == 0 {
-        return false;
+        return Ok(false);
     }
     struct Desc(lt::cublasLtMatmulDesc_t);
     impl Drop for Desc {
@@ -857,7 +877,7 @@ fn run_lt_epilogue(
         )
     } != ok
     {
-        return false;
+        return Err("descriptor could not be created".into());
     }
     let set = |attribute: lt::cublasLtMatmulDescAttributes_t,
                value: *const c_void,
@@ -903,7 +923,7 @@ fn run_lt_epilogue(
             std::mem::size_of::<lt::cudaDataType>(),
         )))
     {
-        return false;
+        return Err("descriptor could not be set".into());
     }
     // cuBLASLt's first heuristic for the product with its epilogue, asked
     // once a shape and kept: the plain product's may not take it.
@@ -922,7 +942,7 @@ fn run_lt_epilogue(
             .or_insert_with(|| first_heuristic(lt_handle, ws_bytes, desc.0, plan).map(|h| h.algo))
     }) else {
         clear_error();
-        return false;
+        return Ok(false);
     };
     let algo = &algo;
     let alpha = 1.0f32;
@@ -958,9 +978,9 @@ fn run_lt_epilogue(
     };
     if status != ok {
         clear_error();
-        return false;
+        return Err(format!("answered {status:?}"));
     }
-    true
+    Ok(true)
 }
 
 struct Device {

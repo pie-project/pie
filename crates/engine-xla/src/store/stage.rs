@@ -4,8 +4,9 @@
 //! (`crate::trace::Source::Stage`); nothing is uploaded per fire.
 //!
 //! `frames in flight + 1` slots, each the slab's rows: a slot is written
-//! again only once the pool its last fire returned is ready (an event, never
-//! a poll), so a fire still queued never reads another's inputs. On the
+//! again only once its last fire has run on the device (the event its
+//! execute returns, never a poll, whatever the fire outputs), so a fire
+//! still queued never reads another's inputs. On the
 //! device one slab serves every fire: fires reach it in order through the
 //! donated pool, each copying its own slot at its start.
 
@@ -19,8 +20,33 @@ use crate::pjrt::{Buffer, Event};
 struct Slot {
     buffer: Buffer,
     at: *mut u32,
-    /// The pool its last fire returned, ready once that fire has run.
-    done: Option<Event>,
+    /// Fires once its last fire has run.
+    done: Option<Done>,
+}
+
+/// A run's device-complete event, shared by the slots one run reads (its
+/// staging slot and its bulk slots): the first to wait takes and awaits it,
+/// the others wait behind it and find it fired.
+#[derive(Clone)]
+pub struct Done(std::sync::Arc<std::sync::Mutex<Option<Event>>>);
+
+impl Done {
+    #[must_use]
+    pub fn of(event: Event) -> Done {
+        Done(std::sync::Arc::new(std::sync::Mutex::new(Some(event))))
+    }
+
+    /// Blocks until the run has completed.
+    pub fn wait(&self) -> Result<()> {
+        let mut event = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(event) = event.take() {
+            event.wait()?;
+        }
+        Ok(())
+    }
 }
 
 pub struct Ring {
@@ -99,9 +125,16 @@ impl Ring {
         &self.slots[at].buffer
     }
 
-    /// Slot `at` is read by the fire whose pool `done` fires once it ran.
-    pub fn read_by(&mut self, at: usize, done: Option<Event>) {
+    /// Slot `at` is read by the run that `done` fires once it completes
+    /// (`None`: one already waited for).
+    pub fn read_by(&mut self, at: usize, done: Option<Done>) {
         self.slots[at].done = done;
+    }
+
+    /// Whether slot `at` waits on a run before it is written again.
+    #[must_use]
+    pub fn fenced(&self, at: usize) -> bool {
+        self.slots[at].done.is_some()
     }
 
     /// Slots, and the rows each takes.

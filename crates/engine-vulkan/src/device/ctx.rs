@@ -204,6 +204,9 @@ pub(crate) struct Core {
     /// it has, the most the load may hold in all, read when the device
     /// bound ([`host_ceiling`]).
     ceiling: Option<u64>,
+    /// Whose memory the device's is ([`device_memory`]): where it is the
+    /// host's, the load states no host tier.
+    whose_memory: engine::DeviceMemory,
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
@@ -845,6 +848,25 @@ pub(crate) fn buffer_ceiling(storage_range: u32, allocation: u64, buffer: Option
 /// heap the host maps, without `VK_EXT_memory_budget`. A discrete card
 /// whose heap the host maps (resizable BAR) has its own memory, so it is
 /// not one.
+/// Whose memory a Vulkan device's is: the host's on every Android device,
+/// and elsewhere on an integrated or CPU device, or any other whose largest
+/// device-local heap the host maps (`mapped`: a heap both `DEVICE_LOCAL`
+/// and `HOST_VISIBLE`). A discrete card whose heap the host maps (resizable
+/// BAR) has memory of its own.
+fn device_memory(device: vk::PhysicalDeviceType, mapped: bool) -> engine::DeviceMemory {
+    let hosts = cfg!(target_os = "android")
+        || match device {
+            vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU => true,
+            vk::PhysicalDeviceType::DISCRETE_GPU => false,
+            _ => mapped,
+        };
+    if hosts {
+        engine::DeviceMemory::Hosts
+    } else {
+        engine::DeviceMemory::Own
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Option<u64>> {
     if !cfg!(target_os = "android") && (memory_budget || !shares_host) {
@@ -995,6 +1017,7 @@ impl Context {
             unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
         let memory_budget = has_extension(&device_exts, ash::ext::memory_budget::NAME);
         // Read before the device is made, so a refusal leaves nothing to free.
+        let whose_memory;
         let ceiling = {
             // SAFETY: `physical` was enumerated from the live `instance`.
             let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
@@ -1014,12 +1037,8 @@ impl Context {
                                 | vk::MemoryPropertyFlags::HOST_VISIBLE,
                         )
                 });
-            let shares_host = match props.device_type {
-                vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU => true,
-                vk::PhysicalDeviceType::DISCRETE_GPU => false,
-                _ => mapped,
-            };
-            host_ceiling(&name, shares_host, memory_budget)?
+            whose_memory = device_memory(props.device_type, mapped);
+            host_ceiling(&name, whose_memory.unified(), memory_budget)?
         };
         let coopmat_ext = has_extension(&device_exts, ash::khr::cooperative_matrix::NAME);
 
@@ -1263,6 +1282,7 @@ impl Context {
             cores,
             device_local,
             ceiling,
+            whose_memory,
             heap,
             vendor_id: props.vendor_id,
             update_after_bind,
@@ -1359,6 +1379,11 @@ impl Context {
     /// Where the device shares the host's memory (a ceiling was read at
     /// bind), the reader of what the host can still give the process, the
     /// bind's reading taken afresh ([`host_ceiling`]).
+    #[must_use]
+    pub fn whose_memory(&self) -> engine::DeviceMemory {
+        self.core.whose_memory
+    }
+
     #[must_use]
     pub fn host_room(&self) -> Option<engine::HostRoom> {
         self.core.ceiling?;
@@ -3980,7 +4005,39 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use super::{Context, Ordering};
+    use ash::vk;
+
+    use super::{Context, Ordering, device_memory};
+
+    /// The phone (Adreno), an integrated GPU and the Spark share the host's
+    /// memory: no host tier there, and a stated one is refused by name. A
+    /// discrete card, its heap mapped or not, is unchanged.
+    #[test]
+    fn a_device_whose_memory_is_the_hosts_states_no_host_tier() {
+        let integrated = device_memory(vk::PhysicalDeviceType::INTEGRATED_GPU, true);
+        assert_eq!(integrated, engine::DeviceMemory::Hosts);
+        assert_eq!(integrated.host_tier(None), Ok(engine::HostTier::Absent));
+        let refused = integrated.host_tier(Some(1 << 30)).unwrap_err();
+        assert!(refused.contains("`[engine.memory] budget_host`"), "{refused}");
+        assert_eq!(
+            device_memory(vk::PhysicalDeviceType::VIRTUAL_GPU, true),
+            engine::DeviceMemory::Hosts
+        );
+        if !cfg!(target_os = "android") {
+            for mapped in [false, true] {
+                let discrete = device_memory(vk::PhysicalDeviceType::DISCRETE_GPU, mapped);
+                assert_eq!(discrete, engine::DeviceMemory::Own);
+                assert_eq!(
+                    discrete.host_tier(Some(1 << 30)),
+                    Ok(engine::HostTier::Seated(Some(1 << 30)))
+                );
+            }
+            assert_eq!(
+                device_memory(vk::PhysicalDeviceType::VIRTUAL_GPU, false),
+                engine::DeviceMemory::Own
+            );
+        }
+    }
 
     /// A storage-buffer set layout, as a kernel's.
     fn layout(context: &Context) -> ash::vk::DescriptorSetLayout {

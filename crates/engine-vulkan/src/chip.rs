@@ -36,15 +36,18 @@ seeded!(
     // Committed measured profiles (`pie tune export --engine vulkan`).
     "nvidia-rtx-pro-4500-blackwell.measured.toml",
     "adreno-tm-840.measured.toml",
+    "nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.measured.toml",
 );
 
 /// The host covers committed for this backend's devices
 /// (`profiles/<device>.covers.json`, `pie tune export --engine vulkan`),
 /// each listed here: the runtime takes a cover whose key matches where the
 /// home's own cache holds none (`engine::Engine::committed_covers`).
-pub const COVERS: &[&str] = &[include_str!(
-    "../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"
-)];
+pub const COVERS: &[&str] = &[
+    include_str!("../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"),
+    include_str!("../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"),
+    include_str!("../profiles/adreno-tm-840.covers.json"),
+];
 
 /// What a device no family file applies to runs.
 pub const DERIVED: &str = include_str!("derived.toml");
@@ -109,6 +112,29 @@ pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Pr
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
     probe_at(0)
+}
+
+/// What this build keys device `index`'s stored measurements by
+/// (`profile::fire::Now`: its device and driver, each kernel's code): what a
+/// committed entry is checked against before an export carries it.
+#[must_use]
+pub fn now_at(index: u32) -> Option<Box<dyn profile::fire::Now>> {
+    measured_on_at(index).map(|on| {
+        Box::new(engine_gpu::stored::Keys::new(on, kernels_slang::Target::Spirv))
+            as Box<dyn profile::fire::Now>
+    })
+}
+
+/// The device and driver device `index`'s measurements are keyed as taken
+/// on (`Context::measured_on`): what a home's host covers of it name.
+#[must_use]
+pub fn measured_on_at(index: u32) -> Option<String> {
+    let boot = crate::api::DeviceBoot {
+        device_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
+    Some(context.measured_on())
 }
 
 /// [`probe`] of the device `index` names, in the order the engine numbers

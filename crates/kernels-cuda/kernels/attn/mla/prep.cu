@@ -14,18 +14,18 @@ __global__ void mla_split_q_b(
     const T* __restrict__ q_b,
     T* __restrict__ q_nope,
     T* __restrict__ q_pe,
-    int total,
+    i64 total,
     int heads,
     int nope,
     int rope,
     const u32* __restrict__ win)
 {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= total) return;
     const int per = nope + rope;
-    const int d = i % per;
-    const int h = (i / per) % heads;
-    const int n = i / (heads * per);
+    const int d = static_cast<int>(i % per);
+    const int h = static_cast<int>((i / per) % heads);
+    const int n = static_cast<int>(i / (static_cast<i64>(heads) * per));
 
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
 

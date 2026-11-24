@@ -541,7 +541,7 @@ pub fn matmul_select(
         && x.dtype == Dtype::Bf16
         && x.width.is_multiple_of(64)
         && count <= ORDER_EXPERT_CAP
-        && (65..=ctx.tuning().moe_dense_batch_until).contains(&fan.route_count.div_ceil(count))
+        && (65..=ctx.tuning().moe_dense_batch_until()).contains(&fan.route_count.div_ceil(count))
     {
         return select_gemm(ctx, OP, x, bank, routes, y, &fan, count, experts);
     }
@@ -556,7 +556,7 @@ pub fn matmul_select(
     // routes.
     if let Some(count) = dense_experts(x, bank, y, experts)
         && x.width.is_multiple_of(8)
-        && let Some(mt) = batch_items(ctx, &fan, count, 64, ctx.tuning().moe_dense_batch_until)
+        && let Some(mt) = batch_items(ctx, &fan, count, 64, ctx.tuning().moe_dense_batch_until())
     {
         let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
         let nbw = dense_nbw(mt);
@@ -626,7 +626,7 @@ pub fn matmul_grouped(
         // The strided launch reads the contiguous bank only.
         && !experts.tabled()
         && dense_experts(x, bank, y, experts) == Some(groups)
-        && routes.rows > ctx.tuning().moe_batch_until
+        && routes.rows > ctx.tuning().moe_batch_until()
         && x.rows == routes.rows * groups
         && y.rows == x.rows
         && grouped_lt(
@@ -724,11 +724,11 @@ fn grouped_worth(
     fan: &Selected,
     experts: ExpertTable,
 ) -> Option<u32> {
-    if !ctx.tuning().moe_grouped {
+    if !ctx.tuning().moe_grouped() {
         return None;
     }
     let count = dense_experts(x, bank, y, experts)?;
-    (fan.route_count.div_ceil(count) >= ctx.tuning().moe_group_at).then_some(count)
+    (fan.route_count.div_ceil(count) >= ctx.tuning().moe_group_at()).then_some(count)
 }
 
 /// 16-row weight blocks a batch wave takes (the kernels' `NBW`), and so the
@@ -755,7 +755,7 @@ const DENSE_WIDE_NBW: u32 = 2;
 fn batch_items(ctx: &Ctx, fan: &Selected, experts: u32, widest: u32, until: u32) -> Option<u32> {
     let t = ctx.tuning();
     let top_k = fan.top_k.unsigned_abs();
-    if !t.moe_batch || fan.route_count < t.moe_batch_from.saturating_mul(top_k) {
+    if !t.moe_batch() || fan.route_count < t.moe_batch_from().saturating_mul(top_k) {
         return None;
     }
     let per = fan.route_count.div_ceil(experts);
@@ -834,16 +834,16 @@ const WIDE_K: u32 = 64;
 fn wide_items(ctx: &Ctx, fan: &Selected, experts: u32, x: Tensor) -> Option<u32> {
     let t = ctx.tuning();
     let top_k = fan.top_k.unsigned_abs();
-    if !t.moe_batch
-        || t.moe_dense_wide_from == 0
-        || fan.route_count < t.moe_batch_from.saturating_mul(top_k)
+    if !t.moe_batch()
+        || t.moe_dense_wide_from() == 0
+        || fan.route_count < t.moe_batch_from().saturating_mul(top_k)
         || !x.width.is_multiple_of(WIDE_K)
         || u64::from(x.rows) * u64::from(x.width) * 2 >= 0xffff_f000
     {
         return None;
     }
     let per = fan.route_count.div_ceil(experts);
-    if per < t.moe_dense_wide_from || per > t.moe_dense_batch_until {
+    if per < t.moe_dense_wide_from() || per > t.moe_dense_batch_until() {
         return None;
     }
     // per ≤ (√cap − 1)² for cap = 64, 128, 192, 256.
@@ -1292,7 +1292,7 @@ mod ordered {
         {
             return Ok(false);
         }
-        let from = ctx.tuning().moe_ordered_from;
+        let from = ctx.tuning().moe_ordered_from();
         if from == 0 || fan.route_count / experts < from {
             return Ok(false);
         }
@@ -1409,7 +1409,7 @@ const LT_STAGE_CAP: u64 = 3 << 30;
 /// (`fits`).
 #[cfg(feature = "rocm")]
 fn lt_wanted(ctx: &Ctx, per: u32, from: u32, fits: bool) -> bool {
-    ctx.tuning().moe_lt_grouped && fits && from > 0 && per >= from
+    ctx.tuning().moe_lt_grouped() && fits && from > 0 && per >= from
 }
 
 /// The library and the solution the profile names for a contraction of `k`
@@ -1425,10 +1425,10 @@ fn lt_solution(
 ) -> Result<(&'static crate::hip::lt_grouped::Library, usize), Error> {
     let lib = crate::hip::lt_grouped::library(dtype).map_err(|why| refuse(op, why))?;
     let t = ctx.tuning();
-    let tile = if k >= t.moe_lt_deep_k {
-        t.moe_lt_tile_deep
+    let tile = if k >= t.moe_lt_deep_k() {
+        t.moe_lt_tile_deep()
     } else {
-        t.moe_lt_tile_shallow
+        t.moe_lt_tile_shallow()
     };
     let at = lib.pick(tile).ok_or_else(|| {
         refuse(
@@ -1595,13 +1595,13 @@ fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<
         return Ok(false);
     };
     let t = ctx.tuning();
-    if !t.moe_grouped
+    if !t.moe_grouped()
         || u64::from(rows) * u64::from(k + 3 * i + out) * 2 > LT_STAGE_CAP
         || !lt_wanted(
             ctx,
             rows / experts,
-            t.moe_lt_mlp_from,
-            k >= t.moe_lt_deep_k && i >= t.moe_lt_deep_k,
+            t.moe_lt_mlp_from(),
+            k >= t.moe_lt_deep_k() && i >= t.moe_lt_deep_k(),
         )
     {
         return Ok(false);
@@ -2106,7 +2106,7 @@ fn matmul_select_mxfp4(
     // streamed or held lands the same bits.
     if x.dtype == Dtype::Bf16
         && codes.rows <= ORDER_EXPERT_CAP
-        && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
+        && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until())
         // Short of 32 routes a lane reads its two scale bytes as one.
         && (mt == 32 || x.width.is_multiple_of(2 * MXFP4_BLOCK))
     {
@@ -2132,9 +2132,9 @@ fn matmul_select_mxfp4(
             &table.args(),
         );
     }
-    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
+    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse() * experts && ctx.tuning().mxfp4_grouped() {
         let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
-        let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
+        let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma();
         let entry = if wmma {
             format!(
                 "::pie::linear::moe_matmul_select_mxfp4_wmma<::pie::i32({})>",
@@ -2630,7 +2630,7 @@ fn matmul_select_mlxu4(
         && x.dtype == Dtype::Bf16
         && codes.rows <= ORDER_EXPERT_CAP
         && x.width.is_multiple_of(2 * group)
-        && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until)
+        && let Some(mt) = batch_items(ctx, &fan, experts, 32, ctx.tuning().moe_batch_until())
     {
         return select_batch(
             ctx,
@@ -2652,9 +2652,9 @@ fn matmul_select_mlxu4(
         );
     }
     let tuning = ctx.tuning();
-    if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
+    if tuning.affine_grouped() && fan.route_count >= tuning.affine_grouped_from() {
         let ordered = route_order(ctx, op, routes, &fan, experts, group_routes(&fan, experts))?;
-        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma;
+        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma();
         let entry = if wmma {
             format!(
                 "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group}), \
@@ -2846,7 +2846,7 @@ fn decode_fan(
         return Ok(None);
     };
     let covered = fan.by_token
-        && ctx.tuning().moe_batch
+        && ctx.tuning().moe_batch()
         && p.limit.is_none()
         && p.packed.width == 2 * i
         && shared.is_none_or(|s| {
@@ -2879,7 +2879,7 @@ fn decode_fan(
 /// them back for it decides here, before the legs.
 pub fn absorbs_shared(ctx: &Ctx, p: &RoutedMlp, shared: SharedGate, hidden: u32) -> bool {
     (shared.banks.is_some() || shared.gate_w.is_some())
-        && p.x.rows >= ctx.tuning().moe_batch_from
+        && p.x.rows >= ctx.tuning().moe_batch_from()
         && matches!(decode_fan(ctx, p, Some(shared), hidden), Ok(Some((fan, count)))
             if batch_plan(ctx, p, &fan, count).is_some())
 }
@@ -2907,7 +2907,7 @@ pub fn decode_mlp(
         return Ok(false);
     };
     let top_k = fan.top_k.unsigned_abs();
-    if x.rows >= t.moe_batch_from {
+    if x.rows >= t.moe_batch_from() {
         return batch_mlp(ctx, p, &fan, count, shared, y);
     }
     if shared.is_some_and(|s| s.banks.is_some() || s.gate_w.is_some()) {
@@ -2984,7 +2984,7 @@ pub fn decode_mlp(
 /// The items [`batch_mlp`] takes, if it takes the fire.
 fn batch_plan(ctx: &Ctx, p: &RoutedMlp, fan: &Selected, count: u32) -> Option<u32> {
     let (x, i) = (p.x, p.intermediate);
-    let until = ctx.tuning().moe_dense_batch_until;
+    let until = ctx.tuning().moe_dense_batch_until();
     let down_fan = Selected {
         by_token: false,
         ..*fan

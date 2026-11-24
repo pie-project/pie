@@ -20,9 +20,9 @@
 //! a policy would. It is not part of the stores, which only carry out
 //! discards.
 //!
-//! The one thing the runtime may still reclaim without asking is idle cache
-//! whose PLEX retention key says it may be dropped ([`may_drop`]). Everything
-//! else goes through `tier-pressure`.
+//! Idle cache the stores reclaim on their own is only what its
+//! `retention/tiers` row lets sit on no lower tier with room; the rest moves
+//! down a tier.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -290,13 +290,6 @@ pub fn reading(tier: Tier) -> Reading {
         band: gauge.band,
         short: gauge.short(),
     }
-}
-
-/// Whether the runtime may drop idle cache under `key` without asking the
-/// policy. Only a key at or below the retention floor says so; above it,
-/// room is asked for with `tier-pressure`.
-pub const fn may_drop(key: i64) -> bool {
-    !super::retention::above_floor(key)
 }
 
 /// Replaces the meter the worker policy reads bytes from.

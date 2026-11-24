@@ -43,6 +43,9 @@ pub struct Arena {
     /// carve: what a fire of the rung's tokens and lanes replays its
     /// recurrent rows in (0 for a model with none).
     rs: Vec<u64>,
+    /// Bytes between the arena's end and the range's: what a reach, counted
+    /// from the range's end, adds (a windowed load's own-row pages).
+    beyond: u64,
 }
 
 /// `bytes` on the [`ALIGN`] boundary.
@@ -109,7 +112,15 @@ impl Arena {
             arms: arms.max(1),
             current: 0,
             rs,
+            beyond: 0,
         }
+    }
+
+    /// The arena ends `bytes` below the range's end: reaches count them.
+    #[must_use]
+    pub fn beyond(mut self, bytes: u64) -> Arena {
+        self.beyond = bytes;
+        self
     }
 
     /// The bytes the kernel scratch plane takes at the span's top.
@@ -271,7 +282,8 @@ impl Arena {
     #[must_use]
     pub fn rung_reach(&self, tokens: u32) -> u64 {
         let index = self.index(tokens);
-        self.scratch
+        self.beyond
+            + self.scratch
             + self.over_carve(index)
             + self.rungs.get(index).map_or(0, |(_, map)| room(map.bytes))
     }

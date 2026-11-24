@@ -97,14 +97,19 @@ impl AdmissionLimits {
             ));
         }
         // A request whose lanes alone make a step outside the set the load
-        // stated: no step the builder forms seats it (it cuts no member), and
-        // the engine recorded nothing for it.
+        // stated. A request here is one piece of its pass, already cut to a
+        // fire (`pipeline::fire::pass_pieces`): a long prompt arrives as
+        // pieces, each inside the set. What is refused is a piece the cut
+        // could not bring inside it, a step no bound above names (its
+        // sequence readouts past the rows one fire reads out, a buffered
+        // step on a load with no rs list, a lane attachment the load does
+        // not serve); the gap names which.
         if let Some(shapes) = self.limits.shapes
             && let Err(gap) = shapes.holds(&composition(req))
         {
             return Some(format!(
-                "forward request of instance {} alone is a step outside the set the load \
-                 stated: {gap}",
+                "forward request of instance {} is a step no cut makes smaller and no stated \
+                 shape holds: {gap}",
                 req.instance_id.0
             ));
         }
@@ -856,6 +861,69 @@ mod tests {
         a_step_carries_no_more_than_its_rungs_tokens();
         a_step_replays_no_more_rows_than_the_engine_states();
         a_wave_of_prompts_past_one_fire_is_cut_and_its_decode_wave_is_one_fire();
+        a_device_fed_lane_is_bound_to_its_own_instance_whatever_its_frame_holds();
+    }
+
+    /// Two frames in flight on a windowed-state load, decode tokens fed on
+    /// the device: frame N holds lanes A, B and C, frame N+1 only A and C (B
+    /// absent), frame N+2 B back, ahead of the others. A lane's input token
+    /// is its program instance's (the attachment naming its lanes), never a
+    /// position in the frame: in every frame each attachment names its own
+    /// instance over exactly its own lane, which keeps its own seat, record
+    /// and window fold.
+    fn a_device_fed_lane_is_bound_to_its_own_instance_whatever_its_frame_holds() {
+        let windowed = |instance: u64, seat: u32| {
+            let mut request = FireRequest::one(crate::engine::fire::lane_of(
+                seat,
+                vec![u32::MAX],
+                64,
+                vec![seat],
+            ));
+            request.single_token_mode = true;
+            // The fire ending its pass: its program runs, its instance attached.
+            request.boundary_program = true;
+            let lane = &mut request.lanes[0].lane;
+            lane.record = ::engine::LaneRecord::Pieces(vec![(
+                ::engine::chunk::ShapeId(1),
+                vec![[seat * 10, seat * 10]],
+            )]);
+            lane.window = Some(::engine::WindowFold {
+                base: 64,
+                fold: ::engine::FoldLen::Host(1),
+                lineage: ::engine::fire::Lineage::Set,
+            });
+            pending(request, InstanceId(instance))
+        };
+        let (a, b, c) = ((1, 7), (2, 3), (3, 5));
+        for members in [vec![a, b, c], vec![a, c], vec![b, c, a]] {
+            let (frame, _) = build_frame_submission(
+                vec![
+                    members
+                        .iter()
+                        .map(|&(instance, seat)| windowed(instance, seat))
+                        .collect(),
+                ],
+                limits(),
+                16,
+                &SchedulerStats::default(),
+            );
+            let step = &frame.steps[0];
+            assert_eq!(step.submission.attachments.len(), members.len());
+            for (at, &(instance, seat)) in members.iter().enumerate() {
+                let attachment = &step.submission.attachments[at];
+                assert_eq!(attachment.instance, InstanceId(instance));
+                assert_eq!(attachment.lanes, 1);
+                let lane = &step.submission.lanes[attachment.lane as usize];
+                assert_eq!(lane.slot, seat, "its own seat");
+                assert_eq!(
+                    lane.record.pieces()[0].1,
+                    vec![[seat * 10, seat * 10]],
+                    "its own record"
+                );
+                assert_eq!(lane.window.map(|window| window.base), Some(64));
+                assert_eq!(step.instances[attachment.lane as usize], InstanceId(instance));
+            }
+        }
     }
 
     /// A verify lane of `instance`: a block of 16 tokens, each row read out.
@@ -1827,6 +1895,96 @@ mod tests {
             refused.contains("instance 7")
                 && refused.contains("outside the set")
                 && refused.contains("nearest stated"),
+            "{refused}"
+        );
+    }
+
+    /// A prompt of 21,250 tokens, past ten times the widest rung (2048), on
+    /// a load stating its set: its pass is cut into pieces of a fire each
+    /// (`pass_pieces`), every piece is admitted, the builder forms each in a
+    /// step of the set, beside decodes too, and every row is served once,
+    /// the last piece reading out. A long prompt is never refused.
+    #[test]
+    fn a_prompt_past_every_rung_is_cut_and_served_never_refused() {
+        let base = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 2048,
+            max_page_refs: 4096,
+            max_context: 32_768,
+            ..limits()
+        };
+        let rungs = [16, 64, 256, 1024, 2048];
+        for buffers in [false, true] {
+            let shapes = stated(base, &rungs, buffers);
+            let limits = holding(base, shapes.clone());
+            let admission = AdmissionLimits::new(limits, 16);
+            let rows = 21_250u32;
+            let mut lane = crate::engine::fire::lane_of(0, (0..rows).map(|t| t + 100).collect(), 0, Vec::new());
+            lane.pages = (0..rows.div_ceil(16)).collect();
+            lane.readout = ::engine::Readout::Last;
+            let mut full = FireRequest::one(lane);
+            full.boundary_program = true;
+            let whole = pending(full.clone(), InstanceId(1));
+            assert!(
+                admission.single_request_limit_error(&whole).is_some(),
+                "uncut, the pass is no fire"
+            );
+            let pieces = crate::pipeline::fire::pass_pieces(&full, true, true, 2048, 16, &[], &[]);
+            assert!(pieces.len() >= 11, "cut into fires: {}", pieces.len());
+            let mut served = 0u32;
+            let mut read = 0usize;
+            for (at, piece) in pieces.iter().enumerate() {
+                let last = at + 1 == pieces.len();
+                let request = crate::pipeline::fire::rows_of_lanes(&full, piece, last, 16);
+                let request = pending(request, InstanceId(1));
+                assert_eq!(
+                    admission.single_request_limit_error(&request),
+                    None,
+                    "piece {at} is admitted"
+                );
+                // Each piece steps beside a few decodes, as a frame would.
+                let mut wave = vec![request];
+                wave.extend((10..13).map(|i| pending(decode(1, 1), InstanceId(i))));
+                let (frame, flattened) =
+                    build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+                assert_eq!(flattened.len(), 4, "no member is dropped");
+                for step in &frame.steps {
+                    let composition = ::engine::StepComposition::of(&step.submission.lanes);
+                    shapes.holds(&composition).unwrap_or_else(|gap| panic!("piece {at}: {gap}"));
+                    for lane in step.submission.lanes.iter().filter(|lane| lane.tokens.len() > 1 || lane.tokens.first() != Some(&1)) {
+                        served += lane.rows();
+                        read += match &lane.readout {
+                            ::engine::Readout::Last => 1,
+                            ::engine::Readout::Rows(rows) => rows.len(),
+                            ::engine::Readout::None => 0,
+                        };
+                    }
+                }
+            }
+            assert_eq!(served, rows, "every row of the prompt served once");
+            assert_eq!(read, 1, "the last piece reads out");
+        }
+    }
+
+    /// What admission refuses against the set is a piece no cut makes
+    /// smaller: here one reading out more rows than one fire reads out
+    /// (prompt logprobs past the engine's readout rows a fire), named with
+    /// the bound it passes.
+    #[test]
+    fn a_piece_reading_out_past_one_fire_is_refused_naming_its_readouts() {
+        let base = SchedulerLimits {
+            max_forward_tokens: 64,
+            max_readouts: 16,
+            ..limits()
+        };
+        let limits = holding(base, stated(base, &[64], false));
+        let mut lane = crate::engine::fire::lane_of(0, (0..40).collect(), 0, vec![1]);
+        lane.readout = ::engine::Readout::Rows((0..40).collect());
+        let refused = AdmissionLimits::new(limits, 16)
+            .single_request_limit_error(&pending(FireRequest::one(lane), InstanceId(9)))
+            .expect("40 readout rows past 16 a fire");
+        assert!(
+            refused.contains("instance 9") && refused.contains("readout rows 40 (the shape's 0-16)"),
             "{refused}"
         );
     }

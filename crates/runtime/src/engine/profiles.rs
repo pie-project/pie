@@ -351,16 +351,23 @@ fn bench_cuda<'a>(
     )))
 }
 
-/// What `pie tune export` wrote of a device ([`export`]).
+/// What `pie tune export` wrote of a device ([`export`]): each part the
+/// home holds, `None` for each it holds none of.
 pub struct Exported {
     /// The device, by name.
     pub device: String,
-    /// The user's file it was read from.
+    /// Why the engine was not probed, where the device is instead the one
+    /// the home's stored measurements are filed under.
+    pub unprobed: Option<String>,
+    /// The user's file the measurements were read from.
     pub from: std::path::PathBuf,
-    /// Its committed file's name (`profile::measured_name`).
-    pub name: String,
-    /// The committed measured profile.
-    pub text: String,
+    /// Its committed file's name (`profile::measured_name`) and text: `None`
+    /// where the home stores no measurement of the device (every entry a
+    /// load took matched a committed one), with why.
+    pub measured: Result<(String, String), String>,
+    /// What a boot of each model the export carries a settle of reads, and
+    /// whether each is carried (`profile::settles_carried`), a line a model.
+    pub report: Vec<String>,
     /// The host covers the home's cache holds for this device
     /// (`<device>.covers.json`, its name and text): each entry whose key
     /// names the device the measurements were taken on. `None` where it
@@ -405,46 +412,208 @@ pub fn covers_of(cache: &Path, on: &str) -> Option<String> {
     serde_json::to_string_pretty(&held).ok().map(|text| text + "\n")
 }
 
-/// The stored measurements of `backend`'s device `index` (the user's file
-/// under `profiles` a load keeps them in) in committed form
-/// (`profile::export`): refused by name where the device is not found, its
-/// user file holds none, or an entry is stored without a key.
-/// With them, the host covers the home's cache (`cache`) holds for the
-/// device ([`covers_of`]).
+/// What the home holds of `backend`'s device `index`: its stored
+/// measurements (the user's file under `profiles` a load keeps them in) in
+/// committed form (`profile::export`; an entry stored without a key is
+/// refused by name), and the host covers its cache (`cache`) holds for the
+/// device ([`covers_of`]). A part the home holds none of is `None`, said
+/// why; the device not found is refused.
 pub fn export(
     backend: &Backend,
     profiles: &Path,
     cache: &Path,
     index: u32,
 ) -> Result<Exported, String> {
-    let device = device_name(backend, index)?;
+    let mut unprobed = None;
+    let device = match device_name(backend, index) {
+        Ok(device) => device,
+        // An engine that cannot be probed beside a load (XLA: opening its
+        // client takes the device): the device the home's stored entries
+        // are filed under, where they are one device's.
+        Err(why) => {
+            let stored = stored_devices(backend, profiles);
+            match stored.as_slice() {
+                [only] => {
+                    tracing::info!(
+                        device = only.as_str(),
+                        "pie tune export: the {} engine was not probed ({why}); the device is the \
+                         one the home's stored measurements are filed under",
+                        backend.name
+                    );
+                    unprobed = Some(why);
+                    only.clone()
+                }
+                [] => return Err(why),
+                many => {
+                    return Err(format!(
+                        "{why}; the home stores measurements of {} devices ({}): export names \
+                         one only where it can probe it",
+                        many.len(),
+                        many.join(", ")
+                    ));
+                }
+            }
+        }
+    };
     let from = backend.shelf.user_path(profiles, &device);
+    let committed = backend
+        .shelf
+        .seeded
+        .iter()
+        .find(|(path, _)| *path == profile::measured_name(&device))
+        .map(|(_, text)| *text);
+    let now = device_now(backend, index, &device);
+    let mut exported = held(
+        (backend.registry)(),
+        device.clone(),
+        from,
+        cache,
+        committed,
+        now.as_deref(),
+        || device_on(backend, index, &device),
+    );
+    exported.unprobed = unprobed;
+    Ok(exported)
+}
+
+/// The devices `backend`'s stored measurements in the home are filed
+/// under (`Shelf::user_path`'s file names, each a device's id), sorted.
+fn stored_devices(backend: &Backend, profiles: &Path) -> Vec<String> {
+    let dir = backend
+        .shelf
+        .user_path(profiles, "x")
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let mut ids: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".toml").map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// [`export`] of `device`, its user's file at `from` (read where it is) and
+/// the home's cache `cache`; `on` names the device its covers key where the
+/// file states none.
+fn held(
+    registry: &Registry,
+    device: String,
+    from: std::path::PathBuf,
+    cache: &Path,
+    committed: Option<&str>,
+    now: Option<&dyn profile::fire::Now>,
+    on: impl FnOnce() -> Option<String>,
+) -> Exported {
+    let origin = from.display().to_string();
     let user = std::fs::read_to_string(&from).map_err(|e| {
         format!(
-            "{}: {e}: no measurement of `{device}` is stored; a load of it stores them",
+            "{}: {e}: no measurement of `{device}` is stored (a load that took every entry from \
+             a committed profile stores none)",
             from.display()
         )
-    })?;
-    let text = profile::export(
-        (backend.registry)(),
-        &device,
-        &user,
-        &from.display().to_string(),
-    )?;
-    let on = (backend.registry)()
-        .parse(&user, &from.display().to_string(), profile::Strict::User)
+    });
+    let stored = user
+        .as_ref()
         .ok()
-        .and_then(|file| file.tuned.rates.measured_on);
-    let covers = on
+        .map(|user| registry.parse(user, &origin, profile::Strict::User));
+    let stored_on = match &stored {
+        Some(Ok(file)) => file.tuned.rates.measured_on.clone(),
+        _ => None,
+    };
+    let committed_rates = committed
+        .map(|text| registry.parse(text, &profile::measured_name(&device), profile::Strict::Measured));
+    let mut report = Vec::new();
+    // The home's measured entries over what of the committed profile still
+    // holds for this build, each said: a re-export never shrinks it.
+    let measured = (|| -> Result<(String, String), String> {
+        let mine = match stored {
+            Some(Ok(file)) => file.tuned.rates,
+            Some(Err(why)) => return Err(why.to_string()),
+            None => profile::fire::Rates::default(),
+        };
+        let theirs = match committed_rates {
+            Some(Ok(file)) => {
+                for line in &file.skipped_rates {
+                    report.push(format!("dropped from the committed profile: {line}"));
+                }
+                Some(file.tuned.rates)
+            }
+            // Not one entry of it reads (each list entry is read alone, so
+            // this is the file as a whole): none carried, said by name.
+            Some(Err(why)) => {
+                report.push(format!("dropped: the committed profile does not read ({why})"));
+                None
+            }
+            None => None,
+        };
+        if mine == profile::fire::Rates::default() && theirs.is_none() {
+            return Err(user.clone().err().unwrap_or_else(|| format!("{origin}: stores nothing")));
+        }
+        let (merged, lines) = profile::merge_committed(mine, theirs, now)?;
+        report.extend(lines);
+        let (text, lines) = profile::export_rates(registry, &device, merged, &origin)?;
+        report.extend(lines);
+        Ok((profile::measured_name(&device), text))
+    })();
+    let covers = stored_on
+        .or_else(on)
         .and_then(|on| covers_of(cache, &on))
         .map(|text| (covers_name(&device), text));
-    Ok(Exported {
-        name: profile::measured_name(&device),
+    Exported {
         device,
+        unprobed: None,
         from,
-        text,
+        measured,
+        report,
         covers,
-    })
+    }
+}
+
+/// What this build keys `backend`'s device `index` (named `device`) by
+/// (`profile::fire::Now`): what a committed entry is checked against before
+/// an export carries it. `None` where the engine states none here (its
+/// committed entries are carried unchecked, and a boot checks them).
+fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::fire::Now>> {
+    let _ = (index, device);
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::now_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::now_at(index),
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => Some(Box::new(engine_cuda::stored::Keys::of(
+            i32::try_from(index).unwrap_or(0),
+            device,
+        ))),
+        _ => None,
+    }
+}
+
+/// The device and driver `backend`'s device `index` (named `device`) keys
+/// its measurements as taken on: what its host covers name, where no stored
+/// file of the home states it.
+fn device_on(backend: &Backend, index: u32, device: &str) -> Option<String> {
+    let _ = (index, device);
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::measured_on_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::measured_on_at(index),
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => Some(profile::fire::Now::on(&engine_cuda::stored::Keys::of(
+            i32::try_from(index).unwrap_or(0),
+            device,
+        ))),
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        "metal" => Some(engine_metal::stored::measured_on(device)),
+        _ => None,
+    }
 }
 
 /// The records of what a deployment's bodies took (the cuda engine's
@@ -593,5 +762,101 @@ mod cover_tests {
         );
         assert_eq!(crate::bootstrap::committed_cover(&text, "another key"), None);
         assert_eq!(covers_name("NVIDIA RTX PRO 4500 Blackwell"), "nvidia-rtx-pro-4500-blackwell.covers.json");
+    }
+
+    /// A home that stores no measurement of the device (every entry a load
+    /// took matched a committed one) and caches its covers: the export
+    /// writes the covers, by the device the engine names, and says the
+    /// measured profile is none.
+    #[test]
+    fn a_home_with_only_covers_exports_its_covers() {
+        let home = std::env::temp_dir().join(format!("pie-only-covers-{}", std::process::id()));
+        let cache = home.join("cache");
+        std::fs::create_dir_all(cache.join("cover")).unwrap();
+        let on = "vulkan 10de:2c31 driver 1";
+        let key = format!("Spirv|{on}|kernels 24 0x1|model a");
+        std::fs::write(
+            cache.join("cover").join("a.json"),
+            serde_json::json!({"key": key, "cover": 1, "frame_us": 5.0, "turnaround_us": 1.0})
+                .to_string(),
+        )
+        .unwrap();
+        let registry = Registry::new("toy", &[], &[]);
+        let exported = held(
+            &registry,
+            "Card X".into(),
+            home.join("profiles/toy/user/card-x.toml"),
+            &cache,
+            None,
+            None,
+            || Some(on.to_string()),
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(exported.measured.is_err(), "no measured profile");
+        let (name, text) = exported.covers.expect("the covers are written");
+        assert_eq!(name, "card-x.covers.json");
+        assert!(text.contains(&key), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod committed_tests {
+    use super::*;
+
+    /// Every committed measured profile this build carries reads whole, as
+    /// committed (`Strict::Measured`): an entry another pie's form left (a
+    /// format change landed without the device files re-exported) fails the
+    /// build here, where a load would skip it and measure it again.
+    #[test]
+    fn every_committed_profile_reads_whole() {
+        for backend in backends() {
+            for (name, text) in backend.shelf.seeded {
+                if !name.ends_with(profile::MEASURED_SUFFIX) {
+                    continue;
+                }
+                let file = (backend.registry)()
+                    .parse(text, name, profile::Strict::Measured)
+                    .unwrap_or_else(|e| panic!("{}: {name}: {e}", backend.name));
+                assert!(
+                    file.skipped_rates.is_empty(),
+                    "{}: {name} carries entries this build skips (re-export it): {:?}",
+                    backend.name,
+                    file.skipped_rates
+                );
+            }
+        }
+    }
+
+    /// Every committed host covers file in the tree is a list of the cover
+    /// cache's entries, each with its key and figures.
+    #[test]
+    fn every_committed_covers_file_reads() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut read = 0;
+        for engine in std::fs::read_dir(&crates).unwrap().flatten() {
+            let profiles = engine.path().join("profiles");
+            for file in std::fs::read_dir(&profiles).into_iter().flatten().flatten() {
+                let path = file.path();
+                if !path.to_string_lossy().ends_with(".covers.json") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let all: Vec<serde_json::Value> = serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                for entry in &all {
+                    let key = entry
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_else(|| panic!("{}: an entry with no key", path.display()));
+                    assert!(
+                        crate::bootstrap::committed_cover(&text, key).is_some(),
+                        "{}: `{key}` does not read as a cover",
+                        path.display()
+                    );
+                }
+                read += 1;
+            }
+        }
+        assert!(read > 0, "no committed covers file found under {}", crates.display());
     }
 }

@@ -187,6 +187,17 @@ pub struct Rows {
     /// The trace's cache rows each shape lays out, in order.
     pub kv_rows: Vec<u32>,
     pub state_rows: Vec<u32>,
+    /// A windowed recipe's rings (CONTRACT-BC 19, 21): the whole chunks a
+    /// record's ring takes (`layout::RING`, one slot a chunk) and the
+    /// windowed layers it holds, each with its bytes (`ChunkFacts::windowed`).
+    pub ring: Option<RingRows>,
+}
+
+/// A windowed recipe's rings, as [`Rows::plan`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingRows {
+    pub pieces: u32,
+    pub layers: Vec<engine::chunk::WindowedLayer>,
 }
 
 /// Why the recipe and this shell disagree, as a load refusal.
@@ -253,6 +264,20 @@ impl Rows {
     ) -> Result<Rows> {
         let mut windows: Vec<WindowRows> = Vec::new();
         let mut window_runs: Vec<&[poem_compiler::chunk::TokenRun]> = Vec::new();
+        // A windowed recipe (CONTRACT-BC 19, `chunks::MetalRing`): the window
+        // buffer is the one window table's slot, its rows the window the
+        // kernels bound (the widest layer's), its pages composed each fire
+        // over the ring, the buffer and the fire's own rows.
+        if let Some(windowed) = recipe.windowed.as_ref()
+            && let Some(SlotLayout::List { tokens, bytes, rows, .. }) = windowed.buffer(recipe)
+        {
+            windows.push(WindowRows {
+                bytes: *bytes,
+                rows: windowed.layers.iter().map(|layer| layer.window).max().unwrap_or(0),
+                tokens: *tokens,
+            });
+            window_runs.push(rows.as_slice());
+        }
         for layout in recipe.windows() {
             if let SlotLayout::List {
                 tokens,
@@ -482,6 +507,26 @@ impl Rows {
             rs,
             kv_rows,
             state_rows,
+            ring: recipe.windowed.as_ref().and_then(|windowed| {
+                let SlotLayout::Fixed { pieces_per_ws, .. } = windowed.ring_shape(recipe)? else {
+                    return None;
+                };
+                Some(RingRows {
+                    pieces: *pieces_per_ws,
+                    layers: windowed
+                        .layers
+                        .iter()
+                        .zip(&windowed.region.layer_bytes)
+                        .filter_map(|(layer, &bytes)| {
+                            Some(engine::chunk::WindowedLayer {
+                                layer: layer.layer?,
+                                window: layer.window,
+                                bytes,
+                            })
+                        })
+                        .collect(),
+                })
+            }),
         })
     }
 }
@@ -572,6 +617,8 @@ pub struct Pools {
     /// Each distinct set of record slots a state row's pieces lie in.
     bands: Vec<Vec<u32>>,
     rs: Option<RsRows>,
+    /// A windowed load's rings ([`Rows::ring`]).
+    ring: Option<RingRows>,
     /// The page tables a fire stages, by the list each pages.
     tables: Vec<TablePaging>,
     /// The disk tier (CONTRACT-BC 22): one slot file of disk chunks, each a
@@ -646,6 +693,13 @@ fn slot_at(layout: &Layout, shape: &Slots, slot: u32) -> u64 {
 }
 
 impl Pools {
+    /// A windowed load's rings: the chunks a record's ring takes and the
+    /// windowed layers it holds (`ChunkFacts::windowed`).
+    #[must_use]
+    pub fn ring(&self) -> Option<&RingRows> {
+        self.ring.as_ref()
+    }
+
     /// A pool of `chunks` chunks of `chunk_bytes` holding no state rows:
     /// only the guest shapes (`INSTANCE`, `CHANNEL`), every segment
     /// committed. For tests of what guests place in slots.
@@ -678,6 +732,7 @@ impl Pools {
             rs: None,
             kv_rows: Vec::new(),
             state_rows: Vec::new(),
+            ring: None,
         };
         let paging = super::kv::Paging::of(16, 256, 1, 1)?;
         let mut pools = Pools::reserve(device, rows, layout, paging)?;
@@ -713,6 +768,7 @@ impl Pools {
             rs: None,
             kv_rows: Vec::new(),
             state_rows: Vec::new(),
+            ring: None,
         };
         let paging = super::kv::Paging::of(16, 256, 1, 1)?;
         let mut pools = Pools::reserve(device, rows, layout, paging)?;
@@ -765,6 +821,7 @@ impl Pools {
                 rows.bands
             },
             rs: rows.rs,
+            ring: rows.ring,
             tables: rows.tables,
             rows: rows.rows,
             pool,
@@ -991,6 +1048,13 @@ impl Pools {
             self.pool.committed_segments(),
             &self.shape_rows,
         );
+        // A windowed load's rings: the layers they hold, and their bytes in
+        // the record (CONTRACT-BC 21); the record's state bytes are the
+        // shell's to add (`Shell::chunk_facts`).
+        if let Some(ring) = &self.ring {
+            facts.windowed.clone_from(&ring.layers);
+            facts.record_bytes = ring.layers.iter().map(|layer| layer.bytes).sum();
+        }
         facts.host_chunks = self.tier.as_ref().map_or(0, |tier| {
             u32::try_from(tier.chunks.len()).unwrap_or(u32::MAX)
         });
@@ -1400,6 +1464,90 @@ impl Pools {
                 .collect();
         }
         refs.iter().map(|&r| unit(r)).collect()
+    }
+
+    /// Where window table `k`'s slot ref `slot` lies, in bytes of the range.
+    pub fn window_slot_offset(&self, k: usize, slot: u32) -> Result<u64> {
+        self.slot_offset(WINDOWS[k.min(MAX_WINDOWS - 1)], slot)
+    }
+
+    /// Where window slot `index` of physical chunk `chunk` lies (a page the
+    /// range's own-row chunks hold, no slot ref of its own), and its page id.
+    pub fn window_slot_at(&self, k: usize, chunk: u32, index: u32) -> Result<(u64, u32)> {
+        let window = *self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?;
+        let per = window.per_chunk.max(1);
+        Ok((
+            u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * window.slot_bytes,
+            self.pool.slot_page(chunk * per + index, per),
+        ))
+    }
+
+    /// Window table `k`'s slot bytes.
+    pub fn window_slot_bytes(&self, k: usize) -> Result<u64> {
+        Ok(self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.slot_bytes)
+    }
+
+    /// Window table `k`'s slots a chunk.
+    pub fn window_slots_a_chunk(&self, k: usize) -> Result<u32> {
+        Ok(self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.per_chunk.max(1))
+    }
+
+    /// Copies whole window slots of table `k`, `(from, to)` byte offsets, in
+    /// `frame`: a boundary own-row page filled from its ring page.
+    pub fn copy_window_slots(&self, frame: &mut Frame, k: usize, copies: &[(u64, u64)]) -> Result<()> {
+        let bytes = self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.slot_bytes;
+        for &(from, to) in copies {
+            self.pool.copy(frame, from, to, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// A windowed fold's copies in `frame` (CONTRACT-BC 19; `store::windowed`):
+    /// each `(source slot's byte, ring slot's byte, first row, rows)` of window
+    /// table `k`'s slot shape copies those rows of every windowed layer's keys
+    /// and values from the source slot to the ring slot, at the same rows.
+    pub fn fold_window_rows(
+        &self,
+        frame: &mut Frame,
+        k: usize,
+        copies: &[(u64, u64, u32, u32)],
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let paging = TablePaging::Window(u8::try_from(k).unwrap_or(u8::MAX));
+        let runs: Vec<(u64, u64, u64, u64)> = self
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Kv {
+                    paging: at,
+                    keys,
+                    values,
+                    keys_cell,
+                    values_cell,
+                    ..
+                } if *at == paging => Some((*keys, *keys_cell, *values, *values_cell)),
+                _ => None,
+            })
+            .collect();
+        for &(from, to, first, rows) in copies {
+            for &(keys, keys_cell, values, values_cell) in &runs {
+                let at = u64::from(first);
+                let len = u64::from(rows);
+                self.pool
+                    .copy(frame, from + keys + at * keys_cell, to + keys + at * keys_cell, len * keys_cell)?;
+                if values != keys {
+                    self.pool.copy(
+                        frame,
+                        from + values + at * values_cell,
+                        to + values + at * values_cell,
+                        len * values_cell,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The page explicit write descriptor page `page` names, as kernels
@@ -2336,19 +2484,10 @@ impl Pools {
         unsafe { self.pool.release_segments(segments) }
     }
 
-    /// Moves each evacuated chunk onto its new physical chunk in `frame`
-    /// and takes the moves into the chunk table; the weight cache's address
-    /// tables follow (no frame is in flight: the caller drained them).
-    /// A refusal from the pool's own evacuate moved nothing (its table is
-    /// swapped only once every copy is encoded): the runtime takes the
-    /// evacuation back. Past it the table has moved, so the evacuation is
-    /// done whatever follows: a weight cache that fails to restage is a
-    /// fault of its own ([`Self::weights_ready`]), never a refusal, which
-    /// would have the runtime roll back a move this engine made.
-    /// The chunk table as it stands: what [`Self::evacuate_back`] restores.
+    /// The chunk table as it stands (`Engine::chunk_table`).
     #[must_use]
-    pub fn chunk_table(&self) -> engine::chunk::ChunkTable {
-        self.pool.table().clone()
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.pool.table()
     }
 
     /// Takes back an evacuation whose copies landed ([`Pool::evacuate_back`]),
@@ -2367,6 +2506,15 @@ impl Pools {
         Ok(())
     }
 
+    /// Moves each evacuated chunk onto its new physical chunk in `frame`
+    /// and takes the moves into the chunk table; the weight cache's address
+    /// tables follow (no frame is in flight: the caller drained them).
+    /// A refusal from the pool's own evacuate moved nothing (its table is
+    /// swapped only once every copy is encoded): the runtime takes the
+    /// evacuation back. Past it the table has moved, so the evacuation is
+    /// done whatever follows: a weight cache that fails to restage is a
+    /// fault of its own ([`Self::weights_ready`]), never a refusal, which
+    /// would have the runtime roll back a move this engine made.
     pub fn evacuate(&mut self, frame: &mut Frame, evacuation: &Evacuation) -> Result<()> {
         self.pool.evacuate(frame, evacuation)?;
         if let Err(fault) = self.restage_weights() {

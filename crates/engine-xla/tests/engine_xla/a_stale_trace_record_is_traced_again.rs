@@ -1,7 +1,7 @@
 //! A warm load takes each fire's program from its traced-fire record,
 //! checking the first against a fresh trace: a record that parts from its
 //! fire's trace (here every record made stale, each naming another fire's
-//! program) is caught, the load traces every fire in full, serving the
+//! program, its file as kept) is caught, the load traces every fire in full, serving the
 //! logits a traced load gives, and rewrites the records, which the next
 //! load takes again. Skipped without a PJRT plugin or a disk cache.
 
@@ -12,10 +12,19 @@ const CONTEXT: u32 = 320;
 
 /// A prompt and three decodes: each step's logits, the load's records
 /// (fires taken, held) and where they lie.
-fn served() -> (Vec<Vec<f32>>, (u64, bool), Option<std::path::PathBuf>) {
+pub(crate) fn served(
+    context: u32,
+) -> (Vec<Vec<f32>>, (u64, bool, u64), Option<std::path::PathBuf>) {
     // a context no other test loads at: a scope of the test's own, whose
     // records no other test's load reads while this one makes them stale
-    let mut model = Model::load_with("qwen3-micro-text", None, CONTEXT, 7, None);
+    let mut model = Model::load_with("qwen3-micro-text", None, context, 7, None);
+    // the programs loading behind serving, all loaded (a record's that
+    // does not load mended) before the first fire
+    model
+        .engine
+        .shell_mut()
+        .expect("a loaded model has its shell")
+        .wait_loaded();
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let mut seq = Seq::new(0);
@@ -49,7 +58,14 @@ fn make_stale(dir: &std::path::Path) -> usize {
                 .expect("a record parses")
         })
         .collect();
-    let program = |r: &serde_json::Value| (r["hash"].clone(), r["name"].clone(), r["len"].clone());
+    let program = |r: &serde_json::Value| {
+        (
+            r["hash"].clone(),
+            r["name"].clone(),
+            r["len"].clone(),
+            r["file_len"].clone(),
+        )
+    };
     let mut distinct: Vec<_> = records.iter().map(program).collect();
     distinct.sort_by_key(|p| p.1.to_string());
     distinct.dedup();
@@ -59,10 +75,11 @@ fn make_stale(dir: &std::path::Path) -> usize {
             .iter()
             .position(|p| *p == program(r))
             .expect("its own program");
-        let (hash, name, len) = distinct[(at + 1) % distinct.len()].clone();
+        let (hash, name, len, file_len) = distinct[(at + 1) % distinct.len()].clone();
         r["hash"] = hash;
         r["name"] = name;
         r["len"] = len;
+        r["file_len"] = file_len;
     }
     for (f, r) in files.iter().zip(&records) {
         std::fs::write(f, serde_json::to_vec(r).expect("a record writes"))
@@ -71,7 +88,7 @@ fn make_stale(dir: &std::path::Path) -> usize {
     files.len()
 }
 
-fn argmax(row: &[f32]) -> usize {
+pub(crate) fn argmax(row: &[f32]) -> usize {
     (0..row.len())
         .max_by(|&a, &b| row[a].total_cmp(&row[b]))
         .unwrap_or(0)
@@ -83,14 +100,14 @@ fn a_stale_trace_record_is_traced_again() {
         return;
     };
     // a load that keeps records (traced, or taken from earlier runs' ones)
-    let (want, _, dir) = served();
+    let (want, _, dir) = served(CONTEXT);
     let Some(dir) = dir.filter(|d| d.is_dir()) else {
         return;
     };
     let made = make_stale(&dir);
     assert!(made > 0, "the load kept its fires' records");
 
-    let (got, (used, hold), _) = served();
+    let (got, (used, hold, _), _) = served(CONTEXT);
     assert!(
         !hold,
         "a stale record parts from its fire's trace and is caught"
@@ -106,7 +123,7 @@ fn a_stale_trace_record_is_traced_again() {
     }
 
     // the parted load rewrote the records: the next takes them again
-    let (again, (used, hold), _) = served();
+    let (again, (used, hold, _), _) = served(CONTEXT);
     assert!(hold, "the rewritten records hold");
     assert!(used > 0, "the rewritten records are taken");
     for (step, (g, w)) in again.iter().zip(&want).enumerate() {

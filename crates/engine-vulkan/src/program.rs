@@ -12,7 +12,7 @@ use engine_gpu::store::layout::INSTANCE;
 #[cfg(feature = "vulkan")]
 use eta_exec::StepOutcome;
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, Value};
-use eta_ir::registry::{GeometryClass, Port, Stage};
+use eta_ir::registry::{GeometryClass, Port, PortMask, Stage};
 
 use engine_gpu::program::Refusal;
 use engine_gpu::program::{decode, numel_of};
@@ -24,6 +24,9 @@ struct Instance {
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
+    /// The ports its program computes on the device
+    /// (`InstanceBinding::device_resolved`).
+    device: PortMask,
 
     #[cfg(feature = "vulkan")]
     session: crate::guest::session::Session,
@@ -74,6 +77,18 @@ fn parked_fire(instance: InstanceId) -> Refusal {
 pub type DeferredPass<'a> =
     engine_gpu::guest::defer::DeferredPass<Vec<Vec<crate::guest::run::Readout<'a>>>>;
 use engine_gpu::guest::defer::{Owed, cell_facts, device_cell_bytes, fold_count, puts_into};
+
+/// Where an evacuation leaves each bound instance's session and each kept
+/// cell in the pool ([`Plane::resolve_rebind`]).
+#[cfg(feature = "vulkan")]
+pub struct Rebound {
+    sessions: Vec<(InstanceId, crate::guest::session::Rebound)>,
+    cells: Vec<(ChannelId, engine_gpu::guest::held::Held<crate::device::Api>)>,
+    /// Each beam group's state where the evacuation leaves its place.
+    beams: Vec<(InstanceId, engine_gpu::beam::Resident<crate::device::Api>)>,
+}
+#[cfg(not(feature = "vulkan"))]
+pub struct Rebound;
 
 #[derive(Default)]
 pub struct Plane {
@@ -375,6 +390,7 @@ impl Plane {
                 plan,
                 inst,
                 geometry: binding.geometry,
+                device: binding.device_resolved,
                 #[cfg(feature = "vulkan")]
                 session,
                 #[cfg(feature = "vulkan")]
@@ -494,54 +510,103 @@ impl Plane {
         )
     }
 
-    /// Points every table and cell at the chunk its slot sits in now.
-    pub fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
+    /// Before an evacuation: every pass a bound instance has on the queue
+    /// has landed, so none reads a set the evacuation's rebind points anew.
+    pub fn quiesce(&mut self) -> Result<(), Refusal> {
+        #[cfg(feature = "vulkan")]
+        for seat in self
+            .instances
+            .values_mut()
+            .filter(|seat| !seat.parked || seat.kept)
+        {
+            seat.session.settle().map_err(Refusal::fault)?;
+        }
+        Ok(())
+    }
+
+    /// Where an evacuation leaves every table and cell
+    /// ([`engine_gpu::program::Programs::resolve_rebind`]): each resolved
+    /// against `pools`' moved table, then every moved session's runs
+    /// claimed as one. Refused with nothing changed.
+    pub fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
         #[cfg(feature = "vulkan")]
         {
             let program = Refusal::fault;
-            // Every holder's runs where the evacuation left them, claimed
+            let mut sessions = Vec::with_capacity(self.instances.len());
+            let mut beams = Vec::new();
+            // Every holder's runs where the evacuation leaves them, claimed
             // in one step before a set is pointed there. A parked instance
             // that shed its state holds nothing here: repointed and claimed
             // at its rebind. One whose park kept its tables in place holds
-            // them, where the evacuation moved them.
+            // them, where the evacuation moves them.
             let mut moved: Vec<(engine::guest_claims::Holder, Vec<engine::guest_claims::Run>)> =
                 Vec::new();
-            for seat in self
+            for (&id, seat) in self
                 .instances
-                .values_mut()
-                .filter(|seat| !seat.parked || seat.kept)
+                .iter_mut()
+                .filter(|(_, seat)| !seat.parked || seat.kept)
             {
                 // Its beam group's state lies at the head of its place:
-                // where the place went, unless its park gave the place back.
-                if !seat.parked {
-                    if let Some(beam) = seat.beam.as_mut() {
-                        beam.rebind(pools).map_err(program)?;
-                    }
+                // where the place goes, unless its park gave the place back.
+                if !seat.parked
+                    && let Some(beam) = seat.beam.as_ref()
+                {
+                    let mut beam = beam.clone();
+                    beam.rebind(pools).map_err(program)?;
+                    beams.push((id, beam));
                 }
-                for (holder, runs) in seat.session.relocate(pools, seat.parked).map_err(program)? {
-                    // A pair's members each name its runs: claimed once.
-                    if !moved.iter().any(|(held, _)| *held == holder) {
-                        moved.push((holder, runs));
-                    }
+                let session = seat.session.resolve(pools, seat.parked).map_err(program)?;
+                moved.push(session.own.clone());
+                // A pair's members each name its runs: claimed once.
+                if let Some(pair) = &session.pair_runs
+                    && !moved.iter().any(|(holder, _)| *holder == pair.0)
+                {
+                    moved.push(pair.clone());
+                }
+                sessions.push((id, session));
+            }
+            let mut cells = Vec::new();
+            for (&id, cell) in self.kept.lock().expect("kept cells lock poisoned").iter() {
+                if let Some(held) = cell.resolve(pools).map_err(program)? {
+                    cells.push((id, held));
                 }
             }
             if let Some(library) = &self.library {
                 library.claim_moved(&moved).map_err(program)?;
             }
-            for seat in self.instances.values().filter(|seat| !seat.parked) {
-                seat.session.repoint().map_err(program)?;
+            Ok(Rebound { sessions, cells, beams })
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = pools;
+            Ok(Rebound)
+        }
+    }
+
+    /// Points every table and cell where [`Self::resolve_rebind`] resolved
+    /// it, the evacuation's copies committed.
+    pub fn install_rebind(&mut self, rebound: Rebound) -> Result<(), Refusal> {
+        #[cfg(feature = "vulkan")]
+        {
+            for (id, session) in rebound.sessions {
+                if let Some(seat) = self.instances.get_mut(&id) {
+                    seat.session.install(session);
+                }
             }
-            for cell in self
-                .kept
-                .lock()
-                .expect("kept cells lock poisoned")
-                .values_mut()
-            {
-                cell.rebind(pools).map_err(program)?;
+            for (id, beam) in rebound.beams {
+                if let Some(seat) = self.instances.get_mut(&id) {
+                    seat.beam = Some(beam);
+                }
+            }
+            let mut kept = self.kept.lock().expect("kept cells lock poisoned");
+            for (id, held) in rebound.cells {
+                if let Some(cell) = kept.get_mut(&id) {
+                    cell.install(held);
+                }
             }
         }
         #[cfg(not(feature = "vulkan"))]
-        let _ = pools;
+        let Rebound = rebound;
         Ok(())
     }
 
@@ -714,6 +779,38 @@ impl Plane {
             &seat.landing,
             &seat.faulted,
         )
+    }
+
+    /// What `instance`'s descriptor ports hold at the fire, once the pass
+    /// that put each cell landed it.
+    pub fn descriptor_ports(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<engine::ports::Envelope>, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        for channel in engine_gpu::program::descriptor_channels(&seat.plan, seat.geometry, seat.device)
+        {
+            let ring = &seat.inst.channels[channel as usize];
+            seat.landing.wait((channel, ring.head()), &seat.faulted);
+        }
+        if seat.faulted.load(Ordering::Acquire) {
+            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
+        }
+        engine_gpu::program::descriptor_ports(
+            &seat.plan,
+            &seat.inst,
+            seat.geometry,
+            seat.device,
+            instance,
+        )
+    }
+
+    #[must_use]
+    pub fn geometry(&self, instance: InstanceId) -> Option<GeometryClass> {
+        self.instances.get(&instance).map(|seat| seat.geometry)
     }
 
     pub fn envelope_tokens(
@@ -1159,7 +1256,10 @@ impl Plane {
             let inputs = PassInputs::none();
             let mut runner =
                 crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats)
-                    .deferred(frame);
+                    .deferred(
+                        frame,
+                        engine_gpu::program::read_at_fire(seat.geometry, seat.device),
+                    );
             let outcome = eta_exec::step_with(
                 &mut seat.inst,
                 &seat.plan,
@@ -1171,6 +1271,7 @@ impl Plane {
                 frame,
                 pass,
                 landings,
+                ..
             } = runner.take_deferral().unwrap_or_default();
             let committed = matches!(outcome, StepOutcome::Committed);
             if committed {
@@ -1381,8 +1482,18 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
         Plane::register_channel(self, registration, place)
     }
 
-    fn rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<(), Refusal> {
-        Plane::rebind(self, pools)
+    fn quiesce(&mut self) -> Result<(), Refusal> {
+        Plane::quiesce(self)
+    }
+
+    type Rebound = Rebound;
+
+    fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
+        Plane::resolve_rebind(self, pools)
+    }
+
+    fn install_rebind(&mut self, rebound: Rebound) -> Result<(), Refusal> {
+        Plane::install_rebind(self, rebound)
     }
 
     fn rebind_slots(
@@ -1459,6 +1570,17 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
 
     fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         Plane::envelope_fold(self, instance)
+    }
+
+    fn geometry(&self, instance: InstanceId) -> Option<GeometryClass> {
+        Plane::geometry(self, instance)
+    }
+
+    fn descriptor_ports(
+        &self,
+        instance: InstanceId,
+    ) -> Result<Option<engine::ports::Envelope>, Refusal> {
+        Plane::descriptor_ports(self, instance)
     }
 
     fn publish(

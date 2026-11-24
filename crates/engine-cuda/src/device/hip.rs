@@ -192,6 +192,7 @@ pub mod rt {
     #[repr(i32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum cudaDeviceAttr {
+        cudaDevAttrIntegrated = 16,
         cudaDevAttrComputeCapabilityMajor = 23,
         cudaDevAttrComputeCapabilityMinor = 61,
         cudaDevAttrMultiProcessorCount = 63,

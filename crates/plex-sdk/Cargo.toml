@@ -1,0 +1,13 @@
+[package]
+name = "plex"
+description = "The PLEX 1.1 guest SDK: the contract's bindings and a few conveniences"
+version = "1.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+wit-bindgen = { version = "0.58", default-features = false, features = ["macros", "realloc"] }
+
+# A guest crate: built for wasm32-unknown-unknown by the policies that use
+# it (crates/builtins/policies), not with the host workspace.
+[workspace]

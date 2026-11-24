@@ -28,6 +28,10 @@ pub struct Seated<'a> {
     /// (`KvDelta::write_end`); its rows land in `[folded, write_end)`.
     pub write_end: u32,
     pub window: &'a [u32],
+    /// How the lane's windowed layers stand as ring + buffer and how far its
+    /// fire folds them (`Lane::window`); `None` where the runtime states
+    /// none (a runtimeless lane folds every row it writes).
+    pub window_fold: Option<engine::fire::WindowFold>,
     /// The lane's slot refs of the window lists past the first, narrowest
     /// first: a list each, where lanes name slot refs.
     pub more_windows: &'a [&'a [u32]],
@@ -42,6 +46,10 @@ pub struct Seated<'a> {
     /// lane's rows land in `rs_slot`'s. `None`: `rs_slot`'s.
     pub rs_read: Option<u32>,
     pub rs_snapshots: &'a [RsSnapshot],
+    /// The lane's replay as the runtime stated it (`Lane::replay_stated`):
+    /// what the submit check's cross-check compares this engine's count
+    /// with (`engine::fire::replay_agrees`).
+    pub replay_stated: Option<engine::fire::LaneReplay>,
     pub readout: Option<&'a [u32]>,
     pub group: Option<u32>,
     pub inputs: &'a [InputFeed],
@@ -64,6 +72,7 @@ impl<'a> Seated<'a> {
             translation: &[],
             write_end: 0,
             window: &[],
+            window_fold: None,
             more_windows: &[],
             mask: None,
             adapter: None,
@@ -72,6 +81,7 @@ impl<'a> Seated<'a> {
             rs_slot: None,
             rs_read: None,
             rs_snapshots: &[],
+            replay_stated: None,
             readout: None,
             group: None,
             inputs: &[],

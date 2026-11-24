@@ -88,7 +88,8 @@ async fn main(input: Input) -> Result<String> {
     let n = prompt_tokens.len() as u32;
     let stop = chat::stop_tokens();
 
-    let ws = WorkingSet::new();
+    // A conversation's turns reuse its earlier ones within its session.
+    let ws = WorkingSet::shared(ShareScope::Session)?;
 
     let pipe = Pipeline::new();
 

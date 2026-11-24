@@ -51,6 +51,14 @@
 //! form `P(w) = p(w)·(1 + g(w) − m)` with `m = E_p[g]`, which is that
 //! tournament's exact per-round win probability and composes across layers
 //! because round-ℓ winners are i.i.d. from `p_ℓ`.
+//!
+//! The run checks itself (`verdict`): the keyed z-score over the distinct
+//! contexts must reach 4 over at least 100 of them. A shorter text, or a
+//! peaked model that keeps repeating its contexts, is reported as too few
+//! contexts to judge, neither a pass nor a failure. The default length
+//! (256 tokens) leaves enough contexts on the shipped models.
+
+mod verdict;
 
 use inferlet::chat;
 use inferlet::eta::prelude::*;
@@ -114,6 +122,9 @@ struct Output {
     /// Steps that contributed to the statistic; steps whose context n-gram
     /// repeated within the ring buffer are masked out on both sides.
     unique_contexts: usize,
+    /// The self-check's decision (`verdict`): registered, missing, too few
+    /// contexts to judge, or not watermarked.
+    verdict: String,
 }
 
 fn default_prompt() -> String {
@@ -144,8 +155,10 @@ fn default_temperature() -> f32 {
     1.0
 }
 
+/// Enough for a peaked model's text to leave `verdict::MIN_CONTEXTS`
+/// distinct contexts.
 fn default_max_tokens() -> usize {
-    32
+    256
 }
 
 fn default_seed() -> u32 {
@@ -335,6 +348,7 @@ async fn main(input: Input) -> Result<Output> {
             mean_null_score: 0.0,
             z_score: 0.0,
             unique_contexts: 0,
+            verdict: verdict::Verdict::of(input.watermark, 0, 0.0).describe(0, 0.0),
         });
     }
 
@@ -404,13 +418,19 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.submit(&pipe).context("prefill submit")?;
 
     let g0 = tok_out_p.take_host::<i32>().await?;
-    if stream {
-        inferlet::session::send("t:1");
+    // A stop token ends the text and is not part of it, as every chat
+    // inferlet here ends its text.
+    let stop_tokens = inferlet::chat::stop_tokens();
+    let stopped = stop_tokens.contains(&(g0 as u32));
+    if !stopped {
+        if stream {
+            inferlet::session::send("t:1");
+        }
+        generated.push(g0 as u32);
     }
-    generated.push(g0 as u32);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
+    if !stopped && generated.len() < max_tokens {
         history[n as usize] = g0;
 
         let tok_in = Channel::from([g0]);
@@ -455,6 +475,9 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
+            if stop_tokens.contains(&(t as u32)) {
+                return Ok(ControlFlow::Break(()));
+            }
             if stream {
                 inferlet::session::send("t:1");
             }
@@ -491,9 +514,11 @@ async fn main(input: Input) -> Result<Output> {
     // `depth * kept` of them has standard error `0.5 / sqrt(depth * kept)`.
     let z_score = 2.0 * (mean_score - 0.5) * (cfg.depth as f32 * denom).sqrt();
 
-    if cfg.watermark && kept >= 16 && mean_score <= mean_null {
+    let verdict = verdict::Verdict::of(cfg.watermark, kept, z_score);
+    if verdict == verdict::Verdict::Missing {
         return Err(format!(
-            "watermark did not register: keyed mean g {mean_score} did not beat the decoy {mean_null} over {kept} unmasked contexts — the context hash is not reaching the tournament"
+            "watermark did not register: {}; keyed mean {mean_score}, decoy {mean_null} — the context hash is not reaching the sampler",
+            verdict.describe(kept, z_score)
         ));
     }
 
@@ -509,5 +534,6 @@ async fn main(input: Input) -> Result<Output> {
         mean_null_score: mean_null,
         z_score,
         unique_contexts: kept,
+        verdict: verdict.describe(kept, z_score),
     })
 }

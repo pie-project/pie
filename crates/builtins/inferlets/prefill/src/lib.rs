@@ -1,8 +1,9 @@
 //! Prefills token ids and exits.
 //!
 //! A worker runs this for a pass another worker offloaded to it. The pages
-//! the run fills seal under the model's content keys and stay in this
-//! worker's cache when the program exits, for the asker to take.
+//! the run fills seal under the asking set's domain (the runtime keys this
+//! process's shared sets under it, whatever scope they name) and stay in
+//! this worker's cache when the program exits, for the asker to take.
 //!
 //! Input: `{"tokens": [u32, ...]}`. Output: `{"tokens": n}`. A launch that
 //! moves a handle in as `ws` gets it back holding the tokens: a checkpoint
@@ -29,7 +30,10 @@ async fn main(input: String) -> std::result::Result<String, String> {
     }
     let tokens: Vec<i32> = input.tokens.iter().map(|&t| t as i32).collect();
     let keep = moved.is_some();
-    let ws = moved.unwrap_or_default();
+    let ws = match moved {
+        Some(ws) => ws,
+        None => WorkingSet::shared(ShareScope::Tenant)?,
+    };
     let pipe = Pipeline::new();
     let toks = Channel::from(&tokens[..]);
     let indptr = Channel::from([0u32, n]);

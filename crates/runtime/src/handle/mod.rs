@@ -20,10 +20,6 @@ pub(crate) use table::{Landing, Table};
 
 use client_api::{HandleErrorCode, HandleName};
 
-/// How long a fork holds up its session for a move to end, before it is
-/// refused as `in_use`: the session has output to deliver.
-const FORK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// The most handles one session names at once: a name costs almost nothing,
 /// but not nothing, and a client that never closes one should hear so.
 const MAX_HANDLES: usize = 4096;
@@ -56,7 +52,7 @@ impl HandleError {
         Self::new(HandleErrorCode::Invalid, message)
     }
 
-    /// What held still would not: it stays, and a retry may find it settled.
+    /// What a held set's stores refused it, by name: it stays as it was.
     fn moving(message: String) -> Self {
         Self::new(HandleErrorCode::InUse, message)
     }

@@ -10,6 +10,11 @@ use super::write::{KvPreparedWrite, PageCommit, PreparedTarget};
 use crate::inferlet::process::ProcessId;
 use crate::policy::retention::Keys;
 
+/// Keys that let every entry go: the runtime's to drop as its room is wanted.
+fn floor(_: Option<ProcessId>) -> i64 {
+    crate::policy::retention::DEFAULT_KEY
+}
+
 fn h(seed: u32) -> Hash256 {
     let mut out = [0u8; 32];
     out[..4].copy_from_slice(&seed.to_le_bytes());
@@ -90,10 +95,16 @@ fn tests_every_case() {
     what_decode_wrote_is_reclaimed_before_the_prompt();
     a_sweep_suspends_only_the_readers_of_what_it_moves();
     idle_cache_goes_to_the_host_and_comes_back_on_a_hit();
+    a_set_moved_down_says_it_is_off_the_device();
+    an_exited_owner_holds_its_kv_until_its_working_set_is_released();
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
-    floor_keyed_idle_cache_is_dropped_not_demoted();
+    idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted();
+    on_the_host_the_lower_set_goes_first();
+    a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host();
+    the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves();
+    a_demote_keeps_off_the_disk_what_its_row_keeps_off_it();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight();
     an_answer_goes_before_an_older_prompt();
@@ -114,7 +125,7 @@ fn a_beams_finish_waits_out_a_suspend_and_names_each_page_once() {
     let ws = store.create_working_set();
     commit_fresh(&mut store, ws, 4, 1);
     let sets = HashSet::from([ws]);
-    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    let txn = store.prepare_suspend(&sets, floor).unwrap().expect("private pages suspend");
     assert!(matches!(
         store.relist_beam_needs(ws, 1, &[2, 0]).unwrap(),
         super::RelistNeeds::MoveEnd(_)
@@ -165,7 +176,7 @@ fn a_beams_finish_copies_the_chosen_pages_another_reads() {
     assert_eq!(still, read, "the fork reads what it read");
     store.release_working_set(ws, store.current_epoch());
     store.release_working_set(other, store.current_epoch());
-    store.drop_entries_off_device();
+    store.drop_entries_off_device(usize::MAX, &floor, None);
     store.retire_idle();
     let cached = total - store.free_committed();
     assert!(
@@ -181,7 +192,7 @@ fn a_cut_waits_out_a_move() {
     let ws = store.create_working_set();
     commit_fresh(&mut store, ws, 4, 1);
     let sets = HashSet::from([ws]);
-    let txn = store.prepare_suspend(&sets).unwrap().expect("private pages suspend");
+    let txn = store.prepare_suspend(&sets, floor).unwrap().expect("private pages suspend");
     assert!(matches!(store.truncate(ws, 0), Err(super::KvStoreError::MoveInFlight)));
     assert_eq!(store.mapped_len(ws).unwrap(), 4, "nothing cut while it moves");
     store.abort_suspend(txn);
@@ -445,7 +456,7 @@ fn sealed(store: &mut KvStore, ws: WorkingSetId, tokens: &[u32]) {
 
 fn kept_and_gone(store: &mut KvStore, seed: u32, pages: u64, owner: ProcessId) -> Vec<u32> {
     let tokens = prompt(seed, pages);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     sealed(store, ws, &tokens);
     store.keep_checkpoint(ws, pages, Some(owner));
     store.release_working_set(ws, store.current_epoch());
@@ -454,7 +465,7 @@ fn kept_and_gone(store: &mut KvStore, seed: u32, pages: u64, owner: ProcessId) -
 }
 
 fn reader(store: &mut KvStore, tokens: &[u32], pages: u64) -> WorkingSetId {
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let keys = keys_ahead(store, ws, 0, tokens);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(ws, &run, pages).unwrap(), pages);
@@ -462,7 +473,7 @@ fn reader(store: &mut KvStore, tokens: &[u32], pages: u64) -> WorkingSetId {
 }
 
 fn on_device(store: &mut KvStore, tokens: &[u32]) -> usize {
-    let probe = store.create_working_set();
+    let probe = store.create_shared_working_set();
     let keys = keys_ahead(store, probe, 0, tokens);
     store.release_working_set(probe, store.current_epoch());
     let run = store.cached_run(&keys);
@@ -484,21 +495,21 @@ fn store_reclaims_cache_lowest_rank_first_and_spares_what_live_ones_read() {
     let rank = |owner: Option<ProcessId>| i64::from(owner == Some(kept));
 
     // Equal ranks: the one used longest ago goes, and alone.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(!store.owns_cache(old) && store.owns_cache(new));
     assert_eq!(on_device(&mut store, &old_tokens), 0);
 
     // A live working set reads `new`, so dropping it would free nothing:
     // the higher-ranked one goes instead.
     let reader = reader(&mut store, &new_tokens, 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(store.owns_cache(new) && !store.owns_cache(kept));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 0);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 0);
 
     // Once nothing reads it, it can go too.
     store.release_working_set(reader, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(store.cached_working_sets().is_empty());
 
     // An owner's whole cached working-set goes when the policy drops it.
@@ -511,7 +522,7 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
     let mut store = KvStore::new(8, h(9));
     let (running, idle) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
     let tokens = prompt(5, 4);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     sealed(&mut store, ws, &tokens);
     for k in 1..=4 {
         store.keep_checkpoint(ws, k, Some(running));
@@ -531,33 +542,33 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
 
     // The running process's entries are the older, but freeing pages
     // means taking the idle one, and only it.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert!(store.owns_cache(running) && !store.owns_cache(idle));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 0);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 0);
     assert_eq!(entries(&store, running), 4);
 
     // Once it ends they are the cache's alone, and go.
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.available_pages(), 4);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 4);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 4);
     assert!(store.cached_working_sets().is_empty());
 
     // A reader of a shorter prefix spares only what it reads: the longer
     // entries go, and the pages only they held with them.
     let tokens = prompt(7, 4);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     sealed(&mut store, ws, &tokens);
     for k in 1..=4 {
         store.keep_checkpoint(ws, k, Some(idle));
     }
     store.release_working_set(ws, store.current_epoch());
     let reader = reader(&mut store, &tokens, 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert_eq!(entries(&store, idle), 2);
     assert_eq!(on_device(&mut store, &tokens), 2);
     store.release_working_set(reader, store.current_epoch());
-    assert_eq!(store.reclaim_cache(store.current_epoch(), rank), 2);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
     assert_eq!(store.available_pages(), 8);
 }
 
@@ -589,10 +600,10 @@ fn a_dropped_entry_leaves_its_readers_whole() {
 
 fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     let mut store = KvStore::new_with_swap(4, 1, 2, h(42));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let before = commit_fresh(&mut store, ws, 3, 1);
     let sets = HashSet::from([ws]);
-    let Some(txn) = store.prepare_suspend(&sets).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&sets, floor).unwrap() else {
         panic!("three private resident pages suspend");
     };
     let tiers: Vec<_> = txn
@@ -604,7 +615,7 @@ fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     assert_eq!(tiers, [(HostPinned, 1), (LocalDisk, 2)]);
     assert_eq!(store.commit_suspend(txn).unwrap(), 3);
     assert_eq!(
-        (store.host_swap_available(), store.disk_swap_available()),
+        (store.host_swap_available(), store.disk_swap_available(floor)),
         (0, 0)
     );
     store.retire_idle();
@@ -613,7 +624,7 @@ fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
     let txn = store.prepare_restore(&sets, &mut granted).unwrap();
     assert_eq!(store.commit_restore(txn).unwrap(), 3);
     assert_eq!(
-        (store.host_swap_available(), store.disk_swap_available()),
+        (store.host_swap_available(), store.disk_swap_available(floor)),
         (1, 2)
     );
     assert_eq!(
@@ -628,7 +639,7 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     // A keeps a 3-page prompt and decodes on; B and C map it in and decode
     // a page each.
     let tokens = prompt(9, 3);
-    let a = store.create_working_set();
+    let a = store.create_shared_working_set();
     sealed(&mut store, a, &tokens);
     store.keep_checkpoint(a, 3, Some(ProcessId::from_u128(1)));
     commit_fresh(&mut store, a, 1, 1);
@@ -638,7 +649,7 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     commit_fresh(&mut store, c, 1, 1);
     assert_eq!(store.available_pages(), 2);
     let suspend = |store: &mut KvStore, ws| {
-        let Some(txn) = store.prepare_suspend(&HashSet::from([ws])).unwrap() else {
+        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), floor).unwrap() else {
             panic!("a suspend with pages to move");
         };
         store.commit_suspend(txn).unwrap()
@@ -682,12 +693,12 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     store.retire_idle();
     assert!(
         store
-            .prepare_sweep(&HashSet::from([c]), usize::MAX, &[], usize::MAX)
+            .prepare_sweep(&HashSet::from([c]), usize::MAX, &[], usize::MAX, floor)
             .unwrap()
             .is_none()
     );
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX, floor)
         .unwrap()
         .unwrap();
     let mut granted = store.reserve_device_pages(4).unwrap();
@@ -716,7 +727,7 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
     let mut store = KvStore::new_with_swap(12, 0, 12, h(13));
     let owner = ProcessId::from_u128(7);
     let tokens = prompt(13, 1);
-    let first = store.create_working_set();
+    let first = store.create_shared_working_set();
     sealed(&mut store, first, &tokens);
     store.keep_checkpoint(first, 1, Some(owner));
     let mut forks = vec![first];
@@ -732,7 +743,7 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
     // The move down of its readers' parked state takes it.
     let order: Vec<_> = forks.iter().map(|&ws| (ws, 0)).collect();
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &order, usize::MAX)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &order, usize::MAX, floor)
         .unwrap()
         .expect("the shared page moves");
     assert_eq!(store.commit_suspend(sweep).unwrap(), 1, "once, for every reader");
@@ -751,7 +762,7 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
     // running: the last one's suspend takes it down.
     let mut store = KvStore::new_with_swap(12, 0, 12, h(14));
     let tokens = prompt(14, 1);
-    let first = store.create_working_set();
+    let first = store.create_shared_working_set();
     sealed(&mut store, first, &tokens);
     store.keep_checkpoint(first, 1, Some(owner));
     let forks: Vec<_> = std::iter::once(first)
@@ -759,11 +770,17 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
         .collect();
     store.discard_cache(owner, crate::policy::By::Policy);
     for &ws in &forks[..6] {
-        assert!(store.prepare_suspend(&HashSet::from([ws])).unwrap().is_none(), "read by the rest");
+        assert!(
+            store
+                .prepare_suspend(&HashSet::from([ws]), floor)
+                .unwrap()
+                .is_none(),
+            "read by the rest"
+        );
         store.mark_suspended(&HashSet::from([ws]));
     }
     let last = store
-        .prepare_suspend(&HashSet::from([forks[6]]))
+        .prepare_suspend(&HashSet::from([forks[6]]), floor)
         .unwrap()
         .expect("the last reader's suspend takes the page");
     assert_eq!(store.commit_suspend(last).unwrap(), 1);
@@ -774,18 +791,19 @@ fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
 fn an_entry_left_on_the_host_goes_when_swap_needs_room() {
     let mut store = KvStore::new_with_swap(5, 3, 0, h(12));
     let tokens = prompt(10, 3);
-    let w = store.create_working_set();
+    let w = store.create_shared_working_set();
     sealed(&mut store, w, &tokens);
     store.keep_checkpoint(w, 3, Some(ProcessId::from_u128(1)));
-    let suspend = |store: &mut KvStore, ws| match store.prepare_suspend(&HashSet::from([ws])) {
-        Ok(Some(txn)) => store.commit_suspend(txn).unwrap(),
-        other => panic!("a suspend with room: {other:?}"),
-    };
+    let suspend =
+        |store: &mut KvStore, ws| match store.prepare_suspend(&HashSet::from([ws]), floor) {
+            Ok(Some(txn)) => store.commit_suspend(txn).unwrap(),
+            other => panic!("a suspend with room: {other:?}"),
+        };
     assert_eq!(suspend(&mut store, w), 3);
     store.release_working_set(w, store.current_epoch());
     assert_eq!(store.host_swap_available(), 0);
 
-    let v = store.create_working_set();
+    let v = store.create_shared_working_set();
     commit_fresh(&mut store, v, 2, 1);
     assert_eq!(suspend(&mut store, v), 2);
     assert_eq!(on_device(&mut store, &tokens), 0);
@@ -803,7 +821,7 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
     let quote = |store: &KvStore| store.reclaim_quotes(&[HashSet::from([b])], u32::MAX);
     // B runs beside A: only its own page goes.
     assert_eq!(quote(&store), [ReclaimQuote::Pages(1)]);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([a])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([a]), floor).unwrap() else {
         panic!("A has its own page to move");
     };
     assert_eq!(store.commit_suspend(txn).unwrap(), 1);
@@ -815,7 +833,7 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
         .prepare_restore(&HashSet::from([a]), &mut granted)
         .unwrap();
     assert_eq!(quote(&store), [ReclaimQuote::Pages(1)]);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([b])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([b]), floor).unwrap() else {
         panic!("B's own page still goes");
     };
     assert_eq!(txn.page_count(), 1);
@@ -831,14 +849,14 @@ fn a_move_under_way_keeps_only_the_pages_it_holds() {
 #[test]
 fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
     let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
-    let a = store.create_working_set();
+    let a = store.create_shared_working_set();
     commit_fresh(&mut store, a, 2, 1);
-    let b = store.create_working_set();
+    let b = store.create_shared_working_set();
     commit_fresh(&mut store, b, 2, 1);
     store.mark_suspended(&HashSet::from([a, b]));
     let page = u64::from(store.page_size.max(1));
     let sweep = store
-        .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1)
+        .prepare_sweep(&HashSet::new(), usize::MAX, &[(b, page), (a, 0)], 1, floor)
         .unwrap()
         .expect("something to move");
     assert_eq!(sweep.page_count(), 1, "no more than was wanted");
@@ -852,14 +870,14 @@ fn a_sweep_takes_readers_in_order_and_a_kept_head_last() {
 #[test]
 fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     let mut store = KvStore::new_with_swap(8, 8, 0, h(14));
-    let a = store.create_working_set();
+    let a = store.create_shared_working_set();
     commit_fresh(&mut store, a, 2, 1);
-    let b = store.create_working_set();
+    let b = store.create_shared_working_set();
     commit_fresh(&mut store, b, 2, 1);
     // Suspended with nothing moved, as a kv-less eviction leaves them.
     store.mark_suspended(&HashSet::from([a, b]));
     let sweep = store
-        .prepare_sweep(&HashSet::new(), 2, &[], usize::MAX)
+        .prepare_sweep(&HashSet::new(), 2, &[], usize::MAX, floor)
         .unwrap()
         .expect("room for two pages");
     assert_eq!(sweep.page_count(), 2);
@@ -877,7 +895,7 @@ fn a_sweep_suspends_only_the_readers_of_what_it_moves() {
     // It runs: the next sweep leaves it alone.
     assert!(
         store
-            .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX)
+            .prepare_sweep(&HashSet::new(), usize::MAX, &[], usize::MAX, floor)
             .unwrap()
             .is_none()
     );
@@ -897,7 +915,7 @@ fn keys_ahead(store: &KvStore, ws: WorkingSetId, start: u64, tokens: &[u32]) -> 
 
 fn keys_from_row_zero_are_hashed_without_the_store() {
     let mut store = KvStore::new(16, h(15));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let tokens: Vec<u32> = (0..40).map(|t| 900 + t).collect();
     let slots = store.slot_hashes(ws, 0, &tokens, 16).unwrap().unwrap();
     let keys = store.page_keys(ws, 0, &slots, 16).unwrap().unwrap();
@@ -924,7 +942,7 @@ fn a_page_seals_under_a_key_that_names_its_prefix() {
     let mut store = KvStore::new(16, h(15));
     let tokens: Vec<u32> = (0..40).map(|t| 500 + t).collect();
     let fresh = |store: &mut KvStore| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         commit_opaque(store, ws, 3);
         ws
     };
@@ -968,12 +986,12 @@ fn a_page_seals_under_a_key_that_names_its_prefix() {
 fn keys_computed_ahead_find_what_another_sealed() {
     let mut store = KvStore::new(16, h(17));
     let tokens: Vec<u32> = (0..48).map(|t| 900 + t).collect();
-    let sealer = store.create_working_set();
+    let sealer = store.create_shared_working_set();
     commit_opaque(&mut store, sealer, 3);
     seal(&mut store, sealer, 0, &tokens[..20]);
     seal(&mut store, sealer, 20, &tokens[20..]);
 
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(keys.len(), 3);
     assert_eq!(store.cached_run(&keys).len(), 3);
@@ -999,7 +1017,7 @@ fn keys_computed_ahead_find_what_another_sealed() {
 
 fn sealed_and_gone(store: &mut KvStore, tokens: &[u32], owner: ProcessId) {
     store.set_keeps(true);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, owner).unwrap();
     commit_opaque(store, ws, (tokens.len() as u64).div_ceil(16));
     seal(store, ws, 0, tokens);
@@ -1020,7 +1038,7 @@ fn a_working_set_that_goes_leaves_its_sealed_prefix() {
     let sets = store.cached_working_sets();
     assert_eq!(sets.len(), 1);
     assert_eq!((sets[0].owner, sets[0].pages), (owner, 2));
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 2);
 
@@ -1032,7 +1050,7 @@ fn a_working_set_that_goes_leaves_its_sealed_prefix() {
     let mut store = KvStore::new(16, h(19));
     sealed_and_gone(&mut store, &tokens, owner);
     store.set_keeps(false);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     commit_opaque(&mut store, ws, 3);
     seal(&mut store, ws, 0, &tokens);
     store.release_working_set(ws, store.current_epoch());
@@ -1050,7 +1068,7 @@ fn a_working_set_maps_in_what_another_sealed() {
     let held = 16 - store.available_pages() as u64;
     assert_eq!(held, 4);
 
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.reserve(ws, 5).unwrap();
     let keys = keys_ahead(&store, ws, 0, &tokens);
     let run = store.cached_run(&keys);
@@ -1087,7 +1105,7 @@ fn a_pass_maps_in_more_after_what_it_mapped_in() {
     let mut store = KvStore::new(16, h(21));
     let tokens: Vec<u32> = (0..64).map(|t| 500 + t).collect();
     sealed_and_gone(&mut store, &tokens, ProcessId::from_u128(9));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     let keys = keys_ahead(&store, ws, 0, &tokens);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(ws, &run, 1).unwrap(), 1);
@@ -1097,7 +1115,7 @@ fn a_pass_maps_in_more_after_what_it_mapped_in() {
     assert_eq!(store.mapped_len(ws).unwrap(), 4);
 
     // Its own first page, computed, is not the path's: nothing maps in.
-    let own = store.create_working_set();
+    let own = store.create_shared_working_set();
     commit_opaque(&mut store, own, 1);
     seal(&mut store, own, 0, &tokens[..16]);
     let keys = keys_ahead(&store, own, 16, &tokens[16..]);
@@ -1110,10 +1128,10 @@ fn a_page_no_one_else_reads_is_written_in_place() {
     let mut store = KvStore::new(16, h(23));
     store.set_keeps(true);
     let tokens: Vec<u32> = (0..40).map(|t| 700 + t).collect();
-    let live = store.create_working_set();
+    let live = store.create_shared_working_set();
     commit_opaque(&mut store, live, 4);
     seal(&mut store, live, 0, &tokens);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(reader, &run, 2).unwrap(), 2);
@@ -1134,14 +1152,14 @@ fn a_lookup_takes_the_copy_on_the_device() {
     let mut store = KvStore::new(16, h(24));
     let tokens: Vec<u32> = (0..48).map(|t| 800 + t).collect();
     let copy = |store: &mut KvStore| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         commit_opaque(store, ws, 3);
         seal(store, ws, 0, &tokens);
         ws
     };
     copy(&mut store);
     copy(&mut store);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     let run = store.cached_run(&keys);
     assert_eq!(run.len(), 3);
@@ -1154,7 +1172,7 @@ fn a_lookup_takes_the_copy_on_the_device() {
 fn decoded(store: &mut KvStore, tokens: &[u32], prefilled: usize, logged: usize) -> WorkingSetId {
     store.set_keeps(true);
     store.set_page_size(16);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, ProcessId::from_u128(11)).unwrap();
     commit_opaque(store, ws, (tokens.len() as u64).div_ceil(16));
     let seq = store.log_begin(ws, 0).unwrap();
@@ -1235,7 +1253,7 @@ fn a_truncated_set_ends_where_it_was_cut() {
     );
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &accepted);
     assert_eq!(
         store.cached_run(&keys).len(),
@@ -1273,7 +1291,7 @@ fn a_fire_that_never_settled_leaves_the_log_cut() {
     assert_eq!(store.fold(ws, 40, true).unwrap(), 0);
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 1);
 }
@@ -1284,7 +1302,7 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
     let (short, long) = (ProcessId::from_u128(12), ProcessId::from_u128(13));
     sealed_and_gone(&mut store, &tokens[..32], short);
     // `long` maps in the two pages, seals a third, and goes.
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, long).unwrap();
     let keys = keys_ahead(&store, ws, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
@@ -1303,7 +1321,7 @@ fn a_hit_refreshes_only_the_entries_it_used_whole() {
             .last_use
     };
     assert!(last_use(&store, long) >= last_use(&store, short));
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens[..32]);
     let run = store.cached_run(&keys);
     assert_eq!(store.attach_run(reader, &run, 2).unwrap(), 2);
@@ -1321,10 +1339,10 @@ fn what_decode_wrote_is_reclaimed_before_the_prompt() {
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.cached_working_sets()[0].entries, 2);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 1);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 1);
     assert_eq!(store.cached_run(&keys).len(), 1, "the prompt's page stays");
 }
 
@@ -1338,7 +1356,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
         .expect("three cache-only pages");
     assert_eq!(txn.page_count(), 3);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), |_| 0),
+        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
         0,
         "a group in a move is not dropped"
     );
@@ -1347,13 +1365,13 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     assert_eq!(store.available_pages(), 8);
     assert_eq!(on_device(&mut store, &tokens), 0);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), |_| 0),
+        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
         0,
         "nothing on the device to free"
     );
 
     // A hit: the run in any tier comes up, held until it is mapped in.
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     let run = store.cached_run_any_tier(&keys);
     assert_eq!((run.len(), store.below_device(&run)), (3, 3));
@@ -1369,8 +1387,45 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     store.release_reader(pin);
     store.release_working_set(reader, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 3);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 3);
     assert_eq!(store.available_pages(), 8);
+}
+
+/// What a set holds where: device pressure has nothing to gain from
+/// discarding a set wholly below the device.
+fn a_set_moved_down_says_it_is_off_the_device() {
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(33));
+    let owner = ProcessId::from_u128(23);
+    kept_and_gone(&mut store, 14, 3, owner);
+    let set = |store: &KvStore| store.cached_working_sets()[0];
+    assert!(set(&store).on_device && !set(&store).on_host);
+    let txn = store.prepare_demote(8, |_| 1).unwrap().expect("three cache-only pages");
+    store.commit_suspend(txn).unwrap();
+    store.retire_idle();
+    assert!(!set(&store).on_device && set(&store).on_host);
+}
+
+/// A process's last fire settles after it exits, and only then is what it
+/// leaves cached: until its working set is released the store still holds
+/// its KV, so its rows are not reaped as a gone set's (a keep the policy
+/// stated would be lost, and the cache it becomes keyed by default).
+fn an_exited_owner_holds_its_kv_until_its_working_set_is_released() {
+    let mut store = KvStore::new(8, h(35));
+    store.set_keeps(true);
+    let (owner, other) = (ProcessId::from_u128(25), ProcessId::from_u128(26));
+    let tokens: Vec<u32> = (0..32).map(|t| 500 + t).collect();
+    let ws = store.create_shared_working_set();
+    store.set_owner(ws, owner).unwrap();
+    commit_opaque(&mut store, ws, 2);
+    seal(&mut store, ws, 0, &tokens);
+    assert!(!store.owns_cache(owner), "nothing cached yet");
+    assert!(store.holds_kv_of(owner), "its working set is still here");
+    assert!(!store.holds_kv_of(other));
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+    assert!(store.owns_cache(owner) && store.holds_kv_of(owner), "now cached");
+    assert_eq!(store.discard_cache(owner, crate::policy::By::Policy), 2, "both pages");
+    assert!(!store.holds_kv_of(owner), "gone");
 }
 
 fn a_suspend_short_of_host_room_drops_host_cache_first() {
@@ -1379,9 +1434,9 @@ fn a_suspend_short_of_host_room_drops_host_cache_first() {
     let txn = store.prepare_demote(8, |_| 1).unwrap().unwrap();
     store.commit_suspend(txn).unwrap();
     assert_eq!(store.host_swap_available(), 0);
-    let running = store.create_working_set();
+    let running = store.create_shared_working_set();
     commit_fresh(&mut store, running, 2, 1);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([running])).unwrap() else {
+    let Some(txn) = store.prepare_suspend(&HashSet::from([running]), floor).unwrap() else {
         panic!("two pages to move");
     };
     use ::engine::transfer::MemoryDomain::HostPinned;
@@ -1409,19 +1464,19 @@ fn a_tail_past_its_step_goes_before_another_head() {
         entries: vec![(a, None, -1), (a, Some(40), 0), (b, None, -1)],
     };
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), keys.clone()),
+        store.reclaim_cache(store.current_epoch(), 1, keys.clone()),
         1,
         "A's tail"
     );
     assert_eq!(on_device(&mut store, &a_tokens), 3);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), keys.clone()),
+        store.reclaim_cache(store.current_epoch(), 1, keys.clone()),
         4,
         "B whole"
     );
     assert_eq!(on_device(&mut store, &b_tokens), 0);
     assert_eq!(on_device(&mut store, &a_tokens), 3, "A's head stays");
-    assert_eq!(store.reclaim_cache(store.current_epoch(), keys.clone()), 3);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keys.clone()), 3);
     assert_eq!(store.available_pages(), 16);
 }
 
@@ -1449,36 +1504,176 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
 }
 
-/// Idle cache no policy keys above the floor is not copied down a tier
-/// when the device wants its room: it is dropped, as without tiers. Keyed
-/// above the floor, the same cache goes to the host.
-fn floor_keyed_idle_cache_is_dropped_not_demoted() {
-    use crate::policy::retention::FLOOR;
+/// Conform's "the higher working set survives": A kept at 20 and B at 10,
+/// both demoted to a full host; a suspend short of host room drops B, the
+/// lower, and keeps A there: the host holds the highest keys first, as the
+/// device does, and drops only as much as the suspend needs.
+fn on_the_host_the_lower_set_goes_first() {
+    let mut store = KvStore::new_with_swap(16, 8, 0, h(43));
+    store.set_page_size(16);
+    let (a, b) = (ProcessId::from_u128(53), ProcessId::from_u128(54));
+    let (a_tokens, b_tokens) = (prompt(25, 4), prompt(26, 4));
+    sealed_and_gone(&mut store, &a_tokens, a);
+    sealed_and_gone(&mut store, &b_tokens, b);
+    let keys = move |owner: Option<ProcessId>| if owner == Some(a) { 20 } else { 10 };
+    for _ in 0..2 {
+        let txn = store
+            .prepare_demote(16, keys)
+            .unwrap()
+            .expect("a set to the host");
+        store.commit_suspend(txn).unwrap();
+    }
+    assert_eq!(store.host_swap_available(), 0, "both on the host");
+    let running = store.create_working_set();
+    commit_fresh(&mut store, running, 4, 1);
+    let txn = store
+        .prepare_suspend(&HashSet::from([running]), keys)
+        .unwrap()
+        .expect("four pages to park");
+    store.commit_suspend(txn).unwrap();
+    let below = |store: &mut KvStore, tokens: &[u32]| {
+        let probe = store.create_shared_working_set();
+        let found = keys_ahead(store, probe, 0, tokens);
+        store.release_working_set(probe, store.current_epoch());
+        store.cached_run_any_tier(&found).len()
+    };
+    assert_eq!(below(&mut store, &b_tokens), 0, "the lower one is gone");
+    assert_eq!(
+        below(&mut store, &a_tokens),
+        4,
+        "the higher one stays on the host"
+    );
+}
+
+/// Each tier holds the highest keys first: B (10) fills the host, and A
+/// (20) moving down off the device takes B's room there; keyed alike,
+/// nothing on the host is displaced and A finds no room.
+fn a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host() {
+    for (a_key, displaced) in [(20, true), (10, false)] {
+        let mut store = KvStore::new_with_swap(16, 4, 0, h(47));
+        store.set_page_size(16);
+        let (a, b) = (ProcessId::from_u128(55), ProcessId::from_u128(56));
+        let (a_tokens, b_tokens) = (prompt(27, 4), prompt(28, 4));
+        sealed_and_gone(&mut store, &b_tokens, b);
+        let keys = move |owner: Option<ProcessId>| if owner == Some(a) { a_key } else { 10 };
+        let txn = store.prepare_demote(16, keys).unwrap().expect("B to the host");
+        store.commit_suspend(txn).unwrap();
+        assert_eq!(store.host_swap_available(), 0, "the host is full");
+        sealed_and_gone(&mut store, &a_tokens, a);
+        let below = |store: &mut KvStore, tokens: &[u32]| {
+            let probe = store.create_shared_working_set();
+            let found = keys_ahead(store, probe, 0, tokens);
+            store.release_working_set(probe, store.current_epoch());
+            store.cached_run_any_tier(&found).len()
+        };
+        match store.prepare_demote(16, keys).unwrap() {
+            Some(txn) => {
+                assert!(displaced, "keyed alike, nothing is displaced");
+                store.commit_suspend(txn).unwrap();
+                store.retire_idle();
+                assert_eq!(on_device(&mut store, &a_tokens), 0, "A moved down");
+                assert_eq!(below(&mut store, &a_tokens), 4, "A on the host");
+                assert_eq!(below(&mut store, &b_tokens), 0, "B gave its room");
+            }
+            None => {
+                assert!(!displaced, "A keyed higher takes B's room");
+                assert_eq!(below(&mut store, &b_tokens), 4, "B stays");
+            }
+        }
+    }
+}
+
+/// The conform shape after earlier turns: the host full of fillers (15),
+/// B (10) idle on the device, A (20) too. B finds no room below (it may
+/// displace nothing keyed higher), so no demote moves A or anything else
+/// ahead of it: B is dropped first, by the reclaim that follows.
+fn the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves() {
+    let mut store = KvStore::new_with_swap(16, 4, 0, h(49));
+    store.set_page_size(16);
+    let (a, b, f) = (ProcessId::from_u128(57), ProcessId::from_u128(58), ProcessId::from_u128(59));
+    let (a_tokens, b_tokens, f_tokens) = (prompt(29, 4), prompt(30, 4), prompt(31, 4));
+    let keys = move |owner: Option<ProcessId>| match owner {
+        Some(o) if o == a => 20,
+        Some(o) if o == b => 10,
+        _ => 15,
+    };
+    sealed_and_gone(&mut store, &f_tokens, f);
+    let txn = store.prepare_demote(16, keys).unwrap().expect("the filler to the host");
+    store.commit_suspend(txn).unwrap();
+    assert_eq!(store.host_swap_available(), 0, "the host is full");
+    sealed_and_gone(&mut store, &b_tokens, b);
+    sealed_and_gone(&mut store, &a_tokens, a);
+    assert!(
+        store.prepare_demote(16, keys).unwrap().is_none(),
+        "B, the lowest, finds no room: nothing above it moves"
+    );
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keys), 4, "B goes");
+    assert_eq!(on_device(&mut store, &b_tokens), 0);
+    assert_eq!(on_device(&mut store, &a_tokens), 4, "A stays");
+}
+
+/// A row naming the device and the host keeps idle cache off the disk: a
+/// demote takes the host's room and no more, however much room the disk
+/// has (conform's keep: fillers spilled to disk, so the host never filled
+/// and the lower set on it was never displaced).
+fn a_demote_keeps_off_the_disk_what_its_row_keeps_off_it() {
+    use crate::policy::retention::{DEVICE, HOST};
+    let mut store = KvStore::new_with_swap(16, 4, 8, h(53));
+    store.set_page_size(16);
+    let owner = ProcessId::from_u128(61);
+    let tokens = prompt(33, 8);
+    sealed_and_gone(&mut store, &tokens, owner);
+    let txn = store
+        .prepare_demote(16, Rows(0, DEVICE | HOST))
+        .unwrap()
+        .expect("the host's room");
+    assert_eq!(txn.page_count(), 4, "the host's four slots, none of the disk's");
+    store.commit_suspend(txn).unwrap();
+    assert_eq!(store.host_swap_available(), 0);
+    assert_eq!(store.disk_swap_available(floor), 8, "the disk untouched");
+}
+
+/// Rows of one key and one tier set for every owner, as a test's table.
+struct Rows(i64, u8);
+
+impl crate::policy::retention::Keys for Rows {
+    fn key_at(&self, _owner: Option<ProcessId>, _at: u64) -> i64 {
+        self.0
+    }
+
+    fn tiers_at(&self, _owner: Option<ProcessId>, _at: u64) -> u8 {
+        self.1
+    }
+}
+
+/// Whether idle cache can move down a tier when the device wants its room
+/// is the tiers row's say, whatever its key: a row without the host keeps
+/// it there to be dropped; every tier (no row) moves it to the host.
+fn idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted() {
+    use crate::policy::retention::{ALL_TIERS, DEVICE};
     let mut store = KvStore::new_with_swap(8, 8, 8, h(37));
     let owner = ProcessId::from_u128(45);
     let tokens = kept_and_gone(&mut store, 18, 3, owner);
-    assert!(
-        store.prepare_demote(8, |_| FLOOR).unwrap().is_none(),
-        "nothing moves at the floor"
-    );
-    assert!(
-        store.prepare_demote(8, |_| FLOOR - 1).unwrap().is_none(),
-        "nor below it"
-    );
+    for key in [-1, 0, 100] {
+        assert!(
+            store.prepare_demote(8, Rows(key, DEVICE)).unwrap().is_none(),
+            "nothing moves at key {key}: its row keeps it off the host"
+        );
+    }
     assert_eq!(store.host_swap_available(), 8, "the host is untouched");
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), 1, Rows(100, DEVICE)),
         3,
-        "it is dropped"
+        "it is dropped, however high its key"
     );
     assert_eq!(on_device(&mut store, &tokens), 0);
     assert!(store.cached_working_sets().is_empty());
 
     let tokens = kept_and_gone(&mut store, 19, 3, owner);
     let txn = store
-        .prepare_demote(8, |_| FLOOR + 1)
+        .prepare_demote(8, Rows(0, ALL_TIERS))
         .unwrap()
-        .expect("keyed above the floor, it moves");
+        .expect("at the default key, with every tier, it moves");
     use ::engine::transfer::MemoryDomain::HostPinned;
     let tiers: Vec<_> = txn
         .copy_plans()
@@ -1489,7 +1684,7 @@ fn floor_keyed_idle_cache_is_dropped_not_demoted() {
     store.commit_suspend(txn).unwrap();
     store.retire_idle();
     assert_eq!(on_device(&mut store, &tokens), 0);
-    let reader = store.create_working_set();
+    let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(
         store.cached_run_any_tier(&keys).len(),
@@ -1509,7 +1704,7 @@ fn an_answer_goes_before_an_older_prompt() {
     store.fold(ws, 40, true).unwrap();
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), |_| 0), 1);
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 1);
     assert_eq!(on_device(&mut store, &other), 2, "the older prompt stays");
 }
 
@@ -1599,7 +1794,7 @@ fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
         4,
         "the orphan's and the short page's slots are free again"
     );
-    store.drop_entries_off_device();
+    store.drop_entries_off_device(usize::MAX, &|_| 0, None);
     assert_eq!(
         store.cached_run_any_tier(&keys).len(),
         3,
@@ -1612,11 +1807,11 @@ fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
     assert_eq!(store.keep_disk(&path, true).unwrap(), 4);
     assert_eq!(store.disk_pool.available(), 4);
     assert_eq!(
-        store.disk_swap_available(),
+        store.disk_swap_available(floor),
         8,
         "swap may take every copy's slot"
     );
-    store.yield_disk(8);
+    store.yield_disk(8, &floor);
     assert_eq!(store.disk_pool.available(), 8, "every slot given back");
     assert_eq!(store.persisted_pages(), 0);
     drop(store);
@@ -1685,13 +1880,18 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
     assert_eq!(store.below_device(&run), 0, "the pages stay on the device");
 
     let epoch = store.current_epoch();
-    assert_eq!(store.reclaim_cache(epoch, Steps::default()), 3);
+    assert_eq!(
+        store.reclaim_cache(epoch, 1, Steps::default()),
+        1,
+        "settled as far as is short"
+    );
+    assert_eq!(store.reclaim_cache(epoch, 3, Steps::default()), 2);
     let run = store.cached_run_any_tier(&keys);
     assert_eq!(run.len(), 3, "the entry stays");
     assert_eq!(store.below_device(&run), 3, "settled on its copies");
     assert_eq!(store.disk_pool.available(), 5, "with nothing copied");
     assert_eq!(
-        store.reclaim_cache(epoch, Steps::default()),
+        store.reclaim_cache(epoch, 1, Steps::default()),
         0,
         "what is on disk alone frees no device page"
     );
@@ -1715,7 +1915,7 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
         3,
         "a restart finds it"
     );
-    assert_eq!(store.make_swap_room(8), 8, "swap wins");
+    assert_eq!(store.make_swap_room(8, &floor), 8, "swap wins");
     assert_eq!(store.persisted_pages(), 0);
     drop(store);
     assert_eq!(store_for().keep_disk(&path, true).unwrap(), 0);
@@ -1815,7 +2015,7 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
     let (low, high) = (run_of(500), run_of(600));
     let mut store = store_for();
     store.keep_disk(&path, true).unwrap();
-    for ((tokens, keys), key) in [(&low, 1), (&high, 9)] {
+    for ((tokens, keys), key) in [(&low, -1), (&high, 0)] {
         let gpu = store.pool.try_alloc_n(2).unwrap();
         assert!(store.import_cached_at(
             &[],
@@ -1827,7 +2027,7 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
         assert_eq!(store.commit_persist(txn), 2);
     }
     assert_eq!(store.disk_pool.available(), 0);
-    assert_eq!(store.make_swap_room(2), 2);
+    assert_eq!(store.make_swap_room(2, &floor), 2);
     assert_eq!(store.persisted_pages(), 2);
     let kept: HashSet<Hash256> = store.persisted_keys().into_iter().collect();
     assert!(
@@ -1866,7 +2066,7 @@ fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
     sealed_and_gone(&mut store, &tokens, ProcessId::from_u128(1));
 
     let asker = ProcessId::from_u128(2);
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     store.set_owner(ws, asker).unwrap();
     store.set_persist_hint(asker, Some(32));
     store.reserve(ws, 4).unwrap();
@@ -1882,14 +2082,14 @@ fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
 #[test]
 fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
     let mut s = KvStore::new_with_swap(8, 8, 0, h(40));
-    let a = s.create_working_set();
+    let a = s.create_shared_working_set();
     commit_fresh(&mut s, a, 3, 1);
     let b = s.fork(a).unwrap();
     s.set_parked(a, true);
     s.set_parked(b, true);
 
     let txn = s
-        .prepare_suspend(&HashSet::from([a]))
+        .prepare_suspend(&HashSet::from([a]), floor)
         .unwrap()
         .expect("no running reader keeps them");
     assert_eq!(s.commit_suspend(txn).unwrap(), 3);
@@ -1910,13 +2110,11 @@ fn a_parked_set_wakes_with_the_pages_its_peers_moved() {
 }
 
 /// How long idle cache is kept is the policy's (KEEP_CACHE moved to PLEX):
-/// a key above the floor keeps it from a reclaim the runtime runs unasked,
-/// and once the policy lowers the key (its keep over, on its alarm) the next
-/// demand reclaims it. With no policy, idle cache has no expiry: it stays
+/// a demand takes the lowest key first, so a key the policy states keeps
+/// cache past the rest. With no policy, idle cache has no expiry: it stays
 /// whatever time passes, and only a demand for its room (the planner's
 /// reclaim) takes it, lowest key then least recently used first.
 fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand() {
-    use crate::policy::retention::FLOOR;
     let mut store = KvStore::new(8, h(43));
     let (kept, unkept) = (ProcessId::from_u128(47), ProcessId::from_u128(48));
     let kept_tokens = kept_and_gone(&mut store, 22, 3, kept);
@@ -1927,30 +2125,14 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
     }
     assert_eq!(on_device(&mut store, &kept_tokens), 3);
     assert_eq!(on_device(&mut store, &unkept_tokens), 3);
-    // The policy keeps one: a demand reclaims only the other.
-    let keep = move |owner: Option<ProcessId>| {
-        if owner == Some(kept) {
-            FLOOR + 1
-        } else {
-            FLOOR
-        }
-    };
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 3);
-    assert_eq!(
-        on_device(&mut store, &unkept_tokens),
-        0,
-        "unkept: reclaimed"
-    );
-    assert_eq!(
-        on_device(&mut store, &kept_tokens),
-        3,
-        "the keep is honoured"
-    );
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), keep), 0);
-    assert_eq!(on_device(&mut store, &kept_tokens), 3, "still kept");
-    // The keep is over: the policy lowers the key, and the next demand
-    // reclaims it.
-    assert_eq!(store.reclaim_droppable(store.current_epoch(), |_| FLOOR), 3);
+    // The policy keys one higher: a demand reclaims the lower first.
+    let keep = move |owner: Option<ProcessId>| i64::from(owner == Some(kept));
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keep), 3);
+    assert_eq!(on_device(&mut store, &unkept_tokens), 0, "the lower key goes first");
+    assert_eq!(on_device(&mut store, &kept_tokens), 3, "the higher stays");
+    // No lower tier to move to: cached KV yields to the next demand,
+    // whatever its key.
+    assert_eq!(store.reclaim_droppable(store.current_epoch(), 1, keep), 3);
     assert_eq!(on_device(&mut store, &kept_tokens), 0);
 }
 
@@ -1959,7 +2141,6 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
 /// what a set last read before the fires in flight began is free at once,
 /// and what a reader read in one of them waits for that one.
 fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
-    use crate::policy::retention::FLOOR;
     let mut store = KvStore::new(8, h(41));
     let owner = ProcessId::from_u128(46);
     kept_and_gone(&mut store, 20, 3, owner);
@@ -1968,7 +2149,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     let busy = store.begin_fire();
     let other = store.begin_fire();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), 1, |_| 0),
         3,
         "dropped"
     );
@@ -1987,7 +2168,7 @@ fn idle_cache_last_read_long_ago_comes_back_past_the_fires_in_flight() {
     store.release_working_set(ws, read);
     store.retire_idle();
     assert_eq!(
-        store.reclaim_droppable(store.current_epoch(), |_| FLOOR),
+        store.reclaim_droppable(store.current_epoch(), 1, |_| 0),
         3,
         "dropped"
     );
@@ -2015,7 +2196,12 @@ fn a_waiting_prompt_finds_its_cached_prefix_and_loses_it_when_evicted() {
     let stores = registry::all_for_model(model);
     let tokens: Vec<u32> = (0..64).map(|t| 700 + t).collect();
     let waiter = ProcessId::from_u128(71);
-    waits(&stores, waiter, &tokens);
+    waits(
+        &stores,
+        waiter,
+        &crate::policy::share::test_tenant(),
+        &tokens,
+    );
     assert_eq!(found(&stores, waiter), (0, Some(0)), "nothing cached yet");
 
     let other: Vec<u32> = (0..64).map(|t| 900 + t).collect();
@@ -2070,12 +2256,12 @@ fn a_prefix_computed_twice_maps_whole_from_either_copy() {
             .collect()
     };
     let computed = |store: &mut KvStore, tail: u32| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         commit_opaque(store, ws, 3);
         seal(store, ws, 0, &prompt(tail));
     };
     let look = |store: &mut KvStore, tail: u32| {
-        let ws = store.create_working_set();
+        let ws = store.create_shared_working_set();
         let keys = keys_ahead(store, ws, 0, &prompt(tail));
         let run = store.cached_run(&keys);
         let mapped = store.attach_run(ws, &run, 2).unwrap();
@@ -2104,9 +2290,253 @@ fn a_prefix_computed_twice_maps_whole_from_either_copy() {
 #[test]
 fn a_release_with_nothing_in_flight_frees_its_pages_at_once() {
     let mut store = KvStore::new(8, h(11));
-    let ws = store.create_working_set();
+    let ws = store.create_shared_working_set();
     commit_opaque(&mut store, ws, 3);
     let before = store.available_pages();
     store.release_working_set(ws, store.current_epoch());
     assert_eq!(store.available_pages(), before + 3, "free now, no retire asked");
+}
+
+/// Keys that name their revision: what a reclaim reads under them it may
+/// keep until they, the table or the entries move.
+#[derive(Clone, Copy)]
+struct Revised(u64);
+
+impl Keys for Revised {
+    fn key_at(&self, _: Option<ProcessId>, _: u64) -> i64 {
+        crate::policy::retention::DEFAULT_KEY
+    }
+
+    fn revision(&self) -> Option<u64> {
+        Some(self.0)
+    }
+}
+
+#[test]
+/// A reclaim frees what is short and no more: a store of 256 pages freed a
+/// 64th of itself, times up to eight for a slow walk, whatever was short.
+/// The order it walked stands for the next while nothing it reads moves,
+/// and is walked again once something does.
+fn a_reclaim_frees_what_is_short_and_keeps_its_order_until_it_moves() {
+    let mut store = KvStore::new(256, h(60));
+    let owners: Vec<ProcessId> = (1..=6).map(ProcessId::from_u128).collect();
+    for (seed, &owner) in (60..).zip(&owners) {
+        kept_and_gone(&mut store, seed, 1, owner);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let keys = Revised(1);
+    let free = store.available_pages();
+    let epoch = store.current_epoch();
+    assert_eq!(store.reclaim_cache(epoch, 0, keys), 0, "nothing short, nothing goes");
+    assert_eq!(store.reclaim_cache(epoch, 1, keys), 1);
+    assert_eq!(store.available_pages(), free + 1);
+    assert!(!store.owns_cache(owners[0]), "the least recently used goes");
+    assert!(owners[1..].iter().all(|&owner| store.owns_cache(owner)));
+    let kept = store.order.as_ref().expect("the walk is kept").groups.clone();
+    assert_eq!(kept, store.reclaim_order(&keys), "as a walk now finds it");
+
+    assert_eq!(store.reclaim_cache(epoch, 3, keys), 3);
+    assert_eq!(store.available_pages(), free + 4);
+    assert!(owners[..4].iter().all(|&owner| !store.owns_cache(owner)));
+    assert!(owners[4..].iter().all(|&owner| store.owns_cache(owner)));
+    let kept = store.order.as_ref().expect("the walk is kept").groups.clone();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept, store.reclaim_order(&keys));
+
+    // An entry joining moves the order: the walk takes it in.
+    let late = ProcessId::from_u128(7);
+    kept_and_gone(&mut store, 70, 1, late);
+    assert_eq!(store.reclaim_cache(epoch, 2, keys), 2);
+    assert!(store.owns_cache(late), "the most recently used goes last");
+    assert_eq!(store.reclaim_cache(epoch, 1, keys), 1);
+    assert!(store.cached_working_sets().is_empty());
+
+    // Keys of no revision keep nothing.
+    kept_and_gone(&mut store, 71, 1, late);
+    assert_eq!(store.reclaim_cache(epoch, 1, floor), 1);
+    assert!(store.order.is_none());
+}
+
+#[test]
+/// A suspend short of host room drops idle cache below the device lowest
+/// key first, then least recently used, only until its room is covered;
+/// cache a key keeps above the floor stays, and the suspend is refused for
+/// want of room rather than have it dropped.
+fn a_suspend_drops_cache_off_the_device_until_covered_and_never_what_a_key_keeps() {
+    let mut store = KvStore::new_with_swap(8, 4, 0, h(61));
+    let (kept, old, new) = (
+        ProcessId::from_u128(1),
+        ProcessId::from_u128(2),
+        ProcessId::from_u128(3),
+    );
+    let keys = move |owner: Option<ProcessId>| if owner == Some(kept) { 5 } else { 0 };
+    for (seed, owner) in [(80, kept), (81, old), (82, new)] {
+        let ws = store.create_working_set();
+        sealed(&mut store, ws, &prompt(seed, 1));
+        store.keep_checkpoint(ws, 1, Some(owner));
+        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), keys).unwrap() else {
+            panic!("a page to move");
+        };
+        assert_eq!(store.commit_suspend(txn).unwrap(), 1);
+        store.release_working_set(ws, store.current_epoch());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(store.host_swap_available(), 1);
+
+    // Two pages to park, one slot free: one entry goes, the older at the
+    // lower key, and nothing past it.
+    let v = store.create_working_set();
+    commit_fresh(&mut store, v, 2, 1);
+    let Some(txn) = store.prepare_suspend(&HashSet::from([v]), keys).unwrap() else {
+        panic!("its pages to move");
+    };
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    assert!(!store.owns_cache(old), "the oldest the keys let go");
+    assert!(store.owns_cache(new), "the room was covered");
+    assert!(store.owns_cache(kept));
+    assert_eq!(store.droppable_below_device(keys), (1, 0), "the kept page is no room");
+
+    // Two more, none free: the last droppable entry goes, and the kept one
+    // stays with the room it holds.
+    let w = store.create_working_set();
+    commit_fresh(&mut store, w, 2, 1);
+    match store.prepare_suspend(&HashSet::from([w]), keys) {
+        Err(super::KvStoreError::HostSwapFull {
+            requested: 2,
+            available: 1,
+        }) => {}
+        other => panic!("refused for want of room: {other:?}"),
+    }
+    assert!(!store.owns_cache(new));
+    assert!(store.owns_cache(kept), "a key above the floor keeps it");
+    assert_eq!(store.droppable_below_device(keys), (0, 0));
+}
+
+#[test]
+/// A suspend gives up the disk tier's copies only where their keys let
+/// them go: a copy kept above the floor is no room, and the suspend is
+/// refused for want of it rather than take it.
+fn a_suspend_takes_no_disk_copy_a_key_keeps() {
+    use super::hash::{chain_slots, page_hash};
+    let seed = h(62);
+    let run_of = |first: u32| {
+        let tokens: Vec<Vec<Option<Hash256>>> =
+            chain_slots(&seed, None, 0, &(first..first + 8).collect::<Vec<_>>())
+                .chunks(4)
+                .map(|page| page.iter().map(|h| Some(*h)).collect())
+                .collect();
+        let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+        (tokens, keys)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = KvStore::new_with_swap(8, 0, 4, seed);
+    store.set_page_size(4);
+    store.set_keeps(true);
+    store.keep_disk(&dir.path().join("g0.journal"), true).unwrap();
+    let (low, high) = (run_of(700), run_of(800));
+    for ((tokens, keys), key) in [(&low, 0), (&high, 9)] {
+        let gpu = store.pool.try_alloc_n(2).unwrap();
+        assert!(store.import_cached_at(
+            &[],
+            tokens.clone(),
+            keys.clone(),
+            gpu.into_iter().map(KvPageBacking::Resident).collect(),
+        ));
+        let txn = store.prepare_persist(keys, key).expect("two pages");
+        assert_eq!(store.commit_persist(txn), 2);
+    }
+    assert_eq!(store.disk_pool.available(), 0);
+    assert_eq!(store.disk_swap_available(floor), 2, "the kept copies are no room");
+
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 3, 1);
+    match store.prepare_suspend(&HashSet::from([ws]), floor) {
+        Err(super::KvStoreError::HostSwapFull {
+            requested: 3,
+            available: 2,
+        }) => {}
+        other => panic!("refused for want of room: {other:?}"),
+    }
+    let kept: HashSet<Hash256> = store.persisted_keys().into_iter().collect();
+    assert!(high.1.iter().all(|key| kept.contains(key)), "the kept copies stay");
+    assert!(low.1.iter().all(|key| !kept.contains(key)), "the floor's went");
+    assert_eq!(store.make_swap_room(4, &floor), 2, "and nothing more yields");
+}
+
+#[test]
+/// What a reclaim frees while a fire in flight still reads it waits on that
+/// fire's retirement: it is returning, and counts toward the shortfall, so
+/// a reclaim for the same shortfall frees nothing more. Past it, only what
+/// is still short goes; the fire's settle brings it back.
+fn a_reclaim_counts_what_it_freed_as_returning_until_its_fire_retires() {
+    let mut store = KvStore::new(8, h(63));
+    let (early, late) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
+    let a = store.create_working_set();
+    sealed(&mut store, a, &prompt(90, 2));
+    store.keep_checkpoint(a, 2, Some(early));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    kept_and_gone(&mut store, 91, 2, late);
+    let fire = store.begin_fire();
+    store.release_working_set(a, store.current_epoch());
+    let free = store.available_pages();
+    let epoch = store.current_epoch();
+
+    assert_eq!(store.reclaim_cache(epoch, 2, floor), 2);
+    assert!(!store.owns_cache(early), "the least recently used went");
+    assert_eq!(store.available_pages(), free, "the fire in flight still reads it");
+    assert_eq!(store.reclaim_returning(), 2);
+    assert_eq!(
+        store.reclaim_cache(epoch, 2, floor),
+        0,
+        "the same shortfall again: what returns covers it"
+    );
+    assert!(store.owns_cache(late), "nothing more went");
+
+    store.settle(fire);
+    assert_eq!(store.reclaim_returning(), 0);
+    assert_eq!(store.available_pages(), free + 2, "back once the fire retired");
+    assert_eq!(store.reclaim_cache(store.current_epoch(), 2, floor), 2);
+    assert!(!store.owns_cache(late), "a new shortfall reclaims again");
+}
+
+#[test]
+/// With no disk tier (and the host short, or none), a suspend whose pages
+/// need the disk is refused by name, as on a full disk: nothing goes
+/// anywhere else, and the pages stay on the device.
+fn a_suspend_that_needs_the_disk_with_no_disk_tier_is_refused_by_name() {
+    for host in [0, 2] {
+        let mut store = KvStore::new_with_swap(8, host, 0, h(64));
+        let ws = store.create_working_set();
+        commit_fresh(&mut store, ws, 3, 1);
+        match store.prepare_suspend(&HashSet::from([ws]), floor) {
+            Err(error @ super::KvStoreError::HostSwapFull { requested: 3, available }) => {
+                assert_eq!(available, host as usize);
+                assert!(error.to_string().contains("swap exhausted"), "{error}");
+            }
+            other => panic!("refused for want of a disk tier: {other:?}"),
+        }
+        assert_eq!(store.swapped_page_count(&HashSet::from([ws])).unwrap(), 0);
+        assert_eq!(store.disk_swap_capacity(), 0);
+    }
+}
+
+/// The directory hears of a shared set's sealed pages, never a private
+/// set's: their keys are unmatchable, and their count would tell of it.
+#[test]
+fn only_a_shared_sets_sealed_keys_are_published() {
+    let mut store = KvStore::new(16, h(43));
+    let tokens: Vec<u32> = (0..32).map(|t| 4100 + t).collect();
+    let shared = store.create_shared_working_set();
+    commit_opaque(&mut store, shared, 2);
+    assert_eq!(seal(&mut store, shared, 0, &tokens), 2);
+    let private = store.create_working_set();
+    commit_opaque(&mut store, private, 2);
+    assert_eq!(seal(&mut store, private, 0, &tokens), 2, "it seals as any set does");
+    let published: HashSet<Hash256> = store.sealed_key_list(&store.node_ids()).into_iter().collect();
+    let keys = |store: &KvStore, ws| keys_ahead(store, ws, 0, &tokens);
+    let shared_keys = keys(&store, shared);
+    let private_keys = keys(&store, private);
+    assert!(shared_keys.iter().all(|key| published.contains(key)));
+    assert!(private_keys.iter().all(|key| !published.contains(key)));
+    assert_eq!(published.len(), 2, "the shared set's two pages, nothing more");
 }

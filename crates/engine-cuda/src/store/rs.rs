@@ -1042,10 +1042,8 @@ pub struct Predicate {
     region: Buffer,
     at_one: u64,
     at_zero: u64,
-    at_commits: u64,
     at_indptr: u64,
     at_mask: u64,
-    at_len: u64,
     at_snap: Option<[u64; 3]>,
     /// The lane bounds the last fire left nonzero, which the next fire that
     /// takes no snapshot zeroes; a run of fires taking none stages nothing.
@@ -1065,10 +1063,8 @@ impl Predicate {
         };
         let at_one = take(4);
         let at_zero = take(4);
-        let at_commits = take(lanes * 8);
         let at_indptr = take((lanes + 1) * 4);
         let at_mask = take(lanes);
-        let at_len = take(lanes * 4);
         let at_snap = snapshots.then(|| {
             let entries = lanes * u64::from(SNAPSHOTS);
             [
@@ -1084,10 +1080,8 @@ impl Predicate {
             region,
             at_one,
             at_zero,
-            at_commits,
             at_indptr,
             at_mask,
-            at_len,
             at_snap,
             snap_dirty: 0,
             lanes: max_lanes,
@@ -1126,32 +1120,6 @@ impl Predicate {
         self.region.ptr() + self.at_zero
     }
 
-    pub fn write(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        commits: &[u64],
-        lens: &[i32],
-    ) -> Result<()> {
-        if commits.len() as u64 > u64::from(self.lanes) {
-            return Err(Fault::Ceiling {
-                what: "rs fold predicates",
-                need: commits.len() as u64,
-                have: u64::from(self.lanes),
-            });
-        }
-        let words: Vec<u8> = commits.iter().flat_map(|c| c.to_le_bytes()).collect();
-        let at_commits = self.at_commits;
-        let at_len = self.at_len;
-        self.region.stage(stream, at_commits, &words)?;
-        let lens: Vec<u8> = lens.iter().flat_map(|n| n.to_le_bytes()).collect();
-        self.region.stage(stream, at_len, &lens)
-    }
-
-    #[must_use]
-    pub fn commits(&self) -> u64 {
-        self.region.ptr() + self.at_commits
-    }
-
     #[must_use]
     pub fn indptr(&self) -> u64 {
         self.region.ptr() + self.at_indptr
@@ -1162,9 +1130,10 @@ impl Predicate {
         kernels_cuda::Tensor::new(self.region.ptr() + self.at_mask, lanes, 1, Dtype::U8)
     }
 
+    /// The lanes a gate's mask holds at most.
     #[must_use]
-    pub fn commit_len(&self, lanes: u32) -> kernels_cuda::Tensor {
-        kernels_cuda::Tensor::new(self.region.ptr() + self.at_len, lanes, 1, Dtype::I32)
+    pub fn lanes(&self) -> u32 {
+        self.lanes
     }
 
     /// Whether this load lands snapshots: its table's planes are reserved.

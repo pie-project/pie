@@ -768,6 +768,10 @@ pub fn warmed_frames<E>(
 pub struct Measured {
     pub rates: profile::fire::Rates,
     pub unsettled: bool,
+    /// The device ran slower than its nominal clock as the step timed
+    /// (`Some(ratio)`, its reference kernel's time over its fastest seen):
+    /// the rates are this load's alone, never stored, and said so.
+    pub throttled: Option<f64>,
 }
 
 /// The order a rates step times `len` points in: a fixed stride through
@@ -1230,6 +1234,7 @@ pub fn resolve_at_load(
     let Measured {
         rates: measured,
         unsettled,
+        throttled,
     } = measure(max_submit)?;
     if let Some((key, why)) = unmeasured(&measured) {
         return Err(format!(
@@ -1244,13 +1249,31 @@ pub fn resolve_at_load(
             rates.missing(keys)
         ));
     }
-    // The user's file is this load's own output (`save_rates`).
-    let saved_to = save
-        .map(|save| save_rates(&save, &rates.only(&lacked)))
-        .transpose()?;
+    // The user's file is this load's own output (`save_rates`): rates
+    // timed on a device below its nominal clock serve this load alone.
+    let saved_to = match throttled {
+        None => save
+            .map(|save| save_rates(&save, &rates.only(&lacked)))
+            .transpose()?,
+        Some(ratio) => {
+            tracing::warn!(
+                ratio,
+                "rates: timed with the device {ratio:.2}x slower than its nominal clock (its \
+                 reference kernel's fastest): served this load, not stored"
+            );
+            None
+        }
+    };
     let mut tuned = chip.tuned().clone();
     tuned.rates = rates;
     tuned.measured_this_load = true;
+    tuned.timed.push(match throttled {
+        None => format!("rates ({})", lacked.join(", ")),
+        Some(ratio) => format!(
+            "rates ({}; device {ratio:.2}x below its nominal clock: not stored)",
+            lacked.join(", ")
+        ),
+    });
     tuned.saved_to = saved_to;
     tuned.frame_cut = unsettled;
     Ok(chip.with_tuned(tuned))
@@ -1460,6 +1483,7 @@ mod tests {
 
     fn all() -> profile::fire::Rates {
         profile::fire::Rates {
+            landing: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
@@ -1470,6 +1494,7 @@ mod tests {
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
@@ -1507,6 +1532,7 @@ mod tests {
                 Ok(Measured {
                     rates: all(),
                     unsettled: true,
+                    throttled: None,
                 })
             },
         )
@@ -1569,6 +1595,7 @@ mod tests {
                 Ok(Measured {
                     rates: all(),
                     unsettled: false,
+                    throttled: None,
                 })
             },
         )
@@ -1693,6 +1720,7 @@ mod tests {
                 Ok(Measured {
                     rates: keyed(build).only(&lacked),
                     unsettled: false,
+                    throttled: None,
                 })
             },
         )
@@ -1915,12 +1943,14 @@ mod tests {
                 of: 5,
                 code: 6,
                 ranges: vec![[1, 1, 0, 0, 0, 0]],
+                planes: vec![(1024, 1024)],
             },
             profile::fire::DenseSettled {
                 method: 1,
                 of: 9,
                 code: 6,
                 ranges: vec![[1, 1, 1, 4, 0, 1]],
+                planes: vec![(1024, 1024)],
             },
         ];
         let user = saved_text(None, &rates, &provenance("toy", "a test"));
@@ -2064,6 +2094,7 @@ mod tests {
                     Ok(Measured {
                         rates: keyed(build).only(&lacked),
                         unsettled: false,
+                        throttled: None,
                     })
                 },
             )
@@ -2145,6 +2176,7 @@ mod tests {
             Ok(Measured {
                 rates: older.clone(),
                 unsettled: false,
+                throttled: None,
             })
         })
         .unwrap();
@@ -2166,6 +2198,7 @@ mod tests {
                 Ok(Measured {
                     rates: all().only(&lacked),
                     unsettled: false,
+                    throttled: None,
                 })
             },
         )
@@ -2268,6 +2301,7 @@ mod tests {
                 Ok(Measured {
                     rates: all(),
                     unsettled: false,
+                    throttled: None,
                 })
             },
         )
@@ -2313,6 +2347,7 @@ mod tests {
             Ok(Measured {
                 rates: all(),
                 unsettled: false,
+                throttled: None,
             })
         })
         .unwrap_err();
@@ -2509,6 +2544,7 @@ mod tests {
                 Ok(Measured {
                     rates: six.clone(),
                     unsettled: false,
+                    throttled: None,
                 })
             },
         )
@@ -2564,6 +2600,7 @@ mod tests {
                     Ok(Measured {
                         rates: zero,
                         unsettled: false,
+                        throttled: None,
                     })
                 },
             )
@@ -2838,6 +2875,7 @@ mod tests {
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
         let rates = profile::fire::Rates {
+            landing: None,
             launch_ns: Some(3500),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
             attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
@@ -2848,6 +2886,7 @@ mod tests {
             few_row_tflops: Some(4.5),
             workgroups_per_core: Some(3.3),
             submit_worst_ratio: None,
+            load_width: None,
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,

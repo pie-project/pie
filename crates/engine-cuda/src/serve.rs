@@ -19,12 +19,13 @@ pub fn export_bodies(
 pub use load::Staged;
 pub(crate) mod pages;
 mod prepare;
+mod ring;
 mod segments;
 mod settle;
 mod stats;
 
 pub use arming::{Armed, Kind, Seal};
-pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, Recording};
+pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, QueueMasks, Recording};
 pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
@@ -68,10 +69,28 @@ use crate::window::Windows;
 use enqueue::{GuestBatch, GuestFault, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
+/// What a load's windowed fires have done ([`Shell::ring_seen`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingSeen {
+    /// Fires' own pages written on their ring directly.
+    pub direct: u64,
+    /// Own-row pages taken.
+    pub own: u64,
+    /// Ring pages a fire both read and then folded rows onto.
+    pub read_then_folded: u64,
+}
+
 pub struct Shell {
     /// The rungs the load weighed its top by and the estimate it weighed
     /// them with (`None` where the profile states no rates).
     weighed: Option<crate::top::Weighed>,
+    /// A windowed fire's ring-fold runs as the device reads them, grown to
+    /// the most a fire has folded (`serve::ring`).
+    ring_runs: Option<crate::device::alloc::Buffer>,
+    /// What the windowed fires served have done since load: pages they
+    /// wrote on their rings directly, own-row pages they took, and the ring
+    /// pages they folded onto that their own reads had read.
+    ring_seen: RingSeen,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,
@@ -227,6 +246,9 @@ pub struct Shell {
     /// Whether the load times the decode products' kernels no layer states
     /// (`[engine] measure`).
     routes_measuring: engine::rates::Measuring,
+    /// What this load timed, each by name (the device's rates where no
+    /// layer stated them, the decode products' times): its last line's.
+    pub(crate) measured: std::cell::RefCell<Vec<String>>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,
@@ -285,6 +307,14 @@ pub(crate) struct KvReport {
     /// One past the last slot the lane's rows landed at, in the set's own
     /// slot numbering, for a lane whose rows land where the device says.
     pub(crate) end: Option<u32>,
+}
+
+impl Shell {
+    /// What this load timed, each by name: empty where it measured nothing.
+    #[must_use]
+    pub fn measured_at_load(&self) -> Vec<String> {
+        self.measured.borrow().clone()
+    }
 }
 
 impl Shell {
@@ -641,7 +671,8 @@ impl Shell {
         self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
-    /// Seats this rank's share of `budget` disk bytes under `dir`: disk
+    /// Seats this rank's share of `budget` disk bytes under `dir`, where a
+    /// positive budget is stated (none, or 0: no disk tier): disk
     /// chunks of a pool chunk each, any state shape's slots in any chunk,
     /// laid out as the device's (CONTRACT-BC 22), the division stated at
     /// load. `persistent` keeps its slot file for the next run. Answers
@@ -651,70 +682,19 @@ impl Shell {
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
         persistent: bool,
-        seats: u32,
-        context: u32,
         world: crate::World,
     ) -> Result<u32> {
         let ranks = u64::from(world.size.max(1));
         let keep =
             persistent.then(|| format!("{} rank {}/{}", self.trace().name, world.rank, ranks));
         let keep = keep.as_deref();
+        // The tier is stated config only: no budget (or 0) is no disk tier.
         let stated = match (budget, dir) {
-            (Some(0), _) | (_, None) => None,
-            (Some(bytes), Some(dir)) => {
+            (Some(bytes), Some(dir)) if bytes > 0 => {
                 self.pools.seat_disk(dir, world.rank, bytes / ranks, keep)?;
                 Some(bytes / ranks)
             }
-            (None, Some(dir)) => {
-                // What kept files take already is theirs again, so a restart
-                // sizes the tier as the run that wrote it did.
-                let kept: u64 = if persistent {
-                    (0..world.size.max(1))
-                        .map(|rank| engine::disk::kept_bytes(dir, &crate::store::disk_file(rank)))
-                        .sum()
-                } else {
-                    0
-                };
-                // Derived on its own ([`engine::disk::derived_budget`]): the
-                // disk chunks `seats` sequences' kv pages at `context` and
-                // their state take, within this rank's share of the free
-                // disk; nothing of the device pool enters it. Never four times the host
-                // tier (a host budget below one chunk seated no disk tier)
-                // nor a quarter of the disk. One that cannot be seated is
-                // refused by name.
-                let free = engine::disk::free_space(dir).saturating_add(kept);
-                let paging = self.pools.paging();
-                let pages = u64::from(seats)
-                    * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
-                let per_chunk = self
-                    .pools
-                    .chunk_layout()
-                    .list
-                    .as_ref()
-                    .map_or(1, |list| u64::from(list.per_chunk.max(1)));
-                let chunk = self.pools.disk_chunk_bytes();
-                let state = (u64::from(seats) * self.state_row_bytes()).div_ceil(chunk.max(1));
-                // The guest state the device can hold live (the room a
-                // guest program binds within): evicted, it has a home.
-                let guest = self.chunk_facts()?.guest_room_bytes();
-                let bytes = engine::disk::derived_budget(
-                    0,
-                    0,
-                    pages.div_ceil(per_chunk) + state,
-                    chunk,
-                    guest,
-                    free / ranks,
-                );
-                // Its inputs, stated at load: what the field rules on.
-                eprintln!(
-                    "engine-cuda: the unstated disk tier: {bytes} bytes = {seats} seats x                      {context} tokens: {pages} kv pages in {} chunks and {state} chunks of state                      ({} B a seat), and {guest} B of guest state the device holds live, chunks of {chunk} B, within {} bytes free a rank",
-                    pages.div_ceil(per_chunk),
-                    self.state_row_bytes(),
-                    free / ranks,
-                );
-                self.pools.seat_disk(dir, world.rank, bytes, keep)?;
-                Some(bytes)
-            }
+            _ => None,
         };
         let chunks = self.pools.disk_chunks();
         if let (Some(budget), true) = (stated, chunks > 0) {
@@ -796,6 +776,37 @@ impl Shell {
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.pools.state_slot_bytes()
+    }
+
+    /// The bytes a record takes, its rings' among them.
+    #[must_use]
+    pub fn record_bytes(&self) -> u64 {
+        self.pools.record_bytes()
+    }
+
+    /// What this load's windowed fires have done since it loaded.
+    #[must_use]
+    pub fn ring_seen(&self) -> RingSeen {
+        self.ring_seen
+    }
+
+    /// The side streams this load's fires fork regions onto.
+    #[must_use]
+    pub fn side_streams(&self) -> usize {
+        self.device.side_streams().len()
+    }
+
+    /// The record a slot ref names (`Pools::record_key`).
+    #[must_use]
+    pub fn record_key(&self, slot: u32) -> u32 {
+        self.pools.record_key(slot)
+    }
+
+    /// The windowed layers the record holds the rings of; none where the
+    /// load serves its windowed rows by window lists.
+    #[must_use]
+    pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
+        self.pools.windowed_layers()
     }
 
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
@@ -1476,6 +1487,9 @@ pub(crate) struct MergeLand {
 }
 
 pub struct Prepared<'a> {
+    /// The ring work of a fire of windowed lanes: the pages filled before
+    /// it, the rows folded after.
+    ring_work: ring::Work,
     lanes: &'a [Seated<'a>],
     attachments: &'a [Attached],
     composition: Composition,

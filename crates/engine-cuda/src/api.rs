@@ -193,7 +193,6 @@ impl Cuda {
         &self,
         trace: &Trace,
         path: &Path,
-        residency: &engine::Residency,
     ) -> EngineResult<(ModelContract, crate::experts::Plan)> {
         let contract = (self.contract_for)(trace, path).map_err(Error::Load)?;
         let prospect =
@@ -208,7 +207,6 @@ impl Cuda {
             crate::store::layout::streamed_experts(trace)
         };
         let ranking = prospect.ranking.clone().caching(&cached);
-        let _ = residency;
         Ok((contract, crate::experts::Plan::cut(&ranking)))
     }
 
@@ -599,6 +597,30 @@ impl Engine for Cuda {
         "cuda"
     }
 
+    fn cover_fingerprint(&self) -> Option<String> {
+        let print = self.shell.as_ref()?.cover_fingerprint();
+        eprintln!(
+            "engine-cuda: the host cover's key: {print} (the device, its kernels' code, the \
+             guest emitter's version, the decode products' picks and a fire's lanes and tokens)"
+        );
+        Some(print)
+    }
+
+    fn committed_covers(&self) -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    fn measured_at_load(&self) -> Vec<String> {
+        self.shell
+            .as_ref()
+            .map(crate::serve::Shell::measured_at_load)
+            .unwrap_or_default()
+    }
+
+    fn skips_measuring(&self) -> bool {
+        self.boot.knobs.measuring == engine::rates::Measuring::Skip
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
     }
@@ -662,7 +684,7 @@ impl Engine for Cuda {
             trace.platform.backend(),
             width_free(&trace.name),
         )?;
-        let (contract, plan) = self.settle(&trace, &path, &residency)?;
+        let (contract, plan) = self.settle(&trace, &path)?;
         let kv_budget = match (residency.device_kv_budget, residency.device_kv_tokens) {
             (Some(_), Some(_)) => {
                 return Err(Error::Load(
@@ -678,16 +700,29 @@ impl Engine for Cuda {
         // Every rank on the host seats its own tier: a tensor-parallel
         // group's and each expert-parallel rank's.
         let ranks = self.boot.world.size * self.expert.size;
+        // On a device whose memory is the host's (`cudaDevAttrIntegrated`)
+        // no host tier is seated, nor its staging ring pinned: suspended kv
+        // goes to the disk, and a stated tier is refused by name.
+        let bound = if ordinal >= 0 {
+            ordinal
+        } else {
+            self.boot.ordinal
+        };
+        let memory = crate::device::card::whose_memory(bound).map_err(fault)?;
+        let host_tier = memory
+            .host_tier(residency.host_kv_budget)
+            .map_err(|why| Error::Load(format!("engine-cuda: {why}")))?;
         // The host tier's staging ring is page-locked here, before anything
-        // measures the device: on an integrated device the ring and the
-        // device draw on the same memory, and what the ring holds is then
-        // gone from the driver's free bytes and Windows' commit alike. A
-        // ring that cannot be pinned refuses the load, here and not after
-        // ready.
+        // measures the device, so what it holds is counted gone before the
+        // device's free bytes are read. A ring that cannot be pinned refuses
+        // the load, here and not after ready.
         let frames = engine::runahead::Runahead::of(frames_in_flight).frames_in_flight;
-        let ring = crate::store::staging_ring_for(residency.host_kv_budget, ranks, frames)
-            .and_then(|size| size.map(crate::store::Ring::pin).transpose())
-            .map_err(fault)?;
+        let ring = match host_tier {
+            engine::HostTier::Absent => None,
+            engine::HostTier::Seated(stated) => crate::store::staging_ring_for(stated, ranks, frames)
+                .and_then(|size| size.map(crate::store::Ring::pin).transpose())
+                .map_err(fault)?,
+        };
         if let Some(ring) = &ring {
             let size = ring.size();
             eprintln!(
@@ -721,11 +756,7 @@ impl Engine for Cuda {
             slots: budgets.slots,
             kv_budget,
             allowance: residency.device,
-            ordinal: if ordinal >= 0 {
-                ordinal
-            } else {
-                self.boot.ordinal
-            },
+            ordinal: bound,
             knobs: crate::Knobs {
                 weights_held: residency.weights_held,
                 ..self.boot.knobs.clone()
@@ -755,30 +786,37 @@ impl Engine for Cuda {
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The context the load serves, a declared one as the load's room cut it.
         let context = shell.paging().context();
-        shell
-            .seat_host_kv(
-                residency.host_kv_budget,
-                residency.kv_seats.unwrap_or(budgets.max_lanes),
-                context,
-                ranks,
-                ring,
-            )
-            .map_err(fault)?;
+        if let engine::HostTier::Seated(stated) = host_tier {
+            shell
+                .seat_host_kv(
+                    stated,
+                    residency.kv_seats.unwrap_or(budgets.max_lanes),
+                    context,
+                    ranks,
+                    ring,
+                )
+                .map_err(fault)?;
+        }
         let kv_handle = if residency.kv_export {
             Some(shell.export_kv(self.boot.world).map_err(fault)?)
         } else {
             None
         };
-        shell
+        let disk_pages = shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
                 residency.disk_kv_persistent,
-                residency.kv_seats.unwrap_or(budgets.max_lanes),
-                context,
                 self.boot.world,
             )
             .map_err(fault)?;
+        if memory.unified() {
+            eprintln!(
+                "engine-cuda: {} ({} disk kv pages)",
+                engine::DeviceMemory::NO_HOST_TIER,
+                disk_pages
+            );
+        }
 
         // Expert parallelism seats its buffers in the arena laid at the
         // span's start: no smaller rung.
@@ -786,7 +824,9 @@ impl Engine for Cuda {
             shell.drop_rungs();
         }
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
-        chunk_facts.record_bytes = shell.state_slot_bytes();
+        chunk_facts.record_bytes = shell.record_bytes();
+        chunk_facts.windowed = shell.windowed_layers();
+        let windowed_state = !chunk_facts.windowed.is_empty();
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -807,7 +847,7 @@ impl Engine for Cuda {
                 backend: "cuda".to_string(),
                 domain: MemoryDomain::CudaDevice(u32::try_from(shell.ordinal()).unwrap_or(0)),
                 sms: shell.sms(),
-                unified_memory: false,
+                unified_memory: memory.unified(),
                 fp8_native: false,
                 native_mxfp4_moe: false,
                 storage_alignment: 256,
@@ -860,7 +900,13 @@ impl Engine for Cuda {
             kv_handle,
             media_encode: false,
             rs_verbs: true,
-            rs_snapshots: if state_rows && shell.lands_snapshots() {
+            windowed_state,
+            // A load of rings alone lands its snapshots itself
+            // (`serve::ring`); one of recurrent state too, as its state
+            // lands them.
+            rs_snapshots: if (state_rows && shell.lands_snapshots())
+                || (windowed_state && !state_rows)
+            {
                 crate::store::rs::SNAPSHOTS
             } else {
                 0
@@ -989,6 +1035,13 @@ impl Engine for Cuda {
             endpoint.rebase(at);
         }
         Ok(())
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        self.shell
+            .as_ref()
+            .map(|shell| shell.chunk_table().clone())
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))
     }
 
     fn program_facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
@@ -1147,7 +1200,7 @@ impl Engine for Cuda {
 
     fn copy_slots(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::store::Tier;
-        use crate::store::layout::{FIXED, LIST, WINDOW};
+        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
         let tier = |domain| match domain {
             MemoryDomain::CudaDevice(_) => Some(Tier::Device),
             MemoryDomain::HostPinned => Some(Tier::Host),
@@ -1174,14 +1227,18 @@ impl Engine for Cuda {
                 .copy_tier_slots(copy.shape, from, to, &copy.slots)
                 .map_err(fault);
         }
-        if copy.shape == FIXED {
+        if copy.shape == FIXED || copy.shape == RING {
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
                     "a fixed record is copied whole, not a run of its tokens".into(),
                 ));
             }
+            // A record is one unit across its shapes: named by any shape's
+            // first piece, copied whole.
             for &(src, dst) in &copy.slots {
-                shell.fork_state(src, dst).map_err(fault)?;
+                shell
+                    .fork_state(shell.record_key(src), shell.record_key(dst))
+                    .map_err(fault)?;
             }
             return Ok(());
         }
@@ -1735,7 +1792,7 @@ impl Cuda {
         // kv refs, and its recurrent record is the pairs `fixed` names, a
         // piece each, copied onto the slots the fire writes where the two
         // differ.
-        use crate::store::layout::{FIXED, LIST, WINDOW};
+        use crate::store::layout::{FIXED, LIST, RING, WINDOW};
         let by_refs = submission.lanes.iter().any(|lane| {
             !lane.tables.is_empty()
                 || !matches!(lane.record, engine::fire::LaneRecord::Unstated)
@@ -1773,7 +1830,16 @@ impl Cuda {
             nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
             let record = match pieces {
                 [] => None,
-                [(shape, pieces)] if *shape == FIXED => {
+                // A record's pieces: its rings' first, then its state's
+                // (CONTRACT-BC 21), named as one record by its first.
+                stated
+                    if stated.iter().all(|(shape, _)| *shape == FIXED || *shape == RING)
+                        && stated.windows(2).all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>
+                {
+                    let pieces: Vec<[u32; 2]> = stated
+                        .iter()
+                        .flat_map(|(_, pieces)| pieces.iter().copied())
+                        .collect();
                     let runs: Vec<u32> = pieces.iter().map(|[run, _]| *run).collect();
                     let written: Vec<u32> = pieces.iter().map(|[_, written]| *written).collect();
                     let run = shell.name_record(&runs).map_err(fault)?;
@@ -1795,9 +1861,21 @@ impl Cuda {
             for snap in lane
                 .rs_snapshots
                 .iter()
-                .filter(|snap| !snap.pieces.is_empty())
+                .filter(|snap| !snap.pieces.is_empty() || !snap.fixed.is_empty())
             {
-                let named = shell.name_record(&snap.pieces).map_err(fault)?;
+                // A record of rings and state names its pieces a shape at a
+                // time: the rings' first.
+                let pieces: Vec<u32> = if snap.fixed.is_empty() {
+                    snap.pieces.clone()
+                } else {
+                    snap.fixed
+                        .iter()
+                        .filter(|(shape, _)| *shape == RING)
+                        .chain(snap.fixed.iter().filter(|(shape, _)| *shape == FIXED))
+                        .flat_map(|(_, pieces)| pieces.iter().copied())
+                        .collect()
+                };
+                let named = shell.name_record(&pieces).map_err(fault)?;
                 if named != snap.slot {
                     return Err(Error::Invalid(format!(
                         "lane in slot {} snapshots into the record at slot ref {}, whose \
@@ -1864,6 +1942,7 @@ impl Cuda {
                     },
                     write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
+                    window_fold: lane.window.clone(),
                     more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1874,6 +1953,7 @@ impl Cuda {
                         .or(nulls[at].then_some(0)),
                     rs_read: records[at].map(|(run, _)| run),
                     rs_snapshots: &lane.rs_snapshots,
+                    replay_stated: lane.replay_stated,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,

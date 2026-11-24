@@ -492,6 +492,33 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         })?))
     }
 
+    async fn share(
+        &mut self,
+        this: Resource<WorkingSet>,
+        scope: pie::inferlet::working_set::ShareScope,
+    ) -> Result<Result<(), String>> {
+        use crate::policy::share::{ShareAs, ShareScope};
+        use pie::inferlet::working_set::ShareScope as Wit;
+        let ask = match self.keying() {
+            Some(crate::inferlet::process::Keying::Asker(asker)) => ShareAs::Scope(
+                match scope {
+                    Wit::Session => ShareScope::Session,
+                    Wit::Tenant => ShareScope::Tenant,
+                    Wit::Group(name) => ShareScope::Group(name),
+                },
+                asker.clone(),
+            ),
+            Some(crate::inferlet::process::Keying::OnBehalf(domain)) => ShareAs::OnBehalf(*domain),
+            None => return Ok(Err("share: this process has no authenticated tenant".to_string())),
+        };
+        let kv_rep = self.ctx().table.get(&this)?.kv;
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        Ok(store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+            s.share(kv.id, ask)
+        }))
+    }
+
     async fn drop(&mut self, this: Resource<WorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.delete(this)?;

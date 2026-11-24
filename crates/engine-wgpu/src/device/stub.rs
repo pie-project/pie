@@ -71,6 +71,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn whose_memory(&self) -> engine::DeviceMemory {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn max_buffer(&self) -> u64 {
         match self.never {}
     }

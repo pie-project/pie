@@ -71,7 +71,12 @@ pub enum TuneCmd {
     /// `<out>/<device>.measured.toml`: each entry with its key, in a fixed
     /// order, no date or path. Checked in under
     /// `crates/engine-<backend>/profiles/`, a load of that device takes each
-    /// entry whose key matches and measures nothing more for it.
+    /// entry whose key matches and measures nothing more for it. Every
+    /// model's settle is said with the curves a boot of it reads, and left
+    /// out where one is not carried. Every committed profile is boot-checked
+    /// before it is pushed: a boot on a clean home with only the committed
+    /// file measures nothing and serves c1 / c8 within 2% of the measured
+    /// home it came from.
     Export {
         /// The engine whose stored measurements to write: `vulkan`, `wgpu`,
         /// `cuda` (CUDA or ROCm, as the build hosts it).
@@ -278,16 +283,38 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
         )
     };
     let dir = crate::paths::pie_home().join("profiles");
-    let exported =
-        match runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0)) {
-            Ok(exported) => exported,
-            Err(why) if !bodies.is_empty() => {
-                return Ok(format!("no stored rates to write ({why}).\n{bodies}"));
-            }
-            Err(why) => return Err(anyhow!(why)),
-        };
-    let path = out.join(&exported.name);
-    std::fs::write(&path, &exported.text)?;
+    let exported = runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0))
+        .map_err(|e| anyhow!(e))?;
+    let named = match &exported.unprobed {
+        Some(why) => format!(
+            "the {} engine was not probed ({why}): the device is `{}`, the one the home's stored \
+             measurements are filed under.\n",
+            backend.name, exported.device
+        ),
+        None => String::new(),
+    };
+    // Each part the home holds is written; each it holds none of is named.
+    let measured = match &exported.measured {
+        Ok((name, text)) => {
+            let path = out.join(name);
+            std::fs::write(&path, text)?;
+            format!(
+                "wrote {} from {}: the stored measurements of {}, each under its key.\n\
+                 A build carries it once it is listed beside the engine's checked-in profiles \
+                 (crates/engine-{}/src/chip.rs, `\"{name}\"`); a load of that device then takes \
+                 each entry whose key matches.\n",
+                ui::short_path(&path),
+                ui::short_path(&exported.from),
+                exported.device,
+                backend.name,
+            )
+        }
+        Err(why) => format!("no measured profile written: {why}.\n"),
+    };
+    let measured = exported
+        .report
+        .iter()
+        .fold(measured, |out, line| format!("{out}{line}\n"));
     let covers = match &exported.covers {
         Some((name, text)) => {
             let at = out.join(name);
@@ -300,18 +327,20 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
                 backend.name,
             )
         }
-        None => "no host cover is cached for it in this home.\n".to_string(),
+        None => "no host covers written: none is cached for it in this home.\n".to_string(),
     };
-    let main = format!(
-        "wrote {} from {}: the stored measurements of {}, each under its key.\n\
-         A build carries it once it is listed beside the engine's checked-in profiles \
-         (crates/engine-{}/src/chip.rs, `\"{}\"`); a load of that device then takes each entry \
-         whose key matches.\n{bodies}",
-        ui::short_path(&path),
-        ui::short_path(&exported.from),
-        exported.device,
-        backend.name,
-        exported.name,
-    );
-    Ok(main + &covers)
+    if bodies.is_empty() && exported.measured.is_err() && exported.covers.is_none() {
+        return Err(anyhow!(
+            "this home holds nothing of {} to export: {}{}no bodies record of this build",
+            exported.device,
+            measured,
+            covers
+        ));
+    }
+    if bodies.is_empty() {
+        return Ok(format!(
+            "{named}{measured}{covers}no bodies record written: none of this build.\n"
+        ));
+    }
+    Ok(format!("{named}{measured}{covers}{bodies}"))
 }

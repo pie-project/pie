@@ -327,14 +327,21 @@ fn prefill_keys(deployment: &Deployment, into: &mut Targets) {
             if deployment.drafting.contains(&class) && !deployment.rs_rungs.contains(&point) {
                 continue;
             }
-            match Shell::spread(
-                point,
-                deployment.seats.min(match deployment.prefill_lanes {
-                    0 => deployment.max_lanes,
-                    cap => deployment.max_lanes.min(cap),
-                }),
-                deployment.context,
-            ) {
+            // A drafting class fires its rows on one lane (a block draft, a
+            // verify): its body is recorded for that schedule.
+            let spread = if deployment.drafting.contains(&class) {
+                (point <= deployment.context).then(|| vec![point])
+            } else {
+                Shell::spread(
+                    point,
+                    deployment.seats.min(match deployment.prefill_lanes {
+                        0 => deployment.max_lanes,
+                        cap => deployment.max_lanes.min(cap),
+                    }),
+                    deployment.context,
+                )
+            };
+            match spread {
                 Some(rows) => into
                     .targets
                     .push((point, BodySynth::Prefill { class, rows })),
@@ -653,10 +660,19 @@ impl Shell {
 
     fn representative(&self, class: usize, rows: u32, wants_media: bool) -> poem_ir::Request {
         let landing = &self.landing[class];
+        // A bare request first (no adapter, no score capture): a switched
+        // class's lands beside its adapter and scoring twins.
+        let bare = |request: &&poem_ir::Request| !request.has_adapter() && !request.captures_scores();
         landing
             .iter()
+            .filter(bare)
             .find(|request| {
                 request.has_media() == wants_media && (request.query_len() == 1) == (rows == 1)
+            })
+            .or_else(|| {
+                landing.iter().find(|request| {
+                    request.has_media() == wants_media && (request.query_len() == 1) == (rows == 1)
+                })
             })
             .or_else(|| {
                 landing
@@ -689,6 +705,7 @@ impl Shell {
                 translation: &[],
                 write_end: 0,
                 window: &lane.window,
+                window_fold: None,
                 more_windows: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
@@ -698,6 +715,7 @@ impl Shell {
                 rs_slot: None,
                 rs_read: None,
                 rs_snapshots: &[],
+                replay_stated: None,
                 group: None,
                 inputs: &[],
                 reports: 0,
@@ -1241,6 +1259,17 @@ impl Shell {
         let max_lanes = self.fire_lanes();
         let classes = self.compiled.classes.classes.len();
         let textual = |class: usize| !self.media.contains(class);
+        // A class past the plain tiers whose fires run a kernel arm of their
+        // own (a switch: dflash's block draft) but no adapter, no score
+        // capture and no media: a served program fires it, so the lattice
+        // captures it at load, keyed as its fire keys (by its bucket alone).
+        let switched = |class: usize| {
+            !self.tiers.plain.contains(class)
+                && !self.landing[class].is_empty()
+                && self.landing[class].iter().any(|request| {
+                    !request.has_adapter() && !request.captures_scores() && !request.has_media()
+                })
+        };
         let staged = self
             .towered
             .then_some(self.patch_seat)
@@ -1257,13 +1286,15 @@ impl Shell {
             decoders: self
                 .decoding
                 .iter()
-                .filter(|class| textual(*class) && self.tiers.plain.contains(*class))
+                .filter(|class| {
+                    textual(*class) && (self.tiers.plain.contains(*class) || switched(*class))
+                })
                 .collect(),
             prefilling: (0..classes)
                 .filter(|class| {
                     !self.decoding.contains(*class)
                         && textual(*class)
-                        && self.tiers.plain.contains(*class)
+                        && (self.tiers.plain.contains(*class) || switched(*class))
                 })
                 .collect(),
             media: self
@@ -1347,7 +1378,11 @@ impl Shell {
                     }
                     _ => None,
                 };
-                let buffers = buffering && rungs.contains(&bucket) && class.is_some();
+                // A wide composition (a class past the plain tiers, keyed
+                // by its bucket alone: a block drafter's verify) buffers and
+                // replays its rows too.
+                let keyed = class.is_some() || matches!(target, BodySynth::Wide { .. });
+                let buffers = buffering && rungs.contains(&bucket) && keyed;
                 // A decoding class replays its carried rows in the body that
                 // buffers (`dispatch::ssm`): it records no replaying body.
                 let decodes = class.is_some_and(|class| self.decoding.contains(class as usize));

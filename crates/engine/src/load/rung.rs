@@ -1,19 +1,27 @@
 //! The top rung a load lays its fires up to (the ruling): of the feasible
-//! rungs, the one whose throughput, against the best any feasible rung
-//! reaches, least gives up for the share of the live range its span takes:
+//! rungs, the one whose fire turns the most of its time into useful work
+//! for the share of the live range its span takes:
 //!
-//! `r_top = argmax_r eff(r) · (1 − span(r) / M)`, `eff(r) = (r / t(r)) /
-//! max_r' (r' / t(r'))`,
+//! `r_top = argmax_r eff(r) · (1 − span(r) / M)`, `eff(r) = r / (r + r*)`,
 //!
-//! `t(r)` a fire's time at rung width `r`, `span(r)` the activation span the
-//! rung reserves, `M` the live range kv and activation share at load. No
-//! constant weighs either term, and an exact tie goes to the narrower rung.
+//! `r*` the roofline crossover, the rows at which a fire's weight read
+//! takes as long as its matmuls' compute; `span(r)` the activation span the
+//! rung reserves, `M` the live range kv and activation share at load. A fire
+//! of `r` rows reads its weights once and computes `r` rows over them, so
+//! `r / (r + r*)` is the share of its weight time that is compute. Over
+//! several weight groups it is the groups' compute over their compute and
+//! read together ([`FireEstimate::eff`]), each group's compute at the rows
+//! its kernel sees: a dense plane the fire's rows, a routed bank the rows
+//! each expert is handed (`r · k / E`), whose weights it reads only for
+//! those. No constant weighs either term, and an exact tie goes to the
+//! narrower rung.
 //!
-//! `t(r)` is the estimate alone ([`FireEstimate::ns`]): work over the
-//! device's rates (the profile's `[rates]`), counted from what the load
-//! knows of the model and the compiled plan. No measured fire time is read
-//! at load; measured fire times only test the estimate (`pie tune
-//! --check-estimate`).
+//! Read and compute are the estimate's alone ([`FireEstimate::terms`]):
+//! work over the device's rates (the profile's `[rates]`), counted from what
+//! the load knows of the model and the compiled plan. No measured fire time
+//! is read at load; measured fire times only test the estimate (`pie tune
+//! --check-estimate`), their crossover fitted from them
+//! ([`measured_effs`]).
 
 use std::fmt;
 
@@ -202,7 +210,7 @@ impl FireEstimate {
                 // grouped kernel the curve stands for.
                 let ns = if s.routed {
                     if flops > 0.0 {
-                        flops / self.rates.gemm_rate(rows, s.n, s.k)
+                        flops / self.rates.gemm_rate(self.expert_rows(rows), s.n, s.k)
                     } else {
                         0.0
                     }
@@ -293,6 +301,48 @@ impl FireEstimate {
             head_read,
             dispatched,
         }
+    }
+
+    /// The rows each routed expert is handed in a fire of `rows`: the
+    /// fire's rows times the `k` of `E` experts a row picks, shared by the
+    /// `E` (at least one).
+    #[must_use]
+    pub fn expert_rows(&self, rows: u32) -> u32 {
+        match self.experts {
+            Some((k, e)) if e > 0 => {
+                let handed = u64::from(rows) * u64::from(k.min(e));
+                u32::try_from(handed.div_ceil(u64::from(e))).unwrap_or(u32::MAX).max(1)
+            }
+            _ => rows,
+        }
+    }
+
+    /// The ruling's efficiency of a fire at `rung`, `r / (r + r*)` over its
+    /// weight groups: each group's compute at the device's full matmul rate
+    /// at its shape (the top of the curve), over that compute and the
+    /// group's weight read together. A group of `r*` rows reads its weights
+    /// in the time it computes them at that rate (the roofline crossover);
+    /// a fire's compute share over its groups is `r / (r + r*)` with `r*`
+    /// their reads over their compute a row. A routed bank's weights are
+    /// read as far as the fire's rows touch them and computed only for the
+    /// `k` of `E` experts each row picks: its crossover is at the rows each
+    /// expert is handed ([`Self::expert_rows`]), `E / k` times its fire's.
+    /// A fire with neither is wholly efficient.
+    #[must_use]
+    pub fn eff(&self, rung: &RungFacts) -> f64 {
+        let rows = f64::from(rung.tokens);
+        let touched = self.touched(rung.tokens);
+        let (mut compute, mut read) = (0.0, 0.0);
+        for s in &self.gemm_shapes {
+            let full = self.rates.gemm_rate(u32::MAX, s.n, s.k);
+            if full > 0.0 && full.is_finite() {
+                compute += rows * s.flops_per_row as f64 / full;
+            }
+            let bytes = s.bytes as f64 * if s.routed { touched } else { 1.0 };
+            read += bytes / self.rates.bytes_per_ns;
+        }
+        let whole = compute + read;
+        if whole > 0.0 { compute / whole } else { 1.0 }
     }
 
     /// The share of the experts a fire of `tokens` touches.
@@ -500,9 +550,10 @@ pub fn top_rung(
             "top rung: a rung weighed"
         );
     }
+    let effs: Vec<f64> = rungs.iter().map(|r| estimate.eff(r)).collect();
     let feasible: Vec<(&RungFacts, f64)> = rungs
         .iter()
-        .zip(times.iter().copied())
+        .zip(effs.iter().copied())
         .filter(|(r, _)| r.infeasible.is_none())
         .collect();
     for (&(rung, _), (eff, live_share, score)) in
@@ -516,7 +567,7 @@ pub fn top_rung(
             "top rung: a feasible rung scored"
         );
     }
-    pick(rungs, &times, live_capacity_bytes)
+    pick(rungs, &effs, live_capacity_bytes)
 }
 
 /// The fire top: the ruling's top rung ([`top_rung`]) over the rungs a
@@ -542,17 +593,18 @@ pub fn fire_top(
     top_rung(&held, live_capacity_bytes, estimate)
 }
 
-/// The ruling's argmax over `rungs` whose fires take `times` (ns, one a
-/// rung): what [`top_rung`] weighs by the estimate, and what a check of the
-/// estimate weighs by measured times.
+/// The ruling's argmax over `rungs` whose fires are `effs` efficient (one
+/// a rung, [`FireEstimate::eff`] or [`measured_effs`]): what [`top_rung`]
+/// weighs by the estimate, and what a check of the estimate weighs by
+/// measured times.
 pub fn pick(
     rungs: &[RungFacts],
-    times: &[f64],
+    effs: &[f64],
     live_capacity_bytes: u64,
 ) -> Result<TopRung, NoRung> {
     let mut feasible: Vec<(&RungFacts, f64)> = rungs
         .iter()
-        .zip(times.iter().copied())
+        .zip(effs.iter().copied())
         .filter(|(r, _)| r.infeasible.is_none())
         .collect();
     if feasible.is_empty() {
@@ -592,44 +644,56 @@ pub fn pick(
     Ok(chosen(feasible[k].0, TopWhy::Argmax { eff, live_share }))
 }
 
-/// `(eff, live share, score)` of each of `feasible` (`(rung, ns)`).
+/// `(eff, live share, score)` of each of `feasible` (`(rung, eff)`).
 fn scores(feasible: &[(&RungFacts, f64)], live: u64) -> Vec<(f64, f64, f64)> {
-    // Tokens a nanosecond; a rung timed at nothing is unboundedly fast.
-    let throughput: Vec<f64> = feasible
-        .iter()
-        .map(|&(r, t)| {
-            if t > 0.0 {
-                f64::from(r.tokens) / t
-            } else {
-                f64::INFINITY
-            }
-        })
-        .collect();
-    let best = throughput.iter().copied().fold(0.0, f64::max);
     feasible
         .iter()
-        .zip(&throughput)
-        .map(|(&(rung, _), &thr)| {
-            let eff = if best.is_infinite() {
-                if thr.is_infinite() { 1.0 } else { 0.0 }
-            } else if best > 0.0 {
-                thr / best
-            } else {
-                0.0
-            };
+        .map(|&(rung, eff)| {
             let live_share = share(rung.span_bytes, live);
             (eff, live_share, eff * (1.0 - live_share))
         })
         .collect()
 }
 
-/// Each feasible rung's score under `times` (ns, one a rung), by tokens:
-/// what a check of the estimate compares the two picks by.
+/// The ruling's efficiency of each of `rungs` whose fires measured `times`
+/// (ns, one a rung; a rung at nothing unmeasured): `r / (r + r*)`, `r*` the
+/// crossover of the line the measured fires fit (least squares, `t = a + b
+/// r`: `a` what a fire takes whatever its rows, the weights' read among it,
+/// and `b` a row's work), `r* = a / b`. Where the fit leaves no fixed part
+/// (`a <= 0`) or no row's work (`b <= 0`), every rung is wholly efficient.
 #[must_use]
-pub fn scored(rungs: &[RungFacts], times: &[f64], live_capacity_bytes: u64) -> Vec<(u32, f64)> {
+pub fn measured_effs(rungs: &[RungFacts], times: &[f64]) -> Vec<f64> {
+    let points: Vec<(f64, f64)> = rungs
+        .iter()
+        .zip(times)
+        .filter(|&(_, &t)| t > 0.0)
+        .map(|(r, &t)| (f64::from(r.tokens), t))
+        .collect();
+    let n = points.len() as f64;
+    let (sx, sy) = points.iter().fold((0.0, 0.0), |(x, y), &(px, py)| (x + px, y + py));
+    let (mx, my) = (sx / n.max(1.0), sy / n.max(1.0));
+    let (sxy, sxx) = points.iter().fold((0.0, 0.0), |(xy, xx), &(px, py)| {
+        (xy + (px - mx) * (py - my), xx + (px - mx) * (px - mx))
+    });
+    let b = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let a = my - b * mx;
+    let crossover = if a > 0.0 && b > 0.0 { a / b } else { 0.0 };
+    rungs
+        .iter()
+        .map(|r| {
+            let rows = f64::from(r.tokens);
+            if rows + crossover > 0.0 { rows / (rows + crossover) } else { 1.0 }
+        })
+        .collect()
+}
+
+/// Each feasible rung's score under `effs` (one a rung), by tokens: what
+/// a check of the estimate compares the two picks by.
+#[must_use]
+pub fn scored(rungs: &[RungFacts], effs: &[f64], live_capacity_bytes: u64) -> Vec<(u32, f64)> {
     let mut feasible: Vec<(&RungFacts, f64)> = rungs
         .iter()
-        .zip(times.iter().copied())
+        .zip(effs.iter().copied())
         .filter(|(r, _)| r.infeasible.is_none())
         .collect();
     feasible.sort_by_key(|(r, _)| r.tokens);
@@ -747,13 +811,15 @@ mod tests {
 
     #[test]
     fn the_argmax_picks_the_documented_rung() {
-        // t(r) = 1000 + r: live 1024 MiB.
-        // r=  64: r/t = .0602, eff .0661, share  8/1024, score .0656
-        // r= 512: r/t = .3386, eff .3718, share  64/1024, score .3486
-        // r=4096: r/t = .8038, eff .8826, share 128/1024, score .7723
-        // r=8192: r/t = .8912, eff .9786, share 256/1024, score .7339
-        // r=10240: r/t = .9107, eff 1, share 400/1024, score .6094
-        let (e, at) = summed(1000, 1.0);
+        // The weights read in 1000 ns, a row's matmul 1 ns: r* = 1000,
+        // eff = r / (r + 1000); live 1024 MiB.
+        // r=  64: eff .0602, share   8/1024, score .0597
+        // r= 512: eff .3386, share  64/1024, score .3174
+        // r=4096: eff .8038, share 128/1024, score .7033
+        // r=8192: eff .8912, share 256/1024, score .6684
+        // r=10240: eff .9110, share 400/1024, score .5551
+        let e = estimate(1000, 1.0);
+        let at = rung;
         let rungs = [
             at(64, 8),
             at(512, 64),
@@ -766,14 +832,16 @@ mod tests {
         let TopWhy::Argmax { eff, live_share } = top.why else {
             panic!("{top:?}")
         };
-        assert!((eff - (4096.0 / 5096.0) / (10240.0 / 11240.0)).abs() < 1e-12);
+        assert!((eff - 4096.0 / 5096.0).abs() < 1e-12);
         assert!((live_share - 0.125).abs() < 1e-12);
     }
 
     #[test]
     fn a_narrow_fire_reads_the_curve_where_it_runs_slower() {
-        // The matmul at a fifth of its rate at 16 rows, whole from 64: 16
-        // tokens cost what 64 do, and the narrow rung does not win.
+        // The matmul at a quarter of its rate at 16 rows, whole from 64: 16
+        // tokens cost what 64 do. Efficiency reads the full rate (the
+        // crossover is the roofline's), so a slow kernel at few rows is no
+        // efficiency, and the narrow rung does not win.
         let e = FireEstimate {
             rates: crate::roofline::Constants {
                 gemm_by_rows: vec![(1, vec![(16, 0.5), (64, 2.0)])],
@@ -788,15 +856,17 @@ mod tests {
         let rungs = [rung(16, 1), rung(64, 4)];
         let times: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
         assert_eq!(times, [640.0, 640.0]);
+        assert!((e.eff(&rungs[0]) - 160.0 / 260.0).abs() < 1e-12);
+        assert!((e.eff(&rungs[1]) - 640.0 / 740.0).abs() < 1e-12);
         let top = top_rung(&rungs, 1024 * MIB, &e).unwrap();
         assert_eq!(top.tokens, 64);
     }
 
     /// The M1's 1024-wide matmul curve: nearly flat from 256 to 512 rows,
     /// then a knee at 1024 (2.3 / 2.35 / 5.0 TFLOP/s). A rule that stops
-    /// where a doubling stops paying stops at 256; the fire top is the
-    /// ruling's argmax over the lattice, so it lies past the knee, bounded
-    /// by what a prompt holds alone.
+    /// where a doubling stops paying stops at 256; the ruling's efficiency
+    /// reads the curve's full rate, so the fire top lies past the knee,
+    /// bounded by what a prompt holds alone.
     #[test]
     fn the_fire_top_reaches_past_a_knee_after_a_flat_stretch() {
         let (e, at) = summed(0, 1.0);
@@ -852,10 +922,10 @@ mod tests {
     }
 
     /// A rung no wider than its lanes is weighed decode-shaped (a lane a
-    /// token, each attending one key), as the check fires it. Weighed as one
-    /// prompt each, attention growing with its square, 512 would run more
-    /// tokens a ns than 1024; decode-shaped, 1024 does. The fire top is the
-    /// check's pick by the estimate, so it is 1024.
+    /// token, each attending one key), as the check fires it. Its efficiency
+    /// is its weights' (attention reads no weights): 1024 is the further past
+    /// the crossover either way it is shaped, and the fire top is the check's
+    /// pick by the estimate.
     #[test]
     fn the_fire_top_is_the_checks_pick_as_its_fires_are_shaped() {
         // The weights read in 1000 ns, a token's matmul 1 ns, no readout.
@@ -876,13 +946,12 @@ mod tests {
             ..rung(tokens, 0)
         };
         let live = 1 << 30;
-        // As prompts the two rank the other way.
         let prompts = [prompt(512), prompt(1024)];
-        assert_eq!(top_rung(&prompts, live, &e).unwrap().tokens, 512);
+        assert_eq!(top_rung(&prompts, live, &e).unwrap().tokens, 1024);
         let rungs = [decode(512), decode(1024)];
         assert!(rungs.iter().all(RungFacts::decode_shaped));
-        let times: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
-        let pick = pick(&rungs, &times, live).unwrap();
+        let effs: Vec<f64> = rungs.iter().map(|r| e.eff(r)).collect();
+        let pick = pick(&rungs, &effs, live).unwrap();
         let top = fire_top(&rungs, live, &e, 4096).unwrap();
         assert_eq!((top.tokens, pick.tokens), (1024, 1024));
     }
@@ -902,13 +971,53 @@ mod tests {
         assert!(e.weight_bytes(1024) > 64_999.0);
     }
 
+    /// A routed bank's crossover is in the rows each expert is handed: a
+    /// fire of `r` rows hands each of 64 experts `r · 8 / 64`, so its
+    /// compute runs at the curve's rate there, and the bank's weights are
+    /// read whole once every expert is touched. Past a few hundred rows the
+    /// dense crossover is passed long before the routed one.
+    #[test]
+    fn a_routed_banks_crossover_is_at_the_rows_each_expert_sees() {
+        let e = FireEstimate {
+            rates: crate::roofline::Constants {
+                // Slow at few rows, whole from 256: a grouped kernel's curve.
+                gemm_by_rows: vec![(1, vec![(16, 0.25), (256, 2.0)])],
+                ..constants(0.0, 1.0)
+            },
+            experts: Some((8, 64)),
+            expert_bytes: 64_000,
+            gemm_shapes: vec![GemmShape {
+                n: 1,
+                k: 1,
+                flops_per_row: 2,
+                planes: 1,
+                bytes: 64_000,
+                routed: true,
+            }],
+            ..estimate(0, 0.0)
+        };
+        assert_eq!(e.expert_rows(1024), 128);
+        assert_eq!(e.expert_rows(1), 1);
+        // The estimate times the bank at the rate an expert's rows run.
+        let r = rung(1024, 0);
+        let t = e.terms(&r);
+        assert!((t.flops - 2048.0 / e.rates.gemm_rate(128, 1, 1)).abs() < 1e-9);
+        // The ruling's crossover: the bank read whole (64 000 ns at a byte a
+        // ns) against 2 flops a row at the full 2 a ns: r* = 64 000 rows, 8
+        // of 64 experts a row. A dense plane of the same bytes and flops a
+        // row reaches its crossover at the same rows; one computing every
+        // expert for every row (64 / 8 times the flops) would at 8 000.
+        assert!((e.eff(&r) - 1024.0 / (1024.0 + 64_000.0)).abs() < 1e-6);
+    }
+
     #[test]
     fn a_small_live_capacity_picks_a_narrow_top_rung() {
         // Qwen3-8B on an MI300X: 16.4 GB of bf16 weights read a fire at
         // about 5.3 TB/s (3.1 ms), 16 GFLOP a token at about 1.3 PFLOP/s
         // (12 µs); the activation span grows toward 7.3 GiB at 8192.
         let span = |gib: f64| (gib * GIB) as u64;
-        let (e, at) = summed(3_100_000, 12_000.0);
+        let e = estimate(3_100_000, 12_000.0);
+        let at = rung;
         let rungs: Vec<RungFacts> = [
             (256, 0.23),
             (512, 0.46),
@@ -932,8 +1041,8 @@ mod tests {
         let TopWhy::Argmax { eff, live_share } = narrow.why else {
             panic!("{narrow:?}")
         };
-        // The wide top's score at this live range: eff 1, its share 7.3 / 10.3.
-        let at_wide = 1.0 - 7.3 / 10.3;
+        // The wide top's score at this live range: its share 7.3 / 10.3.
+        let at_wide = e.eff(&rungs[5]) * (1.0 - 7.3 / 10.3);
         assert!(
             eff * (1.0 - live_share) > at_wide,
             "{narrow:?} against {at_wide}"
@@ -941,10 +1050,22 @@ mod tests {
         assert_eq!(narrow.tokens, 2048);
     }
 
+    /// Measured fires of `t = 1000 + r` fit a crossover of 1000 rows.
+    #[test]
+    fn measured_fires_fit_their_crossover() {
+        let rungs = [rung(256, 0), rung(1024, 0), rung(4096, 0)];
+        let times = [1256.0, 2024.0, 5096.0];
+        let effs = measured_effs(&rungs, &times);
+        for (r, eff) in rungs.iter().zip(effs) {
+            let rows = f64::from(r.tokens);
+            assert!((eff - rows / (rows + 1000.0)).abs() < 1e-9, "{eff}");
+        }
+    }
+
     #[test]
     fn an_infeasible_rung_is_never_chosen() {
-        let (e, at) = summed(1_000_000_000, 1.0);
-        let mut rungs = [at(1024, 16), at(2048, 32), at(4096, 64)];
+        let e = estimate(1_000_000_000, 1.0);
+        let mut rungs = [rung(1024, 16), rung(2048, 32), rung(4096, 64)];
         rungs[2].infeasible = Some("past one binding");
         assert_eq!(top_rung(&rungs, 1 << 40, &e).unwrap().tokens, 2048);
         rungs[1].infeasible = Some("past one binding");
@@ -954,9 +1075,9 @@ mod tests {
 
     #[test]
     fn an_exact_tie_goes_to_the_narrower_rung() {
-        // Equal throughput, equal span: equal scores.
+        // Equal efficiency, equal span: equal scores.
         let rungs = [rung(4096, 64), rung(2048, 64)];
-        let top = pick(&rungs, &[2_000.0, 1_000.0], 1024 * MIB).unwrap();
+        let top = pick(&rungs, &[0.5, 0.5], 1024 * MIB).unwrap();
         assert_eq!(top.tokens, 2048);
         // Every rung timed at nothing: eff 1 each, equal spans.
         let top = top_rung(&rungs, 1024 * MIB, &estimate(0, 0.0)).unwrap();

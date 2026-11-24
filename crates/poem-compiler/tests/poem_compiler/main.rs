@@ -65,3 +65,4 @@ mod the_z_image_import_reads_the_diffusers_pipeline;
 mod the_z_image_rows_bake;
 mod the_z_image_vae_bakes;
 mod the_zt_contract_states_the_cut;
+mod windowed_layers_pack_as_ring_and_buffer;

@@ -2,10 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub use ids::{GatewayId, NodeId, WorkerId};
 
-/// The environment variable a worker the controller launched finds its
-/// launch token in ([`WorkerInfo::launch`]).
-pub const LAUNCH_ENV: &str = "PIE_LAUNCH";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -58,10 +54,6 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub engine: String,
     pub addr: String,
-    /// The token the controller's actuator launched it with
-    /// (`PIE_LAUNCH`), so the controller knows which of its launches it is.
-    #[serde(default)]
-    pub launch: Option<String>,
     /// Its process id, so a controller that did not spawn it, restarted
     /// after the one that did, can still signal a launch it adopts.
     #[serde(default)]
@@ -135,43 +127,11 @@ pub struct RoutableWorker {
 pub struct RoutingTable {
     pub epoch: u64,
     pub workers: Vec<RoutableWorker>,
-    /// The controller launches and stops workers to meet a scale table: it
-    /// has slots to launch into (`cluster.scale`).
-    #[serde(default)]
-    pub scales: bool,
-    /// The gateway that authors the cluster-wide tables (scale,
-    /// replication, retention): the live one with the lowest id. Every
-    /// gateway runs its cluster policies; only this one enacts those
-    /// tables, and the controller takes a scale table only from it.
+    /// The gateway that authors the cluster-wide tables (replication): the
+    /// live one with the lowest id. Every gateway runs its cluster policies;
+    /// only this one enacts those tables.
     #[serde(default)]
     pub author: Option<GatewayId>,
-}
-
-/// A shape of worker, and how many of it the cluster should run.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ScaleEntry {
-    /// The model as workers serve it (`[model] name`); None: workers that
-    /// load no model.
-    pub model: Option<String>,
-    pub engine: String,
-    pub workers: u32,
-}
-
-/// Where a shape a scale table names stands, for whoever converges on it:
-/// the controller's own actuator, or an operator in its place.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScaleStatus {
-    pub model: Option<String>,
-    pub engine: String,
-    pub desired: u32,
-    /// Registered and taking turns.
-    pub serving: u32,
-    /// Launched by the actuator and not registered yet.
-    pub launching: u32,
-    /// Stopped by the actuator and still draining.
-    pub stopping: u32,
-    /// Slots of the shape the actuator has free to launch into.
-    pub free: u32,
 }
 
 /// What a worker holds, as it tells the controller's directory: the sealed
@@ -209,6 +169,10 @@ pub struct StateReport {
     /// across runs; sent with a full report.
     #[serde(default)]
     pub disk_tier: Option<(u32, bool)>,
+    /// The held pages that are off the device, by key, and the tier they
+    /// are on; all of it, whenever any changes.
+    #[serde(default)]
+    pub off_device: Option<Vec<([u8; 32], OffDevice)>>,
 }
 
 /// A sealed page's key.
@@ -221,8 +185,19 @@ pub type Key = [u8; 32];
 pub struct GroupView {
     pub keys: Vec<Key>,
     pub sites: Vec<WorkerId>,
+    /// The sites whose copy is not wholly on the device: the lowest tier
+    /// any of its pages is on. A site not named here holds it on the device.
+    #[serde(default)]
+    pub site_tiers: Vec<(WorkerId, OffDevice)>,
     pub disk_sites: Vec<WorkerId>,
     pub persist_tokens: Option<u64>,
+}
+
+/// Where a held page is, off the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum OffDevice {
+    Host,
+    Disk,
 }
 
 /// The controller's directory as the gateways read it: what each worker
@@ -272,6 +247,10 @@ pub enum ProcessEvent {
         req: u64,
         worker: WorkerId,
     },
+    /// Its process started on its worker (the worker says so).
+    Started {
+        req: u64,
+    },
     /// A running process moved to `worker`, or (none) could not.
     Moved {
         req: u64,
@@ -294,13 +273,18 @@ pub enum ProcessEvent {
     Workers(Vec<WorkerId>),
 }
 
-/// Where the cluster policy puts a process.
+/// Where the cluster policy puts a process (`placement/workers`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlacementView {
-    pub worker: Option<WorkerId>,
+    /// The workers it may run on, best first: the router sends a pending
+    /// process to the first that takes it. Empty holds it at the gateway;
+    /// `None` (no row) leaves the choice to the router. A running process
+    /// stays while the list names its worker, and moves when it does not.
+    pub workers: Option<Vec<WorkerId>>,
     /// Passed on with the process: the worker plane reads `cluster/<name>`.
     pub props: JsonProps,
-    /// Workers its passes may run on, best first.
+    /// `placement/helpers`: the workers its prefill passes may run on, best
+    /// first. Empty, or no row: the worker's own configuration decides.
     pub executors: Vec<WorkerId>,
 }
 
@@ -320,12 +304,18 @@ pub struct ReplicateOrder {
     pub table: String,
 }
 
-/// The order launches leave a gateway's gate in: each process's key (one
-/// not named is 0), and the key below which a process is held.
+/// The cluster's cross-tenant share grants (pie's PLEX extension,
+/// `pie:plex-ext/share-groups`), whole. Each grant carries its id: it changes
+/// with every change to that group's row (the default's with the default),
+/// so KV keyed under one grant never matches under the next.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduleView {
-    pub keys: Vec<(u64, i64)>,
-    pub floor: Option<i64>,
+pub struct ShareGrants {
+    /// Grows with every change; 0: no table yet.
+    pub version: u64,
+    /// (group, tenants, grant id), by group.
+    pub groups: Vec<(String, Vec<String>, u64)>,
+    /// The tenants of every group without a row, and the grant's id.
+    pub default: Option<(Vec<String>, u64)>,
 }
 
 /// The cluster policy's decisions about one gateway's processes,
@@ -337,17 +327,17 @@ pub struct GatewayDecisions {
     pub active: bool,
     /// How long a launch waits for the programs to hear it, in ms.
     pub gate_ms: u64,
-    /// The highest arrival `seq` every program has heard, its decisions
-    /// drained; `u64::MAX` with no program to hear it.
+    /// The highest arrival `seq` every policy has heard, its rows
+    /// committed; `u64::MAX` with no policy to hear it.
     pub heard: u64,
-    /// The gate's order. None: arrival order.
-    pub schedule: Option<ScheduleView>,
     pub placements: Vec<(u64, PlacementView)>,
     /// Processes to end, with the reason: refused at the gate, cancelled
     /// once admitted.
     pub terminated: Vec<(u64, String)>,
     /// For the gateway that carries worker calls: the copies to ask for.
     pub replicate: Vec<ReplicateOrder>,
+    /// The share grants, for every worker the gateway links.
+    pub share: ShareGrants,
 }
 
 #[tarpc::service]
@@ -363,9 +353,6 @@ pub trait Control {
     async fn watch_worker(id: WorkerId, since: u64) -> Neighbors;
 
     async fn watch_gateway(since: u64) -> RoutingTable;
-
-    /// Each shape the scale table names, desired against current.
-    async fn scale_status() -> Vec<ScaleStatus>;
 
     /// What `worker` holds, gained and lost since its last report: the
     /// directory's one input. A pool's comes through the gateway it links to.
@@ -424,7 +411,6 @@ mod tests {
     fn routing_table_serde_round_trip() {
         let table = RoutingTable {
             epoch: 7,
-            scales: false,
             author: Some(GatewayId(2)),
             workers: vec![RoutableWorker {
                 id: WorkerId(3),

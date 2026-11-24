@@ -7,8 +7,9 @@ use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReserva
 use super::holdings::{swapped_page_count, swapped_rs_units};
 use super::inner::RestoreGate;
 use super::proc::{PendingBind, Residency};
-use super::pool::RunNeed;
+use super::pool::{IdleShort, RunNeed};
 use super::wait::{EntryKey, WaitKind, Waiter};
+use super::residency_planner::IdleOutcome;
 use super::{ProcessId, ResidencyPlanner, exec};
 use crate::store::rs::RsUnits;
 
@@ -106,6 +107,9 @@ thread_local! {
 
 impl ResidencyPlanner {
     pub fn plan(self: &Arc<Self>) {
+        if crate::policy::retention::take_idle_cache_new() {
+            self.sweep_tiers();
+        }
         // A grant dropped unspent during the pass gave back room the pass
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
@@ -543,6 +547,16 @@ impl ResidencyPlanner {
             if self.port.compaction_under_way() {
                 return None;
             }
+            // A frame held for a raise the walk has since taken (the cap up
+            // to it): its fire goes on the scheduler's next turn, and lands.
+            // Read as nothing in flight, the pass between the raise and that
+            // fire was a stall (the simulation: a raise beside a restore
+            // waiting on the raiser's room).
+            let (_, engine) = self.port.locus();
+            let owed = crate::store::shared::owed_cut_rows(engine);
+            if owed > 0 && crate::store::shared::fire_cap(engine) >= owed {
+                return None;
+            }
             // Found again: counted each time, said once a head and room.
             self.stats.stuck_settles.fetch_add(1, Ordering::Relaxed);
             if let Some((at, seen, said)) = inner.stall_dumped
@@ -801,6 +815,12 @@ impl ResidencyPlanner {
 
     fn plan_heads(self: &Arc<Self>) -> bool {
         if self.pause_due.swap(false, Ordering::AcqRel) {
+            // A hold may have named the finisher the last pass read: the
+            // gate is read again, without the held, before any is paused.
+            // Read stale, the held finisher was never paused (conform's
+            // running hold on the L40S: 502 tokens while held).
+            let order = self.capacity_order();
+            self.with_inner(|inner| inner.set_capacity(order));
             self.pause_held();
         }
         self.reseat_released();
@@ -812,8 +832,7 @@ impl ResidencyPlanner {
         loop {
             // The capacity gate as this step reads it: a waiter it holds is
             // no head ([`super::inner::CapacityGate`]).
-            let order = self.capacity_order();
-            self.with_inner(|inner| inner.set_capacity(order));
+            self.read_capacity();
             // Each step reads the head's need afresh (the cache spans one
             // step's reads: its own, the map's, the eviction's).
             *self.need_cache.lock() = None;
@@ -1013,7 +1032,10 @@ impl ResidencyPlanner {
                     // takes the raise or refuses it by name.
                     let (run, pieces) = match rise {
                         None => (run, pieces),
-                        Some(rung) => match self.port.rise_room(rung) {
+                        Some(rung) => match self
+                            .with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid))
+                            .map_or(super::pool::RiseRoom::Fits, |pid| self.port.rise_room(pid, rung))
+                        {
                             super::pool::RiseRoom::Short { pieces } => {
                                 let pages = self.port.chunks_as_pages(pieces);
                                 self.with_inner(|inner| {
@@ -1071,8 +1093,27 @@ impl ResidencyPlanner {
                     // allocation: a bind is new demand, not a restore, and
                     // it is funded whether or not the fleet has stalled (a
                     // fleet that keeps decoding never stalls, and the bind
-                    // waited behind it for good).
-                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                    // waited behind it for good). Idle cache its tiers let
+                    // below the device moves down before any is dropped.
+                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                        self.plan_stopped("short of runs: idle cache moves down");
+                        return false;
+                    }
+                    let short = IdleShort {
+                        kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        rs: true,
+                    };
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("bind room: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
                     // A grow the walk will make holds its runs: it waits on
@@ -1141,7 +1182,25 @@ impl ResidencyPlanner {
                         room_stood = Some(key);
                         continue;
                     }
-                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                    if self.demote_idle(self.port.chunks_as_pages(need.run.saturating_mul(need.pieces))) {
+                        self.plan_stopped("bind short of runs: idle cache moves down");
+                        return false;
+                    }
+                    let short = IdleShort {
+                        kv_pages: self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
+                        rs: true,
+                    };
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("bind-suspended restore: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.sweep_stranded(u32::MAX, false) {
                         continue;
                     }
                     // Parked state lying on the device moves down a tier for
@@ -1266,10 +1325,32 @@ impl ResidencyPlanner {
                         self.plan_stopped("restore short of runs: something in flight, not funded");
                         return false;
                     }
-                    // Idle cache holds chunks too: one set goes, and the
+                    // Idle cache holds chunks too: what its tiers let below
+                    // the device moves down, else one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
-                    if self.reclaim_idle_once() || self.sweep_stranded(u32::MAX, false) {
+                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                        self.plan_stopped("restore short of runs: idle cache moves down");
+                        return false;
+                    }
+                    let short = IdleShort {
+                        kv_pages: self
+                            .port
+                            .chunks_as_pages(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
+                        rs: true,
+                    };
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            self.with_inner(|inner| inner.roles_retry_head());
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("restore short of runs: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.sweep_stranded(u32::MAX, false) {
                         self.with_inner(|inner| inner.roles_retry_head());
                         continue;
                     }
@@ -1321,14 +1402,26 @@ impl ResidencyPlanner {
                         self.plan_stopped("short of kv: waits on a grow the walk makes");
                         return true;
                     }
-                    // Idle cache a policy keys above the floor moves down
-                    // a tier before any is dropped; the rest is dropped.
+                    // Idle cache its tiers let below the device moves down
+                    // a tier before any is dropped; what cannot move now is
+                    // dropped, lowest key first.
                     if self.demote_idle(count) {
                         self.plan_stopped("short of kv: idle cache moves down");
                         return false;
                     }
-                    if self.reclaim_idle_once() {
-                        continue;
+                    let short = IdleShort {
+                        kv_pages: count,
+                        rs: false,
+                    };
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("short of kv: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
                     }
                     if self.sweep_stranded(count, false) {
                         self.plan_stopped("short of kv: stranded tails swept");
@@ -1372,14 +1465,28 @@ impl ResidencyPlanner {
                         return true;
                     }
                     // On a shared pool the chunks idle cache holds open for
-                    // state too: what is keyed above the floor moves down a
-                    // tier before any is dropped.
+                    // state too: what its tiers let below the device moves
+                    // down a tier before any is dropped.
                     let as_pages = self.port.rs_as_pages(need);
                     if as_pages > 0 && self.demote_idle(as_pages) {
                         self.plan_stopped("short of state: idle cache moves down");
                         return false;
                     }
-                    if self.reclaim_idle_once() || self.reclaim_head_sharing() {
+                    let short = IdleShort {
+                        kv_pages: as_pages,
+                        rs: true,
+                    };
+                    match self.reclaim_idle_once(short) {
+                        IdleOutcome::Freed => {
+                            continue;
+                        }
+                        IdleOutcome::Returning => {
+                            self.plan_stopped("short of state: reclaimed pages return as their fires retire");
+                            return false;
+                        }
+                        IdleOutcome::Nothing => {}
+                    }
+                    if self.reclaim_head_sharing() {
                         continue;
                     }
                     // And the tails of sets at rest past what their keys
@@ -1547,7 +1654,33 @@ impl ResidencyPlanner {
                                 inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| need.entries())
                             });
                             let held = self.port.reserve_restore(pid, bind.as_deref().unwrap_or_default());
-                            tracing::debug!(%pid, ?bind, held, "planner: a restore sent, its placement held for it");
+                            // What held it for the head it was moved for, as
+                            // that head stood when it went (the hold's terms,
+                            // [`super::inner::Inner::unmet_head`]).
+                            let held_for = tracing::enabled!(tracing::Level::DEBUG)
+                                .then(|| {
+                                    self.with_inner(|inner| {
+                                        let head = inner.procs.get(&pid)?.evicted_for?;
+                                        let queued = inner.queue.values().any(|waiter| waiter.pid == head);
+                                        let state = inner.procs.get(&head).map(|proc| {
+                                            format!(
+                                                "{:?} unfired={} idle={} bind_waiting={} in_request={}",
+                                                proc.state,
+                                                proc.unfired,
+                                                proc.idle,
+                                                proc.bind_waiting,
+                                                super::inner::Inner::in_request(proc)
+                                            )
+                                        });
+                                        Some(format!(
+                                            "head {head} queued={queued} passed={} finisher={} {state:?}",
+                                            inner.passed.iter().any(|&(_, passed)| passed == head),
+                                            inner.is_finisher(pid)
+                                        ))
+                                    })
+                                })
+                                .flatten();
+                            tracing::debug!(%pid, ?bind, held, ?held_for, "planner: a restore sent, its placement held for it");
                             // Said as the pass's end for this head: a restore
                             // refused and queued again showed "ended=none".
                             self.plan_ended(key, "restore sent", false, &[]);

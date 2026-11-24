@@ -100,9 +100,10 @@ pub fn at_load(
                 resident,
                 ms,
                 "rates: `[rates] {}` timed despite measure = false (no layer states it, and the \
-                 device states no count a guest step's grid can stride over): a {}-cubed matmul \
-                 against one workgroup of it, single fires; stored nowhere",
+                 device states no count a guest step's grid can stride over): a {}-row matmul of \
+                 width {} against one workgroup of it, single fires; stored nowhere",
                 profile::fire::RESIDENT_WORKGROUPS,
+                engine_gpu::rates::RESIDENT_ROWS,
                 engine_gpu::rates::RESIDENT_SHAPE
             );
             resident
@@ -116,6 +117,11 @@ pub fn at_load(
         }
     };
     device.hold_resident(resident);
+    if tuning.resident().is_none() && measuring == engine::rates::Measuring::Skip {
+        let mut tuned = tuning.profile().tuned().clone();
+        tuned.timed.push(profile::fire::RESIDENT_WORKGROUPS.to_string());
+        return Ok(tuning.with_profile(tuning.profile().with_tuned(tuned)));
+    }
     Ok(tuning)
 }
 
@@ -236,7 +242,10 @@ pub fn shapes_at_load(
         top_rows,
         measuring,
     );
-    Ok(crate::tuning::Tuning::new(chip?).with_workgroup_bytes(device.workgroup_bytes()))
+    // What the load held of the adapter stays (the decodes it splits): a
+    // load naming its kernels after its curves are timed names what a load
+    // that read them names.
+    Ok(tuning.with_profile(chip?))
 }
 
 /// How a rates frame is timed on wgpu: the device's span where it states
