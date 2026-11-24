@@ -10714,6 +10714,23 @@ impl<B: Serve> Shell<B> {
             room.saturating_sub(still_placed)
         };
         let allowance = remaining();
+        // The memory maps the process may still make: a driver maps for its
+        // allocations (on Android a kgsl mapping each), and a process past
+        // vm.max_map_count maps nothing more, the runtime's sandbox pool
+        // among it. The walk leaves at least as many as the process held
+        // when it began (what the load mapped before it, which the runtime
+        // maps again at most after it); `None` where the host states no
+        // limit it can read.
+        let map_count = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .ok()
+                .map(|maps| maps.lines().count() as u64)
+        };
+        let max_maps = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok());
+        let maps_before = map_count().unwrap_or(0);
+        let mut dearest_maps = 0u64;
         let before = rss();
         let mut dearest = 0u64;
         let mut dearest_device = 0u64;
@@ -10752,7 +10769,13 @@ impl<B: Serve> Shell<B> {
             let cmds_short = most_cmds.is_some_and(|most| {
                 live_cmds.saturating_add(dearest_cmds.saturating_mul(depth as u64)) >= most
             });
-            if device_short || host_short || cmds_short {
+            let maps_now = map_count();
+            let maps_short = max_maps.zip(maps_now).is_some_and(|(most, now)| {
+                now.saturating_add(dearest_maps.saturating_mul(depth as u64))
+                    .saturating_add(maps_before)
+                    >= most
+            });
+            if device_short || host_short || cmds_short || maps_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
                     .iter()
@@ -10771,6 +10794,8 @@ impl<B: Serve> Shell<B> {
                     device_left = self.device.left(),
                     next_bodies = next,
                     live_command_buffers = live_cmds,
+                    maps = ?maps_now,
+                    max_maps = ?max_maps,
                     most_command_buffers = ?most_cmds,
                     from_rows = from,
                     eager = ?eager,
@@ -10799,6 +10824,7 @@ impl<B: Serve> Shell<B> {
                     shapes_recording = armed_shapes.len(),
                     host_bytes = rss().saturating_sub(before),
                     dearest,
+                    maps = ?map_count(),
                     held = %B::held(),
                     "the arm walk so far"
                 );
@@ -10807,6 +10833,7 @@ impl<B: Serve> Shell<B> {
             for arm in 0..depth {
                 let ahead = rss();
                 let cmds_ahead = B::command_buffers(self).0;
+                let maps_ahead = map_count();
                 let left_ahead = self.device.left();
                 let owned = lanes
                     .iter()
@@ -10890,6 +10917,9 @@ impl<B: Serve> Shell<B> {
                 dearest = dearest.max(cost);
                 dearest_device = dearest_device.max(on_device);
                 dearest_cmds = dearest_cmds.max(B::command_buffers(self).0.saturating_sub(cmds_ahead));
+                if let (Some(ahead), Some(after)) = (maps_ahead, map_count()) {
+                    dearest_maps = dearest_maps.max(after.saturating_sub(ahead));
+                }
                 recorded += 1;
             }
             if self.recorded > families {
