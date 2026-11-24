@@ -204,13 +204,14 @@ fn forcing(q: &Qmm) -> String {
 
 /// The kernel `kernels_slang::linear::qmm::ran` names for `q`.
 #[cfg(feature = "vulkan")]
-fn kernel(q: &Qmm) -> &'static str {
+fn kernel(q: &Qmm) -> kernels_slang::linear::qmm::Rung {
+    use kernels_slang::linear::qmm::Rung;
     match q {
-        Qmm::Coopmat => "coopmat",
-        Qmm::RegisterTiled { .. } => "register_tiled",
-        Qmm::Tiled { .. } => "tiled",
-        Qmm::OneRow { .. } => "one_row",
-        Qmm::Qmv { .. } => "qmv",
+        Qmm::Coopmat => Rung::Coopmat,
+        Qmm::RegisterTiled { .. } => Rung::RegisterTiled,
+        Qmm::Tiled { .. } => Rung::Tiled,
+        Qmm::OneRow { .. } => Rung::OneRow,
+        Qmm::Qmv { .. } => Rung::Qmv,
     }
 }
 
