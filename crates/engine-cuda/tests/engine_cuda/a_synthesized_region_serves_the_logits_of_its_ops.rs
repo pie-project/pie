@@ -183,6 +183,7 @@ fn load(fixture: &Fixture, overrides: &str, tokens: u32) -> Shell {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads under {overrides:?}: {why}", fixture.model))
 }

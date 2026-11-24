@@ -1101,6 +1101,10 @@ impl FireCtx<'_> {
                     let after = self.cache.tally();
                     if after.captures > before.captures {
                         self.live.tally(engine::live::Tally::Compiled, 1);
+                    } else if after.stated_eager > before.stated_eager {
+                        // A composition the load stated eager (CONTRACT-BC
+                        // 24): uncaptured, as stated.
+                        self.live.tally(engine::live::Tally::Eager, 1);
                     } else if after.hits == before.hits {
                         self.live.tally(engine::live::Tally::Unrecorded, 1);
                     }

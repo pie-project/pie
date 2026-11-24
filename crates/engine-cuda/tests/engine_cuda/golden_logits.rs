@@ -35,7 +35,16 @@
 //! `golden <model> all <hash>` line a model. `PIE_GOLDEN_MODELS` (a comma
 //! list) picks and orders the models; `PIE_GOLDEN_OUT` writes the lines to a
 //! file; `PIE_GOLDEN_CHECK` compares them with such a file and fails on the
-//! first model whose hash moved.
+//! first model whose hash moved, unless `PIE_GOLDEN_AGAINST` names the
+//! earlier run's `PIE_GOLDEN_LOGITS` rows and each of this run's lies within
+//! the tolerance of its own ([`within_tolerance`]).
+//!
+//! The decode products' kernels are held across builds: every golden load
+//! keeps the product times it chose its kernels by in the cache's `picks`,
+//! and every later one is served with them as they stand (`Knobs::chip`,
+//! a test's pinned profile), so a build whose kernel crate changed picks
+//! what the earlier build picked and its hashes answer for its code, not for
+//! a re-timing. Only a candidate whose own code changed is timed again.
 
 use std::path::{Path, PathBuf};
 
@@ -325,8 +334,8 @@ fn trace_of(model: &str) -> Trace {
     panic!("`{model}` does not trace: {}", first.unwrap_or_default())
 }
 
-struct Fixture {
-    model: String,
+pub(super) struct Fixture {
+    pub(super) model: String,
     trace: Trace,
     contract: ModelContract,
     container: PathBuf,
@@ -334,7 +343,7 @@ struct Fixture {
 
 /// `model`'s trace and its seeded checkpoint, written once into `cache`'s
 /// `fixtures` and read back by every later run.
-fn fixture(model: &str, cache: &Path) -> Fixture {
+pub(super) fn fixture(model: &str, cache: &Path) -> Fixture {
     fixture_as(model, cache, false)
 }
 
@@ -446,7 +455,7 @@ fn fixture_key(trace: &Trace, serving: bool) -> u64 {
 
 /// The fixture cache, `PIE_GOLDEN_CACHE`: refused unset, since a default
 /// in a run's own temp dir rebuilds every fixture (tens of GB) each run.
-fn cache_dir() -> PathBuf {
+pub(super) fn cache_dir() -> PathBuf {
     std::env::var_os("PIE_GOLDEN_CACHE").map_or_else(
         || panic!("set PIE_GOLDEN_CACHE to the fixture cache; unset would rebuild every fixture"),
         PathBuf::from,
@@ -475,7 +484,7 @@ fn load_with(fixture: &Fixture, cache: &Path, knobs: engine_cuda::Knobs) -> Shel
 }
 
 /// [`load_with`] under `allowance`, its refusal returned.
-fn load_under(
+pub(super) fn load_under(
     fixture: &Fixture,
     cache: &Path,
     knobs: engine_cuda::Knobs,
@@ -517,8 +526,10 @@ fn load_under(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .map_err(|why| why.to_string())
+    .inspect(|shell| record_picks(cache, shell))
 }
 
 /// A load of `fixture` under `allowance` at the model's declared context
@@ -550,13 +561,15 @@ fn load_declared(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .map_err(|why| why.to_string())
 }
 
 /// A declared context is cut to the room the load's own room line leaves,
 /// past this process's context and modules: under budgets from where the
-/// modules leave no sequence a room to where they leave a long one, a load
+/// modules leave no sequence a room to where they leave a long one (counted
+/// past the modules' charge the engine states), a load
 /// serves the declared context cut to what it seats, or refuses the card by
 /// name, never faulting on residency.
 #[test]
@@ -570,8 +583,39 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
     let cache = cache_dir();
     let model = buffered_model();
     let fixture = fixture(&model, &cache);
+    // An unbounded load first: where the profile states no roofline rates
+    // (a committed profile not taken for this build) it measures them and
+    // keeps them in the probe's profiles, so the budgets below are weighed
+    // on their room alone, not on room to measure.
+    drop(
+        load_declared(&fixture, &cache, engine::Allowance::WHOLE, DECLARED)
+            .unwrap_or_else(|why| panic!("{model}: an unbounded load serves: {why}")),
+    );
+    // The engine states what this process's context and modules charge the
+    // budget in its room line ("N MiB of it this process's context and
+    // modules"): read off a load under a budget nothing fits, the range below
+    // starts past it, so it spans the same rooms on any backend (ROCm's
+    // modules take ~1.5 GiB, CUDA's far less).
+    let charged = match load_declared(
+        &fixture,
+        &cache,
+        engine::Allowance {
+            budget: Some(1 << 20),
+        },
+        DECLARED,
+    ) {
+        Ok(_) => panic!("a 1 MiB budget served the declared context"),
+        Err(why) => why
+            .split(" MiB of it this process's context and modules")
+            .next()
+            .filter(|head| head.len() < why.len())
+            .and_then(|head| head.rsplit(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("the refusal states no context and modules charge: {why}")),
+    };
+    println!("this process's context and modules: {charged} MiB of the budget");
     let mut served = 0;
-    for mib in (512u64..=2048).step_by(128) {
+    for mib in (charged + 512..=charged + 2048).step_by(128) {
         let allowance = engine::Allowance {
             budget: Some(mib << 20),
         };
@@ -600,7 +644,7 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
 /// state pool aims near, so a miniature's records are cut into pieces as a
 /// full model's are. The logits are the same either way.
-fn knobs() -> engine_cuda::Knobs {
+pub(super) fn knobs() -> engine_cuda::Knobs {
     let mut knobs = engine_cuda::Knobs::default();
     knobs.profiles = Some(cache_dir().join("profiles"));
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
@@ -621,7 +665,81 @@ fn knobs() -> engine_cuda::Knobs {
     // device, as the base engine seats them. The weight cache's own probes
     // load with its shapes ([`load_cached`]).
     knobs.dense_weights = true;
+    knobs.chip = picked(&cache_dir(), knobs.profiles.as_deref());
     knobs
+}
+
+/// The cache's product picks ([`record_picks`]): the decode products' times
+/// an earlier golden load chose their kernels by, one `kind rows k m kernel
+/// ns spread` line each.
+fn picks_path(cache: &Path) -> PathBuf {
+    cache.join("picks")
+}
+
+fn read_picks(cache: &Path) -> Vec<profile::fire::ProductTime> {
+    let text = std::fs::read_to_string(picks_path(cache)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let w: Vec<&str> = line.split_whitespace().collect();
+            let [kind, rows, k, m, kernel, ns, spread] = w[..] else {
+                return None;
+            };
+            Some(profile::fire::ProductTime {
+                kind: kind.parse().ok()?,
+                rows: rows.parse().ok()?,
+                k: k.parse().ok()?,
+                m: m.parse().ok()?,
+                kernel: kernel.parse().ok()?,
+                ns: ns.parse().ok()?,
+                spread: spread.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Keeps what `shell` chose its decode products' kernels by in the cache's
+/// picks, beside those already kept (a kept entry stays; a shape no load
+/// met before joins). A golden load served after takes them as they stand
+/// ([`picked`]), so its logits answer for the code, not for a re-timing.
+fn record_picks(cache: &Path, shell: &Shell) {
+    let mut picks = read_picks(cache);
+    let before = picks.len();
+    for time in shell.product_times() {
+        if picks.iter().all(|kept| kept.key() != time.key()) {
+            picks.push(*time);
+        }
+    }
+    if picks.len() == before {
+        return;
+    }
+    let text: String = picks
+        .iter()
+        .map(|t| {
+            format!(
+                "{} {} {} {} {} {} {}\n",
+                t.kind, t.rows, t.k, t.m, t.kernel, t.ns, t.spread
+            )
+        })
+        .collect();
+    std::fs::write(picks_path(cache), text)
+        .unwrap_or_else(|why| panic!("{}: {why}", picks_path(cache).display()));
+}
+
+/// The device's profile with the cache's product picks laid over its
+/// rates, as a pinned profile (`Knobs::chip`): a golden load serves each
+/// product shape an earlier one met with the kernel it chose then, whatever
+/// this build's stored measurements say, and times only the shapes (or the
+/// changed kernels) none met. `None` while the cache keeps no picks.
+fn picked(cache: &Path, profiles: Option<&Path>) -> Option<profile::Profile> {
+    let picks = read_picks(cache);
+    if picks.is_empty() {
+        return None;
+    }
+    let (name, facts) = engine_cuda::chip::probe(0)?;
+    let (profile, _) = engine_cuda::chip::resolve(&name, &facts, profiles);
+    let mut tuned = profile::fire::Tuned::default();
+    tuned.rates.product_ns = Some(picks);
+    Some(profile.with_tuned(tuned))
 }
 
 /// The buffered probes' knobs: a load that buffers recurrent rows arms
@@ -1615,8 +1733,72 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
                 None => moved.push(format!("{} step {}: not in the golden file", key.0, key.1)),
             }
         }
+        if !moved.is_empty() && within_tolerance() {
+            eprintln!(
+                "golden: hashes moved, every row within tolerance of the earlier run's:\n  {}",
+                moved.join("\n  ")
+            );
+            return;
+        }
         assert!(moved.is_empty(), "logits moved:\n  {}", moved.join("\n  "));
     }
+}
+
+/// A step's logits within this share of their spread of the earlier run's
+/// (the bf16 rule the synthesized-region tests hold a reordered sum to).
+const TOLERANCE: f32 = 2e-2;
+
+/// Whether this run's rows (`PIE_GOLDEN_LOGITS`) each lie within
+/// [`TOLERANCE`] of an earlier run's (`PIE_GOLDEN_AGAINST`, that run's
+/// `PIE_GOLDEN_LOGITS`), row for row, with the same top token unless the
+/// earlier row's top two are that close: what a moved hash is judged by
+/// where the picks could not be held (a product kernel whose code changed is
+/// timed again). Unset either, and a moved hash fails as it stands.
+fn within_tolerance() -> bool {
+    let (Some(ours), Some(theirs)) = (
+        std::env::var_os("PIE_GOLDEN_LOGITS"),
+        std::env::var_os("PIE_GOLDEN_AGAINST"),
+    ) else {
+        return false;
+    };
+    let read = |dir: &std::ffi::OsStr, at: usize| -> Option<Vec<f32>> {
+        let bytes = std::fs::read(Path::new(dir).join(format!("{at}.f32"))).ok()?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        )
+    };
+    let mut rows = 0usize;
+    while let Some(want) = read(&theirs, rows) {
+        let Some(got) = read(&ours, rows) else {
+            eprintln!("golden: row {rows} of the earlier run has none of this run's");
+            return false;
+        };
+        let (lo, hi) = want
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let deviation = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0f32, f32::max);
+        let bound = TOLERANCE * (hi - lo);
+        let (top, picked) = (argmax(&want), argmax(&got));
+        let gap = want[top as usize] - want[picked as usize];
+        if got.len() != want.len() || deviation > bound || (top != picked && gap > 2.0 * deviation)
+        {
+            eprintln!(
+                "golden: row {rows} {deviation} apart over a spread of {} (bound {bound}); top \
+                 {picked}, the earlier run's {top}",
+                hi - lo
+            );
+            return false;
+        }
+        rows += 1;
+    }
+    rows > 0
 }
 
 /// The md5 of every stored input a load selects its kernels and bodies by:
@@ -1625,7 +1807,7 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
 /// order, by `md5sum`; "none" where there is no file. A cold cache reads as
 /// another configuration.
 fn profile_md5(cache: &Path) -> String {
-    let mut files = Vec::new();
+    let mut files = vec![picks_path(cache)].into_iter().filter(|p| p.is_file()).collect::<Vec<_>>();
     let mut dirs = vec![cache.join("profiles"), cache.join("bodies"), cache.join("cover")];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -1713,6 +1895,7 @@ fn served_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     // As a worker boots it: every chunk the fit left the pool backed at
@@ -1883,6 +2066,7 @@ fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f3
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2029,6 +2213,7 @@ fn served_lagged_over(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2260,6 +2445,7 @@ fn served_pace(fixture: &Fixture, cache: &Path, schedule: &str) -> f64 {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -2366,6 +2552,7 @@ fn served_pair_buffered(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     let page = rs_page(&mut shell);
@@ -2506,6 +2693,7 @@ fn every_lane_of_a_wide_replaying_fire_replays_its_own_rows() {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{model} loads: {why}"));
     let page = rs_page(&mut shell);
@@ -3411,6 +3599,7 @@ fn load_lanes(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
 }
@@ -3677,6 +3866,7 @@ fn served_partial_fold(
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
     shell.back_whole().expect("the fitted pool is backed whole");
@@ -4053,9 +4243,32 @@ fn golden_staged_experts() {
                 .all(|bank| said.contains(&format!("`{bank}`"))),
             "{model}: the refusal names the banks: {said}"
         );
+        // The bytes the refusal names are its own fit's: under a budget that
+        // tight the fit may serve fewer rows a fire than the unbounded load
+        // (on ROCm the context's modules take ~1.5 GiB of it), and the
+        // staging holds one fire's routes. The load at the least budget
+        // stages what the fit a byte under it weighed.
+        let at_least = load_under(
+            &fixture,
+            &cache,
+            staged(),
+            engine::Allowance {
+                budget: Some(least),
+            },
+        )
+        .unwrap_or_else(|why| panic!("{model}: serves under its least budget {least}: {why}"));
+        let least_staging = at_least.expert_staging().clone();
+        drop(at_least);
+        assert_eq!(
+            least_staging.banks(),
+            staging.banks(),
+            "{model}: the same banks stage under the least budget"
+        );
         assert!(
-            said.contains(&format!("{} bytes of staged experts", staging.bytes())),
-            "{model}: and the bytes: {said}"
+            said.contains(&format!("{} bytes of staged experts", least_staging.bytes())),
+            "{model}: and the bytes ({} for {} rows under the least budget): {said}",
+            least_staging.bytes(),
+            least_staging.rows()
         );
     }
 }

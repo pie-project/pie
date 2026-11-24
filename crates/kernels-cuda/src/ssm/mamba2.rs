@@ -299,7 +299,7 @@ pub fn mamba2_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_fold"))
+        Fire::at(fold_kernel())
             .apply(Launch::grid([m.heads, 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
@@ -312,4 +312,9 @@ pub fn mamba2_fold(
             stated(OP, groups)?.arg(),
         ],
     )
+}
+
+/// Mamba-2's group fold kernel ([`mamba2_fold`]).
+pub(super) fn fold_kernel() -> &'static crate::jit::Kernel {
+    kernel(MAMBA2, "::pie::ssm::mamba2_fold")
 }

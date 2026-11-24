@@ -1294,3 +1294,34 @@ impl Run<'_> {
     }
 }
 
+
+/// The group folds a fire over `trace`'s recurrent steps can launch ahead
+/// of its body ([`Run::fold_groups_ahead`]), each kind once: a load makes
+/// their kernels before ready, since no arming fire carries a beam group's
+/// fold.
+pub(crate) fn group_folds(trace: &poem_ir::Trace) -> Vec<kernels_cuda::ssm::FoldKernel> {
+    use kernels_cuda::ssm::FoldKernel;
+    use poem_ir::{Fused, Operation};
+    let mut folds = Vec::new();
+    let mut add = |fold: FoldKernel| {
+        if !folds.contains(&fold) {
+            folds.push(fold);
+        }
+    };
+    for node in &trace.nodes {
+        match &node.op {
+            Operation::Ssm(Ssm::CausalConv1d { .. }) => add(FoldKernel::Conv1d),
+            Operation::Ssm(Ssm::GatedDelta { .. }) => add(FoldKernel::GatedDelta),
+            Operation::Fused(Fused::GdnStep { .. }) => {
+                add(FoldKernel::Conv1d);
+                add(FoldKernel::GatedDelta);
+            }
+            Operation::Ssm(Ssm::Kda { head_dim, .. }) => add(FoldKernel::Kda {
+                head_dim: *head_dim,
+            }),
+            Operation::Ssm(Ssm::Mamba2 { .. }) => add(FoldKernel::Mamba2),
+            _ => {}
+        }
+    }
+    folds
+}

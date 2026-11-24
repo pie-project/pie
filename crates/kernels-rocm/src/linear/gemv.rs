@@ -170,7 +170,11 @@ pub(crate) fn skinny_norm_plan(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool) -
         ctx.tuning().gemm_skinny_quad_from(),
         ctx.multiprocessors("linear.skinny")?,
     );
-    let staged = m.unsigned_abs() * k.unsigned_abs() * 2;
+    // The staged rows and, beside them in the same LDS, the prologue's
+    // per-row partial sums (`gemv.hip`'s `sums[ROWS * kNormGroups]` floats):
+    // a fold whose rows fill the LDS on their own has no room for those, and
+    // its launch asks the device for more than a block holds.
+    let staged = m.unsigned_abs() * k.unsigned_abs() * 2 + m.unsigned_abs() * NORM_GROUPS * 4;
     // The prologue sums a row as `residual_add_rmsnorm`'s packed path does,
     // a row of at most NORM_ROW_PACKS packs (`gemv.hip`'s kNormBlock x
     // kNormPpt); a wider one stays apart.
@@ -304,6 +308,10 @@ pub(crate) const SKINNY_LDS: u32 = 64 << 10;
 /// `gemv.hip`'s kNormBlock virtual threads of kNormPpt packs, the unfused
 /// `residual_add_rmsnorm`'s packed path, whose sums it reproduces.
 const NORM_ROW_PACKS: i32 = 256 * 4;
+
+/// The partial sums a row the normed prologue keeps in LDS beside the staged
+/// rows: `gemv.hip`'s kNormGroups, kNormBlock (256) over the wavefront (64).
+const NORM_GROUPS: u32 = 256 / 64;
 
 /// The whole-product kernel's banks: at least this many weight rows (a
 /// short bank leaves its four-row tiles too few to fill the card, where the

@@ -774,15 +774,15 @@ impl Shell {
                 ),
             })
             .collect();
-        // A buffering fire, or one of a drafter's class, pads to a bucket the
-        // lattice records it at (`Shell::rs_rungs`).
-        let buffering = lanes.iter().any(|seated| {
-            matches!(seated.rs, RsVerb::Buffer { .. }) || self.drafts_only(seated.lane.word)
-        });
+        // A buffering step with a prompt's rows composes at its stated rung
+        // (`Shell::buffered_rung`), where the walk recorded it.
+        let buffers = lanes
+            .iter()
+            .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
+        let prompts = lane_rows.iter().any(|&rows| rows > 1);
         let at = self.forced_bucket.take().or_else(|| {
-            let rows: u32 = lane_rows.iter().sum();
-            buffering
-                .then(|| self.rs_rungs().into_iter().find(|&bucket| bucket >= rows))
+            (buffers && prompts)
+                .then(|| self.buffered_rung(lane_rows.iter().sum()))
                 .flatten()
         });
         let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
@@ -1947,6 +1947,31 @@ impl Shell {
             carried: replayed,
             ..engine::ReplayRows::default()
         };
+        // The runtime's count of this fire's replay against this one, in
+        // debug builds or under PIE_CHECK_REPLAY (`engine::fire::replay_agrees`):
+        // the runtime counting less (a fire it priced held that this engine
+        // refuses, or compact where this one lays it wide) is a contract bug,
+        // named with both counts. Compactness here is the load's alone
+        // (`ChunkFacts::rs_scratch_per_fire` is false: a decoding lane's
+        // carried rows never take the run).
+        if engine::fire::replay_check_on() {
+            let snapshots = lanes.iter().any(|seated| !seated.rs_snapshots.is_empty());
+            // As `Shell::chunk_facts` states it (`ChunkFacts::rs_compact`).
+            let compact = self.buffers.is_some();
+            engine::fire::replay_agrees(
+                composition
+                    .lanes()
+                    .iter()
+                    .map(|row| (row.rows, lanes[row.source as usize].replay_stated)),
+                &holds,
+                count,
+                compact,
+                compact,
+                false,
+                snapshots,
+            )
+            .map_err(|why| Fault::program("serve::prepare", why))?;
+        }
         if let Err(past) = engine::fire::rung_holds(&holds, count) {
             return Err(Fault::Ceiling {
                 what: "buffered recurrent rows a fire replays ahead of its own",
