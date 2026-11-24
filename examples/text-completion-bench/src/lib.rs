@@ -402,7 +402,9 @@ async fn run_one(
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let lag = input.fold_lag.min(u32::try_from(num_prompt_tokens).unwrap_or(0));
+    let lag = input
+        .fold_lag
+        .min(u32::try_from(num_prompt_tokens).unwrap_or(0));
     let prefill_fold = Channel::from([u32::try_from(num_prompt_tokens).unwrap_or(0) - lag]);
     let decode_fold = Channel::from([1u32]);
     fn geometry(lag: u32, fold: &Channel) -> StateGeometry<'_> {
@@ -429,7 +431,9 @@ async fn run_one(
     }
     if input.checkpoint_prompt_end {
         let end = u32::try_from(num_prompt_tokens).map_err(|_| "a prompt past u32 rows")?;
-        fwd_p.checkpoints(&[end]).context("ask the prompt end's checkpoint")?;
+        fwd_p
+            .checkpoints(&[end])
+            .context("ask the prompt end's checkpoint")?;
     }
     let prefill_knobs = SampleKnobs::new(temperature, top_p, top_k);
     fwd_p.epilogue(move || {
@@ -486,10 +490,9 @@ async fn run_one(
     // frame is one slot wide — the same shape live_slots = 1 already
     // submits.
     // The prefill goes alone, and the decode window is staged only after its
-    // token has reached the host (below): a window staged ahead held the
-    // first token's drain behind up to three decode fires, which the client
-    // saw as time to first token (Gemma-4-31B on an M5 Max: 754 ms of
-    // prefill, 866 ms to the first token). Throughput at 32 lanes is the same.
+    // token has reached the host (below): a window staged ahead would hold
+    // the first token's drain behind up to three decode fires, which the
+    // client sees as time to first token. Throughput is the same either way.
     let first_decodes = if !honor_wait_for_start
         && !input.report_timing
         && !input.report_arrivals

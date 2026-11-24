@@ -584,7 +584,9 @@ impl Engine for Xla {
                     !shell.input_decls().is_empty(),
                     shell.snapshots() > 0,
                 ),
-            ),
+            )
+            // the mixed steps it pads to lane rungs: no other is stated
+            .with_mixed(shell.mixed_lanes()),
         );
         shell.set_steps(stated.shapes.clone());
         // The warm ladder, every fire shape the load serves, built before

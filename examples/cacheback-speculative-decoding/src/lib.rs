@@ -354,7 +354,6 @@ async fn decode<T: Target>(
     let mut base = n;
     let mut survivors: u32 = 0;
 
-
     while !stopped && generated.len() < input.max_tokens {
         let prev_len = generated.len();
         // ── The window: the pending correct token, then the drafts.
@@ -412,7 +411,8 @@ async fn decode<T: Target>(
         };
         accepted += m;
 
-        // No explicit rollback: the next fire overwrites the rejected tail's slots.
+        // Outside ckpt_sync nothing is restored: the next fire overwrites the
+        // rejected tail's slots.
 
         // ── Commit `window[1 ..= m]` — `window[0]` was committed last round as
         //    the correction that produced it — then the new correction.
@@ -551,8 +551,7 @@ async fn main(input: Input) -> Result<Output> {
 mod tests {
     use super::*;
 
-    /// A key the request does not name is refused by name, not ignored: a
-    /// removed option (`bench_accept`) cannot quietly run something else.
+    /// A key the request does not name is refused by name, not ignored.
     #[test]
     fn an_unknown_key_is_refused() {
         let why = serde_json::from_str::<Input>(r#"{"bench_accept": true}"#)
@@ -652,7 +651,14 @@ mod tests {
             saved: None,
             tops: Vec::new(),
         };
-        ready(decode(&mut toy, input, &[100, 101, 102], stop_tokens, |_| {})).unwrap()
+        ready(decode(
+            &mut toy,
+            input,
+            &[100, 101, 102],
+            stop_tokens,
+            |_| {},
+        ))
+        .unwrap()
     }
 
     /// A 128-token request with drafts says exactly what sequential greedy
@@ -706,9 +712,15 @@ mod tests {
             saved: None,
             tops: Vec::new(),
         };
-        let err = ready(decode(&mut toy, &request(8, 4, "ckpt"), &[100], &[], |_| {}))
-            .err()
-            .expect("an unknown rollback_mode is refused");
+        let err = ready(decode(
+            &mut toy,
+            &request(8, 4, "ckpt"),
+            &[100],
+            &[],
+            |_| {},
+        ))
+        .err()
+        .expect("an unknown rollback_mode is refused");
         assert!(err.contains("unknown rollback_mode `ckpt`"), "{err}");
         assert!(toy.slots.is_empty(), "nothing was fired");
     }

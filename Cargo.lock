@@ -4362,6 +4362,7 @@ version = "0.6.0"
 dependencies = [
  "pie-profile-macros",
  "toml",
+ "tracing",
 ]
 
 [[package]]

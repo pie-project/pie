@@ -913,7 +913,7 @@ pub(crate) fn at_load(
             match measure_at(device, &chip, device.cores(), &lacking, &LOAD_ROWS, &mut |_| {}) {
                 Ok(m) => m,
                 Err(why) => {
-                    eprintln!("{name}: kernel.dense not measured: {why}; the profile's route serves");
+                    tracing::warn!("{name}: kernel.dense not measured: {why}; the profile's route serves");
                     return Ok(chip);
                 }
             };
@@ -942,7 +942,7 @@ pub(crate) fn at_load(
                 ..profile::fire::Rates::default()
             };
             if let Err(why) = engine::rates::save_rates(&save, &stored) {
-                eprintln!("{name}: kernel.dense curves not stored: {why}");
+                tracing::warn!("{name}: kernel.dense curves not stored: {why}");
             }
         }
         let mut tuned = chip.tuned().clone();

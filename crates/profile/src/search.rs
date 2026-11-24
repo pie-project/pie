@@ -1048,7 +1048,7 @@ mod tests {
         fn serve(&mut self, _: usize, file: &str) -> Result<Serving, String> {
             self.0 += 1;
             // Every other serve is 10% faster, whatever it serves.
-            let t = if self.0 % 2 == 0 { 90.0 } else { 100.0 };
+            let t = if self.0.is_multiple_of(2) { 90.0 } else { 100.0 };
             let _ = value(file, "noop");
             Ok(Serving {
                 prompt: vec![t],

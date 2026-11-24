@@ -2962,8 +2962,8 @@ mod delta_table_tests {
     /// page past the first buffer, lies in a buffer of its own: no pool
     /// buffer holds its address, it holds the buffers' deltas, and every
     /// byte of the pool overwritten leaves it as it was. Laid in the pool's
-    /// tables run it was overwritten on the M5 (bf16 rows where the deltas
-    /// belong), and every buffer-1 kv write landed elsewhere.
+    /// tables run it would be overwritten (bf16 rows where the deltas
+    /// belong), and every buffer-1 kv write would land elsewhere.
     #[test]
     fn the_delta_table_lies_outside_the_pool_and_survives_any_write_into_it() {
         let device = Context::bind().expect("a Metal 4 device");

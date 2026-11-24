@@ -200,6 +200,9 @@ pub struct EngineConfig {
     /// those it runs eager ([`::engine::Capabilities::steps`]): held to the
     /// set the runtime's rules form over the load's stated facts.
     pub steps: ::engine::StatedSteps,
+    /// The mixed steps the engine lays out ([`::engine::Capabilities::mixed_lanes`]):
+    /// the set the runtime forms holds no mixed step past them.
+    pub mixed_lanes: ::engine::MixedLanes,
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
     pub inputs: Vec<poem_ir::InputDecl>,
@@ -428,10 +431,17 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             // the runtime's rules over the load's stated facts, the set the
             // engine walked before ready, or the load is refused by name.
             let rules = ::engine::StepRules::runtime();
-            let step_facts = d.limits.step_facts(
-                &d.chunks,
-                ::engine::Attachments::served(d.has_lora, !d.inputs.is_empty(), d.rs_snapshots > 0),
-            );
+            let step_facts = d
+                .limits
+                .step_facts(
+                    &d.chunks,
+                    ::engine::Attachments::served(
+                        d.has_lora,
+                        !d.inputs.is_empty(),
+                        d.rs_snapshots > 0,
+                    ),
+                )
+                .with_mixed(d.mixed_lanes.clone());
             d.steps.agrees(&rules, &step_facts).map_err(|why| {
                 anyhow::anyhow!("engine {}: step shapes: {why}", d.engine_backend.kind())
             })?;

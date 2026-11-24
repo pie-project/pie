@@ -523,6 +523,12 @@ pub struct StepFacts {
     pub buffers: bool,
     /// The attachments its lanes can carry ([`Attachments::served`]).
     pub attachments: Attachments,
+    /// The mixed steps the engine lays out ([`crate::Capabilities::mixed_lanes`]):
+    /// its prompt-lane rungs and the decodes beside each, where it pads a
+    /// mixed step's lanes to them. A mixed step past them is not stated, and
+    /// the runtime forms it no more (its extra prompts go in the step after).
+    #[serde(default)]
+    pub mixed: crate::MixedLanes,
 }
 
 impl StepFacts {
@@ -554,6 +560,7 @@ impl StepFacts {
                 .iter()
                 .any(|shape| shape.role == SlotRole::RsBuffer),
             attachments,
+            mixed: crate::MixedLanes::Any,
         }
     }
 
@@ -562,6 +569,16 @@ impl StepFacts {
     /// reads out, under its ceiling).
     #[must_use]
     pub fn stated(caps: &crate::Capabilities, readouts: &crate::ReadoutFacts) -> StepFacts {
+        Self::stated_of(caps, readouts).with_mixed(caps.mixed_lanes.clone())
+    }
+
+    /// These facts with the mixed steps the engine lays out (`mixed`).
+    #[must_use]
+    pub fn with_mixed(self, mixed: crate::MixedLanes) -> StepFacts {
+        StepFacts { mixed, ..self }
+    }
+
+    fn stated_of(caps: &crate::Capabilities, readouts: &crate::ReadoutFacts) -> StepFacts {
         StepFacts::of(
             &caps.chunks,
             caps.limits.max_lanes,
@@ -733,23 +750,57 @@ impl StepShapes {
                                 attachments: facts.attachments,
                             })
                         }),
-                        StepKind::Mixed => Span::new(lo.max(3), top).and_then(|rows| {
-                            Some(StepShape {
-                                rung,
-                                kind,
-                                treatment,
-                                rows,
-                                decode_lanes: Span::new(1, (lanes - 1).min(rows.hi - 2))?,
-                                prompt_lanes: Span::new(1, (lanes - 1).min((rows.hi - 1) / 2))?,
-                                prompt_rows: Span::new(2, rows.hi - 1)?,
-                                lane_rows: Span::new(2, rows.hi - 1)?,
-                                readout_rows: Span {
-                                    lo: 0,
-                                    hi: reads(rows.hi),
-                                },
-                                attachments: facts.attachments,
-                            })
-                        }),
+                        StepKind::Mixed => {
+                            // Each prompt-lane rung the engine lays a mixed
+                            // step at (its prompts and their rest lane), with
+                            // the decodes beside it; any counts within the
+                            // lanes where it states none.
+                            let bands: Vec<(u32, u32, u32)> = match &facts.mixed {
+                                crate::MixedLanes::Any => vec![(1, lanes - 1, lanes - 1)],
+                                crate::MixedLanes::Laid(rungs) => {
+                                    let mut from = 1;
+                                    rungs
+                                        .iter()
+                                        .map(|r| {
+                                            let band = (
+                                                from,
+                                                r.prompt_lanes.saturating_sub(1),
+                                                r.decode_lanes,
+                                            );
+                                            from = r.prompt_lanes;
+                                            band
+                                        })
+                                        .collect()
+                                }
+                            };
+                            for (p_lo, p_hi, d_hi) in bands {
+                                let shape = Span::new(lo.max(3), top).and_then(|rows| {
+                                    Some(StepShape {
+                                        rung,
+                                        kind,
+                                        treatment,
+                                        rows,
+                                        decode_lanes: Span::new(
+                                            1,
+                                            d_hi.min(lanes - 1).min(rows.hi - 2),
+                                        )?,
+                                        prompt_lanes: Span::new(
+                                            p_lo,
+                                            p_hi.min(lanes - 1).min((rows.hi - 1) / 2),
+                                        )?,
+                                        prompt_rows: Span::new(2, rows.hi - 1)?,
+                                        lane_rows: Span::new(2, rows.hi - 1)?,
+                                        readout_rows: Span {
+                                            lo: 0,
+                                            hi: reads(rows.hi),
+                                        },
+                                        attachments: facts.attachments,
+                                    })
+                                });
+                                shapes.extend(shape);
+                            }
+                            None
+                        }
                     };
                     shapes.extend(shape);
                 }
@@ -987,7 +1038,82 @@ mod tests {
             max_readouts: 0,
             buffers,
             attachments: Attachments::served(true, true, true),
+            mixed: crate::MixedLanes::Any,
         }
+    }
+
+    /// An engine stating no mixed lane rungs (`MixedLanes::Any`: CUDA,
+    /// engine-gpu, Metal, Cerebras) states one mixed shape a rung and
+    /// treatment, any prompt and decode counts within its lanes, as before
+    /// the rungs; one stating rungs (XLA) a shape a prompt-lane rung, its
+    /// decodes no more than the rung lays beside it.
+    #[test]
+    fn mixed_shapes_follow_the_engines_lane_rungs_and_none_where_it_states_none() {
+        let any = facts(&[16, 256, 2048], true);
+        let set = StepShapes::of(&StepRules::runtime(), &any);
+        let mixed: Vec<&StepShape> = set
+            .shapes
+            .iter()
+            .filter(|s| s.kind == StepKind::Mixed)
+            .collect();
+        for shape in &mixed {
+            let lanes = any.max_lanes;
+            assert_eq!(
+                shape.prompt_lanes,
+                Span {
+                    lo: 1,
+                    hi: (lanes - 1).min((shape.rows.hi - 1) / 2)
+                }
+            );
+            assert_eq!(
+                shape.decode_lanes,
+                Span {
+                    lo: 1,
+                    hi: (lanes - 1).min(shape.rows.hi - 2)
+                }
+            );
+        }
+        let per = |set: &StepShapes| {
+            let mut keys: Vec<(u32, Treatment)> = set
+                .shapes
+                .iter()
+                .filter(|s| s.kind == StepKind::Mixed)
+                .map(|s| (s.rung, s.treatment))
+                .collect();
+            let n = keys.len();
+            keys.dedup();
+            (n, keys.len())
+        };
+        let (n, distinct) = per(&set);
+        assert_eq!(n, distinct, "one mixed shape a rung and treatment");
+        let rung = |prompt_lanes, decode_lanes| crate::MixedRung {
+            prompt_lanes,
+            decode_lanes,
+        };
+        let laid = any.clone().with_mixed(crate::MixedLanes::Laid(vec![
+            rung(16, 48),
+            rung(32, 32),
+            rung(64, 0),
+        ]));
+        let set = StepShapes::of(&StepRules::runtime(), &laid);
+        for shape in set.shapes.iter().filter(|s| s.kind == StepKind::Mixed) {
+            let (lo, hi, d) = if shape.prompt_lanes.hi <= 15 {
+                (1, 15, 48)
+            } else {
+                (16, 31, 32)
+            };
+            assert!(
+                shape.prompt_lanes.lo == lo && shape.prompt_lanes.hi <= hi,
+                "{shape:?}"
+            );
+            assert!(shape.decode_lanes.hi <= d, "{shape:?}");
+        }
+        // a rung laying no decodes beside it states no mixed shape
+        assert!(
+            set.shapes
+                .iter()
+                .all(|s| s.kind != StepKind::Mixed || s.prompt_lanes.hi < 32)
+        );
     }
 
     fn lane(rows: usize, buffered: bool) -> Lane {

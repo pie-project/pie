@@ -33,7 +33,11 @@ struct Input {
 /// The token a row's logits pick: the most likely one when `greedy`, else
 /// a Gumbel draw keyed by `r`.
 fn pick(logits: Tensor, r: &Tensor, greedy: bool) -> Tensor {
-    if greedy { reduce_argmax(logits) } else { gumbel_max(logits, r) }
+    if greedy {
+        reduce_argmax(logits)
+    } else {
+        gumbel_max(logits, r)
+    }
 }
 
 #[derive(Serialize)]
@@ -144,8 +148,15 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated = Vec::with_capacity(input.max_tokens);
     let mut gaps = Vec::with_capacity(input.max_tokens);
     for i in 0..input.max_tokens as u32 {
-        let (next, gap) =
-            draw(&ws, &pipe, &tokens, input.seed, input.drawn + i, input.greedy).await?;
+        let (next, gap) = draw(
+            &ws,
+            &pipe,
+            &tokens,
+            input.seed,
+            input.drawn + i,
+            input.greedy,
+        )
+        .await?;
         generated.push(next as u32);
         gaps.push(gap);
         tokens = vec![next];

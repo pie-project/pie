@@ -179,6 +179,7 @@ fn build_model(
                     readout_store: 0,
                 },
                 steps: g.caps.steps.clone(),
+                mixed_lanes: g.caps.mixed_lanes.clone(),
                 engine_backend: g.backend,
             }
         })
