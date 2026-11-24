@@ -6,8 +6,11 @@ use crate::caps::Capabilities;
 
 pub mod armed;
 pub mod check;
+pub mod host_tier;
 pub mod rung;
 pub mod top;
+
+pub use host_tier::{DeviceMemory, HostTier};
 
 pub use rung::{
     CheckFire, FireEstimate, GemmShape, NoRung, RungFacts, Terms, TopRung, TopWhy, fire_top,

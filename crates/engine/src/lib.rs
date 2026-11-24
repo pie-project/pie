@@ -61,7 +61,10 @@ pub use fire::{
     ReplayPast, ReplayRows, RsReset, RsSnapshot, RsVerb, RungReplay, ScratchBytes, Serves, Step,
     WindowFold,
 };
-pub use load::{Allowance, Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use load::{
+    Allowance, Budgets, Checkpoint, DeviceMemory, HostTier, LoadFacts, LoadRequest, Loaded,
+    Residency,
+};
 pub use memory::SAFETY_FLOOR_BYTES;
 pub use shapes::{
     Attachments, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,

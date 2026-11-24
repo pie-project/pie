@@ -702,16 +702,29 @@ impl Engine for Cuda {
         // Every rank on the host seats its own tier: a tensor-parallel
         // group's and each expert-parallel rank's.
         let ranks = self.boot.world.size * self.expert.size;
+        // On a device whose memory is the host's (`cudaDevAttrIntegrated`)
+        // no host tier is seated, nor its staging ring pinned: suspended kv
+        // goes to the disk, and a stated tier is refused by name.
+        let bound = if ordinal >= 0 {
+            ordinal
+        } else {
+            self.boot.ordinal
+        };
+        let memory = crate::device::card::whose_memory(bound).map_err(fault)?;
+        let host_tier = memory
+            .host_tier(residency.host_kv_budget)
+            .map_err(|why| Error::Load(format!("engine-cuda: {why}")))?;
         // The host tier's staging ring is page-locked here, before anything
-        // measures the device: on an integrated device the ring and the
-        // device draw on the same memory, and what the ring holds is then
-        // gone from the driver's free bytes and Windows' commit alike. A
-        // ring that cannot be pinned refuses the load, here and not after
-        // ready.
+        // measures the device, so what it holds is counted gone before the
+        // device's free bytes are read. A ring that cannot be pinned refuses
+        // the load, here and not after ready.
         let frames = engine::runahead::Runahead::of(frames_in_flight).frames_in_flight;
-        let ring = crate::store::staging_ring_for(residency.host_kv_budget, ranks, frames)
-            .and_then(|size| size.map(crate::store::Ring::pin).transpose())
-            .map_err(fault)?;
+        let ring = match host_tier {
+            engine::HostTier::Absent => None,
+            engine::HostTier::Seated(stated) => crate::store::staging_ring_for(stated, ranks, frames)
+                .and_then(|size| size.map(crate::store::Ring::pin).transpose())
+                .map_err(fault)?,
+        };
         if let Some(ring) = &ring {
             let size = ring.size();
             eprintln!(
@@ -745,11 +758,7 @@ impl Engine for Cuda {
             slots: budgets.slots,
             kv_budget,
             allowance: residency.device,
-            ordinal: if ordinal >= 0 {
-                ordinal
-            } else {
-                self.boot.ordinal
-            },
+            ordinal: bound,
             knobs: crate::Knobs {
                 weights_held: residency.weights_held,
                 ..self.boot.knobs.clone()
@@ -779,21 +788,23 @@ impl Engine for Cuda {
         shell.mount_adapters(self.boot.adapter_dir.clone());
         // The context the load serves, a declared one as the load's room cut it.
         let context = shell.paging().context();
-        shell
-            .seat_host_kv(
-                residency.host_kv_budget,
-                residency.kv_seats.unwrap_or(budgets.max_lanes),
-                context,
-                ranks,
-                ring,
-            )
-            .map_err(fault)?;
+        if let engine::HostTier::Seated(stated) = host_tier {
+            shell
+                .seat_host_kv(
+                    stated,
+                    residency.kv_seats.unwrap_or(budgets.max_lanes),
+                    context,
+                    ranks,
+                    ring,
+                )
+                .map_err(fault)?;
+        }
         let kv_handle = if residency.kv_export {
             Some(shell.export_kv(self.boot.world).map_err(fault)?)
         } else {
             None
         };
-        shell
+        let disk_pages = shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
@@ -801,6 +812,13 @@ impl Engine for Cuda {
                 self.boot.world,
             )
             .map_err(fault)?;
+        if memory.unified() {
+            eprintln!(
+                "engine-cuda: {} ({} disk kv pages)",
+                engine::DeviceMemory::NO_HOST_TIER,
+                disk_pages
+            );
+        }
 
         // Expert parallelism seats its buffers in the arena laid at the
         // span's start: no smaller rung.
@@ -831,7 +849,7 @@ impl Engine for Cuda {
                 backend: "cuda".to_string(),
                 domain: MemoryDomain::CudaDevice(u32::try_from(shell.ordinal()).unwrap_or(0)),
                 sms: shell.sms(),
-                unified_memory: false,
+                unified_memory: memory.unified(),
                 fp8_native: false,
                 native_mxfp4_moe: false,
                 storage_alignment: 256,
