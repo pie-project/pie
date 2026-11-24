@@ -125,7 +125,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
                                # in the host stack and bypasses this list
 # scratch_dir     = "/tmp/pie"
 # max_memory      = "4GiB"
-# max_instances   = 1000
+# max_instances   = 1000      # omit: what the address space fits
 # warm_memory     = "0B"
 # warm_slots      = 100
 

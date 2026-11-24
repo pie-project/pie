@@ -368,9 +368,11 @@ pub struct SandboxConfig {
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
     /// Instances the wasmtime pooling allocator may hold. A ceiling on
-    /// concurrent inferlets, reserved up front.
-    #[serde(default = "default_max_instances")]
-    pub max_instances: u32,
+    /// concurrent inferlets, its address space reserved up front; unset,
+    /// what this process's address space fits. A count that does not fit
+    /// is refused at boot.
+    #[serde(default)]
+    pub max_instances: Option<u32>,
     /// Linear memory one instance may address.
     #[serde(default = "default_max_memory")]
     pub max_memory: ByteSize,
@@ -391,7 +393,7 @@ impl Default for SandboxConfig {
             scratch_dir: default_scratch_dir(),
             allow_network: true,
             network_allowed_hosts: default_network_allowed_hosts(),
-            max_instances: default_max_instances(),
+            max_instances: None,
             max_memory: default_max_memory(),
             warm_memory: default_warm_memory(),
             warm_slots: default_warm_slots(),
@@ -401,7 +403,10 @@ impl Default for SandboxConfig {
 
 impl SandboxConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(self.max_instances > 0, "sandbox.max_instances must be > 0");
+        ensure!(
+            self.max_instances != Some(0),
+            "sandbox.max_instances must be > 0"
+        );
         ensure!(
             self.max_memory.as_bytes() > 0,
             "sandbox.max_memory must be > 0"
@@ -410,9 +415,6 @@ impl SandboxConfig {
     }
 }
 
-fn default_max_instances() -> u32 {
-    2048
-}
 fn default_max_memory() -> ByteSize {
     ByteSize::from_mib(4096)
 }

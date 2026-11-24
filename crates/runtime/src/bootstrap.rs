@@ -121,7 +121,9 @@ pub struct BuiltinProgram {
 pub struct RuntimeConfig {
     pub worker_threads: usize,
 
-    pub wasm_max_instances: u32,
+    /// Instances the wasmtime pool holds; `None` holds what this process's
+    /// address space fits.
+    pub wasm_max_instances: Option<u32>,
     pub wasm_max_memory_mb: usize,
     pub wasm_warm_memory_mb: usize,
     pub wasm_warm_slots: u32,
@@ -330,7 +332,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     if !config.skip_tracing {
         init_tracing(config.log_dir.as_deref(), config.verbose, &config.telemetry)?;
     }
-    let wasm_engine = init_wasmtime(&config.runtime);
+    let wasm_engine = init_wasmtime(&config.runtime)?;
 
     program::spawn(
         &wasm_engine,
@@ -1522,8 +1524,8 @@ fn verify_config(config: &Config) -> Result<()> {
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
 #[cfg(target_arch = "wasm32")]
-fn init_wasmtime(_runtime: &RuntimeConfig) -> wasmtime::Engine {
-    browser_wasm_engine()
+fn init_wasmtime(_runtime: &RuntimeConfig) -> Result<wasmtime::Engine> {
+    Ok(browser_wasm_engine())
 }
 
 /// The engine inferlets run on in a browser tab. A component precompiled for
@@ -1538,8 +1540,9 @@ pub fn browser_wasm_engine() -> wasmtime::Engine {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
+fn init_wasmtime(runtime: &RuntimeConfig) -> Result<wasmtime::Engine> {
     let mut wasm_config = wasmtime::Config::default();
+    configure_execution(&mut wasm_config, runtime)?;
 
     if let Some(dir) = &runtime.compile_cache_dir {
         let mut cache_config = wasmtime::CacheConfig::new();
@@ -1555,53 +1558,86 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
         }
     }
 
-    configure_execution(&mut wasm_config, runtime);
-    wasmtime::Engine::new(&wasm_config).unwrap()
+    wasmtime::Engine::new(&wasm_config)
+        .map_err(|error| anyhow::anyhow!("the inferlet sandbox's wasmtime engine: {error:#}"))
 }
 
 /// Apple's platforms other than macOS (iOS, visionOS, tvOS, watchOS) give an
 /// app no executable memory: inferlets run as Pulley bytecode, with memories
 /// allocated on demand.
 #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
-fn configure_execution(wasm_config: &mut wasmtime::Config, _runtime: &RuntimeConfig) {
-    wasm_config
-        .target("pulley64")
-        .expect("pulley64 is compiled in where an app may not JIT");
+fn configure_execution(wasm_config: &mut wasmtime::Config, _runtime: &RuntimeConfig) -> Result<()> {
+    wasm_config.target("pulley64").map_err(|error| {
+        anyhow::anyhow!("pulley64 is compiled in where an app may not JIT: {error:#}")
+    })?;
     wasm_config.signals_based_traps(false);
     wasm_config.memory_reservation(0);
     wasm_config.memory_guard_size(0);
     wasm_config.memory_init_cow(false);
+    Ok(())
 }
 
+/// The pooling allocator, its instance count held to what this process's
+/// address space fits (`sandbox_pool`).
 #[cfg(not(any(
     target_arch = "wasm32",
     all(target_vendor = "apple", not(target_os = "macos"))
 )))]
-fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConfig) {
+fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConfig) -> Result<()> {
+    use crate::sandbox_pool;
+
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-    pooling_config.total_component_instances(runtime.wasm_max_instances);
-    pooling_config.total_memories(runtime.wasm_max_instances);
-    pooling_config.total_stacks(runtime.wasm_max_instances);
     pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
     pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
-    pooling_config.total_core_instances(
-        runtime
-            .wasm_max_instances
-            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
-    );
-    pooling_config.total_tables(
-        runtime
-            .wasm_max_instances
-            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
-    );
     pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
     pooling_config
         .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));
     pooling_config.max_unused_warm_slots(runtime.wasm_warm_slots);
 
+    // What an instance reserves, read off an engine of this configuration
+    // that allocates on demand (it reserves nothing): its memory
+    // reservation, guard and stack, as wasmtime resolves them.
+    let probe = wasmtime::Engine::new(wasm_config)
+        .map_err(|error| anyhow::anyhow!("the inferlet sandbox's wasmtime engine: {error:#}"))?;
+    let layout = sandbox_pool::PoolLayout {
+        page_bytes: sandbox_pool::page_bytes(),
+        memory_reservation: probe.get_memory_reservation(),
+        max_memory: pooling_config.get_max_memory_size() as u64,
+        memory_guard: probe.get_memory_guard_size(),
+        guard_before: probe.get_guard_before_linear_memory(),
+        stack_bytes: probe.get_async_stack_size() as u64,
+        tables_per_instance: u64::from(CORE_RESOURCES_PER_COMPONENT),
+        table_elements: pooling_config.get_table_elements() as u64,
+        table_element_bytes: std::mem::size_of::<usize>() as u64,
+    };
+    drop(probe);
+    let cost = layout.cost();
+    let instances = sandbox_pool::size_pool(
+        runtime.wasm_max_instances,
+        sandbox_pool::read_address_space(),
+        &cost,
+    )?;
+    tracing::info!(
+        "sandbox pool: {instances} instances{}, {} of address space ({} each)",
+        if runtime.wasm_max_instances.is_some() {
+            " as configured"
+        } else {
+            " (what this process's address space fits)"
+        },
+        sandbox_pool::show(cost.bytes(u64::from(instances))),
+        sandbox_pool::show(cost.instance_bytes),
+    );
+
+    pooling_config.total_component_instances(instances);
+    pooling_config.total_memories(instances);
+    pooling_config.total_stacks(instances);
+    pooling_config.total_core_instances(instances.saturating_mul(CORE_RESOURCES_PER_COMPONENT));
+    pooling_config.total_tables(instances.saturating_mul(CORE_RESOURCES_PER_COMPONENT));
+
     wasm_config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
         pooling_config,
     ));
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -102,7 +102,7 @@ impl Settings {
         config.runtime.frame_dispatch_depth = self.frame_dispatch_depth;
         config.runtime.max_concurrent_processes = self.max_concurrent_processes;
         let sandbox = &mut config.sandbox;
-        sandbox.max_instances = 16;
+        sandbox.max_instances = Some(16);
         sandbox.max_memory = ByteSize::from_mib(self.sandbox_memory_mb);
         sandbox.warm_memory = ByteSize::default();
         sandbox.warm_slots = 0;
