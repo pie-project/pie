@@ -960,26 +960,13 @@ impl Plane {
         if let Some(cell) = seat.session.kept_cell(binding.channel) {
             return Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Cell(cell))));
         }
-        let ring = &seat.inst.channels[binding.channel as usize];
-        seat.landing.wait((binding.channel, ring.head()), &seat.faulted);
-        if seat.faulted.load(Ordering::Acquire) {
-            return Err(Refusal::Program(format!("instance {instance} is poisoned")));
-        }
-        if ring.is_empty() {
-            return Err(Refusal::Program(format!(
-                "instance {instance}: the `parents` ring is empty at the fire"
-            )));
-        }
-        let parents = match ring.front() {
-            Value::U32(cells) => cells,
-            Value::I32(cells) => cells.iter().map(|&p| p as u32).collect(),
-            other => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance}: `parents` holds {:?}, not beams",
-                    other.dtype()
-                )));
-            }
-        };
+        let parents = engine_gpu::guest::defer::parents(
+            instance,
+            binding.channel,
+            &seat.inst.channels[binding.channel as usize],
+            &seat.landing,
+            &seat.faulted,
+        )?;
         Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Host(parents))))
     }
 
