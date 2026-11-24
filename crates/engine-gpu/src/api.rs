@@ -272,6 +272,9 @@ pub struct Gpu<B: Host> {
     /// The rows of the loaded model's widest token table: a token id a
     /// guest resolves at or past it is out of bounds.
     vocab: Option<u32>,
+    /// Whether the settle left behind serving was said to wait for an
+    /// empty pool.
+    said_waiting: bool,
 }
 
 impl<B: Host> Gpu<B> {
@@ -537,6 +540,7 @@ impl<B: Host> Gpu<B> {
             guest_built: 0,
             warned_in_fire: false,
             vocab: None,
+            said_waiting: false,
         }
     }
 
@@ -1739,8 +1743,18 @@ where
             return Ok(false);
         };
         // The settle's ranges first (decode's rows before the large ones),
-        // then each rate served by a stale figure.
-        if !shell.measures_behind() {
+        // where the pool is quiet (a settle fire writes its seats); else,
+        // and after, each rate and curve served by a stale figure (its step
+        // writes no pool chunk: it runs on any idle turn).
+        if !shell.measures_behind() || !behind.quiet {
+            if shell.measures_behind() && shell.rates_behind().is_none() && !self.said_waiting {
+                self.said_waiting = true;
+                tracing::info!(
+                    "dense settle behind serving: waiting for an idle turn on which the runtime \
+                     holds no slot of the pool (a settle fire writes its seats); this load \
+                     serves its fallback picks meanwhile"
+                );
+            }
             return self.rate_behind(behind);
         }
         let fired = shell.measure_behind(behind.others).map_err(fault)?;

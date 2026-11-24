@@ -951,9 +951,10 @@ impl Lane {
     }
 
     /// One slice of what the engine measures behind serving, where it has
-    /// any and the runtime holds no slot of the engine's pool (no working
-    /// set, cache entry, snapshot, store table or weight lies in any chunk,
-    /// and no waiter is short of one): the slice's length where it fired.
+    /// any, told whether the runtime holds no slot of the engine's pool (no
+    /// working set, cache entry, snapshot, store table or weight lies in
+    /// any chunk, and no waiter is short of one): the slice's length where
+    /// it fired.
     /// A fault in it ends that measuring, said; serving goes on.
     fn measure_behind(
         engine_idx: usize,
@@ -967,20 +968,21 @@ impl Lane {
         if !engine.measures_behind() {
             return None;
         }
+        // Whether the runtime holds no slot of the pool: what a slice that
+        // writes the pool's chunks (a settle fire's seats) waits for; a
+        // slice that writes none runs on any idle turn.
         let quiet = crate::store::registry::try_get(0, engine_idx)
             .and_then(|stores| stores.shared)
             .is_some_and(|shared| {
                 let pool = shared.lock().unwrap();
                 pool.pool().holds_nothing() && !pool.pool().waiting()
             });
-        if !quiet {
-            return None;
-        }
         let began = Instant::now();
         let others = || SUBMITS.load(std::sync::atomic::Ordering::Acquire);
         let behind = ::engine::BehindServing {
             others: &others,
             arrived,
+            quiet,
         };
         match engine.measure_behind(&behind) {
             Ok(true) => Some(began.elapsed()),

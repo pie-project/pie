@@ -199,6 +199,11 @@ pub struct BehindServing<'a> {
     /// slice of several frames stops at its next frame, so an arrival waits
     /// at most the one in flight.
     pub arrived: &'a dyn Fn() -> bool,
+    /// Whether the runtime holds no slot of the engine's pool (no working
+    /// set, cache entry, snapshot, store table or weight lies in any
+    /// chunk): only then may a slice write the pool's chunks (a settle
+    /// fire's seats). A slice that writes none runs either way.
+    pub quiet: bool,
 }
 
 pub trait Engine: Send {
@@ -687,11 +692,11 @@ pub trait Engine: Send {
         false
     }
 
-    /// One slice of the measuring the load left behind serving, at most
-    /// one fire. The engine's lane calls it only where it would otherwise
-    /// sleep (no fire or call waits, nothing landing is owed) and only while
-    /// the runtime holds no slot of the engine's pool, so the engine may
-    /// fire on its seat-addressed chunks. Nothing it does changes what the
+    /// One slice of the measuring the load left behind serving. The
+    /// engine's lane calls it only where it would otherwise sleep (no fire
+    /// or call waits, nothing landing is owed); a slice that writes the
+    /// pool's chunks runs only where [`BehindServing::quiet`] says the
+    /// runtime holds none of them. Nothing it does changes what the
     /// load serves, records or builds; what it decides is stored for the
     /// next load ([`BehindServing`] says what the runtime tells it). Whether
     /// it fired (`false`: nothing left, or nothing it can fire now).

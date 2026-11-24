@@ -702,13 +702,23 @@ struct Behind {
     pending: usize,
     /// The ranges weighed and stored since.
     stored: usize,
-    /// The points discarded and fired again: overlapped by other work on
-    /// the device, or timed under a clock that sagged.
-    discarded: u64,
+    /// The points discarded and fired again, by cause ([`Discard`]).
+    discarded: [u64; 3],
     /// The slices run, and the longest one: what an arrival can wait
     /// behind.
     slices: u64,
     longest: std::time::Duration,
+}
+
+/// Why a point behind serving was discarded, as its count is kept.
+#[derive(Clone, Copy, Debug)]
+enum Discard {
+    /// The device had other work as it started.
+    Busy = 0,
+    /// Another lane submitted while it ran.
+    Overlap = 1,
+    /// The device's clock moved under it.
+    Clock = 2,
 }
 
 /// One range's weighing behind serving: its options, fired one a slice in
@@ -3201,7 +3211,7 @@ impl<B: Serve> Shell<B> {
             left,
             trial: None,
             stored: 0,
-            discarded: 0,
+            discarded: [0; 3],
             slices: 0,
             longest: std::time::Duration::ZERO,
         });
@@ -3410,18 +3420,20 @@ impl<B: Serve> Shell<B> {
         if more {
             self.behind = Some(behind);
         } else {
+            let [busy, overlap, clock] = behind.discarded;
             tracing::info!(
                 pending = behind.pending,
                 stored = behind.stored,
-                discarded = behind.discarded,
+                busy,
+                overlap,
+                clock,
                 slices = behind.slices,
                 longest_ms = behind.longest.as_secs_f64() * 1e3,
-                "dense settle behind serving done: {} of {} ranges stored for the next load ({} \
-                 points discarded and fired again); the longest slice, what an arrival waited \
-                 behind at most, {:.1} ms",
+                "dense settle behind serving done: {} of {} ranges stored for the next load \
+                 (points discarded: {busy} busy, {overlap} overlapped, {clock} clock); the longest \
+                 slice, what an arrival waited behind at most, {:.1} ms",
                 behind.stored,
                 behind.pending,
-                behind.discarded,
                 behind.longest.as_secs_f64() * 1e3
             );
         }
@@ -3435,7 +3447,7 @@ impl<B: Serve> Shell<B> {
     pub fn behind_status(&self) -> Option<(usize, usize, u64)> {
         self.behind
             .as_ref()
-            .map(|b| (b.pending, b.stored, b.discarded))
+            .map(|b| (b.pending, b.stored, b.discarded.iter().sum()))
     }
 
     fn behind_slice(&mut self, behind: &mut Behind, others: &dyn Fn() -> u64) -> Result<bool> {
@@ -3455,12 +3467,12 @@ impl<B: Serve> Shell<B> {
             }
             return Ok(behind.trial.is_some() || !behind.left.is_empty());
         };
-        if let Some(why) = self.trial_fire(&mut trial, others)? {
-            behind.discarded += 1;
+        if let Some((cause, why)) = self.trial_fire(&mut trial, others)? {
+            behind.discarded[cause as usize] += 1;
             tracing::debug!(
                 bottom = trial.bottom,
                 top = trial.top,
-                discarded = behind.discarded,
+                discarded = ?behind.discarded,
                 "dense settle behind serving: a point discarded ({why}); fired again later"
             );
         }
@@ -3475,15 +3487,18 @@ impl<B: Serve> Shell<B> {
         behind.rows.push(row);
         behind.stored += 1;
         self.to_store = Some(self.behind_entry(behind));
+        let [busy, overlap, clock] = behind.discarded;
         tracing::info!(
             pending = behind.pending,
             stored = behind.stored,
-            discarded = behind.discarded,
-            "dense settle behind serving: {} of {} ranges weighed and stored ({} points \
-             discarded: overlapped by other work on the device, or under a clock that sagged)",
+            busy,
+            overlap,
+            clock,
+            "dense settle behind serving: {} of {} ranges weighed and stored (points discarded \
+             and fired again: {busy} the device busy as they started, {overlap} overlapped by \
+             another lane, {clock} under a clock that moved)",
             behind.stored,
             behind.pending,
-            behind.discarded
         );
         Ok(!behind.left.is_empty())
     }
@@ -3647,19 +3662,20 @@ impl<B: Serve> Shell<B> {
     /// ending, a ramp, a sag). Else it is discarded and fired again in
     /// a later slice, so contention or a DVFS step is never stored as a
     /// kernel's figure: `Some(why)`.
-    fn trial_fire(&mut self, trial: &mut Trial, others: &dyn Fn() -> u64) -> Result<Option<String>> {
+    fn trial_fire(
+        &mut self,
+        trial: &mut Trial,
+        others: &dyn Fn() -> u64,
+    ) -> Result<Option<(Discard, String)>> {
         use crate::backend::Tactics as _;
         let timed = trial.round > 0;
         if timed && !crate::backend::Context::idle(&self.device) {
-            return Ok(Some("the device had other work as it started".to_string()));
+            return Ok(Some((
+                Discard::Busy,
+                "the device had other work as it started".to_string(),
+            )));
         }
         let reference = self.tuning.gemm(self.tier, crate::submit::PROBE.0);
-        let clock_before = if timed {
-            Some(crate::rates::clock_warmed::<B>(&self.device, reference)?)
-        } else {
-            None
-        };
-        let submitted = others();
         let decode = self.trace.facts.word(&poem_ir::Request::new(1, false));
         let word = if trial.per_lane == 1 {
             decode
@@ -3703,6 +3719,22 @@ impl<B: Serve> Shell<B> {
                 })
             })
             .collect();
+        // A slice follows an idle gap, its clock fallen: the point's own
+        // fire first, untimed (the clock raised by the load it times, not
+        // by the small reference alone), then the reference read until the
+        // clock settles ([`crate::rates::warmed`]).
+        let clock_before = if timed {
+            self.drain()?;
+            self.fire_seated(&seated)?;
+            self.drain()?;
+            for slot in 0..fire_lanes {
+                self.open(slot)?;
+            }
+            Some(crate::rates::clock_warmed::<B>(&self.device, reference)?)
+        } else {
+            None
+        };
+        let submitted = others();
         self.drain()?;
         self.spans = Some(Vec::new());
         let began = std::time::Instant::now();
@@ -3731,14 +3763,20 @@ impl<B: Serve> Shell<B> {
             self.open(slot)?;
         }
         if others() != submitted {
-            return Ok(Some("another lane submitted while it ran".to_string()));
+            return Ok(Some((
+                Discard::Overlap,
+                "another lane submitted while it ran".to_string(),
+            )));
         }
         if let Some(before) = clock_before {
             let after = crate::rates::clock_read::<B>(&self.device, reference)?;
             if let Some(ratio) = crate::rates::clock_moved(before, after) {
-                return Ok(Some(format!(
-                    "the device's clock moved under it: its reference {ratio:.2}x the time after \
-                     it that it took before"
+                return Ok(Some((
+                    Discard::Clock,
+                    format!(
+                        "the device's clock moved under it: its reference {ratio:.2}x the time \
+                         after it that it took before"
+                    ),
                 )));
             }
         }

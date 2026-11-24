@@ -1502,10 +1502,10 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 
 **Why later.** It moves when fold counts are fixed (a contract change touching every engine's staging). The carried kernels in the dot-product form (O(n·d)) already make n = 7 cost a few % (CUDA 9B, Vulkan). Pull this in only if a backend's kernel can't reach the 2% gate at n = 7.
 
-## F79. Measuring behind serving with weights streaming through the pool
+## F79. Settle fires behind serving wait for an empty pool
 
-**What.** A load's leftover measuring (the dense settle's ranges, a rate or curve stored under a stale key) runs behind serving only while the runtime holds no slot of the engine's pool (`SlotPool::holds_nothing`), because a settle fire writes the seat-addressed chunks. A model whose weights stream through the pool (a `Weights` holder: experts, token tables) is never quiet, so it serves on the fallback picks and stale figures until a committed settle or profile of its key arrives (the coordinated re-export).
+**What.** The dense settle's ranges, left to weigh behind serving, fire only while the runtime holds no slot of the engine's pool (`SlotPool::holds_nothing`), because a settle fire writes the seat-addressed chunks. The rates and curve slices write no pool chunk and run on any idle lane turn. Under steady traffic, the idle cache a finished request leaves keeps a slot, so the settle may never run (the phone at one request every 4 s ran none in 900 s). The same holds for a model whose weights stream through the pool (a `Weights` holder: experts, token tables), which is never quiet. Each serves on the fallback picks until a committed settle of its key arrives (the coordinated re-export) or the pool empties.
 
-**Idea.** Let the settle fire on chunks the runtime lends for the slice (a reservation by refs), or let the quiet check ignore holders whose chunks lie outside the seat runs a settle fire writes. The rates and curve slices write no pool chunk at all and could run beside a `Weights` holder today.
+**Idea.** Let the settle fire on chunks the runtime lends for the slice (a reservation by refs, sized to one range's fire), or let the quiet check ignore holders whose chunks lie outside the seat runs a settle fire writes.
 
 **Why later.** Accepted for the new-memory PR (coordinator, 2026-11-24): the boot is fast either way, and only the picks stay on the fallback.
