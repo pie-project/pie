@@ -40,7 +40,8 @@ class RuntimeConfig:
     frame_size: Optional[int] = None
     frame_dispatch_depth: Optional[int] = None
     max_concurrent_processes: Optional[int] = None
-    # The worker-plane policy: a built-in name or a .wasm path.
+    # The worker-plane policy: a built-in name or a .wasm path. None: the
+    # server's default ("default"); "noop" writes no rows.
     worker_policy: Optional[str] = None
 
 
@@ -58,8 +59,9 @@ class SandboxConfig:
 
 @dataclass
 class ClusterConfig:
-    # The cluster policies the in-process controller runs.
-    cluster_policies: list[str] = field(default_factory=list)
+    # The cluster policies the in-process controller runs. None: the
+    # server's default (["default-cluster"]); [] runs none.
+    cluster_policies: Optional[list[str]] = None
 
 
 @dataclass
@@ -216,7 +218,7 @@ class Config:
                 engine["max_context"] = int(env_context)
 
         cluster: dict = {}
-        if self.cluster.cluster_policies:
+        if self.cluster.cluster_policies is not None:
             cluster["cluster_policies"] = list(self.cluster.cluster_policies)
 
         buf = io.StringIO()

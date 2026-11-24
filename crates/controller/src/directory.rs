@@ -231,6 +231,7 @@ impl Directory {
                 pools
             },
             peers: sorted(inner.peers.iter().map(|(w, p)| (*w, p.clone())).collect()),
+            links: sorted(inner.links.iter().map(|(w, l)| (*w, l.clone())).collect()),
             published: sorted(
                 inner
                     .published

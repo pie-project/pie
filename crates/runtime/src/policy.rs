@@ -13,10 +13,10 @@ pub mod grants;
 pub mod share;
 
 #[cfg(not(target_arch = "wasm32"))]
-mod port;
+pub(crate) mod port;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use port::{LoadError, reload, start, start_default};
+pub use port::{LoadError, reload, start};
 
 use client_api::Props;
 
@@ -118,10 +118,10 @@ pub(crate) enum Event {
     /// shortfall changes, or stands a while. The policy hears an edge only
     /// when the band changes.
     TierPressure(pressure::Tier, pressure::Reading),
-    /// Swap the policy for this one (name, component), or for none, loaded
-    /// whole first: the answer is why it did not load.
+    /// Swap the policy for this one (name, component), loaded whole first:
+    /// the answer is why it did not load.
     Reload(
-        Option<(String, Vec<u8>)>,
+        (String, Vec<u8>),
         std::sync::mpsc::SyncSender<Result<(), String>>,
     ),
 }
