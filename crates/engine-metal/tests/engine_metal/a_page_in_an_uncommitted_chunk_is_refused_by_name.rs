@@ -10,11 +10,44 @@
 
 use engine_metal::serve::Seated;
 use engine_metal::store::layout::LIST;
-use engine_metal::{Lane, Shell};
+use engine_metal::{Boot, Lane, Shell};
+use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, load_with, word};
+use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, word};
 
 const CONTEXT: u32 = 256;
+
+/// The pool at a stated size, not the device's free memory: a pool sized
+/// to fill what the device has free counts as many chunks as that holds,
+/// and where its chunks less the activation's fell on a segment boundary
+/// (one load in some, after other tests held memory) the span's segment
+/// held no state under the activation and the test could not lay its page
+/// there.
+const KV_BYTES: u64 = 1 << 30;
+
+fn load(fixture: &Fixture) -> Shell {
+    Shell::load(Boot {
+        trace: fixture.trace.clone(),
+        contract: &fixture.contract,
+        checkpoint: &fixture.container,
+        budget: Budget::new(4, 256),
+        patches: None,
+        voxels: None,
+        profile: None,
+        page_size: 16,
+        context: CONTEXT,
+        slots: 4,
+        kv_budget: Some(KV_BYTES),
+        allowance: engine::Allowance::WHOLE,
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_metal::ResidencyPlan::default(),
+        profiles: None,
+        top: engine_metal::Top::EveryRung,
+        measure: engine::rates::Measuring::Time,
+    })
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
+    .unwrap_or_else(|why| panic!("the shell loads: {why}"))
+}
 
 fn fire(shell: &mut Shell, fixture: &Fixture, pages: &[u32]) -> Result<Vec<Vec<f32>>, String> {
     let page = shell.paging().page_size;
@@ -41,7 +74,7 @@ fn a_page_in_an_uncommitted_chunk_is_refused_by_name() {
         return;
     }
     let fixture = fixture_of("qwen3-micro-text", None);
-    let mut shell = load_with(&fixture, CONTEXT);
+    let mut shell = load(&fixture);
     let facts = shell.pool_chunk_facts();
     let layout = shell.pool_layout();
     let segment = facts.segment_chunks;
@@ -57,7 +90,8 @@ fn a_page_in_an_uncommitted_chunk_is_refused_by_name() {
     let top_first = (total - act) / segment * segment;
     assert!(
         top_first < total - act,
-        "the span's segment holds state under the activation"
+        "the span's segment holds state under the activation ({total} chunks, the \
+         activation's {act}, a segment {segment}): choose another KV_BYTES"
     );
     shell
         .commit_span(1)
