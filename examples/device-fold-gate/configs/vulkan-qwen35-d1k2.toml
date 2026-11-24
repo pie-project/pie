@@ -1,0 +1,15 @@
+[server]
+listen = "127.0.0.1:18712"
+verbose = false
+
+[model]
+name = "default"
+source = "Qwen/Qwen3.5-0.8B"
+
+[engine]
+type = "vulkan"
+device = ["vulkan:0"]
+
+[runtime]
+frame_dispatch_depth = 1
+frame_size = 2
