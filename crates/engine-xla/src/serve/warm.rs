@@ -311,7 +311,13 @@ impl Shell {
                         p = pad.next(p);
                         continue;
                     }
-                    let n = p / 2;
+                    // the fewest prompts that pad to `p` (`canonical_pads`:
+                    // `n` prompts and the rest lane at their rung): `p / 2`
+                    // only at a growth of 200
+                    let Some(n) = (1..p).find(|&n| pad.rung(n + 1).max(host) == p) else {
+                        p = pad.next(p);
+                        continue;
+                    };
                     // the prompts' rows: the bucket, less the decodes, the
                     // one-row lanes their count pads with and the rest lane
                     let r = b.saturating_sub(d + p - n);
@@ -351,6 +357,35 @@ impl Shell {
                     }
                 }
             }
+        }
+        // Prompts beside more decodes than their rung's `beside` holds, and
+        // than the lanes they leave hold at the decodes' rung: the decodes
+        // pad to the lanes left (`canonical_pads`), at every prompt rung and
+        // bucket the cutter can form them in (v6e Qwen3-0.6B c64: 19 prompts
+        // padded to 32 lanes beside 48 decodes in 256 rows compiled mid-run,
+        // 10 s, every inferlet waiting).
+        let mut p = host;
+        while p < max_lanes {
+            let left = max_lanes - p;
+            let past = self.mixed_decode_lanes(p) + 1;
+            let d = (past..=left).find(|&d| pad.rung(d) > left);
+            let n = (1..=p).find(|&n| pad.rung(n + 1).max(host) == p);
+            if let (Some(d), Some(n)) = (d, n)
+                && d + n <= lanes_cap
+            {
+                // decodes' pad lanes, prompts' pad lanes; the rest lane a row
+                let ones = (left - d) + (p - 1 - n);
+                for &b in buckets.iter().filter(|&&b| b >= least && b <= widest) {
+                    let r = b.saturating_sub(d + ones + 1);
+                    if r >= 2 * n {
+                        let mut lanes = vec![beside; d as usize];
+                        lanes.extend(std::iter::repeat_n(fresh(prefill, r / n), n as usize));
+                        lanes[d as usize].rows += r % n;
+                        shapes.push(lanes);
+                    }
+                }
+            }
+            p = pad.next(p);
         }
         // A full fire's many prompts beside more decodes than the lanes they
         // leave hold at the decodes' rung: the decodes pad to the lanes left
