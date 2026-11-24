@@ -1438,12 +1438,6 @@ impl Plane {
         bound.session.token_cell(&program.plan)
     }
 
-    /// Passes of instance `id` in flight now.
-    #[must_use]
-    pub fn in_flight(&self, id: InstanceId) -> usize {
-        self.instances.get(&id).map_or(0, |bound| bound.session.in_flight())
-    }
-
     /// Passes of instance `id` that may fly while its next is staged:
     /// none unless it runs ahead ([`Session::ahead_depth`]).
     #[must_use]
