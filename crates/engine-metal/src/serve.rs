@@ -302,6 +302,10 @@ pub struct Shell {
     /// What the load weighed its rungs by, where its profile states rates:
     /// the rungs, the estimate and the live range (`--check-estimate`).
     weighed: Option<crate::top::Weighed>,
+    /// What the load timed, each by name (`engine::Engine::measured_at_load`):
+    /// the device's rates and the model's kernel.dense curves where it
+    /// measured them; nothing where a stored or committed entry served each.
+    measured_at_load: Vec<String>,
     /// The load's pipeline walk is running ([`Shell::warm_pipelines`]): a
     /// seat-addressed fire backs only what the walk backed for it.
     warming: bool,
@@ -1764,6 +1768,7 @@ impl PreparedLoad<'_> {
         });
         let shell = Shell {
             weighed,
+            measured_at_load: chip.tuned().timed.clone(),
             tuning,
             device,
             outside,
@@ -1895,6 +1900,12 @@ impl Shell {
             });
         }
         Ok(record[0])
+    }
+
+    /// What this load timed, each by name; empty where it measured nothing.
+    #[must_use]
+    pub fn measured_at_load(&self) -> &[String] {
+        &self.measured_at_load
     }
 
     /// The chunk pool as the runtime counts it.
