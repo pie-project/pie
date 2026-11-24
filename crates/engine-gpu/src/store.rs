@@ -2108,7 +2108,9 @@ impl<B: Backend> Pools<B> {
 
     /// Checks what a fire touches is committed: `demand`'s kv pages and
     /// state slots are one past the highest physical page and record unit
-    /// it names; lifts the watermark over it.
+    /// it names, each counted in its shape's unit ([`Pools::unit`]: the
+    /// slot where a chunk holds whole ones, else `gcd(chunk, slot)` bytes,
+    /// as [`Pools::kv_pages`] names a page); lifts the watermark over it.
     pub fn admit(&mut self, demand: engine::frame::Demand) -> Result<()> {
         if demand.workspace > 0 {
             return Err(Fault::Ceiling {
@@ -2118,10 +2120,8 @@ impl<B: Backend> Pools<B> {
             });
         }
         let chunk = self.layout.chunk_bytes;
-        if demand.kv_pages > 0
-            && let Some(list) = self.layout.list
-        {
-            let at = u64::from(demand.kv_pages - 1) * list.slot_bytes;
+        if demand.kv_pages > 0 && self.layout.list.is_some() {
+            let at = u64::from(demand.kv_pages - 1) * self.unit(LIST)?;
             self.pool
                 .admit(u32::try_from(at / chunk).unwrap_or(u32::MAX))?;
         }

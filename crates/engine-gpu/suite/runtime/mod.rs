@@ -8,6 +8,7 @@ mod fold;
 mod folded_roots;
 mod guest_settle;
 mod guest_state;
+mod held_experts;
 mod hosted;
 mod lane_refusal;
 mod nan_guards;
