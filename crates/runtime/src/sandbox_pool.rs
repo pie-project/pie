@@ -318,10 +318,11 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     let free = (MAX_ADDRESS - PAGE_ZERO).saturating_sub(mapped);
     // What the process maps does not lie in one place (the shared region,
     // the GPU's ranges, the weights), so the range free in one piece is
-    // found, not reckoned: three quarters of it, for what the process maps
-    // into it before the pool reserves.
+    // found, not reckoned; and, as `pool_bytes` leaves the rest of the
+    // process as much again as it maps now, that range less what it maps:
+    // the GPU's and the driver's later mappings may land in it.
     Ok(AddressSpace {
-        largest_free: largest_reservation(free) / 4 * 3,
+        largest_free: largest_reservation(free).saturating_sub(mapped),
         free,
         mapped,
         limit: address_space_limit(),
