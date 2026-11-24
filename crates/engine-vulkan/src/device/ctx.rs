@@ -294,6 +294,16 @@ impl Core {
     }
 
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
+        if matches!(
+            code,
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                | vk::Result::ERROR_OUT_OF_POOL_MEMORY
+                | vk::Result::ERROR_FRAGMENTED_POOL
+                | vk::Result::ERROR_FRAGMENTATION
+        ) {
+            SPENT.store(true, Ordering::Release);
+        }
         Fault::Vulkan {
             what: call,
             code: code.as_raw(),
@@ -460,6 +470,16 @@ pub(crate) struct SharedSets {
 pub(crate) static LIVE_CMDS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 pub(crate) static LIVE_FRAMES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// The driver ran out of what frames take (memory, pool room, command
+/// buffers) since the last [`take_spent`]: set where the call failed, read by
+/// the caller whatever its error became on the way up.
+static SPENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the driver ran out of what frames take since the last call.
+pub fn take_spent() -> bool {
+    SPENT.swap(false, Ordering::AcqRel)
+}
+
 /// What the device holds for frames now: command buffers, frames, shared
 /// descriptor sets, descriptor pools made and freed.
 #[must_use]
@@ -493,11 +513,13 @@ impl Core {
                 LIVE_CMDS.fetch_add(1, Ordering::Relaxed);
                 Ok(cmd)
             }
-            _ => Err(Fault::Ceiling {
+            _ => Err({
+                SPENT.store(true, Ordering::Release);
+                Fault::Ceiling {
                 what: "command buffers: the driver allocated a null one",
                 need: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0) + 1,
                 have: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0),
-            }),
+            }}),
         }
     }
 }

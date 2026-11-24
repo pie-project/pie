@@ -677,3 +677,8 @@ impl Pipelines {
 pub fn held_counts() -> (i64, i64, u64, u64, u64) {
     (0, 0, 0, 0, 0)
 }
+
+#[must_use]
+pub fn take_spent() -> bool {
+    false
+}

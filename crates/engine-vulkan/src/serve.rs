@@ -434,6 +434,10 @@ impl Serve for Api {
             .seal_descriptor_pools(shell.readout.len() + 3)
     }
 
+    fn spent() -> bool {
+        crate::device::take_spent()
+    }
+
     fn held() -> String {
         let (cmds, frames, sets, pools_made, pools_freed) = crate::device::held_counts();
         format!(
