@@ -730,315 +730,23 @@ impl Shell {
             have: self.arms.depth() as u64,
         })?;
 
-        let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
-        // Each resolved envelope's instance, by the same index.
-        let mut resolved_of: Vec<engine::InstanceId> = Vec::new();
-        let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
-        // A decode envelope's beam groups (`crate::beam`): each one's
-        // parents cell, state and lanes; and each lane's group.
-        let mut beam_groups: Vec<crate::beam::Group> = Vec::new();
-        let mut group_of: Vec<Option<usize>> = vec![None; lanes.len()];
-        if !attachments.is_empty() {
-            let instances: Vec<engine::InstanceId> =
-                attachments.iter().map(|a| a.instance).collect();
-            self.fence_instances(&instances, true)?;
-            for attached in attachments {
-                let Some(mut envelope) = self.programs.envelope(attached.instance)? else {
-                    // A host-class instance has no device envelope, and a beam
-                    // step remaps the device-placed geometry its envelope
-                    // lays: one that states parents would run its beams as
-                    // plain lanes on one working set, each beam's rows
-                    // written over another's. Refused by name, never run.
-                    if self.programs.parents_cell(attached.instance)?.is_some() {
-                        return Err(Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "instance {} states parents (a beam group) and its geometry \
-                                 is host-class: a beam step remaps device-placed geometry \
-                                 only, so its beams would run as plain lanes on one working \
-                                 set; put the pass's tokens and positions from the device \
-                                 (an epilogue's put), as a beam search does",
-                                attached.instance
-                            ),
-                        ));
-                    }
-                    continue;
-                };
-                let first = attached.lane as usize;
-                envelope.host_rows = lanes
-                    .iter()
-                    .skip(first)
-                    .take(attached.lanes.max(1) as usize)
-                    .map(|seated| seated.lane.tokens.len() as u32)
-                    .collect();
-                let carried = envelope.lanes();
-                // Its ports describe its own lanes only: past them they
-                // would set another request's positions and kv slots.
-                let owned = attached.lanes.max(1) as usize;
-                if carried > owned {
-                    return Err(Fault::GeometryLanes {
-                        lane: attached.lane,
-                        instance: attached.instance.0,
-                        carried: u32::try_from(carried).unwrap_or(u32::MAX),
-                        owned: owned as u32,
-                    });
-                }
-                if first + carried > lanes.len() {
-                    return Err(Fault::program(
-                        "serve::prepare",
-                        format!(
-                            "instance {} is attached at lane {first} and its \
-                             `embed_indptr` port describes {carried} lane(s), which runs \
-                             past the {} this fire carries; its descriptor ports have no \
-                             rows to describe",
-                            attached.instance,
-                            lanes.len()
-                        ),
-                    ));
-                }
-                let held = resolved.len();
-                for lane in 0..carried {
-                    if envelope_of[first + lane].is_some() {
-                        return Err(Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "lane {} is claimed by two attached instances, the second \
-                                 being {}; a lane's descriptor ports have one author, and \
-                                 two would decide the same rows twice",
-                                first + lane,
-                                attached.instance
-                            ),
-                        ));
-                    }
-                    envelope_of[first + lane] = Some((held, lane));
-                }
-                if let Some((cell, at)) = self.programs.parents_cell(attached.instance)? {
-                    let Some((state, layout)) = self.programs.beam_state(attached.instance)? else {
-                        return Err(Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "instance {} states parents and holds no beam state",
-                                attached.instance
-                            ),
-                        ));
-                    };
-                    let parents = cell.address_at(at).ok_or_else(|| {
-                        Fault::program(
-                            "serve::prepare",
-                            format!("instance {}'s parents cell has no address", attached.instance),
-                        )
-                    })?;
-                    if carried as u32 != layout.lanes {
-                        return Err(Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "instance {} states parents for {} beam(s) and runs {carried}                                  lane(s); every beam runs every fire",
-                                attached.instance, layout.lanes
-                            ),
-                        ));
-                    }
-                    for lane in 0..carried {
-                        group_of[first + lane] = Some(beam_groups.len());
-                    }
-                    beam_groups.push(crate::beam::Group {
-                        instance: attached.instance,
-                        parents,
-                        state,
-                        layout,
-                        lanes: Vec::new(),
-                    });
-                }
-                resolved.push(envelope);
-                resolved_of.push(attached.instance);
-            }
-        }
+        let Resolved {
+            resolved,
+            resolved_of,
+            envelope_of,
+            beam_groups,
+            group_of,
+        } = self.resolve_attachments(lanes, attachments)?;
 
-        let page_tokens = self.pools.paging().page_size.max(1);
-        let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
-        let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
-        let mut device_masks: Vec<Option<Masking>> = vec![None; lanes.len()];
-        let mut lane_rows: Vec<u32> = lanes
-            .iter()
-            .map(|seated| seated.lane.tokens.len() as u32)
-            .collect();
-        for source in 0..lanes.len() {
-            let Some((held, at)) = envelope_of[source] else {
-                continue;
-            };
-            let ports = resolved[held].lane(at, source)?;
-            let table = lanes[source].translation;
-            let translate = |page: u32, port: &str| -> Result<u32> {
-                table.get(page as usize).copied().ok_or_else(|| {
-                    Fault::program(
-                        "serve::prepare",
-                        format!(
-                            "lane {source}'s `{port}` port names working-set page {page} \
-                             and the table this fire was handed maps {} page(s); a guest \
-                             holds relative indexes and the pool's ids are the runtime's, \
-                             so an index past the table addresses somebody else's cache",
-                            table.len()
-                        ),
-                    )
-                })
-            };
-            if ports.owns_slots() {
-                lane_rows[source] = ports.rows();
-            }
-            let rows = lane_rows[source] as usize;
-            if let (Some(slots), Some(reach)) = (ports.slots(rows)?, ports.reach(rows)?) {
-                device_pages[source] = Some(
-                    (0..reach.div_ceil(page_tokens))
-                        .map(|page| translate(page, "slots"))
-                        .collect::<Result<Vec<u32>>>()?,
-                );
-                device_writes[source] = Some((
-                    slots
-                        .iter()
-                        .map(|&slot| translate(slot / page_tokens, "slots"))
-                        .collect::<Result<Vec<u32>>>()?,
-                    slots.iter().map(|&slot| slot % page_tokens).collect(),
-                ));
-            }
-            if let Some((cells, stride)) = ports.mask(rows)? {
-                if rows != 1 {
-                    return Err(Fault::program(
-                        "serve::prepare",
-                        format!(
-                            "lane {source} resolves its attention mask from a channel and \
-                             carries {rows} query rows; the expansion intersects each row \
-                             with the order the cache is written in, and a lane that \
-                             states its own slots has no such order this shell can derive"
-                        ),
-                    ));
-                }
-                device_masks[source] = Some(engine::ports::from_dense(cells, stride));
-            }
-        }
+        let DevicePorts {
+            device_pages,
+            device_writes,
+            device_masks,
+            lane_rows,
+        } = self.device_ports(lanes, &resolved, &envelope_of)?;
 
-        let mut media_of: Vec<Option<&Media<'_>>> = vec![None; lanes.len()];
-        for shot in media {
-            let Some(seat) = self.patch_seat else {
-                return Err(Fault::from(poem_exec::Error::Fire(
-                    poem_exec::fire::Fault::Towerless { lane: shot.lane },
-                )));
-            };
-            let at = shot.lane as usize;
-            if at >= lanes.len() {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "a media row names lane {} of the {} this fire has",
-                        shot.lane,
-                        lanes.len()
-                    ),
-                ));
-            }
-            if media_of[at].is_some() {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "lane {} carries two media rows; one lane's spans are one \
-                         concatenation with one payload order",
-                        shot.lane
-                    ),
-                ));
-            }
-            let patch_rows = shot.rows.iter().copied().fold(0u32, u32::saturating_add) as u64;
-            let rows_here = u64::from(lane_rows[at]);
-            let owed = patch_rows.saturating_mul(seat.row_bytes);
-            for (what, have, want) in [
-                ("payload bytes", shot.patches.len() as u64, owed),
-                ("routes", shot.routes.len() as u64, patch_rows),
-                (
-                    "grid positions",
-                    shot.positions.len() as u64,
-                    patch_rows * 3,
-                ),
-                (
-                    "image grids",
-                    shot.grids.len() as u64,
-                    shot.rows.len() as u64 * 3,
-                ),
-            ] {
-                if have != want {
-                    return Err(Fault::PatchPayload {
-                        lane: shot.lane,
-                        what,
-                        have,
-                        want,
-                    });
-                }
-            }
-            if !shot.token_positions.is_empty()
-                && shot.token_positions.len() as u64 != rows_here * 3
-            {
-                return Err(Fault::PatchPayload {
-                    lane: shot.lane,
-                    what: "trunk rotation triples",
-                    have: shot.token_positions.len() as u64,
-                    want: rows_here * 3,
-                });
-            }
-            let drop = self.drops_patch_rows;
-            let rows_here32 = lane_rows[at];
-            if let Some((j, &route)) = shot.routes.iter().enumerate().find(|&(_, &route)| {
-                !(drop && route == PATCH_ROUTE_DROP) && (route < 0 || route as u32 >= rows_here32)
-            }) {
-                return Err(Fault::from(poem_exec::Error::Fire(
-                    poem_exec::fire::Fault::PatchRoute {
-                        at: j as u32,
-                        route,
-                        rows: rows_here32,
-                    },
-                )));
-            }
-            media_of[at] = Some(shot);
-        }
-
-        let mut clips_of: Vec<Option<&Clips<'_>>> = vec![None; lanes.len()];
-        for tile in clips {
-            if self.voxel_seat.is_none() {
-                return Err(Fault::Program {
-                    at: "serve::prepare",
-                    why: format!(
-                        "lane {} submits VAE clips and this load seats no voxel row",
-                        tile.lane
-                    ),
-                });
-            }
-            let at = tile.lane as usize;
-            if at >= lanes.len() {
-                return Err(Fault::Program {
-                    at: "serve::prepare",
-                    why: format!(
-                        "a clip submission names lane {} of the {} this fire has",
-                        tile.lane,
-                        lanes.len()
-                    ),
-                });
-            }
-            if tile.boxes.is_empty() {
-                return Err(Fault::Program {
-                    at: "serve::prepare",
-                    why: format!(
-                        "lane {} carries a voxel row naming no clips; a lane with no clip \
-                         constructs no voxel row at all",
-                        tile.lane
-                    ),
-                });
-            }
-            if clips_of[at].is_some() {
-                return Err(Fault::Program {
-                    at: "serve::prepare",
-                    why: format!(
-                        "lane {} submits two clip records; a lane's clips are one \
-                         concatenation with one payload order",
-                        tile.lane
-                    ),
-                });
-            }
-            clips_of[at] = Some(tile);
-        }
+        let media_of = self.media_rows(media, &lane_rows)?;
+        let clips_of = self.clip_rows(clips, lanes.len())?;
         let submitted: Vec<FireLane> = lanes
             .iter()
             .zip(&lane_rows)
@@ -1076,9 +784,9 @@ impl Shell {
                     .to_string(),
             });
         }
-        let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
-        let mut kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
-        let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        let seats: Vec<Seat> = Vec::with_capacity(lanes.len());
+        let kv_less: Vec<bool> = Vec::with_capacity(lanes.len());
+        let tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         // Per window list, per lane: its pages.
         let window_lists = self.pools.layout().window_lists().count();
         // A fire's windowed own-row pages, fills and folds start afresh.
@@ -1100,59 +808,59 @@ impl Shell {
         }
         self.window_fills.clear();
         self.window_folds.clear();
-        let mut window_tables: Vec<Vec<Vec<u32>>> =
+        let window_tables: Vec<Vec<Vec<u32>>> =
             vec![Vec::with_capacity(lanes.len()); window_lists];
-        let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
+        let tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         // Token rows copied from a cell on the device before the forward:
         // the row, and the cell's buffer and byte offset.
-        let mut token_feeds: Vec<(u32, crate::device::Buffer, u64)> = Vec::new();
+        let token_feeds: Vec<(u32, crate::device::Buffer, u64)> = Vec::new();
         // Rotation rows copied from a positions cell on the device before
         // the forward: the row, and the cell's buffer and byte offset.
-        let mut position_feeds: Vec<(u32, crate::device::Buffer, u64)> = Vec::new();
-        let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
-        let mut rotations: Vec<i32> = Vec::with_capacity(rows as usize);
+        let position_feeds: Vec<(u32, crate::device::Buffer, u64)> = Vec::new();
+        let positions: Vec<i32> = Vec::with_capacity(rows as usize);
+        let rotations: Vec<i32> = Vec::with_capacity(rows as usize);
         // Each row's stated position, the mrope table's fill where a row
         // carries no stream of its own.
-        let mut stated_rows: Vec<i32> = Vec::with_capacity(rows as usize);
+        let stated_rows: Vec<i32> = Vec::with_capacity(rows as usize);
         // Each band's lane and row tables of record piece ids, filled lane
         // by lane and joined band after band below.
         let widths = self.pools.bands();
-        let mut lane_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
-        let mut row_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
-        let mut state_top = 0u32;
+        let lane_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
+        let row_bands: Vec<Vec<i32>> = vec![Vec::new(); widths.len()];
+        let state_top = 0u32;
         // Every physical fixed slot the fire's records name, each admitted
         // (checked backed) once the fire's segments are committed.
-        let mut state_ids: Vec<u32> = Vec::new();
-        let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        let state_ids: Vec<u32> = Vec::new();
+        let rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         // Each lane's buffered reads as one run ending at its first row
         // (`engine::fire::lane_one_run`), the input the shared compactness
         // helper takes, from the same verb values the plan is built from.
-        let mut rs_one_run: Vec<bool> = Vec::with_capacity(lanes.len());
+        let rs_one_run: Vec<bool> = Vec::with_capacity(lanes.len());
         // Per seat, its buffer's base and its set's rs pages (slab slots),
         // where it buffers: what a hybrid's beams resolve over (§11).
-        let mut rs_sets: Vec<Option<(u32, Vec<u32>)>> = Vec::with_capacity(lanes.len());
+        let rs_sets: Vec<Option<(u32, Vec<u32>)>> = Vec::with_capacity(lanes.len());
         // Per seat, its own rows: what its carried rows count toward the
         // rung by (`engine::fire::lane_carried`).
-        let mut rs_own: Vec<u32> = Vec::with_capacity(lanes.len());
+        let rs_own: Vec<u32> = Vec::with_capacity(lanes.len());
         // Per reporting lane whose rows a port places, one past the last
         // slot they land at, in the set's own numbering (`KvWrites::end`).
-        let mut ends: Vec<engine::KvWrites> = Vec::new();
-        let mut rs_active = false;
+        let ends: Vec<engine::KvWrites> = Vec::new();
+        let rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
         // own and then those slots (`kernels_metal::ssm::Snapshots`).
-        let mut snap_bands: Vec<Vec<i32>> = Vec::new();
-        let mut snap_slots = 0u32;
-        let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
-        let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
+        let snap_bands: Vec<Vec<i32>> = Vec::new();
+        let snap_slots = 0u32;
+        let request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
+        let masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut adapter_routes: Vec<i32> = Vec::new();
         let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
             adapter_routes.reserve(rows as usize);
         }
-        let mut beginning: Vec<Vec<u32>> = Vec::new();
-        let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
+        let beginning: Vec<Vec<u32>> = Vec::new();
+        let writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         // What each lane writes and reads of its set (`engine::extent`).
-        let mut extents = engine::extent::FireExtents::default();
+        let extents = engine::extent::FireExtents::default();
         // Each beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): the slot its
         // set's state is folded to before any of its lanes reads it, as its
         // lanes state it (the runtime states it on the first); the fold the
@@ -1173,630 +881,95 @@ impl Shell {
                 beam_to[group] = Some(beam_to[group].map_or(to, |at: u32| at.max(to)));
             }
         }
-        let mut beam_folded: Vec<bool> = vec![false; beam_groups.len()];
-        let mut group_folds: Vec<i32> = Vec::new();
-        let mut rs_skips: Vec<u32> = Vec::with_capacity(lanes.len());
-        for row in composition.lanes() {
-            let source = row.source as usize;
-            let seated = &lanes[source];
-            let lane = &seated.lane;
-            let ports = match envelope_of[source] {
-                Some((held, at)) => Some(resolved[held].lane(at, source)?),
-                None => None,
+        let beam_folded: Vec<bool> = vec![false; beam_groups.len()];
+        let group_folds: Vec<i32> = Vec::new();
+        let rs_skips: Vec<u32> = Vec::with_capacity(lanes.len());
+        let mut acc = LaneAccum {
+            seats,
+            kv_less,
+            tables,
+            window_tables,
+            tokens,
+            token_feeds,
+            position_feeds,
+            positions,
+            rotations,
+            stated_rows,
+            lane_bands,
+            row_bands,
+            state_top,
+            state_ids,
+            rs_plans,
+            rs_one_run,
+            rs_sets,
+            rs_own,
+            ends,
+            rs_active,
+            snap_bands,
+            snap_slots,
+            request_of_token,
+            masks,
+            adapter_routes,
+            beginning,
+            writes,
+            extents,
+            beam_groups,
+            beam_folded,
+            group_folds,
+            rs_skips,
+        };
+        {
+            let inputs = LaneInputs {
+                lanes,
+                envelope_of: &envelope_of,
+                resolved: &resolved,
+                resolved_of: &resolved_of,
+                device_pages: &device_pages,
+                device_writes: &device_writes,
+                device_masks: &device_masks,
+                group_of: &group_of,
+                beam_to: &beam_to,
+                widths: &widths,
+                any_adapter,
             };
-            let have = match ports.as_ref().filter(|ports| ports.owns_slots()) {
-                Some(ports) => {
-                    let after = ports.reach(row.rows as usize)?.ok_or_else(|| {
-                        Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "lane {source} states where its rows land and reaches no \
-                                 slot; the page count, the last page's fill and the \
-                                 attention schedules are all carved from what it reads"
-                            ),
-                        )
-                    })?;
-                    if after < row.rows {
-                        return Err(Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "lane {source} reads a KV extent of {after} and this fire \
-                                 writes {} row(s) into it; the extent is AFTER the append, \
-                                 so it can never be shorter than what the append adds",
-                                row.rows
-                            ),
-                        ));
-                    }
-                    after - row.rows
-                }
-                None => match seated.held {
-                    Some(held) => held,
-                    None => self
-                        .held
-                        .get(lane.slot as usize)
-                        .copied()
-                        .ok_or(Fault::Ceiling {
-                            what: "slots",
-                            need: u64::from(lane.slot) + 1,
-                            have: self.held.len() as u64,
-                        })?,
-                },
-            };
-            debug_assert_eq!(
-                row.row_offset as usize,
-                tokens.len(),
-                "a lane's rows stand where the composition placed them"
-            );
-            let fresh = match seated.rs_reset {
-                engine::fire::RsReset::Inferred => have == 0,
-                engine::fire::RsReset::Fresh => true,
-                engine::fire::RsReset::Held => false,
-            };
-            let record = self.record_of(seated)?;
-            for (k, lists) in window_tables.iter_mut().enumerate() {
-                lists.push(if seated.kv_less {
-                    Vec::new()
-                } else if self.pools.ring().is_none() {
-                    // Windowed layers are a lane's ring and window buffer
-                    // (CONTRACT-BC 19, 21), on every load that has them.
-                    return Err(Fault::program(
-                        "serve::windowed",
-                        "a load with window lists and no rings: Metal serves windowed layers \
-                         as ring + buffer only"
-                            .to_string(),
-                    ));
-                } else if let Some(fold) = seated.window {
-                    let port_fold = ports.as_ref().and_then(engine::ports::LanePorts::fold);
-                    self.windowed_pages(k, seated, fold, port_fold, have, row.rows)?
-                } else if seated.ring.is_some() {
-                    // A lane whose record holds rings states how it folds
-                    // them; its buffer slots are no whole window.
-                    return Err(Fault::program(
-                        "serve::windowed",
-                        format!(
-                            "lane in slot {} of a load whose windowed layers are ring + buffer \
-                             states no window fold (`Lane::window`)",
-                            lane.slot
-                        ),
-                    ));
-                } else if !seated.refs {
-                    // A seat-addressed lane (a caller firing directly, the
-                    // tuner): its seat's ring, every row it writes folded in
-                    // the fire, no buffer.
-                    let page_size = self.pools.window_paging(k).page_size.max(1);
-                    let after = have.saturating_add(row.rows);
-                    let fold = engine::fire::WindowFold {
-                        base: after / page_size * page_size,
-                        fold: engine::fire::FoldLen::Host(row.rows),
-                        lineage: engine::fire::Lineage::Set,
-                    };
-                    let seat = Seated {
-                        folded: have,
-                        windows: &[],
-                        ..*seated
-                    };
-                    self.windowed_pages(k, &seat, fold, None, have, row.rows)?
-                } else {
-                    // A runtime lane with no fold and no ring (arming, the
-                    // load's own fires, the pipeline walk): nothing reads
-                    // what such a fire computes, so every page it names is
-                    // one scratch page, in the own-row region's last chunk
-                    // (past every arm's share).
-                    let page_size = self.pools.window_paging(k).page_size.max(1);
-                    let (first, chunks) = self.own_top;
-                    if chunks == 0 {
-                        return Err(Fault::program(
-                            "serve::windowed",
-                            "a ring + buffer load with no own-row region for a fold-less lane"
-                                .to_string(),
-                        ));
-                    }
-                    let (_, id) = self.pools.window_slot_at(k, first + chunks - 1, 0)?;
-                    let after = have.saturating_add(row.rows);
-                    vec![id; after.div_ceil(page_size).max(1) as usize]
-                });
-            }
-            state_top = record
-                .iter()
-                .map(|&id| id.saturating_add(1))
-                .fold(state_top, u32::max);
-            state_ids.extend_from_slice(&record);
-            if fresh {
-                beginning.push(record.clone());
-            }
-            if let Some(group) = group_of[source] {
-                beam_groups[group].lanes.push(crate::beam::GroupLane {
-                    source,
-                    seat: seats.len(),
-                    row_offset: row.row_offset,
-                    have,
-                    rows: row.rows,
-                });
-            }
-            seats.push(Seat {
-                slot: lane.slot,
-                have,
-                rows: row.rows,
-            });
-            kv_less.push(seated.kv_less);
-            tables.push(match &device_pages[source] {
-                Some(pages) => std::borrow::Cow::Owned(self.pools.kv_pages(pages, None)?),
-                None if seated.kv_less => std::borrow::Cow::Borrowed(seated.pages),
-                None => {
-                    let after = u64::from(have) + u64::from(row.rows);
-                    let page_size = u64::from(self.pools.paging().page_size.max(1));
-                    let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
-                    std::borrow::Cow::Owned(
-                        self.pools
-                            .kv_pages(seated.pages, Some((lane.slot, pages)))?,
-                    )
-                }
-            });
-            // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
-            let masking = if seated.kv_less {
-                None
-            } else {
-                device_masks[source].as_ref().or(seated.mask)
-            };
-            let runs_masked_arm = self.masked.contains(row.class as usize);
-            if masking.is_some() && self.masked.is_empty() {
-                return Err(Fault::Maskless { lane: row.source });
-            }
-            // The mask is per-lane data: a lane stating none reads every key
-            // in a masked arm too. One stated where no arm applies it is refused.
-            if masking.is_some() && !runs_masked_arm {
-                return Err(Fault::MaskUnread {
-                    lane: row.source,
-                    word: lane.word,
-                });
-            }
-            masks.push(crate::mask::LaneMask {
-                mask: masking,
-                have,
-                folded: seated.folded.min(have),
-                rows: row.rows,
-                wide: self.wide.contains(row.class as usize),
-            });
-            let runs_correction = self.corrected.contains(row.class as usize);
-            if seated.adapter.is_some() && self.corrected.is_empty() {
-                return Err(Fault::Adapterless { lane: row.source });
-            }
-            let unreachable = seated.adapter.is_some()
-                && !runs_correction
-                && !self
-                    .compiled
-                    .classes
-                    .correction_reaches(&self.corrected, lane.word);
-            if seated.adapter.is_some() != runs_correction && !unreachable {
-                return Err(Fault::AdapterWord {
-                    lane: row.source,
-                    word: lane.word,
-                    runs_correction,
-                });
-            }
-            if any_adapter {
-                let id = seated
-                    .adapter
-                    .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
-                adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
-            }
-            // This lane's index: its seat was pushed above.
-            let at_lane = seats.len() as i32 - 1;
-            {
-                const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
-                let snaps = seated.rs_snapshots;
-                if snaps.len() > MAX
-                    || (!snaps.is_empty() && row.rows as usize != lane.tokens.len())
-                    || snaps
-                        .iter()
-                        .any(|snap| snap.row == 0 || snap.row >= row.rows)
-                {
-                    return Err(Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {source} snapshots its recurrent state at rows {:?} and runs \
-                             {} of its {} rows in this fire; a fire lands at most {MAX} \
-                             interior rows of a lane it runs whole",
-                            snaps.iter().map(|snap| snap.row).collect::<Vec<_>>(),
-                            row.rows,
-                            lane.tokens.len()
-                        ),
-                    ));
-                }
-                if !snaps.is_empty() && snap_bands.is_empty() {
-                    snap_bands = widths
-                        .iter()
-                        .map(|&w| vec![0i32; at_lane as usize * MAX * (1 + w as usize)])
-                        .collect();
-                }
-                // Lane 0 leaves the tables empty above, so emptiness cannot
-                // stand for "no lane has snapshots".
-                if !snaps.is_empty() || !snap_bands.is_empty() {
-                    // Each snapshot's record, a physical id a piece
-                    // (`RsSnapshot::pieces`, its slot the first; a seat's
-                    // record where the lane is seat-addressed).
-                    let mut records = Vec::with_capacity(snaps.len());
-                    for snap in snaps {
-                        let record = if !seated.refs {
-                            self.pools.record(None, snap.slot)?
-                        } else if snap.pieces.is_empty() {
-                            vec![self.pools.state_slot(snap.slot, false)?]
-                        } else {
-                            self.pools.record(Some(&snap.pieces), lane.slot)?
-                        };
-                        snap_slots = record
-                            .iter()
-                            .map(|&id| id.saturating_add(1))
-                            .fold(snap_slots, u32::max);
-                        state_ids.extend_from_slice(&record);
-                        records.push(self.pools.band_ids(&record));
-                    }
-                    let mut at = 0usize;
-                    for (band, &w) in snap_bands.iter_mut().zip(&widths) {
-                        let w = w as usize;
-                        let mut entry = vec![0i32; MAX * (1 + w)];
-                        for (n, (snap, ids)) in snaps.iter().zip(&records).enumerate() {
-                            entry[n] = narrow(u64::from(snap.row));
-                            entry[MAX + n * w..MAX + (n + 1) * w].copy_from_slice(&ids[at..at + w]);
-                        }
-                        band.extend(entry);
-                        at += w;
-                    }
-                }
-            }
-            if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
-                if self.rs_layout.is_none() {
-                    return Err(Fault::program(
-                        "serve::rs",
-                        format!(
-                            "lane {source} asks a recurrent verb of a plan that declares no \
-                             recurrent state to buffer"
-                        ),
-                    ));
-                }
-                rs_active = true;
-            }
-            let stated = match &ports {
-                Some(ports) => ports.slots(row.rows as usize)?,
-                None => None,
-            };
-            let placed = stated.is_some();
-            let first = stated
-                .and_then(|slots| slots.first().copied())
-                .unwrap_or(have);
-            // The buffer's rows live in the rs list: the verb's pages, in
-            // token order from its base (CONTRACT-BC 18).
-            // Where the record stands: the stated frozen length, or past it
-            // where this engine's last fold of the record froze more than
-            // the runtime has yet been told.
-            let held_key = record.first().copied();
-            if fresh && let Some(key) = held_key {
-                self.frozen_ahead.remove(&key);
-            }
-            let rs = match seated.rs {
-                engine::fire::RsVerb::Buffer {
-                    pages,
-                    base,
-                    folded,
-                    fold,
-                    lineage,
-                } => {
-                    // A beam group's set is folded by the runtime alone
-                    // (§11.3): its lanes read the length it states, and an
-                    // entry left on the record's slot by an earlier set
-                    // (a fold writes a fresh record) is dropped.
-                    let beam_lane = group_of[source].is_some();
-                    if beam_lane && let Some(key) = held_key {
-                        self.frozen_ahead.remove(&key);
-                    }
-                    let ahead = held_key
-                        .filter(|_| !beam_lane)
-                        .and_then(|key| self.frozen_ahead.get(&key).copied());
-                    let folded = match ahead {
-                        Some(ahead) if ahead > *folded => ahead,
-                        _ => {
-                            if let Some(key) = held_key {
-                                self.frozen_ahead.remove(&key);
-                            }
-                            *folded
-                        }
-                    };
-                    engine::fire::RsVerb::Buffer {
-                        pages: self
-                            .pools
-                            .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
-                        base: *base,
-                        folded,
-                        fold: *fold,
-                        lineage: *lineage,
-                    }
-                }
-                verb => verb.clone(),
-            };
-        let plan = engine::rs::LanePlan::of(
-                &rs,
-                row.rows,
-                first,
-                masking,
-                ports.as_ref().and_then(engine::ports::LanePorts::fold),
-            )
-            .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
-            rs_one_run.push(match &rs {
-                engine::fire::RsVerb::Buffer { folded, lineage, .. } => {
-                    engine::fire::lane_one_run(masking, *folded, first, *lineage)
-                }
-                _ => true,
-            });
-            // A beam group's lanes share their set's state: what its lanes
-            // fold is folded once for all of them, from the first's buffered
-            // rows, before any reads it (§11.3). Each lane then replays only
-            // the rows past it, from its page table row started past them,
-            // and folds none itself.
-            let beam_group = group_of[source].filter(|_| {
-                matches!(rs, engine::fire::RsVerb::Buffer { .. })
-            });
-            let mut plan = plan;
-            let (skip, beam_fold_to) = match (beam_group, &rs) {
-                (Some(group), engine::fire::RsVerb::Buffer { folded, .. }) => {
-                    let to = beam_to[group].unwrap_or(*folded).min(first).max(*folded);
-                    let skip = to - folded;
-                    if beam_to[group].is_some_and(|stated| stated > first) {
-                        tracing::warn!(
-                            instance = %beam_groups[group].instance,
-                            lane = source,
-                            folded = *folded,
-                            stated = beam_to[group].unwrap_or(0),
-                            first,
-                            "a beam group's fold is stated past its lanes' first row (§11.3)"
-                        );
-                    }
-                    if skip > 0 && plan.gathers.len() != 1 {
-                        return Err(Fault::program(
-                            "serve::rs",
-                            format!(
-                                "lane {source} of a beam group folds {skip} shared row(s) before \
-                                 its step and replays {} run(s) of its buffer; a group fold \
-                                 reads one run from the set's fold (BEAM-PAGE-LISTS.md §11.3)",
-                                plan.gathers.len()
-                            ),
-                        ));
-                    }
-                    plan.replay = plan.replay.saturating_sub(skip);
-                    plan.commit = 0;
-                    if skip > 0 && !beam_folded[group] {
-                        beam_folded[group] = true;
-                        group_folds.push(rs_plans.len() as i32);
-                        group_folds.push(skip as i32);
-                    }
-                    (skip, Some(to))
-                }
-                _ => (0, None),
-            };
-            rs_skips.push(skip);
-            // A reporting lane that buffers tells, where the fire settles,
-            // how many slots past its state's frozen length this fire froze
-            // (as `LanePlan::of` reckons it) and, where a port places its
-            // rows, one past the last slot they landed at.
-            if seated.reports != 0 {
-                let end = first.saturating_add(row.rows);
-                let fold = match &rs {
-                    engine::fire::RsVerb::Buffer { folded, fold, .. } => {
-                        let fold = match fold {
-                            engine::fire::FoldLen::Host(n) => Some(*n),
-                            engine::fire::FoldLen::Device => ports
-                                .as_ref()
-                                .and_then(engine::ports::LanePorts::fold),
-                        };
-                        // A beam lane folds nothing itself: its group's fold
-                        // is the runtime's, applied to the set (§11.3).
-                        if beam_fold_to.is_some() {
-                            Some(0)
-                        } else {
-                            fold.map(|n| folded.saturating_add(n).min(end) - folded)
-                        }
-                    }
-                    // A lane with no recurrent state to buffer (a kv-only
-                    // model's): its fold is what its program's `fold` port
-                    // states for it, the count the runtime adds to the set's
-                    // frozen length when the fire settles, as for a buffering
-                    // lane. Unreported, the set's cursor never comes to rest
-                    // and a fork or a save of it is refused.
-                    _ => ports.as_ref().and_then(engine::ports::LanePorts::fold),
-                };
-                ends.push(engine::KvWrites {
-                    tag: seated.reports,
-                    fold,
-                    end: placed.then_some(end),
-                    ..engine::KvWrites::default()
-                });
-            }
-            if let (engine::fire::RsVerb::Buffer { folded, fold, .. }, Some(key)) = (&rs, held_key) {
-                let n = match fold {
-                    engine::fire::FoldLen::Host(n) => Some(*n),
-                    engine::fire::FoldLen::Device => {
-                        ports.as_ref().and_then(engine::ports::LanePorts::fold)
-                    }
-                };
-                // A beam group's set is folded by the runtime as it prepares
-                // the fire (§11.3): nothing is frozen ahead of what it states.
-                let to = n.map_or(*folded, |n| {
-                    folded.saturating_add(n).min(first.saturating_add(row.rows))
-                });
-                if beam_fold_to.is_none() && to > *folded {
-                    self.frozen_ahead.insert(key, to);
-                }
-            }
-            if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
-                eprintln!(
-                    "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
-                    row.source, row.rows, plan.replay, plan.commit, plan.gather, plan.scatter
-                );
-            }
-            // The state the lane's kernels read and fold: the record it
-            // writes, but a lane of a copy-on-write group that folds nothing
-            // reads the run side, which no other lane writes this fire
-            // (CONTRACT-BC 15); its buffered rows still land in `record`.
-            // A beam group's lanes read the record its fold, if any, has
-            // written before them (§11.3).
-            let state = match seated.record_run {
-                Some(run) if plan.commit == 0 && beam_fold_to.is_none() => {
-                    self.pools.record(Some(run), lane.slot)?
-                }
-                _ => record.clone(),
-            };
-            state_top = state
-                .iter()
-                .map(|&id| id.saturating_add(1))
-                .fold(state_top, u32::max);
-            state_ids.extend_from_slice(&state);
-            let band_ids = self.pools.band_ids(&state);
-            {
-                let mut at = 0usize;
-                for ((lanes_band, rows_band), &width) in
-                    lane_bands.iter_mut().zip(row_bands.iter_mut()).zip(&widths)
-                {
-                    let ids = &band_ids[at..at + width as usize];
-                    lanes_band.extend_from_slice(ids);
-                    for _ in 0..row.rows {
-                        rows_band.extend_from_slice(ids);
-                    }
-                    at += width as usize;
-                }
-            }
-            rs_sets.push(match &rs {
-                engine::fire::RsVerb::Buffer { pages, base, .. } => Some((*base, pages.clone())),
-                _ => None,
-            });
-            rs_own.push(row.rows);
-            rs_plans.push(plan);
-            if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
-                return Err(Fault::Positions {
-                    lane: row.source,
-                    stated: seated.positions.len() as u64,
-                    rows: lane.tokens.len() as u64,
-                });
-            }
-            let rows_here = row.rows as usize;
-            match ports.as_ref() {
-                Some(ports) => {
-                    ports.check_extent(have.saturating_add(row.rows))?;
-                    // A pass of its instance still in flight puts the token
-                    // this one reads: copied from that cell on the device
-                    // before the forward, not read on the host.
-                    let in_flight = match envelope_of[source] {
-                        Some((held, at)) => resolved_of
-                            .get(held)
-                            .and_then(|&instance| self.programs.token_cell(instance).transpose())
-                            .transpose()?
-                            .map(|(buffer, cell)| (buffer, cell + 4 * at as u64)),
-                        None => None,
-                    };
-                    if let Some((buffer, cell)) = in_flight {
-                        token_feeds.push((tokens.len() as u32, buffer, cell));
-                    }
-                    for &token in ports.tokens_for(rows_here)? {
-                        tokens.push(token as i32);
-                    }
-                    let rows: Vec<i32> = (0..rows_here)
-                        .map(|at| narrow(u64::from(have) + at as u64))
-                        .collect();
-                    // Positions its program computes in a channel: copied
-                    // from the cell on the device, never read here.
-                    let position_cell = match envelope_of[source] {
-                        Some((held, at)) => resolved_of
-                            .get(held)
-                            .and_then(|&instance| self.programs.positions_cell(instance).transpose())
-                            .transpose()?
-                            .map(|(buffer, cell)| (buffer, cell + 4 * at as u64)),
-                        None => None,
-                    };
-                    if position_cell.is_some() && rows_here != 1 {
-                        return Err(Fault::program(
-                            "serve::prepare",
-                            format!(
-                                "lane {source} carries its positions on the device and {rows_here} \
-                                 rows; a decode envelope's lane states one position a row, one row"
-                            ),
-                        ));
-                    }
-                    let stated: Vec<i32> = match position_cell
-                        .is_none()
-                        .then(|| ports.positions_for(have, rows_here))
-                        .transpose()?
-                        .flatten()
-                    {
-                        Some(stated) => stated.iter().map(|&at| narrow(u64::from(at))).collect(),
-                        None if !seated.positions.is_empty() => seated
-                            .positions
-                            .iter()
-                            .map(|&at| narrow(u64::from(at)))
-                            .collect(),
-                        None => rows.clone(),
-                    };
-                    // The causal bound is the row order, the cache row; a
-                    // stated position rotates the row and bounds nothing.
-                    positions.extend(&rows);
-                    if let Some((buffer, cell)) = position_cell {
-                        position_feeds.push((rotations.len() as u32, buffer, cell));
-                    }
-                    rotations.extend(if self.states_mrope { &rows } else { &stated });
-                    stated_rows.extend(&stated);
-                    match &device_writes[source] {
-                        Some((slots, offsets)) => {
-                            for (&page, &off) in slots.iter().zip(offsets) {
-                                let page = self.pools.kv_page(page)?;
-                                writes
-                                    .push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
-                            }
-                        }
-                        None => writes.extend(std::iter::repeat_n(None, rows_here)),
-                    }
-                    for _ in 0..rows_here {
-                        request_of_token.push(at_lane);
-                    }
-                }
-                None => {
-                    for (at, token) in lane.tokens.iter().enumerate() {
-                        tokens.push(*token as i32);
-                        let row = narrow(u64::from(have) + at as u64);
-                        let stated = seated
-                            .positions
-                            .get(at)
-                            .map_or(row, |&p| narrow(u64::from(p)));
-                        // The causal bound is the row order, the cache row; a
-                        // stated position rotates the row and bounds nothing.
-                        // With mrope the rotation rides its own table.
-                        positions.push(row);
-                        rotations.push(if self.states_mrope { row } else { stated });
-                        stated_rows.push(stated);
-                        request_of_token.push(at_lane);
-                    }
-                    writes.extend(std::iter::repeat_n(None, rows_here));
-                }
-            }
-            if !seated.kv_less {
-                let reach = have.saturating_add(row.rows);
-                let set = (seated.set, seated.readable);
-                match ports.as_ref().map(|ports| ports.slots(rows_here)).transpose()? {
-                    Some(Some(slots)) => extents.lane(
-                        &self.written,
-                        source,
-                        lane.slot,
-                        set,
-                        slots.iter().map(|&slot| slot..slot.saturating_add(1)),
-                        reach,
-                    ),
-                    _ => extents.lane(
-                        &self.written,
-                        source,
-                        lane.slot,
-                        set,
-                        std::iter::once(have..reach),
-                        reach,
-                    ),
-                }
+            for row in composition.lanes() {
+                self.stage_lane(row, &inputs, &mut acc)?;
             }
         }
+        let LaneAccum {
+            seats,
+            kv_less,
+            tables,
+            window_tables,
+            tokens,
+            token_feeds,
+            position_feeds,
+            positions,
+            rotations,
+            stated_rows,
+            lane_bands,
+            row_bands,
+            state_top,
+            state_ids,
+            rs_plans,
+            rs_one_run,
+            rs_sets,
+            rs_own,
+            ends,
+            rs_active,
+            snap_bands,
+            snap_slots,
+            request_of_token,
+            masks,
+            adapter_routes,
+            beginning,
+            writes,
+            mut extents,
+            mut beam_groups,
+            beam_folded: _,
+            group_folds,
+            rs_skips,
+        } = acc;
         // A page holds what its last owner left until its set writes it: no
         // lane reads past what its set holds written.
         extents
@@ -3163,4 +2336,1111 @@ impl Shell {
             }
         }
     }
+
+    /// The fire's attached instances: each one's envelope and the lanes it
+    /// describes, refused by name where two claim a lane, its ports run past
+    /// the fire, or a beam group's parents and state disagree with its lanes.
+    fn resolve_attachments(
+        &mut self,
+        lanes: &[Seated<'_>],
+        attachments: &[Attached],
+    ) -> Result<Resolved> {
+        let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
+        // Each resolved envelope's instance, by the same index.
+        let mut resolved_of: Vec<engine::InstanceId> = Vec::new();
+        let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
+        // A decode envelope's beam groups (`crate::beam`): each one's
+        // parents cell, state and lanes; and each lane's group.
+        let mut beam_groups: Vec<crate::beam::Group> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; lanes.len()];
+        if !attachments.is_empty() {
+            let instances: Vec<engine::InstanceId> =
+                attachments.iter().map(|a| a.instance).collect();
+            self.fence_instances(&instances, true)?;
+            for attached in attachments {
+                let Some(mut envelope) = self.programs.envelope(attached.instance)? else {
+                    // A host-class instance has no device envelope, and a beam
+                    // step remaps the device-placed geometry its envelope
+                    // lays: one that states parents would run its beams as
+                    // plain lanes on one working set, each beam's rows
+                    // written over another's. Refused by name, never run.
+                    if self.programs.parents_cell(attached.instance)?.is_some() {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents (a beam group) and its geometry \
+                                 is host-class: a beam step remaps device-placed geometry \
+                                 only, so its beams would run as plain lanes on one working \
+                                 set; put the pass's tokens and positions from the device \
+                                 (an epilogue's put), as a beam search does",
+                                attached.instance
+                            ),
+                        ));
+                    }
+                    continue;
+                };
+                let first = attached.lane as usize;
+                envelope.host_rows = lanes
+                    .iter()
+                    .skip(first)
+                    .take(attached.lanes.max(1) as usize)
+                    .map(|seated| seated.lane.tokens.len() as u32)
+                    .collect();
+                let carried = envelope.lanes();
+                // Its ports describe its own lanes only: past them they
+                // would set another request's positions and kv slots.
+                let owned = attached.lanes.max(1) as usize;
+                if carried > owned {
+                    return Err(Fault::GeometryLanes {
+                        lane: attached.lane,
+                        instance: attached.instance.0,
+                        carried: u32::try_from(carried).unwrap_or(u32::MAX),
+                        owned: owned as u32,
+                    });
+                }
+                if first + carried > lanes.len() {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "instance {} is attached at lane {first} and its \
+                             `embed_indptr` port describes {carried} lane(s), which runs \
+                             past the {} this fire carries; its descriptor ports have no \
+                             rows to describe",
+                            attached.instance,
+                            lanes.len()
+                        ),
+                    ));
+                }
+                let held = resolved.len();
+                for lane in 0..carried {
+                    if envelope_of[first + lane].is_some() {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {} is claimed by two attached instances, the second \
+                                 being {}; a lane's descriptor ports have one author, and \
+                                 two would decide the same rows twice",
+                                first + lane,
+                                attached.instance
+                            ),
+                        ));
+                    }
+                    envelope_of[first + lane] = Some((held, lane));
+                }
+                if let Some((cell, at)) = self.programs.parents_cell(attached.instance)? {
+                    let Some((state, layout)) = self.programs.beam_state(attached.instance)? else {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents and holds no beam state",
+                                attached.instance
+                            ),
+                        ));
+                    };
+                    let parents = cell.address_at(at).ok_or_else(|| {
+                        Fault::program(
+                            "serve::prepare",
+                            format!("instance {}'s parents cell has no address", attached.instance),
+                        )
+                    })?;
+                    if carried as u32 != layout.lanes {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "instance {} states parents for {} beam(s) and runs {carried}                                  lane(s); every beam runs every fire",
+                                attached.instance, layout.lanes
+                            ),
+                        ));
+                    }
+                    for lane in 0..carried {
+                        group_of[first + lane] = Some(beam_groups.len());
+                    }
+                    beam_groups.push(crate::beam::Group {
+                        instance: attached.instance,
+                        parents,
+                        state,
+                        layout,
+                        lanes: Vec::new(),
+                    });
+                }
+                resolved.push(envelope);
+                resolved_of.push(attached.instance);
+            }
+        }
+        Ok(Resolved {
+            resolved,
+            resolved_of,
+            envelope_of,
+            beam_groups,
+            group_of,
+        })
+    }
+
+    /// The pages, writes and masks each attached lane's device ports state,
+    /// translated through the lane's table, and each lane's rows.
+    fn device_ports(
+        &self,
+        lanes: &[Seated<'_>],
+        resolved: &[engine::ports::Envelope],
+        envelope_of: &[Option<(usize, usize)>],
+    ) -> Result<DevicePorts> {
+        let page_tokens = self.pools.paging().page_size.max(1);
+        let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
+        let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
+        let mut device_masks: Vec<Option<Masking>> = vec![None; lanes.len()];
+        let mut lane_rows: Vec<u32> = lanes
+            .iter()
+            .map(|seated| seated.lane.tokens.len() as u32)
+            .collect();
+        for source in 0..lanes.len() {
+            let Some((held, at)) = envelope_of[source] else {
+                continue;
+            };
+            let ports = resolved[held].lane(at, source)?;
+            let table = lanes[source].translation;
+            let translate = |page: u32, port: &str| -> Result<u32> {
+                table.get(page as usize).copied().ok_or_else(|| {
+                    Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source}'s `{port}` port names working-set page {page} \
+                             and the table this fire was handed maps {} page(s); a guest \
+                             holds relative indexes and the pool's ids are the runtime's, \
+                             so an index past the table addresses somebody else's cache",
+                            table.len()
+                        ),
+                    )
+                })
+            };
+            if ports.owns_slots() {
+                lane_rows[source] = ports.rows();
+            }
+            let rows = lane_rows[source] as usize;
+            if let (Some(slots), Some(reach)) = (ports.slots(rows)?, ports.reach(rows)?) {
+                device_pages[source] = Some(
+                    (0..reach.div_ceil(page_tokens))
+                        .map(|page| translate(page, "slots"))
+                        .collect::<Result<Vec<u32>>>()?,
+                );
+                device_writes[source] = Some((
+                    slots
+                        .iter()
+                        .map(|&slot| translate(slot / page_tokens, "slots"))
+                        .collect::<Result<Vec<u32>>>()?,
+                    slots.iter().map(|&slot| slot % page_tokens).collect(),
+                ));
+            }
+            if let Some((cells, stride)) = ports.mask(rows)? {
+                if rows != 1 {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source} resolves its attention mask from a channel and \
+                             carries {rows} query rows; the expansion intersects each row \
+                             with the order the cache is written in, and a lane that \
+                             states its own slots has no such order this shell can derive"
+                        ),
+                    ));
+                }
+                device_masks[source] = Some(engine::ports::from_dense(cells, stride));
+            }
+        }
+        Ok(DevicePorts {
+            device_pages,
+            device_writes,
+            device_masks,
+            lane_rows,
+        })
+    }
+
+    /// Each lane's media row, checked against the load's patch seat and the
+    /// lane's rows.
+    fn media_rows<'m>(
+        &self,
+        media: &'m [Media<'m>],
+        lane_rows: &[u32],
+    ) -> Result<Vec<Option<&'m Media<'m>>>> {
+        let lanes_len = lane_rows.len();
+        let mut media_of: Vec<Option<&'m Media<'m>>> = vec![None; lanes_len];
+        for shot in media {
+            let Some(seat) = self.patch_seat else {
+                return Err(Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::Towerless { lane: shot.lane },
+                )));
+            };
+            let at = shot.lane as usize;
+            if at >= lanes_len {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "a media row names lane {} of the {} this fire has",
+                        shot.lane,
+                        lanes_len
+                    ),
+                ));
+            }
+            if media_of[at].is_some() {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "lane {} carries two media rows; one lane's spans are one \
+                         concatenation with one payload order",
+                        shot.lane
+                    ),
+                ));
+            }
+            let patch_rows = shot.rows.iter().copied().fold(0u32, u32::saturating_add) as u64;
+            let rows_here = u64::from(lane_rows[at]);
+            let owed = patch_rows.saturating_mul(seat.row_bytes);
+            for (what, have, want) in [
+                ("payload bytes", shot.patches.len() as u64, owed),
+                ("routes", shot.routes.len() as u64, patch_rows),
+                (
+                    "grid positions",
+                    shot.positions.len() as u64,
+                    patch_rows * 3,
+                ),
+                (
+                    "image grids",
+                    shot.grids.len() as u64,
+                    shot.rows.len() as u64 * 3,
+                ),
+            ] {
+                if have != want {
+                    return Err(Fault::PatchPayload {
+                        lane: shot.lane,
+                        what,
+                        have,
+                        want,
+                    });
+                }
+            }
+            if !shot.token_positions.is_empty()
+                && shot.token_positions.len() as u64 != rows_here * 3
+            {
+                return Err(Fault::PatchPayload {
+                    lane: shot.lane,
+                    what: "trunk rotation triples",
+                    have: shot.token_positions.len() as u64,
+                    want: rows_here * 3,
+                });
+            }
+            let drop = self.drops_patch_rows;
+            let rows_here32 = lane_rows[at];
+            if let Some((j, &route)) = shot.routes.iter().enumerate().find(|&(_, &route)| {
+                !(drop && route == PATCH_ROUTE_DROP) && (route < 0 || route as u32 >= rows_here32)
+            }) {
+                return Err(Fault::from(poem_exec::Error::Fire(
+                    poem_exec::fire::Fault::PatchRoute {
+                        at: j as u32,
+                        route,
+                        rows: rows_here32,
+                    },
+                )));
+            }
+            media_of[at] = Some(shot);
+        }
+        Ok(media_of)
+    }
+
+    /// Each lane's clip record, checked against the load's voxel seat.
+    fn clip_rows<'c>(&self, clips: &'c [Clips<'c>], lanes_len: usize) -> Result<Vec<Option<&'c Clips<'c>>>> {
+        let mut clips_of: Vec<Option<&'c Clips<'c>>> = vec![None; lanes_len];
+        for tile in clips {
+            if self.voxel_seat.is_none() {
+                return Err(Fault::Program {
+                    at: "serve::prepare",
+                    why: format!(
+                        "lane {} submits VAE clips and this load seats no voxel row",
+                        tile.lane
+                    ),
+                });
+            }
+            let at = tile.lane as usize;
+            if at >= lanes_len {
+                return Err(Fault::Program {
+                    at: "serve::prepare",
+                    why: format!(
+                        "a clip submission names lane {} of the {} this fire has",
+                        tile.lane,
+                        lanes_len
+                    ),
+                });
+            }
+            if tile.boxes.is_empty() {
+                return Err(Fault::Program {
+                    at: "serve::prepare",
+                    why: format!(
+                        "lane {} carries a voxel row naming no clips; a lane with no clip \
+                         constructs no voxel row at all",
+                        tile.lane
+                    ),
+                });
+            }
+            if clips_of[at].is_some() {
+                return Err(Fault::Program {
+                    at: "serve::prepare",
+                    why: format!(
+                        "lane {} submits two clip records; a lane's clips are one \
+                         concatenation with one payload order",
+                        tile.lane
+                    ),
+                });
+            }
+            clips_of[at] = Some(tile);
+        }
+        Ok(clips_of)
+    }
+
+    /// One lane row of a fire, staged into the accumulators the fire builds
+    /// ([`LaneAccum`]): its seat and page tables, tokens and positions, record
+    /// bands, rs plan, mask, adapter routes and writes.
+    fn stage_lane<'i, 'a: 'i>(
+        &mut self,
+        row: &poem_exec::fire::LaneRow,
+        inputs: &LaneInputs<'i, 'a>,
+        acc: &mut LaneAccum<'i, 'a>,
+    ) -> Result<()> {
+        let LaneInputs {
+            lanes,
+            envelope_of,
+            resolved,
+            resolved_of,
+            device_pages,
+            device_writes,
+            device_masks,
+            group_of,
+            beam_to,
+            widths,
+            any_adapter,
+            ..
+        } = *inputs;
+        let LaneAccum {
+            beam_groups,
+            beam_folded,
+            seats,
+            kv_less,
+            tables,
+            window_tables,
+            tokens,
+            token_feeds,
+            position_feeds,
+            positions,
+            rotations,
+            stated_rows,
+            lane_bands,
+            row_bands,
+            state_top,
+            state_ids,
+            rs_plans,
+            rs_one_run,
+            rs_sets,
+            rs_own,
+            ends,
+            rs_active,
+            snap_bands,
+            snap_slots,
+            request_of_token,
+            masks,
+            adapter_routes,
+            beginning,
+            writes,
+            extents,
+            group_folds,
+            rs_skips,
+            ..
+        } = acc;
+        let source = row.source as usize;
+        let seated = &lanes[source];
+        let lane = &seated.lane;
+        let ports = match envelope_of[source] {
+            Some((held, at)) => Some(resolved[held].lane(at, source)?),
+            None => None,
+        };
+        let have = match ports.as_ref().filter(|ports| ports.owns_slots()) {
+            Some(ports) => {
+                let after = ports.reach(row.rows as usize)?.ok_or_else(|| {
+                    Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source} states where its rows land and reaches no \
+                             slot; the page count, the last page's fill and the \
+                             attention schedules are all carved from what it reads"
+                        ),
+                    )
+                })?;
+                if after < row.rows {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source} reads a KV extent of {after} and this fire \
+                             writes {} row(s) into it; the extent is AFTER the append, \
+                             so it can never be shorter than what the append adds",
+                            row.rows
+                        ),
+                    ));
+                }
+                after - row.rows
+            }
+            None => match seated.held {
+                Some(held) => held,
+                None => self
+                    .held
+                    .get(lane.slot as usize)
+                    .copied()
+                    .ok_or(Fault::Ceiling {
+                        what: "slots",
+                        need: u64::from(lane.slot) + 1,
+                        have: self.held.len() as u64,
+                    })?,
+            },
+        };
+        debug_assert_eq!(
+            row.row_offset as usize,
+            tokens.len(),
+            "a lane's rows stand where the composition placed them"
+        );
+        let fresh = match seated.rs_reset {
+            engine::fire::RsReset::Inferred => have == 0,
+            engine::fire::RsReset::Fresh => true,
+            engine::fire::RsReset::Held => false,
+        };
+        let record = self.record_of(seated)?;
+        for (k, lists) in window_tables.iter_mut().enumerate() {
+            lists.push(if seated.kv_less {
+                Vec::new()
+            } else if self.pools.ring().is_none() {
+                // Windowed layers are a lane's ring and window buffer
+                // (CONTRACT-BC 19, 21), on every load that has them.
+                return Err(Fault::program(
+                    "serve::windowed",
+                    "a load with window lists and no rings: Metal serves windowed layers \
+                     as ring + buffer only"
+                        .to_string(),
+                ));
+            } else if let Some(fold) = seated.window {
+                let port_fold = ports.as_ref().and_then(engine::ports::LanePorts::fold);
+                self.windowed_pages(k, seated, fold, port_fold, have, row.rows)?
+            } else if seated.ring.is_some() {
+                // A lane whose record holds rings states how it folds
+                // them; its buffer slots are no whole window.
+                return Err(Fault::program(
+                    "serve::windowed",
+                    format!(
+                        "lane in slot {} of a load whose windowed layers are ring + buffer \
+                         states no window fold (`Lane::window`)",
+                        lane.slot
+                    ),
+                ));
+            } else if !seated.refs {
+                // A seat-addressed lane (a caller firing directly, the
+                // tuner): its seat's ring, every row it writes folded in
+                // the fire, no buffer.
+                let page_size = self.pools.window_paging(k).page_size.max(1);
+                let after = have.saturating_add(row.rows);
+                let fold = engine::fire::WindowFold {
+                    base: after / page_size * page_size,
+                    fold: engine::fire::FoldLen::Host(row.rows),
+                    lineage: engine::fire::Lineage::Set,
+                };
+                let seat = Seated {
+                    folded: have,
+                    windows: &[],
+                    ..*seated
+                };
+                self.windowed_pages(k, &seat, fold, None, have, row.rows)?
+            } else {
+                // A runtime lane with no fold and no ring (arming, the
+                // load's own fires, the pipeline walk): nothing reads
+                // what such a fire computes, so every page it names is
+                // one scratch page, in the own-row region's last chunk
+                // (past every arm's share).
+                let page_size = self.pools.window_paging(k).page_size.max(1);
+                let (first, chunks) = self.own_top;
+                if chunks == 0 {
+                    return Err(Fault::program(
+                        "serve::windowed",
+                        "a ring + buffer load with no own-row region for a fold-less lane"
+                            .to_string(),
+                    ));
+                }
+                let (_, id) = self.pools.window_slot_at(k, first + chunks - 1, 0)?;
+                let after = have.saturating_add(row.rows);
+                vec![id; after.div_ceil(page_size).max(1) as usize]
+            });
+        }
+        *state_top = record
+            .iter()
+            .map(|&id| id.saturating_add(1))
+            .fold(*state_top, u32::max);
+        state_ids.extend_from_slice(&record);
+        if fresh {
+            beginning.push(record.clone());
+        }
+        if let Some(group) = group_of[source] {
+            beam_groups[group].lanes.push(crate::beam::GroupLane {
+                source,
+                seat: seats.len(),
+                row_offset: row.row_offset,
+                have,
+                rows: row.rows,
+            });
+        }
+        seats.push(Seat {
+            slot: lane.slot,
+            have,
+            rows: row.rows,
+        });
+        kv_less.push(seated.kv_less);
+        tables.push(match &device_pages[source] {
+            Some(pages) => std::borrow::Cow::Owned(self.pools.kv_pages(pages, None)?),
+            None if seated.kv_less => std::borrow::Cow::Borrowed(seated.pages),
+            None => {
+                let after = u64::from(have) + u64::from(row.rows);
+                let page_size = u64::from(self.pools.paging().page_size.max(1));
+                let pages = u32::try_from(after.div_ceil(page_size).max(1)).unwrap_or(u32::MAX);
+                std::borrow::Cow::Owned(
+                    self.pools
+                        .kv_pages(seated.pages, Some((lane.slot, pages)))?,
+                )
+            }
+        });
+        // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
+        let masking = if seated.kv_less {
+            None
+        } else {
+            device_masks[source].as_ref().or(seated.mask)
+        };
+        let runs_masked_arm = self.masked.contains(row.class as usize);
+        if masking.is_some() && self.masked.is_empty() {
+            return Err(Fault::Maskless { lane: row.source });
+        }
+        // The mask is per-lane data: a lane stating none reads every key
+        // in a masked arm too. One stated where no arm applies it is refused.
+        if masking.is_some() && !runs_masked_arm {
+            return Err(Fault::MaskUnread {
+                lane: row.source,
+                word: lane.word,
+            });
+        }
+        masks.push(crate::mask::LaneMask {
+            mask: masking,
+            have,
+            folded: seated.folded.min(have),
+            rows: row.rows,
+            wide: self.wide.contains(row.class as usize),
+        });
+        let runs_correction = self.corrected.contains(row.class as usize);
+        if seated.adapter.is_some() && self.corrected.is_empty() {
+            return Err(Fault::Adapterless { lane: row.source });
+        }
+        let unreachable = seated.adapter.is_some()
+            && !runs_correction
+            && !self
+                .compiled
+                .classes
+                .correction_reaches(&self.corrected, lane.word);
+        if seated.adapter.is_some() != runs_correction && !unreachable {
+            return Err(Fault::AdapterWord {
+                lane: row.source,
+                word: lane.word,
+                runs_correction,
+            });
+        }
+        if any_adapter {
+            let id = seated
+                .adapter
+                .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
+            adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
+        }
+        // This lane's index: its seat was pushed above.
+        let at_lane = seats.len() as i32 - 1;
+        {
+            const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
+            let snaps = seated.rs_snapshots;
+            if snaps.len() > MAX
+                || (!snaps.is_empty() && row.rows as usize != lane.tokens.len())
+                || snaps
+                    .iter()
+                    .any(|snap| snap.row == 0 || snap.row >= row.rows)
+            {
+                return Err(Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {source} snapshots its recurrent state at rows {:?} and runs \
+                         {} of its {} rows in this fire; a fire lands at most {MAX} \
+                         interior rows of a lane it runs whole",
+                        snaps.iter().map(|snap| snap.row).collect::<Vec<_>>(),
+                        row.rows,
+                        lane.tokens.len()
+                    ),
+                ));
+            }
+            if !snaps.is_empty() && snap_bands.is_empty() {
+                *snap_bands = widths
+                    .iter()
+                    .map(|&w| vec![0i32; at_lane as usize * MAX * (1 + w as usize)])
+                    .collect();
+            }
+            // Lane 0 leaves the tables empty above, so emptiness cannot
+            // stand for "no lane has snapshots".
+            if !snaps.is_empty() || !snap_bands.is_empty() {
+                // Each snapshot's record, a physical id a piece
+                // (`RsSnapshot::pieces`, its slot the first; a seat's
+                // record where the lane is seat-addressed).
+                let mut records = Vec::with_capacity(snaps.len());
+                for snap in snaps {
+                    let record = if !seated.refs {
+                        self.pools.record(None, snap.slot)?
+                    } else if snap.pieces.is_empty() {
+                        vec![self.pools.state_slot(snap.slot, false)?]
+                    } else {
+                        self.pools.record(Some(&snap.pieces), lane.slot)?
+                    };
+                    *snap_slots = record
+                        .iter()
+                        .map(|&id| id.saturating_add(1))
+                        .fold(*snap_slots, u32::max);
+                    state_ids.extend_from_slice(&record);
+                    records.push(self.pools.band_ids(&record));
+                }
+                let mut at = 0usize;
+                for (band, &w) in snap_bands.iter_mut().zip(widths) {
+                    let w = w as usize;
+                    let mut entry = vec![0i32; MAX * (1 + w)];
+                    for (n, (snap, ids)) in snaps.iter().zip(&records).enumerate() {
+                        entry[n] = narrow(u64::from(snap.row));
+                        entry[MAX + n * w..MAX + (n + 1) * w].copy_from_slice(&ids[at..at + w]);
+                    }
+                    band.extend(entry);
+                    at += w;
+                }
+            }
+        }
+        if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
+            if self.rs_layout.is_none() {
+                return Err(Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {source} asks a recurrent verb of a plan that declares no \
+                         recurrent state to buffer"
+                    ),
+                ));
+            }
+            *rs_active = true;
+        }
+        let stated = match &ports {
+            Some(ports) => ports.slots(row.rows as usize)?,
+            None => None,
+        };
+        let placed = stated.is_some();
+        let first = stated
+            .and_then(|slots| slots.first().copied())
+            .unwrap_or(have);
+        // The buffer's rows live in the rs list: the verb's pages, in
+        // token order from its base (CONTRACT-BC 18).
+        // Where the record stands: the stated frozen length, or past it
+        // where this engine's last fold of the record froze more than
+        // the runtime has yet been told.
+        let held_key = record.first().copied();
+        if fresh && let Some(key) = held_key {
+            self.frozen_ahead.remove(&key);
+        }
+        let rs = match seated.rs {
+            engine::fire::RsVerb::Buffer {
+                pages,
+                base,
+                folded,
+                fold,
+                lineage,
+            } => {
+                // A beam group's set is folded by the runtime alone
+                // (§11.3): its lanes read the length it states, and an
+                // entry left on the record's slot by an earlier set
+                // (a fold writes a fresh record) is dropped.
+                let beam_lane = group_of[source].is_some();
+                if beam_lane && let Some(key) = held_key {
+                    self.frozen_ahead.remove(&key);
+                }
+                let ahead = held_key
+                    .filter(|_| !beam_lane)
+                    .and_then(|key| self.frozen_ahead.get(&key).copied());
+                let folded = match ahead {
+                    Some(ahead) if ahead > *folded => ahead,
+                    _ => {
+                        if let Some(key) = held_key {
+                            self.frozen_ahead.remove(&key);
+                        }
+                        *folded
+                    }
+                };
+                engine::fire::RsVerb::Buffer {
+                    pages: self
+                        .pools
+                        .rs_pages(pages, (!seated.refs).then_some(lane.slot))?,
+                    base: *base,
+                    folded,
+                    fold: *fold,
+                    lineage: *lineage,
+                }
+            }
+            verb => verb.clone(),
+        };
+    let plan = engine::rs::LanePlan::of(
+            &rs,
+            row.rows,
+            first,
+            masking,
+            ports.as_ref().and_then(engine::ports::LanePorts::fold),
+        )
+        .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
+        rs_one_run.push(match &rs {
+            engine::fire::RsVerb::Buffer { folded, lineage, .. } => {
+                engine::fire::lane_one_run(masking, *folded, first, *lineage)
+            }
+            _ => true,
+        });
+        // A beam group's lanes share their set's state: what its lanes
+        // fold is folded once for all of them, from the first's buffered
+        // rows, before any reads it (§11.3). Each lane then replays only
+        // the rows past it, from its page table row started past them,
+        // and folds none itself.
+        let beam_group = group_of[source].filter(|_| {
+            matches!(rs, engine::fire::RsVerb::Buffer { .. })
+        });
+        let mut plan = plan;
+        let (skip, beam_fold_to) = match (beam_group, &rs) {
+            (Some(group), engine::fire::RsVerb::Buffer { folded, .. }) => {
+                let to = beam_to[group].unwrap_or(*folded).min(first).max(*folded);
+                let skip = to - folded;
+                if beam_to[group].is_some_and(|stated| stated > first) {
+                    tracing::warn!(
+                        instance = %beam_groups[group].instance,
+                        lane = source,
+                        folded = *folded,
+                        stated = beam_to[group].unwrap_or(0),
+                        first,
+                        "a beam group's fold is stated past its lanes' first row (§11.3)"
+                    );
+                }
+                if skip > 0 && plan.gathers.len() != 1 {
+                    return Err(Fault::program(
+                        "serve::rs",
+                        format!(
+                            "lane {source} of a beam group folds {skip} shared row(s) before \
+                             its step and replays {} run(s) of its buffer; a group fold \
+                             reads one run from the set's fold (BEAM-PAGE-LISTS.md §11.3)",
+                            plan.gathers.len()
+                        ),
+                    ));
+                }
+                plan.replay = plan.replay.saturating_sub(skip);
+                plan.commit = 0;
+                if skip > 0 && !beam_folded[group] {
+                    beam_folded[group] = true;
+                    group_folds.push(rs_plans.len() as i32);
+                    group_folds.push(skip as i32);
+                }
+                (skip, Some(to))
+            }
+            _ => (0, None),
+        };
+        rs_skips.push(skip);
+        // A reporting lane that buffers tells, where the fire settles,
+        // how many slots past its state's frozen length this fire froze
+        // (as `LanePlan::of` reckons it) and, where a port places its
+        // rows, one past the last slot they landed at.
+        if seated.reports != 0 {
+            let end = first.saturating_add(row.rows);
+            let fold = match &rs {
+                engine::fire::RsVerb::Buffer { folded, fold, .. } => {
+                    let fold = match fold {
+                        engine::fire::FoldLen::Host(n) => Some(*n),
+                        engine::fire::FoldLen::Device => ports
+                            .as_ref()
+                            .and_then(engine::ports::LanePorts::fold),
+                    };
+                    // A beam lane folds nothing itself: its group's fold
+                    // is the runtime's, applied to the set (§11.3).
+                    if beam_fold_to.is_some() {
+                        Some(0)
+                    } else {
+                        fold.map(|n| folded.saturating_add(n).min(end) - folded)
+                    }
+                }
+                // A lane with no recurrent state to buffer (a kv-only
+                // model's): its fold is what its program's `fold` port
+                // states for it, the count the runtime adds to the set's
+                // frozen length when the fire settles, as for a buffering
+                // lane. Unreported, the set's cursor never comes to rest
+                // and a fork or a save of it is refused.
+                _ => ports.as_ref().and_then(engine::ports::LanePorts::fold),
+            };
+            ends.push(engine::KvWrites {
+                tag: seated.reports,
+                fold,
+                end: placed.then_some(end),
+                ..engine::KvWrites::default()
+            });
+        }
+        if let (engine::fire::RsVerb::Buffer { folded, fold, .. }, Some(key)) = (&rs, held_key) {
+            let n = match fold {
+                engine::fire::FoldLen::Host(n) => Some(*n),
+                engine::fire::FoldLen::Device => {
+                    ports.as_ref().and_then(engine::ports::LanePorts::fold)
+                }
+            };
+            // A beam group's set is folded by the runtime as it prepares
+            // the fire (§11.3): nothing is frozen ahead of what it states.
+            let to = n.map_or(*folded, |n| {
+                folded.saturating_add(n).min(first.saturating_add(row.rows))
+            });
+            if beam_fold_to.is_none() && to > *folded {
+                self.frozen_ahead.insert(key, to);
+            }
+        }
+        if !matches!(seated.rs, engine::fire::RsVerb::Fold) && crate::diag::on().rs_trace {
+            eprintln!(
+                "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
+                row.source, row.rows, plan.replay, plan.commit, plan.gather, plan.scatter
+            );
+        }
+        // The state the lane's kernels read and fold: the record it
+        // writes, but a lane of a copy-on-write group that folds nothing
+        // reads the run side, which no other lane writes this fire
+        // (CONTRACT-BC 15); its buffered rows still land in `record`.
+        // A beam group's lanes read the record its fold, if any, has
+        // written before them (§11.3).
+        let state = match seated.record_run {
+            Some(run) if plan.commit == 0 && beam_fold_to.is_none() => {
+                self.pools.record(Some(run), lane.slot)?
+            }
+            _ => record.clone(),
+        };
+        *state_top = state
+            .iter()
+            .map(|&id| id.saturating_add(1))
+            .fold(*state_top, u32::max);
+        state_ids.extend_from_slice(&state);
+        let band_ids = self.pools.band_ids(&state);
+        {
+            let mut at = 0usize;
+            for ((lanes_band, rows_band), &width) in
+                lane_bands.iter_mut().zip(row_bands.iter_mut()).zip(widths)
+            {
+                let ids = &band_ids[at..at + width as usize];
+                lanes_band.extend_from_slice(ids);
+                for _ in 0..row.rows {
+                    rows_band.extend_from_slice(ids);
+                }
+                at += width as usize;
+            }
+        }
+        rs_sets.push(match &rs {
+            engine::fire::RsVerb::Buffer { pages, base, .. } => Some((*base, pages.clone())),
+            _ => None,
+        });
+        rs_own.push(row.rows);
+        rs_plans.push(plan);
+        if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
+            return Err(Fault::Positions {
+                lane: row.source,
+                stated: seated.positions.len() as u64,
+                rows: lane.tokens.len() as u64,
+            });
+        }
+        let rows_here = row.rows as usize;
+        match ports.as_ref() {
+            Some(ports) => {
+                ports.check_extent(have.saturating_add(row.rows))?;
+                // A pass of its instance still in flight puts the token
+                // this one reads: copied from that cell on the device
+                // before the forward, not read on the host.
+                let in_flight = match envelope_of[source] {
+                    Some((held, at)) => resolved_of
+                        .get(held)
+                        .and_then(|&instance| self.programs.token_cell(instance).transpose())
+                        .transpose()?
+                        .map(|(buffer, cell)| (buffer, cell + 4 * at as u64)),
+                    None => None,
+                };
+                if let Some((buffer, cell)) = in_flight {
+                    token_feeds.push((tokens.len() as u32, buffer, cell));
+                }
+                for &token in ports.tokens_for(rows_here)? {
+                    tokens.push(token as i32);
+                }
+                let rows: Vec<i32> = (0..rows_here)
+                    .map(|at| narrow(u64::from(have) + at as u64))
+                    .collect();
+                // Positions its program computes in a channel: copied
+                // from the cell on the device, never read here.
+                let position_cell = match envelope_of[source] {
+                    Some((held, at)) => resolved_of
+                        .get(held)
+                        .and_then(|&instance| self.programs.positions_cell(instance).transpose())
+                        .transpose()?
+                        .map(|(buffer, cell)| (buffer, cell + 4 * at as u64)),
+                    None => None,
+                };
+                if position_cell.is_some() && rows_here != 1 {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source} carries its positions on the device and {rows_here} \
+                             rows; a decode envelope's lane states one position a row, one row"
+                        ),
+                    ));
+                }
+                let stated: Vec<i32> = match position_cell
+                    .is_none()
+                    .then(|| ports.positions_for(have, rows_here))
+                    .transpose()?
+                    .flatten()
+                {
+                    Some(stated) => stated.iter().map(|&at| narrow(u64::from(at))).collect(),
+                    None if !seated.positions.is_empty() => seated
+                        .positions
+                        .iter()
+                        .map(|&at| narrow(u64::from(at)))
+                        .collect(),
+                    None => rows.clone(),
+                };
+                // The causal bound is the row order, the cache row; a
+                // stated position rotates the row and bounds nothing.
+                positions.extend(&rows);
+                if let Some((buffer, cell)) = position_cell {
+                    position_feeds.push((rotations.len() as u32, buffer, cell));
+                }
+                rotations.extend(if self.states_mrope { &rows } else { &stated });
+                stated_rows.extend(&stated);
+                match &device_writes[source] {
+                    Some((slots, offsets)) => {
+                        for (&page, &off) in slots.iter().zip(offsets) {
+                            let page = self.pools.kv_page(page)?;
+                            writes
+                                .push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
+                        }
+                    }
+                    None => writes.extend(std::iter::repeat_n(None, rows_here)),
+                }
+                for _ in 0..rows_here {
+                    request_of_token.push(at_lane);
+                }
+            }
+            None => {
+                for (at, token) in lane.tokens.iter().enumerate() {
+                    tokens.push(*token as i32);
+                    let row = narrow(u64::from(have) + at as u64);
+                    let stated = seated
+                        .positions
+                        .get(at)
+                        .map_or(row, |&p| narrow(u64::from(p)));
+                    // The causal bound is the row order, the cache row; a
+                    // stated position rotates the row and bounds nothing.
+                    // With mrope the rotation rides its own table.
+                    positions.push(row);
+                    rotations.push(if self.states_mrope { row } else { stated });
+                    stated_rows.push(stated);
+                    request_of_token.push(at_lane);
+                }
+                writes.extend(std::iter::repeat_n(None, rows_here));
+            }
+        }
+        if !seated.kv_less {
+            let reach = have.saturating_add(row.rows);
+            let set = (seated.set, seated.readable);
+            match ports.as_ref().map(|ports| ports.slots(rows_here)).transpose()? {
+                Some(Some(slots)) => extents.lane(
+                    &self.written,
+                    source,
+                    lane.slot,
+                    set,
+                    slots.iter().map(|&slot| slot..slot.saturating_add(1)),
+                    reach,
+                ),
+                _ => extents.lane(
+                    &self.written,
+                    source,
+                    lane.slot,
+                    set,
+                    std::iter::once(have..reach),
+                    reach,
+                ),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What [`Shell::resolve_attachments`] finds of a fire's attached instances.
+struct Resolved {
+    resolved: Vec<engine::ports::Envelope>,
+    /// Each resolved envelope's instance, by the same index.
+    resolved_of: Vec<engine::InstanceId>,
+    envelope_of: Vec<Option<(usize, usize)>>,
+    /// A decode envelope's beam groups (`crate::beam`): each one's parents
+    /// cell, state and lanes; and each lane's group.
+    beam_groups: Vec<crate::beam::Group>,
+    group_of: Vec<Option<usize>>,
+}
+
+/// What [`Shell::device_ports`] reads of each lane's device ports.
+struct DevicePorts {
+    device_pages: Vec<Option<Vec<u32>>>,
+    device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>>,
+    device_masks: Vec<Option<Masking>>,
+    lane_rows: Vec<u32>,
+}
+
+/// What [`Shell::stage_lane`] reads of the fire it stages.
+#[derive(Clone, Copy)]
+struct LaneInputs<'i, 'a> {
+    lanes: &'a [Seated<'a>],
+    envelope_of: &'i [Option<(usize, usize)>],
+    resolved: &'i [engine::ports::Envelope],
+    resolved_of: &'i [engine::InstanceId],
+    device_pages: &'i [Option<Vec<u32>>],
+    device_writes: &'i [Option<(Vec<u32>, Vec<u32>)>],
+    device_masks: &'i [Option<Masking>],
+    group_of: &'i [Option<usize>],
+    beam_to: &'i [Option<u32>],
+    widths: &'i [u32],
+    any_adapter: bool,
+}
+
+/// What a fire's lane rows build, row by row ([`Shell::stage_lane`]).
+struct LaneAccum<'i, 'a> {
+    seats: Vec<Seat>,
+    kv_less: Vec<bool>,
+    tables: Vec<std::borrow::Cow<'a, [u32]>>,
+    window_tables: Vec<Vec<Vec<u32>>>,
+    tokens: Vec<i32>,
+    token_feeds: Vec<(u32, crate::device::Buffer, u64)>,
+    position_feeds: Vec<(u32, crate::device::Buffer, u64)>,
+    positions: Vec<i32>,
+    rotations: Vec<i32>,
+    stated_rows: Vec<i32>,
+    lane_bands: Vec<Vec<i32>>,
+    row_bands: Vec<Vec<i32>>,
+    state_top: u32,
+    state_ids: Vec<u32>,
+    rs_plans: Vec<engine::rs::LanePlan>,
+    rs_one_run: Vec<bool>,
+    rs_sets: Vec<Option<(u32, Vec<u32>)>>,
+    rs_own: Vec<u32>,
+    ends: Vec<engine::KvWrites>,
+    rs_active: bool,
+    snap_bands: Vec<Vec<i32>>,
+    snap_slots: u32,
+    request_of_token: Vec<i32>,
+    masks: Vec<crate::mask::LaneMask<'i>>,
+    adapter_routes: Vec<i32>,
+    beginning: Vec<Vec<u32>>,
+    writes: Vec<Option<(i32, i32)>>,
+    extents: engine::extent::FireExtents,
+    beam_groups: Vec<crate::beam::Group>,
+    beam_folded: Vec<bool>,
+    group_folds: Vec<i32>,
+    rs_skips: Vec<u32>,
 }
