@@ -2695,7 +2695,11 @@ impl<'c> Run<'c> {
         })
     }
 
-    pub(crate) fn planning(&self, geom: ValueId, plan: ValueId) -> Planning<'_> {
+    pub(crate) fn planning(
+        &self,
+        geom: ValueId,
+        plan: ValueId,
+    ) -> Result<Planning<'_>, kernels_cuda::Error> {
         let at = geom.0 as usize;
         let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def else {
             panic!(
@@ -2765,18 +2769,12 @@ impl<'c> Run<'c> {
                 gathered.page_indptr_host.as_slice(),
                 gathered.kv_len_host.as_slice(),
             ),
-            None => {
-                let first = span.lane_offset as usize;
-                let lanes = ceiling.map_or(span.lanes, |(_, lanes)| lanes) as usize;
-                (
-                    seat.kv_indptr
-                        .get(first..=first + lanes)
-                        .unwrap_or(&seat.kv_indptr),
-                    seat.kv_len
-                        .get(first..first + lanes)
-                        .unwrap_or(&seat.kv_len),
-                )
-            }
+            None => window_tables(
+                &seat.kv_indptr,
+                &seat.kv_len,
+                span.lane_offset as usize,
+                ceiling.map_or(span.lanes, |(_, lanes)| lanes) as usize,
+            )?,
         };
         let shape = Shape {
             num_requests: ceiling.map_or(span.lanes, |(_, lanes)| lanes),
@@ -2811,7 +2809,7 @@ impl<'c> Run<'c> {
             rows >= live.rows,
             "a row carve is never narrower than the fire"
         );
-        Planning {
+        Ok(Planning {
             kv_indptr,
             kv_len,
             shape,
@@ -2819,7 +2817,7 @@ impl<'c> Run<'c> {
             rows,
             window: schedule.window,
             workspace: schedule.workspace,
-        }
+        })
     }
 
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
@@ -3021,9 +3019,52 @@ fn skip(handle: Tensor, skip: u32, keep: u32) -> Tensor {
     )
 }
 
+/// The window's own lanes `first..first + lanes` of the fire's kv tables, or
+/// the fire fails by name: the whole table from lane 0 in their place plans
+/// each lane on another's pages.
+fn window_tables<'a>(
+    kv_indptr: &'a [i32],
+    kv_len: &'a [i32],
+    first: usize,
+    lanes: usize,
+) -> Result<(&'a [i32], &'a [i32]), kernels_cuda::Error> {
+    let short = |table: &str, len: usize, want: usize| kernels_cuda::Error::Backend {
+        op: "run::planning",
+        detail: format!(
+            "the window's lanes {first}..{} need {table} entries through {want}, \
+             and the fire's table holds {len}",
+            first + lanes,
+        ),
+    };
+    Ok((
+        kv_indptr
+            .get(first..=first + lanes)
+            .ok_or_else(|| short("kv_indptr", kv_indptr.len(), first + lanes + 1))?,
+        kv_len
+            .get(first..first + lanes)
+            .ok_or_else(|| short("kv_len", kv_len.len(), first + lanes))?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::RsScratch;
+
+    /// A window's lanes the fire's kv tables do not hold fail by name; the
+    /// whole table from lane 0 is never planned in their place.
+    #[test]
+    fn a_window_past_the_fires_kv_tables_is_refused_not_planned_on_lane_0() {
+        let indptr = [0, 4, 9, 12];
+        let len = [4, 5, 3];
+        let (ip, kl) = super::window_tables(&indptr, &len, 1, 2).unwrap();
+        assert_eq!((ip, kl), (&indptr[1..4], &len[1..3]));
+        for (first, lanes) in [(2, 2), (3, 1), (0, 4)] {
+            let why = super::window_tables(&indptr, &len, first, lanes)
+                .unwrap_err()
+                .to_string();
+            assert!(why.contains("the fire's table holds"), "{why}");
+        }
+    }
 
     #[test]
     fn the_windows_of_a_fire_share_a_layers_planes_and_keep_their_own_layout_words() {

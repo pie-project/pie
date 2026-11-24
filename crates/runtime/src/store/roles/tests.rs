@@ -1870,3 +1870,30 @@ fn a_rebind_read_before_a_park_is_cancelled_once_its_item_moved() {
     roles.lock().unwrap().close_instance(instance);
     roles.lock().unwrap().close_channel(channel);
 }
+
+/// An adapter parked with its process is held by its instances alone:
+/// once the last of them closes while the process is away, its host
+/// slots go back then, not at a restore that no longer has it to bring
+/// back (`close_instance` detaches the instance and frees what nothing
+/// holds, on whichever tier it lies).
+#[test]
+fn a_parked_adapter_s_host_slots_go_back_as_its_last_instance_closes_while_away() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = adapting(7);
+    let before = held(&device);
+    let id = bind(&roles, &mut engine, Vec::new(), 1);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    assert!(held(&host) > 0, "the instance and its adapter lie on the host");
+    assert_eq!(held(&device), before);
+    roles.lock().unwrap().close_instance(id);
+    assert_eq!(held(&host), 0, "the adapter's host slots are back with it");
+    assert!(
+        roles.lock().unwrap().prepare_unpark(holder(1)).unwrap().is_none(),
+        "nothing of it is left to bring back"
+    );
+}
