@@ -408,6 +408,32 @@ pub(crate) fn land_slots(
         // a pool view lands whole blocks (see `take_slots`)
         if f.is_view(slab) {
             let mut out = f.reshape(slab, &[blocks, per, width])?;
+            // Past a few lanes, the lanes in a loop (see `take_slots`): a
+            // buffered fire's recurrence lands every lane's block through a
+            // pool view, 130 lanes a layer in Qwen3.5.
+            if l > SLICED_LANES {
+                let landed = f.for_loop(l, &[out, rows, slot, write], |f, c, a| {
+                    let zero = ci(f, 0);
+                    let at = f.dynamic_slice(a[2], &[c], &[1])?;
+                    let at = f.reshape(at, &[])?;
+                    let w = f.dynamic_slice(a[3], &[c], &[1])?;
+                    let w = f.reshape(w, &[])?;
+                    let lo = ci(f, 0);
+                    let hi = ci(f, blocks - 1);
+                    let inside = cmp_i(f, Cmp::Ge, at, 0)?;
+                    let below = cmp_i(f, Cmp::Lt, at, blocks)?;
+                    let inside = f.and(inside, below)?;
+                    let lands = f.and(w, inside)?;
+                    let at = f.clamp(lo, at, hi)?;
+                    let r_i = f.dynamic_slice(a[1], &[c, zero, zero], &[1, per, width])?;
+                    let held = f.dynamic_slice(a[0], &[at, zero, zero], &[1, per, width])?;
+                    let lands = f.broadcast(lands, &[1, per, width], &[])?;
+                    let r_i = f.select(lands, r_i, held)?;
+                    let out = f.dynamic_update_slice(a[0], r_i, &[at, zero, zero])?;
+                    Ok(vec![out, a[1], a[2], a[3]])
+                })?;
+                return f.reshape(landed[0], &[n, width]);
+            }
             for i in 0..l {
                 let (at, lands) = lane(f, i)?;
                 let r_i = f.slice_axis(rows, 0, i, i + 1)?;
