@@ -46,7 +46,7 @@ pub fn rated(profiles: &Path, say: &mut dyn FnMut(&str)) -> Result<engine::rates
         &device,
         &tuning,
         crate::rates::stated_submit_bound(),
-        &profile::fire::Rates::default(),
+        &profile::rates::Rates::default(),
         say,
     )
     .map_err(|e| e.to_string())?;

@@ -103,7 +103,7 @@ struct Point {
     /// Seconds per launch for each candidate; `None` where it did not run.
     times: Vec<Option<f64>>,
     /// Each candidate's spread over its timed rounds, `(slowest - fastest)
-    /// / median` (not kept in the measurements' text).
+    /// / median`.
     spread: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     baseline: Option<usize>,
@@ -133,15 +133,21 @@ impl Measured {
                 .iter()
                 .map(|t| t.map_or_else(|| "-".to_string(), |t| format!("{t:e}")))
                 .collect();
+            let spread: Vec<String> = p
+                .spread
+                .iter()
+                .map(|s| s.map_or_else(|| "-".to_string(), |s| format!("{s:e}")))
+                .collect();
             let _ = writeln!(
                 out,
-                "point {} {} {} {} {}",
+                "point {} {} {} {} {} {}",
                 p.rows,
                 p.n,
                 p.k,
                 p.baseline
                     .map_or_else(|| "-".to_string(), |b| b.to_string()),
-                times.join(",")
+                times.join(","),
+                spread.join(",")
             );
         }
         out
@@ -179,7 +185,14 @@ impl Measured {
                     n: num(1)?,
                     k: num(2)?,
                     baseline: f.get(3).and_then(|b| b.parse().ok()),
-                    spread: Vec::new(),
+                    spread: f
+                        .get(5)
+                        .ok_or(format!(
+                            "`{line}` states no spread (measured by an older pie); measure again"
+                        ))?
+                        .split(',')
+                        .map(|s| s.parse().ok())
+                        .collect(),
                     times: f
                         .get(4)
                         .ok_or("times")?
@@ -202,6 +215,12 @@ impl Measured {
 /// The timed rounds a curve's point takes, and a point slower than both its
 /// neighbours takes again.
 const ROUNDS: usize = 7;
+
+/// A point's relative range over [`ROUNDS`] rounds as its median's relative
+/// error: `ROUNDS` normal draws span 2.704 standard deviations on average
+/// (Tippett's `d_n` at n = 7), and their median's error is `sqrt(pi / 2)`
+/// deviations over `sqrt(ROUNDS)` ([`profile::tune::median_and_error`]).
+const RANGE_TO_ERROR: f64 = 1.253_314 / (2.704 * 2.645_751);
 const RETIME_ROUNDS: usize = 21;
 
 /// More than any Apple GPU's system-level cache.
@@ -355,7 +374,7 @@ fn measure_at(
             })?;
             let mut row = vec![None; candidates.len()];
             let mut spread = vec![None; candidates.len()];
-            for (c, (t, lo, hi)) in live.iter().zip(times) {
+            for (c, (t, lo, hi, _)) in live.iter().zip(times) {
                 row[*c] = Some(lo);
                 spread[*c] = Some((hi - lo) / t.max(1e-12));
             }
@@ -393,7 +412,7 @@ fn measure_at(
                 let again = time_rounds(device, &pipelines, &handles, &[c], RETIME_ROUNDS, |sink, c, copy| {
                     launch(sink, &forced[c], copy)
                 })?;
-                if let (Some(&(_, lo, _)), Some(old)) = (again.first(), out.points[at].times[c]) {
+                if let (Some(&(_, lo, ..)), Some(old)) = (again.first(), out.points[at].times[c]) {
                     out.points[at].times[c] = Some(old.min(lo));
                 }
             }
@@ -469,6 +488,9 @@ fn fit_at(
             at: vec![i64::from(p.rows), i64::from(p.n), i64::from(p.k)],
             weight: weight(grid, shapes, p.rows),
             times: p.times.clone(),
+            spread: profile::tune::pooled(
+                p.spread.iter().flatten().map(|range| range * RANGE_TO_ERROR),
+            ),
         })
         .collect();
     let baseline: Vec<Option<usize>> = measured.points.iter().map(|p| p.baseline).collect();
@@ -558,12 +580,12 @@ fn composed(measured: &str, shapes: &[(u32, u32)], base: &str) -> String {
     out
 }
 
-/// The curve `d` is stored as (`profile::fire::KernelCurve` kind and key):
+/// The curve `d` is stored as (`profile::curves::KernelCurve` kind and key):
 /// the few-row vector forms as a vector kernel of 8 rows, the simdgroup
 /// row tiles as a tile (key 0: its row tile follows the rows), the
 /// tensor-op tile as an MPP tile of 32 rows.
 fn curve_id(d: Dense) -> (u32, u32) {
-    use profile::fire::KernelCurve;
+    use profile::curves::KernelCurve;
     match d {
         Dense::Rows => (KernelCurve::VECTOR, Dense::ROWS_MAX),
         Dense::Tile => (KernelCurve::TILE, 0),
@@ -590,8 +612,8 @@ fn curve_file(d: Dense) -> &'static str {
 /// rows with each point's spread, keyed by the candidate's kernel source.
 /// The vector forms end at 8 rows, the most they take: their curve stops
 /// there, as one beaten past it.
-fn curves_of(measured: &Measured) -> Vec<profile::fire::KernelCurve> {
-    use profile::fire::KernelCurve;
+fn curves_of(measured: &Measured) -> Vec<profile::curves::KernelCurve> {
+    use profile::curves::KernelCurve;
     let mut out: Vec<KernelCurve> = Vec::new();
     for p in &measured.points {
         for (c, d) in measured.candidates.iter().enumerate() {
@@ -618,7 +640,7 @@ fn curves_of(measured: &Measured) -> Vec<profile::fire::KernelCurve> {
                     curve: vec![(p.rows, tflops)],
                     stop: None,
                     spread: vec![(p.rows, spread)],
-                    by: crate::stored::by(profile::fire::KERNEL_CURVES, &[curve_file(*d)]),
+                    by: crate::stored::by(profile::rates::KERNEL_CURVES, &[curve_file(*d)]),
                 }),
             }
         }
@@ -638,7 +660,7 @@ fn curves_of(measured: &Measured) -> Vec<profile::fire::KernelCurve> {
 /// [`Measured`]'s form for the fit: each candidate's time from its TFLOP/s;
 /// `today` the route the load would take without them.
 fn points_of(
-    curves: &[profile::fire::KernelCurve],
+    curves: &[profile::curves::KernelCurve],
     candidates: &[Dense],
     shapes: &[(u32, u32)],
     today: &kernels_metal::Tuning,
@@ -815,7 +837,7 @@ fn winners(measured: &Measured, today: &kernels_metal::Tuning) -> (String, Strin
 }
 
 /// `chip` with `kernel.dense` stated by this model's own bf16 shapes,
-/// from each shape's curves (`[rates] kernel_tflops_by_shape_keyed`, one a
+/// from each shape's curves (`[rates] kernel_curves`, one a
 /// candidate kernel): taken where the user's file or the device's committed
 /// measured profile states them under a matching key (`crate::stored`: the
 /// device, its OS release, the kernel's source), else measured here before
@@ -841,13 +863,13 @@ pub(crate) fn at_load(
     let name = device.name().to_string();
     let family = device.family();
     let candidates = candidates(family);
-    let stated: Vec<profile::fire::KernelCurve> = chip
+    let stated: Vec<profile::curves::KernelCurve> = chip
         .rates()
-        .kernel_tflops_by_shape
+        .kernel_curves
         .clone()
         .unwrap_or_default();
     let top = *LOAD_ROWS.last().expect("rows");
-    let lacks = |curves: &[profile::fire::KernelCurve], n: u32, k: u32| {
+    let lacks = |curves: &[profile::curves::KernelCurve], n: u32, k: u32| {
         candidates.iter().filter(|d| runs_shape(**d, n, k)).any(|d| {
             let (kind, key) = curve_id(*d);
             !curves
@@ -870,16 +892,16 @@ pub(crate) fn at_load(
     // that a figure exists for, and nothing behind serving (a timing lays
     // buffers of its own, and nothing is laid after ready). Only a shape no
     // layer states at all is timed here.
-    let stale: Vec<profile::fire::KernelCurve> = chip
+    let stale: Vec<profile::curves::KernelCurve> = chip
         .rates()
         .stale
         .as_ref()
-        .and_then(|stale| stale.kernel_tflops_by_shape.clone())
+        .and_then(|stale| stale.kernel_curves.clone())
         .unwrap_or_default();
     let lacking: Vec<(u32, u32)> = if stale.is_empty() || lacking.is_empty() {
         lacking
     } else {
-        let with: Vec<profile::fire::KernelCurve> = curves
+        let with: Vec<profile::curves::KernelCurve> = curves
             .iter()
             .chain(stale.iter().filter(|s| !curves.iter().any(|c| c.id() == s.id())))
             .cloned()
@@ -936,10 +958,10 @@ pub(crate) fn at_load(
                 provenance: crate::rates::provenance(&name),
                 registry: crate::chip::registry(),
             };
-            let stored = profile::fire::Rates {
-                kernel_tflops_by_shape: Some(fresh.clone()),
+            let stored = profile::rates::Rates {
+                kernel_curves: Some(fresh.clone()),
                 measured_on: Some(crate::stored::measured_on(&name)),
-                ..profile::fire::Rates::default()
+                ..profile::rates::Rates::default()
             };
             if let Err(why) = engine::rates::save_rates(&save, &stored) {
                 tracing::warn!("{name}: kernel.dense curves not stored: {why}");

@@ -62,6 +62,13 @@ pub struct TuneArgs {
     /// constants (launch, matmul and attention rates, bandwidths, scan).
     #[arg(long, conflicts_with = "check_estimate")]
     pub rates: bool,
+
+    /// The serving mix a candidate is judged by: four weights for the
+    /// prompt and the 1-, 4- and 8-lane decode steps, `prompt,1,4,8`
+    /// (scaled to sum to one). A chat server might state `1,4,1,0`, a batch
+    /// service `1,0,1,4`. Equal weights where it is not stated.
+    #[arg(long, value_name = "PROMPT,1,4,8")]
+    pub mix: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,6 +134,10 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     let mut say = |line: &str| eprintln!("{}", palette.dim(line));
     let artifacts = crate::paths::pie_home().join("artifacts");
     let cache = crate::paths::pie_home().join("tune");
+    let mix = match args.mix.as_deref() {
+        Some(text) => runtime::engine::profiles::Mix::parse(text).map_err(|e| anyhow!(e))?,
+        None => runtime::engine::profiles::Mix::default(),
+    };
     let mut check = args.check.clone();
     check.extend(args.check_estimate.iter().flatten().cloned());
     let req = runtime::engine::profiles::TuneRequest {
@@ -137,6 +148,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         check_estimate: args.check_estimate.is_some(),
         dissect: &args.dissect,
         rates: args.rates,
+        mix,
         ..runtime::engine::profiles::TuneRequest::at(&dir, &artifacts, &cache)
     };
     // A check of the estimate is a test: it writes nothing.

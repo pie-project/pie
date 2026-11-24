@@ -171,6 +171,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         readout,
         read,
         refused: None,
+        layers: trace.decoder_layers(),
     })
 }
 
@@ -206,9 +207,18 @@ struct Vulkan<'a> {
     base: &'a Profile,
     facts: &'a Facts,
     cores: u32,
+    mix: search::Mix,
 }
 
 impl Bench for Vulkan<'_> {
+    fn mix(&self) -> search::Mix {
+        self.mix
+    }
+
+    fn agreement(&self) -> f64 {
+        engine::rates::AGREEMENT
+    }
+
     fn models(&self) -> Vec<String> {
         self.models.iter().map(|(_, d)| d.clone()).collect()
     }
@@ -361,6 +371,7 @@ pub fn run(
     cache: &Path,
     refit: bool,
     models: &[(PathBuf, String)],
+    mix: search::Mix,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -413,6 +424,7 @@ pub fn run(
         base: &base,
         facts: &facts,
         cores,
+        mix,
     };
     let mut chosen = Vec::new();
     if models.is_empty() {

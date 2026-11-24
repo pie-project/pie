@@ -2,7 +2,7 @@
 //! whichever the estimate (`engine::roofline`) weighs fastest over the
 //! model's dense planes, from the device's measured rates: each kernel at
 //! each of the model's own plane shapes at its rate measured there, at the
-//! rows it lands (`kernel_tflops_by_shape`, timed once the model's shapes
+//! rows it lands (`kernel_curves`, timed once the model's shapes
 //! are known, `crate::rates::measure_shapes`). A measured rate holds every
 //! weight pass the kernel makes and the occupancy it reaches at that plane.
 //! No kernel is weighed past the rows it was timed at: it is no candidate
@@ -202,7 +202,7 @@ impl Dense {
     }
 }
 
-/// Which model's settle a stored one is (`profile::fire::DenseSettled::of`):
+/// Which model's settle a stored one is (`profile::curves::DenseSettled::of`):
 /// a fingerprint of the model's dense planes, the load's lanes, its top rows
 /// and the target, in canonical words (each list sorted, every number as it
 /// reads back from a profile). One entry a model a device: a model's settle
@@ -222,19 +222,19 @@ pub fn settle_of(planes: &[(u32, u32, u32, f64)], lanes: u32, top: u32, target: 
         Target::Spirv => "spirv",
         Target::Wgsl => "wgsl",
     };
-    profile::fire::fingerprint(
+    profile::rates::fingerprint(
         format!("planes {}|lanes {lanes}|top {top}|{target}", planes.join(" ")).as_bytes(),
     )
 }
 
 /// What a stored settle's ranges were weighed against
-/// (`profile::fire::DenseSettled::code`): the code of every kernel the
+/// (`profile::curves::DenseSettled::code`): the code of every kernel the
 /// load's fires can ask for (`kernels`, `crate::stored::code_of_all`) and
 /// the kernel the curves picked at each range ([`Dense::canonical`]). A
 /// change of either settles the model again.
 #[must_use]
 pub fn settle_code(kernels: u32, dense: &Dense) -> u32 {
-    profile::fire::fingerprint(format!("kernels {kernels:#010x}|picks {}", dense.canonical()).as_bytes())
+    profile::rates::fingerprint(format!("kernels {kernels:#010x}|picks {}", dense.canonical()).as_bytes())
 }
 
 /// Which of a settle's candidates' timings (`samples`, each candidate's
@@ -377,7 +377,7 @@ pub fn tiled_kernels(target: Target, base: Tactic) -> Vec<Tactic> {
 
 /// What a load is refused by where its profile states no kernel's curve at
 /// all: the key it lacks.
-pub const UNREACHED: &str = profile::fire::KERNEL_CURVES;
+pub const UNREACHED: &str = profile::rates::KERNEL_CURVES;
 
 /// The `(n, k)` of every weight a dense matmul of `trace` multiplies by
 /// (`Linear::Matmul`, the output head's among them): the planes the dense
@@ -435,12 +435,12 @@ pub fn planes(counts: &Counts, multiplied: Option<&[(u32, u32)]>) -> Vec<(u32, u
 #[must_use]
 pub fn plane_ns(
     target: Target,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     tactic: Tactic,
     (n, k): (u32, u32),
     rows: u32,
 ) -> Option<f64> {
-    let curves = rates.kernel_tflops_by_shape.as_deref()?;
+    let curves = rates.kernel_curves.as_deref()?;
     let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
     let found = curves.iter().find(|c| c.id() == (kind, key, n, k))?;
     let (&(first, _), &(most, last)) = (found.curve.first()?, found.curve.last()?);
@@ -449,7 +449,7 @@ pub fn plane_ns(
         return (last > 0.0).then(|| flops(rows) / (last * 1e3));
     }
     let at = rows.max(first);
-    profile::fire::interpolate(&found.curve, f64::from(at)).map(|t| flops(at) / (t * 1e3))
+    profile::curves::interpolate(&found.curve, f64::from(at)).map(|t| flops(at) / (t * 1e3))
 }
 
 /// How many times `standing`'s dense matmul time at `rows` over `planes`
@@ -459,13 +459,13 @@ pub fn plane_ns(
 #[must_use]
 pub fn slower_by(
     target: Target,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     planes: &[(u32, u32, u32, f64)],
     standing: &Dense,
     option: &Dense,
     rows: u32,
 ) -> Option<f64> {
-    let curves = rates.kernel_tflops_by_shape.as_deref()?;
+    let curves = rates.kernel_curves.as_deref()?;
     let time = |tactic: Tactic, n: u32, k: u32| -> Option<f64> {
         let (kind, key) = crate::rates::curve_key(target, tactic, n, k);
         let found = curves.iter().find(|c| c.id() == (kind, key, n, k))?;
@@ -475,7 +475,7 @@ pub fn slower_by(
         }
         let at = rows.max(first);
         let flops = 2.0 * f64::from(at) * f64::from(n) * f64::from(k);
-        profile::fire::interpolate(&found.curve, f64::from(at)).map(|t| flops / (t * 1e3))
+        profile::curves::interpolate(&found.curve, f64::from(at)).map(|t| flops / (t * 1e3))
     };
     let (mut was, mut is) = (0.0, 0.0);
     for &(n, k, count, _) in planes {
@@ -498,7 +498,7 @@ pub fn choose(
     target: Target,
     rungs: &[u32],
     tiled: impl Fn(u32) -> Tactic,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     planes: &[(u32, u32, u32, f64)],
     records: bool,
     full: Option<u32>,
@@ -517,7 +517,7 @@ pub fn choose_unrated(
     target: Target,
     rungs: &[u32],
     tiled: impl Fn(u32) -> Tactic,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     planes: &[(u32, u32, u32, f64)],
     records: bool,
     full: Option<u32>,
@@ -532,7 +532,7 @@ fn weigh(
     target: Target,
     rungs: &[u32],
     tiled: &dyn Fn(u32) -> Tactic,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     launch_ns: f64,
     planes: &[(u32, u32, u32, f64)],
     records: bool,
@@ -586,14 +586,14 @@ fn pick(
     target: Target,
     rungs: &[u32],
     tiled: &dyn Fn(u32) -> Tactic,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     launch_ns: f64,
     planes: &[(u32, u32, u32, f64)],
     records: bool,
     full: Option<u32>,
     incumbent: Option<&dyn Fn(u32) -> Tactic>,
 ) -> Result<(Vec<(u32, Tactic)>, Vec<Weighed>), &'static str> {
-    let curves = rates.kernel_tflops_by_shape.as_deref().ok_or(UNREACHED)?;
+    let curves = rates.kernel_curves.as_deref().ok_or(UNREACHED)?;
     // The candidates at `kernel_rows` (a rung's, or a fire's own): each
     // vector kernel, and each tiled one.
     let candidates = |kernel_rows: u32| -> Vec<Tactic> {
@@ -640,7 +640,7 @@ fn pick(
             .filter(|&&(r, _)| r <= at)
             .map(|&(r, t)| flops(r) / (t * 1e3))
             .fold(0.0, f64::max);
-        profile::fire::interpolate(curve, f64::from(at))
+        profile::curves::interpolate(curve, f64::from(at))
             .map(|t| ((flops(at) / (t * 1e3)).max(floor), true))
     };
     let time_at =
@@ -670,7 +670,7 @@ fn pick(
             curves.iter().any(|c| {
                 c.id() == (kind, key, n, k)
                     && matches!(c.stop, Some((at, why))
-                        if why == profile::fire::KernelCurve::BEATEN && rows >= at)
+                        if why == profile::curves::KernelCurve::BEATEN && rows >= at)
             })
         })
     };
@@ -682,7 +682,7 @@ fn pick(
         curves
             .iter()
             .find(|c| c.id() == (kind, key, n, k))
-            .and_then(|c| profile::fire::interpolate(&c.spread, f64::from(rows)))
+            .and_then(|c| profile::curves::interpolate(&c.spread, f64::from(rows)))
             .unwrap_or(0.0)
     };
     // `tactic`'s spread at `rows` over every plane some candidate of
@@ -1095,9 +1095,9 @@ mod tests {
     }
 
     /// A kernel's curve at the 4096-square planes of [`counts`].
-    fn at_4096(kind: u32, key: u32, curve: Vec<(u32, f64)>) -> profile::fire::KernelCurve {
-        profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
+    fn at_4096(kind: u32, key: u32, curve: Vec<(u32, f64)>) -> profile::curves::KernelCurve {
+        profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
             kind,
             key,
             n: 4096,
@@ -1110,30 +1110,30 @@ mod tests {
 
     /// `r` with its vector kernels' curves at 4096 square `vectors`, `(rows a
     /// workgroup carries, curve)`.
-    fn set_vectors(r: &mut profile::fire::Rates, vectors: Vec<(u32, Vec<(u32, f64)>)>) {
-        let curves = r.kernel_tflops_by_shape.get_or_insert_with(Vec::new);
-        curves.retain(|c| c.kind != profile::fire::KernelCurve::VECTOR);
+    fn set_vectors(r: &mut profile::rates::Rates, vectors: Vec<(u32, Vec<(u32, f64)>)>) {
+        let curves = r.kernel_curves.get_or_insert_with(Vec::new);
+        curves.retain(|c| c.kind != profile::curves::KernelCurve::VECTOR);
         curves.extend(
             vectors
                 .into_iter()
-                .map(|(rows, curve)| at_4096(profile::fire::KernelCurve::VECTOR, rows, curve)),
+                .map(|(rows, curve)| at_4096(profile::curves::KernelCurve::VECTOR, rows, curve)),
         );
     }
 
     /// Rates whose vector kernels run at `few` TFLOP/s at every rows (none
     /// stated where `None`) and tiled kernels at `tiles` (by row tile), all
     /// at [`counts`]' 4096-square planes.
-    fn rates(few: Option<f64>, tiles: Vec<(u32, Vec<(u32, f64)>)>) -> profile::fire::Rates {
-        let mut r = profile::fire::Rates {
+    fn rates(few: Option<f64>, tiles: Vec<(u32, Vec<(u32, f64)>)>) -> profile::rates::Rates {
+        let mut r = profile::rates::Rates {
             launch_ns: Some(3000),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (2048, 30.0)])]),
             hbm_gbps: Some(650.0),
             cached_gbps: None,
             elementwise_gbps: Some(700.0),
-            kernel_tflops_by_shape: Some(
+            kernel_curves: Some(
                 tiles
                     .into_iter()
-                    .map(|(tile, curve)| at_4096(profile::fire::KernelCurve::TILE, tile, curve))
+                    .map(|(tile, curve)| at_4096(profile::curves::KernelCurve::TILE, tile, curve))
                     .collect(),
             ),
             ..Default::default()
@@ -1235,7 +1235,7 @@ mod tests {
     fn without_curves_the_stated_roofline_weighs_the_work_shape() {
         let rungs = [1, 4, 16, 64, 256, 1024, 2048];
         let mut r = rates(None, Vec::new());
-        r.kernel_tflops_by_shape = None;
+        r.kernel_curves = None;
         let c = Constants::of(&r).unwrap();
         let (dense, said) = by_shape(
             Target::Spirv,
@@ -1284,7 +1284,7 @@ mod tests {
         .unwrap();
         assert!(dense.at(1, 4096, 4096).vector > 0, "{weighed:?}");
         assert_eq!(dense.at(2048, 4096, 4096).vector, 0, "{weighed:?}");
-        r.kernel_tflops_by_shape = None;
+        r.kernel_curves = None;
         assert_eq!(
             choose_unrated(
                 Target::Spirv,
@@ -1336,25 +1336,25 @@ mod tests {
         let r = rates(Some(5.0), coopmat_tiles());
         let planes = planes(&counts(), None);
         let rungs = [1, 2, 4, 8, 16, 32, 64];
-        let pick = |r: &profile::fire::Rates| {
+        let pick = |r: &profile::rates::Rates| {
             choose(Target::Spirv, &rungs, coopmat, r, &planes, true, None).unwrap().0
         };
         let a = settle_of(&planes, 4, 64, Target::Spirv);
-        let code = |r: &profile::fire::Rates| settle_code(7, &pick(r));
+        let code = |r: &profile::rates::Rates| settle_code(7, &pick(r));
         let first = code(&r);
         // Model B measured after A: its curves join A's (another plane, and
         // A's own plane timed again to more rows at the same rates).
         let mut joined = r.clone();
-        let mut elsewhere = joined.kernel_tflops_by_shape.as_ref().unwrap()[0].clone();
+        let mut elsewhere = joined.kernel_curves.as_ref().unwrap()[0].clone();
         elsewhere.n = 777;
-        joined.kernel_tflops_by_shape.as_mut().unwrap().push(elsewhere);
-        let longer = joined.kernel_tflops_by_shape.as_mut().unwrap();
+        joined.kernel_curves.as_mut().unwrap().push(elsewhere);
+        let longer = joined.kernel_curves.as_mut().unwrap();
         let last = *longer[0].curve.last().unwrap();
         longer[0].curve.push((last.0 * 2, last.1));
         assert_eq!(settle_of(&planes, 4, 64, Target::Spirv), a, "B leaves A's key");
         assert_eq!(code(&joined), first, "B's curves move none of A's picks");
         let mut reversed = r.clone();
-        reversed.kernel_tflops_by_shape.as_mut().unwrap().reverse();
+        reversed.kernel_curves.as_mut().unwrap().reverse();
         assert_eq!(code(&reversed), first, "the curves' order keys nothing");
         let registry = profile::Registry::new("test", &[], &[]);
         let read = registry
@@ -1362,8 +1362,8 @@ mod tests {
             .expect("the curves read back");
         assert_eq!(code(&read.rates()), first, "written and read back, the same");
         let mut slower = r.clone();
-        for c in slower.kernel_tflops_by_shape.as_mut().unwrap() {
-            if c.kind == profile::fire::KernelCurve::VECTOR {
+        for c in slower.kernel_curves.as_mut().unwrap() {
+            if c.kind == profile::curves::KernelCurve::VECTOR {
                 for p in &mut c.curve {
                     p.1 /= 1000.0;
                 }
@@ -1448,7 +1448,7 @@ mod tests {
     #[test]
     fn a_missing_rate_is_refused_by_its_key() {
         let mut none = rates(Some(5.0), coopmat_tiles());
-        none.kernel_tflops_by_shape = None;
+        none.kernel_curves = None;
         let refused = choose(
             Target::Spirv,
             &[1, 2],
@@ -1458,9 +1458,9 @@ mod tests {
             true,
             None,
         );
-        assert_eq!(refused.unwrap_err(), profile::fire::KERNEL_CURVES);
+        assert_eq!(refused.unwrap_err(), profile::rates::KERNEL_CURVES);
         let mut elsewhere = rates(Some(5.0), coopmat_tiles());
-        for c in elsewhere.kernel_tflops_by_shape.iter_mut().flatten() {
+        for c in elsewhere.kernel_curves.iter_mut().flatten() {
             c.n = 1024;
         }
         let refused = choose(
@@ -1510,8 +1510,8 @@ mod tests {
             gemm_shapes: vec![shape(1024, 3072), shape(3072, 1024)],
             ..counts()
         };
-        let curve = |kind, key, n, k, rate: f64| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
+        let curve = |kind, key, n, k, rate: f64| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -1522,20 +1522,20 @@ mod tests {
         };
         let tile =
             |wide, n, k| crate::rates::curve_key(Target::Wgsl, Tactic { wide, ..tiled(0) }, n, k).1;
-        let tag = profile::fire::KernelCurve::TILE;
+        let tag = profile::curves::KernelCurve::TILE;
         let mut curves = Vec::new();
         for (n, k) in [(1024, 3072), (3072, 1024)] {
             curves.push(curve(tag, tile(false, n, k), n, k, 9.0));
             curves.push(curve(tag, tile(true, n, k), n, k, 6.0));
             for rows in gemm::VECTOR_ROWS {
-                curves.push(curve(profile::fire::KernelCurve::VECTOR, rows, n, k, 0.5));
+                curves.push(curve(profile::curves::KernelCurve::VECTOR, rows, n, k, 0.5));
             }
         }
         // At 4096 square, not a plane of the model: the wide tile far ahead.
         curves.push(curve(tag, tile(true, 4096, 4096), 4096, 4096, 16.0));
         curves.push(curve(tag, tile(false, 4096, 4096), 4096, 4096, 6.4));
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(curves),
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves),
             ..rates(None, Vec::new())
         };
         let (dense, weighed) = choose(
@@ -2380,11 +2380,11 @@ mod tests {
                 ],
             ),
         ];
-        let mut curves: Vec<profile::fire::KernelCurve> = phone
+        let mut curves: Vec<profile::curves::KernelCurve> = phone
             .into_iter()
             .map(
-                |(kind, key, n, k, stop, curve, spread)| profile::fire::KernelCurve {
-                    by: profile::fire::MeasuredBy::default(),
+                |(kind, key, n, k, stop, curve, spread)| profile::curves::KernelCurve {
+                    by: profile::rates::MeasuredBy::default(),
                     kind,
                     key,
                     n,
@@ -2395,9 +2395,9 @@ mod tests {
                 },
             )
             .collect();
-        curves.sort_by_key(profile::fire::KernelCurve::id);
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(curves.clone()),
+        curves.sort_by_key(profile::curves::KernelCurve::id);
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves.clone()),
             ..rates(None, Vec::new())
         };
         let shape = |n: u32, k: u32, planes| engine::load::GemmShape {
@@ -2434,7 +2434,7 @@ mod tests {
                     let rate = if rows > last.0 {
                         last.1
                     } else {
-                        profile::fire::interpolate(&c.curve, f64::from(rows)).unwrap()
+                        profile::curves::interpolate(&c.curve, f64::from(rows)).unwrap()
                     };
                     f64::from(count) * 2.0 * f64::from(rows) * f64::from(n) * f64::from(k)
                         / (rate * 1e3)
@@ -2495,8 +2495,8 @@ mod tests {
             gemm_shapes: vec![shape(1024, 1024, 28), shape(head_n, head_k, 1)],
             ..counts()
         };
-        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
+        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -2507,8 +2507,8 @@ mod tests {
         };
         let tile = |n, k| crate::rates::curve_key(Target::Wgsl, tiled(0), n, k).1;
         let (v, t) = (
-            profile::fire::KernelCurve::VECTOR,
-            profile::fire::KernelCurve::TILE,
+            profile::curves::KernelCurve::VECTOR,
+            profile::curves::KernelCurve::TILE,
         );
         let mut curves = vec![
             // The layers: the vector kernel ahead of the tile to 1024 rows.
@@ -2537,12 +2537,12 @@ mod tests {
                 head_n,
                 head_k,
                 vec![(1, 1.0), (256, 1.5)],
-                Some((512, profile::fire::KernelCurve::BEATEN)),
+                Some((512, profile::curves::KernelCurve::BEATEN)),
             ),
         ];
-        curves.sort_by_key(profile::fire::KernelCurve::id);
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(curves),
+        curves.sort_by_key(profile::curves::KernelCurve::id);
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves),
             ..rates(None, Vec::new())
         };
         let rungs = [256, 512, 1024];
@@ -2599,8 +2599,8 @@ mod tests {
             gemm_shapes: vec![shape(1024, 1024, 28), shape(8192, 1024, 1)],
             ..counts()
         };
-        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
+        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -2611,8 +2611,8 @@ mod tests {
         };
         let tile = |n, k| crate::rates::curve_key(Target::Wgsl, tiled(0), n, k).1;
         let (v, t) = (
-            profile::fire::KernelCurve::VECTOR,
-            profile::fire::KernelCurve::TILE,
+            profile::curves::KernelCurve::VECTOR,
+            profile::curves::KernelCurve::TILE,
         );
         let mut curves = vec![
             // The layer planes: the vector kernel 4x the tile to 256 rows.
@@ -2640,11 +2640,11 @@ mod tests {
                 8192,
                 1024,
                 vec![(1, 0.02), (16, 2.0)],
-                Some((64, profile::fire::KernelCurve::BEATEN)),
+                Some((64, profile::curves::KernelCurve::BEATEN)),
             ),
         ];
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(curves.clone()),
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves.clone()),
             ..rates(None, Vec::new())
         };
         let (dense, weighed) = choose(
@@ -2663,9 +2663,9 @@ mod tests {
         assert_eq!(dense.at(128, 8192, 1024).vector, 0, "{:?}", dense.runs());
         let _ = weighed;
         // Stopped by the bound at the head instead: not shown beaten.
-        curves[3].stop = Some((64, profile::fire::KernelCurve::BOUND));
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(curves),
+        curves[3].stop = Some((64, profile::curves::KernelCurve::BOUND));
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves),
             ..rates(None, Vec::new())
         };
         let (dense, weighed) = choose(
@@ -2699,8 +2699,8 @@ mod tests {
     fn the_full_chunk_rung_is_picked_at_its_top_rows() {
         let (n, k) = (1024, 2048);
         let tile = crate::rates::curve_key(Target::Spirv, coopmat(0), n, k).1;
-        let curve = |kind, key, points: Vec<(u32, f64)>| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
+        let curve = |kind, key, points: Vec<(u32, f64)>| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -2709,15 +2709,15 @@ mod tests {
             stop: None,
             spread: Vec::new(),
         };
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(vec![
+        let r = profile::rates::Rates {
+            kernel_curves: Some(vec![
                 curve(
-                    profile::fire::KernelCurve::TILE,
+                    profile::curves::KernelCurve::TILE,
                     tile,
                     vec![(1, 0.02), (256, 3.8), (1024, 15.4)],
                 ),
                 curve(
-                    profile::fire::KernelCurve::VECTOR,
+                    profile::curves::KernelCurve::VECTOR,
                     16,
                     vec![(1, 0.6), (256, 11.2), (1024, 12.6)],
                 ),
@@ -2776,9 +2776,9 @@ mod tests {
             crate::rates::curve_key(Target::Wgsl, Tactic { wide, ..narrow(0) }, n, k).1
         };
         let with = |spread: f64| {
-            let curve = |wide, n, k, rate: f64| profile::fire::KernelCurve {
-                by: profile::fire::MeasuredBy::default(),
-                kind: profile::fire::KernelCurve::TILE,
+            let curve = |wide, n, k, rate: f64| profile::curves::KernelCurve {
+                by: profile::rates::MeasuredBy::default(),
+                kind: profile::curves::KernelCurve::TILE,
                 key: key(wide, n, k),
                 n,
                 k,
@@ -2786,8 +2786,8 @@ mod tests {
                 stop: None,
                 spread: vec![(1, spread), (256, spread)],
             };
-            profile::fire::Rates {
-                kernel_tflops_by_shape: Some(vec![
+            profile::rates::Rates {
+                kernel_curves: Some(vec![
                     // The plane the model's pick follows: narrow far ahead.
                     curve(false, 4096, 4096, 10.0),
                     curve(true, 4096, 4096, 5.0),
@@ -2839,9 +2839,9 @@ mod tests {
             wide: false,
         };
         let rows: Vec<u32> = (0..7).map(|i| 1 << i).collect();
-        let curve = |key: u32, lead: bool| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
-            kind: profile::fire::KernelCurve::VECTOR,
+        let curve = |key: u32, lead: bool| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
+            kind: profile::curves::KernelCurve::VECTOR,
             key,
             n: 4096,
             k: 4096,
@@ -2857,9 +2857,9 @@ mod tests {
             spread: rows.iter().map(|&r| (r, 0.05)).collect(),
         };
         let mut curves = vec![curve(4, true), curve(8, false)];
-        curves.sort_by_key(profile::fire::KernelCurve::id);
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(curves),
+        curves.sort_by_key(profile::curves::KernelCurve::id);
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves),
             ..rates(None, Vec::new())
         };
         let (dense, _) = choose(
@@ -2891,8 +2891,8 @@ mod tests {
             vector: 0,
             wide: true,
         };
-        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
+        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
             kind,
             key,
             n,
@@ -2902,12 +2902,12 @@ mod tests {
             spread: Vec::new(),
         };
         let (v, t) = (
-            profile::fire::KernelCurve::VECTOR,
-            profile::fire::KernelCurve::TILE,
+            profile::curves::KernelCurve::VECTOR,
+            profile::curves::KernelCurve::TILE,
         );
         let tile = |n, k| crate::rates::curve_key(Target::Wgsl, wide(0), n, k).1;
         let (head_n, head_k) = (151_936, 1024);
-        let bound = Some((4, profile::fire::KernelCurve::BOUND));
+        let bound = Some((4, profile::curves::KernelCurve::BOUND));
         let mut curves = vec![
             // The layers: the vector kernel well ahead of the tile to 64 rows.
             curve(
@@ -2930,9 +2930,9 @@ mod tests {
                 bound,
             ),
         ];
-        curves.sort_by_key(profile::fire::KernelCurve::id);
-        let r = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(curves),
+        curves.sort_by_key(profile::curves::KernelCurve::id);
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves),
             ..rates(None, Vec::new())
         };
         let shape = |n: u32, k: u32, planes| engine::load::GemmShape {

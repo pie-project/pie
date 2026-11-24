@@ -805,7 +805,7 @@ impl Context {
     /// The workgroups the device holds at once, which what sizes a fire's
     /// work to the device reads: WebGPU reports no count of an adapter's
     /// compute units, so the load's rates step measures this
-    /// (`profile::fire::RESIDENT_WORKGROUPS`) and lays it here. `None`
+    /// (`profile::rates::RESIDENT_WORKGROUPS`) and lays it here. `None`
     /// before the load has.
     #[must_use]
     pub fn resident(&self) -> Option<u32> {

@@ -26,7 +26,7 @@
 //! # each dense kernel's TFLOP/s by rows at each of a model's dense shapes:
 //! # [kind, key, n, k, stopped at rows, why, method, [[kernel, code]],
 //! #  [[rows, TFLOP/s], ...], [[rows, spread], ...]]
-//! kernel_tflops_by_shape_keyed = [[1, 4, 1024, 1024, 0, 0, 1,
+//! kernel_curves = [[1, 4, 1024, 1024, 0, 0, 1,
 //!   [["linear_gemm_gemv_v_bf16", 3735928559]], [[1, 0.3], [256, 2.0]], []]]
 //! # a user's file only: the device its measurements were taken on, and
 //! # each rate's key: [rate, method, [[kernel, code], ...]]
@@ -51,6 +51,25 @@
 
 use std::fmt::Write as _;
 
+use toml::Spanned;
+use toml::de::DeValue;
+
+use crate::curves::{DenseSettled, KernelCurve};
+use crate::registry::Walk;
+use form::Slot;
+
+mod form;
+mod read;
+mod stored;
+
+/// A curve: `(x, rate)` pairs, strictly ascending in `x`.
+pub type Curve = Vec<(u32, f64)>;
+
+/// A curve at each of several widths: `(width, curve)`, ascending in width.
+pub type WidthCurves = Vec<(u32, Curve)>;
+
+pub use stored::{MeasuredBy, Now, fingerprint};
+
 /// A device's rates, each where a layer states it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Rates {
@@ -59,11 +78,11 @@ pub struct Rates {
     /// Dense bf16 matmul TFLOP/s by rows at each width (columns and depth
     /// both): `(width, [(rows, TFLOP/s)])`, ascending in width, each curve
     /// strictly ascending in rows.
-    pub gemm_tflops_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
+    pub gemm_tflops_by_rows: Option<WidthCurves>,
     /// Prefill attention TFLOP/s (the full rectangle's flops, four a query
     /// element a key) by keys, one sequence attending itself: `(keys,
     /// TFLOP/s)`, strictly ascending in keys.
-    pub attn_tflops_by_keys: Option<Vec<(u32, f64)>>,
+    pub attn_tflops_by_keys: Option<Curve>,
     /// Device memory GB/s, achieved by a streaming copy (read plus write).
     pub hbm_gbps: Option<f64>,
     /// GB/s of reads the last-level caches serve: every workgroup reading a
@@ -132,7 +151,7 @@ pub struct Rates {
     /// square curve reads such a step's attention as up to twice as fast as
     /// it runs. Measured, and read, only where the platform states a bound
     /// on one submission (`engine_gpu::submit`); not one of [`KEYS`].
-    pub attn_tflops_by_rows_keys: Option<Vec<(u32, Vec<(u32, f64)>)>>,
+    pub attn_tflops_by_rows_keys: Option<WidthCurves>,
     /// Each decode product's time on each kernel that can serve it, measured
     /// in place (a captured burst over the model's own layer weights, as a
     /// step meets them), keyed by the product's shape: what a backend picks
@@ -148,7 +167,7 @@ pub struct Rates {
     /// load measuring only the shapes and kernels the table lacks to its rows.
     /// Measured; not one of [`KEYS`] (a load measures it once its model's
     /// shapes are known).
-    pub kernel_tflops_by_shape: Option<Vec<KernelCurve>>,
+    pub kernel_curves: Option<Vec<KernelCurve>>,
     /// The dense kernels each load's settle took in context over the
     /// curves' picks ([`DENSE_SETTLED`]), one entry per key (a model's
     /// planes, curves and rungs: [`DenseSettled::of`]), many a device: what
@@ -176,170 +195,6 @@ pub struct Rates {
     /// behind serving (`engine::rates::resolve_at_load`). Read, never
     /// written.
     pub stale: Option<Box<Rates>>,
-}
-
-/// What one stored measurement was measured by, beside the device it was
-/// measured on ([`Rates::measured_on`]): the version of its measuring method
-/// (bumped only when the method changes, stated beside the measuring code)
-/// and each kernel it fired with its code's fingerprint in the build that
-/// measured it ([`Now::code`]). A measurement whose method or any of whose
-/// kernels' code differs from this build's is measured again; nothing else
-/// of the build (its version, its commit, the day) keys it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MeasuredBy {
-    pub method: u32,
-    pub kernels: Vec<(String, u32)>,
-}
-
-impl MeasuredBy {
-    /// Why a measurement by `self` is not valid under `now`, `None` where
-    /// it is: its method's version moved, or a kernel's code changed or left
-    /// the build.
-    #[must_use]
-    pub fn stale(&self, what: &str, now: &dyn Now) -> Option<String> {
-        match now.method(what) {
-            None => return Some(format!("`{what}` is measured by no method of this build")),
-            Some(method) if method != self.method => {
-                return Some(format!(
-                    "its measuring method is version {method} now, {} when stored",
-                    self.method
-                ));
-            }
-            Some(_) => {}
-        }
-        for (kernel, code) in &self.kernels {
-            match now.code(kernel) {
-                None => return Some(format!("kernel `{kernel}` is not in this build")),
-                Some(now) if now != *code => {
-                    return Some(format!(
-                        "kernel `{kernel}`'s code changed ({code:#010x} stored, {now:#010x} now)"
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-        None
-    }
-
-    /// The key as the load log states it: `method v<n>, <kernel> <code>, ...`.
-    #[must_use]
-    pub fn said(&self) -> String {
-        let kernels: Vec<String> = self
-            .kernels
-            .iter()
-            .map(|(k, c)| format!("{k} {c:#010x}"))
-            .collect();
-        format!("method v{}, kernels [{}]", self.method, kernels.join(", "))
-    }
-}
-
-/// What a stored measurement's key is checked against: this build on this
-/// device. A backend that stores measurements states it.
-pub trait Now {
-    /// The device as its measurements depend on it: vendor, device id and
-    /// driver version.
-    fn on(&self) -> String;
-    /// The version of the method that measures `what` (a `[rates]` key), or
-    /// `None` where this build measures no such thing.
-    fn method(&self, what: &str) -> Option<u32>;
-    /// The fingerprint of `kernel`'s compiled code in this build, `None`
-    /// where the build carries no such kernel.
-    fn code(&self, kernel: &str) -> Option<u32>;
-}
-
-/// The fingerprint of `bytes` a stored key holds: FNV-1a folded to 32 bits,
-/// the same on every build and toolchain (std's hasher is not).
-#[must_use]
-pub fn fingerprint(bytes: &[u8]) -> u32 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    (hash ^ (hash >> 32)) as u32
-}
-
-/// A settle's outcome, keyed: `method`, the version of the settle's
-/// measuring method; `of`, a fingerprint of what it weighed (the curves, the
-/// model's planes, the load's rungs, lanes and kernel choice); `code`, a
-/// fingerprint of the code of every kernel the load's served step fires
-/// (what each weighed step ran); and each row range it decided, `[bottom,
-/// top, replaced, vector, wide, tier]`: 1 where it replaced the curves'
-/// kernel with the one named (the tier `kernels_slang::Tier` as a number), 2
-/// where it kept theirs and names it (every plane took that one), 0 where
-/// it kept theirs unnamed (a row from before the kept kernel was named, or
-/// planes that took different kernels): a load serves the curves' pick
-/// there, never a guess.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DenseSettled {
-    pub method: u32,
-    pub of: u32,
-    pub code: u32,
-    pub ranges: Vec<[u32; 6]>,
-    /// The model's dense planes the settle weighed, `(n, k)`, sorted: what a
-    /// boot of that model reads the curves at, so an export can say which
-    /// curves the settle's model needs and whether each is carried.
-    pub planes: Vec<(u32, u32)>,
-}
-
-/// One dense kernel's measured curve at one shape
-/// ([`Rates::kernel_tflops_by_shape`]): the kernel (`kind`
-/// [`KernelCurve::VECTOR`], `key` the rows a workgroup carries, or
-/// [`KernelCurve::TILE`], `key` its row tile at the shape), the plane's `n x
-/// k`, its TFLOP/s by rows ascending, and where it stopped short of the rows
-/// it was asked to reach, if it did (`stop`: the rows not timed, and why,
-/// [`KernelCurve::BOUND`]: that fire's estimate passed the device's bound on
-/// one submission; [`KernelCurve::BUFFER`]: an operand passed the device's
-/// largest buffer; [`KernelCurve::BEATEN`]: a vector kernel ran slower than
-/// twice a tiled kernel at the same rows, beaten at every rows past them).
-/// A stopped curve is final: no load times it again.
-#[derive(Debug, Clone, PartialEq)]
-pub struct KernelCurve {
-    pub kind: u32,
-    pub key: u32,
-    pub n: u32,
-    pub k: u32,
-    pub curve: Vec<(u32, f64)>,
-    pub stop: Option<(u32, u32)>,
-    /// Each point's spread over its repeats, `(max - min) / median`, by
-    /// rows as `curve`: what a choice between two kernels may call a
-    /// difference (none stated: no spread measured).
-    pub spread: Vec<(u32, f64)>,
-    /// What the curve was measured by: the curve's method and its kernel's
-    /// code ([`MeasuredBy`]).
-    pub by: MeasuredBy,
-}
-
-impl KernelCurve {
-    pub const VECTOR: u32 = 1;
-    pub const TILE: u32 = 2;
-    /// A tensor-op (Metal 4 MPP) tile, `key` its row tile: Metal's.
-    pub const MPP: u32 = 3;
-    pub const BOUND: u32 = 1;
-    pub const BUFFER: u32 = 2;
-    pub const BEATEN: u32 = 3;
-    /// Every sample at the rows was dropped (a fire timed below its
-    /// launches): no measurement there, and nothing past it.
-    pub const UNTIMED: u32 = 4;
-
-    /// What the curve measures: its kernel and shape.
-    #[must_use]
-    pub const fn id(&self) -> (u32, u32, u32, u32) {
-        (self.kind, self.key, self.n, self.k)
-    }
-
-    /// The curve as a load's log names it: `<kind>/<key> at <n>x<k>`.
-    #[must_use]
-    pub fn name(&self) -> String {
-        format!("{}/{} at {}x{}", self.kind, self.key, self.n, self.k)
-    }
-
-    /// Whether a load of up to `rows` needs nothing more of it: it reaches
-    /// them, or stopped for a reason it records.
-    #[must_use]
-    pub fn serves(&self, rows: u32) -> bool {
-        self.stop.is_some() || self.curve.last().is_some_and(|&(at, _)| at >= rows)
-    }
 }
 
 /// One product's measured time on one kernel ([`Rates::product_ns`]): the
@@ -381,9 +236,9 @@ pub const KEYS: [&str; 9] = [
 ];
 
 /// The `[rates]` key of the dense kernels' curves at a model's planes
-/// (`Rates::kernel_tflops_by_shape`), each curve keyed by what measured it
+/// (`Rates::kernel_curves`), each curve keyed by what measured it
 /// ([`KernelCurve::by`]).
-pub const KERNEL_CURVES: &str = "kernel_tflops_by_shape_keyed";
+pub const KERNEL_CURVES: &str = "kernel_curves";
 
 /// The `[rates]` key of [`Rates::dense_settled`]: a list of `[method, of,
 /// code, [[bottom, top, replaced, vector, wide, tier], ...], [[n, k], ...]]`,
@@ -494,326 +349,139 @@ pub const ATTN_BY_ROWS_KEYS: &str = "attn_tflops_by_rows_keys";
 /// estimate's [`KEYS`] on the slang backends.
 pub const RESIDENT_WORKGROUPS: &str = "resident_workgroups";
 
+/// The keys a measurement is stated under, each beside the field that holds
+/// it, in the order a profile writes them: the one place a key is named for
+/// writing, reading, laying, unstating and picking ([`form::Slot`], a
+/// value's form beside it in [`form`]). Adding a field to [`Rates`] without
+/// a line here does not compile.
+macro_rules! rate_keys {
+    ($($field:ident: $key:expr,)*) => {
+        /// Every `[rates]` key a measurement is stated under, in the order a
+        /// profile writes them; [`MEASURED_ON`] and [`MEASURED_BY`], what
+        /// keys those measurements, follow them.
+        pub const RATES: &[&str] = &[$($key),*];
+
+        impl Rates {
+            /// `self` laid over `below`: each key `self` states replaces
+            /// `below`'s; a list of entries (the products' times, the curves,
+            /// the settles, the stored keys) joins `below`'s, its own
+            /// replacing an entry both state.
+            #[must_use]
+            pub fn over(self, below: Rates) -> Rates {
+                Rates {
+                    $($field: Slot::lay(self.$field, below.$field),)*
+                    measured_on: self.measured_on.or(below.measured_on),
+                    measured_by: match (self.measured_by, below.measured_by) {
+                        (Some(mine), Some(theirs)) => {
+                            Some(form::joined(mine, theirs, |(rate, _)| rate.clone()))
+                        }
+                        (mine, theirs) => mine.or(theirs),
+                    },
+                    stale: match (self.stale, below.stale) {
+                        (Some(mine), Some(theirs)) => Some(Box::new(mine.over(*theirs))),
+                        (mine, theirs) => mine.or(theirs),
+                    },
+                }
+            }
+
+            /// Whether `key` (one of [`RATES`]) is stated.
+            #[must_use]
+            pub fn states(&self, key: &str) -> bool {
+                $(if key == $key {
+                    return Slot::stated(&self.$field);
+                })*
+                false
+            }
+
+            /// `key` unstated, its stored key with it.
+            pub fn unstate(&mut self, key: &str) {
+                $(if key == $key {
+                    self.$field = Default::default();
+                })*
+                if key == MEASURED_ON {
+                    self.measured_on = None;
+                }
+                if key == MEASURED_BY {
+                    self.measured_by = None;
+                }
+                if let Some(by) = &mut self.measured_by {
+                    by.retain(|(rate, _)| rate != key);
+                }
+            }
+
+            /// Only `keys` of `self` (as [`Rates::missing`] names them), the
+            /// rest unstated.
+            #[must_use]
+            pub fn only(&self, keys: &[&str]) -> Rates {
+                let has = |key: &str| keys.contains(&key);
+                Rates {
+                    $($field: if has($key) { self.$field.clone() } else { Default::default() },)*
+                    measured_on: self.measured_on.clone(),
+                    measured_by: self
+                        .measured_by
+                        .as_ref()
+                        .map(|by| by.iter().filter(|(rate, _)| has(rate)).cloned().collect()),
+                    stale: None,
+                }
+            }
+
+            /// `[rates]` as profile TOML.
+            #[must_use]
+            pub fn toml(&self) -> String {
+                let mut out = String::from("[rates]\n");
+                $(Slot::write(&self.$field, $key, &mut out);)*
+                if let Some(on) = &self.measured_on {
+                    let _ = writeln!(out, "{MEASURED_ON} = {}", toml_string(on));
+                }
+                if let Some(by) = &self.measured_by {
+                    let rows: Vec<String> = by
+                        .iter()
+                        .map(|(rate, by)| format!("  [{}, {}],\n", toml_string(rate), by_toml(by)))
+                        .collect();
+                    let _ = writeln!(out, "{MEASURED_BY} = [\n{}]", rows.concat());
+                }
+                out
+            }
+
+            /// `[rates] key = v` read into its field; `false` where no
+            /// measurement is stated under `key`.
+            pub(crate) fn read_key(
+                &mut self,
+                walk: &mut Walk<'_>,
+                key: &str,
+                v: &Spanned<DeValue<'_>>,
+            ) -> bool {
+                $(if key == $key {
+                    self.$field = Slot::read(walk, $key, v);
+                    return true;
+                })*
+                false
+            }
+        }
+    };
+}
+
+rate_keys! {
+    launch_ns: "launch_ns",
+    load_width: LOAD_WIDTH,
+    gemm_tflops_by_rows: "gemm_tflops_by_rows",
+    attn_tflops_by_keys: "attn_tflops_by_keys",
+    hbm_gbps: "hbm_gbps",
+    cached_gbps: "cached_gbps",
+    elementwise_gbps: "elementwise_gbps",
+    scan_gelems: "scan_gelems",
+    few_row_tflops: "few_row_tflops",
+    workgroups_per_core: "workgroups_per_core",
+    submit_worst_ratio: SUBMIT_WORST_RATIO,
+    resident_workgroups: RESIDENT_WORKGROUPS,
+    product_ns: "product_ns",
+    landing: LANDING,
+    attn_tflops_by_rows_keys: ATTN_BY_ROWS_KEYS,
+    kernel_curves: KERNEL_CURVES,
+    dense_settled: DENSE_SETTLED,
+}
+
 impl Rates {
-    /// `self` laid over `below`: each key `self` states replaces `below`'s.
-    #[must_use]
-    pub fn over(self, below: Rates) -> Rates {
-        Rates {
-            launch_ns: self.launch_ns.or(below.launch_ns),
-            gemm_tflops_by_rows: self.gemm_tflops_by_rows.or(below.gemm_tflops_by_rows),
-            attn_tflops_by_keys: self.attn_tflops_by_keys.or(below.attn_tflops_by_keys),
-            hbm_gbps: self.hbm_gbps.or(below.hbm_gbps),
-            cached_gbps: self.cached_gbps.or(below.cached_gbps),
-            elementwise_gbps: self.elementwise_gbps.or(below.elementwise_gbps),
-            scan_gelems: self.scan_gelems.or(below.scan_gelems),
-            few_row_tflops: self.few_row_tflops.or(below.few_row_tflops),
-            workgroups_per_core: self.workgroups_per_core.or(below.workgroups_per_core),
-            submit_worst_ratio: self.submit_worst_ratio.or(below.submit_worst_ratio),
-            load_width: self.load_width.or(below.load_width),
-            resident_workgroups: self.resident_workgroups.or(below.resident_workgroups),
-            attn_tflops_by_rows_keys: self
-                .attn_tflops_by_rows_keys
-                .or(below.attn_tflops_by_rows_keys),
-            // Entry by entry: a load's shapes join those already measured,
-            // its own replacing a shape both state.
-            product_ns: match (self.product_ns, below.product_ns) {
-                (Some(mine), Some(theirs)) => {
-                    let mut all: Vec<ProductTime> = theirs
-                        .into_iter()
-                        .filter(|t| mine.iter().all(|m| m.key() != t.key()))
-                        .collect();
-                    all.extend(mine);
-                    all.sort_by_key(ProductTime::key);
-                    Some(all)
-                }
-                (mine, theirs) => mine.or(theirs),
-            },
-            // Entry by entry, as `product_ns`: a load's curves join those
-            // already measured, its own replacing one both state.
-            kernel_tflops_by_shape: match (
-                self.kernel_tflops_by_shape,
-                below.kernel_tflops_by_shape,
-            ) {
-                (Some(mine), Some(theirs)) => {
-                    let mut all: Vec<KernelCurve> = theirs
-                        .into_iter()
-                        .filter(|t| mine.iter().all(|m| m.id() != t.id()))
-                        .collect();
-                    all.extend(mine);
-                    all.sort_by_key(KernelCurve::id);
-                    Some(all)
-                }
-                (mine, theirs) => mine.or(theirs),
-            },
-            // Entry by entry, by its key: a load's settle joins the others
-            // (another model's), its own replacing one of the same key.
-            landing: self.landing.or(below.landing),
-            dense_settled: {
-                let mut all: Vec<DenseSettled> = below
-                    .dense_settled
-                    .into_iter()
-                    .filter(|t| self.dense_settled.iter().all(|m| m.of != t.of))
-                    .collect();
-                all.extend(self.dense_settled);
-                all.sort_by_key(|d| d.of);
-                all
-            },
-            measured_on: self.measured_on.or(below.measured_on),
-            stale: match (self.stale, below.stale) {
-                (Some(mine), Some(theirs)) => Some(Box::new(mine.over(*theirs))),
-                (mine, theirs) => mine.or(theirs),
-            },
-            // Entry by entry: a rate's key goes with its value.
-            measured_by: match (self.measured_by, below.measured_by) {
-                (Some(mine), Some(theirs)) => {
-                    let mut all: Vec<(String, MeasuredBy)> = theirs
-                        .into_iter()
-                        .filter(|(t, _)| mine.iter().all(|(m, _)| m != t))
-                        .collect();
-                    all.extend(mine);
-                    all.sort_by(|a, b| a.0.cmp(&b.0));
-                    Some(all)
-                }
-                (mine, theirs) => mine.or(theirs),
-            },
-        }
-    }
-
-    /// Whether `key` (one of [`KEYED`]) is stated.
-    #[must_use]
-    pub fn states(&self, key: &str) -> bool {
-        !self.missing_any(key)
-    }
-
-    fn missing_any(&self, key: &str) -> bool {
-        match key {
-            "launch_ns" => self.launch_ns.is_none(),
-            "gemm_tflops_by_rows" => self.gemm_tflops_by_rows.is_none(),
-            "attn_tflops_by_keys" => self.attn_tflops_by_keys.is_none(),
-            "hbm_gbps" => self.hbm_gbps.is_none(),
-            "cached_gbps" => self.cached_gbps.is_none(),
-            "elementwise_gbps" => self.elementwise_gbps.is_none(),
-            "scan_gelems" => self.scan_gelems.is_none(),
-            "few_row_tflops" => self.few_row_tflops.is_none(),
-            "workgroups_per_core" => self.workgroups_per_core.is_none(),
-            SUBMIT_WORST_RATIO => self.submit_worst_ratio.is_none(),
-            LOAD_WIDTH => self.load_width.is_none(),
-            RESIDENT_WORKGROUPS => self.resident_workgroups.is_none(),
-            ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys.is_none(),
-            "product_ns" => self.product_ns.is_none(),
-            LANDING => self.landing.is_none(),
-            KERNEL_CURVES => self.kernel_tflops_by_shape.is_none(),
-            DENSE_SETTLED => self.dense_settled.is_empty(),
-            _ => true,
-        }
-    }
-
-    /// `key` (one of [`KEYED`]) unstated, its stored key with it.
-    pub fn unstate(&mut self, key: &str) {
-        match key {
-            "launch_ns" => self.launch_ns = None,
-            "gemm_tflops_by_rows" => self.gemm_tflops_by_rows = None,
-            "attn_tflops_by_keys" => self.attn_tflops_by_keys = None,
-            "hbm_gbps" => self.hbm_gbps = None,
-            "cached_gbps" => self.cached_gbps = None,
-            "elementwise_gbps" => self.elementwise_gbps = None,
-            "scan_gelems" => self.scan_gelems = None,
-            "few_row_tflops" => self.few_row_tflops = None,
-            "workgroups_per_core" => self.workgroups_per_core = None,
-            SUBMIT_WORST_RATIO => self.submit_worst_ratio = None,
-            LOAD_WIDTH => self.load_width = None,
-            RESIDENT_WORKGROUPS => self.resident_workgroups = None,
-            ATTN_BY_ROWS_KEYS => self.attn_tflops_by_rows_keys = None,
-            "product_ns" => self.product_ns = None,
-            KERNEL_CURVES => self.kernel_tflops_by_shape = None,
-            DENSE_SETTLED => self.dense_settled = Vec::new(),
-            MEASURED_ON => self.measured_on = None,
-            MEASURED_BY => self.measured_by = None,
-            LANDING => self.landing = None,
-            _ => {}
-        }
-        if let Some(by) = &mut self.measured_by {
-            by.retain(|(rate, _)| rate != key);
-        }
-    }
-
-    /// The key `key` was stored under, where the file states one.
-    #[must_use]
-    pub fn key_of(&self, key: &str) -> Option<&MeasuredBy> {
-        self.measured_by
-            .iter()
-            .flatten()
-            .find(|(rate, _)| rate == key)
-            .map(|(_, by)| by)
-    }
-
-    /// A user's file's measurements (`self`, its `[rates]` alone) checked
-    /// against `now`, this build on this device ([`Rates::sift_as`], said as
-    /// `stored`).
-    pub fn sift(&mut self, now: &dyn Now) -> Vec<String> {
-        self.sift_as(now, "stored")
-    }
-
-    /// Stored measurements (`self`, a file's `[rates]` alone: the user's,
-    /// `what` "stored", or a committed measured profile's, "committed")
-    /// checked against `now`, this build on this device: each whose key
-    /// matches is kept, to be taken with no measurement; each whose key
-    /// does not (or that states none) is dropped, by itself. Measured on
-    /// another device (or driver), every one is dropped. Each drop is said,
-    /// a line each, with why; what is kept is said once the layers are
-    /// joined ([`Rates::whence`]), by the layer that decides it. A figure
-    /// dropped for its key alone (this device's) is kept as an estimate
-    /// ([`Rates::stale`]).
-    pub fn sift_as(&mut self, now: &dyn Now, what: &str) -> Vec<String> {
-        let mut said = Vec::new();
-        let on = now.on();
-        let stored = KEYED.iter().any(|key| self.states(key))
-            || self.kernel_tflops_by_shape.is_some()
-            || !self.dense_settled.is_empty();
-        if !stored {
-            said.push(format!("{what} measurements: none for `{on}`"));
-            *self = Rates::default();
-            return said;
-        }
-        if self.measured_on.as_deref() != Some(on.as_str()) {
-            said.push(format!(
-                "{what} measurements: taken on `{}`, this device is `{on}`: none is taken",
-                self.measured_on.as_deref().unwrap_or("no device stated")
-            ));
-            *self = Rates::default();
-            return said;
-        }
-        let mut stale = Rates::default();
-        for key in KEYED {
-            if !self.states(key) {
-                continue;
-            }
-            let why = match self.key_of(key) {
-                None => Some("stored without a key".to_string()),
-                Some(by) => by.stale(key, now),
-            };
-            if let Some(why) = why {
-                said.push(format!(
-                    "{what} `{key}`: not taken as measured, {why}; kept as an estimate"
-                ));
-                let figure = self.only(&[key]);
-                stale = figure.over(stale);
-                self.unstate(key);
-            }
-        }
-        // A key whose rate is not stated keys nothing.
-        let stated: Vec<&str> = KEYED.into_iter().filter(|key| self.states(key)).collect();
-        self.measured_by = self
-            .measured_by
-            .take()
-            .map(|by| {
-                by.into_iter()
-                    .filter(|(rate, _)| stated.contains(&rate.as_str()))
-                    .collect::<Vec<_>>()
-            })
-            .filter(|by| !by.is_empty());
-        if let Some(curves) = self.kernel_tflops_by_shape.take() {
-            let mut kept = Vec::with_capacity(curves.len());
-            let mut estimates = Vec::new();
-            for curve in curves {
-                match curve.by.stale(KERNEL_CURVES, now) {
-                    None => kept.push(curve),
-                    Some(why) => {
-                        said.push(format!(
-                            "{what} curve {}: not taken as measured, {why}; kept as an estimate",
-                            curve.name()
-                        ));
-                        estimates.push(curve);
-                    }
-                }
-            }
-            self.kernel_tflops_by_shape = (!kept.is_empty()).then_some(kept);
-            if !estimates.is_empty() {
-                stale = Rates {
-                    kernel_tflops_by_shape: Some(estimates),
-                    ..Rates::default()
-                }
-                .over(stale);
-            }
-        }
-        for settled in std::mem::take(&mut self.dense_settled) {
-            match now.method(DENSE_SETTLED) {
-                Some(method) if method == settled.method => {
-                    self.dense_settled.push(settled);
-                }
-                now => said.push(format!(
-                    "{what} dense settle {:#010x}: not taken, its method is version {} now, {} \
-                     when stored",
-                    settled.of,
-                    now.map_or_else(|| "none".to_string(), |m| m.to_string()),
-                    settled.method
-                )),
-            }
-        }
-        stale.measured_on = None;
-        stale.measured_by = None;
-        self.stale = (stale != Rates::default()).then(|| Box::new(stale));
-        said
-    }
-
-    /// Each entry `self` (the rates a load takes, the user's stored over a
-    /// committed profile's, each sifted: [`Rates::sift_as`]) states by its
-    /// key, said once by the layer that decides it: `stored` (`user`, the
-    /// user's sifted `[rates]`, from `user_from`) where the user's file
-    /// states it, else `committed` (from `committed_from`). The dense
-    /// settle's key is checked by the settle itself, which says which it
-    /// takes.
-    #[must_use]
-    pub fn whence(&self, user: &Rates, user_from: &str, committed_from: &str) -> Vec<String> {
-        let mut said = Vec::new();
-        for key in KEYED {
-            if !self.states(key) {
-                continue;
-            }
-            let Some(by) = self.key_of(key) else {
-                continue;
-            };
-            let from = if user.states(key) {
-                format!("stored ({user_from})")
-            } else {
-                format!("committed ({committed_from})")
-            };
-            said.push(format!("`{key}`: {from}, its key matches: {}", by.said()));
-        }
-        for curve in self.kernel_tflops_by_shape.iter().flatten() {
-            let mine = user
-                .kernel_tflops_by_shape
-                .iter()
-                .flatten()
-                .any(|c| c.id() == curve.id());
-            let from = if mine {
-                format!("stored ({user_from})")
-            } else {
-                format!("committed ({committed_from})")
-            };
-            said.push(format!(
-                "curve {}: {from}, its key matches: {}",
-                curve.name(),
-                curve.by.said()
-            ));
-        }
-        said
-    }
-
-    /// The first entry of `self` a committed measured profile could not
-    /// take ([`crate::Strict::Measured`]): no device stated, or a rate (one
-    /// of [`KEYED`]) stored without a key. `None` where every entry is keyed.
-    #[must_use]
-    pub fn unkeyed(&self) -> Option<String> {
-        if self.measured_on.is_none() {
-            return Some(format!("`rates.{MEASURED_ON}` names no device"));
-        }
-        KEYED
-            .iter()
-            .find(|key| self.states(key) && self.key_of(key).is_none())
-            .map(|key| format!("`rates.{key}` is stored without a key"))
-    }
-
     /// `self` in the order a committed measured profile writes it: each
     /// rate's key by its rate, each curve by its kernel and shape, so one
     /// device's export writes the same text whatever order its loads stored
@@ -823,7 +491,7 @@ impl Rates {
         if let Some(by) = &mut self.measured_by {
             by.sort_by(|a, b| a.0.cmp(&b.0));
         }
-        if let Some(curves) = &mut self.kernel_tflops_by_shape {
+        if let Some(curves) = &mut self.kernel_curves {
             curves.sort_by_key(KernelCurve::id);
         }
         if let Some(product) = &mut self.product_ns {
@@ -837,58 +505,6 @@ impl Rates {
         *self == Rates::default()
     }
 
-    /// Only `keys` of `self` (as [`Rates::missing`] names them), the rest
-    /// unstated.
-    #[must_use]
-    pub fn only(&self, keys: &[&str]) -> Rates {
-        let has = |key: &str| keys.contains(&key);
-        Rates {
-            launch_ns: self.launch_ns.filter(|_| has("launch_ns")),
-            gemm_tflops_by_rows: self
-                .gemm_tflops_by_rows
-                .clone()
-                .filter(|_| has("gemm_tflops_by_rows")),
-            attn_tflops_by_keys: self
-                .attn_tflops_by_keys
-                .clone()
-                .filter(|_| has("attn_tflops_by_keys")),
-            hbm_gbps: self.hbm_gbps.filter(|_| has("hbm_gbps")),
-            cached_gbps: self.cached_gbps.filter(|_| has("cached_gbps")),
-            elementwise_gbps: self.elementwise_gbps.filter(|_| has("elementwise_gbps")),
-            scan_gelems: self.scan_gelems.filter(|_| has("scan_gelems")),
-            few_row_tflops: self.few_row_tflops.filter(|_| has("few_row_tflops")),
-            workgroups_per_core: self
-                .workgroups_per_core
-                .filter(|_| has("workgroups_per_core")),
-            submit_worst_ratio: self.submit_worst_ratio.filter(|_| has(SUBMIT_WORST_RATIO)),
-            load_width: self.load_width.filter(|_| has(LOAD_WIDTH)),
-            resident_workgroups: self
-                .resident_workgroups
-                .filter(|_| has(RESIDENT_WORKGROUPS)),
-            attn_tflops_by_rows_keys: self
-                .attn_tflops_by_rows_keys
-                .clone()
-                .filter(|_| has(ATTN_BY_ROWS_KEYS)),
-            product_ns: self.product_ns.clone().filter(|_| has("product_ns")),
-            kernel_tflops_by_shape: self
-                .kernel_tflops_by_shape
-                .clone()
-                .filter(|_| has(KERNEL_CURVES)),
-            landing: self.landing.filter(|_| has(LANDING)),
-            dense_settled: if has(DENSE_SETTLED) {
-                self.dense_settled.clone()
-            } else {
-                Vec::new()
-            },
-            measured_on: self.measured_on.clone(),
-            measured_by: self
-                .measured_by
-                .as_ref()
-                .map(|by| by.iter().filter(|(rate, _)| has(rate)).cloned().collect()),
-            stale: None,
-        }
-    }
-
     /// The keys of `keys` (a backend's estimate's: those its roofline weighs
     /// a fire by, of [`KEYS`]) this states none of: what a load measures
     /// before it is ready (`engine::rates::rates_at_load`).
@@ -896,7 +512,7 @@ impl Rates {
     pub fn missing(&self, keys: &[&'static str]) -> Vec<&'static str> {
         keys.iter()
             .copied()
-            .filter(|key| self.missing_any(key))
+            .filter(|key| !self.states(key))
             .collect()
     }
 
@@ -904,145 +520,6 @@ impl Rates {
     #[must_use]
     pub fn complete(&self, keys: &[&'static str]) -> bool {
         self.missing(keys).is_empty()
-    }
-
-    /// `[rates]` as profile TOML.
-    #[must_use]
-    pub fn toml(&self) -> String {
-        let mut out = String::from("[rates]\n");
-        if let Some(v) = self.launch_ns {
-            let _ = writeln!(out, "launch_ns = {v}");
-        }
-        if let Some(v) = self.load_width {
-            let _ = writeln!(out, "{LOAD_WIDTH} = {v}");
-        }
-        let keyed = |out: &mut String, key: &str, v: &Option<Vec<(u32, Vec<(u32, f64)>)>>| {
-            if let Some(keyed) = v {
-                let curves: Vec<String> = keyed
-                    .iter()
-                    .map(|(w, c)| {
-                        let points: Vec<String> =
-                            c.iter().map(|(x, r)| format!("[{x}, {r:?}]")).collect();
-                        format!("  [{w}, [{}]],\n", points.join(", "))
-                    })
-                    .collect();
-                let _ = writeln!(out, "{key} = [\n{}]", curves.concat());
-            }
-        };
-        keyed(&mut out, "gemm_tflops_by_rows", &self.gemm_tflops_by_rows);
-        let mut curve = |key: &str, v: &Option<Vec<(u32, f64)>>| {
-            if let Some(points) = v {
-                let points: Vec<String> = points
-                    .iter()
-                    .map(|(x, r)| format!("[{x}, {r:?}]"))
-                    .collect();
-                let _ = writeln!(out, "{key} = [{}]", points.join(", "));
-            }
-        };
-        curve("attn_tflops_by_keys", &self.attn_tflops_by_keys);
-        let mut float = |key: &str, v: Option<f64>| {
-            if let Some(v) = v {
-                let _ = writeln!(out, "{key} = {v:?}");
-            }
-        };
-        float("hbm_gbps", self.hbm_gbps);
-        float("cached_gbps", self.cached_gbps);
-        float("elementwise_gbps", self.elementwise_gbps);
-        float("scan_gelems", self.scan_gelems);
-        float("few_row_tflops", self.few_row_tflops);
-        float("workgroups_per_core", self.workgroups_per_core);
-        float(SUBMIT_WORST_RATIO, self.submit_worst_ratio);
-        float(RESIDENT_WORKGROUPS, self.resident_workgroups);
-        if let Some(times) = &self.product_ns {
-            let rows: Vec<String> = times
-                .iter()
-                .map(|t| {
-                    format!(
-                        "  [{}, {}, {}, {}, {}, {:?}, {:?}],\n",
-                        t.kind, t.rows, t.k, t.m, t.kernel, t.ns, t.spread
-                    )
-                })
-                .collect();
-            let _ = writeln!(out, "product_ns = [\n{}]", rows.concat());
-        }
-        if let Some(landing) = &self.landing {
-            let values: Vec<String> = landing.values().iter().map(|v| format!("{v:?}")).collect();
-            let _ = writeln!(out, "{LANDING} = [{}]", values.join(", "));
-        }
-        keyed(&mut out, ATTN_BY_ROWS_KEYS, &self.attn_tflops_by_rows_keys);
-        if let Some(curves) = &self.kernel_tflops_by_shape {
-            let rows: Vec<String> = curves
-                .iter()
-                .map(|c| {
-                    let points: Vec<String> = c
-                        .curve
-                        .iter()
-                        .map(|(x, r)| format!("[{x}, {r:?}]"))
-                        .collect();
-                    let (at, why) = c.stop.unwrap_or((0, 0));
-                    let spread: Vec<String> = c
-                        .spread
-                        .iter()
-                        .map(|(x, f)| format!("[{x}, {f:?}]"))
-                        .collect();
-                    format!(
-                        "  [{}, {}, {}, {}, {at}, {why}, {}, [{}], [{}]],\n",
-                        c.kind,
-                        c.key,
-                        c.n,
-                        c.k,
-                        by_toml(&c.by),
-                        points.join(", "),
-                        spread.join(", ")
-                    )
-                })
-                .collect();
-            let _ = writeln!(out, "{KERNEL_CURVES} = [\n{}]", rows.concat());
-        }
-        if !self.dense_settled.is_empty() {
-            let mut settles: Vec<&DenseSettled> = self.dense_settled.iter().collect();
-            settles.sort_by_key(|d| d.of);
-            let rows: Vec<String> = settles
-                .iter()
-                .map(|settled| {
-                    let ranges: Vec<String> = settled
-                        .ranges
-                        .iter()
-                        .map(|r| {
-                            format!(
-                                "[{}, {}, {}, {}, {}, {}]",
-                                r[0], r[1], r[2], r[3], r[4], r[5]
-                            )
-                        })
-                        .collect();
-                    let planes: Vec<String> = settled
-                        .planes
-                        .iter()
-                        .map(|(n, k)| format!("[{n}, {k}]"))
-                        .collect();
-                    format!(
-                        "  [{}, {}, {}, [{}], [{}]],\n",
-                        settled.method,
-                        settled.of,
-                        settled.code,
-                        ranges.join(", "),
-                        planes.join(", ")
-                    )
-                })
-                .collect();
-            let _ = writeln!(out, "{DENSE_SETTLED} = [\n{}]", rows.concat());
-        }
-        if let Some(on) = &self.measured_on {
-            let _ = writeln!(out, "{MEASURED_ON} = {}", toml_string(on));
-        }
-        if let Some(by) = &self.measured_by {
-            let rows: Vec<String> = by
-                .iter()
-                .map(|(rate, by)| format!("  [{}, {}],\n", toml_string(rate), by_toml(by)))
-                .collect();
-            let _ = writeln!(out, "{MEASURED_BY} = [\n{}]", rows.concat());
-        }
-        out
     }
 }
 
@@ -1072,55 +549,6 @@ fn toml_string(text: &str) -> String {
     out.push('"');
     out
 }
-
-/// `curve` (`(x, y)`, ascending in `x`) at `x`: linear in `log x` between
-/// its points, clamped at its ends. `None` for an empty curve.
-#[must_use]
-pub fn interpolate(curve: &[(u32, f64)], x: f64) -> Option<f64> {
-    let (&(x0, y0), &(x1, y1)) = (curve.first()?, curve.last()?);
-    if x <= f64::from(x0) {
-        return Some(y0);
-    }
-    if x >= f64::from(x1) {
-        return Some(y1);
-    }
-    let at = curve.partition_point(|&(p, _)| f64::from(p) <= x);
-    let ((lo, a), (hi, b)) = (curve[at - 1], curve[at]);
-    let t = (x.ln() - f64::from(lo).ln()) / (f64::from(hi).ln() - f64::from(lo).ln());
-    Some(a + (b - a) * t)
-}
-
-/// A matmul's rate at `m` rows of an `n x k` plane, read off `by_rows` (rows
-/// curves at each square width, ascending in width, in any unit of rate):
-/// each width's curve at the timed rows at or below `m` (its first below
-/// that), in `log width` at `sqrt(n k)` between the widths. Past the widest
-/// width its last span's slope in log width carries on (a wider plane fills
-/// more tiles), never below the widest's rate; below the narrowest, its rate.
-/// Infinite for no curves.
-#[must_use]
-pub fn gemm_rate(by_rows: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> f64 {
-    let at = |curve: &[(u32, f64)]| -> f64 {
-        curve
-            .iter()
-            .rev()
-            .find(|&&(rows, _)| rows <= m)
-            .or(curve.first())
-            .map_or(f64::INFINITY, |&(_, r)| r)
-    };
-    let width: Vec<(u32, f64)> = by_rows.iter().map(|(w, c)| (*w, at(c))).collect();
-    let square = (f64::from(n) * f64::from(k)).sqrt();
-    if let [.., (w0, r0), (w1, r1)] = width[..]
-        && square > f64::from(w1)
-    {
-        let slope = (r1 - r0) / (f64::from(w1).ln() - f64::from(w0).ln());
-        return (r1 + slope * (square.ln() - f64::from(w1).ln())).max(r1);
-    }
-    interpolate(&width, square).unwrap_or(f64::INFINITY)
-}
-
-/// `(tokens, ns)` of a fire at each rung width, ascending in tokens: what a
-/// check of the estimate measures. Never a profile's.
-pub type FireTable = Vec<(u32, u64)>;
 
 /// What a profile states beside its decisions: its rates.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1255,7 +683,7 @@ mod tests {
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
-            kernel_tflops_by_shape: Some(vec![KernelCurve {
+            kernel_curves: Some(vec![KernelCurve {
                 kind: KernelCurve::VECTOR,
                 key: 4,
                 n: 1024,
@@ -1295,7 +723,7 @@ mod tests {
              150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
              attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
              cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\nkernel_tflops_by_shape_keyed = [\n  [1, 4, 1024, 2048, 512, 1, 1, \
+             workgroups_per_core = 3.3\nkernel_curves = [\n  [1, 4, 1024, 2048, 512, 1, 1, \
              [[\"linear_gemm_gemv_v_bf16\", 7]], [[1, 0.5]], []],\n]\n\
              dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]], [[1024, 2048]]],\n]\n\
              measured_on = \"vk 10de:2c31 driver 1\"\n\
@@ -1388,7 +816,7 @@ mod tests {
             launch_ns: Some(900),
             hbm_gbps: Some(700.0),
             gemm_tflops_by_rows: Some(vec![(1024, vec![(256, 20.0)])]),
-            kernel_tflops_by_shape: Some(vec![curve(32, "tiled"), curve(64, "coopmat")]),
+            kernel_curves: Some(vec![curve(32, "tiled"), curve(64, "coopmat")]),
             dense_settled: vec![DenseSettled {
                 method: 1,
                 of: 5,
@@ -1467,7 +895,7 @@ mod tests {
         let now = build();
         let committed = stored(&now);
         let measured = Rates {
-            kernel_tflops_by_shape: committed.kernel_tflops_by_shape.clone().map(|curves| {
+            kernel_curves: committed.kernel_curves.clone().map(|curves| {
                 curves
                     .into_iter()
                     .take(1)
@@ -1488,14 +916,8 @@ mod tests {
         );
         assert_eq!(merged.hbm_gbps, committed.hbm_gbps);
         assert_eq!(
-            merged.kernel_tflops_by_shape.as_ref().map(Vec::len),
-            Some(
-                committed
-                    .kernel_tflops_by_shape
-                    .as_ref()
-                    .map_or(0, Vec::len)
-                    + 1
-            ),
+            merged.kernel_curves.as_ref().map(Vec::len),
+            Some(committed.kernel_curves.as_ref().map_or(0, Vec::len) + 1),
             "the committed curves and the home's"
         );
         assert_eq!(merged.dense_settled, committed.dense_settled);
@@ -1591,7 +1013,7 @@ mod tests {
             planes,
         };
         let mut rates = Rates {
-            kernel_tflops_by_shape: Some(vec![curve(1024, 2048), curve(3072, 1024)]),
+            kernel_curves: Some(vec![curve(1024, 2048), curve(3072, 1024)]),
             dense_settled: vec![
                 settle(7, vec![(1024, 2048), (3072, 1024)]),
                 settle(9, vec![(1024, 2048), (5120, 1024)]),
@@ -1710,7 +1132,7 @@ mod tests {
         assert_eq!(rates.gemm_tflops_by_rows, None, "it fired coopmat");
         assert_eq!(rates.launch_ns, before.launch_ns);
         assert_eq!(rates.hbm_gbps, before.hbm_gbps);
-        let curves = rates.kernel_tflops_by_shape.clone().unwrap();
+        let curves = rates.kernel_curves.clone().unwrap();
         assert_eq!(curves.len(), 1);
         assert_eq!(curves[0].key, 32, "the tiled curve stands");
         assert_eq!(
@@ -1833,14 +1255,5 @@ mod tests {
             measured.only(&[SUBMIT_WORST_RATIO]).submit_worst_ratio,
             Some(1.83)
         );
-    }
-
-    #[test]
-    fn a_curve_is_read_in_log_x_and_clamped() {
-        let c = [(256, 100.0), (1024, 200.0)];
-        assert_eq!(interpolate(&c, 1.0), Some(100.0));
-        assert_eq!(interpolate(&c, 4096.0), Some(200.0));
-        assert!((interpolate(&c, 512.0).unwrap() - 150.0).abs() < 1e-9);
-        assert_eq!(interpolate(&[], 1.0), None);
     }
 }

@@ -4,7 +4,7 @@
 //! `t = launch_ns + max(flops / rate, bytes / bandwidth)`,
 //!
 //! over the device's measured rates (the profile's `[rates]`:
-//! `profile::fire::Rates`). The compute rates are measured curves, not
+//! `profile::rates::Rates`). The compute rates are measured curves, not
 //! peaks: a matmul's rate by its rows at a few widths (columns and depth;
 //! a plane of `n x k` is read at its square width `sqrt(n k)`, in `log
 //! width` between the widths measured, at the timed rows (half octaves) at or
@@ -142,7 +142,7 @@ impl Constants {
     /// backend's tile. A rate stated at or below zero, or not finite, is
     /// refused by its key as an unstated one is
     /// (`crate::rates::unmeasured`): nothing divides by it.
-    pub fn of(rates: &profile::fire::Rates) -> Result<Constants, &'static str> {
+    pub fn of(rates: &profile::rates::Rates) -> Result<Constants, &'static str> {
         if let Some((key, _)) = crate::rates::unmeasured(rates) {
             return Err(key);
         }
@@ -253,17 +253,17 @@ impl Constants {
             .zip(self.gemm_full_by_rows.as_deref());
         match stated {
             Some((waves, full)) => {
-                flops / profile::fire::gemm_rate(full, m, n, k) * wave_fill(waves)
+                flops / profile::curves::gemm_rate(full, m, n, k) * wave_fill(waves)
             }
             None => flops / self.gemm_rate(m, n, k),
         }
     }
 
     /// The matmul rate at `m` rows of an `n x k` plane, as the curve was
-    /// timed ([`profile::fire::gemm_rate`]).
+    /// timed ([`profile::curves::gemm_rate`]).
     #[must_use]
     pub fn gemm_rate(&self, m: u32, n: u32, k: u32) -> f64 {
-        profile::fire::gemm_rate(&self.gemm_by_rows, m, n, k)
+        profile::curves::gemm_rate(&self.gemm_by_rows, m, n, k)
     }
 
     /// The rows a matmul of `m x n x k` computes: `m` padded to its
@@ -295,7 +295,7 @@ impl Constants {
     /// The attention rate at `keys` keys a row.
     #[must_use]
     pub fn attn_rate(&self, keys: u32) -> f64 {
-        profile::fire::interpolate(&self.attn_by_keys, f64::from(keys)).unwrap_or(f64::INFINITY)
+        profile::curves::interpolate(&self.attn_by_keys, f64::from(keys)).unwrap_or(f64::INFINITY)
     }
 
     /// A dispatch's cost: its launch and the longer of `flops` over `rate`
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn a_rate_stated_at_nothing_is_refused_by_its_key() {
-        let all = profile::fire::Rates {
+        let all = profile::rates::Rates {
             stale: None,
             landing: None,
             launch_ns: Some(900),
@@ -555,7 +555,7 @@ mod tests {
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
-            kernel_tflops_by_shape: None,
+            kernel_curves: None,
             dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
@@ -563,28 +563,28 @@ mod tests {
         assert!(Constants::of(&all).is_ok());
         for (bad, key) in [
             (
-                profile::fire::Rates {
+                profile::rates::Rates {
                     few_row_tflops: Some(0.0),
                     ..all.clone()
                 },
                 "few_row_tflops",
             ),
             (
-                profile::fire::Rates {
+                profile::rates::Rates {
                     workgroups_per_core: Some(f64::NAN),
                     ..all.clone()
                 },
                 "workgroups_per_core",
             ),
             (
-                profile::fire::Rates {
+                profile::rates::Rates {
                     attn_tflops_by_keys: Some(vec![(512, 0.0)]),
                     ..all.clone()
                 },
                 "attn_tflops_by_keys",
             ),
             (
-                profile::fire::Rates {
+                profile::rates::Rates {
                     hbm_gbps: Some(-1.0),
                     cached_gbps: None,
                     ..all.clone()

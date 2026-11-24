@@ -1747,9 +1747,9 @@ where
         // What the settle decided so far, kept in the user's profile for
         // the next load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {
-            let rates = profile::fire::Rates {
+            let rates = profile::rates::Rates {
                 dense_settled: vec![settled],
-                ..profile::fire::Rates::default()
+                ..profile::rates::Rates::default()
             };
             if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
                 tracing::warn!(%why, "the dense settle was not kept in the profile");

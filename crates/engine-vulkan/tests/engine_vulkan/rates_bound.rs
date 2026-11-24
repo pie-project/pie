@@ -7,7 +7,7 @@
 //! again.
 
 use engine_vulkan::device::{Api, Context, Frame};
-use profile::fire::Rates;
+use profile::rates::Rates;
 
 /// A bound tight enough that the slowest kernels' curves stop short of the
 /// rows asked: 25 ms a submission.
@@ -118,7 +118,7 @@ fn the_rates_step_stays_under_a_simulated_bound() {
     }
     // A load of these shapes, the curves saved, times nothing again.
     let saved = Rates {
-        kernel_tflops_by_shape: Some(curves),
+        kernel_curves: Some(curves),
         ..stated
     };
     assert!(
@@ -130,7 +130,7 @@ fn the_rates_step_stays_under_a_simulated_bound() {
          of {} curves stopped",
         longest as f64 / 1e6,
         worst.get() as f64 / 1e6,
-        saved.kernel_tflops_by_shape.as_ref().map_or(0, Vec::len)
+        saved.kernel_curves.as_ref().map_or(0, Vec::len)
     );
 }
 
@@ -187,7 +187,7 @@ fn a_bound_no_cube_fits_stops_the_curves_not_the_load() {
         match c.stop {
             Some((at, why)) => {
                 assert!(at > reach, "{c:?}");
-                bound += usize::from(why == profile::fire::KernelCurve::BOUND);
+                bound += usize::from(why == profile::curves::KernelCurve::BOUND);
             }
             None => assert_eq!(reach, TOP, "{c:?}"),
         }
@@ -197,7 +197,7 @@ fn a_bound_no_cube_fits_stops_the_curves_not_the_load() {
         "no curve stopped by a {tight:?} bound: {curves:?}"
     );
     let rates = Rates {
-        kernel_tflops_by_shape: Some(curves),
+        kernel_curves: Some(curves),
         gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (8192, 30.0)])]),
         attn_tflops_by_keys: Some(vec![(512, 5.0), (8192, 10.0)]),
         elementwise_gbps: Some(600.0),
@@ -377,16 +377,16 @@ fn a_later_model_extends_a_shared_curve_and_keeps_its_points() {
         )
         .expect("the curves are timed");
         Rates {
-            kernel_tflops_by_shape: Some(curves),
+            kernel_curves: Some(curves),
             ..Rates::default()
         }
         .over(stated.clone())
     };
     let first = measure(&stated, 16);
     let second = measure(&first, 64);
-    for a in first.kernel_tflops_by_shape.iter().flatten().filter(|c| c.stop.is_none()) {
+    for a in first.kernel_curves.iter().flatten().filter(|c| c.stop.is_none()) {
         let b = second
-            .kernel_tflops_by_shape
+            .kernel_curves
             .iter()
             .flatten()
             .find(|b| b.id() == a.id())
