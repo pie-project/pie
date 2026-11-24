@@ -1705,14 +1705,43 @@ fn delta(
             } else {
                 (4_194_304 / stride).clamp(1, t)
             };
-            let rounds = t / round;
-            if rounds > 1 && t % round == 0 {
+            let rounds = (t + round - 1) / round;
+            if rounds > 1 {
                 // The rounds in a loop: unrolled, the program (and its
                 // compile, a minute at 128 lanes) grows with the fire's lanes.
+                // Rows past a whole number of rounds (a buffered fire's
+                // carried rows beside its lanes) pad to the next round, the
+                // padding landing nothing (`write` off) and dropped from the
+                // output: unrolled, each layer of a 130-row fire emitted its
+                // rounds inline (Qwen3.5: 21 MB programs).
+                let padded = rounds * round;
+                let pad = |fq: &mut Func, x: Val| -> Built<Val> {
+                    if padded == t {
+                        return Ok(x);
+                    }
+                    let d = fq.dims(x).to_vec();
+                    let el = fq.elem(x);
+                    let zero = if el.is_int() || el == Elem::Pred {
+                        fq.const_i(el, 0, &[])
+                    } else {
+                        fq.const_f(el, 0.0, &[])
+                    };
+                    let mut high = vec![0; d.len()];
+                    high[0] = padded - t;
+                    fq.pad(x, zero, &vec![0; d.len()], &high, &vec![0; d.len()])
+                };
+                let heads = Heads {
+                    q: pad(fq, heads.q)?,
+                    k: pad(fq, heads.k)?,
+                    v: pad(fq, heads.v)?,
+                    g: pad(fq, heads.g)?,
+                    beta: pad(fq, heads.beta)?,
+                };
+                let (slot, write) = (pad(fq, lanes.slot)?, pad(fq, lanes.write)?);
                 let (yv, slab) = decode_rounds(
                     fq,
                     heads,
-                    [lanes.slot, lanes.write],
+                    [slot, write],
                     [hh, dk, dv],
                     slab,
                     per,
@@ -1720,6 +1749,11 @@ fn delta(
                     rounds,
                     input.rule(),
                 )?;
+                let yv = if padded == t {
+                    yv
+                } else {
+                    fq.slice_axis(yv, 0, 0, t)?
+                };
                 return Ok((yv, slab));
             }
             let mut slab = slab;

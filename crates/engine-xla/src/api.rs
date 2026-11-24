@@ -561,6 +561,32 @@ impl Engine for Xla {
         // a slot size, compiled now whether or not the ladder runs: none is
         // built after the load.
         shell.warm_maintenance().map_err(fault)?;
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24), computed before the warm ladder, which lays
+        // the buffered treatment for exactly the shapes the set states so.
+        let max_readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
+            &budgets,
+        )))
+        .unwrap_or(u32::MAX);
+        let stated = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::of(
+                &shell.tiered_facts(),
+                budgets.max_lanes,
+                budgets.max_tokens,
+                engine::ReadoutFacts {
+                    landing: engine::ReadoutLanding::InSpan,
+                    store_rows: Shell::readout_store_rows(&shell),
+                }
+                .fire_rows(max_readouts),
+                engine::Attachments::served(
+                    true,
+                    !shell.input_decls().is_empty(),
+                    shell.snapshots() > 0,
+                ),
+            ),
+        );
+        shell.set_steps(stated.shapes.clone());
         // The warm ladder, every fire shape the load serves, built before
         // ready: none is built after it (a fire outside it is a ladder miss,
         // named with its shape).
@@ -667,23 +693,27 @@ impl Engine for Xla {
             steps: engine::StatedSteps::default(),
         };
 
-        // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the warm ladder keys
-        // on it in its own branch (its laid mixed rungs, `mixed_lanes`, are
-        // narrower than the set's mixed shapes).
+        // The set the ladder laid (`Shell::set_steps`), stated: the runtime
+        // computes it again from the stated facts and refuses another.
         let mut caps = caps;
-        caps.steps = engine::StatedSteps::of(
-            &steps,
-            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts {
-                landing: engine::ReadoutLanding::InSpan,
-                store_rows: Shell::readout_store_rows(&shell),
-            }),
+        caps.steps = stated;
+        debug_assert_eq!(
+            caps.steps.shapes,
+            engine::StepShapes::of(
+                &steps,
+                &engine::StepFacts::stated(
+                    &caps,
+                    &engine::ReadoutFacts {
+                        landing: engine::ReadoutLanding::InSpan,
+                        store_rows: Shell::readout_store_rows(&shell),
+                    }
+                ),
+            ),
+            "the set computed before the ladder is the one the caps state"
         );
         tracing::info!(
-            "engine-xla: step set: {}; its arm walk does not key on the set yet, so none \
-             of the {} is checked against what it records",
+            "engine-xla: step set: {}; the warm ladder laid its buffered treatment",
             caps.steps.shapes.census(),
-            caps.steps.shapes.len(),
         );
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
