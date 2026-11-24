@@ -662,7 +662,13 @@ impl Shell {
             "xla warm ladder compiled"
         );
         self.laddered = fired > 0;
+        // The parked programs load now, before ready, in the order serving
+        // meets them, while the host holds them beside the guest compiles'
+        // room; those past it stay parked, each loaded by its shape's first
+        // fire. Loading them behind serving instead put every early fire on
+        // a load (v6e Qwen3.5 c64 at ready: 3.4k tok/s, 11.2k two minutes on).
         self.load_behind();
+        self.wait_loaded();
         Ok(fired)
     }
 
@@ -735,10 +741,10 @@ impl Shell {
         }
         let device = std::sync::Arc::clone(&self.device);
         let stated = self.host_programs;
-        // after ready, nothing compiles but guest stages: their room (by
-        // their measured needs, `guest::run::guest_reserve`) is what the
-        // loader leaves free, read as it loads
-        let floor = 0;
+        // the room of a compile, the widest of theirs (the guest stages'
+        // compile beside them, by their measured needs, is kept too:
+        // `guest::run::guest_reserve`, read as it loads)
+        let floor = queue.iter().map(|q| q.1.need()).max().unwrap_or(0);
         let scope = self.trace_scope.clone();
         let stop = std::sync::Arc::clone(&self.behind.stop);
         let width = self.load_width.clone();
@@ -864,6 +870,7 @@ impl Shell {
                     s = started.elapsed().as_secs_f64(),
                     stopped = stop.load(SeqCst),
                     host_full = full.load(SeqCst),
+                    hold_per_kib = room.per_kib(),
                     "xla warm programs loaded behind serving"
                 );
             });

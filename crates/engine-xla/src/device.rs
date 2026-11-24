@@ -1367,6 +1367,12 @@ impl HostRoom {
         }
     }
 
+    /// The most resident bytes a program held a KiB of its text, as a
+    /// load alone measured it (0: none measured).
+    pub(crate) fn per_kib(&self) -> u64 {
+        self.state.lock().map_or(0, |st| st.per_kib)
+    }
+
     /// What the programs loaded since the room was made hold: the
     /// process's resident growth.
     pub(crate) fn held(&self) -> u64 {
