@@ -112,28 +112,39 @@ fn planned() -> Vec<usize> {
 }
 
 /// Places `pid` on an engine: its parent's where it has one (a restart or a
-/// fork keeps its kv where it was), else the engine running the fewest
-/// processes. With one engine, engine 0.
+/// fork keeps its kv where it was), else the first engine with room (no
+/// demand of its planner waiting for room), else the first engine. With one
+/// engine, engine 0. Spreading load is a cluster policy's choice, not the
+/// runtime's.
 pub fn assign(pid: ProcessId, parent: Option<ProcessId>) -> usize {
+    let planned = planned();
+    // Read before the placement lock: a planner's lock is never taken
+    // under it.
+    let room: Vec<usize> = planned
+        .iter()
+        .copied()
+        .filter(|&engine| planner_for(0, engine).is_none_or(|planner| !planner.demand_waits()))
+        .collect();
     let engines_of = engines();
     let mut held = engines_of.write().unwrap();
     let engine = match parent.and_then(|p| held.get(&p).copied()) {
         Some(engine) => engine,
-        None => fewest(&planned(), held.values().copied()),
+        None => first_with_room(&planned, |engine| room.contains(&engine)),
     };
-    if engine != 0 || planned().len() > 1 {
+    if engine != 0 || planned.len() > 1 {
         held.insert(pid, engine);
     }
     engine
 }
 
-/// Of `engines`, the one running the fewest of `running` (each a process's
-/// engine), the lowest on a tie; engine 0 where there are none.
-fn fewest(engines: &[usize], running: impl Iterator<Item = usize> + Clone) -> usize {
+/// Of `engines` (ascending), the first `has_room` says has room, else the
+/// first; engine 0 where there are none.
+fn first_with_room(engines: &[usize], has_room: impl Fn(usize) -> bool) -> usize {
     engines
         .iter()
         .copied()
-        .min_by_key(|e| (running.clone().filter(|x| x == e).count(), *e))
+        .find(|&engine| has_room(engine))
+        .or_else(|| engines.first().copied())
         .unwrap_or(0)
 }
 
@@ -223,14 +234,14 @@ pub fn planners() -> Vec<Arc<ResidencyPlanner>> {
 
 #[cfg(test)]
 mod tests {
-    use super::fewest;
+    use super::first_with_room;
 
     #[test]
-    fn a_process_goes_to_the_engine_running_the_fewest() {
-        assert_eq!(fewest(&[], [].into_iter()), 0);
-        assert_eq!(fewest(&[0], [0, 0].into_iter()), 0);
-        assert_eq!(fewest(&[0, 1, 2], [].into_iter()), 0);
-        assert_eq!(fewest(&[0, 1, 2], [0, 1].into_iter()), 2);
-        assert_eq!(fewest(&[0, 1, 2], [0, 2, 0].into_iter()), 1);
+    fn a_process_goes_to_the_first_engine_with_room() {
+        assert_eq!(first_with_room(&[], |_| true), 0, "no engine: engine 0");
+        assert_eq!(first_with_room(&[0, 1, 2], |_| true), 0, "room everywhere: the first");
+        assert_eq!(first_with_room(&[0, 1, 2], |e| e != 0), 1, "the first with room");
+        assert_eq!(first_with_room(&[0, 1, 2], |e| e == 2), 2);
+        assert_eq!(first_with_room(&[0, 1, 2], |_| false), 0, "room nowhere: the first");
     }
 }
