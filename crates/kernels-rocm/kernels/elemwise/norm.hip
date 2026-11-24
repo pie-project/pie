@@ -351,14 +351,15 @@ __global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n
 }
 
 // x *= s, with s rounded to T first as the reference does.
-template <class T>
-__global__ void mul_scalar(T* __restrict__ x, float s, usize n, int width,
+template <class T, class I>
+__global__ void mul_scalar(T* __restrict__ x, float s, I n, int width,
                            const u32* __restrict__ win) {
-    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const long long at = flat_at(win, static_cast<long long>(i), width);
-    if (at < 0) return;
-    x[at] = from_f32<T>(to_f32(x[at]) * to_f32(from_f32<T>(s)));
+    sweep(n, [&](I i) {
+        const long long at = flat_at(win, i, width);
+        if (at < 0) return false;
+        x[at] = from_f32<T>(to_f32(x[at]) * to_f32(from_f32<T>(s)));
+        return true;
+    });
 }
 
 // out[n] += bias, one block per row.
@@ -372,26 +373,28 @@ __global__ void add_bias(T* __restrict__ out, const TB* __restrict__ bias, int d
 }
 
 // x = silu(s · x).
-template <class T>
-__global__ void silu_scaled(T* __restrict__ x, float s, usize n, int width,
+template <class T, class I>
+__global__ void silu_scaled(T* __restrict__ x, float s, I n, int width,
                             const u32* __restrict__ win) {
-    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const long long at = flat_at(win, static_cast<long long>(i), width);
-    if (at < 0) return;
-    const float v = to_f32(x[at]) * s;
-    x[at] = from_f32<T>(v / (1.f + __expf(-v)));
+    sweep(n, [&](I i) {
+        const long long at = flat_at(win, i, width);
+        if (at < 0) return false;
+        const float v = to_f32(x[at]) * s;
+        x[at] = from_f32<T>(v / (1.f + __expf(-v)));
+        return true;
+    });
 }
 
 // x *= s[0], the factor read from a one-element device plane.
-template <class T>
-__global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n, int width,
+template <class T, class I>
+__global__ void scale(T* __restrict__ x, const T* __restrict__ s, I n, int width,
                       const u32* __restrict__ win) {
-    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const long long at = flat_at(win, static_cast<long long>(i), width);
-    if (at < 0) return;
-    x[at] = from_f32<T>(to_f32(x[at]) * to_f32(s[0]));
+    sweep(n, [&](I i) {
+        const long long at = flat_at(win, i, width);
+        if (at < 0) return false;
+        x[at] = from_f32<T>(to_f32(x[at]) * to_f32(s[0]));
+        return true;
+    });
 }
 
 // out = (out - bias) · scale per column, one block per row. The launch is

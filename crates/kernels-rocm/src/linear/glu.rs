@@ -1,6 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
+use crate::elemwise::Sweep;
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
@@ -175,14 +176,7 @@ fn swiglu_clamp_lanes(
             ),
         ));
     }
-    let n = y.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the activation's element count", lanes)?;
+    let n = crate::elemwise::element_count(op, "the activation's element count", y)?;
     let (packed, routed) = (up.is_none(), weights.is_some());
     let absent = crate::jit::ArgValue::ABSENT;
     // A lane takes a 16-byte pack where every row is whole packs.
@@ -195,20 +189,23 @@ fn swiglu_clamp_lanes(
     } else {
         1
     };
-    let lanes = lanes / vec;
+    let sweep = Sweep::of(n / vec, BLOCK);
     ctx.fire(
         op,
         Fire::at(kernel(
             FILE,
-            &format!("::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}, {vec}>"),
+            &format!(
+                "::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}, {vec}, {}>",
+                sweep.index()
+            ),
         ))
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(sweep.launch),
         &[
             gate.arg(),
             up.map_or(absent, |u| u.arg()),
             weights.map_or(absent, |w| w.arg()),
             y.arg(),
-            stated(op, lanes)?.arg(),
+            sweep.count(),
             stated(op, y.width)?.arg(),
             limit.arg(),
             stated(op, fan)?.arg(),
@@ -275,17 +272,10 @@ pub fn swiglu_clamp_routed(
     swiglu_clamp_lanes(ctx, OP, packed, None, Some(weights), fan, limit, y)
 }
 
-/// The lanes of a flat launch over the activation's elements, a lane each.
-fn flat_lanes(op: &'static str, y: &Tensor) -> Result<u32, Error> {
-    let n = y.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the activation's element count", lanes)?;
-    Ok(lanes)
+/// A flat sweep over the activation's elements, a thread each.
+fn flat_sweep(op: &'static str, y: &Tensor) -> Result<Sweep, Error> {
+    let n = crate::elemwise::element_count(op, "the activation's element count", y)?;
+    Ok(Sweep::of(n, BLOCK))
 }
 
 /// [`swiglu_clamp_alpha`] over a gate and an up plane held apart.
@@ -301,19 +291,22 @@ pub fn swiglu_clamp_alpha_split(
 ) -> Result<(), Error> {
     const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let lanes = flat_lanes(OP, y)?;
+    let sweep = flat_sweep(OP, y)?;
     ctx.fire(
         OP,
         Fire::at(kernel(
             FILE,
-            &format!("::pie::linear::mlp_swiglu_clamp_alpha_split<{t}>"),
+            &format!(
+                "::pie::linear::mlp_swiglu_clamp_alpha_split<{t}, {}>",
+                sweep.index()
+            ),
         ))
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(sweep.launch),
         &[
             gate.arg(),
             up.arg(),
             y.arg(),
-            stated(OP, lanes)?.arg(),
+            sweep.count(),
             stated(OP, y.width)?.arg(),
             limit.arg(),
             alpha.arg(),
@@ -339,16 +332,19 @@ pub fn situ_split(
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let lanes = flat_lanes(OP, y)?;
+    let sweep = flat_sweep(OP, y)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, &format!("::pie::linear::mlp_situ_split<{t}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::linear::mlp_situ_split<{t}, {}>", sweep.index()),
+        ))
+        .apply(sweep.launch),
         &[
             gate.arg(),
             up.arg(),
             y.arg(),
-            stated(OP, lanes)?.arg(),
+            sweep.count(),
             stated(OP, y.width)?.arg(),
             beta.arg(),
             up_cap.unwrap_or(0.0).arg(),
@@ -367,16 +363,19 @@ pub fn geglu_tanh(
 ) -> Result<(), Error> {
     const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let lanes = flat_lanes(OP, y)?;
+    let sweep = flat_sweep(OP, y)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, &format!("::pie::linear::mlp_geglu_tanh<{t}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::linear::mlp_geglu_tanh<{t}, {}>", sweep.index()),
+        ))
+        .apply(sweep.launch),
         &[
             gate.arg(),
             up.arg(),
             y.arg(),
-            stated(OP, lanes)?.arg(),
+            sweep.count(),
             stated(OP, y.width)?.arg(),
             stated(OP, fan)?.arg(),
             ctx.stage(),
@@ -405,25 +404,18 @@ fn act(
         x.dtype,
         { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" }
     );
-    let n = y.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the activation's element count", lanes)?;
+    let sweep = flat_sweep(op, y)?;
     ctx.fire(
         op,
         Fire::at(kernel(
             FILE,
-            &format!("::pie::linear::mlp_act<{t}, {relu2}>"),
+            &format!("::pie::linear::mlp_act<{t}, {relu2}, {}>", sweep.index()),
         ))
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(sweep.launch),
         &[
             x.arg(),
             y.arg(),
-            stated(op, lanes)?.arg(),
+            sweep.count(),
             stated(op, y.width)?.arg(),
             stated(op, fan)?.arg(),
             ctx.stage(),

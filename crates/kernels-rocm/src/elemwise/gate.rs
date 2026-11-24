@@ -14,18 +14,11 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
         gate.rows == x.rows && gate.width == x.width,
         "the gate plane is the rectangle it gates"
     );
-    let n = x.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the gated rectangle's element count", lanes)?;
+    let n = crate::elemwise::element_count(OP, "the gated rectangle's element count", x)?;
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::linear::gate_sigmoid_mul")).apply(super::pointwise::sweep(
-            u64::from(lanes),
+            n.unsigned_abs(),
             if x.width.is_multiple_of(4) && x.ptr.is_multiple_of(8) && gate.ptr.is_multiple_of(8) {
                 4
             } else {
@@ -35,7 +28,7 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
         &[
             x.arg(),
             gate.arg(),
-            stated(OP, lanes)?.arg(),
+            n.arg(),
             stated(OP, x.width)?.arg(),
             stated(OP, fan)?.arg(),
             ctx.stage(),
