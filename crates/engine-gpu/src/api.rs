@@ -347,19 +347,23 @@ impl<B: Host> Gpu<B> {
         let max_submit = B::submit_bound(&self.boot);
         // Under a platform's bound, each frame held to one decode step of
         // this load, until a point is found past it.
-        let cap = (!long)
-            .then(|| shell.decode_step_ns())
-            .flatten()
+        // Under a platform's bound, each frame held to one decode step of
+        // this load; a key deferred once (a single fire past it) runs its
+        // long fires alone, a frame of one, once nothing is live.
+        let cap = shell
+            .decode_step_ns()
             .map(|ns| std::time::Duration::from_nanos(ns as u64));
         let resume = self.rates_resume.entry(key.clone()).or_default();
         resume.begin();
         let mut stated = shell.tuning().profile().rates();
         stated.stale = None;
-        let reference = shell.tuning().gemm(shell.tier(), crate::submit::PROBE.0);
         let submitted = (behind.others)();
         let began = std::time::Instant::now();
+        let Some(probe) = shell.behind_probe() else {
+            return Ok(false);
+        };
         let Some(before) =
-            crate::rates::clock_warmed_until::<B>(shell.device(), reference, behind.arrived)
+            crate::rates::clock_warmed_on::<B>(shell.device(), probe, behind.arrived)
                 .map_err(fault)?
         else {
             return Ok(true);
@@ -400,7 +404,11 @@ impl<B: Host> Gpu<B> {
                         max_submit,
                         &stated,
                         behind.arrived,
-                        crate::rates::Behind { resume, cap },
+                        crate::rates::Behind {
+                            resume,
+                            cap,
+                            single_past: long,
+                        },
                     )
                     .and_then(|measured| match measured.throttled {
                         None => Ok(measured.rates),
@@ -421,7 +429,12 @@ impl<B: Host> Gpu<B> {
             let Some(shell) = this.shell.as_ref() else {
                 return Ok(());
             };
-            let after = crate::rates::clock_read::<B>(shell.device(), reference).map_err(fault)?;
+            let Some(probe) = shell.behind_probe() else {
+                return Ok(());
+            };
+            let after = crate::rates::read_clock_until::<B>(shell.device(), probe, &|| false)
+                .map_err(fault)?
+                .expect("never stopped");
             let moved = (behind.others)() != submitted
                 || crate::rates::throttled(before, after).is_some();
             let resume = this.rates_resume.entry(key.clone()).or_default();
@@ -459,7 +472,12 @@ impl<B: Host> Gpu<B> {
             }
             Err(why) => return Err(fault(why)),
         };
-        let after = crate::rates::clock_read::<B>(shell.device(), reference).map_err(fault)?;
+        let after = match shell.behind_probe() {
+            Some(probe) => crate::rates::read_clock_until::<B>(shell.device(), probe, &|| false)
+                .map_err(fault)?
+                .expect("never stopped"),
+            None => before,
+        };
         let why = if (behind.others)() != submitted {
             Some("another lane submitted while it ran".to_string())
         } else {
@@ -1270,6 +1288,7 @@ where
         // second bind walk, and what it walked is the load's.
         let settling = std::time::Instant::now();
         shell.settle_dense().map_err(fault)?;
+        shell.lay_behind_probe().map_err(fault)?;
         tracing::info!(
             settle_ms = settling.elapsed().as_millis() as u64,
             "load phases: the dense settle's picks (nothing fires before ready)"

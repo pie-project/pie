@@ -618,6 +618,12 @@ struct Rig<'a, B: Serve> {
     /// whose single fire is past that stops the step ([`DEFERRED`]), to run
     /// once nothing is live, never dropped from its curve.
     defer_past: bool,
+    /// Behind serving: what each frame (and the warm-up's cube) is held to,
+    /// one decode step of the load; the platform's bound still admits
+    /// every fire.
+    behind_cap: Option<std::time::Duration>,
+    /// A fire past `behind_cap` runs alone, a frame of one.
+    single_past: bool,
 }
 
 /// A sink that fires through `inner` and keeps each kernel it fires: a
@@ -731,6 +737,8 @@ impl<'a, B: Serve> Rig<'a, B> {
             planes_most: None,
             yield_to: None,
             defer_past: false,
+            behind_cap: None,
+            single_past: false,
         }
     }
 
@@ -860,6 +868,29 @@ impl<'a, B: Serve> Rig<'a, B> {
     /// The fires a frame of `count` of the current step holds: halved until
     /// it fits the bound; a single fire past it refused by name.
     fn fitting(&self, count: u32) -> Result<u32> {
+        let count = self.fitting_platform(count)?;
+        // Behind serving, a frame holds no more than one decode step of
+        // fires; a single fire past it is deferred (or, once nothing is
+        // live, runs as a frame of one).
+        let Some(cap) = self.behind_cap else {
+            return Ok(count);
+        };
+        let worst = self.admission.get().worst.max(1.0);
+        let cap = cap.as_nanos() as f64;
+        match self.per_fire_now().map(|per| per * worst) {
+            Some(per) if per > cap => {
+                if self.single_past {
+                    Ok(1)
+                } else {
+                    Err(self.refuse(Some(per), 1))
+                }
+            }
+            Some(per) => Ok(count.min(((cap / per).floor() as u32).max(1))),
+            None => Ok(1),
+        }
+    }
+
+    fn fitting_platform(&self, count: u32) -> Result<u32> {
         self.retime()?;
         let a = self.admission.get();
         let per_fire = self.per_fire_now();
@@ -2351,6 +2382,10 @@ pub fn curve_named(
 pub struct Behind<'a> {
     pub resume: &'a mut Resume,
     pub cap: Option<std::time::Duration>,
+    /// A point whose single fire is past `cap` runs as a frame of that one
+    /// fire (under the platform's bound), not deferred: what a key does
+    /// once nothing is live.
+    pub single_past: bool,
 }
 
 /// What a rates step behind serving keeps across its slices, a key's: each
@@ -2426,9 +2461,14 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     yield_to: Option<&dyn Fn() -> bool>,
     behind: Option<Behind<'_>>,
 ) -> Result<engine::rates::Measured> {
-    let (mut resume, cap) = match behind {
-        Some(Behind { resume, cap }) => (Some(resume), cap),
-        None => (None, None),
+    let behind_serving = behind.is_some();
+    let (mut resume, cap, single_past) = match behind {
+        Some(Behind {
+            resume,
+            cap,
+            single_past,
+        }) => (Some(resume), cap, single_past),
+        None => (None, None, false),
     };
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
@@ -2439,28 +2479,24 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     // rates are this load's alone where the after read is slower than the
     // warmed before read.
     let reference = tactics.gemm(tier, crate::submit::PROBE.0);
-    let clock_before = match yield_to {
-        Some(stop) => clock_warmed_until::<B>(device, reference, stop)?.ok_or_else(|| {
-            Fault::Device {
-                call: "measuring behind serving",
-                why: YIELDED.to_string(),
-            }
-        })?,
-        None => clock_warmed::<B>(device, reference)?,
+    // Behind serving, the caller reads the clock around each slice on the
+    // probe it laid at load: nothing is laid or compiled here.
+    let clock_before = if behind_serving {
+        None
+    } else {
+        Some(clock_warmed::<B>(device, reference)?)
     };
     let mut rig = Rig::<B>::new(device, max_submit);
     rig.yield_to = yield_to;
     // Behind serving, each frame held to `cap` (one decode step) where the
     // platform bounds a submission: a point whose single fire is past it is
     // deferred, never dropped.
+    // The platform's bound still admits every fire (a fire past it loses
+    // the device); the cap sizes each frame and the warm-up's cube.
     if let (Some(cap), Some(bound)) = (cap, max_submit) {
-        let held = cap.min(bound);
-        let mut admission = rig.admission.get();
-        admission.bound = Some(held);
-        rig.admission.set(admission);
-        // The warm-up's cube and every frame's count are sized to it too.
-        rig.max_submit = Some(held);
-        rig.defer_past = true;
+        rig.behind_cap = Some(cap.min(bound));
+        rig.defer_past = !single_past;
+        rig.single_past = single_past;
     }
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
@@ -2994,7 +3030,10 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
         unsettled: rig.unsettled.get(),
         throttled: {
             drop(rig);
-            throttled(clock_before, clock_read::<B>(device, reference)?)
+            match clock_before {
+                Some(before) => throttled(before, clock_read::<B>(device, reference)?),
+                None => None,
+            }
         },
     })
 }
@@ -3074,7 +3113,8 @@ fn warm<B: Serve>(
     // The cube's side, walked up by real fires under the device's bound on
     // one submission (`engine::rates::warm_side`): each size's second fire
     // timed (its first builds and touches).
-    let max_submit = rig.max_submit;
+    // Behind serving, the cube is sized to one decode step.
+    let max_submit = rig.behind_cap.or(rig.max_submit);
     let (mut side, worst) = engine::rates::warm_side(max_submit, 1.0, |p, estimate| {
         let act = rig.operand(p, p, Dtype::Bf16)?;
         let w = rig.operand(p, p, Dtype::Bf16)?;
@@ -4125,6 +4165,55 @@ pub fn clock_warmed_until<B: Serve>(
 ) -> Result<Option<ClockRead>> {
     let probe = crate::submit::Probe::<B>::new(device, tactic)?;
     engine::rates::warmed_until(|| read_clock(device, &probe), stop)
+}
+
+/// [`clock_warmed_until`] on a probe laid once (`probe`, laid at load):
+/// nothing is laid, compiled or recorded per read, and `stop` is read
+/// before each of the reference's fires, so an arrival waits at most one
+/// fire of it.
+pub fn clock_warmed_on<B: Serve>(
+    device: &B::Context,
+    probe: &crate::submit::Probe<B>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>> {
+    let stopped = std::cell::Cell::new(false);
+    let read = engine::rates::warmed_until::<Fault>(
+        || match read_clock_until(device, probe, stop)? {
+            Some(read) => Ok(read),
+            None => {
+                stopped.set(true);
+                // Read as settled so the warm-up ends; dropped below.
+                Ok(ClockRead {
+                    fastest_ns: 1.0,
+                    spread: f64::INFINITY,
+                })
+            }
+        },
+        &|| stopped.get() || stop(),
+    )?;
+    Ok(read.filter(|_| !stopped.get()))
+}
+
+/// One read of the reference on `probe` ([`clock_read`]'s), `stop` read
+/// before each fire: `None` where it stopped.
+pub fn read_clock_until<B: Serve>(
+    device: &B::Context,
+    probe: &crate::submit::Probe<B>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>> {
+    let mut fires = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        if stop() {
+            return Ok(None);
+        }
+        fires.push(probe.fire(device)?);
+    }
+    let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
+    let slowest = fires.iter().copied().fold(0.0, f64::max);
+    Ok(Some(ClockRead {
+        fastest_ns: fastest,
+        spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
+    }))
 }
 
 /// `engine::rates::warmed` over this crate's faults.

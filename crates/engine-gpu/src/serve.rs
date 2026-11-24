@@ -1121,6 +1121,10 @@ pub struct Shell<B: Serve> {
     /// The `[rates]` keys this load serves by a figure stored under a stale
     /// key, left to time behind serving (`profile::fire::Tuned::behind`).
     rates_behind: Vec<String>,
+    /// The reference kernel the work behind serving reads the device's
+    /// clock by, laid at load where any is left (nothing is laid or
+    /// compiled after ready).
+    behind_probe: Option<crate::submit::Probe<B>>,
 
     pipelines: B::Pipelines,
 
@@ -2970,6 +2974,7 @@ impl<B: Serve> Shell<B> {
             to_store: None,
             behind: None,
             rates_behind,
+            behind_probe: None,
             built: B::compiled(&pipelines),
             recorded: 0,
             unkept: 0,
@@ -3377,6 +3382,25 @@ impl<B: Serve> Shell<B> {
         self.rates_behind.first().cloned()
     }
 
+    /// Lays the reference the work behind serving reads the device's clock
+    /// by, where any is left: at load, before ready (nothing is laid or
+    /// compiled after).
+    pub fn lay_behind_probe(&mut self) -> Result<()> {
+        use crate::backend::Tactics as _;
+        if self.behind_probe.is_none() && (self.behind.is_some() || !self.rates_behind.is_empty()) {
+            let reference = self.tuning.gemm(self.tier, crate::submit::PROBE.0);
+            self.behind_probe = Some(crate::submit::Probe::<B>::new(&self.device, reference)?);
+        }
+        Ok(())
+    }
+
+    /// The reference laid for the work behind serving
+    /// ([`Shell::lay_behind_probe`]).
+    #[must_use]
+    pub fn behind_probe(&self) -> Option<&crate::submit::Probe<B>> {
+        self.behind_probe.as_ref()
+    }
+
     /// The kernel and plane the curve `name` (`<kind>/<key> at <n>x<k>`)
     /// names among this load's dense kernels at its planes, to time behind
     /// serving.
@@ -3411,13 +3435,12 @@ impl<B: Serve> Shell<B> {
         self.rates_behind.len()
     }
 
-    /// Whether `tactic`'s entry at every dense plane of this load is built:
-    /// a pick this load may serve without building after ready.
+    /// Whether `tactic` has an entry at every dense plane of this load: a
+    /// pick the load may serve. One not built yet is built by the load's
+    /// second bind walk, before ready (`Gpu::load`, `walk_binds`).
     fn tactic_built(&self, tactic: kernels_slang::linear::gemm::Tactic) -> bool {
-        let built = B::built_since(&self.pipelines, 0);
         self.dense_planes.iter().all(|&(n, k, ..)| {
-            kernels_slang::linear::gemm::entry(B::TARGET, tactic, n, k)
-                .is_ok_and(|fire| built.iter().any(|kernel| kernel.starts_with(fire.entrypoint)))
+            kernels_slang::linear::gemm::entry(B::TARGET, tactic, n, k).is_ok()
         })
     }
 
@@ -3801,7 +3824,6 @@ impl<B: Serve> Shell<B> {
         arrived: &dyn Fn() -> bool,
         seats: Option<&[engine::BehindSeat]>,
     ) -> Result<Option<(Discard, String)>> {
-        use crate::backend::Tactics as _;
         let timed = trial.round > 0;
         if timed && !crate::backend::Context::idle(&self.device) {
             return Ok(Some((
@@ -3809,7 +3831,6 @@ impl<B: Serve> Shell<B> {
                 "the device had other work as it started".to_string(),
             )));
         }
-        let reference = self.tuning.gemm(self.tier, crate::submit::PROBE.0);
         let decode = self.trace.facts.word(&poem_ir::Request::new(1, false));
         let word = if trial.per_lane == 1 {
             decode
@@ -3918,7 +3939,12 @@ impl<B: Serve> Shell<B> {
             self.fire_seated(&seated)?;
             self.drain()?;
             fresh_seats(self)?;
-            match crate::rates::clock_warmed_until::<B>(&self.device, reference, arrived)? {
+            let Some(probe) = self.behind_probe.as_ref() else {
+                return Err(Fault::Unbound {
+                    what: "the clock's reference behind serving, laid at load".into(),
+                });
+            };
+            match crate::rates::clock_warmed_on::<B>(&self.device, probe, arrived)? {
                 Some(read) => Some(read),
                 None => return yielded(),
             }
@@ -3961,7 +3987,11 @@ impl<B: Serve> Shell<B> {
             )));
         }
         if let Some(before) = clock_before {
-            let after = crate::rates::clock_read::<B>(&self.device, reference)?;
+            let probe = self.behind_probe.as_ref().expect("read before the point");
+            let Some(after) = crate::rates::read_clock_until::<B>(&self.device, probe, &|| false)?
+            else {
+                unreachable!("never stopped");
+            };
             if let Some(ratio) = crate::rates::clock_moved(before, after) {
                 return Ok(Some((
                     Discard::Clock,
