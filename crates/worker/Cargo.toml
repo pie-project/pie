@@ -18,6 +18,7 @@ default = ["net"]
 # in-process runtime an app embeds (`embedded`, `Server` without `listen`).
 net = [
     "dep:client",
+    "controller-api/client",
     "dep:mimalloc",
     "dep:libmimalloc-sys",
     "dep:reqwest",

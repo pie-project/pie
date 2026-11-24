@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub use ids::{GatewayId, NodeId, WorkerId};
 
+#[cfg(feature = "client")]
+mod client;
+#[cfg(feature = "client")]
+pub use client::{ControllerLink, HEARTBEAT_INTERVAL};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {

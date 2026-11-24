@@ -400,7 +400,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 }
 
 pub async fn run(config: Config) -> Result<GatewayHandle> {
-    let control = controller::Controller::connect(&config.controller).await?;
+    let control = controller_api::ControllerLink::dial(&config.controller).await?;
     run_with(config, control).await
 }
 
