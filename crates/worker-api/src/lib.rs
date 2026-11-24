@@ -9,7 +9,7 @@ pub use controller_api::StateReport;
 pub use data::{Accepted, BlobRef, Control, Priority, Request, Tokens};
 pub use link::{
     ChannelOrIoError, LINK_MAX_FRAME_BYTES, TwoWayMessage, accept_gateway_link,
-    connect_gateway_link, dispatch_codec, spawn_twoway,
+    connect_gateway_link, dispatch_codec, spawn_twoway, until_link_lost,
 };
 
 #[tarpc::service]
