@@ -2026,15 +2026,24 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         } else {
             let mut tuned = chip.tuned().clone();
             for curve in &served {
+                let behind = measuring == engine::rates::Measuring::Time
+                    && stale_rates(max_submit) == engine::rates::StaleRates::TimedBehind;
                 tracing::info!(
                     "rates: gemm curve {curve}: served by the curve stored under its stale key{}",
-                    if measuring == engine::rates::Measuring::Time {
-                        "; timed again behind serving, stored for the next load"
-                    } else {
-                        " (`[engine] measure = false`: not timed again)"
+                    match (measuring, behind) {
+                        (engine::rates::Measuring::Time, true) => {
+                            "; timed again behind serving, stored for the next load"
+                        }
+                        (engine::rates::Measuring::Time, false) => {
+                            " (not timed again where the platform bounds one submission: the \
+                             next export round refreshes it)"
+                        }
+                        (engine::rates::Measuring::Skip, _) => {
+                            " (`[engine] measure = false`: not timed again)"
+                        }
                     }
                 );
-                if measuring == engine::rates::Measuring::Time {
+                if behind {
                     tuned.behind.push(format!("{CURVE_BEHIND}{curve}"));
                 }
             }
@@ -2258,6 +2267,21 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     measure_yielding::<B, T>(device, tactics, tier, timer, max_submit, stated, say, None)
 }
 
+/// What a load on this engine does with a rate or curve stored under a
+/// stale key: served by its figure and timed again behind serving; where
+/// the platform states a bound on one submission (`max_submit`), served
+/// and not timed again (a rates step's frames are sized to that bound, so
+/// one frame would hold a serving request for as long; the next export
+/// round refreshes it).
+#[must_use]
+pub fn stale_rates(max_submit: Option<std::time::Duration>) -> engine::rates::StaleRates {
+    if max_submit.is_some() {
+        engine::rates::StaleRates::Served
+    } else {
+        engine::rates::StaleRates::TimedBehind
+    }
+}
+
 /// The prefix of a `profile::fire::Tuned::behind` entry naming a dense
 /// kernel's curve (`<kind>/<key> at <n>x<k>`) served by a stale figure.
 pub const CURVE_BEHIND: &str = "curve ";
@@ -2311,7 +2335,15 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     // rates are this load's alone where the after read is slower than the
     // warmed before read.
     let reference = tactics.gemm(tier, crate::submit::PROBE.0);
-    let clock_before = clock_warmed::<B>(device, reference)?;
+    let clock_before = match yield_to {
+        Some(stop) => clock_warmed_until::<B>(device, reference, stop)?.ok_or_else(|| {
+            Fault::Device {
+                call: "measuring behind serving",
+                why: YIELDED.to_string(),
+            }
+        })?,
+        None => clock_warmed::<B>(device, reference)?,
+    };
     let mut rig = Rig::<B>::new(device, max_submit);
     rig.yield_to = yield_to;
     // Under a stated bound, the probe first: every estimate grows from it.
@@ -3898,6 +3930,18 @@ pub fn clock_warmed<B: Serve>(
 ) -> Result<ClockRead> {
     let probe = crate::submit::Probe::<B>::new(device, tactic)?;
     warmed(|| read_clock(device, &probe))
+}
+
+/// [`clock_warmed`] behind serving: `stop` read before each read, `None`
+/// where it stopped it (a request arrived), so an arrival waits at most one
+/// read of the reference.
+pub fn clock_warmed_until<B: Serve>(
+    device: &B::Context,
+    tactic: kernels_slang::linear::gemm::Tactic,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>> {
+    let probe = crate::submit::Probe::<B>::new(device, tactic)?;
+    engine::rates::warmed_until(|| read_clock(device, &probe), stop)
 }
 
 /// `engine::rates::warmed` over this crate's faults.

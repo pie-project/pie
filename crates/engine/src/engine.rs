@@ -199,6 +199,42 @@ pub struct BehindServing<'a> {
     /// slice of several frames stops at its next frame, so an arrival waits
     /// at most the one in flight.
     pub arrived: &'a dyn Fn() -> bool,
+    /// The slots the runtime took for this slice's fire, one a lane, as
+    /// the engine asked for them ([`Engine::behind_need`]): a fire behind
+    /// serving names its slots by these refs, as a serving lane does,
+    /// never by seat address. `None`: the caller holds the whole pool (no
+    /// runtime: a test or a tool), and the fire may use the engine's seats.
+    /// Fewer than asked (the pool had no room beyond live work): a slice
+    /// that fires does not run now.
+    pub seats: Option<&'a [BehindSeat]>,
+    /// Whether no process is live on the engine at all (none running,
+    /// queued or parked; only idle cache holds the pool): what a slice
+    /// longer than one decode step of the load waits for, so a live
+    /// request never waits behind it.
+    pub alone: bool,
+}
+
+/// One lane's slots the runtime took for a fire behind serving
+/// ([`BehindServing::seats`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BehindSeat {
+    /// The kv list's slot refs, as many pages as the lane's rows take.
+    pub pages: Vec<u32>,
+    /// A fresh record's slot refs, each fixed shape's pieces in order;
+    /// empty where the load holds no recurrent state.
+    pub record: Vec<(crate::chunk::ShapeId, Vec<u32>)>,
+}
+
+/// What the next slice behind serving fires ([`Engine::behind_need`]):
+/// `lanes` lanes of `tokens` rows each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BehindNeed {
+    pub lanes: u32,
+    pub tokens: u32,
+    /// Whether the point is expected to run longer than one decode step
+    /// of the load (by the load's own figures): it runs only where
+    /// [`BehindServing::alone`].
+    pub long: bool,
 }
 
 pub trait Engine: Send {
@@ -687,11 +723,20 @@ pub trait Engine: Send {
         false
     }
 
-    /// One slice of the measuring the load left behind serving, at most
-    /// one fire. The engine's lane calls it only where it would otherwise
-    /// sleep (no fire or call waits, nothing landing is owed) and only while
-    /// the runtime holds no slot of the engine's pool, so the engine may
-    /// fire on its seat-addressed chunks. Nothing it does changes what the
+    /// What the next slice behind serving fires, where it fires on the
+    /// pool: the runtime takes one point's slots for it (taking idle cache
+    /// where the pool has no room for them, never live work) and hands
+    /// them over in [`BehindServing::seats`]. `None`: the next slice fires
+    /// nothing on the pool.
+    fn behind_need(&self) -> Option<BehindNeed> {
+        None
+    }
+
+    /// One slice of the measuring the load left behind serving. The
+    /// engine's lane calls it only where it would otherwise sleep (no fire
+    /// or call waits, nothing landing is owed); a slice that fires on the
+    /// pool fires on the slots the runtime took for it
+    /// ([`BehindServing::seats`], [`Engine::behind_need`]). Nothing it does changes what the
     /// load serves, records or builds; what it decides is stored for the
     /// next load ([`BehindServing`] says what the runtime tells it). Whether
     /// it fired (`false`: nothing left, or nothing it can fire now).

@@ -2580,6 +2580,91 @@ fn only_a_shared_sets_sealed_keys_are_published() {
     assert_eq!(published.len(), 2, "the shared set's two pages, nothing more");
 }
 
+/// A shared pool of `pages` kv list slots (one a chunk), its stores as a
+/// load registers them.
+fn behind_stores(pages: u32) -> crate::store::registry::Stores {
+    use ::engine::chunk::{
+        ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
+        SlotShape,
+    };
+    let kind = SlotKind::List {
+        tokens: 16,
+        rate: 1,
+        window: None,
+    };
+    let facts = ChunkFacts {
+        chunk_bytes: 1 << 20,
+        total_chunks: pages + 1,
+        segment_chunks: pages + 1,
+        segments: SegmentFacts {
+            committed: 1,
+            max: 1,
+            growth: Growth::Fixed,
+        },
+        reserved: vec![ReservedRun {
+            what: Reserved::Null,
+            first: 0,
+            chunks: 1,
+        }],
+        shapes: vec![SlotShape {
+            id: ShapeId(0),
+            kind,
+            slot_bytes: 1 << 20,
+            slots_per_chunk: 1,
+            sets_per_working_set: kind.sets_per_working_set(),
+            rows: Vec::new(),
+            pinned: None,
+            role: SlotRole::State,
+        }],
+        ..ChunkFacts::default()
+    };
+    let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(pool));
+    crate::store::registry::shared_stores(
+        &shared,
+        &crate::store::shared::Tiers::default(),
+        16,
+        1024,
+    )
+}
+
+/// A point behind serving (the dense settle's, `Engine::behind_need`) whose
+/// slots the pool holds none of, idle cache filling it: idle cache yields
+/// what one point takes and no more, the point's slots go back after it,
+/// and while a waiter is short of a slot (an arrival, a parked process) it
+/// takes nothing at all.
+#[test]
+fn a_point_behind_serving_takes_idle_cache_for_its_slots_and_no_more() {
+    use crate::scheduler::lane::{give_behind, take_behind};
+    let stores = behind_stores(8);
+    {
+        let mut kv = stores.kv.lock();
+        for seed in 0..4u32 {
+            kept_and_gone(&mut kv, 40 + seed, 2, ProcessId::from_u128(u128::from(seed) + 1));
+        }
+        assert_eq!(kv.available_pages(), 0, "idle cache fills the pool");
+    }
+    // Two lanes of 16 rows: a page each.
+    let need = ::engine::BehindNeed {
+        lanes: 2,
+        tokens: 16,
+        long: false,
+    };
+    let taken = take_behind(&stores, need);
+    assert_eq!(taken.seats.len(), 2, "the point's slots were taken");
+    assert!(taken.seats.iter().all(|seat| seat.pages.len() == 1));
+    let cached = stores.kv.lock().cached_working_sets().len();
+    assert_eq!(cached, 3, "one cache entry (two pages) yielded, no more");
+    give_behind(&stores, taken);
+    assert_eq!(stores.kv.lock().available_pages(), 2, "the point's slots came back");
+
+    // A waiter short of a slot comes first: nothing is taken for the point.
+    stores.shared.as_ref().unwrap().lock().unwrap().pool_mut().wait(1, 0, 1);
+    let taken = take_behind(&stores, need);
+    assert!(taken.seats.is_empty(), "a waiter outranks the point");
+    assert_eq!(stores.kv.lock().cached_working_sets().len(), 3, "no cache yielded for it");
+}
+
 /// The reports of one process that exits with `prompt` prompt rows and
 /// `decoded` more, and one that stays live.
 fn an_exit_and_a_live_one(

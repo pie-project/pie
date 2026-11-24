@@ -618,7 +618,7 @@ pub fn at_load(
     // A key stored under a stale key serves by its old figure and is timed
     // again behind serving (`Shell::rates_behind`); only what no layer
     // states is measured here, those keys alone.
-    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, true, |_max_submit, stated| {
+    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, engine::rates::StaleRates::TimedBehind, |_max_submit, stated| {
         let lacked = stated.missing(&KEYS);
         Ok(engine::rates::Measured {
             rates: measure_keys(device, measure_chip, &lacked, None, &mut |_| {})?,

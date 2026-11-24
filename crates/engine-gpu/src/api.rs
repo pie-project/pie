@@ -272,9 +272,34 @@ pub struct Gpu<B: Host> {
     /// The rows of the loaded model's widest token table: a token id a
     /// guest resolves at or past it is out of bounds.
     vocab: Option<u32>,
+    /// What the work behind serving was last said to be doing
+    /// ([`Gpu::behind_state`]).
+    said_behind: Option<&'static str>,
 }
 
 impl<B: Host> Gpu<B> {
+    /// The pending frame's numbers, each step's rows read back from its
+    /// readout seats where not read yet ([`Engine::settle_frame`] takes
+    /// them from here): what frees the seats on an idle turn.
+    fn take_pending_rows(&mut self) -> EngineResult<()> {
+        let (Some((_, pending)), Some(shell)) = (self.pending.as_mut(), self.shell.as_mut()) else {
+            return Ok(());
+        };
+        for step in pending.iter_mut().filter(|step| step.rows.is_none()) {
+            step.rows = Some(shell.rows_of(&step.landed).map_err(fault)?);
+        }
+        Ok(())
+    }
+
+    /// What the work left behind serving is doing now, said once each time
+    /// it changes: running, or why it does not run.
+    fn behind_state(&mut self, state: &'static str) {
+        if self.said_behind != Some(state) {
+            self.said_behind = Some(state);
+            tracing::info!(state, "behind serving: {state}");
+        }
+    }
+
     /// One slice behind serving of a `[rates]` key or a dense kernel's curve
     /// the load serves by a figure stored under a stale key
     /// (`profile::fire::Tuned::behind`): the rates step timing that key
@@ -296,15 +321,25 @@ impl<B: Host> Gpu<B> {
             return Ok(false);
         };
         if !crate::backend::Context::idle(shell.device()) {
+            self.behind_state("waiting: the device is busy");
             return Ok(false);
         }
+        self.behind_state("running: the stale rates and curves");
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
         let max_submit = B::submit_bound(&self.boot);
         let mut stated = shell.tuning().profile().rates();
         stated.stale = None;
         let reference = shell.tuning().gemm(shell.tier(), crate::submit::PROBE.0);
         let submitted = (behind.others)();
         let began = std::time::Instant::now();
-        let before = crate::rates::clock_warmed::<B>(shell.device(), reference).map_err(fault)?;
+        let Some(before) =
+            crate::rates::clock_warmed_until::<B>(shell.device(), reference, behind.arrived)
+                .map_err(fault)?
+        else {
+            return Ok(true);
+        };
         let timed: crate::error::Result<profile::fire::Rates> =
             match key.strip_prefix(crate::rates::CURVE_BEHIND) {
                 Some(curve) => {
@@ -537,6 +572,7 @@ impl<B: Host> Gpu<B> {
             guest_built: 0,
             warned_in_fire: false,
             vocab: None,
+            said_behind: None,
         }
     }
 
@@ -1731,20 +1767,57 @@ where
             .is_some_and(|shell| shell.measures_behind() || shell.rates_behind().is_some())
     }
 
+    fn behind_need(&self) -> Option<engine::BehindNeed> {
+        self.shell.as_ref().and_then(Shell::behind_need)
+    }
+
     fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
-        // A frame whose numbers are not yet taken holds its readout seats.
+        // A frame whose numbers are not yet taken holds its readout seats,
+        // which a settle fire would write: on an idle turn they are taken
+        // now (they are due anyway; the frame's settle reads them back from
+        // here), so the seats are free for what runs behind serving.
         if self.pending.is_some() {
-            return Ok(false);
+            self.take_pending_rows()?;
         }
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
         // The settle's ranges first (decode's rows before the large ones),
-        // then each rate served by a stale figure.
-        if !shell.measures_behind() {
+        // where the runtime took the slots its next fire asks for; else,
+        // and after, each rate and curve served by a stale figure (its step
+        // writes no pool slot: it runs on any idle turn).
+        let need = shell.behind_need();
+        let seats_short = match (need, behind.seats) {
+            (Some(need), Some(seats)) => seats.len() < need.lanes as usize,
+            _ => false,
+        };
+        // A point longer than one decode step runs only with no process
+        // live, so a live request never waits behind it.
+        let long_held = need.is_some_and(|need| need.long) && !behind.alone;
+        if !shell.measures_behind() || seats_short || long_held {
+            if shell.rates_behind().is_none() {
+                if long_held {
+                    self.behind_state(
+                        "waiting: the settle's next point runs longer than one decode step, and \
+                         runs only once no process is live",
+                    );
+                } else if seats_short {
+                    self.behind_state(
+                        "waiting: the pool holds no room for one settle point's slots beyond \
+                         live work (the settle runs on a later idle turn; the fallback picks \
+                         serve)",
+                    );
+                }
+            }
             return self.rate_behind(behind);
         }
-        let fired = shell.measure_behind(behind.others).map_err(fault)?;
+        self.behind_state("running: the dense settle");
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        let fired = shell
+            .measure_behind(behind.others, behind.arrived, behind.seats)
+            .map_err(fault)?;
         // What the settle decided so far, kept in the user's profile for
         // the next load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {

@@ -173,8 +173,9 @@ fn ensure_by(
         None,
         measuring,
         // A stale roofline key's figure serves; the engine times it again behind
-        // serving (`Shell::measure_behind`).
-        true,
+        // serving (`Shell::measure_behind`). Product banks are served stale
+        // and refreshed by the export round (not keys of this step).
+        engine::rates::StaleRates::TimedBehind,
         |_max_submit, _| {
             Ok(engine::rates::Measured {
                 rates: keys.stamp(measure(&measure_chip)?),
