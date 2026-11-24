@@ -1365,8 +1365,14 @@ impl Shell {
     }
 
     /// The buckets a stated shape's steps compose at: each its rows pad to
-    /// (`Shell::bucket_for`), its rows themselves on a load with no buckets.
+    /// (`Shell::bucket_for`), its rows themselves on a load with no buckets;
+    /// a buffering step with a prompt's rows at its rung's alone
+    /// ([`Shell::buffered_rung`]).
     fn buckets_of(&self, shape: &engine::StepShape) -> Vec<u32> {
+        if shape.treatment == engine::Treatment::Buffers && shape.kind != engine::StepKind::Decode
+        {
+            return self.bucket_for(shape.rung).into_iter().collect();
+        }
         let buckets = &self.budget.buckets;
         if buckets.is_empty() {
             return (shape.rows.lo..=shape.rows.hi).collect();
@@ -1452,6 +1458,23 @@ impl Shell {
             ),
         };
         self.steps = engine::StepShapes::of(rules, &facts);
+    }
+
+    /// The bucket a buffering step with a prompt's rows (a mixed or prompt
+    /// step whose lanes buffer or replay recurrent rows) of `rows` rows
+    /// composes at: its rung's in the walked set (the smallest holding
+    /// them), which the runtime prices the step at already
+    /// (`engine::fire::rung_holds`). Its bodies are recorded there alone, not
+    /// at every finer bucket: they are many (each class set, each of
+    /// buffering, splitting and replaying), and a prompt's are the widest.
+    /// A decode step's buffering lanes keep their own bucket.
+    pub(super) fn buffered_rung(&self, rows: u32) -> Option<u32> {
+        self.steps
+            .shapes
+            .iter()
+            .map(|shape| shape.rung)
+            .find(|&rung| rung >= rows)
+            .and_then(|rung| self.bucket_for(rung))
     }
 
     /// The set the arm walk takes its targets from ([`Shell::walk_steps`]).

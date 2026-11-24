@@ -269,7 +269,7 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
       bucket, its lanes' classes and their treatment, never a lane's rows: each decoding class alone, each prompting
       class alone, a tower, a decoding class beside a prompting one, every class at once), each composition recorded as each
       `RsBody` a serving fire of it keys (buffers; splits where a decoding lane's carry can split; replays where a
-      prompting lane can replay). A buffering fire composes at its own bucket (no coarser rs lattice). The
+      prompting lane can replay). A buffering decode step composes at its own bucket; a buffering step with a prompt's rows at its stated rung's (`Shell::buffered_rung`, the rung the runtime prices it at), where alone its bodies are recorded (no other coarser rs lattice). The
       allowance keeps by the set's order (`rule_rank`: shape, then bucket, launches, classes); capture order stays
       the top bucket's first. The load states the set from its stated facts, eager each shape a bucket of whose
       treatment arming left a composition unrecorded (`Shell::stated_steps`), and tallies a fire of a key

@@ -774,7 +774,17 @@ impl Shell {
                 ),
             })
             .collect();
-        let at = self.forced_bucket.take();
+        // A buffering step with a prompt's rows composes at its stated rung
+        // (`Shell::buffered_rung`), where the walk recorded it.
+        let buffers = lanes
+            .iter()
+            .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
+        let prompts = lane_rows.iter().any(|&rows| rows > 1);
+        let at = self.forced_bucket.take().or_else(|| {
+            (buffers && prompts)
+                .then(|| self.buffered_rung(lane_rows.iter().sum()))
+                .flatten()
+        });
         let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
         let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut readout_first = vec![0u32; lanes.len()];
