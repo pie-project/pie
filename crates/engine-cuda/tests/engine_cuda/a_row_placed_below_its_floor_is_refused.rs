@@ -69,30 +69,12 @@ impl ForwardHybrid for Micro {
 pub(crate) fn shell(trace: poem::Trace, path: &Path) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
-        voxels: None,
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract: &contract,
-        checkpoint: path,
-        budget: Budget::new(2, 64),
-        patches: None,
         page_size: PAGE,
-        context: 256,
-        slots: 2,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
             pin: Some((Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(trace, &contract, path, Budget::new(2, 64), 256, 2)
     })
     .expect("the shell loads");
     shell.open(0).expect("slot 0 opens");

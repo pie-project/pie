@@ -915,7 +915,7 @@ __global__ void conv1d_carried_vec8(
     }
 }
 
-// A beam group's fold of its conv window (BEAM-PAGE-LISTS §11.3): the window
+// A beam group's fold of its conv window: the window
 // stored as it stands after the group's fold rows (the committed cells, then
 // the rows' inputs, plane 0, through the representative lane's pages), so the
 // committed point moves with the set's recurrent state. A thread a channel,

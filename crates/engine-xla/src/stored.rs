@@ -1,9 +1,9 @@
-//! What XLA's stored measurements are keyed by (`profile::fire::Now`): the
+//! What XLA's stored measurements are keyed by (`profile::rates::Now`): the
 //! TPU's kind and the PJRT plugin's build, and each measuring method's
 //! version. A stored or committed entry whose key matches this build on
 //! this device is taken; any other is measured anew.
 
-use profile::fire::{MeasuredBy, Now};
+use profile::rates::{MeasuredBy, Now};
 
 /// The version of the method `[rates] load_width` is measured by
 /// (`Shell::load_behind`): a change to how it is found moves it, and a
@@ -34,7 +34,7 @@ impl Now for Keys {
     }
 
     fn method(&self, what: &str) -> Option<u32> {
-        (what == profile::fire::LOAD_WIDTH).then_some(LOAD_WIDTH_METHOD)
+        (what == profile::rates::LOAD_WIDTH).then_some(LOAD_WIDTH_METHOD)
     }
 
     /// The width loads programs, firing no kernel.

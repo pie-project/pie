@@ -12,33 +12,21 @@
 //! a page of 16 (25 keys held of its 32), past the first.
 
 use engine_metal::serve::Seated;
-use engine_metal::{Boot, Lane, Shell};
+use engine_metal::{Lane, Shell};
 use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, word};
+use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, fixture_of, word};
 
 const SEATS: u32 = 8;
 
 fn load(fixture: &Fixture, page_size: u32) -> Shell {
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
+    Load {
         budget: Budget::new(SEATS, 512),
-        patches: None,
-        voxels: None,
-        profile: None,
         page_size,
-        context: 256,
         slots: SEATS,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
 }

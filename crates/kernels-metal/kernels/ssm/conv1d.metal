@@ -606,7 +606,7 @@ template <typename T>
 
 instantiate_causal_conv1d_verify(bfloat16, bfloat)
 
-// A beam group's conv fold (BEAM-PAGE-LISTS §11.3): before the layer's
+// A beam group's conv fold: before the layer's
 // step, each group's window moves on by the `n` rows every live beam shares,
 // read from its first lane's buffer. That lane's page table row starts `n`
 // rows past them (its replay starts at the fold), so row `t` of the fold is

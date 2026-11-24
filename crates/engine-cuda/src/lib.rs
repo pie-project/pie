@@ -188,7 +188,7 @@ pub use run::{
 };
 pub use serve::{
     Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, QueueMasks, Recording, Seal,
-    Seated, Shell,
+    Seated, Shell, WeightPin,
 };
 
 pub use blob::{

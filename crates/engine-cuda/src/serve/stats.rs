@@ -64,7 +64,7 @@ impl Shell {
             .map_or(0, |routes| routes.fingerprint());
         format!(
             "cuda|{}|kernels {}|emitter {}|routes {routes:#010x}|lanes {} tokens {}",
-            profile::fire::Now::on(&self.keys),
+            profile::rates::Now::on(&self.keys),
             self.keys.codes_said(),
             eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION,
             self.budget.max_lanes,
@@ -367,8 +367,8 @@ impl Shell {
                 if self.pools.weights_located() {
                     // The recorded bodies keep the plain-load select they
                     // chose, which reads a located table as well.
-                    eprintln!(
-                        "engine-cuda: a held weight set arrived after lanes named slot refs; \
+                    tracing::info!(
+                        "a held weight set arrived after lanes named slot refs; \
                          the recorded bodies keep the per-route select (send the set before \
                          the first fire)"
                     );
@@ -404,8 +404,8 @@ impl Shell {
             let freed = tier.release_host(&held);
             if freed > 0 {
                 self.pools.drop_weight_hosts();
-                eprintln!(
-                    "engine-cuda: the weights the pool holds whole are read from it alone; \
+                tracing::info!(
+                    "the weights the pool holds whole are read from it alone; \
                      {} MiB of their host copy freed",
                     freed >> 20
                 );
@@ -459,7 +459,7 @@ impl Shell {
             .copy_whole_slots(self.device.stream(), shape, pairs)
     }
 
-    /// Copies whole slots of `shape` between tiers (CONTRACT-BC 22), on
+    /// Copies whole slots of `shape` between tiers, on
     /// the stream behind the fires enqueued and ahead of the next.
     pub fn copy_tier_slots(
         &mut self,

@@ -39,6 +39,7 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+from ..imports import frames
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
@@ -61,21 +62,21 @@ class Image:
     """
     
     @classmethod
-    def from_frames(cls, f: Any) -> Self:
-        """
-        A one-frame `frames` as `from-bytes` reads an encoded still: pixels
-        a process made, or a client uploaded, go on to a model with no
-        codec between. Errors on more than one frame.
-
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    @classmethod
     def from_bytes(cls, bytes: bytes) -> Self:
         """
         Encoded still image (PNG / JPEG / …). The host decodes it, frames
         it by the package's `frame` and cuts it into patch rows. Errors if
         the model reads no stills or the bytes don't decode.
+        
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    @classmethod
+    def from_frames(cls, f: frames.Frames) -> Self:
+        """
+        A one-frame `frames` as `from-bytes` reads an encoded still: pixels
+        a process made, or a client uploaded, go on to a model with no
+        codec between. Errors on more than one frame.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

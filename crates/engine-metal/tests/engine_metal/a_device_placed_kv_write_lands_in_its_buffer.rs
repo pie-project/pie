@@ -10,7 +10,7 @@
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{
-    ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer,
 };
 use eta_ir::op::Op;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Port, PortMask, Stage};
@@ -23,21 +23,11 @@ use engine_metal::{Lane, Shell};
 use super::a_scattered_pool_serves_the_same_logits::{
     Fixture, Profiles, argmax, fixture_of, load_stored, same, word,
 };
+use crate::common::{const_port};
 
 const CONTEXT: u32 = 256;
 const PROMPT: u32 = 40;
 const STEPS: u32 = 4;
-
-fn const_port(port: Port, words: &[u32]) -> PortBinding {
-    PortBinding {
-        port,
-        source: PortSource::Const {
-            dtype: EtaDtype::U32,
-            shape: Shape::vector(words.len() as u32),
-            data: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        },
-    }
-}
 
 /// A program whose ports state one lane's prompt: its tokens, and slots
 /// `0..PROMPT` of its working set (positions the slots); its epilogue puts
@@ -284,9 +274,5 @@ fn a_device_placed_kv_write_lands_in_its_buffer() {
         "the device-placed prefill past the first buffer against one buffer's",
         &spread,
         &one,
-    );
-    eprintln!(
-        "a device-placed kv write lands in its buffer ({} rows)",
-        spread.len()
     );
 }

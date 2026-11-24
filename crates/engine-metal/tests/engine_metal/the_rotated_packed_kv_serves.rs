@@ -1,11 +1,11 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2d — the rotated + packed-4-bit KV codec, served end to end.
+//! The rotated + packed-4-bit KV codec, served end to end.
 //!
-//! C0 showed the rotation helps a low-bit quantizer; C1 wired the rotation into
-//! qwen attention and showed it is the un-rotated forward at the bf16 rounding
-//! floor; C2a/b/c built and unit-tested the `KvU4` codec's pack/write/read
-//! kernels in isolation. This test proves the pieces COMPOSE: a real small-model
+//! The rotation (`the_kv_rotation_is_the_unrotated_forward`) and the `KvU4`
+//! codec's pack, write and read kernels (`the_kv_codec_round_trips`,
+//! `the_kv_write_round_trips`, `the_packed_kv_decode_reads`) are each checked
+//! alone; this checks that they COMPOSE: a real small-model
 //! Metal forward run through the serve path, over a deployment that turns the rotation
 //! ON and stores the KV cache as the packed `KvU4` codec, against the shipped
 //! bf16-KV baseline over the SAME weights.
@@ -14,7 +14,7 @@
 //!
 //!   (baseline) rotate_kv = false, KV = Bf16  — the shipped path, ground truth.
 //!   (rot-only) rotate_kv = true,  KV = Bf16  — rotation, no quant. This MUST
-//!               reproduce C1's rounding floor: the Hadamard is orthonormal, so
+//!               reproduce `the_kv_rotation_is_the_unrotated_forward`'s rounding floor: the Hadamard is orthonormal, so
 //!               the only difference from baseline is bf16 rounding of the extra
 //!               butterflies. If this is NOT tiny, the wiring is broken and the
 //!               packed-path deviation below is meaningless.
@@ -51,7 +51,7 @@ const VOCAB: usize = 256;
 const PROMPT: &[u32] = &[7, 42, 11, 200, 3, 99, 128, 65];
 const STEPS: usize = 3;
 
-// ---- deterministic synthetic weights (same integer mixer as the C1 test) -----
+// ---- deterministic synthetic weights (same integer mixer as the `the_kv_rotation_is_the_unrotated_forward` test) -----
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
@@ -99,7 +99,7 @@ fn write_safetensors(path: &Path, tensors: &[(String, Vec<u64>, Vec<f32>)]) {
 }
 
 /// Every plane `micro_text` imports under the transformers layout, at `head_dim`,
-/// filled with synthetic f32 (same salting/scales as the C1 fixture, generalized
+/// filled with synthetic f32 (same salting/scales as the `the_kv_rotation_is_the_unrotated_forward` fixture, generalized
 /// to a configurable head_dim).
 fn synth_fixture(dir: &Path, head_dim: usize) {
     let layer = |l: usize, leaf: &str| format!("model.language_model.layers.{l}.{leaf}");
@@ -384,13 +384,9 @@ fn the_rotated_packed_kv_serves() {
     for &head_dim in &[256u32, 128] {
         serve_case(head_dim);
     }
-    eprintln!(
-        "=== C2d: the rotated packed-4-bit KV deployment serves — argmax-identical, ~3.9x smaller cache ==="
-    );
 }
 
 fn serve_case(head_dim: u32) {
-    eprintln!("---- head_dim {head_dim} ----");
 
     // ---- memory: straight from the allocation layer, needs no device --------
     // Any paging gives the same ratio (both dtypes scale by the same cell count);
@@ -402,10 +398,6 @@ fn serve_case(head_dim: u32) {
     // packed head = head_dim/2 + 2 bytes; bf16 head = head_dim * 2 bytes.
     let want = (f64::from(head_dim) / 2.0 + 2.0) / (f64::from(head_dim) * 2.0);
     let reduction = 1.0 / ratio;
-    eprintln!(
-        "[mem  ] bf16 KV = {bf16_bytes} B, KvU4 KV = {u4_bytes} B, ratio {ratio:.5} \
-         (expected {want:.5}), reduction {reduction:.3}x"
-    );
     assert!(
         (ratio - want).abs() < 1e-9,
         "packed cache must be (head_dim/2+2)/(head_dim*2) of bf16 at head_dim {head_dim}: \
@@ -453,14 +445,9 @@ fn serve_case(head_dim: u32) {
     let am_u4 = argmaxes(&rot_u4);
 
     // ---- rotation-only: MUST be the bf16 rounding floor (else the wiring is
-    // broken and the packed number below is meaningless). This reproduces C1.
-    let (rot_max, rot_mean, spread) = deviation(&baseline, &rot_only);
+    // broken and the packed number below is meaningless). This reproduces `the_kv_rotation_is_the_unrotated_forward`.
+    let (rot_max, _, spread) = deviation(&baseline, &rot_only);
     let rot_rel = rot_max / spread.max(1e-6);
-    eprintln!(
-        "[rot  ] spread {spread:.4}; vs baseline max {rot_max:.5}, mean {rot_mean:.6}, \
-         max/spread {rot_rel:.4}"
-    );
-    eprintln!("[rot  ] argmax base {am_base:?} vs rot {am_rot:?}");
     assert_eq!(
         am_base, am_rot,
         "rotation-only chose different tokens than baseline — a wiring bug, not rounding"
@@ -473,17 +460,14 @@ fn serve_case(head_dim: u32) {
 
     // ---- rot + 4-bit: rotation rounding PLUS 4-bit quant loss. Larger than
     // rot-only, dominated by quant, and argmax-identical to baseline.
-    let (u4_max, u4_mean, _) = deviation(&baseline, &rot_u4);
+    let (u4_max, _, _) = deviation(&baseline, &rot_u4);
     let u4_rel = u4_max / spread.max(1e-6);
-    eprintln!("[u4   ] vs baseline max {u4_max:.5}, mean {u4_mean:.6}, max/spread {u4_rel:.4}");
-    eprintln!("[u4   ] argmax base {am_base:?} vs u4 {am_u4:?}");
     // A token may differ only where the baseline's own top two lie closer than
     // the 4-bit path's error at that step (a near-tie the quantization noise
     // tips); anywhere clearer, a flip is a wiring bug.
     for (step, (base, u4)) in baseline.iter().zip(&rot_u4).enumerate() {
         let err = base.iter().zip(u4).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         let gap = margin(base);
-        eprintln!("[u4   ] step {step}: error {err:.4}, baseline margin {gap:.4}");
         if gap > 2.0 * err {
             assert_eq!(
                 am_base[step], am_u4[step],
@@ -501,7 +485,7 @@ fn serve_case(head_dim: u32) {
     // The ceiling: measured on THIS fixture, then set a hair above. Observed
     // max/spread is ~8.4% at head_dim 256 and ~11.8% at 128 (mean ~4.5% / ~6%) —
     // higher than a real model would show because the synthetic KV is
-    // unstructured Gaussians the Hadamard cannot de-spike (C0: the rotation helps
+    // unstructured Gaussians the Hadamard cannot de-spike (`the_hadamard_transform_agrees`: the rotation helps
     // BECAUSE of outliers), so this is close to raw 4-bit-on-noise error. It is
     // dominated by quant, NOT a systematic basis offset — the rotation-only floor
     // above is only ~0.5%, so essentially the whole gap is quantization, and

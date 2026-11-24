@@ -30,7 +30,7 @@
 //!
 //! Once a model's shapes are known, each dense kernel the slang backends
 //! choose between at each of its planes, at each power of two of rows to
-//! the load's most (`kernel_rows`), for `kernel_tflops_by_shape`
+//! the load's most (`kernel_rows`), for `kernel_curves`
 //! ([`shapes_at_load`]): what a rung's dense kernel is chosen by, the
 //! kernels' occupancy at the model's own planes in their time.
 //!
@@ -59,7 +59,7 @@
 use engine::rates::{SCAN_SHAPE, Touched, attn_flops, gemm_flops, scan_elements, weights_at};
 use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
-use profile::fire::Rates;
+use profile::rates::Rates;
 
 use crate::backend::{Buffer as _, Context as _, Frame as _, Tactics};
 use crate::error::{Fault, Result};
@@ -183,7 +183,7 @@ fn tdr_value(name: &str) -> Option<u32> {
 }
 
 /// The `[rates]` keys the slang backends' estimate weighs a fire by (of
-/// `profile::fire::KEYS`): what a load whose profile lacks one measures.
+/// `profile::rates::KEYS`): what a load whose profile lacks one measures.
 /// `few_row_tflops` and `workgroups_per_core` are not weighed here: no
 /// choice on these backends reads them, so a load measures neither. The
 /// dense kernels' curves at the model's planes, which a rung's dense kernel
@@ -201,23 +201,23 @@ pub const KEYS: [&str; 6] = [
 /// The `[rates]` keys a load measures where its profile lacks one: the
 /// estimate's [`KEYS`]; where the platform states a bound on one
 /// submission (`max_submit`) the margin a serving step is held to it at
-/// (`profile::fire::SUBMIT_WORST_RATIO`, `crate::submit`); and the
+/// (`profile::rates::SUBMIT_WORST_RATIO`, `crate::submit`); and the
 /// workgroups the device holds at once, which a guest step's grid strides
 /// over and, where the device states no count of its compute units, what
-/// sizes a fire's work to it (`profile::fire::RESIDENT_WORKGROUPS`).
+/// sizes a fire's work to it (`profile::rates::RESIDENT_WORKGROUPS`).
 #[must_use]
 pub fn keys_at(max_submit: Option<std::time::Duration>) -> Vec<&'static str> {
     let mut keys = KEYS.to_vec();
     if max_submit.is_some() {
-        keys.push(profile::fire::SUBMIT_WORST_RATIO);
-        keys.push(profile::fire::ATTN_BY_ROWS_KEYS);
+        keys.push(profile::rates::SUBMIT_WORST_RATIO);
+        keys.push(profile::rates::ATTN_BY_ROWS_KEYS);
     }
-    keys.push(profile::fire::RESIDENT_WORKGROUPS);
+    keys.push(profile::rates::RESIDENT_WORKGROUPS);
     keys
 }
 
 /// The rows of a prompt step the prefixed attention curve is timed at
-/// (`profile::fire::Rates::attn_tflops_by_rows_keys`): the prompt rungs a
+/// (`profile::rates::Rates::attn_tflops_by_rows_keys`): the prompt rungs a
 /// slang load on a bound-stating device lays its top at (wgpu's 512, native
 /// Vulkan's 1024, and the narrower a phone's room leaves).
 pub const PREFIX_ROWS: [u32; 4] = [128, 256, 512, 1024];
@@ -234,7 +234,7 @@ fn kernel_rows(top: u32) -> Vec<u32> {
 }
 
 /// The rows each dense kernel is timed at at a shape
-/// (`profile::fire::Rates::kernel_tflops_by_shape`): every power of four
+/// (`profile::rates::Rates::kernel_curves`): every power of four
 /// from one row to `top`, then `top`, so no kernel is weighed past the rows
 /// it was timed at; a rung between two is read between them, in log rows
 /// (`crate::dense`).
@@ -278,7 +278,7 @@ pub fn dense_kernels<T: Tactics + ?Sized>(
 }
 
 /// The curve `tactic`'s kernel at an `n x k` plane is measured and read as
-/// (`profile::fire::KernelCurve`'s kind and key): a vector kernel by the rows
+/// (`profile::curves::KernelCurve`'s kind and key): a vector kernel by the rows
 /// a workgroup carries, a tiled one by its row tile at the plane.
 #[must_use]
 pub fn curve_key(
@@ -288,15 +288,15 @@ pub fn curve_key(
     k: u32,
 ) -> (u32, u32) {
     if tactic.vector > 0 {
-        (profile::fire::KernelCurve::VECTOR, tactic.vector)
+        (profile::curves::KernelCurve::VECTOR, tactic.vector)
     } else {
         let tile = kernels_slang::linear::gemm::tile_for(target, tactic, n, k).row_tile();
-        (profile::fire::KernelCurve::TILE, tile.max(1))
+        (profile::curves::KernelCurve::TILE, tile.max(1))
     }
 }
 
 /// Of `kernels` at each of `shapes` (`(n, k)`), those whose curve `stated`
-/// does not serve to `top` rows (`profile::fire::KernelCurve::serves`): what
+/// does not serve to `top` rows (`profile::curves::KernelCurve::serves`): what
 /// a load measures once its model's shapes are known ([`measure_shapes`]).
 /// Two kernels read as one curve at a shape are measured once.
 #[must_use]
@@ -318,7 +318,7 @@ pub fn lacking(
             }
             seen.push(id);
             let served = stated
-                .kernel_tflops_by_shape
+                .kernel_curves
                 .iter()
                 .flatten()
                 .any(|c| c.id() == id && c.serves(top));
@@ -400,7 +400,7 @@ pub const LAUNCH: u32 = 16;
 const VIEW_ALIGN: u64 = 256;
 
 /// Timed frames of each kind; the median is kept.
-pub const ROUNDS: usize = 5;
+pub const ROUNDS: usize = engine::rates::ROUNDS;
 
 /// The most single-fire frames a queued rates frame keeps in flight
 /// (`Rig::queue`): as many as the frames of all but the tiniest fires hold
@@ -1451,12 +1451,12 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
 }
 
 /// The version of [`measure_shapes`]' method (each dense kernel's curve's
-/// stored key, `profile::fire::KernelCurve::by`): bumped only when how a
+/// stored key, `profile::curves::KernelCurve::by`): bumped only when how a
 /// curve is measured changes.
 pub const CURVE_METHOD: u32 = 1;
 
 /// Each of `wanted` (`(kernel, n, k)`, [`lacking`]) timed at the load's
-/// rows to `top` (`profile::fire::Rates::kernel_tflops_by_shape`): a matmul
+/// rows to `top` (`profile::rates::Rates::kernel_curves`): a matmul
 /// of each row count over an `n x k` plane, each fire reading the next plane
 /// past the last-level cache, its flops over its time, every weight pass it
 /// makes in it. Each fire is admitted by the rig's estimate (grown from the
@@ -1487,7 +1487,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     model: Option<u64>,
     top: u32,
     say: &mut dyn FnMut(&str),
-) -> Result<Vec<profile::fire::KernelCurve>> {
+) -> Result<Vec<profile::curves::KernelCurve>> {
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
@@ -1563,10 +1563,10 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     // profile states: what a vector kernel is held beaten against beside
     // those timed here.
     let stated_tiled: Vec<(u32, u32, Vec<(u32, f64)>)> = stated
-        .kernel_tflops_by_shape
+        .kernel_curves
         .iter()
         .flatten()
-        .filter(|c| c.kind == profile::fire::KernelCurve::TILE)
+        .filter(|c| c.kind == profile::curves::KernelCurve::TILE)
         .map(|c| {
             let ns = c
                 .curve
@@ -1614,13 +1614,13 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             .map(|&(tactic, ..)| {
                 let (kind, key) = curve_key(B::TARGET, tactic, n, k);
                 let name = match kind {
-                    profile::fire::KernelCurve::VECTOR => {
+                    profile::curves::KernelCurve::VECTOR => {
                         format!("vector matmul ({key} rows a workgroup)")
                     }
                     _ => format!("{key}-row tile matmul"),
                 };
                 let stored = stated
-                    .kernel_tflops_by_shape
+                    .kernel_curves
                     .iter()
                     .flatten()
                     .find(|c| c.id() == (kind, key, n, k) && c.stop.is_none());
@@ -1681,7 +1681,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             }
             let Some((act, weights, ys)) = laid.as_ref().filter(|_| fits(m)) else {
                 for &t in &live {
-                    timed[t].stop = Some((m, profile::fire::KernelCurve::BUFFER));
+                    timed[t].stop = Some((m, profile::curves::KernelCurve::BUFFER));
                 }
                 break;
             };
@@ -1784,7 +1784,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                                     k,
                                     "rates point: past the bound, the curve stops"
                                 );
-                                timed[t].stop = Some((m, profile::fire::KernelCurve::BOUND));
+                                timed[t].stop = Some((m, profile::curves::KernelCurve::BOUND));
                             }
                         }
                     }
@@ -1822,7 +1822,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                         kept = samples[t].len(),
                         "rates point: fewer samples kept than a point's {REPEATS}, the curve stops"
                     );
-                    timed[t].stop = Some((m, profile::fire::KernelCurve::UNTIMED));
+                    timed[t].stop = Some((m, profile::curves::KernelCurve::UNTIMED));
                     continue;
                 }
                 let (ns, spread) = best_spread(&samples[t]);
@@ -1888,7 +1888,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             // passes (one a workgroup's rows) only grow with the rows.
             let fastest_tiled = timed
                 .iter()
-                .filter(|c| c.kind == profile::fire::KernelCurve::TILE)
+                .filter(|c| c.kind == profile::curves::KernelCurve::TILE)
                 .filter_map(|c| c.points.last().filter(|p| p.0 == m).map(|p| p.1))
                 .chain(
                     stated_tiled
@@ -1898,7 +1898,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                             let inside = curve.first().is_some_and(|&(at, _)| at <= m)
                                 && curve.last().is_some_and(|&(at, _)| at >= m);
                             inside
-                                .then(|| profile::fire::interpolate(curve, f64::from(m)))
+                                .then(|| profile::curves::interpolate(curve, f64::from(m)))
                                 .flatten()
                         }),
                 )
@@ -1912,7 +1912,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                         .last()
                         .is_some_and(|p| p.0 == m && p.1 > 2.0 * tiled)
                     {
-                        c.stop = Some((next, profile::fire::KernelCurve::BEATEN));
+                        c.stop = Some((next, profile::curves::KernelCurve::BEATEN));
                     }
                 }
             }
@@ -1934,14 +1934,14 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             let kernel = kernels_slang::linear::gemm::entry(B::TARGET, c.tactic, n, k)
                 .and_then(crate::naming::Kernel::of)
                 .map_err(fault("rates: a curve's kernel"))?;
-            let by = crate::stored::by(B::TARGET, profile::fire::KERNEL_CURVES, [&kernel])?;
+            let by = crate::stored::by(B::TARGET, profile::rates::KERNEL_CURVES, [&kernel])?;
             tracing::info!(
                 "rates: curve {}/{} at {n}x{k} measured, stored under its key: {}",
                 c.kind,
                 c.key,
                 by.said()
             );
-            curves.push(profile::fire::KernelCurve {
+            curves.push(profile::curves::KernelCurve {
                 by,
                 kind: c.kind,
                 key: c.key,
@@ -1971,7 +1971,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
 }
 
 /// `chip` with each dense kernel's curve at each of `shapes` to `top` rows
-/// (`profile::fire::Rates::kernel_tflops_by_shape`): the curves it lacks
+/// (`profile::rates::Rates::kernel_curves`): the curves it lacks
 /// ([`lacking`]) measured on `device` ([`measure_shapes`]), joined to those
 /// it states, and saved to the user's profile `save` names, as a load saves
 /// its rates (`engine::rates::save_rates`). Nothing is timed where it lacks
@@ -2005,13 +2005,13 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     let stale_curves = stated
         .stale
         .as_ref()
-        .and_then(|stale| stale.kernel_tflops_by_shape.clone())
+        .and_then(|stale| stale.kernel_curves.clone())
         .unwrap_or_default();
     let (chip, stated, wanted) = if stale_curves.is_empty() || wanted.is_empty() {
         (chip, stated, wanted)
     } else {
         let with = stated.clone().over(Rates {
-            kernel_tflops_by_shape: Some(stale_curves),
+            kernel_curves: Some(stale_curves),
             ..Rates::default()
         });
         let still = lacking(B::TARGET, &kernels, &with, shapes, top);
@@ -2048,7 +2048,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     // rung's kernel estimated from the work's shape where none is
     // (`crate::dense::by_shape`).
     if measuring == engine::rates::Measuring::Skip {
-        let served = if stated.kernel_tflops_by_shape.is_some() {
+        let served = if stated.kernel_curves.is_some() {
             "the dense choice weighs the kernels whose curves are stated, and keeps the rung \
              below's kernel where none reaches"
         } else {
@@ -2091,12 +2091,12 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
     // The user's file gains what this load measured alone: a curve taken
     // from a committed profile stays the committed profile's.
     let fresh = Rates {
-        kernel_tflops_by_shape: Some(curves.clone()),
+        kernel_curves: Some(curves.clone()),
         measured_on: Some(on.to_string()),
         ..Rates::default()
     };
     let measured = Rates {
-        kernel_tflops_by_shape: Some(curves),
+        kernel_curves: Some(curves),
         ..Rates::default()
     }
     .over(stated.clone());
@@ -2226,7 +2226,7 @@ impl Wanted {
         let lacked = stated.missing(keys);
         let lacks = |key: &str| lacked.contains(&key);
         Wanted {
-            resident: lacks(profile::fire::RESIDENT_WORKGROUPS),
+            resident: lacks(profile::rates::RESIDENT_WORKGROUPS),
             launch: lacks("launch_ns") || lacks("hbm_gbps"),
             gemm: lacks("gemm_tflops_by_rows"),
             attn: lacks("attn_tflops_by_keys"),
@@ -2464,7 +2464,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     // against a longer prefix, at each of [`PREFIX_ROWS`] against each of
     // `engine::rates::ATTN_KEYS` past them: the shapes the steps that near
     // the bound fire, which the square curve reads up to twice as fast as
-    // they run (`profile::fire::Rates::attn_tflops_by_rows_keys`). A point
+    // they run (`profile::rates::Rates::attn_tflops_by_rows_keys`). A point
     // past the bound is dropped by name, as every rate's is.
     //
     // A point's first fire is estimated from the prefixed points measured
@@ -2673,7 +2673,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         few_row_tflops: None,
         product_ns: None,
         workgroups_per_core: None,
-        kernel_tflops_by_shape: None,
+        kernel_curves: None,
         dense_settled: Vec::new(),
         resident_workgroups: resident,
         // How much slower the device ran than its own measurements said:
@@ -2698,9 +2698,9 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         ("attn_tflops_by_keys", &attn_fired),
         ("elementwise_gbps", &elementwise_fired),
         ("scan_gelems", &scan_fired),
-        (profile::fire::RESIDENT_WORKGROUPS, &resident_fired),
-        (profile::fire::ATTN_BY_ROWS_KEYS, &prefixed_fired),
-        (profile::fire::SUBMIT_WORST_RATIO, &step_fired),
+        (profile::rates::RESIDENT_WORKGROUPS, &resident_fired),
+        (profile::rates::ATTN_BY_ROWS_KEYS, &prefixed_fired),
+        (profile::rates::SUBMIT_WORST_RATIO, &step_fired),
     ] {
         if rates.states(key) {
             let by = crate::stored::by(B::TARGET, key, fired)?;
@@ -4017,9 +4017,9 @@ mod curve_tests {
             wide: false,
         };
         let kernels = [vector(1), vector(4), vector(4)];
-        let curve = |key, n, k, to, stop| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy::default(),
-            kind: profile::fire::KernelCurve::VECTOR,
+        let curve = |key, n, k, to, stop| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
+            kind: profile::curves::KernelCurve::VECTOR,
             key,
             n,
             k,
@@ -4027,8 +4027,8 @@ mod curve_tests {
             stop,
             spread: Vec::new(),
         };
-        let rates = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(vec![
+        let rates = profile::rates::Rates {
+            kernel_curves: Some(vec![
                 // Reaches 8192 rows.
                 curve(1, 1024, 1024, 8192, None),
                 // Stopped by the bound at 2048: final.
@@ -4037,7 +4037,7 @@ mod curve_tests {
                     1024,
                     1024,
                     1024,
-                    Some((2048, profile::fire::KernelCurve::BOUND)),
+                    Some((2048, profile::curves::KernelCurve::BOUND)),
                 ),
                 // Short of 8192 with no stop: timed again.
                 curve(1, 2048, 1024, 4096, None),
@@ -4063,7 +4063,7 @@ mod curve_tests {
         // What a load saves keeps where the curves stopped and their points'
         // spreads, and reads back.
         let mut rates = rates;
-        if let Some(curves) = rates.kernel_tflops_by_shape.as_mut() {
+        if let Some(curves) = rates.kernel_curves.as_mut() {
             curves[0].spread = vec![(1, 0.0), (8192, 0.05)];
         }
         let text = format!("api = 1\n{}", rates.toml());
@@ -4071,7 +4071,7 @@ mod curve_tests {
             .load_user(&text, "test")
             .unwrap()
             .rates();
-        assert_eq!(read.kernel_tflops_by_shape, rates.kernel_tflops_by_shape);
+        assert_eq!(read.kernel_curves, rates.kernel_curves);
     }
 
     /// Stored curves sifted by their keys (`crate::stored`): under the same
@@ -4084,7 +4084,7 @@ mod curve_tests {
             on: &'static str,
             code: [(&'static str, u32); 2],
         }
-        impl profile::fire::Now for Build {
+        impl profile::rates::Now for Build {
             fn on(&self) -> String {
                 self.on.to_string()
             }
@@ -4113,12 +4113,12 @@ mod curve_tests {
             on: "vulkan 10de:2c31 driver 0x1",
             code: [("gemv", 1), ("tiled", 2)],
         };
-        let curve = |kind, key, n, kernel: &str| profile::fire::KernelCurve {
-            by: profile::fire::MeasuredBy {
+        let curve = |kind, key, n, kernel: &str| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy {
                 method: CURVE_METHOD,
                 kernels: vec![(
                     kernel.to_string(),
-                    profile::fire::Now::code(&build, kernel).unwrap(),
+                    profile::rates::Now::code(&build, kernel).unwrap(),
                 )],
             },
             kind,
@@ -4129,12 +4129,12 @@ mod curve_tests {
             stop: None,
             spread: Vec::new(),
         };
-        let stored = profile::fire::Rates {
-            kernel_tflops_by_shape: Some(vec![
-                curve(profile::fire::KernelCurve::VECTOR, 4, 1024, "gemv"),
-                curve(profile::fire::KernelCurve::TILE, 32, 1024, "tiled"),
-                curve(profile::fire::KernelCurve::VECTOR, 4, 2048, "gemv"),
-                curve(profile::fire::KernelCurve::TILE, 32, 2048, "tiled"),
+        let stored = profile::rates::Rates {
+            kernel_curves: Some(vec![
+                curve(profile::curves::KernelCurve::VECTOR, 4, 1024, "gemv"),
+                curve(profile::curves::KernelCurve::TILE, 32, 1024, "tiled"),
+                curve(profile::curves::KernelCurve::VECTOR, 4, 2048, "gemv"),
+                curve(profile::curves::KernelCurve::TILE, 32, 2048, "tiled"),
             ]),
             measured_on: Some(build.on.to_string()),
             ..Default::default()
@@ -4191,7 +4191,7 @@ mod wanted_tests {
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
-            kernel_tflops_by_shape: None,
+            kernel_curves: None,
             dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,

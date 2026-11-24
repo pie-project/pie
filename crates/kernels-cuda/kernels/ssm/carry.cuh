@@ -19,7 +19,8 @@ struct CarryLane {
 
 static_assert(sizeof(CarryLane) == 20, "CarryLane: `channel::RsLane` mirrors this layout");
 
-// A beam group's fold (BEAM-PAGE-LISTS §11.3): its representative lane, where
+// A beam group's fold (the rows its beams share, folded once by its
+// representative before the step reads any): its representative lane, where
 // its fold rows' spans start in the replay table, and how many rows (none
 // folds nothing).
 struct GroupFold {
@@ -133,7 +134,7 @@ struct Carry {
         locate(l, span_tok(replay_spans, l.replay_off, static_cast<u32>(j)), slot, tok);
     }
 
-    // The page slot of a beam group's j-th fold row (BEAM-PAGE-LISTS §11.3)
+    // The page slot of a beam group's j-th fold row
     // and its token in it: the j-th of the spans from `fold_off`, read through
     // the group's representative lane's rs pages as a carried row is.
     __device__ __forceinline__ void fold_at(const CarryLane& l, u32 fold_off, int j, u64& slot, u32& tok) const {

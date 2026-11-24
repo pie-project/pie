@@ -722,7 +722,7 @@ __global__ void copy_pages(
     }
 }
 
-// Beam page lists (new-memory/designs/BEAM-PAGE-LISTS.md): one group's step.
+// Beam page lists: one group's step.
 // The group's resident state, u32 words: a header (primed, fires run, the
 // pool's pages at the last fire), its
 // lists twice (the fire's and the one before, by the fire count's parity),
@@ -747,7 +747,7 @@ struct BeamListRun {
 
 static_assert(sizeof(BeamListRun) == 40, "BeamListRun: the Rust `channel::BeamListRun` mirrors this layout");
 
-// A beam's rs copy (§6.4 on a hybrid): the first `tokens` slots of pool page
+// A beam's rs copy (a fork's rows on a hybrid): the first `tokens` slots of pool page
 // `src` to pool page `dst` (the `[src, dst, tokens]` its group's step left
 // at `copy`), row by row of each plane, through the set's rs entries'
 // slot addresses (`bases`): a slot below the buffer (the prompt's tail, in
@@ -819,8 +819,9 @@ __global__ void copy_rs_rows(
 }
 
 // A group's step: its state, the parents its last epilogue wrote, its pool's
-// device ids, its lanes' list runs and fault words, and the numbers of §3;
-// on a hybrid its beams' rs rows (`RsRows`, §11.1, a beam each), which it
+// device ids, its lanes' list runs and fault words, and the fire's numbers
+// (the page size, the set's frozen slots, its pool's pages); on a hybrid
+// its beams' rs rows (`RsRows`, a beam each), which it
 // points at their lists as it leaves them.
 struct BeamStepRun {
     u32* state;
@@ -843,9 +844,11 @@ struct BeamStepRun {
 static_assert(sizeof(BeamStepRun) == 88, "BeamStepRun: the Rust `channel::BeamStepRun` mirrors this layout");
 
 
-// One block a group (blockIdx.x). §5 on the group's first fire, §6.1-6.3
-// after, then §6.5 over its lanes' staged tables; leaves this fire's copies
-// (§6.4) in its state for `copy_pages`.
+// One block a group (blockIdx.x). The group's first fire primes its lists;
+// every later one reorders them by the parents and frees the pages none
+// keeps; then each lane's staged table is resolved over its list. Leaves
+// this fire's page copies (a forked beam's page) in its state for
+// `copy_pages`.
 __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u32 width)
 {
     if (blockIdx.x >= run_count) return;
@@ -894,7 +897,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
     __shared__ u32 handed;
 
     if (primed == 0u) {
-        // §5: beam b on pool page b; page 0 is the prompt's where it ends
+        // Primed: beam b on pool page b; page 0 is the prompt's where it ends
         // mid-page, which beam 0 keeps and every other beam copies.
         for (u32 at = threadIdx.x; at < B * cap; at += blockDim.x)
             map_new[at] = (at % cap) == 0u ? at / cap : 0u;
@@ -911,7 +914,8 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
             if (B > Q) atomicMax(&r.faults[b], PIE_PAGES_EXHAUSTED);
         }
     } else {
-        // §6.1-6.2.
+        // Each beam's list is its parent's; a forked beam's last page is
+        // copied to a free one.
         for (u32 b = threadIdx.x; b < B; b += blockDim.x) {
             const u32 p = r.parents[b];
             if (p >= B) {
@@ -921,7 +925,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
                 parent_of[b] = p;
             }
         }
-        // The pool grows a column at a time (§3): pages that joined it since
+        // The pool grows a column at a time: pages that joined it since
         // the last fire are free.
         const u32 grown = header[2] < Q ? header[2] : Q;
         for (u32 q = grown + threadIdx.x; q < Q; q += blockDim.x)
@@ -980,7 +984,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
         }
         __syncthreads();
         // Only the columns up to this fire's are live (later ones are
-        // unspecified, §4).
+        // unspecified).
         const u32 live = c + 1u < cap ? c + 1u : cap;
         for (u32 at = threadIdx.x; at < B * live; at += blockDim.x) {
             const u32 b = at / live, j = at % live;
@@ -994,7 +998,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
             copies[b * 3u + 1u] = copy ? fresh[b] : 0u;
             copies[b * 3u + 2u] = copy ? o : 0u;
         }
-        // §6.3: the pages freed `frames` fires ago join the free ones; this
+        // The pages freed `frames` fires ago join the free ones; this
         // fire's take their slot of the ring.
         for (u32 q = threadIdx.x; q < cap; q += blockDim.x) {
             bool taken = false;
@@ -1018,7 +1022,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
         }
     }
     __syncthreads();
-    // §6.5: each lane's staged entries past `f0` and its rows' write pages.
+    // Each lane's staged entries past `f0` and its rows' write pages.
     for (u32 i = 0u; i < r.list_count; ++i) {
         const BeamListRun l = r.lists[i];
         const u32* list = map_new + l.lane * cap;
@@ -1050,7 +1054,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
             l.write_page[row] = r.trans[q];
         }
     }
-    // The group's common slot (BEAM-PAGE-LISTS §11.3, §11.4): the depth of
+    // The group's common slot: the depth of
     // its live lanes' most recent common ancestor, whatever the guest forks
     // them for. `lca[i][j]` holds, for lanes i != j, the slot below which
     // their rows agree: lanes forked from one parent agree below this fire's
@@ -1089,7 +1093,7 @@ __global__ void beam_step(const BeamStepRun* __restrict__ runs, u32 run_count, u
     }
 }
 
-// A windowed fire's ring fold (CONTRACT-BC 19): each run copies `bytes` of
+// A windowed fire's ring fold, after every read its lanes make: each run copies `bytes` of
 // a row run from a window-buffer or own-row page onto its ring page, a
 // block a run.
 struct CopyRun {

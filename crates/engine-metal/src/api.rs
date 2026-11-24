@@ -34,6 +34,10 @@ pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<std::path::PathBuf>,
+    /// `[metal] cache`: pie's engine cache directory, where the Neural
+    /// Engine's compiled programs are kept between runs. `None` (a test or
+    /// a tool stating no home): a directory of the system's temporary one.
+    pub cache: Option<std::path::PathBuf>,
     /// `[metal] measure`: whether a load times what no stored or committed
     /// profile states under a matching key.
     pub measure: engine::rates::Measuring,
@@ -675,6 +679,7 @@ impl Engine for Metal {
 
             prepared
                 .set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
+            prepared.set_ane_cache(self.boot.cache.clone());
             match prepared.load() {
                 Ok(shell) => break shell,
                 Err(Fault::FitShort(short)) => {
@@ -771,7 +776,7 @@ impl Engine for Metal {
             kv_handle: None,
             media_encode: false,
             rs_verbs: shell.serves_rs_verbs(),
-            // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): a load
+            // Windowed layers as ring + buffer: a load
             // with any states the rings and the window buffer in its facts.
             windowed_state: shell.pool_ring().is_some(),
             rs_snapshots: crate::rs::snapshots(shell.trace()),
@@ -791,7 +796,7 @@ impl Engine for Metal {
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24), computed before the walk, which fires each.
+        // facts, computed before the walk, which fires each.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
@@ -973,7 +978,7 @@ impl Engine for Metal {
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -1510,7 +1515,7 @@ impl Metal {
             })?;
         }
         // A lane names its kv pages, its window pages and its state record
-        // in its slot tables (CONTRACT-BC 4): this engine states one shared
+        // in its slot tables: this engine states one shared
         // pool, so the runtime states them. A device-geometry lane's list
         // table is its working set's whole mapped table, which its ports'
         // page indexes translate through.
@@ -1596,7 +1601,7 @@ impl Metal {
             shell.copy_records(&forks, &ring_forks).map_err(fault)?;
         }
         // Tail copies (an rs-list or kv slot a fork shares) land before any
-        // lane of the fire reads or writes (CONTRACT-BC 20).
+        // lane of the fire reads or writes.
         let slot_copies: Vec<_> = submission
             .lanes
             .iter()
@@ -1631,8 +1636,8 @@ impl Metal {
                         Readout::Last | Readout::None => None,
                     },
                     // A beam group's lane resolves through its working set's
-                    // whole reserve (the pool its list's entries name,
-                    // BEAM-PAGE-LISTS §6.5); any other lane through its own
+                    // whole reserve (the pool its list's entries name);
+                    // any other lane through its own
                     // table.
                     translation: if lane.reserve.is_empty() {
                         match lane.list {

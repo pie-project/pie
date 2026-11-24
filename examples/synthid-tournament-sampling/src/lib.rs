@@ -420,8 +420,7 @@ async fn main(input: Input) -> Result<Output> {
     let g0 = tok_out_p.take_host::<i32>().await?;
     // A stop token ends the text and is not part of it, as every chat
     // inferlet here ends its text.
-    let stop_tokens = inferlet::chat::stop_tokens();
-    let stopped = stop_tokens.contains(&(g0 as u32));
+    let stopped = chat::is_stop(g0 as u32);
     if !stopped {
         if stream {
             inferlet::session::send("t:1");
@@ -475,7 +474,7 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
-            if stop_tokens.contains(&(t as u32)) {
+            if chat::is_stop(t as u32) {
                 return Ok(ControlFlow::Break(()));
             }
             if stream {

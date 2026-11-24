@@ -244,7 +244,7 @@ impl Group {
                 }
                 Ok((rank, Err(error))) => {
                     heard += 1;
-                    eprintln!("engine-cuda: tensor-parallel rank {rank} refused: {error}");
+                    tracing::warn!("tensor-parallel rank {rank} refused: {error}");
                     if refused.is_none() {
                         // Every rank refusing the same lanes ran nothing:
                         // the group stays whole (`engine::Error::Lanes`).
@@ -265,8 +265,8 @@ impl Group {
                                         (&error, &lanes),
                                         (Error::Lanes(these), Some(first)) if these == first
                                     );
-                                    eprintln!(
-                                        "engine-cuda: tensor-parallel rank {rank} refused: {error}"
+                                    tracing::warn!(
+                                        "tensor-parallel rank {rank} refused: {error}"
                                     );
                                 }
                                 Ok(_) => {
@@ -294,7 +294,7 @@ impl Group {
                          within {}s; the group is aborted and poisoned",
                         wait.as_secs()
                     );
-                    eprintln!("engine-cuda: {why}");
+                    tracing::warn!("{why}");
                     self.poison_with(&why);
                     refused = Some(Error::Device(why));
                     break;
@@ -336,7 +336,7 @@ impl Group {
         })?;
         shell.bind_thread()?;
         verb(&mut shell).inspect_err(|error| {
-            eprintln!("engine-cuda: tensor-parallel rank {rank} refused: {error}");
+            tracing::warn!("tensor-parallel rank {rank} refused: {error}");
         })
     }
 
@@ -405,7 +405,7 @@ impl Engine for Group {
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
-        // The shared pool's tiers (CONTRACT-BC 22): each rank pins and opens
+        // The shared pool's tiers: each rank pins and opens
         // its own, and the group moves what every rank holds.
         let least = |of: fn(&engine::chunk::ChunkFacts) -> u32| {
             answers
@@ -655,8 +655,8 @@ impl Engine for Group {
         self.lead(move |rank| rank.copy_kv(&copy))
     }
 
-    /// Each rank moves its band of every slot to and from its own tiers
-    /// (CONTRACT-BC 22).
+    /// Each rank moves its band of every slot to and from its own tiers,
+    /// whole slots laid alike.
     fn commit_segments(&mut self, segments: u32) -> EngineResult<()> {
         self.lead(move |rank| rank.commit_segments(segments))
     }

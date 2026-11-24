@@ -261,7 +261,7 @@ describe('eta state binding', () => {
   });
 });
 
-describe('final rows (CONTRACT-BC 25)', () => {
+describe('final rows', () => {
   const stub = (fwd: ForwardPass) => fwd.wit as unknown as ForwardPassStub;
   const pass = () => {
     const fwd = new ForwardPass();
@@ -282,6 +282,10 @@ describe('final rows (CONTRACT-BC 25)', () => {
     lagged.attachProgram();
     expect(stub(lagged).finalStated).toBe(0);
     expect(() => lagged.retractable()).toThrow(/already attached/);
+
+    const beam = pass();
+    stub(beam).finalRefusal = 'a beam';
+    expect(() => beam.attachProgram()).toThrow(/final-rows: a beam .*ForwardPass\.retractable\(\)/);
   });
 
   it('retracts past a run-ahead break only for a retractable pass', () => {

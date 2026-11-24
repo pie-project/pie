@@ -411,7 +411,7 @@ fn routing(trace: &Trace) -> Option<(u32, u32)> {
 /// model attends, the scan rate where it carries recurrent state.
 pub fn estimate(
     counts: &Counts,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
 ) -> Result<FireEstimate, &'static str> {
     let constants = crate::roofline::Constants::of(rates)?;
     if counts.attn_flops_per_row_key > 0 && rates.attn_tflops_by_keys.is_none() {
@@ -475,7 +475,7 @@ pub fn choose(
     rungs: &[RungFacts],
     live: u64,
     context: u32,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     device: &str,
     counts: &Counts,
 ) -> Result<(TopRung, FireEstimate), Refused> {
@@ -488,7 +488,7 @@ pub fn choose_tiled(
     rungs: &[RungFacts],
     live: u64,
     context: u32,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     row_tile: Option<crate::roofline::RowTile>,
     device: &str,
     counts: &Counts,
@@ -508,7 +508,7 @@ pub fn choose_shaped(
     rungs: &[RungFacts],
     live: u64,
     context: u32,
-    rates: &profile::fire::Rates,
+    rates: &profile::rates::Rates,
     device: &str,
     counts: &Counts,
     shape: impl FnOnce(
@@ -534,7 +534,7 @@ pub fn line_of(
     top: u32,
     span: u64,
     live: u64,
-    tuned: &profile::fire::Tuned,
+    tuned: &profile::rates::Tuned,
 ) -> String {
     let r = &tuned.rates;
     let rates = format!(
@@ -571,7 +571,7 @@ pub fn line_of(
 /// constants>; saved to <path>` (or kept for this load alone); `None` where
 /// its profile stated them.
 #[must_use]
-pub fn measured_line(tuned: &profile::fire::Tuned) -> Option<String> {
+pub fn measured_line(tuned: &profile::rates::Tuned) -> Option<String> {
     if !tuned.measured_this_load {
         return None;
     }
@@ -642,22 +642,22 @@ mod tests {
         }
     }
 
-    fn rates() -> profile::fire::Rates {
-        profile::fire::Rates {
+    fn rates() -> profile::rates::Rates {
+        profile::rates::Rates {
             launch_ns: Some(5),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 5.0), (4096, 10.0)])]),
             attn_tflops_by_keys: Some(vec![(2048, 7.0)]),
             hbm_gbps: Some(100.0),
             elementwise_gbps: Some(50.0),
             scan_gelems: None,
-            ..profile::fire::Rates::default()
+            ..profile::rates::Rates::default()
         }
     }
 
     #[test]
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = [rung(1024, 100 * MIB, None), rung(2048, 150 * MIB, None)];
-        let bare = profile::fire::Rates::default();
+        let bare = profile::rates::Rates::default();
         let err = choose(&rungs, 1 << 33, u32::MAX, &bare, "Card X", &counts()).unwrap_err();
         assert!(
             err.to_string()
@@ -669,7 +669,7 @@ mod tests {
                 .contains("`pie tune <backend> --rates` measures it"),
             "{err}"
         );
-        // No feasible rung at all: the ruling's refusal.
+        // No feasible rung at all: the fire-top rule's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let err = choose(&none, 1 << 33, u32::MAX, &rates(), "Card X", &counts()).unwrap_err();
         assert!(matches!(err, Refused::NoRung(_)), "{err}");
@@ -707,28 +707,28 @@ mod tests {
         for (key, unstated) in [
             (
                 "hbm_gbps",
-                profile::fire::Rates {
+                profile::rates::Rates {
                     hbm_gbps: None,
                     ..rates()
                 },
             ),
             (
                 "gemm_tflops_by_rows",
-                profile::fire::Rates {
+                profile::rates::Rates {
                     gemm_tflops_by_rows: None,
                     ..rates()
                 },
             ),
             (
                 "elementwise_gbps",
-                profile::fire::Rates {
+                profile::rates::Rates {
                     elementwise_gbps: None,
                     ..rates()
                 },
             ),
             (
                 "attn_tflops_by_keys",
-                profile::fire::Rates {
+                profile::rates::Rates {
                     attn_tflops_by_keys: None,
                     ..rates()
                 },
@@ -744,7 +744,7 @@ mod tests {
             estimate(&recurrent, &rates()).map(|_| ()),
             Err("scan_gelems")
         );
-        let scanned = profile::fire::Rates {
+        let scanned = profile::rates::Rates {
             scan_gelems: Some(3.0),
             ..rates()
         };
@@ -760,7 +760,7 @@ mod tests {
             attn_flops_per_row_key: 0,
             ..counts()
         };
-        let no_attn = profile::fire::Rates {
+        let no_attn = profile::rates::Rates {
             attn_tflops_by_keys: None,
             ..rates()
         };
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn the_refusal_names_the_key_unstated() {
         let rungs = [rung(1024, 100 * MIB, None)];
-        let rates = profile::fire::Rates {
+        let rates = profile::rates::Rates {
             attn_tflops_by_keys: None,
             ..rates()
         };
@@ -783,7 +783,7 @@ mod tests {
         );
         // A rate that settled at nothing is refused by the same name, never
         // divided by.
-        let zero = profile::fire::Rates {
+        let zero = profile::rates::Rates {
             attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 4.0)]),
             ..self::rates()
         };
@@ -945,18 +945,18 @@ mod tests {
                 live_share: 0.25,
             },
         };
-        let tuned = profile::fire::Tuned {
-            rates: profile::fire::Rates {
+        let tuned = profile::rates::Tuned {
+            rates: profile::rates::Rates {
                 gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 249.0)])]),
                 hbm_gbps: Some(654.0),
                 launch_ns: Some(1620),
-                ..profile::fire::Rates::default()
+                ..profile::rates::Rates::default()
             },
             measured_this_load: false,
             saved_to: None,
             frame_cut: false,
             refused: None,
-            ..profile::fire::Tuned::default()
+            ..profile::rates::Tuned::default()
         };
         assert_eq!(
             line_of(&top, 2048, 512 * MIB, 2 << 30, &tuned),
@@ -964,7 +964,7 @@ mod tests {
              of 2.0 GiB live; the profile's rates: 249.0 TFLOP/s bf16, 654 GB/s, launch 1620 ns"
         );
         // Measured by this load and saved: the line says so, and where.
-        let measured = profile::fire::Tuned {
+        let measured = profile::rates::Tuned {
             measured_this_load: true,
             saved_to: Some("/home/u/.pie/profiles/cuda/user/nvidia-l40s.toml".into()),
             ..tuned

@@ -277,45 +277,6 @@ pub fn backed(lanes: u32, slot: u32, folded: u32, page: u32, frames: u32, reserv
         .min(reserve)
 }
 
-/// Why a lane's fault word faults it (§7).
-#[must_use]
-pub fn fault_reason(code: u32, lane: usize) -> String {
-    let why = match code {
-        kb::PAGES_PAST_RESERVE => "names a page past its working set's pool",
-        kb::PAGES_SHORT => "is shorter than the pages the lane reads",
-        kb::PAGES_BELOW_FLOOR => {
-            "would land a row below its working set's frozen slots or past its reserve"
-        }
-        kb::PAGES_COPY_BOUNDS => {
-            "states a page copy past its working set's pool, longer than a page, or into frozen \
-             slots"
-        }
-        kb::PAGES_PARENT => "continues a parent past its beams",
-        kb::PAGES_TOO_WIDE => {
-            tracing::error!(
-                lane,
-                "engine-gpu: BUG: a beam group's step record passes the step's bounds; its \
-                 width and pool are admitted at its bind"
-            );
-            "is in a group whose step record passes the step's bounds (more beams than its \
-             tables hold, or a pool past its state's columns): nothing was stepped"
-        }
-        kb::PAGES_EXHAUSTED => {
-            tracing::error!(
-                lane,
-                "engine-gpu: BUG: a beam group found fewer free pages than it hands out; its \
-                 pool is sized exactly (BEAM-PAGE-LISTS.md §3)"
-            );
-            "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
-        }
-        _ => "faulted",
-    };
-    format!(
-        "Overreach: lane {lane}'s page list {why}; nothing was written outside its own working \
-         set, and the lane is failed"
-    )
-}
-
 /// A part of the room, filled from its first word: refused by name past
 /// what the load laid.
 struct Part {

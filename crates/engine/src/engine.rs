@@ -867,9 +867,5 @@ pub trait Engine: Send {
     }
 }
 
-const _: () = {
-    #[allow(dead_code)]
-    fn object_safe(engine: &dyn Engine) -> &'static str {
-        engine.kind()
-    }
-};
+// `Engine` stays object safe: the runtime holds engines as `dyn Engine`.
+const _: Option<&dyn Engine> = None;

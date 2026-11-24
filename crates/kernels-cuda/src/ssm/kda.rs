@@ -539,7 +539,7 @@ pub fn kda_chunked(
     )
 }
 
-/// Folds each beam group's fold rows (`BEAM-PAGE-LISTS.md` §11.3, `carry`'s
+/// Folds each beam group's fold rows (`carry`'s
 /// planes forget, beta, keys, `u`) into its KDA state, as a decode step
 /// folds a committed row, the rows stored once.
 /// The groups that fold lead `folds` (`groups` entries at most, the first of

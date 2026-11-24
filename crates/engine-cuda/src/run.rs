@@ -363,7 +363,7 @@ pub struct RsSeat<'a> {
     pub splits: bool,
     pub scratch: Option<&'a RsScratch>,
     /// The beam groups' fold table and its entries, where the fire stages
-    /// folds (§11.3): every recurrent layer folds them ahead of the body.
+    /// folds: every recurrent layer folds them ahead of the body.
     pub folds: Option<(u64, u32)>,
 }
 
@@ -1425,8 +1425,8 @@ impl<'c> Run<'c> {
     /// The carried rows a decode step of this window reads: the staged
     /// tables, the commit lengths of `pool` and the places of the step's
     /// buffered `planes` (in the order its kernel reads them).
-    /// The beam groups' folds a recurrent layer runs before its step
-    /// (`BEAM-PAGE-LISTS.md` §11.3): a carry over the fire's whole lane table
+    /// The beam groups' folds a recurrent layer runs before its step: a
+    /// carry over the fire's whole lane table
     /// (a fold names its representative by its fire lane) placing `planes`,
     /// the fold table, and its entries. `None`: the fire's body folds none.
     pub(crate) fn rs_group_folds(

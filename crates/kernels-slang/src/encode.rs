@@ -334,12 +334,10 @@ pub(crate) fn instantiated(op: &'static str, name: String) -> Result<&'static st
         .ok_or_else(|| refuse(op, format!("no kernel is instantiated as `{name}`")))
 }
 
-#[allow(dead_code)]
 pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the shader's int")))
 }
 
-#[allow(unused_macros)]
 macro_rules! dtype_dispatch {
     ($op:expr, $dtype:expr, { $($stamped:ident => $arm:expr),+ $(,)? }) => {
         match $dtype {
@@ -354,5 +352,4 @@ macro_rules! dtype_dispatch {
     };
 }
 
-#[allow(unused_imports)]
 pub(crate) use dtype_dispatch;

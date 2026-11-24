@@ -200,8 +200,7 @@ impl Cuda {
         // Dense weights always live on the device. The weight cache streams
         // the routed banks it takes an expert at a time: the plan seats none
         // itself.
-        let diagnostics = &self.boot.knobs.diagnostics;
-        let cached = if self.boot.knobs.dense_weights() || diagnostics.dense_experts {
+        let cached = if self.boot.knobs.dense_experts() {
             Vec::new()
         } else {
             crate::store::layout::streamed_experts(trace)
@@ -235,7 +234,7 @@ impl Cuda {
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -604,8 +603,8 @@ impl Engine for Cuda {
 
     fn cover_fingerprint(&self) -> Option<String> {
         let print = self.shell.as_ref()?.cover_fingerprint();
-        eprintln!(
-            "engine-cuda: the host cover's key: {print} (the device, its kernels' code, the \
+        tracing::info!(
+            "the host cover's key: {print} (the device, its kernels' code, the \
              guest emitter's version, the decode products' picks and a fire's lanes and tokens)"
         );
         Some(print)
@@ -730,8 +729,8 @@ impl Engine for Cuda {
         };
         if let Some(ring) = &ring {
             let size = ring.size();
-            eprintln!(
-                "engine-cuda: the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
+            tracing::info!(
+                "the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
                  piece for each of 2 stages for each of {frames} frames in flight)",
                 size.bytes() >> 20,
                 size.pieces,
@@ -819,8 +818,8 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
         if memory.unified() {
-            eprintln!(
-                "engine-cuda: {} ({} disk kv pages)",
+            tracing::info!(
+                "{} ({} disk kv pages)",
                 engine::DeviceMemory::NO_HOST_TIER,
                 disk_pages
             );
@@ -928,7 +927,7 @@ impl Engine for Cuda {
             steps: engine::StatedSteps::default(),
         };
         // The set as the load states it, from its stated facts, with those
-        // the arm walk left eager (CONTRACT-BC 24). It is the set the walk
+        // the arm walk left eager. It is the set the walk
         // took: a fire's stamped shape names the walk's shape.
         let stated = engine::StepShapes::of(
             &steps,
@@ -944,16 +943,16 @@ impl Engine for Cuda {
         }
         let mut caps = caps;
         caps.steps = shell.stated_steps(stated);
-        eprintln!(
-            "engine-cuda: step set: {}; {} stated eager",
+        tracing::info!(
+            "step set: {}; {} stated eager",
             caps.steps.shapes.census(),
             caps.steps.eager.len(),
         );
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
         // decode wave seats at most `max_lanes` lanes.
-        eprintln!(
-            "engine-cuda: fire limits: {} lanes, {} rows, {} readouts",
+        tracing::info!(
+            "fire limits: {} lanes, {} rows, {} readouts",
             caps.limits.max_lanes, caps.limits.max_tokens, caps.limits.max_readouts,
         );
         self.replay = crate::replay::Replay::of(&shell);
@@ -1223,7 +1222,7 @@ impl Engine for Cuda {
         let shell = self.loaded_mut()?;
         shell.take_refs();
         if from != Tier::Device || to != Tier::Device {
-            // Between tiers (CONTRACT-BC 22): whole slots, each laid alike.
+            // Between tiers: whole slots, each laid alike.
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
                     "token runs move within the device; between tiers a slot moves whole".into(),
@@ -1611,8 +1610,8 @@ impl Engine for Cuda {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        // The host and disk tiers move through `copy_slots` (CONTRACT-BC
-        // 22): a kv copy is within the device.
+        // The host and disk tiers move through `copy_slots`, whole slots
+        // laid alike: a kv copy is within the device.
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
@@ -1623,7 +1622,7 @@ impl Engine for Cuda {
         let page_size = self.loaded_mut()?.paging().page_size;
         let moves = copy.runs(page_size)?;
         // Windowed pages a write into a shared one copies first ride the
-        // pre-launch copy beside the kv list's (CONTRACT-BC 19).
+        // pre-launch copy beside the kv list's.
         let windowed: Vec<engine::transfer::KvRun> = copy
             .windowed
             .iter()
@@ -1670,7 +1669,7 @@ impl Cuda {
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -1841,8 +1840,8 @@ impl Cuda {
             nulls.push(matches!(lane.record, engine::fire::LaneRecord::Null));
             let record = match pieces {
                 [] => None,
-                // A record's pieces: its rings' first, then its state's
-                // (CONTRACT-BC 21), named as one record by its first.
+                // A record's pieces: its rings' first, then its state's,
+                // named as one record by its first.
                 stated
                     if stated.iter().all(|(shape, _)| *shape == FIXED || *shape == RING)
                         && stated.windows(2).all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>
@@ -1904,16 +1903,6 @@ impl Cuda {
                 .find(|(id, _)| *id == shape)
                 .map(|(_, refs)| refs.as_slice())
         }
-        // Each lane's refs of the window lists past the first, a list each.
-        let more_windows: Vec<Vec<&[u32]>> = submission
-            .lanes
-            .iter()
-            .map(|lane| {
-                (1..crate::store::layout::MOST_WINDOWS)
-                    .map_while(|at| table(lane, crate::store::layout::window_id(at)))
-                    .collect()
-            })
-            .collect();
         // A lane's list kind says what its list table holds: its pages, or
         // the working set's mapped pages its program's page indexes address
         // (a device-geometry instance's lane).
@@ -1954,7 +1943,6 @@ impl Cuda {
                     write_end: lane.kv.write_end,
                     window: table(lane, WINDOW).unwrap_or(&[]),
                     window_fold: lane.window.clone(),
-                    more_windows: &more_windows[at],
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     rs: lane.rs.clone(),

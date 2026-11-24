@@ -1,5 +1,5 @@
 //! What a measurement this engine stores in a device's profile is keyed by
-//! ([`profile::fire::Now`]): the device as its measurements depend on it,
+//! ([`profile::rates::Now`]): the device as its measurements depend on it,
 //! the version of the method that measured it (a constant here, beside the
 //! measuring code's rule: bumped only when that method changes), and the
 //! code of each kernel it fired. A load takes each stored or committed
@@ -13,7 +13,7 @@
 //! capability and driver, the carried library's text with the NVRTC that
 //! compiles it, and cuBLASLt's version.
 
-use profile::fire::{KEYED, MeasuredBy, Now, Rates};
+use profile::rates::{KEYED, MeasuredBy, Now, Rates};
 
 /// The version of the method `rates::measure` measures each roofline rate
 /// by (`rates::KEYS`).
@@ -110,7 +110,7 @@ fn method(what: &str) -> Option<u32> {
         Some(RATES_METHOD)
     } else if what == PRODUCT_NS {
         Some(PRODUCT_METHOD)
-    } else if what == profile::fire::LANDING {
+    } else if what == profile::rates::LANDING {
         Some(LANDING_METHOD)
     } else {
         None
@@ -141,7 +141,7 @@ mod backend {
     pub(super) fn fired(what: &str) -> &'static [&'static str] {
         match what {
             "gemm_tflops_by_rows" => &[BLASLT],
-            "hbm_gbps" | profile::fire::LANDING => &[],
+            "hbm_gbps" | profile::rates::LANDING => &[],
             super::PRODUCT_NS => &[LIBRARY_KERNELS, BLASLT],
             _ => &[LIBRARY_KERNELS],
         }
@@ -173,7 +173,7 @@ mod backend {
     pub(super) fn fired(what: &str) -> &'static [&'static str] {
         match what {
             "gemm_tflops_by_rows" => &[BLASLT],
-            "hbm_gbps" | profile::fire::LANDING => &[],
+            "hbm_gbps" | profile::rates::LANDING => &[],
             super::PRODUCT_NS => &[LIBRARY_KERNELS, BLASLT],
             _ => &[LIBRARY_KERNELS],
         }

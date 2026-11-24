@@ -122,7 +122,7 @@ impl Shell {
         } else {
             Vec::new()
         };
-        // Each beam group's common slot (§11.3), read after the fault words.
+        // Each beam group's common slot, read after the fault words.
         let commons: Vec<(u64, engine::InstanceId)> =
             if done.is_some() && prepared.page_faults.is_some() {
                 prepared.page_work.commons.clone()
@@ -267,7 +267,7 @@ impl Shell {
                         outcome.fault_lanes(
                             lane32..lane32 + 1,
                             Some(instance),
-                            &super::pages::fault_reason(word, lane),
+                            &engine::beam::fault_reason(word, lane, "engine-cuda"),
                         );
                     }
                 }

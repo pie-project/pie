@@ -170,7 +170,7 @@ impl Serve for Api {
     fn save_rates(
         device: &Context,
         boot: &crate::api::DeviceBoot,
-        rates: &profile::fire::Rates,
+        rates: &profile::rates::Rates,
     ) -> Result<()> {
         crate::rates::save_rates(device, boot.profiles.as_deref(), rates)
     }

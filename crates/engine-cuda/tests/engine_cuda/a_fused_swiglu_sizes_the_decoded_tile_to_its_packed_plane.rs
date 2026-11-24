@@ -8,6 +8,7 @@ use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_
 use poem_compiler::Budget;
 use poem_ir::GluAct;
 use poem_ir::{Fused, Operation, Trace};
+use crate::common::bf16_bits;
 
 const VOCAB: u32 = 1000;
 // The packed gate-up plane decodes to 16 MiB of bf16 and the down plane to
@@ -75,12 +76,6 @@ impl Lcg {
     fn unit(&mut self) -> f32 {
         ((self.next() >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     }
-}
-
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding) >> 16) as u16
 }
 
 fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, k: usize, seed: u64) {

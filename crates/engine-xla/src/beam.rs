@@ -119,33 +119,3 @@ impl BeamLane {
     }
 }
 
-/// Why a beam's fault word (`BEAM-PAGE-LISTS.md` §7) fails its lane, named.
-#[must_use]
-pub fn fault_reason(code: u32, lane: u32) -> String {
-    use kernels_xla::beam::fault;
-    let why = match i64::from(code) {
-        fault::PAST_RESERVE => "names a page past its working set's pool",
-        fault::SHORT => "is shorter than the pages the lane reads",
-        fault::BELOW_FLOOR => {
-            "would land a row below its working set's frozen slots or past its reserve"
-        }
-        fault::COPY_BOUNDS => {
-            "states a page copy past its working set's pool, longer than a page, or into frozen \
-             slots"
-        }
-        fault::PARENT => "continues a parent past its beams",
-        fault::RESERVE_EXHAUSTED => {
-            tracing::error!(
-                lane,
-                "engine-xla: BUG: a beam group found fewer free pages than it hands out; its pool \
-                 is sized exactly (BEAM-PAGE-LISTS.md §3)"
-            );
-            "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
-        }
-        _ => "faulted",
-    };
-    format!(
-        "Overreach: lane {lane}'s page list {why}; nothing was written outside its own working \
-         set, and the lane is failed"
-    )
-}

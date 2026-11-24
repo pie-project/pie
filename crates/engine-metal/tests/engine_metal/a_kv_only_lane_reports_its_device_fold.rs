@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{
-    ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer,
 };
 use eta_ir::op::Op;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Port, PortMask, Stage};
@@ -25,20 +25,10 @@ use engine_metal::serve::{Attached, Seated, StepView};
 use engine_metal::{Done, Lane, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{fixture_of, load_with, word};
+use crate::common::{const_port};
 
 const ROWS: u32 = 5;
 const FOLD: u32 = 3;
-
-fn const_port(port: Port, words: &[u32]) -> PortBinding {
-    PortBinding {
-        port,
-        source: PortSource::Const {
-            dtype: EtaDtype::U32,
-            shape: Shape::vector(words.len() as u32),
-            data: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        },
-    }
-}
 
 /// One lane of `ROWS` tokens; with `fold`, a `fold` port stating `FOLD` for
 /// it. The epilogue puts the logits' argmax in a ring.

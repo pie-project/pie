@@ -1013,6 +1013,10 @@ pub struct Roles {
     disk: Option<Disk>,
     shapes: RoleShapes,
     programs: HashMap<ProgramId, ProgramFacts>,
+    /// Each holder's largest bind room so far, in runs of whole chunks:
+    /// its scratch and its pair's state laid fresh, and the single chunks
+    /// beside them ([`Self::bind_claim`]).
+    bind_claims: HashMap<Holder, Vec<(u32, u32)>>,
     items: Items,
     /// The host writes held while their instance's slots are parked or
     /// not yet rebound, in the order they were asked.
@@ -1107,6 +1111,7 @@ impl Roles {
             disk: None,
             shapes,
             programs: HashMap::new(),
+            bind_claims: HashMap::new(),
             items: Items::new(),
             held: Vec::new(),
             chunk_slots,

@@ -474,6 +474,10 @@ impl<B: Host> Gpu<B> {
             self.live.tally(engine::live::Tally::BoundInFire, bound);
             self.warn_in_fire("what a dispatch binds (a bind group the load's walk did not build)");
         }
+        let laid = self.shell.as_mut().map_or(0, Shell::laid_serving);
+        if laid > 0 {
+            self.live.tally(engine::live::Tally::LaidAtFirstFire, laid);
+        }
         let filled = self.shell.as_mut().map_or(0, Shell::filled_serving);
         if filled > 0 {
             self.live.tally(engine::live::Tally::FilledInFire, filled);
@@ -1203,8 +1207,8 @@ where
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the walk's own branch
-        // (sc/gpu-arm-before-ready) consumes it before ready.
+        // facts, computed once the caps are: the arm walk keys on them before
+        // ready.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
@@ -1747,9 +1751,9 @@ where
         // What the settle decided so far, kept in the user's profile for
         // the next load of the same curves, model, rungs and build.
         if let Some(settled) = shell.take_settled() {
-            let rates = profile::fire::Rates {
+            let rates = profile::rates::Rates {
                 dense_settled: vec![settled],
-                ..profile::fire::Rates::default()
+                ..profile::rates::Rates::default()
             };
             if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
                 tracing::warn!(%why, "the dense settle was not kept in the profile");
@@ -1816,8 +1820,10 @@ where
 
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
-        if let Some(shell) = self.shell.as_mut() {
-            let _ = shell.reap();
+        if let Some(shell) = self.shell.as_mut()
+            && let Err(fault) = shell.reap()
+        {
+            tracing::warn!(%fault, "reaping landed frames before a fire");
         }
     }
 

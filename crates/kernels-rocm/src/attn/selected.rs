@@ -17,10 +17,6 @@ const GROUPS: i32 = BLOCK as i32 / 32;
 /// Elements of a head one lane holds (`kMaxPer`): heads up to 512 wide.
 const MAX_PER: i32 = 16;
 
-/// Blocks enough to fill the device before a block shares its groups out
-/// over more than one head.
-const WAVE_TARGET: i64 = 296;
-
 /// The matrix-core walk's block (`kSelThreads`) and the keys its LDS lists
 /// a window at a time (`kSelTable`): a block of keys wider than that takes
 /// the vector walk.
@@ -33,11 +29,13 @@ const MAX_SPLITS: u32 = 16;
 const MERGE_BLOCK: u32 = 256;
 
 /// The query heads one block answers: as many as divide the heads, down to
-/// one when fewer blocks would leave the device idle.
-fn head_group(num_heads: i32, total_tokens: i32) -> i32 {
+/// one when fewer blocks than the device's `cus` compute units would leave
+/// it idle.
+fn head_group(num_heads: i32, total_tokens: i32, cus: u32) -> i32 {
     let mut g = GROUPS;
     while g > 1
-        && (num_heads % g != 0 || i64::from(total_tokens) * i64::from(num_heads / g) < WAVE_TARGET)
+        && (num_heads % g != 0
+            || i64::from(total_tokens) * i64::from(num_heads / g) < i64::from(cus))
     {
         g >>= 1;
     }
@@ -165,7 +163,7 @@ fn selected(
         );
     }
 
-    let g = head_group(q_heads, total_tokens);
+    let g = head_group(q_heads, total_tokens, ctx.multiprocessors(op)?);
     #[allow(clippy::cast_sign_loss)]
     let launch = Launch::grid(
         [

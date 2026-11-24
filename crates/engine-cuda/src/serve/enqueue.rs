@@ -200,8 +200,6 @@ impl Shell {
             airborne: &self.airborne,
             shifted: &self.shifted,
             schedule_readers: &self.schedule_readers,
-            decoding: &self.decoding,
-            tiers: &self.tiers,
             decoded_tiles: &self.decoded_tiles,
             expert_staged: self.expert_staged.as_ref(),
             guest_faults: &mut self.guest_faults,
@@ -237,7 +235,7 @@ impl Shell {
 }
 
 impl Shell {
-    /// A windowed fire's fold (CONTRACT-BC 19): the rows it folds, from
+    /// A windowed fire's fold: the rows it folds, from
     /// their buffer or own-row pages onto their ring pages, after its
     /// forward on its stream.
     fn fold_rings(&mut self, work: &super::ring::Work) -> Result<()> {
@@ -311,8 +309,6 @@ struct FireCtx<'a> {
     airborne: &'a Airborne,
     shifted: &'a [bool],
     schedule_readers: &'a [Option<u32>],
-    decoding: &'a poem_ir::ClassSet,
-    tiers: &'a record::Tiers,
     decoded_tiles: &'a [u64],
     /// Where a select stages a host-resident bank's experts.
     expert_staged: Option<&'a crate::experts::staging::Staged>,
@@ -693,7 +689,7 @@ impl FireCtx<'_> {
         // A fire that runs the side streams carves the arena laid out for
         // them (`CompiledModel::arena_forked`); the rest the one in order.
         let forks = !self.device.side_ctx().is_empty()
-            && record::forks(self.compiled, p.composition.bucket(), &p.islands);
+            && record::forks(self.compiled, p.composition.bucket(), &p.key.islands);
         let (map, forked) = match &self.compiled.arena_forked {
             Some(forked) if forks => (forked, true),
             _ => (&self.compiled.arena, false),
@@ -948,12 +944,12 @@ impl FireCtx<'_> {
                 per_axis: poem_ir::PerAxis::new([
                     Some(record::AxisCarve {
                         classes: p.composition.table(poem_ir::RowAxis::Tokens),
-                        ladder: &p.ladder,
+                        ladder: &p.key.classes,
                         lane_ceiling: Some(p.lane_ceiling),
                     }),
-                    p.patch_ladder.as_ref().map(|ladder| record::AxisCarve {
+                    p.key.patch.as_ref().map(|axis| record::AxisCarve {
                         classes: p.composition.table(poem_ir::RowAxis::Patches),
-                        ladder,
+                        ladder: &axis.classes,
                         lane_ceiling: None,
                     }),
                     None,
@@ -1017,7 +1013,7 @@ impl FireCtx<'_> {
             });
         }
         // The fire's beam group folds, every layer's, on its stream ahead of
-        // its body (§11.3): no step of the fire reads a state before its
+        // its body: no step of the fire reads a state before its
         // fold.
         if p.rs.predicated {
             let lanes = self.gate_lanes(p);
@@ -1048,7 +1044,7 @@ impl FireCtx<'_> {
         );
         let walked = if records && crate::sizing::active() {
             let lanes = forked.filter(|_| {
-                p.bodied && record::forks(self.compiled, p.composition.bucket(), &p.islands)
+                p.bodied && record::forks(self.compiled, p.composition.bucket(), &p.key.islands)
             });
             let mut cursor = match lanes {
                 Some(lanes) => Cursor::across(&place, lanes),
@@ -1080,16 +1076,11 @@ impl FireCtx<'_> {
                     // Side streams for the fires narrow enough to leave the
                     // card room for them (`compiler.dag_streams_until`).
                     lanes: forked.filter(|_| {
-                        record::forks(self.compiled, p.composition.bucket(), &p.islands)
+                        record::forks(self.compiled, p.composition.bucket(), &p.key.islands)
                     }),
                     conditionals,
-                    decoding: self.decoding,
-                    tiers: self.tiers,
-                    lane_ceiling: p.lane_ceiling,
-                    towered: p.towered,
                     ceilings,
-                    islands: &p.islands,
-                    rs: p.rs.body,
+                    key: &p.key,
                 };
 
                 // A serving fire replays a body or is counted: one that
@@ -1102,8 +1093,8 @@ impl FireCtx<'_> {
                     if after.captures > before.captures {
                         self.live.tally(engine::live::Tally::Compiled, 1);
                     } else if after.stated_eager > before.stated_eager {
-                        // A composition the load stated eager (CONTRACT-BC
-                        // 24): uncaptured, as stated.
+                        // A composition the load stated eager: uncaptured,
+                        // as stated.
                         self.live.tally(engine::live::Tally::Eager, 1);
                     } else if after.hits == before.hits {
                         self.live.tally(engine::live::Tally::Unrecorded, 1);

@@ -43,32 +43,26 @@ pub use engine::Capabilities as EngineCapabilities;
 
 /// The fire ceilings of a shell with no planner to derive its rungs from
 /// the device: the most lanes and tokens one fire carries.
-#[cfg_attr(
-    not(any(
-        feature = "vulkan",
-        feature = "wgpu",
-        feature = "xla",
-        feature = "cerebras",
-        all(feature = "metal", target_vendor = "apple")
-    )),
-    allow(dead_code, reason = "only the shells without a planner take them")
-)]
+#[cfg(any(
+    feature = "vulkan",
+    feature = "wgpu",
+    feature = "xla",
+    feature = "cerebras",
+    all(feature = "metal", target_vendor = "apple")
+))]
 #[derive(Clone, Copy)]
 struct Fire {
     lanes: u32,
     tokens: u32,
 }
 
-#[cfg_attr(
-    not(any(
-        feature = "vulkan",
-        feature = "wgpu",
-        feature = "xla",
-        feature = "cerebras",
-        all(feature = "metal", target_vendor = "apple")
-    )),
-    allow(dead_code, reason = "only the shells without a planner take them")
-)]
+#[cfg(any(
+    feature = "vulkan",
+    feature = "wgpu",
+    feature = "xla",
+    feature = "cerebras",
+    all(feature = "metal", target_vendor = "apple")
+))]
 impl Fire {
     /// Its lanes and tokens.
     const fn of(self) -> (u32, u32) {
@@ -107,10 +101,7 @@ const CEREBRAS_FIRE: Fire = Fire {
 
 /// The index in a device name (`vulkan:1`, `tpu:0`), for a shell that drives
 /// one device; its family must be one of `families`.
-#[cfg_attr(
-    not(any(feature = "vulkan", feature = "wgpu", feature = "xla")),
-    allow(dead_code, reason = "only the one-device shells read an index")
-)]
+#[cfg(any(feature = "vulkan", feature = "wgpu", feature = "xla"))]
 fn device_index(devices: &[String], families: &[&str]) -> Result<u32> {
     let [device] = devices else {
         anyhow::bail!(
@@ -129,14 +120,8 @@ fn device_index(devices: &[String], families: &[&str]) -> Result<u32> {
         .map_err(|_| anyhow!("[engine] device {device:?}: {index:?} is not a device number"))
 }
 
-/// The tokens a kv page holds on the cuda shell: the planner's page.
 #[cfg(any(feature = "engine-cuda", test))]
-const CUDA_PAGE_SIZE: u32 = 16;
-
-/// The lanes one fire may carry on the cuda shell; the tokens are the
-/// largest rung its card holds, derived at load.
-#[cfg(any(feature = "engine-cuda", test))]
-const CUDA_FIRE_LANES: u32 = 512;
+use engine::load::{CUDA_FIRE_LANES, CUDA_PAGE_SIZE};
 
 #[cfg(any(feature = "engine-cuda", test))]
 fn cuda_budgets(
@@ -603,6 +588,10 @@ pub(crate) fn create_engine_backend(
             boot_doc.push_str(&format!(
                 "profiles = {}\n",
                 toml::Value::String(home.join("profiles").display().to_string())
+            ));
+            boot_doc.push_str(&format!(
+                "cache = {}\n",
+                toml::Value::String(cache_dir.display().to_string())
             ));
             boot_doc.push_str(&format!("measure = {measure}\n"));
             if let Some(mount) = adapter_dir {

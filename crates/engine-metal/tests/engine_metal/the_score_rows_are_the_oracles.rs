@@ -8,11 +8,11 @@
 //! lane's rows.
 
 use engine_metal::serve::Seated;
-use engine_metal::{Boot, Lane, Shell};
+use engine_metal::Lane;
 use poem::Request;
 use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{fixture_of, seeded_bf16, word};
+use super::a_scattered_pool_serves_the_same_logits::{Load, fixture_of, seeded_bf16, word};
 use super::a_score_reader_holds_its_rows_through_a_park::{at_lane, bind_reader, reader};
 
 const MODEL: &str = "qwen3-micro-text";
@@ -27,25 +27,14 @@ fn the_score_rows_are_the_oracles() {
         return;
     }
     let fixture = fixture_of(MODEL, None);
-    let mut shell = Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
+    let mut shell = Load {
         budget: Budget::new(LANES, 512),
-        patches: None,
-        voxels: None,
-        profile: None,
         page_size: PAGE,
         context: CONTEXT,
         slots: LANES,
-        kv_budget: None,
-        allowance: engine::Allowance::WHOLE,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
-        profiles: None,
-        top: engine_metal::Top::EveryRung,
-        measure: engine::rates::Measuring::Time,
-    })
+        ..Load::default()
+    }
+    .boot(&fixture)
     .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"));
     let prompt: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();

@@ -1,7 +1,7 @@
 //! What every backend's `pie tune <backend> --rates` (or a load on a
 //! device whose profile lacks them) times, and how it counts the work: a few
 //! shapes, model-independent, whose times give the device's rates
-//! (`profile::fire::Rates`), so a profile's `[rates]` mean the same on every
+//! (`profile::rates::Rates`), so a profile's `[rates]` mean the same on every
 //! backend and the estimate (`crate::load::FireEstimate`, over
 //! `crate::roofline`) reads them the same way. Each backend times these
 //! shapes through its own kernels and its own clock; the counts here turn
@@ -29,7 +29,7 @@
 //!   the kernel serving picks at those rows (below [`GEMM_ROWS`]' first, so
 //!   the curve never weighs it), its flops over its time once its weight
 //!   reads no longer bind it. Measured on every backend.
-//! - `kernel_tflops_by_shape`: each dense matmul kernel the slang backends
+//! - `kernel_curves`: each dense matmul kernel the slang backends
 //!   choose between (the vector kernels by the rows a workgroup carries,
 //!   the tiled by their row tile) at each of a model's dense shapes, by
 //!   rows, its flops over its time, its weight passes in it; measured once
@@ -42,7 +42,7 @@
 //!   same work at the rate its full curve states ([`workgroups_per_core`]).
 //!
 //! Each backend's estimate weighs a fire by the keys it names
-//! ([`rates_at_load`]'s `keys`, of `profile::fire::KEYS`); a rate measured
+//! ([`rates_at_load`]'s `keys`, of `profile::rates::KEYS`); a rate measured
 //! or stated at or below zero, or not finite, is refused by its key
 //! ([`unmeasured`]), never saved or divided by.
 
@@ -82,6 +82,10 @@ pub fn step_bytes() -> u64 {
         .max(elementwise)
         .max(copy)
 }
+
+/// Timed bursts of each kind a rates step measures: the median kept, an
+/// odd count so it is one burst's.
+pub const ROUNDS: usize = 5;
 
 /// The columns and depth the matmul curves are timed at: the catalog's
 /// hidden widths from a small model's 1024 to an 8B-class model's 4096 (a
@@ -227,11 +231,16 @@ pub const ATTN_DISPATCHES: u32 = 1;
 pub const SCAN_DISPATCHES: u32 = 2;
 pub const COPY_DISPATCHES: u32 = 1;
 
-/// The tolerance two runs of a rates step agree within, and a check's
-/// estimate within the measured best: what [`rate_from`] allows a burst to
-/// fall below its launches before it calls the two a measurement fault.
-/// Defined once, in the profile crate, whose search breaks ties by it.
-pub use profile::AGREEMENT;
+/// The tolerance two measurements of one thing agree within: two runs of a
+/// rates step, a check's estimate against the measured best (what
+/// [`rate_from`] allows a burst to fall below its launches before it calls
+/// the two a measurement fault), and two candidates of `pie tune`'s search
+/// (the lowest of those within it of the fastest is taken). Fixed, not
+/// drawn from a run's own spread, so two tunes of one device take the same
+/// of a near tie and write the same profile; 5% is the run-to-run spread of
+/// the rates steps on the noisiest device measured (Adreno 840: a scan's
+/// rate repeats within 5-10% in a session).
+pub const AGREEMENT: f64 = 0.05;
 
 /// What a backend's rates step (`pie tune --rates`) produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -296,7 +305,7 @@ pub fn launch_from(chain_ns: f64, one_ns: f64, n: u32) -> f64 {
 /// rates are read ([`rates_at_load`], `crate::roofline::Constants::of`):
 /// nothing divides by it.
 #[must_use]
-pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)> {
+pub fn unmeasured(rates: &profile::rates::Rates) -> Option<(&'static str, String)> {
     let bad = |v: f64| !(v.is_finite() && v > 0.0);
     let point = |key: &'static str, unit: &str, curve: &[(u32, f64)]| {
         curve
@@ -313,14 +322,14 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
     }
     if let Some(by_rows) = &rates.attn_tflops_by_rows_keys {
         for (rows, curve) in by_rows {
-            if let Some((key, at)) = point(profile::fire::ATTN_BY_ROWS_KEYS, "keys", curve) {
+            if let Some((key, at)) = point(profile::rates::ATTN_BY_ROWS_KEYS, "keys", curve) {
                 return Some((key, format!("{at} ({rows} rows)")));
             }
         }
     }
-    if let Some(curves) = &rates.kernel_tflops_by_shape {
+    if let Some(curves) = &rates.kernel_curves {
         for c in curves {
-            if let Some((key, at)) = point(profile::fire::KERNEL_CURVES, "rows", &c.curve) {
+            if let Some((key, at)) = point(profile::rates::KERNEL_CURVES, "rows", &c.curve) {
                 return Some((
                     key,
                     format!("{at} (kernel {}/{} at {}x{})", c.kind, c.key, c.n, c.k),
@@ -341,7 +350,7 @@ pub fn unmeasured(rates: &profile::fire::Rates) -> Option<(&'static str, String)
         ("scan_gelems", rates.scan_gelems),
         ("few_row_tflops", rates.few_row_tflops),
         ("workgroups_per_core", rates.workgroups_per_core),
-        (profile::fire::SUBMIT_WORST_RATIO, rates.submit_worst_ratio),
+        (profile::rates::SUBMIT_WORST_RATIO, rates.submit_worst_ratio),
     ] {
         if let Some(v) = v.filter(|&v| bad(v)) {
             return Some((key, format!("as {v}")));
@@ -766,7 +775,7 @@ pub fn warmed_frames<E>(
 /// stopped at the device's bound on one submission before it settled.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Measured {
-    pub rates: profile::fire::Rates,
+    pub rates: profile::rates::Rates,
     pub unsettled: bool,
     /// The device ran slower at the step's end than at its warmed start
     /// (`Some(ratio)`, its reference kernel's time over its fastest seen):
@@ -793,8 +802,8 @@ pub const ATTN_SET_BYTES: usize = WEIGHT_BYTES;
 /// The q / k / v sets the timed attentions of `shape` rotate through, its
 /// kv laid in pages of `page` keys: [`ATTN_SET_BYTES`] of the shape's q rows
 /// and of k and v over the pages as laid, whole (bf16), and never fewer
-/// than 2. (engine-cuda's sizing, 63876a684: a few-key point's page is
-/// laid whole, so its sets are counted by it.)
+/// than 2. A few-key point's page is laid whole, so its sets are counted by
+/// it (as engine-cuda sizes them).
 #[must_use]
 pub fn attn_sets_at(shape: AttnShape, page: u32) -> usize {
     let q_bytes = shape.rows as usize * (shape.q_heads * shape.head_dim) as usize * 2;
@@ -966,7 +975,7 @@ pub fn scan_elements(shape: ScanShape) -> f64 {
 /// The `[rates]` block a `pie tune <backend> --rates` writes, as profile
 /// TOML: every rate it measured.
 #[must_use]
-pub fn tuned(rates: &profile::fire::Rates) -> String {
+pub fn tuned(rates: &profile::rates::Rates) -> String {
     rates.toml()
 }
 
@@ -1022,7 +1031,7 @@ pub struct SaveTo<'a> {
 #[must_use]
 pub fn saved_text(
     existing: Option<&str>,
-    measured: &profile::fire::Rates,
+    measured: &profile::rates::Rates,
     provenance: &(&'static str, String),
 ) -> String {
     let entry = format!("{} = {}", provenance.0, provenance.1);
@@ -1048,7 +1057,7 @@ pub fn saved_text(
     // The old table out, whole, the new one in its place; what of the old
     // reads stays under the measured.
     let at = header(&lines, "rates");
-    let mut kept = profile::fire::Rates::default();
+    let mut kept = profile::rates::Rates::default();
     if let Some(at) = at {
         let end = table_end(&lines, at);
         let table = format!("api = 1\n{}\n", lines[at..end].join("\n"));
@@ -1061,15 +1070,15 @@ pub fn saved_text(
         }
         lines.drain(at..end);
     }
-    // Keyed measurements ([`profile::fire::Rates::measured_on`]) are kept
+    // Keyed measurements ([`profile::rates::Rates::measured_on`]) are kept
     // only beside those of the same device, each keyed: what another device
     // measured, or a rate stored without a key, is no measurement of this
     // one.
     if let Some(on) = &measured.measured_on {
         if kept.measured_on.as_ref() != Some(on) {
-            kept = profile::fire::Rates::default();
+            kept = profile::rates::Rates::default();
         }
-        for key in profile::fire::KEYED {
+        for key in profile::rates::KEYED {
             if kept.states(key) && kept.key_of(key).is_none() {
                 kept.unstate(key);
             }
@@ -1117,7 +1126,7 @@ pub fn saved_text(
 
 /// The roofline a load weighs its fires by, one rule for every engine: the
 /// rates `chip`'s layers state where they state every one of `keys` (those
-/// the backend's estimate weighs a fire by, of `profile::fire::KEYS`) (a checked-in
+/// the backend's estimate weighs a fire by, of `profile::rates::KEYS`) (a checked-in
 /// profile's over a saved one, `profile::Registry::resolve`); else, before
 /// the load is ready, the device's own, measured by `measure` (the backend's
 /// `pie tune --rates` step, seconds long, its frames sized by
@@ -1193,7 +1202,7 @@ impl Measuring {
 /// [`rates_at_load`] under `measuring`: where it skips, nothing is timed or
 /// saved, each key of `keys` no layer states is said, by name, to be served
 /// by the estimate, and kept as skipped in the profile
-/// (`profile::fire::Tuned::skipped`), so each choice that reads it takes
+/// (`profile::rates::Tuned::skipped`), so each choice that reads it takes
 /// the engine's estimate and names it. A checked-in profile stating a rate
 /// this pie does not read is refused either way: it is a build's fault, not
 /// a measurement.
@@ -1205,7 +1214,7 @@ pub fn resolve_at_load(
     max_submit: Option<std::time::Duration>,
     measuring: Measuring,
     stale_rates: StaleRates,
-    measure: impl FnOnce(Option<std::time::Duration>, &profile::fire::Rates) -> Result<Measured, String>,
+    measure: impl FnOnce(Option<std::time::Duration>, &profile::rates::Rates) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
     // A checked-in file this device takes states a rate this pie does not
     // read: it was refused whole, and the load is refused by it.
@@ -1213,7 +1222,7 @@ pub fn resolve_at_load(
         return Err(format!(
             "{stale}: a checked-in profile states a rate this pie does not read, and is refused \
              whole; [rates] holds {:?}",
-            profile::fire::KEYS
+            profile::rates::KEYS
         ));
     }
     let stated = chip.rates();
@@ -1224,7 +1233,7 @@ pub fn resolve_at_load(
     // A key a layer states of this device under a stale key (a kernel's
     // code or the method changed) is served by that figure, a fair
     // estimate, and timed again behind serving
-    // (`profile::fire::Tuned::behind`): a load never measures before ready
+    // (`profile::rates::Tuned::behind`): a load never measures before ready
     // what it holds a figure for. Only a key no layer states at all is
     // measured here. What the engine does with such a key is its own
     // statement ([`StaleRates`]).
@@ -1349,7 +1358,7 @@ pub fn resolve_at_load(
 /// reads (a person's own decisions), drops each it no longer reads (said, by
 /// name), gains `measured` (each key it states replacing the file's) and how
 /// it was measured. The file must read back; its path, said.
-pub fn save_rates(save: &SaveTo<'_>, measured: &profile::fire::Rates) -> Result<String, String> {
+pub fn save_rates(save: &SaveTo<'_>, measured: &profile::rates::Rates) -> Result<String, String> {
     let existing = std::fs::read_to_string(&save.path).ok().map(|text| {
         let (kept, dropped) = save.registry.prune(&text);
         for key in dropped {
@@ -1611,15 +1620,15 @@ mod tests {
     use super::*;
 
     /// A profile of the toy registry stating `rates`.
-    fn chip(rates: profile::fire::Rates) -> profile::Profile {
+    fn chip(rates: profile::rates::Rates) -> profile::Profile {
         let p = profile::Registry::new("toy", &[], &[]).defaults();
         let mut tuned = p.tuned().clone();
         tuned.rates = rates;
         p.with_tuned(tuned)
     }
 
-    fn all() -> profile::fire::Rates {
-        profile::fire::Rates {
+    fn all() -> profile::rates::Rates {
+        profile::rates::Rates {
             stale: None,
             landing: None,
             launch_ns: Some(900),
@@ -1636,7 +1645,7 @@ mod tests {
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
-            kernel_tflops_by_shape: None,
+            kernel_curves: None,
             dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,
@@ -1650,14 +1659,14 @@ mod tests {
         let registry = profile::Registry::new("toy", &[], &[]);
         // A checked-in launch, nothing else: the rest measured, the launch
         // kept, each submission under the budget asked.
-        let stated = profile::fire::Rates {
+        let stated = profile::rates::Rates {
             launch_ns: Some(1234),
-            ..profile::fire::Rates::default()
+            ..profile::rates::Rates::default()
         };
         let mut asked = None;
         let p = rates_at_load(
             chip(stated),
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             Some(SaveTo {
                 path: path.clone(),
                 provenance: provenance("toy", "a test"),
@@ -1718,10 +1727,10 @@ mod tests {
         let facts = profile::Facts::of(&registry);
         let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
         let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        assert!(!first.rates().complete(&profile::fire::KEYS));
+        assert!(!first.rates().complete(&profile::rates::KEYS));
         let measured = rates_at_load(
             first,
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             Some(SaveTo {
                 path: SHELF.user_path(&dir, "Card X"),
                 provenance: provenance("toy", "a test"),
@@ -1746,7 +1755,7 @@ mod tests {
         assert_eq!(second.rates(), all());
         let second = rates_at_load(
             second,
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             None,
             None,
             None,
@@ -1757,13 +1766,13 @@ mod tests {
     }
 
     /// This build on a device, as a keyed load checks a stored measurement
-    /// against (`profile::fire::Now`): each kernel's code, each method one.
+    /// against (`profile::rates::Now`): each kernel's code, each method one.
     struct Build {
         on: &'static str,
         code: Vec<(&'static str, u32)>,
     }
 
-    impl profile::fire::Now for Build {
+    impl profile::rates::Now for Build {
         fn on(&self) -> String {
             self.on.to_string()
         }
@@ -1780,16 +1789,16 @@ mod tests {
 
     /// What a rates step measures under `build`, keyed: `gemm_tflops_by_rows`
     /// fires the `gemm` kernel, every other rate the `copy` kernel.
-    fn keyed(build: &Build) -> profile::fire::Rates {
-        use profile::fire::Now as _;
-        let by = |kernel: &str| profile::fire::MeasuredBy {
+    fn keyed(build: &Build) -> profile::rates::Rates {
+        use profile::rates::Now as _;
+        let by = |kernel: &str| profile::rates::MeasuredBy {
             method: 1,
             kernels: vec![(kernel.to_string(), build.code(kernel).unwrap())],
         };
-        profile::fire::Rates {
+        profile::rates::Rates {
             measured_on: Some(build.on()),
             measured_by: Some(
-                profile::fire::KEYS
+                profile::rates::KEYS
                     .iter()
                     .map(|&key| {
                         let kernel = if key == "gemm_tflops_by_rows" {
@@ -1854,7 +1863,7 @@ mod tests {
         let measured = std::cell::Cell::new(Vec::new());
         let loaded = resolve_at_load(
             chip,
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             Some(SaveTo {
                 path: shelf.user_path(dir, "Card X"),
                 provenance: provenance("toy", "a test"),
@@ -1865,7 +1874,7 @@ mod tests {
             measuring,
             stale_rates,
             |_, stated| {
-                let lacked = stated.missing(&profile::fire::KEYS);
+                let lacked = stated.missing(&profile::rates::KEYS);
                 measured.set(lacked.clone());
                 Ok(Measured {
                     rates: keyed(build).only(&lacked),
@@ -1993,7 +2002,7 @@ mod tests {
             "{:#?}",
             report.stored
         );
-        assert_eq!(loaded.rates().complete(&profile::fire::KEYS), true);
+        assert_eq!(loaded.rates().complete(&profile::rates::KEYS), true);
         // Another driver: the committed profile is none of this device's.
         let other = Build {
             on: "toy 10de:2c31 driver 2",
@@ -2002,7 +2011,7 @@ mod tests {
         let dir = home("committed-driver");
         let (measured, _, _) = load_from(shelf, &dir, &other, Measuring::Time);
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(measured, profile::fire::KEYS);
+        assert_eq!(measured, profile::rates::KEYS);
     }
 
     /// The user's stored entry under a matching key is taken over the
@@ -2020,7 +2029,7 @@ mod tests {
             "Card X",
             &saved_text(
                 None,
-                &profile::fire::Rates {
+                &profile::rates::Rates {
                     launch_ns: Some(2222),
                     ..keyed(&build)
                 },
@@ -2033,7 +2042,7 @@ mod tests {
         let dir = home("user-over-committed");
         let path = shelf.user_path(&dir, "Card X");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut user = profile::fire::Rates {
+        let mut user = profile::rates::Rates {
             launch_ns: Some(1111),
             ..keyed(&build)
         }
@@ -2055,7 +2064,7 @@ mod tests {
         // committed launch, whose key matches, is taken.
         user.measured_by = Some(vec![(
             "launch_ns".into(),
-            profile::fire::MeasuredBy {
+            profile::rates::MeasuredBy {
                 method: 1,
                 kernels: vec![("copy".into(), 8)],
             },
@@ -2086,43 +2095,43 @@ mod tests {
         };
         let registry = profile::Registry::new("toy", &[], &[]);
         let mut rates = keyed(&build);
-        rates.kernel_tflops_by_shape = Some(vec![
-            profile::fire::KernelCurve {
-                kind: profile::fire::KernelCurve::TILE,
+        rates.kernel_curves = Some(vec![
+            profile::curves::KernelCurve {
+                kind: profile::curves::KernelCurve::TILE,
                 key: 64,
                 n: 1024,
                 k: 1024,
                 curve: vec![(1, 0.5), (64, 9.0)],
                 stop: None,
                 spread: vec![(1, 0.01), (64, 0.02)],
-                by: profile::fire::MeasuredBy {
+                by: profile::rates::MeasuredBy {
                     method: 1,
                     kernels: vec![("gemm".into(), 7)],
                 },
             },
-            profile::fire::KernelCurve {
-                kind: profile::fire::KernelCurve::VECTOR,
+            profile::curves::KernelCurve {
+                kind: profile::curves::KernelCurve::VECTOR,
                 key: 4,
                 n: 1024,
                 k: 1024,
                 curve: vec![(1, 0.3)],
-                stop: Some((16, profile::fire::KernelCurve::BEATEN)),
+                stop: Some((16, profile::curves::KernelCurve::BEATEN)),
                 spread: vec![(1, 0.01)],
-                by: profile::fire::MeasuredBy {
+                by: profile::rates::MeasuredBy {
                     method: 1,
                     kernels: vec![("gemm".into(), 7)],
                 },
             },
         ]);
         rates.dense_settled = vec![
-            profile::fire::DenseSettled {
+            profile::curves::DenseSettled {
                 method: 1,
                 of: 5,
                 code: 6,
                 ranges: vec![[1, 1, 0, 0, 0, 0]],
                 planes: vec![(1024, 1024)],
             },
-            profile::fire::DenseSettled {
+            profile::curves::DenseSettled {
                 method: 1,
                 of: 9,
                 code: 6,
@@ -2142,7 +2151,7 @@ mod tests {
         // Stored in another order, the same text.
         let mut shuffled = rates.clone();
         shuffled.measured_by.as_mut().unwrap().reverse();
-        shuffled.kernel_tflops_by_shape.as_mut().unwrap().reverse();
+        shuffled.kernel_curves.as_mut().unwrap().reverse();
         let again = saved_text(None, &shuffled, &provenance("toy", "another day"));
         assert_eq!(
             profile::export(&registry, "Card X", &again, "elsewhere.toml").unwrap(),
@@ -2198,9 +2207,9 @@ mod tests {
         let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Skip);
         assert_eq!(measured, Vec::<&str>::new());
         assert!(!shelf.user_path(&dir, "Card X").exists(), "nothing is saved");
-        assert_eq!(loaded.tuned().skipped, profile::fire::KEYS, "{report:?}");
+        assert_eq!(loaded.tuned().skipped, profile::rates::KEYS, "{report:?}");
         assert!(!loaded.tuned().measured_this_load);
-        assert_eq!(loaded.rates(), profile::fire::Rates::default());
+        assert_eq!(loaded.rates(), profile::rates::Rates::default());
         // A committed profile still serves what it states under skip.
         let registry = profile::Registry::new("toy", &[], &[]);
         let committed = profile::export(
@@ -2220,7 +2229,7 @@ mod tests {
         assert_eq!(loaded.rates().launch_ns, all().launch_ns);
         assert_eq!(
             loaded.tuned().skipped.len(),
-            profile::fire::KEYS.len() - 2,
+            profile::rates::KEYS.len() - 2,
             "{:?}",
             loaded.tuned().skipped
         );
@@ -2258,11 +2267,11 @@ mod tests {
                 !report.stored.is_empty(),
                 "every keyed load says what it found"
             );
-            let lacked = chip.rates().missing(&profile::fire::KEYS);
+            let lacked = chip.rates().missing(&profile::rates::KEYS);
             let measures = std::cell::Cell::new(0);
             rates_at_load(
                 chip,
-                &profile::fire::KEYS,
+                &profile::rates::KEYS,
                 Some(save(version)),
                 None,
                 None,
@@ -2281,7 +2290,7 @@ mod tests {
         };
         assert_eq!(
             load(&build, "0.6.0"),
-            profile::fire::KEYS,
+            profile::rates::KEYS,
             "a first load measures all"
         );
         assert_eq!(
@@ -2305,7 +2314,7 @@ mod tests {
         };
         assert_eq!(
             load(&other, "0.7.2"),
-            profile::fire::KEYS,
+            profile::rates::KEYS,
             "another device measures all"
         );
         let text = std::fs::read_to_string(&path).unwrap();
@@ -2338,12 +2347,12 @@ mod tests {
             provenance: provenance("toy", "a test"),
             registry: &registry,
         };
-        let older = profile::fire::Rates {
+        let older = profile::rates::Rates {
             few_row_tflops: None,
             ..all()
         };
         // An older pie, which read every key but this one, saved the file.
-        let older_keys: Vec<&'static str> = profile::fire::KEYS
+        let older_keys: Vec<&'static str> = profile::rates::KEYS
             .iter()
             .copied()
             .filter(|&key| key != "few_row_tflops")
@@ -2360,13 +2369,13 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
         let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         assert_eq!(
-            second.rates().missing(&profile::fire::KEYS),
+            second.rates().missing(&profile::rates::KEYS),
             ["few_row_tflops"]
         );
-        let lacked = second.rates().missing(&profile::fire::KEYS);
+        let lacked = second.rates().missing(&profile::rates::KEYS);
         let loaded = rates_at_load(
             second,
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             Some(save()),
             None,
             None,
@@ -2397,10 +2406,10 @@ mod tests {
 
     #[test]
     fn a_saved_file_gains_the_measured_keys_and_their_provenance_alone() {
-        let measured = profile::fire::Rates {
+        let measured = profile::rates::Rates {
             hbm_gbps: Some(700.0),
             cached_gbps: None,
-            ..profile::fire::Rates::default()
+            ..profile::rates::Rates::default()
         };
         let how = ("rates", "\"measured at load\"".to_string());
         // No file yet: the keys and how, nothing else.
@@ -2426,7 +2435,7 @@ mod tests {
         // A table of a schema this pie outlived (Nov 16's keys): replaced
         // whole, none of it kept, so no key is written twice.
         let old = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 1.0\nlaunch_ns = 900\n\n[provenance]\nrates = \"old\"\n";
-        let all = profile::fire::Rates {
+        let all = profile::rates::Rates {
             launch_ns: Some(1200),
             ..measured.clone()
         };
@@ -2463,10 +2472,10 @@ mod tests {
         .unwrap();
         let (first, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
         assert!(!report.rejected.is_empty(), "the old file is refused");
-        assert!(!first.rates().complete(&profile::fire::KEYS));
+        assert!(!first.rates().complete(&profile::rates::KEYS));
         let measured = rates_at_load(
             first,
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             Some(SaveTo {
                 path: path.clone(),
                 provenance: provenance("toy", "a test"),
@@ -2496,7 +2505,7 @@ mod tests {
         assert_eq!(second.rates(), all());
         rates_at_load(
             second,
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             None,
             None,
             None,
@@ -2520,7 +2529,7 @@ mod tests {
         let registry = profile::Registry::new("toy", &[], &[]);
         let facts = profile::Facts::of(&registry);
         let (chip, _) = SHELF.resolve(&registry, "Card X", &facts, None);
-        let err = rates_at_load(chip, &profile::fire::KEYS, None, None, None, |_| {
+        let err = rates_at_load(chip, &profile::rates::KEYS, None, None, None, |_| {
             Ok(Measured {
                 rates: all(),
                 unsettled: false,
@@ -2668,8 +2677,8 @@ mod tests {
     fn a_budget_short_of_the_step_is_refused_by_name_and_measures_nothing() {
         let short = step_bytes() - 1;
         let err = rates_at_load(
-            chip(profile::fire::Rates::default()),
-            &profile::fire::KEYS,
+            chip(profile::rates::Rates::default()),
+            &profile::rates::KEYS,
             None,
             Some(short),
             None,
@@ -2683,7 +2692,7 @@ mod tests {
     fn a_load_whose_layers_state_every_constant_measures_nothing() {
         let p = rates_at_load(
             chip(all()),
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             None,
             None,
             None,
@@ -2700,10 +2709,10 @@ mod tests {
     /// weighing all eight.
     #[test]
     fn a_load_measures_the_keys_its_backend_weighs_and_no_others() {
-        let six = all().only(&profile::fire::KEYS[..6]);
+        let six = all().only(&profile::rates::KEYS[..6]);
         let p = rates_at_load(
             chip(six.clone()),
-            &profile::fire::KEYS[..6],
+            &profile::rates::KEYS[..6],
             None,
             None,
             None,
@@ -2713,7 +2722,7 @@ mod tests {
         assert_eq!(p.rates(), six);
         let err = rates_at_load(
             chip(six.clone()),
-            &profile::fire::KEYS,
+            &profile::rates::KEYS,
             None,
             None,
             None,
@@ -2741,21 +2750,21 @@ mod tests {
         let registry = profile::Registry::new("toy", &[], &[]);
         for (zero, says) in [
             (
-                profile::fire::Rates {
+                profile::rates::Rates {
                     workgroups_per_core: Some(0.0),
                     ..all()
                 },
                 "`[rates] workgroups_per_core` as 0",
             ),
             (
-                profile::fire::Rates {
+                profile::rates::Rates {
                     few_row_tflops: Some(f64::NAN),
                     ..all()
                 },
                 "`[rates] few_row_tflops` as NaN",
             ),
             (
-                profile::fire::Rates {
+                profile::rates::Rates {
                     attn_tflops_by_keys: Some(vec![(512, 0.0), (8192, 150.0)]),
                     ..all()
                 },
@@ -2768,8 +2777,8 @@ mod tests {
                 registry: &registry,
             };
             let err = rates_at_load(
-                chip(profile::fire::Rates::default()),
-                &profile::fire::KEYS,
+                chip(profile::rates::Rates::default()),
+                &profile::rates::KEYS,
                 Some(save),
                 None,
                 None,
@@ -2787,7 +2796,7 @@ mod tests {
         }
         // Stated in a profile, it is refused by the same key: the roofline
         // divides by none of it.
-        let stated = profile::fire::Rates {
+        let stated = profile::rates::Rates {
             attn_tflops_by_keys: Some(vec![(512, 0.0)]),
             ..all()
         };
@@ -2795,7 +2804,7 @@ mod tests {
             crate::roofline::Constants::of(&stated).err(),
             Some("attn_tflops_by_keys")
         );
-        let nan = profile::fire::Rates {
+        let nan = profile::rates::Rates {
             hbm_gbps: Some(f64::NAN),
             ..all()
         };
@@ -2950,7 +2959,7 @@ mod tests {
         assert!(ATTN_DIMS.windows(2).all(|w| w[0] < w[1]));
         // 512 keys at d 64: 1 MiB of q, 1 MiB of k and v; 16384 at 256: 256
         // MiB, three sets past 768 MiB.
-        // engine-cuda's sizing (63876a684), the pages laid whole: 512 keys
+        // The pages laid whole, as engine-cuda sizes them: 512 keys
         // at d 64, q 1 MiB and kv 1 MiB, 384 sets of 768 MiB; at 16384 and
         // d 256 three; one key lays its whole page of 16.
         assert_eq!(attn_sets_at(ATTN_SHAPE.at(512).with_dim(64), 16), 384);
@@ -3018,8 +3027,7 @@ mod tests {
     fn the_warm_up_runs_until_its_rate_stops_falling() {
         // A clock sinking 100, 90, 84, then 82 and 82.5: five rotations, to
         // the second step in a row that moves it by less than AGREEMENT
-        // (the stop rule every measurement settles by; it was the first
-        // rotation not slower than the one before).
+        // (the stop rule every measurement settles by).
         let mut rates = [100.0, 90.0, 84.0, 82.0, 82.5, 80.0].into_iter();
         let warmed = warm_up(|| Ok::<f64, ()>(rates.next().unwrap())).unwrap();
         assert_eq!((warmed.rotations, warmed.rate), (5, 82.5));
@@ -3051,7 +3059,7 @@ mod tests {
 
     #[test]
     fn the_writer_writes_what_the_profile_reads() {
-        let rates = profile::fire::Rates {
+        let rates = profile::rates::Rates {
             stale: None,
             landing: None,
             launch_ns: Some(3500),
@@ -3068,7 +3076,7 @@ mod tests {
             resident_workgroups: None,
             attn_tflops_by_rows_keys: None,
             product_ns: None,
-            kernel_tflops_by_shape: None,
+            kernel_curves: None,
             dense_settled: Vec::new(),
             measured_on: None,
             measured_by: None,

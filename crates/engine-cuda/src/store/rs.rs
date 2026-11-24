@@ -41,16 +41,12 @@ pub struct StepGates {
 /// (`ChunkProfile::rs_corrected`): each buffered row's keys (the conv
 /// output's key heads, bf16) and its corrected values (`u = beta (v - g
 /// S^T k)`, the value its delta rule writes, f32: `width` counts bf16
-/// elements, two a value). A gated-delta layer's rows then keep their
-/// per-head scalars (`scalars`, `poem_compiler::rs::gdn_scalars_bytes`:
-/// each value head's log-gate, then its key norm's inverse, f32), which
-/// this engine's kernels do not yet write or read: a fork copies the plane
-/// with the rest.
+/// elements, two a value). No per-head scalars: this engine's kernels
+/// recompute them (`ChunkProfile::rs_scalars` is off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Corrected {
     pub k: Plane,
     pub u: Plane,
-    pub scalars: Option<Plane>,
 }
 
 impl Planes {
@@ -68,7 +64,7 @@ impl Planes {
             .0
             .values()
             .copied()
-            .chain(self.3.values().flat_map(|c| [c.k, c.u].into_iter().chain(c.scalars)))
+            .chain(self.3.values().flat_map(|c| [c.k, c.u]))
             .chain(self.4.values().map(|(k, ..)| *k))
             .collect();
         planes.sort_by_key(|plane| (plane.layer, plane.at, plane.width));
@@ -195,7 +191,7 @@ impl Buffers {
             .map(|&(offset, _)| offset)
             .collect();
         // A beam's fork copies a page's rows plane by plane
-        // (`Buffers::page_planes`, BEAM-PAGE-LISTS.md §11.2): the planes must
+        // (`Buffers::page_planes`): the planes must
         // tile each buffered layer's row, or a fork leaves a plane's rows
         // stale.
         for (layer, &width) in widths.iter().enumerate() {
@@ -359,7 +355,6 @@ enum Reads {
         keys: u64,
         values: u64,
         key_head: u32,
-        v_heads: u32,
     },
     Kda {
         mixed: ValueId,
@@ -473,20 +468,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     width: 2 * values,
                 };
                 here += 2 * values;
-                let scalars = Plane {
-                    layer: decode_layers,
-                    at: page * here,
-                    width: poem_compiler::rs::gdn_scalars_bytes(*v_heads) / ELEMENT,
-                };
-                here += scalars.width;
-                corrected.insert(
-                    y.0,
-                    Corrected {
-                        k,
-                        u,
-                        scalars: Some(scalars),
-                    },
-                );
+                corrected.insert(y.0, Corrected { k, u });
                 let count = u32::try_from(keys).unwrap_or(u32::MAX);
                 keys_of.insert(conv.0, (k, count, count));
                 step_gates.insert(
@@ -519,7 +501,6 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                         keys: u64::from(k_heads * k_dim),
                         values: u64::from(v_heads * v_dim),
                         key_head: *k_dim,
-                        v_heads: *v_heads,
                     },
                     true,
                 ),
@@ -540,7 +521,6 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                         keys: u64::from(k_heads * k_dim),
                         values: u64::from(v_heads * v_dim),
                         key_head: *k_dim,
-                        v_heads: *v_heads,
                     },
                     false,
                 ),
@@ -708,19 +688,18 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             // with the conv output they are read from, the channel they
             // start at in it, and their count.
             let narrow = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
-            let (conv_y, keys, values, k_off, scalar_heads) = match reads {
+            let (conv_y, keys, values, k_off) = match reads {
                 Reads::GatedDelta {
                     qkv,
                     keys,
                     values,
                     y,
-                    v_heads,
                     ..
-                } => (qkv, keys, Some((y, values)), keys, Some(v_heads)),
+                } => (qkv, keys, Some((y, values)), keys),
                 Reads::Kda {
                     mixed, width, y, ..
-                } => (mixed, width, Some((y, width)), width, None),
-                Reads::Mamba2 { xbc, xb, .. } => (xbc, xb, None, 0, None),
+                } => (mixed, width, Some((y, width)), width),
+                Reads::Mamba2 { xbc, xb, .. } => (xbc, xb, None, 0),
             };
             let k = Plane {
                 layer,
@@ -736,13 +715,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
                     width: 2 * values,
                 };
                 here += 2 * values;
-                let scalars = scalar_heads.map(|heads| Plane {
-                    layer,
-                    at: page * here,
-                    width: poem_compiler::rs::gdn_scalars_bytes(heads) / ELEMENT,
-                });
-                here += scalars.map_or(0, |plane| plane.width);
-                corrected.insert(y.0, Corrected { k, u, scalars });
+                corrected.insert(y.0, Corrected { k, u });
             }
             if chunked {
                 widths.push(here);
@@ -891,7 +864,7 @@ impl Buffers {
 
     /// Every buffered plane as a page copy spans it: its rows' place in a
     /// page's slot and the bytes a token's row takes (a beam's fork copies a
-    /// page's first rows of each, `BEAM-PAGE-LISTS.md` §11).
+    /// page's first rows of each).
     pub fn page_planes(&self) -> Result<Vec<kernels_cuda::runtime::channel::PagePlane>> {
         self.planes
             .all()

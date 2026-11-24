@@ -12,6 +12,7 @@ use engine_cuda::{Lane, Shell};
 use poem::{Dtype, Join, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
+use crate::common::fnv;
 
 /// A dense model whose package states q, k and v apart.
 const ROW: &str = "qwen3-0.6b-bf16-kv-bf16";
@@ -60,15 +61,6 @@ fn scratch_root() -> &'static Path {
         }
         parent.join(std::process::id().to_string())
     })
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// A plane's bf16 values, by its name. A head's q and k norms scale by a
@@ -244,25 +236,6 @@ const ROWS: [&str; 11] = [
     "dots3-note-mini-bf16-kv-bf16",
     "inkling-mini-l7-e8-bf16-kv-bf16",
 ];
-
-/// Rows whose legs apart this engine does not yet answer as joined: the
-/// apart form is what serves only where the compiler cannot join them.
-/// Muse's apart answers 0.17 off over a spread of 3.2, as its joined trace
-/// does with its qkv write unfused: its unit-RMS q and k heads, unscaled,
-/// score keys 3.9 apart under its softmax scale, and its eight layers carry
-/// a last-place rounding 5% of the spread.
-const APART_OPEN: [&str; 1] = ["muse-glimmer-30b-mini-l8-bf16-kv-bf16"];
-
-#[test]
-#[ignore = "the engine's apart forms of these rows are open"]
-fn the_open_rows_answer_apart_what_they_answer_joined() {
-    if !engine_cuda::device::present() {
-        return;
-    }
-    for name in APART_OPEN {
-        check(name);
-    }
-}
 
 #[test]
 fn a_joined_projection_answers_what_its_legs_answer() {

@@ -409,7 +409,7 @@ class TestForwardPassState:
 
 
 class TestFinalRows:
-    """A pass is final unless the program states it retractable (CONTRACT-BC 25)."""
+    """A pass is final unless the program states it retractable."""
 
     @staticmethod
     def _pass():
@@ -435,6 +435,11 @@ class TestFinalRows:
         assert lagged.wit.final_stated == 0
         with pytest.raises(InferletError, match="already attached"):
             lagged.retractable()
+
+        beam = self._pass()
+        beam.wit.final_refusal = "a beam"
+        with pytest.raises(InferletError, match=r"final-rows: a beam .*ForwardPass\.retractable\(\)"):
+            beam.attach_program()
 
     def test_run_ahead_retracts_only_a_retractable_pass(self):
         import asyncio

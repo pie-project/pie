@@ -68,30 +68,18 @@ impl ForwardHybrid for Micro {
 fn shell(trace: poem::Trace, path: &Path) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
-        voxels: None,
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract: &contract,
-        checkpoint: path,
-        budget: Budget::new(LANES, LANES * ROWS),
-        patches: None,
-        page_size: 16,
-        context: 64,
-        slots: LANES,
-        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
-        allowance: engine::Allowance::WHOLE,
-        context_declared: false,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
             pin: Some((Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-        steps: engine::StepRules::runtime(),
+        ..crate::common::boot(
+            trace,
+            &contract,
+            path,
+            Budget::new(LANES, LANES * ROWS),
+            64,
+            LANES,
+        )
     })
     .expect("the shell loads");
     for slot in 0..LANES {
@@ -620,8 +608,7 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
 /// back; instance B binds into exactly that scratch and pair without an
 /// overlap refusal; A's unpark rebinds it to fresh room, claimed again,
 /// and it fires there. Unparked without the park said, B's bind would be
-/// refused by name on A's stale claim (Metal and Vulkan under pressure on
-/// 720d94565).
+/// refused by name on A's stale claim.
 #[test]
 fn a_parked_instance_s_shed_room_is_another_s_and_its_unpark_claims_again() {
     if !engine_cuda::device::present() {

@@ -9,6 +9,35 @@ impl Roles {
         self.programs.insert(program, facts);
     }
 
+    /// `holder`'s claim of whole chunks for a bind: the largest room any
+    /// of its binds asked so far, its pair's state counted as laid fresh
+    /// (a bind may lay it so), in runs of whole chunks; none where it has
+    /// bound nothing that takes whole chunks. What the capacity gate
+    /// reserves for the finisher before it asks
+    /// (`planner::ResidencyPlanner::chunk_spare`).
+    #[must_use]
+    pub fn bind_claim(&self, holder: Holder) -> Vec<(u32, u32)> {
+        self.bind_claims.get(&holder).cloned().unwrap_or_default()
+    }
+
+    /// `holder` asked a bind of `runs`: its claim is the larger of the two.
+    pub(super) fn claim(&mut self, holder: Holder, runs: Vec<(u32, u32)>) {
+        let chunks = |runs: &[(u32, u32)]| {
+            runs.iter()
+                .map(|&(run, pieces)| u64::from(run) * u64::from(pieces))
+                .sum::<u64>()
+        };
+        let claim = self.bind_claims.entry(holder).or_default();
+        if chunks(&runs) > chunks(claim) {
+            *claim = runs;
+        }
+    }
+
+    /// `holder` left: its claim goes.
+    pub fn forget_claim(&mut self, holder: Holder) {
+        self.bind_claims.remove(&holder);
+    }
+
     /// Whether `program`'s facts are known here.
     #[must_use]
     pub fn knows(&self, program: ProgramId) -> bool {

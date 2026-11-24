@@ -41,7 +41,7 @@ pub struct Weights {
     decoded: Vec<Buffer>,
     /// How this load landed its weights, where it measured it: for the
     /// device's profile, so a later load measures nothing.
-    landing: Option<profile::fire::Landing>,
+    landing: Option<profile::rates::Landing>,
 }
 
 pub(crate) fn decodes_at_load(param: &poem_ir::Param) -> bool {
@@ -309,8 +309,8 @@ fn restore_from_checkpoint(
         Err(_) => return Err(Rotten::Machine("a digest worker panicked".to_string())),
         Ok(Ok(())) => {}
     }
-    eprintln!(
-        "engine-cuda: this boot read its whole image out of {:?} — {} device image(s) \
+    tracing::info!(
+        "this boot read its whole image out of {:?} — {} device image(s) \
          pumped and {} T1 plane(s) {}, so the executor never ran",
         serving.path(),
         pumped,
@@ -526,7 +526,7 @@ impl Weights {
         target: StorageTarget,
         decode_dense: bool,
         held: bool,
-        known: Option<profile::fire::Landing>,
+        known: Option<profile::rates::Landing>,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -633,8 +633,8 @@ impl Weights {
                     }),
                 ) {
                     Ok(ring) => {
-                        eprintln!(
-                            "engine-cuda: the weights cross by a pinned ring of 2 x {} KiB: the \
+                        tracing::info!(
+                            "the weights cross by a pinned ring of 2 x {} KiB: the \
                              link moves {:.1} GB/s from {} KiB copies past a {:.1} us latency; \
                              a slot fills at {:.1} GB/s ({} in {} ms)",
                             ring.slot_bytes() >> 10,
@@ -648,8 +648,8 @@ impl Weights {
                         Some(ring)
                     }
                     Err(why) => {
-                        eprintln!(
-                            "engine-cuda: no pinned ring for the weights ({why}); each is copied \
+                        tracing::info!(
+                            "no pinned ring for the weights ({why}); each is copied \
                              as it lands"
                         );
                         None
@@ -687,8 +687,8 @@ impl Weights {
             if let Some(ring) = &sink.ring {
                 ring.drain()?;
             }
-            eprintln!(
-                "engine-cuda: the weights landed in {} ms",
+            tracing::info!(
+                "the weights landed in {} ms",
                 landing_started.elapsed().as_millis()
             );
             // What this machine's landing measured, where it measured it
@@ -696,7 +696,7 @@ impl Weights {
             let all = [reads.spawn_s, reads.thread_bytes_per_s, reads.whole_bytes_per_s];
             measured_landing = match (&sink.ring, known) {
                 (Some(ring), None) if all.iter().all(|v| *v > 0.0) => {
-                    Some(profile::fire::Landing {
+                    Some(profile::rates::Landing {
                         copy_latency_ns: ring.rates.latency * 1e9,
                         copy_gbps: ring.rates.copy / 1e9,
                         copy_full_bytes: ring.rates.saturated as f64,
@@ -1413,7 +1413,7 @@ impl Weights {
     }
 
     #[must_use]
-    pub fn landing(&self) -> Option<profile::fire::Landing> {
+    pub fn landing(&self) -> Option<profile::rates::Landing> {
         self.landing
     }
 

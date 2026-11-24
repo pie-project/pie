@@ -29,15 +29,10 @@ pub struct Fire<'a> {
     pub stream: *mut core::ffi::c_void,
     pub lanes: Option<Lanes<'a>>,
     pub conditionals: Option<crate::window::Conditionals<'a>>,
-    pub decoding: &'a poem_ir::ClassSet,
-    pub tiers: &'a Tiers,
-    pub towered: bool,
-    pub lane_ceiling: u32,
     pub ceilings: Ceilings<'a>,
-    /// [`BodyKey::islands`] as prepared for this fire.
-    pub islands: &'a [u8],
-    /// [`BodyKey::rs`] as prepared for this fire.
-    pub rs: RsBody,
+    /// The body's key as the fire was prepared (`serve::prepare`): the
+    /// one derivation of a fire's key.
+    pub key: &'a BodyKey,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -122,8 +117,8 @@ impl Bodies {
         tally.eager_unbodied += 1;
         let count = tally.eager_unbodied;
         if count.is_power_of_two() {
-            eprintln!(
-                "engine-cuda: WARNING: a serving fire ran with no recorded body ({why}); \
+            tracing::warn!(
+                "a serving fire ran with no recorded body ({why}); \
                  {count} such fire(s) so far (BodyTally::eager_unbodied). Every serving \
                  composition of a load that records bodies should replay one"
             );
@@ -457,26 +452,8 @@ pub struct BodyKey {
 }
 
 impl BodyKey {
-    #[cfg(test)]
     #[must_use]
     pub fn of(
-        classes: &WindowTable,
-        bucket: u32,
-        decoding: &poem_ir::ClassSet,
-        lane_ceiling: u32,
-        tiers: &Tiers,
-    ) -> BodyKey {
-        BodyKey {
-            bucket,
-            classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
-            patch: None,
-            islands: Box::default(),
-            rs: RsBody::Folds,
-        }
-    }
-
-    #[must_use]
-    pub fn of_axes(
         classes: &WindowTable,
         bucket: u32,
         decoding: &poem_ir::ClassSet,
@@ -491,6 +468,33 @@ impl BodyKey {
             islands: Box::default(),
             rs: RsBody::Folds,
         }
+    }
+
+    /// The key a fire of `composition` records and replays under: its
+    /// token axis's classes and bucket (and its patch axis's, where the
+    /// load is towered) under the lane ceiling, its lanes' treatment of
+    /// their recurrent rows. Prepare derives it once (`serve::prepare`) and
+    /// hands it down; the body map and arming read that one.
+    #[must_use]
+    pub fn for_fire(
+        composition: &poem_exec::fire::Composition,
+        decoding: &poem_ir::ClassSet,
+        lane_ceiling: u32,
+        tiers: &Tiers,
+        towered: bool,
+        rs: RsBody,
+    ) -> BodyKey {
+        let tokens = composition.axis(poem_ir::RowAxis::Tokens);
+        let patches = composition.axis(poem_ir::RowAxis::Patches);
+        BodyKey::of(
+            &tokens.classes,
+            tokens.bucket,
+            decoding,
+            lane_ceiling,
+            tiers,
+            towered.then_some((&patches.classes, patches.bucket)),
+        )
+        .with_rs(rs)
     }
 
     /// The same key, for a fire whose lanes treat their recurrent rows so.
@@ -979,20 +983,7 @@ impl Bodies {
         prepare.settle()?;
         crate::serve::btrace::mark("settle");
         let shape = run.schedule_shape();
-        let mut key = BodyKey::of_axes(
-            at.descriptor.table(poem_ir::RowAxis::Tokens),
-            at.descriptor.bucket,
-            at.decoding,
-            at.lane_ceiling,
-            at.tiers,
-            at.towered.then_some((
-                at.descriptor.table(poem_ir::RowAxis::Patches),
-                at.descriptor.patch_bucket,
-            )),
-        );
-        key.islands = at.islands.into();
-        key.rs = at.rs;
-
+        let key = at.key.clone();
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
         let (short, moved, empty) = match self.map.bodies.get(&key) {
@@ -1119,8 +1110,8 @@ impl Bodies {
                 } else {
                     "the resident body is empty"
                 };
-                eprintln!(
-                    "engine-cuda: WARNING: the sealed map holds no body for {key} ({why}) — \
+                tracing::warn!(
+                    "the sealed map holds no body for {key} ({why}) — \
                      this shape walks eagerly for the life of the load \
                      (BodyTally::sealed_declines counts each such fire; {declines} so far) {}",
                     self.body_stats()
@@ -1136,8 +1127,8 @@ impl Bodies {
         }
         if !run.capturable() {
             if warmed == WARM_FIRES {
-                eprintln!(
-                    "engine-cuda: body {key} declines to capture ({}), so this \
+                tracing::info!(
+                    "body {key} declines to capture ({}), so this \
                      composition walks eagerly for good, each serving fire counted \
                      unrecorded.",
                     run.uncapturable_why().join("; ")
@@ -1645,19 +1636,19 @@ mod tests {
 
     fn a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one() {
         let decoding = poem_ir::ClassSet::of([0usize]);
-        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers());
+        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers(), None);
         assert_eq!(
             fired.to_string(),
             "b8[c0:4]",
             "the lane ceiling binds below the bucket, and three rows say nothing",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES, &plain_tiers()).to_string(),
+            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES, &plain_tiers(), None).to_string(),
             "b2[c0:2]",
             "and the bucket binds below the lane ceiling",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES, &plain_tiers()).to_string(),
+            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES, &plain_tiers(), None).to_string(),
             "b8[c0:8]",
             "a class the decode arm does not name takes the bucket whole",
         );
@@ -1754,7 +1745,7 @@ mod tests {
     fn the_map_never_inserts_a_body_whose_script_is_empty() {
         let mut graphs = Bodies::new();
         let classes = table(&[(8, 1)]);
-        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers());
+        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers(), None);
         let empty = Body {
             script: Box::new([]),
             gate_step: None,

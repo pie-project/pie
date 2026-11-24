@@ -290,6 +290,19 @@ pub struct Trace {
     pub inputs: Vec<GuestInput>,
 }
 
+impl Trace {
+    /// The model's decoder layers: one past the deepest layer a node states,
+    /// 0 where none states one.
+    #[must_use]
+    pub fn decoder_layers(&self) -> u32 {
+        self.nodes
+            .iter()
+            .filter_map(|n| n.layer)
+            .max()
+            .map_or(0, |l| l + 1)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestInput {
     pub name: String,

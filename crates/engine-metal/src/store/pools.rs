@@ -147,7 +147,7 @@ pub struct RsRows {
 }
 
 /// The list a kv row's slots lie in, so the page table it reads: the kv
-/// list or window list `k` (CONTRACT-BC 19, 21).
+/// list or window list `k`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TablePaging {
     List,
@@ -175,7 +175,7 @@ pub struct Rows {
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The window lists (CONTRACT-BC 19, 21), in the recipe's order; none
+    /// The window lists, in the recipe's order; none
     /// where nothing is windowed.
     pub windows: Vec<WindowRows>,
     /// The page tables a fire stages, by the list each pages: the kv
@@ -187,7 +187,7 @@ pub struct Rows {
     /// The trace's cache rows each shape lays out, in order.
     pub kv_rows: Vec<u32>,
     pub state_rows: Vec<u32>,
-    /// A windowed recipe's rings (CONTRACT-BC 19, 21): the whole chunks a
+    /// A windowed recipe's rings: the whole chunks a
     /// record's ring takes (`layout::RING`, one slot a chunk) and the
     /// windowed layers it holds, each with its bytes (`ChunkFacts::windowed`).
     pub ring: Option<RingRows>,
@@ -264,7 +264,7 @@ impl Rows {
     ) -> Result<Rows> {
         let mut windows: Vec<WindowRows> = Vec::new();
         let mut window_runs: Vec<&[poem_compiler::chunk::TokenRun]> = Vec::new();
-        // A windowed recipe (CONTRACT-BC 19, `chunks::MetalRing`): the window
+        // A windowed recipe (`chunks::MetalRing`): the window
         // buffer is the one window table's slot, its rows the window the
         // kernels bound (the widest layer's), its pages composed each fire
         // over the ring, the buffer and the fire's own rows.
@@ -621,11 +621,11 @@ pub struct Pools {
     ring: Option<RingRows>,
     /// The page tables a fire stages, by the list each pages.
     tables: Vec<TablePaging>,
-    /// The disk tier (CONTRACT-BC 22): one slot file of disk chunks, each a
+    /// The disk tier: one slot file of disk chunks, each a
     /// pool chunk on the direct I/O boundary, any shape's slots in any
     /// chunk, laid out as on the device.
     disk: Option<Spill>,
-    /// The shared pool's host tier (CONTRACT-BC 22), where one is stated.
+    /// The shared pool's host tier, where one is stated.
     tier: Option<HostTier>,
     /// The weight cache's row-streamed tables, a shape each (`super::rows`).
     weight_caches: Vec<super::streamed::Cache>,
@@ -1049,7 +1049,7 @@ impl Pools {
             &self.shape_rows,
         );
         // A windowed load's rings: the layers they hold, and their bytes in
-        // the record (CONTRACT-BC 21); the record's state bytes are the
+        // the record; the record's state bytes are the
         // shell's to add (`Shell::chunk_facts`).
         if let Some(ring) = &self.ring {
             facts.windowed.clone_from(&ring.layers);
@@ -1067,8 +1067,7 @@ impl Pools {
         facts
     }
 
-    /// Seats a host tier of `budget` bytes, in whole chunks (CONTRACT-BC
-    /// 22).
+    /// Seats a host tier of `budget` bytes, in whole chunks .
     pub fn seat_tier(&mut self, budget: u64) {
         let chunk_bytes = self.layout.chunk_bytes;
         let chunks = budget.checked_div(chunk_bytes).unwrap_or(0);
@@ -1401,7 +1400,7 @@ impl Pools {
             .unwrap_or(0)
     }
 
-    /// Window list `k`'s paging: `T_w` tokens a page (CONTRACT-BC 21), as
+    /// Window list `k`'s paging: `T_w` tokens a page, as
     /// many pages a seat as its context fills.
     #[must_use]
     pub fn window_paging(&self, k: usize) -> Paging {
@@ -1501,7 +1500,7 @@ impl Pools {
         Ok(())
     }
 
-    /// A windowed fold's copies in `frame` (CONTRACT-BC 19; `store::windowed`):
+    /// A windowed fold's copies in `frame` (`store::windowed`):
     /// each `(source slot's byte, ring slot's byte, first row, rows)` of window
     /// table `k`'s slot shape copies those rows of every windowed layer's keys
     /// and values from the source slot to the ring slot, at the same rows.
@@ -2163,7 +2162,7 @@ impl Pools {
 
     /// Copies token runs between kv pages (slot refs of the list shape).
     /// The GPU addresses kv list pages `refs` (slot refs) start at: what a
-    /// beam group's page copies address (BEAM-PAGE-LISTS §6.4).
+    /// beam group's page copies address.
     pub fn kv_page_addresses(&self, refs: &[u32]) -> Result<Vec<u64>> {
         let list = *self.shape(LIST)?;
         refs.iter()
@@ -2330,7 +2329,7 @@ impl Pools {
     }
 
     /// The bytes one disk chunk takes: a pool chunk, on the slot file's
-    /// direct I/O boundary (CONTRACT-BC 22).
+    /// direct I/O boundary.
     #[must_use]
     pub fn disk_chunk_bytes(&self) -> u64 {
         self.layout.chunk_bytes.next_multiple_of(engine::disk::ALIGN as u64)

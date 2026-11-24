@@ -6,7 +6,7 @@
 //! named), every atom in a pool slot, every other atom in one, the whole set
 //! held (the weights' own copies given back), and every atom in a slot whose
 //! chunks are evacuated mid-decode; each against the load that states no
-//! weight shape at all (the contiguous weights, as before the cache). The
+//! weight shape at all (the contiguous weights). The
 //! use record counts one row read a token and whole routes of experts, and
 //! a seat-addressed fire refuses to run over a weight slot in the seats' own
 //! chunks.
@@ -125,7 +125,6 @@ fn lay(shell: &Shell, first: u32, keep: impl Fn(u32) -> bool) -> (Vec<ResidentWe
 fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
     let told = matches!(mode, Mode::Seated { .. } | Mode::Reseated);
     let warm = matches!(mode, Mode::Seated { warm: true } | Mode::Reseated);
-    let started = std::time::Instant::now();
     let mut shell = if told {
         let checkpoint = if warm {
             serving(fixture)
@@ -136,11 +135,6 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
     } else {
         load(fixture, mode == Mode::Whole)
     };
-    eprintln!(
-        "{mode:?}: loaded in {} ms (weights warm: {})",
-        started.elapsed().as_millis(),
-        shell.weights_warm()
-    );
     assert_eq!(
         shell.weights_warm(),
         warm || is_serving(fixture),
@@ -167,21 +161,6 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
             !facts.weights.is_empty(),
             "this miniature streams a table by its rows"
         );
-        if mode == Mode::Host {
-            for shape in &facts.weights {
-                eprintln!(
-                    "weight shape {}: {:?} {} atoms, {} B slots, {} a chunk of {} B, floor {} ({})",
-                    shape.id,
-                    shape.kind,
-                    shape.count,
-                    shape.slot_bytes,
-                    shape.slots_per_chunk,
-                    facts.chunk_bytes,
-                    shape.floor_slots,
-                    shape.name.split(',').count(),
-                );
-            }
-        }
     }
     // The weight slots from the first segment above the seats' runs, so a
     // seat-addressed fire never writes them.
@@ -290,9 +269,6 @@ fn serve(fixture: &Fixture, mode: Mode) -> (Vec<Vec<f32>>, u64) {
                         reads >= tokens && reads.is_multiple_of(tokens),
                         "{mode:?}: {reads} expert reads over {tokens} tokens"
                     );
-                    if mode == Mode::Host {
-                        eprintln!("weight shape {}: {reads} expert reads", shape.id);
-                    }
                 }
             }
         }
@@ -389,7 +365,6 @@ fn check_fixture(model: &str, fixture: &Fixture) {
             &got,
             &whole,
         );
-        eprintln!("{model}: {mode:?} = whole over {} rows", got.len());
     }
 }
 
@@ -467,117 +442,6 @@ fn a_mixtures_dense_experts_serve_the_dense_logits_qwen3() {
 #[test]
 fn a_mixtures_dense_experts_serve_the_dense_logits_dsv4() {
     experts("dsv4-flash-mini");
-}
-
-/// The process's resident set and physical footprint (what the system
-/// charges it, Metal heaps and wired pages included), in MiB.
-#[allow(unsafe_code)]
-fn memory_mib() -> (u64, u64) {
-    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-    // SAFETY: a v2 record the call fills for this process.
-    let ok = unsafe {
-        libc::proc_pid_rusage(
-            std::process::id() as i32,
-            libc::RUSAGE_INFO_V2,
-            (&raw mut info).cast(),
-        )
-    };
-    assert_eq!(ok, 0, "proc_pid_rusage");
-    (info.ri_resident_size >> 20, info.ri_phys_footprint >> 20)
-}
-
-/// Probe (ignored): a warm load out of a serving artifact, told held
-/// (`PIE_PROBE_HELD=1`) or not, the runtime then naming every atom held,
-/// then a prefill and decodes: load time and the resident set before the
-/// load, after it, and after the fires. `PIE_PROBE_MODEL` names the
-/// miniature (qwen3-30b-a3b-mini), `PIE_PROBE_LAYERS` cuts it.
-#[test]
-#[ignore = "a probe: run one mode a process"]
-fn a_held_warm_load_probe() {
-    if !engine_metal::device::present() {
-        return;
-    }
-    let model = std::env::var("PIE_PROBE_MODEL").unwrap_or("qwen3-30b-a3b-mini".into());
-    let layers = std::env::var("PIE_PROBE_LAYERS")
-        .ok()
-        .and_then(|n| n.parse().ok());
-    let held = std::env::var("PIE_PROBE_HELD").is_ok_and(|v| v == "1");
-    let fixture = fixture_of(&model, layers);
-    let path = serving(&fixture);
-    // Written by an earlier process (`PIE_PROBE_WRITE=1` writes and stops),
-    // so this one's memory holds no fixture writing.
-    if std::env::var("PIE_PROBE_WRITE").is_ok_and(|v| v == "1") {
-        eprintln!("probe fixture written: {}", path.display());
-        return;
-    }
-    let before = memory_mib();
-    let started = std::time::Instant::now();
-    let mut shell = load_as(&fixture, false, held, &path);
-    let loaded = started.elapsed();
-    let at_load = memory_mib();
-    let facts = shell.pool_chunk_facts();
-    let segment = facts.segment_chunks;
-    let first = shell.pool_layout().free_chunk().div_ceil(segment) * segment;
-    let resident: Vec<ResidentWeight> = if held {
-        facts
-            .weights
-            .iter()
-            .flat_map(|shape| {
-                let seated = shape.seated.expect("seated");
-                (0..shape.count).map(move |atom| ResidentWeight {
-                    atom: WeightAtom {
-                        shape: shape.id,
-                        atom,
-                    },
-                    slot: seated + atom,
-                })
-            })
-            .collect()
-    } else {
-        let (all, span) = lay(&shell, first, |_| true);
-        shell
-            .commit_segments((first + span).div_ceil(segment))
-            .expect("the segments commit");
-        all
-    };
-    let started = std::time::Instant::now();
-    shell
-        .weight_residency(&WeightResidency {
-            staging: Vec::new(),
-            resident,
-            held: true,
-        })
-        .expect("the residency lands");
-    let named = started.elapsed();
-    let mut fed: Vec<u32> = (0..150u32).map(|at| (at * 37 + 11) % 256).collect();
-    let mut seen = 0u32;
-    let mut last = Vec::new();
-    for _ in 0..8 {
-        let seated = Seated {
-            replay_stated: None,
-            held: Some(seen),
-            ..Seated::of(Lane {
-                slot: 0,
-                word: word(&fixture.trace, fed.len() as u32),
-                tokens: &fed,
-            })
-        };
-        let got = shell.fire_seated(&[seated]).expect("the fire lands");
-        seen += fed.len() as u32;
-        fed = vec![argmax(&got[0])];
-        last = got;
-    }
-    let weights: u64 = facts.weights.iter().map(|s| s.all_bytes()).sum();
-    eprintln!(
-        "probe {model} held={held}: load {} ms, first residency {} ms, weight shapes {} MiB, \
-         (resident, footprint) MiB before {before:?} at load {at_load:?} after fires {:?} \
-         (token {})",
-        loaded.as_millis(),
-        named.as_millis(),
-        weights >> 20,
-        memory_mib(),
-        argmax(&last[0]),
-    );
 }
 
 /// A quantized deployment's routed banks (their codes, scales, zero points

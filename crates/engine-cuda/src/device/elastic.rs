@@ -158,7 +158,7 @@ impl PhysicalPool {
             let (free, total) = crate::device::card::memory()?;
             let beside = Beside::read()?;
             if !beside.said.is_empty() {
-                eprintln!("engine-cuda: outside the pool, {}", beside.said);
+                tracing::info!("outside the pool, {}", beside.said);
             }
             let budget = room_under(ceiling, free, total);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
@@ -581,15 +581,6 @@ impl Arena {
             // `unwritten-nan`: nothing has written any of it yet.
             if crate::serve::diag::on().unwritten_nan {
                 crate::device::fill_span(self.base, self.virtual_bytes as usize, 0xFF)?;
-                let mut head = [0u8; 4];
-                let mut tail = [0u8; 4];
-                crate::device::copy_d2h(self.base, &mut head)?;
-                crate::device::copy_d2h(self.base + self.virtual_bytes - 4, &mut tail)?;
-                eprintln!(
-                    "engine-cuda: unwritten-nan: the flat range's {} bytes filled (reads {head:02x?} \
-                     at its start, {tail:02x?} at its end)",
-                    self.virtual_bytes
-                );
             }
             self.units.fill(Some(FLAT));
             self.mapped = self.units.len() as u64;

@@ -394,7 +394,7 @@ mod tests {
         assert!(refuse_late_buffers(b"not an elf").is_err_and(|why| why.contains("not an ELF")));
         assert!(refuse_late_buffers(&[]).is_err());
         // An ELF whose notes carry no kernel metadata.
-        assert!(image(&[]).len() > 0);
+        assert!(!image(&[]).is_empty());
         assert!(refuse_late_buffers(&image(&[0xc0])).is_err_and(|why| why.contains("no AMDGPU")));
     }
 

@@ -1570,3 +1570,82 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F88. CUDA: Muse's joined projection apart
+
+**What.** `muse-glimmer-30b-mini-l8-bf16-kv-bf16`'s projection legs served apart answer 0.17 off over a spread of 3.2 against the joined projection, as its joined trace does with its qkv write unfused: its unit-RMS q and k heads, unscaled, score keys 3.9 apart under its softmax scale, and its eight layers carry a last-place rounding 5% of the spread. The apart form serves only where the compiler cannot join the legs, so no served load reaches it. The ignored check (`the_open_rows_answer_apart_what_they_answer_joined` in engine-cuda's `a_joined_projection_answers_what_its_legs_answer`) was removed in the cleanup; add the row back to that test's `ROWS` once the apart form agrees.
+
+**Why later.** No served path takes it.
+
+## F87. Rollback cost models (`flush_free` / `ckpt_sync` / `stop_wait`) left the examples
+
+**What.** beam-search, cacheback- and mtp-speculative-decoding took a `rollback_mode`: `ckpt_sync` forked the set before each fire and, on a rejection, replayed the kept rows on a fork of that checkpoint; `stop_wait` replayed twice (mtp, beam) or verified one row a fire (cacheback). Each restored fork's result was discarded, so the modes priced a checkpoint rollback beside the flush-free one and changed no output. They are removed; the examples run flush-free only, and a request naming them is refused as an unknown key.
+
+**Why later.** Examples cleanup (2026-11-24): a cost model of a rollback no backend runs. If checkpoint rollback is measured again, it belongs in one bench, not copied into three examples.
+
+## F89. XLA decode: a page walk whose cost does not follow the page bound, so the bound can be data (v6e, 2026-11-25)
+
+**What.** Each decode lane rung is compiled at every page bound (16/32/64/128/256 pages), times masked or not: 70 folded and 31 buffered decode programs on Qwen3.5-0.8B. The per-row walk (`kernels-xla` `attn/paged.rs` `per_row`) already loops only to the chunk that holds the largest admitted key. Laying every decode at the cap (256 pages) instead was measured slower (Qwen3-0.6B, ABBA, tok/s medians): c1 −2% and c8 −5% at a 16-page context, c1 −1% and c8 −3% at a 64-page context. What still follows the bound is the chunk width (`c = min(budget c, span)`, so a short span reads narrower chunks) and the in-graph `[lanes, max_pages]` page table and walk.
+
+**Idea.** Make the chunk width independent of the span (chosen per fire from the runtime bound, e.g. a few widths switched inside one program), and gather the page table only to the runtime bound. Then one program per lane rung holds every page bound.
+
+**Why later.** Decode is a small share of the ladder's compile time (~1,400 of ~18,000 compile-s on Qwen3.5); the prefill and mixed programs dominate it.
+
+## F90. XLA prefill on a hybrid: lanes cost real work, and power-of-two lane padding costs up to ~25% (v6e, 2026-11-25)
+
+**What.** A recurrent layer's chunked scan lays chunks per lane, so one prefill fire's time grows with its lane count at a fixed row bucket. qwen35-d0.8b, full depth, one fire of R rows as n prompts (median ms):
+- 128 rows: n=1 3.34, 2 3.81, 4 5.04, 8 8.03, 16 13.40, 32 21.84, 64 46.65.
+- 512 rows: 4.66, 5.85, 7.01, 8.96, 13.65, 23.42, 38.64.
+- 2048 rows: 10.64, 12.12, 13.14, 15.38, 21.72, 28.48, 48.18.
+
+So no coarser lane rung is within 2% at any bucket, and the canonical power-of-two padding (`canonical_pads`) costs up to ~25% over the exact count. The ~13 programs per bucket are not duplicates of the same work either. A one-row pad or rest lane turns on the per-row attention path but skips the chunked scan, while a multi-row one runs it. At 512 rows, 4 lanes: 2 prompts with a one-row pad took 6.44 ms; 4 exact prompts took 6.65; the same rows over 4 multi-row lanes took 7.41. One 511-row prompt with a one-row rest lane took 5.01, with a two-row rest 6.10.
+
+**Idea.** Exact lane counts for small prompt counts (fewer padding lanes in the scan) traded against program count, or a chunked scan whose cost follows the live lanes (padding lanes skipped as data).
+
+**Why later.** A perf opportunity against the program count; the boot-time work keeps today's rungs.
+
+## F91. Gated-delta per-head scalars in the rs row
+
+**What.** The corrected planes of a gated-delta row may keep its per-head scalars (`poem_compiler::rs::gdn_scalars_bytes`: each value head's log-gate, then its key norm's inverse, f32), as `ChunkProfile::rs_scalars` states. Metal's decode reads them. CUDA's kernels recompute them from the row's `[b | a]` and keys, so CUDA's profile lays none (the cleanup dropped `Corrected::scalars`). engine-gpu's profile still lays the plane and, by its own `rs::Plane::Scalars` doc, neither writes nor reads it.
+
+**Why later.** engine-gpu is GPU's to flip (`rs_scalars: false` in `chunks::profile`). On CUDA, lay them again (`rs_scalars: true` and a plane in `store::rs`) only if a decode kernel comes to read them in place of recomputing.
+
+## F93. Shared host crate: the kernels-rocm / kernels-cuda host files that repeat each other
+
+**What.** Phase 1, dropped from the cleanup PR (coordinator, 2026-11-24): the byte-identical and comment-only host files (tensor.rs, attn/sched.rs = kernels-cuda attn/plan/sched.rs, sizing.rs, voxels.rs; ~0.76k lines a side) are no pure move: each imports its own crate's `jit` / `error` (`Error`, `ArgValue`, `refuse`, the slab hooks), which differ per backend, so a shared crate first owns one `Error` / `ArgValue` / `refuse`. Phase 2: 15 same-path files (~4.7k lines a side) remain near-copies: attn/plan.rs, elemwise/rope.rs, linear/affine/tiled.rs, jit/ctx.rs, synth.rs, elemwise/pointwise.rs, jit/kernel.rs, conv/conv3d.rs and others, plus the attention schedulers (kernels-rocm attn/sched_{decode,prefill,mla}.rs against kernels-cuda attn/plan/{decode,prefill,mla}.rs: 70 / 277 / 80 diff lines).
+
+**Idea.** Move each into the shared crate with its backend differences as parameters (wave 64 vs warp 32, unit names `.hip` / `.cuh`, `-ffp-contract=off` vs `fmad=false`, the device facts each reads), one file a commit, each verified by both backends' kernel tests.
+
+**Why later.** Too large this close to the PR (coordinator, 2026-11-24); phase 1 is pure moves, this is not.
+
+## F94. ROCm: one carried GDN step for 128-wide heads, the conv fused or not
+
+**What.** kernels-rocm has three carried GDN decode steps: `ssm_gdn_step_carried<BV>` (any head width), `ssm_gdn_rows_carried<128, 128, 256>` (128-wide heads, the conv run apart) and `ssm_gdn_step_fused_carried` (128-wide heads, the conv fused). The last two share a layout, but 356 of their ~860 lines differ: the fused step stages carried rows into LDS a chunk at a time, resolves their page slots once, and reads a lane that writes no state wholly as linear attention.
+
+**Idea.** One kernel with a `FUSED` flag: rows_carried's body replaced by the fused step's with its conv half compiled out. It changes rows_carried's arithmetic order, so it needs the per-shape rocprofv3 microbench (rows 1 / 8 / 64, carried 0 / 1, commit 1 / 8) and bit-identical outputs and states before it lands.
+
+**Why later.** Not a mechanical merge (the cleanup round took only moves); `ssm_gdn_step_carried` stays the fallback for other head widths either way.
+
+## F96. `ChunkFacts::act_span_chunks` goes once no engine pins its span's bottom at load
+
+**What.** `crates/engine/src/chunk.rs:143` `act_span_chunks`: the chunks from the range's end a rung's activation may take. The end state is `None` on every engine; engine-gpu (`store/layout.rs:412`) and engine-metal (`store/layout.rs:576`) still state it, as they pin their span's bottom at load. The field and the runtime's reads of it (`store/shared.rs`, `store/shared/programs.rs`) go with the last of them.
+
+**Why later.** Each engine's span has to be backed on demand first; the comment that called it interim moved here.
+
+## F97. engine-gpu: arm the request classes whose lanes carry an attachment
+
+**What.** `crates/engine-gpu/src/serve.rs:10420` (`record_bodies`), `:1248` (`eager_classes`), `:5232` (`eager_kind`): a class whose lanes carry a score capture, an adapter or a guest input is stated eager at load, since its commands bind each attachment, which multiplies the bodies past what a device holds. It is armed once its commands read the attachment as data.
+
+**Why later.** Needs the attachment read as data in the recorded commands; until then those classes run eager, stated at load.
+
+## F98. SDK parity: beam search and the speculative / latent helpers outside Rust
+
+**What.** The JS and Python bridges never bind `parents` / `parentsEnd`, so JS and Python inferlets cannot run beam search (Rust has `BeamGroup`). Python also lacks the speculative verify and latent flow-match helpers, and JS has diffusion only.
+
+## F100. Derive the ROCm caps stated as chosen bounds
+
+**What.** kernels-rocm and engine-cuda's HIP code state these as chosen bounds, not measured ones (their origin was lost to the squashed import): `linear::moe` LT_STAGE_CAP (3 GiB) and GROUP_WORKSPACE_CAP (512 MiB), `linear::affine::tiled` THIN_ROWS, `elemwise::norm` ROWS_PER_SPLIT, `linear::dense_batch` MAX_SPLITS / MIN_STAGES, `weights::hip` STAGED (256 MiB).
+
+**Idea.** A sweep per cap on MI300X over the shapes the served models fire (rocprofv3 on the kernel tests, the staging caps against the load's device-memory budget), each value then derived from what it bounds (the budget, the device's CUs, the pipeline's depth) or kept with its measurement stated.
+
+**Why later.** A value change re-measures what it fires; the cleanup PR changes no value.

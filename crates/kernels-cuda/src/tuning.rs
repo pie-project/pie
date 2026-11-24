@@ -1149,7 +1149,7 @@ impl RoofRates {
     /// The matmul's flops a ns at `m` rows of an `n x k` plane.
     #[must_use]
     pub fn gemm_rate(&self, m: u32, n: u32, k: u32) -> f64 {
-        profile::fire::gemm_rate(&self.gemm_by_rows, m, n, k)
+        profile::curves::gemm_rate(&self.gemm_by_rows, m, n, k)
     }
 }
 
@@ -1160,7 +1160,7 @@ impl Roof {
     /// `rates`' roofline, [`Roof::UNSTATED`] where it lacks the launch, the
     /// bandwidth or the matmul curves.
     #[must_use]
-    pub fn of(rates: &profile::fire::Rates) -> Roof {
+    pub fn of(rates: &profile::rates::Rates) -> Roof {
         let (Some(launch_ns), Some(gbps), Some(curves)) = (
             rates.launch_ns,
             rates.hbm_gbps,

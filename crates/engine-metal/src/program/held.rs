@@ -1,5 +1,4 @@
-//! Where a guest instance's state lives (REDESIGN step 4,
-//! `new-memory/STATE-ROLES.md`): its bind-time launch tables and its rings,
+//! Where a guest instance's state lives: its bind-time launch tables and its rings,
 //! in pool slots of role `Instance` and `Channel` the runtime took for it.
 //! The one exception the contract states is a ring larger than a chunk: no
 //! slots, a buffer of the engine's own.
@@ -111,7 +110,7 @@ impl Held {
 
     /// `bytes` zeroed bytes over the run of `count` slots of `shape` from
     /// `first`: adjacent slots of one chunk, so one span in the view and in
-    /// the heap (STATE-ROLES.md option D).
+    /// the heap.
     pub fn in_run(
         pools: &Pools,
         shape: ShapeId,

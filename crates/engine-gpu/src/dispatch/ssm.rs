@@ -187,7 +187,6 @@ impl<B: Backend> Run<'_, B> {
         if to <= from {
             return Ok(());
         }
-        let _ = folds.count;
         let carry = seat
             .fold_carry(&folds, u32::try_from(from).unwrap_or(u32::MAX))
             .map_err(fault)?;

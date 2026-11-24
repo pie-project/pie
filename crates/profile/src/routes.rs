@@ -63,20 +63,23 @@ pub struct Wanted {
     pub candidates: Vec<u32>,
 }
 
+/// A bank: a product's `(rows, k, m)` as the table keys it.
+type Bank = (u32, u32, u32);
+
 /// A device's measured product times and the shapes they lacked.
 #[derive(Debug, Default)]
 pub struct Routes {
-    times: HashMap<((u32, u32, u32), u32), (Kind, f64, f64)>,
+    times: HashMap<(Bank, u32), (Kind, f64, f64)>,
     wanted: Mutex<BTreeMap<Shape, Wanted>>,
     /// Every shape answered by one kernel: a test's table ([`Routes::all`]).
     all: Option<u32>,
     /// Banks answered by one kernel whatever is measured: a probe's table
     /// while it times a body under each choice ([`Routes::forcing`]).
-    forced: HashMap<(u32, u32, u32), u32>,
+    forced: HashMap<Bank, u32>,
     /// The entries of `times` that are estimates: figures stored under a
-    /// stale key (`profile::fire::Rates::stale`), served as they stand
+    /// stale key (`profile::rates::Rates::stale`), served as they stand
     /// ([`Routes::estimating`]).
-    estimated: std::collections::HashSet<((u32, u32, u32), u32)>,
+    estimated: std::collections::HashSet<(Bank, u32)>,
     /// The shapes [`Routes::pick`] answered by an estimate since the last
     /// call of [`Routes::behind`].
     behind: Mutex<BTreeMap<Shape, Wanted>>,
@@ -84,14 +87,14 @@ pub struct Routes {
     /// the tables a load's measuring lays over this one ([`Routes::with`]),
     /// not with a probe's ([`Routes::forcing`]): what the load's bodies
     /// were armed under ([`Routes::fingerprint`]).
-    picked: std::sync::Arc<Mutex<BTreeMap<(u32, u32, u32), u32>>>,
+    picked: std::sync::Arc<Mutex<BTreeMap<Bank, u32>>>,
 }
 
 impl Routes {
     /// The table `[rates] product_ns` states (entries of a kind this crate
     /// does not know are not read).
     #[must_use]
-    pub fn of(times: &[crate::fire::ProductTime]) -> Self {
+    pub fn of(times: &[crate::rates::ProductTime]) -> Self {
         let mut table = HashMap::new();
         for t in times {
             if let Some(kind) = Kind::ALL.into_iter().find(|k| *k as u32 == t.kind) {
@@ -112,8 +115,8 @@ impl Routes {
     /// load says which banks serve by them.
     #[must_use]
     pub fn estimating(
-        measured: &[crate::fire::ProductTime],
-        estimates: &[crate::fire::ProductTime],
+        measured: &[crate::rates::ProductTime],
+        estimates: &[crate::rates::ProductTime],
     ) -> Self {
         let mut routes = Self::of(measured);
         for (at, time) in Self::of(estimates).times {
@@ -216,7 +219,7 @@ impl Routes {
     #[must_use]
     pub fn fingerprint(&self) -> u32 {
         let picked = self.picked.lock().expect("routes lock poisoned").clone();
-        crate::fire::fingerprint(format!("{picked:?}|{:?}", self.all).as_bytes())
+        crate::rates::fingerprint(format!("{picked:?}|{:?}", self.all).as_bytes())
     }
 
     /// The shapes [`Routes::pick`] met unmeasured since the last call, with
@@ -286,10 +289,10 @@ fn note(notes: &Mutex<BTreeMap<Shape, Wanted>>, shape: Shape, weight: u64, candi
 
 /// `measured` as `[rates] product_ns` entries.
 #[must_use]
-pub fn product_times(measured: &[(Shape, u32, f64, f64)]) -> Vec<crate::fire::ProductTime> {
+pub fn product_times(measured: &[(Shape, u32, f64, f64)]) -> Vec<crate::rates::ProductTime> {
     measured
         .iter()
-        .map(|&(s, kernel, ns, spread)| crate::fire::ProductTime {
+        .map(|&(s, kernel, ns, spread)| crate::rates::ProductTime {
             kind: s.kind as u32,
             rows: s.rows,
             k: s.k,
@@ -378,7 +381,7 @@ mod tests {
     /// wanted before ready; once timed it is measured, no longer noted.
     #[test]
     fn a_stale_figure_answers_and_is_noted_behind() {
-        let time = |kernel, ns| crate::fire::ProductTime {
+        let time = |kernel, ns| crate::rates::ProductTime {
             kind: Kind::NormedGated as u32,
             rows: GATE_UP.rows,
             k: GATE_UP.k,

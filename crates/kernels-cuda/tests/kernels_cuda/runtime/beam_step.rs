@@ -1,11 +1,11 @@
 //! A beam group's head step (`channel::beam_step`) against the host replay
-//! of `new-memory/designs/BEAM-PAGE-LISTS.md` (`engine::beam::step`), fire
+//! (`engine::beam::step`), fire
 //! by fire: widths 2, 4 and 8, a prompt ending mid-page and one ending on a
 //! page, parents with forks and retirements; and the state moved to another
 //! allocation mid-search (a suspend and restore of the instance's bytes),
 //! after which the search goes on identically. On a hybrid each beam's rs
 //! row lands, through its group's list as the step left it
-//! (`channel::RsRows`), on the set's row of the slot §11.1 names.
+//! (`channel::RsRows`), on the set's row of the slot its group writes.
 #![cfg(feature = "cuda")]
 #![allow(unsafe_code)]
 
@@ -109,7 +109,7 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
             })
             .collect();
         let lists_at = gpu.up(&lists);
-        // A hybrid's beams' rs rows (§11.1): the step points each at its list.
+        // A hybrid's beams' rs rows: the step points each at its list.
         let beams: Vec<RsRows> = (0..lanes)
             .map(|b| RsRows {
                 list: state_at + u64::from(channel::BEAM_HEADER + b * cap) * 4,
@@ -190,7 +190,7 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
             assert_eq!(entries, &list[..], "{at}: beam {b}'s resolved entries");
             assert_eq!(writes[b], device_id(want.lists[b][c as usize]), "{at}: beam {b}'s write page");
         }
-        // A hybrid's rows (§11.1): each beam lands its row at this fire's
+        // A hybrid's rows: each beam lands its row at this fire's
         // slot through the list the step pointed it at, on the set's row of
         // slot (f0 + list[j]) S + slot mod S.
         let rs_lanes: Vec<RsLane> = (0..lanes)
@@ -289,7 +289,7 @@ fn a_parent_past_the_group_faults_its_lane() {
     assert_eq!(replay.fired, 2);
 }
 
-/// A fork's rs copy on a hybrid (`BEAM-PAGE-LISTS.md` §6.4, §11): rows of
+/// A fork's rs copy on a hybrid: rows of
 /// 2 a page from slot 38, kv pages of 16 (the live Qwen3.5 frozen slot),
 /// two planes of other row bytes. A copy of 5 slots from pool page 1 to 3
 /// ends mid rs page; one from the prompt's own page 0 skips its tail's

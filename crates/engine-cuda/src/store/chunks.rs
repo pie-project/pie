@@ -1015,21 +1015,18 @@ impl Chunks {
                 },
             ));
         }
-        // Where the record holds the rings, the one window list is the
-        // window buffer (CONTRACT-BC 21).
-        let ringed = layout.ring.is_some();
+        // The record holds the rings, so the one window list is the window
+        // buffer.
         for window in &layout.windows {
             let mut stated = shape(
                 window,
                 SlotKind::List {
                     tokens: window.tokens,
                     rate: 1,
-                    window: if ringed { None } else { window.window },
+                    window: None,
                 },
             );
-            if ringed {
-                stated.role = engine::chunk::SlotRole::WindowBuffer;
-            }
+            stated.role = engine::chunk::SlotRole::WindowBuffer;
             shapes.push(stated);
         }
         if let Some(rs) = &layout.rs {
@@ -1044,7 +1041,7 @@ impl Chunks {
             stated.role = engine::chunk::SlotRole::RsBuffer;
             shapes.push(stated);
         }
-        // The ring shape, before the record's state shape (CONTRACT-BC 21).
+        // The ring shape, before the record's state shape.
         if let Some(ring) = &layout.ring {
             let mut stated = shape(
                 &ring.slot,
@@ -1107,7 +1104,7 @@ impl Chunks {
             shapes,
             // Every rung below one fire's tokens, one lending nothing among
             // them: the stated rungs are the arena's, so the step set the
-            // load states is the one its arm walk took (CONTRACT-BC 24).
+            // load states is the one its arm walk took.
             act_chunks: rungs
                 .iter()
                 .filter(|&&(tokens, _)| tokens < max_tokens)

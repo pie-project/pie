@@ -997,81 +997,6 @@ fn attn_paged_relative_bias() {
     }
 }
 
-/// Probe (by hand, `--ignored --nocapture`): a decode's attention planned
-/// eagerly (`enable_cuda_graph` false) against the plan a captured body
-/// takes (true), at 1 / 8 / 64 lanes over 512 and 4096 keys, Qwen3-0.6B's
-/// and Qwen3-8B's heads, microseconds a launch.
-#[test]
-#[ignore = "a probe run by hand"]
-fn decode_eager_against_body_probe() {
-    let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
-    let device = plan::Device::probe(&ctx).unwrap();
-    let cus = kernels_rocm::hip::multiprocessors(0).unwrap();
-    for (name, c) in [
-        ("0.6B", Case::new(16, 8, 128, 16, false)),
-        ("8B", Case::new(32, 8, 128, 16, false)),
-    ] {
-        let max_grid = attn::paged::decode_max_grid_size(c.kv_heads, cus);
-        for lanes in [1u32, 8, 64] {
-            for keys in [512u32, 4096] {
-                let kv_lens = vec![keys; lanes as usize];
-                let cache = cache(&gpu, &c, &kv_lens, 7);
-                let qv: Vec<f32> = values((lanes * c.q_heads * c.head_dim) as usize, 3, 1.0)
-                    .into_iter()
-                    .map(round_bf16)
-                    .collect();
-                let q = || RaggedTensor {
-                    data: gpu.tensor(&qv, lanes, c.q_heads * c.head_dim, Dtype::Bf16),
-                    indptr: gpu.column(&(0..=lanes as i32).collect::<Vec<_>>()),
-                };
-                let kv_len: Vec<i32> = kv_lens.iter().map(|&x| x as i32).collect();
-                let mut line = format!("[decode] {name} lanes {lanes:>2} keys {keys:>4}:");
-                for (arm, graph) in [("eager", false), ("body", true)] {
-                    let built = plan::plan_decode(
-                        &cache.page_indptr,
-                        &kv_len,
-                        plan::Shape {
-                            num_requests: lanes,
-                            lane_offset: 0,
-                            num_q_heads: c.q_heads,
-                            num_kv_heads: c.kv_heads,
-                            head_dim: c.head_dim,
-                            page_size: c.page_size,
-                            hnd_layout: c.hnd,
-                        },
-                        plan::Live {
-                            requests: lanes,
-                            lane_offset: 0,
-                            row_offset: 0,
-                            rows: lanes,
-                        },
-                        None,
-                        graph,
-                        max_grid,
-                        plan::Toggles::of(kernels_rocm::tuning::Tuning::DEFAULT),
-                        &device,
-                        workspace(&gpu),
-                    )
-                    .unwrap();
-                    built.stage(&ctx).unwrap();
-                    let q = q();
-                    let mut o = gpu.zeros(lanes, c.q_heads * c.head_dim, Dtype::Bf16);
-                    let us = gpu.time(200, || {
-                        attn::decode(&ctx, q, &built, &cache.pool, None, c.head_dim, 0.0, &mut o, None)
-                            .unwrap();
-                    });
-                    line.push_str(&format!(
-                        "  {arm} {us:7.1} us (split={} items={})",
-                        built.info.split_kv, built.info.padded_batch_size
-                    ));
-                }
-                eprintln!("{line}");
-            }
-        }
-    }
-}
-
 /// The masked prefill reads each request's two segments as the custom mask
 /// states them: its committed run (keys below its origin) whole, cut at the
 /// row's position unless its word is wide, and its buffer (keys from its
@@ -1107,7 +1032,7 @@ fn attn_paged_masked_prefill() {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            state % 3 != 0
+            !state.is_multiple_of(3)
         };
         let mut bytes: Vec<u8> = Vec::new();
         let mut indptr: Vec<i64> = Vec::new();
@@ -1258,7 +1183,7 @@ fn attn_paged_masked_decode() {
             let mut seed = 0x9e37_79b9u64;
             let mut bit = || {
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-                (seed >> 33) % 3 != 0
+                !(seed >> 33).is_multiple_of(3)
             };
             let (mut bytes, mut indptr, mut reads) = (Vec::<u8>::new(), Vec::<i64>::new(), Vec::new());
             for r in 0..n as usize {

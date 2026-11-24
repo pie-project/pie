@@ -426,6 +426,7 @@ pub fn load(
     mlp_split: AneMlp,
     projection_split: AneProjections,
     min_rows: u32,
+    cache: Option<&std::path::Path>,
 ) -> Result<Option<Private>> {
     use objc2_metal::MTLDevice;
     let mut keep = banks::Keep::default();
@@ -511,10 +512,12 @@ pub fn load(
             site.shape.clone(),
         ));
     }
+    let cache = kernels_metal::ane::cache_directory(
+        &cache.map_or_else(|| std::env::temp_dir().join("pie-cache"), std::path::Path::to_path_buf),
+    );
     std::thread::Builder::new()
         .name("pie-ane-compile".into())
         .spawn(move || {
-            let cache = kernels_metal::ane::cache_directory();
             for job in jobs {
                 job.run(&cache);
             }

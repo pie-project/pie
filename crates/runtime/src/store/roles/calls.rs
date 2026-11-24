@@ -162,6 +162,14 @@ pub fn take_bind(
         .asked_runs()
         .filter(|&(run, pieces)| roles.device.lock().unwrap().pool().runs_most(run) >= pieces)
         .or(fresh);
+    if let Some(holder) = holder {
+        let mut runs: Vec<(u32, u32)> =
+            asked.into_iter().filter(|&(_, pieces)| pieces > 0).collect();
+        if beside > 0 {
+            runs.push((1, beside));
+        }
+        roles.claim(holder, runs);
+    }
     let mut taken = roles
         .take_instance(
             binding.program,

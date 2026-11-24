@@ -84,8 +84,8 @@ export function runAheadWindow(): number;
 /**
  * Frames the engine keeps in flight (`[runtime] frame_dispatch_depth`, the
  * engine's `frames_in_flight`): a beam group's freed pages wait this many
- * fires before they are handed out again (`new-memory/designs/
- * BEAM-PAGE-LISTS.md` §3), so a guest sizing a beam pool reads it here.
+ * fires before they are handed out again, so a guest sizing a beam pool
+ * reads it here.
  * Static for the run.
  */
 export function framesInFlight(): number;
@@ -132,7 +132,7 @@ export interface SwitchDecl {
  * 
  * ## `"voxel"`
  */
-export type InputAxis = 'lane' | 'row' | 'voxel';
+export type InputAxis = "lane" | "row" | "voxel";
 /**
  * The rows a lane binding an input carries: exactly `n`, or the fewest
  * multiple of `n` holding the guest's own; the guest zero-pads to them.
@@ -214,7 +214,7 @@ export interface LatentSpace {
  * 
  * v-prediction.
  */
-export type ScheduleKind = 'flow' | 'epsilon' | 'v';
+export type ScheduleKind = "flow" | "epsilon" | "v";
 /**
  * The noise schedule the denoiser was trained under: `shift` is the
  * trained timestep shift (1.0 = none; a flow model's base `mu` when it

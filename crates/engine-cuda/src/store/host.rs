@@ -1,4 +1,4 @@
-//! The shared pool's host tier (CONTRACT-BC 22): pageable host memory, and
+//! The shared pool's host tier: pageable host memory, and
 //! a page-locked staging ring every move to or from the device goes
 //! through, a piece at a time.
 //!
@@ -649,7 +649,7 @@ impl Drop for HostTier {
 fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32) {
     if let Err(why) = crate::device::ctx::bind_thread(ordinal) {
         let what = format!("the host tier's landing thread bound no device: {why}");
-        eprintln!("engine-cuda: {what}");
+        tracing::warn!("{what}");
         // Every job finishes, moving nothing, so no stream waits forever.
         while let Ok(job) = jobs.recv() {
             shared.finish(job.id, Some(what.clone()));

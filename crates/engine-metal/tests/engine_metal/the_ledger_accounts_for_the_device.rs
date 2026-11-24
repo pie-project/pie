@@ -15,14 +15,8 @@ const CONTEXT: u32 = 256;
 /// heap's worth, which the driver's own allocations stay well inside.
 const SLACK: i128 = 16 << 20;
 
-fn audited(shell: &engine_metal::Shell, when: &str) -> i128 {
+fn audited(shell: &engine_metal::Shell, _: &str) -> i128 {
     let audit = shell.audit();
-    eprintln!(
-        "{when}: {}; device {} MiB, gap {} KiB",
-        shell.ledger(),
-        audit.device >> 20,
-        audit.gap() / 1024
-    );
     audit.gap()
 }
 

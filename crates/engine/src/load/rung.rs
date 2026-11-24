@@ -1,4 +1,4 @@
-//! The top rung a load lays its fires up to (the ruling): of the feasible
+//! The top rung a load lays its fires up to (the fire-top rule): of the feasible
 //! rungs, the one whose fire turns the most of its time into useful work
 //! for the share of the live range its span takes:
 //!
@@ -317,7 +317,7 @@ impl FireEstimate {
         }
     }
 
-    /// The ruling's efficiency of a fire at `rung`, `r / (r + r*)` over its
+    /// The fire-top rule's efficiency of a fire at `rung`, `r / (r + r*)` over its
     /// weight groups: each group's compute at the device's full matmul rate
     /// at its shape (the top of the curve), over that compute and the
     /// group's weight read together. A group of `r*` rows reads its weights
@@ -529,7 +529,7 @@ impl fmt::Display for NoRung {
 
 impl std::error::Error for NoRung {}
 
-/// The top rung of `rungs` (the module's ruling), over a live range of
+/// The top rung of `rungs` (the module's rule), over a live range of
 /// `live_capacity_bytes`, each rung's fire timed by `estimate`.
 pub fn top_rung(
     rungs: &[RungFacts],
@@ -537,7 +537,7 @@ pub fn top_rung(
     estimate: &FireEstimate,
 ) -> Result<TopRung, NoRung> {
     let times: Vec<f64> = rungs.iter().map(|r| estimate.ns(r)).collect();
-    // Each rung as the ruling weighs it: its estimate, and why it is out
+    // Each rung as the fire-top rule weighs it: its estimate, and why it is out
     // where it is (the device's memory, a stated bound on one submission).
     for (rung, &ns) in rungs.iter().zip(&times) {
         tracing::debug!(
@@ -570,7 +570,7 @@ pub fn top_rung(
     pick(rungs, &effs, live_capacity_bytes)
 }
 
-/// The fire top: the ruling's top rung ([`top_rung`]) over the rungs a
+/// The fire top: the fire-top rule's top rung ([`top_rung`]) over the rungs a
 /// prompt can hold (no wider than `context`) of every rung the engine's
 /// lattice offers, each weighed as its check fire shapes it
 /// ([`RungFacts::check_fire`]: decode-shaped no wider than its lanes,
@@ -593,7 +593,7 @@ pub fn fire_top(
     top_rung(&held, live_capacity_bytes, estimate)
 }
 
-/// The ruling's argmax over `rungs` whose fires are `effs` efficient (one
+/// The fire-top rule's argmax over `rungs` whose fires are `effs` efficient (one
 /// a rung, [`FireEstimate::eff`] or [`measured_effs`]): what [`top_rung`]
 /// weighs by the estimate, and what a check of the estimate weighs by
 /// measured times.
@@ -655,7 +655,7 @@ fn scores(feasible: &[(&RungFacts, f64)], live: u64) -> Vec<(f64, f64, f64)> {
         .collect()
 }
 
-/// The ruling's efficiency of each of `rungs` whose fires measured `times`
+/// The fire-top rule's efficiency of each of `rungs` whose fires measured `times`
 /// (ns, one a rung; a rung at nothing unmeasured): `r / (r + r*)`, `r*` the
 /// crossover of the line the measured fires fit (least squares, `t = a + b
 /// r`: `a` what a fire takes whatever its rows, the weights' read among it,
@@ -864,7 +864,7 @@ mod tests {
 
     /// The M1's 1024-wide matmul curve: nearly flat from 256 to 512 rows,
     /// then a knee at 1024 (2.3 / 2.35 / 5.0 TFLOP/s). A rule that stops
-    /// where a doubling stops paying stops at 256; the ruling's efficiency
+    /// where a doubling stops paying stops at 256; the fire-top rule's efficiency
     /// reads the curve's full rate, so the fire top lies past the knee,
     /// bounded by what a prompt holds alone.
     #[test]
@@ -1002,7 +1002,7 @@ mod tests {
         let r = rung(1024, 0);
         let t = e.terms(&r);
         assert!((t.flops - 2048.0 / e.rates.gemm_rate(128, 1, 1)).abs() < 1e-9);
-        // The ruling's crossover: the bank read whole (64 000 ns at a byte a
+        // The fire-top rule's crossover: the bank read whole (64 000 ns at a byte a
         // ns) against 2 flops a row at the full 2 a ns: r* = 64 000 rows, 8
         // of 64 experts a row. A dense plane of the same bytes and flops a
         // row reaches its crossover at the same rows; one computing every

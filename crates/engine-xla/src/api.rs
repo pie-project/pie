@@ -654,7 +654,7 @@ impl Engine for Xla {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
-                prefill_lanes: 0,
+                prefill_lanes: shell.prefill_lanes(),
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
                     &budgets,
                 )))
@@ -2441,7 +2441,7 @@ impl Xla {
                     for (b, &code) in words.iter().take(live as usize).enumerate() {
                         if code != 0 {
                             let lane = first + b as u32;
-                            hold.fault_lane(lane, instance, &crate::beam::fault_reason(code, lane));
+                            hold.fault_lane(lane, instance, &engine::beam::fault_reason(code, lane as usize, "engine-xla"));
                         }
                     }
                     // the group's common slot, after the lanes' faults (§11.3)

@@ -193,7 +193,7 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
                 "the state folded through the commit",
             );
 
-            // A beam group's fold (§11.3) of the first rows, from the kept
+            // A beam group's fold of its common first rows, from the kept
             // planes, leaves the plain step's state there; a group folding
             // none beside it touches nothing.
             for n in [5u32, T as u32] {
@@ -373,7 +373,7 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
             "the state folded through the commit",
         );
 
-        // A beam group's fold (§11.3) of the first rows, from the kept
+        // A beam group's fold of its common first rows, from the kept
         // planes, leaves the plain step's state there; a group folding none
         // beside it touches nothing.
         for n in [5u32, T as u32] {

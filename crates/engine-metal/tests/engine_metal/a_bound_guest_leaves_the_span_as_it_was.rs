@@ -2,9 +2,7 @@
 //! A guest program's state is its instances' and its pair's, in `Instance`
 //! slots (`engine::Engine::guest_state`): nothing of it lies in the
 //! activation span. Bound 64 times over, a program leaves the span the
-//! rung's fires take as it was before the first bind. (Laid in the span,
-//! its batch tables and lanes' scratch cut the widest rung that fit beside
-//! them to 32 rows on a load sized for 1024.)
+//! rung's fires take as it was before the first bind.
 
 use eta_ir::registry::{GeometryClass, PortMask};
 

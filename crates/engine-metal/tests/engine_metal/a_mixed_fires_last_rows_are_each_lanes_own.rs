@@ -2,10 +2,9 @@
 
 //! A lane's last row of an output written over every token row of a fire
 //! (`InputAxis::Row`, not gathered at the readout rows) is its own token
-//! row, whatever lanes share the fire. In a load that gathers readout rows
-//! (its logits), that row was taken as the lane's index among the fire's
-//! readout rows: right for a gathered output, another lane's row for a
-//! token-row one wherever a prompt sits between decodes.
+//! row, whatever lanes share the fire, in a load that gathers readout rows
+//! (its logits) too: never the lane's index among the fire's readout rows,
+//! which is another lane's row wherever a prompt sits between decodes.
 //!
 //! The micro text model gathers its logits; its final hidden rows, read out
 //! under `hidden` (the readout gather's input, every token row), are the

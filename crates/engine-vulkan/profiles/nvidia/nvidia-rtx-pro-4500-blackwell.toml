@@ -16,7 +16,7 @@ rates = "pie tune vulkan --rates on 2026-11-19 (pie 0.6.0): NVIDIA RTX PRO 4500 
 gemm.path = [{ when = "rows < 96", use = "tiled" }, "coopmat"]
 
 # Measured on the device at a load (GPU, 2026-11-19). The dense kernels'
-# curves (`kernel_tflops_by_shape_keyed`) are left to the device's own first load
+# curves (`kernel_curves`) are left to the device's own first load
 # of each model: they are timed at the model's own planes.
 [rates]
 launch_ns = 5755

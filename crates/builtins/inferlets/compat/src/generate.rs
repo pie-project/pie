@@ -410,8 +410,8 @@ fn prompt_rows(
 /// With a `guide`, every fire's logits are masked to what it allows next,
 /// and generation ends when it terminates.
 ///
-/// Every pass but the speculative path's is final, the SDK's default
-/// (CONTRACT-BC 25): the prompt's and the decode's fires fold at fire and
+/// Every pass but the speculative path's is final, the SDK's default:
+/// the prompt's and the decode's fires fold at fire and
 /// run the plain folded step. A request makes its own working set and
 /// releases it when it ends, so a stop (a stop token, a stop sequence, the
 /// budget, a grammar's end) only ends the output: what ran past it stays in

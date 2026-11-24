@@ -236,6 +236,7 @@ fn serve(
         readout,
         read: chip.read(),
         refused: None,
+        layers: trace.decoder_layers(),
     })
 }
 
@@ -302,6 +303,7 @@ struct Cuda<'a> {
     facts: &'a Facts,
     sms: u32,
     profiles: Option<&'a Path>,
+    mix: search::Mix,
 }
 
 impl Cuda<'_> {
@@ -313,6 +315,14 @@ impl Cuda<'_> {
 }
 
 impl Bench for Cuda<'_> {
+    fn mix(&self) -> search::Mix {
+        self.mix
+    }
+
+    fn agreement(&self) -> f64 {
+        engine::rates::AGREEMENT
+    }
+
     fn models(&self) -> Vec<String> {
         self.models.iter().map(|(_, d)| d.clone()).collect()
     }
@@ -348,6 +358,7 @@ impl Bench for Cuda<'_> {
 pub fn run(
     profiles: Option<&Path>,
     models: &[(PathBuf, String)],
+    mix: search::Mix,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -366,6 +377,7 @@ pub fn run(
         facts: &facts,
         sms,
         profiles,
+        mix,
     };
     let mut lines = Vec::new();
     let mut chosen = Vec::new();
