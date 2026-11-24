@@ -193,8 +193,9 @@ impl Serve for Api {
         max_submit: Option<std::time::Duration>,
         stated: &profile::fire::Rates,
         yield_to: &dyn Fn() -> bool,
+        behind: engine_gpu::rates::Behind<'_>,
     ) -> Result<engine::rates::Measured> {
-        crate::rates::measure_behind(device, tuning, max_submit, stated, yield_to)
+        crate::rates::measure_behind(device, tuning, max_submit, stated, yield_to, behind)
     }
 
     fn measure_curves(

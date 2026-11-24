@@ -275,6 +275,12 @@ pub struct Gpu<B: Host> {
     /// What the work behind serving was last said to be doing
     /// ([`Gpu::behind_state`]).
     said_behind: Option<&'static str>,
+    /// Each stale rate's points completed behind serving so far, by key: a
+    /// slice resumes at its next unmeasured point.
+    rates_resume: std::collections::HashMap<String, crate::rates::Resume>,
+    /// The stale rates one of whose points is past one decode step: their
+    /// rest runs once nothing is live.
+    rates_long: std::collections::HashSet<String>,
 }
 
 impl<B: Host> Gpu<B> {
@@ -324,11 +330,29 @@ impl<B: Host> Gpu<B> {
             self.behind_state("waiting: the device is busy");
             return Ok(false);
         }
+        // A key one of whose points is past one decode step runs (at the
+        // platform's bound) only once nothing is live.
+        let long = self.rates_long.contains(&key);
+        if long && !behind.alone {
+            self.behind_state(
+                "waiting: a stale rate's next point runs longer than one decode step, and runs \
+                 only once no process is live",
+            );
+            return Ok(false);
+        }
         self.behind_state("running: the stale rates and curves");
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
         let max_submit = B::submit_bound(&self.boot);
+        // Under a platform's bound, each frame held to one decode step of
+        // this load, until a point is found past it.
+        let cap = (!long)
+            .then(|| shell.decode_step_ns())
+            .flatten()
+            .map(|ns| std::time::Duration::from_nanos(ns as u64));
+        let resume = self.rates_resume.entry(key.clone()).or_default();
+        resume.begin();
         let mut stated = shell.tuning().profile().rates();
         stated.stale = None;
         let reference = shell.tuning().gemm(shell.tier(), crate::submit::PROBE.0);
@@ -376,6 +400,7 @@ impl<B: Host> Gpu<B> {
                         max_submit,
                         &stated,
                         behind.arrived,
+                        crate::rates::Behind { resume, cap },
                     )
                     .and_then(|measured| match measured.throttled {
                         None => Ok(measured.rates),
@@ -390,14 +415,42 @@ impl<B: Host> Gpu<B> {
                 }
             };
         let ms = began.elapsed().as_secs_f64() * 1e3;
+        // A slice that stopped keeps the points it completed, where it had
+        // the device alone at a steady clock; else they are timed again.
+        let kept = |this: &mut Self, why: &str| -> EngineResult<()> {
+            let Some(shell) = this.shell.as_ref() else {
+                return Ok(());
+            };
+            let after = crate::rates::clock_read::<B>(shell.device(), reference).map_err(fault)?;
+            let moved = (behind.others)() != submitted
+                || crate::rates::throttled(before, after).is_some();
+            let resume = this.rates_resume.entry(key.clone()).or_default();
+            if moved {
+                resume.discard();
+            }
+            tracing::info!(
+                key = %key,
+                ms,
+                done = resume.done(),
+                moved,
+                "rates behind serving: `{key}` {why}; {} points kept{}",
+                resume.done(),
+                if moved { " (this slice's taken back: overlapped, or its clock moved)" } else { "" }
+            );
+            Ok(())
+        };
         let timed = match timed {
             Ok(rates) => rates,
             Err(why) if crate::rates::yielded(&why) => {
-                tracing::info!(
-                    key = %key,
-                    ms,
-                    "rates behind serving: `{key}` yielded to an arrival; timed again later"
-                );
+                kept(self, "yielded to an arrival, resumed later")?;
+                return Ok(true);
+            }
+            Err(why) if crate::rates::deferred(&why) || (cap.is_some() && !long) => {
+                // A point past one decode step (or a step that cannot hold
+                // its frames to it): the key's rest runs once nothing is
+                // live, at the platform's bound.
+                self.rates_long.insert(key.clone());
+                kept(self, &format!("deferred until nothing is live ({why})"))?;
                 return Ok(true);
             }
             Err(why @ crate::error::Fault::Device { call: "rates behind serving", .. }) => {
@@ -420,8 +473,16 @@ impl<B: Host> Gpu<B> {
                 ms,
                 "rates behind serving: `{key}` discarded ({why}); timed again later"
             );
+            if let Some(resume) = self.rates_resume.get_mut(&key) {
+                resume.discard();
+            }
             return Ok(true);
         }
+        self.rates_resume.remove(&key);
+        self.rates_long.remove(&key);
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
         if let Err(why) = B::save_rates(shell.device(), &self.boot, &timed) {
             tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
         }
@@ -573,6 +634,8 @@ impl<B: Host> Gpu<B> {
             warned_in_fire: false,
             vocab: None,
             said_behind: None,
+            rates_resume: std::collections::HashMap::new(),
+            rates_long: std::collections::HashSet::new(),
         }
     }
 

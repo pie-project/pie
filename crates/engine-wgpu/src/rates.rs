@@ -77,10 +77,9 @@ pub fn at_load(
         max_submit,
         measuring,
         // A stale key's figure serves; the engine times it again behind
-        // serving (`engine_gpu::serve::Shell::measure_behind`), except where
-        // the platform states a bound on one submission
-        // (`engine_gpu::rates::stale_rates`).
-        engine_gpu::rates::stale_rates(max_submit),
+        // serving, resuming point by point, each frame held to one decode
+        // step (`engine_gpu::rates::Resume`).
+        engine::rates::StaleRates::TimedBehind,
         |max_submit, stated| measure(device, &tuning, max_submit, stated).map_err(|e| e.to_string()),
     )
     .map_err(|why| engine_gpu::error::Fault::Device {
@@ -261,6 +260,7 @@ pub fn measure_behind(
     max_submit: Option<std::time::Duration>,
     stated: &profile::fire::Rates,
     yield_to: &dyn Fn() -> bool,
+    behind: engine_gpu::rates::Behind<'_>,
 ) -> Result<engine::rates::Measured> {
     let tier = <Api as engine_gpu::serve::Serve>::tier(device);
     let timer = timer();
@@ -273,6 +273,7 @@ pub fn measure_behind(
         stated,
         &mut |_| {},
         Some(yield_to),
+        Some(behind),
     )?;
     measured.rates.measured_on = Some(device.measured_on());
     Ok(measured)

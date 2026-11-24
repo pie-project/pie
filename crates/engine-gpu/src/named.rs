@@ -475,6 +475,7 @@ impl<B: Serve> Serve for Named<B> {
         _max_submit: Option<std::time::Duration>,
         _stated: &profile::fire::Rates,
         _yield_to: &dyn Fn() -> bool,
+        _behind: crate::rates::Behind<'_>,
     ) -> Result<engine::rates::Measured> {
         Err(crate::error::Fault::Unbound {
             what: "a rates step on a naming load, which runs nothing on a device".into(),

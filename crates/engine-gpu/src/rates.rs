@@ -614,6 +614,10 @@ struct Rig<'a, B: Serve> {
     /// each frame; one that did stops the step ([`YIELDED`]), so an arrival
     /// waits at most the frame in flight.
     yield_to: Option<&'a dyn Fn() -> bool>,
+    /// Behind serving with its frames held to one decode step: a point
+    /// whose single fire is past that stops the step ([`DEFERRED`]), to run
+    /// once nothing is live, never dropped from its curve.
+    defer_past: bool,
 }
 
 /// A sink that fires through `inner` and keeps each kernel it fires: a
@@ -665,6 +669,39 @@ impl<'a, B: Serve> Rig<'a, B> {
         std::mem::take(&mut *self.fired.borrow_mut())
     }
 
+    /// The point `key` of a step behind serving: taken from `resume` where
+    /// an earlier slice completed it (its kernels counted as fired), else
+    /// measured by `measure` and kept there. Without `resume` (a load's
+    /// step) it is measured, as ever.
+    fn memo(
+        &mut self,
+        resume: &mut Option<&mut Resume>,
+        key: String,
+        measure: impl FnOnce(&mut Self) -> Result<f64>,
+    ) -> Result<f64> {
+        if let Some(resume) = resume.as_deref_mut()
+            && let Some((rate, fired)) = resume.points.get(&key)
+        {
+            self.fired.borrow_mut().extend(fired.iter().copied());
+            return Ok(*rate);
+        }
+        let before = self.take_fired();
+        let measured = measure(self);
+        let fired = self.take_fired();
+        self.fired
+            .borrow_mut()
+            .extend(before.into_iter().chain(fired.iter().copied()));
+        if let Some(resume) = resume.as_deref_mut() {
+            resume.drift = resume.drift.max(self.drift.get());
+            resume.swing = resume.swing.max(self.swing.get());
+            if let Ok(rate) = &measured {
+                resume.points.insert(key.clone(), (*rate, fired));
+                resume.fresh.push(key);
+            }
+        }
+        measured
+    }
+
     fn new(device: &'a B::Context, max_submit: Option<std::time::Duration>) -> Self {
         Rig {
             device,
@@ -693,6 +730,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             quick: false,
             planes_most: None,
             yield_to: None,
+            defer_past: false,
         }
     }
 
@@ -1296,6 +1334,10 @@ fn dropped<B: Serve, T>(
             say(&format!("[rates]: unmeasured ({why}, every repeat)"));
             Ok(None)
         }
+        Err(_) if rig.defer_past && rig.past_bound.borrow().is_some() => Err(Fault::Device {
+            call: "measuring behind serving",
+            why: DEFERRED.to_string(),
+        }),
         Err(e) => match rig.past_bound.borrow_mut().take() {
             Some(step) => {
                 tracing::debug!(step = %step, why = %e, "dropped: past the bound");
@@ -2027,7 +2069,7 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
             let mut tuned = chip.tuned().clone();
             for curve in &served {
                 let behind = measuring == engine::rates::Measuring::Time
-                    && stale_rates(max_submit) == engine::rates::StaleRates::TimedBehind;
+                    && self::stale_curves(max_submit) == engine::rates::StaleRates::TimedBehind;
                 tracing::info!(
                     "rates: gemm curve {curve}: served by the curve stored under its stale key{}",
                     match (measuring, behind) {
@@ -2264,17 +2306,16 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     stated: &Rates,
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
-    measure_yielding::<B, T>(device, tactics, tier, timer, max_submit, stated, say, None)
+    measure_yielding::<B, T>(device, tactics, tier, timer, max_submit, stated, say, None, None)
 }
 
-/// What a load on this engine does with a rate or curve stored under a
-/// stale key: served by its figure and timed again behind serving; where
-/// the platform states a bound on one submission (`max_submit`), served
-/// and not timed again (a rates step's frames are sized to that bound, so
-/// one frame would hold a serving request for as long; the next export
-/// round refreshes it).
+/// What a load on this engine does with a dense curve stored under a stale
+/// key: served by its figure and timed again behind serving; where the
+/// platform states a bound on one submission (`max_submit`), served and not
+/// timed again (a curve's step does not resume point by point yet, so a
+/// slice would hold a serving request; the next export round refreshes it).
 #[must_use]
-pub fn stale_rates(max_submit: Option<std::time::Duration>) -> engine::rates::StaleRates {
+pub fn stale_curves(max_submit: Option<std::time::Duration>) -> engine::rates::StaleRates {
     if max_submit.is_some() {
         engine::rates::StaleRates::Served
     } else {
@@ -2303,9 +2344,67 @@ pub fn curve_named(
     })
 }
 
+/// A rates step run behind serving ([`measure_yielding`]): what it keeps
+/// across its slices, and the frame cap it runs under (one decode step of
+/// the load where the platform bounds a submission; `None`: the platform's
+/// bound, as at load, where nothing is live).
+pub struct Behind<'a> {
+    pub resume: &'a mut Resume,
+    pub cap: Option<std::time::Duration>,
+}
+
+/// What a rates step behind serving keeps across its slices, a key's: each
+/// point it completed (its rate and the kernels it fired), the warm-up's
+/// outcome and the admission it settled, and the step's drift and swing so
+/// far. A slice that yields resumes at its next unmeasured point, never
+/// from scratch; the key is stored once its last point completes.
+#[derive(Debug, Default)]
+pub struct Resume {
+    points: std::collections::HashMap<String, (f64, std::collections::BTreeSet<crate::naming::Kernel>)>,
+    warm: Option<(u32, engine::rates::Warmed, f64, std::collections::BTreeSet<crate::naming::Kernel>)>,
+    admission: Option<engine::rates::Admission>,
+    drift: f64,
+    swing: f64,
+    /// The points completed by the slice running now: what a discarded
+    /// slice (overlapped, or under a clock that moved) takes back.
+    fresh: Vec<String>,
+}
+
+impl Resume {
+    /// The points completed so far.
+    #[must_use]
+    pub fn done(&self) -> usize {
+        self.points.len()
+    }
+
+    /// A new slice begins: what it completes is its own.
+    pub fn begin(&mut self) {
+        self.fresh.clear();
+    }
+
+    /// The slice ran beside other work, or under a clock that moved: the
+    /// points it completed are taken back, timed again later.
+    pub fn discard(&mut self) {
+        for key in self.fresh.drain(..) {
+            self.points.remove(&key);
+        }
+    }
+}
+
 /// Why a step measuring behind serving stopped: a request arrived
 /// ([`Rig`]'s `yield_to`). Nothing of it is kept; it runs again later.
 pub const YIELDED: &str = "yielded to an arrival";
+
+/// Why a step behind serving stopped where its frames are held to one decode
+/// step: a point's single fire is past that, and runs once nothing is live.
+pub const DEFERRED: &str =
+    "a point's single fire is past one decode step: deferred until nothing is live";
+
+/// Whether `fault` is a step behind serving deferring a long point.
+#[must_use]
+pub fn deferred(fault: &Fault) -> bool {
+    matches!(fault, Fault::Device { why, .. } if why == DEFERRED)
+}
 
 /// Whether `fault` is a step behind serving yielding to an arrival.
 #[must_use]
@@ -2325,7 +2424,12 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     stated: &Rates,
     say: &mut dyn FnMut(&str),
     yield_to: Option<&dyn Fn() -> bool>,
+    behind: Option<Behind<'_>>,
 ) -> Result<engine::rates::Measured> {
+    let (mut resume, cap) = match behind {
+        Some(Behind { resume, cap }) => (Some(resume), cap),
+        None => (None, None),
+    };
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
     // The keys a load asks for at this bound ([`keys_at`]), those `stated`
@@ -2346,16 +2450,54 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     };
     let mut rig = Rig::<B>::new(device, max_submit);
     rig.yield_to = yield_to;
+    // Behind serving, each frame held to `cap` (one decode step) where the
+    // platform bounds a submission: a point whose single fire is past it is
+    // deferred, never dropped.
+    if let (Some(cap), Some(bound)) = (cap, max_submit) {
+        let held = cap.min(bound);
+        let mut admission = rig.admission.get();
+        admission.bound = Some(held);
+        rig.admission.set(admission);
+        // The warm-up's cube and every frame's count are sized to it too.
+        rig.max_submit = Some(held);
+        rig.defer_past = true;
+    }
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
     // The launch first: every rate below takes its dispatches' launches off.
     let (bytes_per_ns, launch_ns) = match (want.launch, stated.hbm_gbps, stated.launch_ns) {
         (false, Some(bytes), Some(launch)) => (bytes, launch),
-        _ => repeated(|| {
-            let measured = copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say);
-            rig.release();
-            measured
-        })?,
+        _ => {
+            let held = resume.as_deref().and_then(|r| {
+                Some((r.points.get("launch bytes")?.0, r.points.get("launch ns")?.0 as u64))
+            });
+            match held {
+                Some((bytes, ns)) => {
+                    for key in ["launch bytes", "launch ns"] {
+                        if let Some((_, fired)) = resume.as_deref().and_then(|r| r.points.get(key)) {
+                            rig.fired.borrow_mut().extend(fired.iter().copied());
+                        }
+                    }
+                    (bytes, ns)
+                }
+                None => {
+                    let (bytes, ns) = repeated(|| {
+                        let measured =
+                            copy_and_launch(&mut rig, tactics.gemm(tier, LAUNCH), timer, say);
+                        rig.release();
+                        measured
+                    })?;
+                    if let Some(r) = resume.as_deref_mut() {
+                        let fired = rig.fired.borrow().clone();
+                        r.points.insert("launch bytes".into(), (bytes, fired.clone()));
+                        r.points.insert("launch ns".into(), (ns as f64, fired));
+                        r.fresh.push("launch bytes".into());
+                        r.fresh.push("launch ns".into());
+                    }
+                    (bytes, ns)
+                }
+            }
+        }
     };
     // Each measurement's kernels, as its frames fired them: what its stored
     // key names (`crate::stored`); every kernel the step fired keys the
@@ -2363,7 +2505,27 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     let launch_fired = rig.take_fired();
     let mut step_fired = launch_fired.clone();
     let launch = launch_ns as f64;
-    let (side, warmed, walk_worst) = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
+    // The warm-up, once a key behind serving: a later slice takes its
+    // outcome and the admission it settled, the clock already warmed by
+    // its own reference reads.
+    let (side, warmed, walk_worst) = match resume.as_deref().and_then(|r| r.warm.clone()) {
+        Some((side, warmed, worst, fired)) => {
+            if let Some(admission) = resume.as_deref().and_then(|r| r.admission) {
+                let bound = rig.admission.get().bound;
+                rig.admission.set(engine::rates::Admission { bound, ..admission });
+            }
+            rig.fired.borrow_mut().extend(fired);
+            (side, warmed, worst)
+        }
+        None => {
+            let warm = warm(&mut rig, &|rows| tactics.gemm(tier, rows), timer)?;
+            if let Some(r) = resume.as_deref_mut() {
+                r.warm = Some((warm.0, warm.1, warm.2, rig.fired.borrow().clone()));
+                r.admission = Some(rig.admission.get());
+            }
+            warm
+        }
+    };
     step_fired.extend(rig.take_fired());
     say(&format!(
         "[rates]: warm-up: {} rotations of the {side}^3 matmul, settled at {:.1} TFLOP/s",
@@ -2379,10 +2541,12 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     for w in engine::rates::GEMM_WIDTHS.into_iter().filter(|_| want.gemm) {
         let mut curve = Vec::new();
         for m in engine::rates::GEMM_ROWS {
-            let rate = repeated(|| {
-                let rate = matmul(&mut rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
-                rig.release();
-                rate
+            let rate = rig.memo(&mut resume, format!("gemm {m} {w}"), |rig| {
+                repeated(|| {
+                    let rate = matmul(rig, tactics.gemm(tier, m), timer, (m, w, w), launch);
+                    rig.release();
+                    rate
+                })
             });
             let Some(rate) = dropped(&rig, rate, say)? else {
                 continue;
@@ -2423,8 +2587,11 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
                     "no matmul curve at width {w} to measure the resident workgroups against"
                 ),
             })?;
-        let measured = resident_workgroups(&mut rig, tactics, tier, timer, &curve, w, launch)?;
-        rig.release();
+        let measured = rig.memo(&mut resume, "resident".into(), |rig| {
+            let measured = resident_workgroups(rig, tactics, tier, timer, &curve, w, launch);
+            rig.release();
+            measured
+        })?;
         say(&format!(
             "[rates]: resident workgroups: {measured:.1} (one workgroup of the matmul's peak kernel against its full rate)"
         ));
@@ -2455,9 +2622,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     };
     for keys in attn_keys {
         let shape = engine::rates::ATTN_SHAPE.at(keys);
-        let rate = repeated(|| {
+        let rate = rig.memo(&mut resume, format!("attn {keys}"), |rig| repeated(|| {
             let rate = attention(
-                &mut rig,
+                rig,
                 tactics,
                 tier,
                 timer,
@@ -2467,7 +2634,7 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
             );
             rig.release();
             rate
-        });
+        }));
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
         };
@@ -2485,9 +2652,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
         loop {
             keys /= 2;
             let shape = engine::rates::ATTN_SHAPE.at(keys);
-            let rate = repeated(|| {
+            let rate = rig.memo(&mut resume, format!("attn {keys}"), |rig| repeated(|| {
                 let rate = attention(
-                    &mut rig,
+                    rig,
                     tactics,
                     tier,
                     timer,
@@ -2497,7 +2664,7 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
                 );
                 rig.release();
                 rate
-            });
+            }));
             if let Some(rate) = dropped(&rig, rate, say)? {
                 say(&format!(
                     "[rates]: attention {keys} keys d 128: {:.1} TFLOP/s (the most keys whose \
@@ -2526,9 +2693,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
         .filter(|&d| want.attn && d != 128)
     {
         let shape = engine::rates::ATTN_SHAPE.at(longest).with_dim(d);
-        let rate = repeated(|| {
+        let rate = rig.memo(&mut resume, format!("attn {longest} d {d}"), |rig| repeated(|| {
             let rate = attention(
-                &mut rig,
+                rig,
                 tactics,
                 tier,
                 timer,
@@ -2538,7 +2705,7 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
             );
             rig.release();
             rate
-        });
+        }));
         let Some(rate) = dropped(&rig, rate, say)? else {
             continue;
         };
@@ -2577,9 +2744,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
                     keys,
                     ..engine::rates::ATTN_SHAPE
                 };
-                let rate = repeated(|| {
+                let rate = rig.memo(&mut resume, format!("prefixed {rows} {keys}"), |rig| repeated(|| {
                     let rate = attention(
-                        &mut rig,
+                        rig,
                         tactics,
                         tier,
                         timer,
@@ -2589,7 +2756,7 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
                     );
                     rig.release();
                     rate
-                });
+                }));
                 let Some(rate) = dropped(&rig, rate, say)? else {
                     break;
                 };
@@ -2617,9 +2784,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
                     keys,
                     ..engine::rates::ATTN_SHAPE
                 };
-                let rate = repeated(|| {
+                let rate = rig.memo(&mut resume, format!("prefixed {rows} {keys}"), |rig| repeated(|| {
                     let rate = attention(
-                        &mut rig,
+                        rig,
                         tactics,
                         tier,
                         timer,
@@ -2629,7 +2796,7 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
                     );
                     rig.release();
                     rate
-                });
+                }));
                 if let Some(rate) = dropped(&rig, rate, say)? {
                     say(&format!(
                         "[rates]: attention {rows} rows x {keys} keys d 128: {:.2} TFLOP/s (the \
@@ -2654,10 +2821,12 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     let prefixed_fired = rig.take_fired();
     step_fired.extend(prefixed_fired.iter().copied());
     let elementwise = if want.elementwise {
-        let gbps = repeated(|| {
-            let gbps = elementwise(&mut rig, timer, launch);
-            rig.release();
-            gbps
+        let gbps = rig.memo(&mut resume, "elementwise".into(), |rig| {
+            repeated(|| {
+                let gbps = elementwise(rig, timer, launch);
+                rig.release();
+                gbps
+            })
         })?;
         say(&format!("[rates]: per-row ops: {gbps:.0} GB/s"));
         Some(gbps)
@@ -2667,7 +2836,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     let elementwise_fired = rig.take_fired();
     step_fired.extend(elementwise_fired.iter().copied());
     let scan = if want.scan {
-        Some(scan_within(&mut rig, tactics, timer, launch, say)?)
+        Some(rig.memo(&mut resume, "scan".into(), |rig| {
+            scan_within(rig, tactics, timer, launch, say)
+        })?)
     } else {
         None
     };
@@ -2691,6 +2862,7 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
         ));
     }
     let sustained = if max_submit.is_some() && clock_table.is_none() {
+        rig.memo(&mut resume, "sustained".into(), |rig| -> Result<f64> {
         // Rotated as the warm-up rotated it: each fire its own submission,
         // admitted at the worst ratio the warm-up's walk measured (not at
         // the step's own worst since, which its micro-shapes' host latency
@@ -2703,14 +2875,14 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
             ..step_admission
         });
         let rotated = warm_at(
-            &mut rig,
+            rig,
             side,
             &|rows| tactics.gemm(tier, rows),
             timer,
             walk_worst,
         );
         rig.admission.set(step_admission);
-        match rotated? {
+        Ok(match rotated? {
             Some(hot) => {
                 let drop = (warmed.rate / hot.rate.max(f64::MIN_POSITIVE)).max(1.0);
                 say(&format!(
@@ -2734,7 +2906,8 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
                 );
                 drop
             }
-        }
+        })
+        })?
     } else {
         1.0
     };
@@ -2770,8 +2943,18 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
         // (`Rig::drift`, `sustained`): the margin a serving step's estimate
         // is held to the bound at (`crate::submit`), measured where the
         // platform states one.
-        submit_worst_ratio: max_submit
-            .map(|_| rig.drift.get().max(rig.swing.get()).max(sustained).max(1.0)),
+        submit_worst_ratio: max_submit.map(|_| {
+            let (drift, swing) = resume
+                .as_deref()
+                .map_or((1.0, 1.0), |r| (r.drift, r.swing));
+            rig.drift
+                .get()
+                .max(drift)
+                .max(rig.swing.get())
+                .max(swing)
+                .max(sustained)
+                .max(1.0)
+        }),
         attn_tflops_by_rows_keys: (!prefixed.is_empty()).then_some(prefixed),
         measured_on: None,
         measured_by: None,

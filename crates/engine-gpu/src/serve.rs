@@ -171,6 +171,7 @@ pub trait Serve: Backend {
         max_submit: Option<std::time::Duration>,
         stated: &profile::fire::Rates,
         yield_to: &dyn Fn() -> bool,
+        behind: crate::rates::Behind<'_>,
     ) -> Result<engine::rates::Measured>;
 
     /// Each of `wanted`'s dense kernel curves to `top` rows on `device`
@@ -3361,6 +3362,18 @@ impl<B: Serve> Shell<B> {
         let kernels = crate::rates::dense_kernels(B::TARGET, &self.tuning, self.tier, self.curve_top());
         let shapes: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
         crate::rates::curve_named(B::TARGET, &kernels, &shapes, name)
+    }
+
+    /// One decode step of this load, ns: the settle's first point (at its
+    /// fewest rows) where it ran, else the device time of the last served
+    /// step read back (under a platform's bound, every step's is). `None`
+    /// where neither is known yet.
+    #[must_use]
+    pub fn decode_step_ns(&self) -> Option<f64> {
+        self.behind
+            .as_ref()
+            .and_then(|b| b.decode_ns)
+            .or(self.last_landed.map(|ns| ns as f64))
     }
 
     /// The rows a curve of this load is timed to: its widest rung.
