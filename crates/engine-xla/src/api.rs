@@ -379,7 +379,7 @@ impl Xla {
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
         // The runtime's stamp of each step's stated shape, cross-checked
-        // against this load's stated set in debug builds (CONTRACT-BC 24).
+        // against this load's stated set in debug builds.
         if let Some(caps) = self.caps.as_ref() {
             frame.debug_check_shapes(&caps.steps);
         }
@@ -563,7 +563,7 @@ impl Engine for Xla {
         // built after the load.
         shell.warm_maintenance().map_err(fault)?;
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24), computed before the warm ladder, which lays
+        // facts, computed before the warm ladder, which lays
         // the buffered treatment for exactly the shapes the set states so.
         let stated = shell.stated_steps(&steps);
         shell.set_steps(stated.shapes.clone());
@@ -1225,8 +1225,8 @@ impl engine::Programs for Xla {
         )))
     }
 
-    /// Beam `beam`'s page list as the group's last fire left it
-    /// (`BEAM-PAGE-LISTS.md` §6.6): row `beam` of the state's `map` (one
+    /// Beam `beam`'s page list as the group's last fire left it:
+    /// row `beam` of the state's `map` (one
     /// copy, words `2 + beam · cap`, `cap` columns), read out of the pool,
     /// which every fire that wrote it lands before.
     fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
@@ -1390,7 +1390,7 @@ impl engine::Tiers for Xla {
         let moves = copy.runs(page_size)?;
         shell.copy_kv(&moves).map_err(fault)?;
         // Windowed slots a write into a shared one copies first, whole
-        // (CONTRACT-BC 21, degenerate form; a pool states them as
+        // (degenerate form; a pool states them as
         // `Lane::slot_copies`).
         if let Some(id) = shell.pools().window_shape() {
             let pairs: Vec<(engine::chunk::ShapeId, u32, u32)> = copy
@@ -1467,7 +1467,7 @@ impl engine::Tiers for Xla {
         }
         let shell = self.loaded_mut()?;
         if from != Tier::Device || to != Tier::Device {
-            // Between tiers (CONTRACT-BC 22): whole slots, laid alike.
+            // Between tiers: whole slots, laid alike.
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
                     "token runs move within the device; between tiers a slot moves whole".into(),
@@ -2325,7 +2325,7 @@ impl Xla {
             )));
         }
         // A load serving windowed layers as ring + buffer: every lane the
-        // runtime seats states its fold (CONTRACT-BC 21), a kv-less one none.
+        // runtime seats states its fold, a kv-less one none.
         if shell.serves_windowed_state()
             && let Some(lane) = submission
                 .lanes

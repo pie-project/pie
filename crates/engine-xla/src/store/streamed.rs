@@ -1,5 +1,5 @@
-//! The weight cache on XLA (SPEC "Weight cache", WEIGHT-CACHE-CUDA.md): the
-//! weights a load streams live as read-only slots of the one chunk pool,
+//! The weight cache on XLA: the weights a load streams (those past what the
+//! device holds whole) live as read-only slots of the one chunk pool,
 //! and a fire reads them through tables the host writes.
 //!
 //! Two kinds, as on CUDA and Vulkan:
