@@ -2064,6 +2064,7 @@ dependencies = [
 name = "eta-compiler"
 version = "0.6.0"
 dependencies = [
+ "eta-compiler",
  "naga",
  "pie-eta-ir",
  "serde",
