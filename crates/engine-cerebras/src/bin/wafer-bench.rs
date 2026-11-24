@@ -344,6 +344,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         let toks: Vec<u32> = local.iter().map(|s| seq[s.unwrap_or(0)]).collect();
         let pos: Vec<u32> = local.iter().map(|s| s.unwrap_or(0) as u32).collect();
         let (_, entries) = reading.decode_step(&mut host, &trace, &toks, &pos)?;
+        let io0 = rt.io;
         reading.write_pos(&mut rt, pos[0])?;
         // lane t its own lane slot and state slot
         let rows: Vec<(u32, u32, u32)> = (0..lanes).map(|t| (t as u32, t as u32, pos[t])).collect();
@@ -351,6 +352,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         let t1 = std::time::Instant::now();
         let (got, cycles) = reading.launch(&mut rt, &entries)?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let io1 = rt.io;
         reading.write_ahead(&mut rt, &mut host, &trace, &toks, &pos)?;
         // (`--stamps <dir>`: each step's stamps too, as `--reading` saves them; `--stamps 1` the
         // cycles alone)
@@ -359,6 +361,13 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
         }
         // the program's own argmax (its head roots'), against the logits read back
         let on_wafer = engine_cerebras::reading::Fabric::argmax(&mut rt, &reading)?;
+        // the step's copies (the stamps apart): before and through its launch, and after it
+        let io2 = rt.io;
+        let ms = |a: u64, b: u64| (a - b) as f64 / 1e6;
+        let io = json!({"h2d": [io1.h2d.0 - io0.h2d.0, io1.h2d.2 - io0.h2d.2, ms(io1.h2d.1, io0.h2d.1)],
+            "ahead": [io2.h2d.0 - io1.h2d.0, io2.h2d.2 - io1.h2d.2, ms(io2.h2d.1, io1.h2d.1)],
+            "d2h": [io2.d2h.0 - io0.d2h.0, io2.d2h.2 - io0.d2h.2, ms(io2.d2h.1, io0.d2h.1)],
+            "launch_ms": ms(io2.launch.1, io0.launch.1)});
         let back = reading.rows_back(&got)?;
         let logits = back
             .iter()
@@ -431,6 +440,7 @@ fn decode(get: &HashMap<String, String>) -> Result<bool, String> {
                     "checked": past, "ok": best as u32 == want, "cycles": cycles, "wall_ms": wall_ms,
                     "finite": v.iter().all(|x| x.is_finite()),
                     "wafer_argmax": on_wafer.as_ref().and_then(|a| a.get(t)),
+                    "io": io,
                     "golden_top": if past { gtop.clone() } else { Value::Null }})
             );
         }

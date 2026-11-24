@@ -67,6 +67,13 @@ fn row(t: u16, x: [*]f32, o: [*]f32) void {
   hb = 0;
 }
 
+// A decode step's end, every row's read: each row's position + 1, so the host writes `rowp` only
+// where its rows differ (a prompt, a rollback, a new slot).
+fn advance() void {
+  var r: u16 = 0;
+  while (r < ROWS) : (r += 1) { rowp[3 * r + 2] += 1; }
+}
+
 // One step: x [q | k | v | b | a] (NCH + 1 + AW f32) in, o (DV f32) out.
 fn step(x: [*]f32, o: [*]f32) void {
   // the conv over the history (oldest first) and this row, its SiLU; the history shifted

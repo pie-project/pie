@@ -1259,8 +1259,16 @@ impl Runtime {
             w: w as i32,
             h: h as i32,
         };
+        let d2h = self.io.d2h;
         self.memcpy_d2h("tsc", &mut ts, rect, 3, Order::RowMajor, DataType::Bits32)
             .map_err(|x| x.to_string())?;
+        let s = &mut self.io.stamps;
+        (s.0, s.1, s.2) = (
+            s.0 + self.io.d2h.0 - d2h.0,
+            s.1 + self.io.d2h.1 - d2h.1,
+            s.2 + self.io.d2h.2 - d2h.2,
+        );
+        self.io.d2h = d2h;
         Ok(Some(ts))
     }
 

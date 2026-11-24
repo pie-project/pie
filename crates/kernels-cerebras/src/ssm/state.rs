@@ -477,6 +477,11 @@ impl Column for State {
         false
     }
 
+    /// A decode step's root and PEs add one to each row's position once every row has read it.
+    fn advances(&self) -> bool {
+        true
+    }
+
     /// Its state's rows over the fewest PEs (a decode step's a state a lane slot, a row a lane).
     fn pya(&self, a: &ColumnAsk) -> u32 {
         PYA * a.lanes.max(1)
@@ -618,6 +623,9 @@ fn st_root_file(p: &Program, k: usize, ks: &KvSched) -> R<(String, String)> {
         );
         at += rows;
     }
+    if decode {
+        body.push_str("  cy.advance();\n");
+    }
     body.push_str("  stamp(1);\n  sys_mod.unblock_cmd_stream();\n");
     let _ = write!(t, "task go() void {{\n{body}}}\n");
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(stw_p, \"stw\");\n");
@@ -658,13 +666,17 @@ fn st_pe_file(p: &Program, k: usize, ks: &KvSched) -> R<(String, String)> {
     // a decode step's rows each a lane's (its state slot; `rowp`, the host's)
     t.push_str("var rowp_p: [*]u32 = &st.rowp;\n");
     // (a stream step's rows one sequence's, from a cleared state)
-    let (init, step) = if rows_of(p).is_some() {
-        ("st.myrow = @as(u16, pcfg[0]);", "st.row(t);")
+    let (init, step, end) = if rows_of(p).is_some() {
+        (
+            "st.myrow = @as(u16, pcfg[0]);",
+            "st.row(t);",
+            "\n  st.advance();",
+        )
     } else {
-        ("st.init(@as(u16, pcfg[0]));", "st.step();")
+        ("st.init(@as(u16, pcfg[0]));", "st.step();", "")
     };
     let body = format!(
-        "  stamp(0);\n  {init}\n  red.role = @as(u16, pcfg[1]);\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ {step} }} }}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n"
+        "  stamp(0);\n  {init}\n  red.role = @as(u16, pcfg[1]);\n  {{ var t: u16 = 0; while (t < {rows}) : (t += 1) {{ {step} }} }}{end}\n  stamp(1);\n  sys_mod.unblock_cmd_stream();\n"
     );
     let _ = write!(t, "task go() void {{\n{body}}}\n");
     t.push_str("comptime {\n  @bind_local_task(go, T_GO);\n  @export_symbol(run);\n  @export_symbol(tsc_p, \"tsc\");\n  @export_symbol(pcfg_p, \"pcfg\");\n  @initialize_queue(q_am, .{ .color = @get_color(C_AM) });\n  @initialize_queue(q_r, .{ .color = @get_color(C_R) });\n  @initialize_queue(q_s, .{ .color = @get_color(C_S) });\n");

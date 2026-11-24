@@ -362,6 +362,8 @@ pub struct IoStats {
     pub h2d: (u64, u64, u64),
     pub d2h: (u64, u64, u64),
     pub launch: (u64, u64),
+    /// The PEs' stamps read back (apart from `d2h`).
+    pub stamps: (u64, u64, u64),
     /// Launches whose end was polled ([`crate::reading::Reading::poll`]): how many, and the time
     /// from each call to a one-word read of its first PE coming back.
     pub done: (u64, u64),

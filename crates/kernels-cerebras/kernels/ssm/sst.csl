@@ -52,6 +52,13 @@ fn row(t: u16) void {
 
 fn step() void { step_at(0); }
 
+// A decode step's end, every row's read: each row's position + 1, so the host writes `rowp` only
+// where its rows differ (a prompt, a rollback, a new slot).
+fn advance() void {
+  var r: u16 = 0;
+  while (r < ROWS) : (r += 1) { rowp[3 * r + 2] += 1; }
+}
+
 fn step_at(base: u16) void {
   @fmovs(kq_d, fab.fin(YM, 3 * DK));
   @fmovs(acc_d, @as(f32, 0.0));
