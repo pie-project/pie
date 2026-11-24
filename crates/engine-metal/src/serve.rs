@@ -2663,18 +2663,47 @@ impl Shell {
         self.pipelines.take_unbuilt()
     }
 
+    /// The step set the runtime's builder forms over this load
+    /// ([`engine::StepShapes::of`] of [`engine::StepRules::runtime`] over the
+    /// load's own facts), for a walk the load request did not hand one.
+    #[must_use]
+    pub fn step_shapes(&self) -> engine::StepShapes {
+        engine::StepShapes::of(
+            &engine::StepRules::runtime(),
+            &engine::StepFacts::of(
+                &self.pool_chunk_facts(),
+                self.budgets.tokens.max_lanes,
+                self.budgets.tokens.max_tokens,
+                u32::try_from(poem_compiler::arena::readouts_ceiling(&self.budgets.tokens))
+                    .unwrap_or(u32::MAX),
+                engine::Attachments::default(),
+            ),
+        )
+    }
+
+    /// [`Shell::warm_pipelines_over`] the runtime's set over this load
+    /// ([`Shell::step_shapes`]).
     pub fn warm_pipelines(&mut self) -> Result<(u32, u64)> {
+        let steps = self.step_shapes();
+        self.warm_pipelines_over(&steps)
+    }
+
+    /// Builds, before ready, every pipeline a step of `steps` dispatches
+    /// (CONTRACT-BC 24): each shape in the set's order, smallest first, at
+    /// its rung, under its treatment's verbs, at the rows its span reaches
+    /// (one, every matmul band start inside it, each unrolled few-rows
+    /// matmul's top, 2 / 4 / 8, and its top) and at each readout tier inside
+    /// its `readout_rows` (the same points, every row of the prompt read
+    /// out), so a dense routing a step's rows or readouts reach is built (the
+    /// M1's `dense_gemv_t_rows8` in a c64 step, met after ready and
+    /// refused). Metal records no bodies: every shape is walked, none eager.
+    pub fn warm_pipelines_over(&mut self, steps: &engine::StepShapes) -> Result<(u32, u64)> {
         use engine::frame::Shell as FrameShell;
         let before = self.pipelines.compiled();
-        // The seats the pool lays runs for: a seat-addressed lane past them
-        // names chunks the pool does not hold. A fire's matmul tiles follow
-        // its rows (the prefill fires walk every rung's), its attention one
-        // row a lane (one decode lane reaches it).
-        // One seat: a fire's matmul tiles follow its rows (the prefill fires
-        // walk every rung's), its attention one row a lane, its readout the
-        // rows it reads; no key turns on how many seats carry them, so the
-        // walk backs one seat run, not every seat's.
-        let seats = 1u32;
+        // One lane on seat 0: a fire's matmul tiles follow its rows, its
+        // attention one row a lane (a one-row lane reaches the decode form),
+        // its lm_head the rows it reads out; no key turns on how many lanes
+        // or seats carry them, so the walk backs one seat run.
         let context = self.paging().context().max(1);
         let standing = self.rung;
         self.warming = true;
@@ -2765,102 +2794,130 @@ impl Shell {
         // ones' are the capture's, which no rung's rows key.
         let rungs = self.arena.rung_tokens();
         let octaves = engine::load::armed::scored_buckets(&rungs);
-        // Beside each rung's own rows, every band start of the matmul
-        // routing below it and above the rung before
+        // Every band start of the matmul routing
         // (`kernels_metal::linear::gemm::row_bands`: the fixed bands and
-        // where the profile's `kernel.dense` changes its pick), walked at
-        // that rung: a fire's rows reach every band its rungs span, and each
-        // band's kernel is built here, not refused while serving.
+        // where the profile's `kernel.dense` changes its pick): a shape's
+        // rows, and its readouts, reach every band its span holds.
         let bands = kernels_metal::linear::gemm::row_bands(&self.tuning);
-        let mut below = 0u32;
-        let sized: Vec<(u32, Vec<u32>)> = rungs
-            .iter()
-            .map(|&rung| {
-                let mut sizes = vec![rung];
-                sizes.extend(
-                    bands
-                        .iter()
-                        .copied()
-                        .filter(|&band| band > below && band < rung),
-                );
-                below = rung;
-                (rung, sizes)
-            })
-            .collect();
-        let _ = kernels_metal::linear::gemm::record_shapes(true);
-        let walked = (|| -> Result<u32> {
-            let mut fires = 0u32;
-            for (rung, sizes) in sized {
-                self.set_rung(self.rung, rung)?;
-                for size in sizes {
-                    for &form in forms
-                        .iter()
-                        .filter(|(_, scores)| !scores || octaves.contains(&rung))
-                    {
-                        for (verb, held) in &verbs {
-                            let prompt = size
-                                .min(self.budgets.tokens.max_tokens)
-                                .min(context.saturating_sub(*held))
-                                .max(1);
-                            let lanes = size.min(self.budgets.tokens.max_lanes).min(seats).max(1);
-                            let prompt_tokens = vec![0u32; prompt as usize];
-                            let one = [0u32];
-                            let prefill = [Seated {
-                                replay_stated: None,
-                                held: Some(*held),
-                                rs: verb,
-                                refs: true,
-                                pages: &kv_pages,
-                                record: (!record.is_empty()).then_some(&record[..]),
-                                windows: &windows,
-                                ..Seated::of(Lane {
-                                    slot: 0,
-                                    word: word(prompt, form),
-                                    tokens: &prompt_tokens,
-                                })
-                            }];
-                            let decode: Vec<Seated<'_>> = (0..lanes)
-                                .map(|slot| Seated {
-                                    replay_stated: None,
-                                    held: Some(*held),
-                                    rs: verb,
-                                    refs: true,
-                                    pages: &kv_pages,
-                                    record: (!record.is_empty()).then_some(&record[..]),
-                                    windows: &windows,
-                                    ..Seated::of(Lane {
-                                        slot,
-                                        word: word(1, form),
-                                        tokens: &one,
-                                    })
-                                })
-                                .collect();
-                            for lanes in [&prefill[..], &decode[..]] {
-                                // Each dropped fire's command buffer goes back
-                                // with its own pool: left to the thread's, a
-                                // walk of more fires than the queue holds
-                                // command buffers blocks making the next one.
-                                let walked = pooled(|| -> Result<()> {
-                                    let prepared = FrameShell::prepare(
-                                        self,
-                                        StepView {
-                                            lanes,
-                                            attachments: &[],
-                                            media: &[],
-                                            clips: &[],
-                                            done: None,
-                                        },
-                                        None,
-                                    )?;
-                                    drop(self.walk(&prepared, true)?);
-                                    Ok(())
-                                });
-                                walked?;
-                                fires += 1;
-                            }
+        let inside = |span: engine::shapes::Span, extra: &[u32]| -> Vec<u32> {
+            let mut at: Vec<u32> = bands
+                .iter()
+                .chain(extra)
+                .copied()
+                .chain([span.hi])
+                .filter(|&n| n >= span.lo.max(1) && n <= span.hi)
+                .collect();
+            at.sort_unstable();
+            at.dedup();
+            at
+        };
+        // A treatment's verbs: a folding shape's lanes fold, a buffering
+        // one's buffer (folding nothing, or replaying what they held).
+        let verbs_of = |treatment: engine::Treatment| -> Vec<usize> {
+            match treatment {
+                engine::Treatment::Folds => vec![0],
+                engine::Treatment::Buffers if verbs.len() > 1 => (1..verbs.len()).collect(),
+                engine::Treatment::Buffers => vec![0],
+            }
+        };
+        // What the walk fires, each once: (rung, prompt rows, rows read
+        // out, form, verb), a prompt of one row the decode forms.
+        let mut fired: std::collections::HashSet<(u32, u32, u32, (bool, bool), usize)> =
+            std::collections::HashSet::new();
+        let mut plan: Vec<(u32, u32, u32, (bool, bool), usize)> = Vec::new();
+        for shape in &steps.shapes {
+            // The arena's rung the shape runs at: its own, or the
+            // narrowest past it (a lattice's last rung is one fire's tokens).
+            let rung = rungs
+                .iter()
+                .copied()
+                .find(|&r| r >= shape.rung)
+                .or_else(|| rungs.last().copied())
+                .unwrap_or(shape.rung);
+            let top = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
+            let mut fires: Vec<(u32, u32)> = Vec::new();
+            // A step's rows: one (the decode forms), and as a prompt each
+            // band start inside its rows, each unrolled few-rows matmul's top
+            // (2 / 4 / 8: a decode step of 5-8 lanes runs `rows8`), and its
+            // top; a prompt's matmuls are a decode step's at the same rows.
+            fires.push((1, 1));
+            fires.extend(
+                inside(shape.rows, &[2, 4, 8])
+                    .into_iter()
+                    .filter(|&rows| rows > 1)
+                    .map(|rows| (rows, 1)),
+            );
+            // The readout tiers: a prompt of as many rows reads out every
+            // one of them, the lm_head at that row count.
+            for reads in inside(shape.readout_rows, &[2, 4, 8]) {
+                if reads > 1 {
+                    fires.push((reads, reads));
+                }
+            }
+            for (rows, reads) in fires {
+                let rows = rows.min(top);
+                let reads = reads.min(rows);
+                for &form in forms.iter().filter(|(_, scores)| !scores || octaves.contains(&rung)) {
+                    for verb in verbs_of(shape.treatment) {
+                        let key = (rung, rows, reads, form, verb);
+                        if fired.insert(key) {
+                            plan.push(key);
                         }
                     }
                 }
+            }
+        }
+        // The rows one fire reads logits for at most: a tier past it is no
+        // step's.
+        let readouts = u32::try_from(poem_compiler::arena::readouts_ceiling(&self.budgets.tokens))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let _ = kernels_metal::linear::gemm::record_shapes(true);
+        let walked = (|| -> Result<u32> {
+            let mut fires = 0u32;
+            for (rung, rows, reads, form, verb) in plan {
+                if self.rung != rung {
+                    self.set_rung(self.rung, rung)?;
+                }
+                let (verb, held) = (&verbs[verb].0, verbs[verb].1);
+                let rows = rows.min(context.saturating_sub(held)).max(1);
+                let reads = reads.min(rows).min(readouts).max(1);
+                let tokens = vec![0u32; rows as usize];
+                let tail: Vec<u32> = (rows - reads..rows).collect();
+                let lane = [Seated {
+                    replay_stated: None,
+                    held: Some(held),
+                    rs: verb,
+                    refs: true,
+                    pages: &kv_pages,
+                    record: (!record.is_empty()).then_some(&record[..]),
+                    windows: &windows,
+                    readout: (reads > 1).then_some(&tail[..]),
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: word(rows, form),
+                        tokens: &tokens,
+                    })
+                }];
+                // Each dropped fire's command buffer goes back with its own
+                // pool: left to the thread's, a walk of more fires than the
+                // queue holds command buffers blocks making the next one.
+                pooled(|| -> Result<()> {
+                    let prepared = FrameShell::prepare(
+                        self,
+                        StepView {
+                            lanes: &lane,
+                            attachments: &[],
+                            media: &[],
+                            clips: &[],
+                            done: None,
+                        },
+                        None,
+                    )?;
+                    drop(self.walk(&prepared, true)?);
+                    Ok(())
+                })?;
+                fires += 1;
             }
             Ok(fires)
         })();

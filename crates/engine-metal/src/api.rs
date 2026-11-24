@@ -768,16 +768,17 @@ impl Engine for Metal {
         };
 
         // The step compositions the runtime's builder forms over this load's
-        // facts (CONTRACT-BC 24). Interim: computed once the caps are; the warm walk takes
-        // its readout rows per rung from it in its own branch.
+        // facts (CONTRACT-BC 24), computed before the walk, which fires each.
         let mut caps = caps;
         caps.steps = engine::StatedSteps::of(
             &steps,
             &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
         );
+        // Metal records no bodies (its walk builds pipelines): every shape
+        // is walked, none eager.
+        caps.steps.eager.clear();
         tracing::info!(
-            "engine-metal: step set: {}; its arm walk does not key on the set yet, so none \
-             of the {} is checked against what it records",
+            "engine-metal: step set: {}; the walk fires every one of the {}, none eager",
             caps.steps.shapes.census(),
             caps.steps.shapes.len(),
         );
@@ -804,7 +805,7 @@ impl Engine for Metal {
         let (fires, built) = match listed {
             Some(keys) => (0, shell.build_pipelines(&keys).map_err(fault)?),
             None => {
-                let walked = shell.warm_pipelines().map_err(fault)?;
+                let walked = shell.warm_pipelines_over(&caps.steps.shapes).map_err(fault)?;
                 if let Some((key, keys, _archive)) = cache.as_ref() {
                     write_pipeline_keys(keys, key, &shell.pipeline_keys());
                     #[cfg(target_vendor = "apple")]

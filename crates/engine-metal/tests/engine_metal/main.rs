@@ -23,6 +23,7 @@ mod a_device_fold_lane_states_its_own_fold;
 mod a_kv_only_lane_reports_its_device_fold;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_load_measuring_nothing_admits_its_own_pool;
+mod a_load_walks_every_readout_tier_its_set_states;
 mod a_load_walks_its_score_capturing_forms;
 mod a_recurrent_load_walks_its_pipelines;
 mod a_refused_lane_is_refused_alone;
