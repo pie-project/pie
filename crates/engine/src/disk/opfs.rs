@@ -29,10 +29,15 @@ impl SlotFile {
     }
 }
 
-/// Zero when the browser offers no synchronous OPFS here, so an unstated
-/// budget comes to nothing and the tab serves without the tier. Must run on
-/// a green thread.
+/// The origin's free OPFS room, which the browser's quota already bounds:
+/// it keeps no reserve of its own beyond it. Nothing when the browser offers
+/// no synchronous OPFS here, so an unstated budget comes to nothing and the
+/// tab serves without the tier. Must run on a green thread.
 #[must_use]
-pub fn free_space(dir: &Path) -> u64 {
-    web_std::opfs::free_space(&dir.to_string_lossy())
+pub fn room(dir: &Path) -> super::Room {
+    super::Room {
+        free: web_std::opfs::free_space(&dir.to_string_lossy()),
+        reserve: 0,
+        reserve_is: "nothing (the browser's storage quota bounds the origin)".to_string(),
+    }
 }
