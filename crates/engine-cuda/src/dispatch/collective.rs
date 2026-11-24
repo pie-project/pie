@@ -58,6 +58,12 @@ impl Run<'_> {
                 ..
             } => {
                 const OP: &str = "collective.dispatch";
+                // A size-only walk (`crate::sizing`) moves nothing, and a
+                // dispatch takes no slab: its landing is the group's seats,
+                // which a rank staged ahead of its group has yet to join.
+                if crate::sizing::active() {
+                    return Ok(());
+                }
                 let ep = self
                     .ep_rank()
                     .ok_or_else(|| backend(OP, "this rank is in no expert-parallel group"))?;
@@ -112,6 +118,11 @@ impl Run<'_> {
                 ..
             } => {
                 const OP: &str = "collective.combine";
+                // As a dispatch: a size-only walk moves nothing, and the
+                // combine's buffers are the group's seats.
+                if crate::sizing::active() {
+                    return Ok(());
+                }
                 let ep = self
                     .ep_rank()
                     .ok_or_else(|| backend(OP, "this rank is in no expert-parallel group"))?;
