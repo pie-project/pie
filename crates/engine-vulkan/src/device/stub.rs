@@ -367,6 +367,16 @@ impl Image {
     pub fn sealed(&self) -> Image {
         Image
     }
+
+    #[must_use]
+    pub fn same(&self, _other: &Image) -> bool {
+        true
+    }
+
+    #[must_use]
+    pub fn layout(&self) -> Vec<usize> {
+        Vec::new()
+    }
 }
 
 /// An arm's fire block: none, with no device.
