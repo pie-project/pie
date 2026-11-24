@@ -842,6 +842,10 @@ pub(crate) fn give_behind(stores: &crate::store::registry::Stores, taken: Behind
 /// runs).
 static BEHIND_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a lane said its behind work waits for ready.
+static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Every lane's control queue, to turn it once the runtime is ready
 /// ([`open_behind`]).
 static LANES: std::sync::Mutex<Vec<crate::rt::channel::Sender<LaneRequest>>> =
@@ -855,10 +859,12 @@ static LANES: std::sync::Mutex<Vec<crate::rt::channel::Sender<LaneRequest>>> =
 pub(crate) fn open_behind() {
     BEHIND_OPEN.store(true, std::sync::atomic::Ordering::Release);
     // A lane that has shut down drops out.
-    LANES
-        .lock()
-        .unwrap()
-        .retain(|lane| lane.send(LaneRequest::Behind).is_ok());
+    let mut lanes = LANES.lock().unwrap();
+    lanes.retain(|lane| lane.send(LaneRequest::Behind).is_ok());
+    tracing::info!(
+        lanes = lanes.len(),
+        "behind serving: ready; each engine lane turned once to take up its behind work"
+    );
 }
 
 /// The times an engine lane found nothing queued and stayed awake: a fire
@@ -1111,11 +1117,18 @@ impl Lane {
         engine: &mut Option<EngineBox>,
         arrived: &dyn Fn() -> bool,
     ) -> Option<std::time::Duration> {
-        if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire) {
-            return None;
-        }
         let engine = engine.as_mut()?;
         if !engine.measures_behind() {
+            return None;
+        }
+        if !BEHIND_OPEN.load(std::sync::atomic::Ordering::Acquire) {
+            if !BEHIND_SAID_EARLY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    engine_idx,
+                    "behind serving: waiting: the runtime is not ready yet (each lane is turned \
+                     at ready)"
+                );
+            }
             return None;
         }
         let began = Instant::now();

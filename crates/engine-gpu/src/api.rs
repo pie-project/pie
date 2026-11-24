@@ -272,12 +272,21 @@ pub struct Gpu<B: Host> {
     /// The rows of the loaded model's widest token table: a token id a
     /// guest resolves at or past it is out of bounds.
     vocab: Option<u32>,
-    /// Whether the settle left behind serving was said to wait for an
-    /// empty pool.
-    said_waiting: bool,
+    /// What the work behind serving was last said to be doing
+    /// ([`Gpu::behind_state`]).
+    said_behind: Option<&'static str>,
 }
 
 impl<B: Host> Gpu<B> {
+    /// What the work left behind serving is doing now, said once each time
+    /// it changes: running, or why it does not run.
+    fn behind_state(&mut self, state: &'static str) {
+        if self.said_behind != Some(state) {
+            self.said_behind = Some(state);
+            tracing::info!(state, "behind serving: {state}");
+        }
+    }
+
     /// One slice behind serving of a `[rates]` key or a dense kernel's curve
     /// the load serves by a figure stored under a stale key
     /// (`profile::fire::Tuned::behind`): the rates step timing that key
@@ -299,8 +308,13 @@ impl<B: Host> Gpu<B> {
             return Ok(false);
         };
         if !crate::backend::Context::idle(shell.device()) {
+            self.behind_state("waiting: the device is busy");
             return Ok(false);
         }
+        self.behind_state("running: the stale rates and curves");
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
         let max_submit = B::submit_bound(&self.boot);
         let mut stated = shell.tuning().profile().rates();
         stated.stale = None;
@@ -545,7 +559,7 @@ impl<B: Host> Gpu<B> {
             guest_built: 0,
             warned_in_fire: false,
             vocab: None,
-            said_waiting: false,
+            said_behind: None,
         }
     }
 
@@ -1746,6 +1760,7 @@ where
     fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
         // A frame whose numbers are not yet taken holds its readout seats.
         if self.pending.is_some() {
+            self.behind_state("waiting: a frame's numbers are not taken yet");
             return Ok(false);
         }
         let Some(shell) = self.shell.as_mut() else {
@@ -1760,17 +1775,18 @@ where
             _ => false,
         };
         if !shell.measures_behind() || seats_short {
-            if seats_short && shell.rates_behind().is_none() && !self.said_waiting {
-                self.said_waiting = true;
-                tracing::info!(
-                    "dense settle behind serving: the pool holds no room for one point's slots \
-                     beyond live work; weighed on a later idle turn, this load serving its \
-                     fallback picks meanwhile"
+            if seats_short && shell.rates_behind().is_none() {
+                self.behind_state(
+                    "waiting: the pool holds no room for one settle point's slots beyond live \
+                     work (the settle runs on a later idle turn; the fallback picks serve)",
                 );
             }
             return self.rate_behind(behind);
         }
-        self.said_waiting = false;
+        self.behind_state("running: the dense settle");
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
         let fired = shell
             .measure_behind(behind.others, behind.arrived, behind.seats)
             .map_err(fault)?;

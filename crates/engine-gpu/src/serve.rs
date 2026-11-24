@@ -3195,6 +3195,20 @@ impl<B: Serve> Shell<B> {
             );
             return Ok(());
         }
+        // A settle point fires a whole model step: on a load whose weights
+        // stream, it would route experts and stage them from the host, so
+        // it is never fired; the dense kernels stand as the curves weighed
+        // them, each timed alone on its plane (`crate::rates::measure_shapes`).
+        if self.weights_stream() {
+            tracing::info!(
+                pending = left.len(),
+                "dense settle: not weighed (a settle point fires a whole model step, which on a \
+                 load whose weights stream would stage experts from the host); this load serves \
+                 {served_by}, the dense kernels as the curves weighed them alone"
+            );
+            self.say_served("settle not weighed: the weights stream", replaced);
+            return Ok(());
+        }
         tracing::info!(
             pending = left.len(),
             ranges = %left.iter().map(|(b, t)| format!("{b}-{t}")).collect::<Vec<_>>().join(", "),
