@@ -279,6 +279,14 @@ pub struct RsFire<'a> {
     pub folds: &'a [kernels_cuda::ssm::GroupFold],
 }
 
+/// Where a fire's fold gate lies (`crate::store::rs::Predicate`): a lane's
+/// commit word's address, and the rows it folds.
+#[derive(Debug, Clone, Copy)]
+struct GateAt {
+    commits: u64,
+    lens: u64,
+}
+
 /// The rs section's offsets and capacities.
 #[derive(Debug, Clone, Copy)]
 struct RsAt {
@@ -536,6 +544,9 @@ pub struct Staged {
     packed: bool,
     /// The rs tables' replay span words staged, when it buffers.
     rs: Option<u32>,
+    /// The fold gate's lanes staged ([`Inputs::write_gate`]), when the fire
+    /// gates its folds.
+    gate: Option<u32>,
 }
 
 impl Staged {
@@ -925,6 +936,7 @@ pub struct Inputs {
     packings: Vec<PackingAt>,
     page_tables: Vec<TableAt>,
     rs: Option<RsAt>,
+    gate: GateAt,
     max_lanes: u32,
     max_rows: u32,
     plans: Vec<Option<Workspace>>,
@@ -1154,6 +1166,12 @@ impl Inputs {
                 folds_cap: lanes,
             }
         });
+        // The fold gate, a lane's commit word's address and its rows folded,
+        // staged with the rest so a body's gate reads them as data.
+        let gate = GateAt {
+            commits: take(lanes * 8),
+            lens: take(lanes * 4),
+        };
         // A group's mask is a bit a (query, key) pair of its rows, from a
         // byte of its own, and only a group some lane states one for has
         // bits (the rest read "none", `-1`, as data). A stated mask speaks of
@@ -1275,6 +1293,7 @@ impl Inputs {
             packings,
             page_tables,
             rs,
+            gate,
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs,
@@ -1684,7 +1703,63 @@ impl Inputs {
             state_ids,
             packed,
             rs,
+            gate: None,
         })
+    }
+
+    /// Writes the fire's fold gate into `slot`'s staging, copied with the
+    /// rest of its tables ([`Inputs::commit`]): a lane's commit word's
+    /// address and the rows it folds, `lanes` entries (`commits` padded with
+    /// `pad`, `lens` with 0), so every lane a gate reads names a word.
+    pub fn write_gate(
+        &self,
+        slot: &SlotGuard,
+        staged: &mut Staged,
+        commits: &[u64],
+        lens: &[i32],
+        lanes: u32,
+        pad: u64,
+    ) -> Result<()> {
+        let need = (lanes as usize).max(commits.len()).max(lens.len());
+        if need as u64 > u64::from(self.max_lanes) {
+            return Err(crate::error::Fault::Ceiling {
+                what: "rs fold predicates",
+                need: need as u64,
+                have: u64::from(self.max_lanes),
+            });
+        }
+        let host = &self.staging[slot.at() as usize];
+        let mut words = commits.to_vec();
+        words.resize(need, pad);
+        let mut rows = lens.to_vec();
+        rows.resize(need, 0);
+        let put = |offset: u64, bytes: &[u8]| -> Result<()> {
+            if host.write(usize::try_from(offset).unwrap_or(usize::MAX), bytes) {
+                return Ok(());
+            }
+            Err(crate::error::Fault::Ceiling {
+                what: "staged rs fold predicates",
+                need: offset + bytes.len() as u64,
+                have: self.stage_bytes,
+            })
+        };
+        let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        put(self.gate.commits, &words)?;
+        put(self.gate.lens, bytes_of(&rows))?;
+        staged.gate = Some(need as u32);
+        Ok(())
+    }
+
+    /// The fold gate's commit word addresses, a lane each.
+    #[must_use]
+    pub fn gate_commits(&self) -> u64 {
+        self.store.ptr() + self.gate.commits
+    }
+
+    /// The fold gate's rows folded, a lane each of `lanes`.
+    #[must_use]
+    pub fn gate_lens(&self, lanes: u32) -> Tensor {
+        i32s(self.store.ptr() + self.gate.lens, lanes)
     }
 
     #[must_use]
@@ -1832,6 +1907,7 @@ impl Inputs {
             state_ids,
             packed,
             rs,
+            gate,
         } = staged;
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
@@ -1855,6 +1931,7 @@ impl Inputs {
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
         let rs_at = self.rs;
+        let gate_at = self.gate;
         let stream = device.stream();
         let capturing = crate::device::alloc::is_capturing(stream);
         // The run tables hold a run a lane.
@@ -1978,6 +2055,11 @@ impl Inputs {
             }
             _ => None,
         };
+
+        if let Some(lanes) = gate {
+            copy(gate_at.commits, *lanes as usize * 8)?;
+            copy(gate_at.lens, *lanes as usize * 4)?;
+        }
 
         // SAFETY: the sources are the slot's pinned bytes, held until the `SlotGuard` drops.
         unsafe { store.stage_batch_from(stream, &spans)? };

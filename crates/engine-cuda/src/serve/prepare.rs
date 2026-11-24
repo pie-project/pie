@@ -2646,10 +2646,12 @@ impl Shell {
                     || rs_moves
                         .iter()
                         .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. })),
-                predicated: rs_body.buffers()
-                    || attachments.iter().any(|attached| {
-                        !attached.adapter_only && self.programs.prologue_runs(attached.instance)
-                    }),
+                // Every fire on a load with recurrent state is gated, whatever
+                // its lanes: a prologue's commit holds back its lane's fold on
+                // any body, so every body the load records lays the gate
+                // (`Run::lay_gate`) and none is keyed by whether a lane gates.
+                // A load with none reads no gate.
+                predicated: self.pools.has_state(),
                 truncates: rs_body.buffers(),
                 body: rs_body,
                 group_folds: !rs_folds.is_empty(),

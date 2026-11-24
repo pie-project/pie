@@ -338,6 +338,18 @@ impl RsScratch {
     }
 }
 
+/// A fire's fold gate as its body reads it: each lane's commit word's
+/// address (`commits`, staged with the fire's tables), the lanes' mask rows
+/// (`indptr`) and the mask the folds read (`mask`), over `lanes` lanes, the
+/// most the fire's body carries, so one body serves every fire of its key.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate {
+    pub commits: u64,
+    pub indptr: u64,
+    pub mask: u64,
+    pub lanes: u32,
+}
+
 /// A buffering fire's recurrent rows: the staged tables its kernels address
 /// them through, and whether its recurrences run extended (a lane of it
 /// replays buffered rows).
@@ -630,6 +642,11 @@ pub struct Run<'c> {
 
     rs: Option<RsSeat<'c>>,
 
+    /// The fire's fold gate, when its lanes' commits gate their folds: the
+    /// body lays its mask ahead of every kernel that reads it
+    /// ([`Run::lay_gate`]).
+    gate: Option<Gate>,
+
     windows: &'c Windows,
 
     place: &'c At,
@@ -748,6 +765,7 @@ impl<'c> Run<'c> {
             values_wide: values.len(),
             fire,
             rs: None,
+            gate: None,
             windows,
             place,
             side: &[],
@@ -967,6 +985,34 @@ impl<'c> Run<'c> {
     pub fn buffered(mut self, rs: RsSeat<'c>) -> Self {
         self.rs = Some(rs);
         self
+    }
+
+    /// The fire's lanes' commits gate their folds through `gate`.
+    pub fn gated(mut self, gate: Gate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Lays the fold gate's mask from the lanes' commit words, on the fire's
+    /// stream ahead of anything that reads it: the first thing the body
+    /// records (`record::Bodies::fire_body`), and what an eager walk runs
+    /// first. Nothing where the fire gates no fold.
+    pub(crate) fn lay_gate(&self) -> Result<(), kernels_cuda::Error> {
+        let Some(gate) = self.gate else {
+            return Ok(());
+        };
+        kernels_cuda::runtime::channel::mask_from_commit(
+            self.ctx,
+            gate.commits,
+            gate.indptr,
+            gate.mask,
+            gate.lanes,
+        )
+    }
+
+    /// Whether the fire's lanes' commits gate their folds.
+    pub(crate) fn gates(&self) -> bool {
+        self.gate.is_some()
     }
 
     fn rs_fault(op: &'static str, fault: crate::error::Fault) -> kernels_cuda::Error {
