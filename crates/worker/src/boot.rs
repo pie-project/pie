@@ -273,6 +273,9 @@ fn load(
     engine: Engine,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
 ) -> Result<Loaded> {
+    // Before any engine loads: what the sandbox pool leaves the rest of
+    // the process to grow by (an engine's maps do not grow after its load).
+    runtime::bootstrap::note_maps_before_engines();
     runtime::catalog::install(&home.join("models"));
     let opened = match engine {
         Engine::None => return load_without_engine(user_cfg, home, builtins),

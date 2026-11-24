@@ -314,6 +314,11 @@ impl BootstrapHandle {
     }
 }
 
+/// Records the memory maps this process holds before its engines load:
+/// what the sandbox pool leaves the rest of the process to grow by. Call
+/// it before the engines load; [`bootstrap`] comes after them.
+pub use crate::sandbox_pool::note_maps_before_engines;
+
 pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
     bootstrap_inner(config).await
 }
