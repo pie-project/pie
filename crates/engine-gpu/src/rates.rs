@@ -615,15 +615,13 @@ struct Rig<'a, B: Serve> {
     /// waits at most the frame in flight.
     yield_to: Option<&'a dyn Fn() -> bool>,
     /// Behind serving with its frames held to one decode step: a point
-    /// whose single fire is past that stops the step ([`DEFERRED`]), to run
-    /// once nothing is live, never dropped from its curve.
+    /// whose single fire is past that stops the step ([`DEFERRED`]), never
+    /// dropped from its curve.
     defer_past: bool,
     /// Behind serving: what each frame (and the warm-up's cube) is held to,
     /// one decode step of the load; the platform's bound still admits
     /// every fire.
     behind_cap: Option<std::time::Duration>,
-    /// A fire past `behind_cap` runs alone, a frame of one.
-    single_past: bool,
 }
 
 /// A sink that fires through `inner` and keeps each kernel it fires: a
@@ -738,7 +736,6 @@ impl<'a, B: Serve> Rig<'a, B> {
             yield_to: None,
             defer_past: false,
             behind_cap: None,
-            single_past: false,
         }
     }
 
@@ -870,21 +867,16 @@ impl<'a, B: Serve> Rig<'a, B> {
     fn fitting(&self, count: u32) -> Result<u32> {
         let count = self.fitting_platform(count)?;
         // Behind serving, a frame holds no more than one decode step of
-        // fires; a single fire past it is deferred (or, once nothing is
-        // live, runs as a frame of one).
+        // fires; a single fire past it is refused ([`DEFERRED`]).
         let Some(cap) = self.behind_cap else {
             return Ok(count);
         };
         let worst = self.admission.get().worst.max(1.0);
         let cap = cap.as_nanos() as f64;
         match self.per_fire_now().map(|per| per * worst) {
-            Some(per) if per > cap => {
-                if self.single_past {
-                    Ok(1)
-                } else {
-                    Err(self.refuse(Some(per), 1))
-                }
-            }
+            // A single fire past one decode step never runs behind serving:
+            // an arrival landing on it would wait for it.
+            Some(per) if per > cap => Err(self.refuse(Some(per), 1)),
             Some(per) => Ok(count.min(((cap / per).floor() as u32).max(1))),
             None => Ok(1),
         }
@@ -2382,10 +2374,6 @@ pub fn curve_named(
 pub struct Behind<'a> {
     pub resume: &'a mut Resume,
     pub cap: Option<std::time::Duration>,
-    /// A point whose single fire is past `cap` runs as a frame of that one
-    /// fire (under the platform's bound), not deferred: what a key does
-    /// once nothing is live.
-    pub single_past: bool,
 }
 
 /// What a rates step behind serving keeps across its slices, a key's: each
@@ -2431,9 +2419,11 @@ impl Resume {
 pub const YIELDED: &str = "yielded to an arrival";
 
 /// Why a step behind serving stopped where its frames are held to one decode
-/// step: a point's single fire is past that, and runs once nothing is live.
+/// step: a point's single fire is past that, which behind serving never
+/// runs (the key stays served by its stale figure; the export round or
+/// `pie tune` measures it in the foreground).
 pub const DEFERRED: &str =
-    "a point's single fire is past one decode step: deferred until nothing is live";
+    "a point's single fire is past one decode step, which behind serving never runs";
 
 /// Whether `fault` is a step behind serving deferring a long point.
 #[must_use]
@@ -2462,13 +2452,9 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     behind: Option<Behind<'_>>,
 ) -> Result<engine::rates::Measured> {
     let behind_serving = behind.is_some();
-    let (mut resume, cap, single_past) = match behind {
-        Some(Behind {
-            resume,
-            cap,
-            single_past,
-        }) => (Some(resume), cap, single_past),
-        None => (None, None, false),
+    let (mut resume, cap) = match behind {
+        Some(Behind { resume, cap }) => (Some(resume), cap),
+        None => (None, None),
     };
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
@@ -2495,8 +2481,7 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     // the device); the cap sizes each frame and the warm-up's cube.
     if let (Some(cap), Some(bound)) = (cap, max_submit) {
         rig.behind_cap = Some(cap.min(bound));
-        rig.defer_past = !single_past;
-        rig.single_past = single_past;
+        rig.defer_past = true;
     }
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;

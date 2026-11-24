@@ -1385,7 +1385,14 @@ impl Lane {
                 None => {
                     let owed = !landed_instances.is_empty();
                     let awake = || owed || settled_at == Some(parks.count());
-                    let arrived = || !launch_rx.is_empty() || !control_rx.is_empty();
+                    // An arrival: a request queued on the lane, or a process
+                    // opening a pipeline (a request the scheduler is still
+                    // binding reaches the lane only later).
+                    let arrived = || {
+                        !launch_rx.is_empty()
+                            || !control_rx.is_empty()
+                            || !crate::pipeline::none_active()
+                    };
                     let behind = || Self::measure_behind(engine_idx, &mut engine, &arrived);
                     match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, awake, behind) {
                         Ok(request) => request,

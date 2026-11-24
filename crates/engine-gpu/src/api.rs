@@ -278,9 +278,7 @@ pub struct Gpu<B: Host> {
     /// Each stale rate's points completed behind serving so far, by key: a
     /// slice resumes at its next unmeasured point.
     rates_resume: std::collections::HashMap<String, crate::rates::Resume>,
-    /// The stale rates one of whose points is past one decode step: their
-    /// rest runs once nothing is live.
-    rates_long: std::collections::HashSet<String>,
+
 }
 
 impl<B: Host> Gpu<B> {
@@ -328,16 +326,6 @@ impl<B: Host> Gpu<B> {
         };
         if !crate::backend::Context::idle(shell.device()) {
             self.behind_state("waiting: the device is busy");
-            return Ok(false);
-        }
-        // A key one of whose points is past one decode step runs (at the
-        // platform's bound) only once nothing is live.
-        let long = self.rates_long.contains(&key);
-        if long && !behind.alone {
-            self.behind_state(
-                "waiting: a stale rate's next point runs longer than one decode step, and runs \
-                 only once no process is live",
-            );
             return Ok(false);
         }
         self.behind_state("running: the stale rates and curves");
@@ -404,11 +392,7 @@ impl<B: Host> Gpu<B> {
                         max_submit,
                         &stated,
                         behind.arrived,
-                        crate::rates::Behind {
-                            resume,
-                            cap,
-                            single_past: long,
-                        },
+                        crate::rates::Behind { resume, cap },
                     )
                     .and_then(|measured| match measured.throttled {
                         None => Ok(measured.rates),
@@ -458,12 +442,25 @@ impl<B: Host> Gpu<B> {
                 kept(self, "yielded to an arrival, resumed later")?;
                 return Ok(true);
             }
-            Err(why) if crate::rates::deferred(&why) || (cap.is_some() && !long) => {
-                // A point past one decode step (or a step that cannot hold
-                // its frames to it): the key's rest runs once nothing is
-                // live, at the platform's bound.
-                self.rates_long.insert(key.clone());
-                kept(self, &format!("deferred until nothing is live ({why})"))?;
+            Err(why) if crate::rates::deferred(&why) || cap.is_some() => {
+                // A point whose single fire is past one decode step (or a
+                // step that cannot hold its frames to it): behind serving
+                // never runs such a fire, since an arrival landing on it
+                // would wait for it. The key stays served by its stale
+                // figure; the export round or `pie tune` measures it in the
+                // foreground. A key is stored whole, so the points it
+                // finished are not stored on their own.
+                tracing::info!(
+                    key = %key,
+                    ms,
+                    "rates behind serving: `{key}` stays served by its stale figure: a point's \
+                     single fire is past one decode step of this load, which behind serving \
+                     never runs ({why}); the export round or `pie tune` measures it"
+                );
+                self.rates_resume.remove(&key);
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.rate_timed(&key);
+                }
                 return Ok(true);
             }
             Err(why @ crate::error::Fault::Device { call: "rates behind serving", .. }) => {
@@ -497,7 +494,6 @@ impl<B: Host> Gpu<B> {
             return Ok(true);
         }
         self.rates_resume.remove(&key);
-        self.rates_long.remove(&key);
         let Some(shell) = self.shell.as_mut() else {
             return Ok(false);
         };
@@ -653,7 +649,7 @@ impl<B: Host> Gpu<B> {
             vocab: None,
             said_behind: None,
             rates_resume: std::collections::HashMap::new(),
-            rates_long: std::collections::HashSet::new(),
+
         }
     }
 
