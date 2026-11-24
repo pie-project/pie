@@ -309,6 +309,28 @@ mod tests {
         (trace, compiled)
     }
 
+    /// A load whose fires replay bodies carves every rung's fire for the
+    /// body's lane capacity: what a rung states state may take is what lies
+    /// under that wider carve, nothing where no rung holds the lanes.
+    #[test]
+    fn a_rung_lends_state_only_under_the_carve_its_fires_lay() {
+        let map = |bytes| ArenaMap {
+            placements: Vec::new(),
+            spans: Vec::new(),
+            live_in: Vec::new(),
+            bytes,
+        };
+        let mut arena = Arena::reserve(3000).with_rungs(vec![(256, map(1000)), (1024, map(2000))]);
+        arena.committed = 3000;
+        assert_eq!(arena.rungs(None), vec![(256, 2000), (1024, 1000)]);
+        arena.reach_lanes(1024);
+        assert_eq!(arena.rungs(None), vec![(256, 1000), (1024, 1000)]);
+        assert_eq!(arena.carve_of(None, 1, 1), 2000);
+        arena.reach_lanes(2048);
+        assert_eq!(arena.rungs(None), vec![(256, 0), (1024, 0)]);
+        assert_eq!(arena.carve_of(None, 1, 1), 3000);
+    }
+
     #[test]
     fn the_carve_fits_the_allocation_it_asks_for() {
         let (_, compiled) = compiled();
