@@ -1603,9 +1603,10 @@ impl Shell {
 
     /// The bucket a buffering step with a prompt's rows (a mixed or prompt
     /// step whose lanes buffer or replay recurrent rows) of `rows` rows
-    /// composes at: its rung's in the walked set (the smallest holding
-    /// them), which the runtime prices the step at already
-    /// (`engine::fire::rung_holds`). Its bodies are recorded there alone, not
+    /// composes at: the smallest buffered rung in the walked set holding
+    /// them (`engine::StepFacts::buffered_rungs`, coarser than the folded
+    /// lattice), which the runtime asks the step's activation rung for
+    /// (`FireRequest::pads_to`). Its bodies are recorded there alone, not
     /// at every finer bucket: they are many (each class set, each of
     /// buffering, splitting and replaying), and a prompt's are the widest.
     /// A decode step's buffering lanes keep their own bucket.
@@ -1613,6 +1614,7 @@ impl Shell {
         self.steps
             .shapes
             .iter()
+            .filter(|shape| shape.treatment == engine::Treatment::Buffers)
             .map(|shape| shape.rung)
             .find(|&rung| rung >= rows)
             .and_then(|rung| self.bucket_for(rung))
