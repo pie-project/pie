@@ -1400,7 +1400,10 @@ pub fn lt_grouped_fires() -> u64 {
     LT_FIRES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// The most the hipBLASLt leg stages: its routes' rows in and out.
+/// The most the hipBLASLt leg stages: its routes' rows in and out. The load
+/// lays that staging for good (`jit::device` places every slab at load), so
+/// this bounds the device memory the leg holds: a chosen bound, not a
+/// measured one; a wider shape takes the grouped kernels.
 #[cfg(feature = "rocm")]
 const LT_STAGE_CAP: u64 = 3 << 30;
 
@@ -1710,6 +1713,9 @@ const fn block_rows(per_expert: u32) -> u32 {
     }
 }
 
+/// The most the rocBLAS leg stages (its blocks' rows in and out), held for
+/// good as [`LT_STAGE_CAP`]'s: a chosen bound, not a measured one; a wider
+/// shape takes the grouped kernels.
 #[cfg(feature = "rocm")]
 const GROUP_WORKSPACE_CAP: u64 = 512 << 20;
 

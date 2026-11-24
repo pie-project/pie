@@ -28,7 +28,9 @@ const fn item_rows(m: u32) -> u32 {
     }
 }
 
-/// The most slices of K a launch takes, and the fewest stages a slice.
+/// The most slices of K a launch takes (each a partial the sum reads back),
+/// and the fewest 128-element stages a slice keeps, so a slice still
+/// overlaps its loads with its products: chosen bounds, not measured ones.
 const MAX_SPLITS: u32 = 8;
 const MIN_STAGES: u32 = 4;
 

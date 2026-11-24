@@ -249,8 +249,12 @@ impl Carve {
 /// Wavefronts a block at most.
 const MAX_SPLIT: u32 = 16;
 
+/// Wavefronts a block at least: two on each of a CU's four SIMDs, so one
+/// hides the other's loads.
 pub const MIN_SPLIT: u32 = 8;
 
+/// The rows up to which a product takes the thin split-K maximum
+/// (`qmm_split_thin_max`): a chosen bound, not a measured one.
 pub const THIN_ROWS: u32 = 8;
 
 /// The most activation rows the GEMV lands (one 16-row tile of the core).

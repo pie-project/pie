@@ -645,8 +645,12 @@ const FINALIZE_BLOCK: u32 = 64;
 
 const APPLY_BLOCK: u32 = 256;
 
+/// Splits of a lane's rows at most: the one-wavefront merge
+/// (`group_norm_finalize`) folds eight a lane.
 const MAX_SPLITS: u32 = 512;
 
+/// Rows a stats block reduces before the merge: a chosen granularity, not
+/// a measured one.
 const ROWS_PER_SPLIT: u32 = 256;
 
 /// `base`: the row `grid` addresses `x`'s (and `o`'s) row 0 at.

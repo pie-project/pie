@@ -479,10 +479,13 @@ pub(crate) mod naive {
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::{Arg, kernel};
 
+    /// The walk's block (`mla_naive::kBlock`).
     pub const NAIVE_BLOCK: u32 = 256;
 
+    /// Latent and rope elements a lane holds in registers
+    /// (`mla_naive::kMaxPer` / `kMaxPe`): latent rows up to 1024, rope up to
+    /// 256.
     pub const NAIVE_MAX_PER: i32 = 16;
-
     pub const NAIVE_MAX_PE_PER: i32 = 4;
 
     /// Wavefronts in the MLA walk's block.
