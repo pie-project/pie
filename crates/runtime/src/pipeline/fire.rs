@@ -13000,6 +13000,95 @@ mod unfolded_tests {
         }
     }
 
+    /// A prompt's prefill and its decodes, every pass stated final
+    /// (CONTRACT-BC 25), on a recurrent set: the prefill folds its rows at
+    /// fire, so the first decode, staged on the prompt's end, carries none
+    /// of them in. It folds its own row, its verb is `Fold` and its step is
+    /// the plain folded one, and so is every decode after it.
+    #[test]
+    fn a_final_prefill_leaves_its_first_decode_nothing_to_carry() {
+        use ::engine::fire::RsVerb;
+        use ::engine::shapes::{StepComposition, Treatment};
+        const PROMPT: u32 = 10;
+        let stores = pool_of_one_row_rs_pages();
+        let kv = stores.kv.lock().create_working_set();
+        let ws = stores
+            .rs
+            .lock()
+            .unwrap()
+            .create_working_set(crate::store::rs::RsGeometry {
+                state_size: 1 << 10,
+                buffer_page_tokens: 1,
+            });
+        let cursor = Arc::new(Mutex::new(Cursor::default()));
+        let ids = [ws];
+        let groups_of = lane_groups(&[kv]);
+        // One fire of `rows` rows from `start`, the folding geometry, its
+        // pass final; `run_ahead` where its tokens are the device's.
+        let fire = |start: u32, rows: u32, run_ahead: bool| {
+            let frozen = stores.rs.lock().unwrap().frozen(ws).unwrap();
+            let pass = PassLanes {
+                places: vec![geometry::Place {
+                    folded: frozen,
+                    folded_exact: true,
+                    tail: None,
+                    shared: false,
+                    spans: Vec::new(),
+                    readable: start,
+                    readable_known: true,
+                    set: 1,
+                }],
+                cursors: vec![cursor.clone()],
+                kv: Vec::new(),
+            };
+            let landings = [geometry::Landing { start, rows }];
+            let fold = pass_fold(
+                geometry::Fold::Host(vec![u32::MAX]),
+                true,
+                run_ahead,
+                true,
+                &pass,
+                &groups_of,
+                &landings,
+            );
+            let mut req = lane(start, rows);
+            let plan =
+                host_rs_plan(&stores, &ids, &groups_of, &req, &fold, &[], None, None).unwrap();
+            let frozen_at = lanes_frozen(&stores, &ids, &groups_of, 1, false).unwrap();
+            let counted = piece_rows(&req, &[Some((0, rows))], &frozen_at, false);
+            let mut store = stores.rs.lock().unwrap();
+            let prepared = rs::prepare_many(&mut store, &ids, &plan, None).unwrap();
+            prepared.apply_to(&mut req);
+            rs::settle(&mut store, prepared.txn);
+            (req, counted)
+        };
+        let (prefill, _) = fire(0, PROMPT, false);
+        assert_eq!(
+            stores.rs.lock().unwrap().frozen(ws).unwrap(),
+            PROMPT,
+            "the prefill folded every prompt row at fire"
+        );
+        assert_eq!(prefill.lanes[0].lane.rs, RsVerb::Fold);
+        for step in 0..3u32 {
+            let start = PROMPT + step;
+            let (req, counted) = fire(start, 1, true);
+            assert_eq!(counted.carried, 0, "decode {step} carries no row in");
+            assert_eq!(req.lanes[0].lane.rs, RsVerb::Fold, "decode {step}");
+            let replayed = req.lanes[0]
+                .lane
+                .replay_stated
+                .map_or(0, |stated| stated.replayed);
+            assert_eq!(replayed, 0, "decode {step}");
+            let alone = StepComposition::of([&req.lanes[0].lane]);
+            assert_eq!(
+                (alone.treatment, alone.carried),
+                (Treatment::Folds, 0),
+                "decode {step}"
+            );
+            assert_eq!(stores.rs.lock().unwrap().frozen(ws).unwrap(), start + 1);
+        }
+    }
+
     /// MTP with k = 4 on a pool whose rs pages hold one row: the draft
     /// writes a window of five rows unfolded, the next window carries those
     /// five in and folds the accepted rows. Not one rs page: a lane's buffer

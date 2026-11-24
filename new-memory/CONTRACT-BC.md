@@ -306,9 +306,16 @@ Proposed by the L40S session (branch `sc/l40s-bc`), accepted by New Pie. Runtime
     (`Treatment::Buffers`, the carried kernels). A lane whose program will never take a row back needs none of it.
     - **Where the statement lives.** A property of a forward pass: `forward-pass.final-rows: func() -> result<_,
       error>` (`forward.wit`), set before `program`; the SDK's `ForwardPass::final_rows()` (Rust) states it for
-      every lane of the pass and every fire of it. Compat inferlets state it per request: a request whose decode
-      takes back nothing (no stop sequences, no speculation, no beams) runs its decode pass final; one with stop
-      sequences, a draft or a beam search does not. **Default: not final.** A pass that states nothing keeps the
+      every lane of the pass and every fire of it. Declaring inferlets state it on every pass that only appends,
+      the prompt's prefill as well as the decode (a prefill left unstated hands its first decode a buffered
+      row, and a steady step that catches one runs the buffered body): the compat inferlets on every request's
+      prompt-scoring, prefill and decode passes, stop sequences or none (each request makes its own set and
+      releases it, so a stop sequence only cuts the output: nothing is retracted, truncated or rewound, and the
+      rows run past it are published keyed by their tokens, as past an EOS); text-completion-bench on its
+      prefill and decode (unless a fold lag or `final_rows: false` asks otherwise); the prefill builtin on its
+      one pass. The compat speculative path rewrites a rejected draft's slots, so its passes state nothing.
+      The served census reads it back: the model status counts the steps fired by their stated treatment
+      (`engine.fires_folds`, `engine.fires_buffers`, beside `built_in_fire`). **Default: not final.** A pass that states nothing keeps the
       lagged fold. The runtime never infers finality: not from the absence of a beam, of stop strings, of a
       retract, nor from anything else; only the statement counts. Refused by name on a pass binding `parents` (a
       beam search keeps its rows buffered, §11.3).
