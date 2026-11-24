@@ -23,6 +23,9 @@ use ids::{GatewayId, NodeId, WorkerId};
 use actor::{Actor, ActorConfig, Command};
 use topology::{Topology, empty_routing, project};
 
+/// How long a long-poll watch hangs before answering with what it holds:
+/// well inside the callers' transport deadline (300 s), so an idle watch
+/// answers rather than times out.
 const T_HANG: Duration = Duration::from_secs(20);
 /// How often a changed directory is published to the gateways: reports
 /// within it go out as one view.

@@ -17,10 +17,15 @@ use worker_api::{
 
 use crate::session::Sessions;
 
+/// The largest frame the gateway reads on a worker link.
 pub(crate) const WORKER_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// A client request's limit: 1 MiB under the worker link's, the room for
+/// the envelope the gateway forwards it in.
 pub const MAX_CLIENT_FRAME_BYTES: usize = WORKER_MAX_FRAME_BYTES - (1024 * 1024);
 
+/// What the client socket reads: past the request limit, so an oversized
+/// request is refused by name rather than cut off by the socket.
 pub const MAX_CLIENT_FRAME_RECV_BYTES: usize = WORKER_MAX_FRAME_BYTES - (256 * 1024);
 
 #[derive(Debug)]
