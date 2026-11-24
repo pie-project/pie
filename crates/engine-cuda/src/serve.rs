@@ -1355,16 +1355,33 @@ impl Shell {
         attachments: &[Attached],
         media: &[Media<'_>],
     ) -> Result<Vec<Vec<f32>>> {
-        let prepared = FrameShell::prepare(
-            self,
-            StepView {
-                lanes,
-                attachments,
-                media,
-                voxels: &[],
-            },
-            None,
-        )?;
+        self.fire_step(StepView {
+            lanes,
+            attachments,
+            media,
+            voxels: &[],
+        })
+    }
+
+    /// A fire of lanes with their media and voxel clips, no attachments:
+    /// arming's synthetic fires ([`Shell::fire_step`]).
+    pub(crate) fn fire_view(
+        &mut self,
+        lanes: &[Seated<'_>],
+        media: &[Media<'_>],
+        voxels: &[Clips<'_>],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.fire_step(StepView {
+            lanes,
+            attachments: &[],
+            media,
+            voxels,
+        })
+    }
+
+    /// One fire of `step`, its logits read back.
+    fn fire_step(&mut self, step: StepView<'_>) -> Result<Vec<Vec<f32>>> {
+        let prepared = FrameShell::prepare(self, step, None)?;
         let enqueued = FrameShell::enqueue(self, prepared)?;
         let mut settled = FrameShell::settle(self, enqueued)?;
         Shell::read_out(self, &mut settled)?;
