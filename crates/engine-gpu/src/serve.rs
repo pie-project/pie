@@ -404,6 +404,13 @@ pub trait Serve: Backend {
         String::new()
     }
 
+    /// Whether the driver ran out of what a recording takes (memory, pool
+    /// room, command buffers) since the last call, whatever error that
+    /// became on its way up.
+    fn spent() -> bool {
+        false
+    }
+
     /// Submits the walked `frame`.
     fn submit(
         shell: &mut Shell<Self>,
@@ -10622,6 +10629,7 @@ impl<B: Serve> Shell<B> {
         let mut dearest = 0u64;
         let mut dearest_device = 0u64;
         let mut spent_at: Option<usize> = None;
+        let _ = B::spent();
         if let Some(known) = &known {
             match steps {
                 Some(_) => self.eager_from = known.eager.map(|at| at as usize),
@@ -10755,20 +10763,7 @@ impl<B: Serve> Shell<B> {
                     // descriptor pools, its memory) ends the walk where it
                     // stands, the rest stated eager, as the allowance does; any
                     // other failure fails the load.
-                    let why = fault.to_string();
-                    let spent = [
-                        "vkAllocate",
-                        "vkCreateDescriptorPool",
-                        "vkCreateCommandPool",
-                        "vkBeginCommandBuffer",
-                        "command buffers",
-                        "descriptor pools",
-                        "VkResult -1 ",
-                        "VkResult -2 ",
-                        "VkResult -1000069000",
-                    ]
-                    .iter()
-                    .any(|named| why.contains(named) || why.ends_with(named.trim_end()));
+                    let spent = B::spent();
                     if !spent {
                         tracing::error!(
                             %fault,
