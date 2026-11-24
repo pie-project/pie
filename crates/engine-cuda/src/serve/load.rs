@@ -1015,6 +1015,7 @@ impl Shell {
     pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
         let rules = boot.steps.clone();
+        let expert_ranks = boot.expert.size;
         crate::program::launch::state_queue_masks(&boot.knobs.queue_masks);
         let Baked {
             mut device,
@@ -1903,6 +1904,11 @@ impl Shell {
         // The step compositions the runtime's builder forms over this load
         // (CONTRACT-BC 24): what the size-only walk and arming take their
         // targets from.
+        // Expert parallelism seats its buffers in the arena laid at the
+        // span's start: no smaller rung, for the set, the walk and serving.
+        if expert_ranks > 1 {
+            shell.drop_rungs();
+        }
         shell.walk_steps(&rules);
         let walked = if shell.pools.fresh() {
             shell.size_arming()?

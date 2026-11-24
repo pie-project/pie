@@ -292,6 +292,7 @@ impl Shell {
             lanes,
             attachments,
             media,
+            shape,
             ..
         } = step;
         let arming = self.arming;
@@ -774,16 +775,20 @@ impl Shell {
                 ),
             })
             .collect();
-        // A buffering step with a prompt's rows composes at its stated rung
-        // (`Shell::buffered_rung`), where the walk recorded it.
-        let buffers = lanes
-            .iter()
-            .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
-        let prompts = lane_rows.iter().any(|&rows| rows > 1);
-        let at = self.forced_bucket.take().or_else(|| {
-            (buffers && prompts)
-                .then(|| self.buffered_rung(lane_rows.iter().sum()))
-                .flatten()
+        // A buffering step with a prompt's rows composes at its stated rung,
+        // where the walk recorded it: the stamped shape's (CONTRACT-BC 24),
+        // else the rung its lanes' rows make (`Shell::buffered_rung`).
+        let at = self.forced_bucket.take().or_else(|| match shape {
+            Some(shape) => self.stamped_bucket(shape),
+            None => {
+                let buffers = lanes
+                    .iter()
+                    .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
+                let prompts = lane_rows.iter().any(|&rows| rows > 1);
+                (buffers && prompts)
+                    .then(|| self.buffered_rung(lane_rows.iter().sum()))
+                    .flatten()
+            }
         });
         let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
         let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
@@ -1991,7 +1996,15 @@ impl Shell {
             .iter()
             .map(|reads| crate::run::replayed(reads))
             .collect();
-        let rs_lands = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
+        // Whether a lane buffers rows: the stamped shape's treatment, else
+        // the lanes' moves (a fire built by hand); the two agree.
+        let moves = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
+        let rs_lands = shape.map_or(moves, |shape| shape.treatment == engine::Treatment::Buffers);
+        debug_assert_eq!(
+            rs_lands, moves,
+            "a fire stamped {shape:?} whose lanes {} buffer rows",
+            if moves { "do" } else { "do not" }
+        );
         // A decoding lane replays its carried rows in its decode step's own
         // kernels (`dispatch::ssm`, `kernels_cuda::ssm::Carry`), in the body
         // that buffers; only a wider lane's replay runs extended.
