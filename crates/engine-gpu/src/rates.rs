@@ -610,10 +610,6 @@ struct Rig<'a, B: Serve> {
     /// matmul against one workgroup of it, its operands' place in the cache
     /// moving neither); `None`, every reading's [`weights_at`].
     planes_most: Option<usize>,
-    /// Measuring behind serving: whether a request arrived, read before
-    /// each frame; one that did stops the step ([`YIELDED`]), so an arrival
-    /// waits at most the frame in flight.
-    yield_to: Option<&'a dyn Fn() -> bool>,
 }
 
 /// A sink that fires through `inner` and keeps each kernel it fires: a
@@ -692,7 +688,6 @@ impl<'a, B: Serve> Rig<'a, B> {
             fired: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             quick: false,
             planes_most: None,
-            yield_to: None,
         }
     }
 
@@ -993,13 +988,6 @@ impl<'a, B: Serve> Rig<'a, B> {
         fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>,
         then: &dyn Fn(&mut B::Frame) -> Result<()>,
     ) -> Result<(Option<u64>, u64)> {
-        // Behind serving, an arrival stops the step before its next frame.
-        if self.yield_to.is_some_and(|arrived| arrived()) {
-            return Err(Fault::Device {
-                call: "measuring behind serving",
-                why: YIELDED.to_string(),
-            });
-        }
         // A frame follows an idle device: re-timed first, under a bound.
         self.retime()?;
         let step = self.step.borrow().clone();
@@ -1485,7 +1473,6 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     model: Option<u64>,
     top: u32,
     say: &mut dyn FnMut(&str),
-    yield_to: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<profile::fire::KernelCurve>> {
     if wanted.is_empty() {
         return Ok(Vec::new());
@@ -1500,7 +1487,6 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     };
     let launch = launch_ns as f64;
     let mut rig = Rig::<B>::new(device, max_submit);
-    rig.yield_to = yield_to;
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
     // The clock warmed by the warm-up's cube where one fits the bound at the
@@ -1999,10 +1985,9 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         format!("{kind}/{key} at {n}x{k}")
     };
     // A curve stored under a stale key (a kernel's code or the method
-    // changed) serves by its old figure, a fair estimate, and is timed
-    // again behind serving (`profile::fire::Tuned::behind`, `curve <name>`):
-    // nothing is timed before ready that a figure exists for. Only a curve
-    // no layer states at all is timed here.
+    // changed) serves by its old figure, a fair estimate, until the export
+    // round or `pie tune` measures it: nothing is timed before ready that a
+    // figure exists for. Only a curve no layer states at all is timed here.
     let stale_curves = stated
         .stale
         .as_ref()
@@ -2026,26 +2011,10 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         } else {
             let mut tuned = chip.tuned().clone();
             for curve in &served {
-                let behind = measuring == engine::rates::Measuring::Time
-                    && stale_rates(max_submit) == engine::rates::StaleRates::TimedBehind;
                 tracing::info!(
-                    "rates: gemm curve {curve}: served by the curve stored under its stale key{}",
-                    match (measuring, behind) {
-                        (engine::rates::Measuring::Time, true) => {
-                            "; timed again behind serving, stored for the next load"
-                        }
-                        (engine::rates::Measuring::Time, false) => {
-                            " (not timed again where the platform bounds one submission: the \
-                             next export round refreshes it)"
-                        }
-                        (engine::rates::Measuring::Skip, _) => {
-                            " (`[engine] measure = false`: not timed again)"
-                        }
-                    }
+                    "rates: gemm curve {curve}: served by the curve stored under its stale key \
+                     (not timed again by this load: the export round or `pie tune` measures it)"
                 );
-                if behind {
-                    tuned.behind.push(format!("{CURVE_BEHIND}{curve}"));
-                }
             }
             tuned.rates = with.clone();
             (chip.with_tuned(tuned), with, still)
@@ -2104,7 +2073,6 @@ pub fn shapes_at_load<B: Serve, T: Tactics + ?Sized>(
         model,
         top,
         &mut |_| {},
-        None,
     )?;
     // The user's file gains what this load measured alone: a curve taken
     // from a committed profile stays the committed profile's.
@@ -2264,68 +2232,6 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     stated: &Rates,
     say: &mut dyn FnMut(&str),
 ) -> Result<engine::rates::Measured> {
-    measure_yielding::<B, T>(device, tactics, tier, timer, max_submit, stated, say, None)
-}
-
-/// What a load on this engine does with a rate or curve stored under a
-/// stale key: served by its figure and timed again behind serving; where
-/// the platform states a bound on one submission (`max_submit`), served
-/// and not timed again (a rates step's frames are sized to that bound, so
-/// one frame would hold a serving request for as long; the next export
-/// round refreshes it).
-#[must_use]
-pub fn stale_rates(max_submit: Option<std::time::Duration>) -> engine::rates::StaleRates {
-    if max_submit.is_some() {
-        engine::rates::StaleRates::Served
-    } else {
-        engine::rates::StaleRates::TimedBehind
-    }
-}
-
-/// The prefix of a `profile::fire::Tuned::behind` entry naming a dense
-/// kernel's curve (`<kind>/<key> at <n>x<k>`) served by a stale figure.
-pub const CURVE_BEHIND: &str = "curve ";
-
-/// The curve `name` (`<kind>/<key> at <n>x<k>`, [`CURVE_BEHIND`]'s) names
-/// among `kernels` at `shapes`: the kernel and plane to time it at.
-#[must_use]
-pub fn curve_named(
-    target: kernels_slang::Target,
-    kernels: &[kernels_slang::linear::gemm::Tactic],
-    shapes: &[(u32, u32)],
-    name: &str,
-) -> Option<(kernels_slang::linear::gemm::Tactic, u32, u32)> {
-    shapes.iter().find_map(|&(n, k)| {
-        kernels.iter().find_map(|&tactic| {
-            let (kind, key) = curve_key(target, tactic, n, k);
-            (format!("{kind}/{key} at {n}x{k}") == name).then_some((tactic, n, k))
-        })
-    })
-}
-
-/// Why a step measuring behind serving stopped: a request arrived
-/// ([`Rig`]'s `yield_to`). Nothing of it is kept; it runs again later.
-pub const YIELDED: &str = "yielded to an arrival";
-
-/// Whether `fault` is a step behind serving yielding to an arrival.
-#[must_use]
-pub fn yielded(fault: &Fault) -> bool {
-    matches!(fault, Fault::Device { why, .. } if why == YIELDED)
-}
-
-/// [`measure_saying`] behind serving: `yield_to` read before each frame,
-/// the step stopping ([`YIELDED`]) where a request arrived.
-#[allow(clippy::too_many_arguments)]
-pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
-    device: &B::Context,
-    tactics: &T,
-    tier: kernels_slang::Tier,
-    timer: Timer<'_, B>,
-    max_submit: Option<std::time::Duration>,
-    stated: &Rates,
-    say: &mut dyn FnMut(&str),
-    yield_to: Option<&dyn Fn() -> bool>,
-) -> Result<engine::rates::Measured> {
     // Only what `stated` lacks is timed; what it states stands in for the
     // rates the timed ones read (the launch, the bandwidth, the curve's peak).
     // The keys a load asks for at this bound ([`keys_at`]), those `stated`
@@ -2335,17 +2241,8 @@ pub fn measure_yielding<B: Serve, T: Tactics + ?Sized>(
     // rates are this load's alone where the after read is slower than the
     // warmed before read.
     let reference = tactics.gemm(tier, crate::submit::PROBE.0);
-    let clock_before = match yield_to {
-        Some(stop) => clock_warmed_until::<B>(device, reference, stop)?.ok_or_else(|| {
-            Fault::Device {
-                call: "measuring behind serving",
-                why: YIELDED.to_string(),
-            }
-        })?,
-        None => clock_warmed::<B>(device, reference)?,
-    };
+    let clock_before = clock_warmed::<B>(device, reference)?;
     let mut rig = Rig::<B>::new(device, max_submit);
-    rig.yield_to = yield_to;
     // Under a stated bound, the probe first: every estimate grows from it.
     rig.lay_probe(tactics.gemm(tier, crate::submit::PROBE.0))?;
     // The launch first: every rate below takes its dispatches' launches off.
@@ -3932,17 +3829,55 @@ pub fn clock_warmed<B: Serve>(
     warmed(|| read_clock(device, &probe))
 }
 
-/// [`clock_warmed`] behind serving: `stop` read before each read, `None`
-/// where it stopped it (a request arrived), so an arrival waits at most one
-/// read of the reference.
-pub fn clock_warmed_until<B: Serve>(
+/// [`clock_warmed`] on a probe laid once (`probe`, laid at load):
+/// nothing is laid, compiled or recorded per read, and `stop` is read
+/// before each of the reference's fires, so an arrival waits at most one
+/// fire of it.
+pub fn clock_warmed_on<B: Serve>(
     device: &B::Context,
-    tactic: kernels_slang::linear::gemm::Tactic,
+    probe: &crate::submit::Probe<B>,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<ClockRead>> {
-    let probe = crate::submit::Probe::<B>::new(device, tactic)?;
-    engine::rates::warmed_until(|| read_clock(device, &probe), stop)
+    let stopped = std::cell::Cell::new(false);
+    let read = engine::rates::warmed_until::<Fault>(
+        || match read_clock_until(device, probe, stop)? {
+            Some(read) => Ok(read),
+            None => {
+                stopped.set(true);
+                // Read as settled so the warm-up ends; dropped below.
+                Ok(ClockRead {
+                    fastest_ns: 1.0,
+                    spread: f64::INFINITY,
+                })
+            }
+        },
+        &|| stopped.get() || stop(),
+    )?;
+    Ok(read.filter(|_| !stopped.get()))
 }
+
+/// One read of the reference on `probe` ([`clock_read`]'s), `stop` read
+/// before each fire: `None` where it stopped.
+pub fn read_clock_until<B: Serve>(
+    device: &B::Context,
+    probe: &crate::submit::Probe<B>,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<ClockRead>> {
+    let mut fires = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        if stop() {
+            return Ok(None);
+        }
+        fires.push(probe.fire(device)?);
+    }
+    let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
+    let slowest = fires.iter().copied().fold(0.0, f64::max);
+    Ok(Some(ClockRead {
+        fastest_ns: fastest,
+        spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
+    }))
+}
+
 
 /// `engine::rates::warmed` over this crate's faults.
 pub fn warmed(read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {

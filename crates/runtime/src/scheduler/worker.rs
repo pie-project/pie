@@ -2269,6 +2269,7 @@ impl BatchScheduler {
                     }
                     launch.completion.reject_unsubmitted(message);
                 } else {
+                    launch.request.pads_to = batch::pads_to(&launch, limits.shapes);
                     if frame_policy.single_slot()
                         && launch.frame.is_none()
                         && let Some(lane) = launch.pipeline_id
@@ -3150,6 +3151,17 @@ impl BatchScheduler {
                 && submission.steps.iter().all(|step| !step.submission.lanes.is_empty()),
             "a fire posted to the engine carries at least one lane in every step"
         );
+        // A buffered step takes the stated buffered rung it pads to.
+        let padded = submission
+            .steps
+            .iter()
+            .filter_map(|step| {
+                let shape = step.submission.shape?;
+                let stated = step.shapes?.shapes.get(shape.id as usize)?;
+                (stated.treatment == ::engine::Treatment::Buffers).then_some(stated.rung as usize)
+            })
+            .max()
+            .unwrap_or(0);
         let batch_size = requests.len() as u64;
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
@@ -3163,7 +3175,7 @@ impl BatchScheduler {
             started: Instant::now(),
             batch_size,
             total_tokens,
-            rung_rows: total_tokens.max(carried),
+            rung_rows: total_tokens.max(carried).max(padded),
             placement: Vec::new(),
             unfired: Vec::new(),
         });

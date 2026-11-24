@@ -76,11 +76,10 @@ pub fn at_load(
         Some(device.left()),
         max_submit,
         measuring,
-        // A stale key's figure serves; the engine times it again behind
-        // serving (`engine_gpu::serve::Shell::measure_behind`), except where
-        // the platform states a bound on one submission
-        // (`engine_gpu::rates::stale_rates`).
-        engine_gpu::rates::stale_rates(max_submit),
+        // A stale key's figure serves until the export round or `pie tune`
+        // measures it: its step needs device buffers of its own, which
+        // nothing lays after ready, so it is not timed behind serving.
+        engine::rates::StaleRates::Served,
         |max_submit, stated| measure(device, &tuning, max_submit, stated).map_err(|e| e.to_string()),
     )
     .map_err(|why| engine_gpu::error::Fault::Device {
@@ -251,68 +250,6 @@ pub fn shapes_at_load(
     // load naming its kernels after its curves are timed names what a load
     // that read them names.
     Ok(tuning.with_profile(chip?))
-}
-
-/// [`measure`] behind serving: `yield_to` read before each frame, an
-/// arrival stopping the step (`engine_gpu::rates::yielded`).
-pub fn measure_behind(
-    device: &Context,
-    tuning: &crate::tuning::Tuning,
-    max_submit: Option<std::time::Duration>,
-    stated: &profile::fire::Rates,
-    yield_to: &dyn Fn() -> bool,
-) -> Result<engine::rates::Measured> {
-    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
-    let timer = timer();
-    let mut measured = engine_gpu::rates::measure_yielding::<Api, _>(
-        device,
-        tuning,
-        tier,
-        &timer,
-        max_submit,
-        stated,
-        &mut |_| {},
-        Some(yield_to),
-    )?;
-    measured.rates.measured_on = Some(device.measured_on());
-    Ok(measured)
-}
-
-/// Each of `wanted`'s dense kernel curves to `top` rows behind serving
-/// (`engine_gpu::rates::measure_shapes`), each point timed as
-/// [`shapes_at_load`] times it, `yield_to` read before each frame.
-pub fn curves_behind(
-    device: &Context,
-    tuning: &crate::tuning::Tuning,
-    max_submit: Option<std::time::Duration>,
-    stated: &profile::fire::Rates,
-    wanted: &[(kernels_slang::linear::gemm::Tactic, u32, u32)],
-    top: u32,
-    yield_to: &dyn Fn() -> bool,
-) -> Result<Vec<profile::fire::KernelCurve>> {
-    let tier = <Api as engine_gpu::serve::Serve>::tier(device);
-    let timer = |frame: Frame| {
-        let started = std::time::Instant::now();
-        let span = frame.commit_spanned()?;
-        Ok((
-            span.filter(|&ns| ns > 0),
-            started.elapsed().as_nanos() as u64,
-        ))
-    };
-    engine_gpu::rates::measure_shapes::<Api, _>(
-        device,
-        tuning,
-        tier,
-        &timer,
-        max_submit,
-        None,
-        stated,
-        wanted,
-        None,
-        top,
-        &mut |_| {},
-        Some(yield_to),
-    )
 }
 
 /// How a rates frame is timed on wgpu: the device's span where it states

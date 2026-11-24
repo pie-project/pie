@@ -265,8 +265,11 @@ pub fn fingerprint(bytes: &[u8]) -> u32 {
 /// fingerprint of the code of every kernel the load's served step fires
 /// (what each weighed step ran); and each row range it decided, `[bottom,
 /// top, replaced, vector, wide, tier]`: 1 where it replaced the curves'
-/// kernel with the one named (the tier `kernels_slang::Tier` as a number), 0
-/// where it kept theirs.
+/// kernel with the one named (the tier `kernels_slang::Tier` as a number), 2
+/// where it kept theirs and names it (every plane took that one), 0 where
+/// it kept theirs unnamed (a row from before the kept kernel was named, or
+/// planes that took different kernels): a load serves the curves' pick
+/// there, never a guess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenseSettled {
     pub method: u32,

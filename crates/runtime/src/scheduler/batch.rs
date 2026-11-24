@@ -122,6 +122,21 @@ fn composition(request: &PendingRequest) -> ::engine::StepComposition {
     ::engine::StepComposition::of(request.request.lanes.iter().map(|lane| &lane.lane))
 }
 
+/// The stated buffered rung `request`'s step pads up to where its lanes
+/// buffer ([`crate::engine::FireRequest::pads_to`]): the rung of the stated
+/// shape holding it, buffered steps running at the load's buffered rungs
+/// ([`::engine::StepFacts::buffered_rungs`]). 0 where its lanes fold or the
+/// limits state no set.
+pub(crate) fn pads_to(request: &PendingRequest, shapes: Option<&::engine::StepShapes>) -> u32 {
+    let step = composition(request);
+    if step.treatment != ::engine::Treatment::Buffers {
+        return 0;
+    }
+    shapes
+        .and_then(|shapes| shapes.shape_of(&step).map(|at| shapes.shapes[at].rung))
+        .unwrap_or(0)
+}
+
 /// The set a step is checked against under the contract check: the load's
 /// stated one; in a test building its limits by hand, the one the runtime's
 /// rules form over those limits, every rung one fire wide, buffering.
@@ -319,12 +334,21 @@ impl StepGroup {
         }
         // The step it would make is one the load stated: else it goes in a
         // later step, and this one is formed without it.
-        if let Some(shapes) = limits.shapes
-            && shapes
-                .shape_of(&self.composition.with(composition(request)))
-                .is_none()
-        {
-            return false;
+        // A buffered step pads up to its stated buffered rung: it stays
+        // within the activation rung the step may take, else the member goes
+        // in a later step (each member's own pad it asked at admission,
+        // `FireRequest::pads_to`).
+        if let Some(shapes) = limits.shapes {
+            match shapes.shape_of(&self.composition.with(composition(request))) {
+                None => return false,
+                Some(at)
+                    if shapes.shapes[at].treatment == ::engine::Treatment::Buffers
+                        && shapes.shapes[at].rung as usize > limits.max_forward_tokens =>
+                {
+                    return false;
+                }
+                Some(_) => {}
+            }
         }
         self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
             && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
@@ -1814,17 +1838,19 @@ mod tests {
     /// The set the runtime's rules form over `limits` at `rungs`, as a load
     /// states it.
     fn stated(limits: SchedulerLimits, rungs: &[u32], buffers: bool) -> ::engine::StepShapes {
-        ::engine::StepShapes::of(
-            &::engine::StepRules::runtime(),
-            &::engine::StepFacts {
-                rungs: rungs.to_vec(),
-                max_lanes: limits.max_forward_requests as u32,
-                max_tokens: limits.max_forward_tokens as u32,
-                max_readouts: limits.max_readouts as u32,
-                buffers,
-                attachments: ::engine::Attachments::served(true, true, true),
-            },
-        )
+        ::engine::StepShapes::of(&::engine::StepRules::runtime(), &facts(limits, rungs, buffers))
+    }
+
+    /// The facts a load of `rungs` under `limits` states.
+    fn facts(limits: SchedulerLimits, rungs: &[u32], buffers: bool) -> ::engine::StepFacts {
+        ::engine::StepFacts {
+            rungs: rungs.to_vec(),
+            max_lanes: limits.max_forward_requests as u32,
+            max_tokens: limits.max_forward_tokens as u32,
+            max_readouts: limits.max_readouts as u32,
+            buffers,
+            attachments: ::engine::Attachments::served(true, true, true),
+        }
     }
 
     fn holding(limits: SchedulerLimits, shapes: ::engine::StepShapes) -> SchedulerLimits {
@@ -1862,12 +1888,21 @@ mod tests {
     /// Waves of decodes (folded and buffered), prompts of every width and
     /// both together, on a load of rungs 4, 16 and 64: every step the
     /// builder forms is a composition of the set the load stated, and
-    /// every lane is served.
+    /// every lane is served. A buffered step pads to a stated buffered rung
+    /// (16 and 64: the lattice's widest spacing is 4), never past its
+    /// folded rung by more than that spacing, and each buffered member
+    /// asks the rung it pads to.
     #[test]
     fn every_step_the_builder_forms_is_in_the_stated_set() {
         let base = limits();
+        let facts = facts(base, &[4, 16, 64], true);
         let shapes = stated(base, &[4, 16, 64], true);
         let limits = holding(base, shapes.clone());
+        let buffered_rungs = facts.buffered_rungs();
+        assert_eq!(buffered_rungs, vec![16, 64]);
+        let (upper, lower) = facts.spacing();
+        let lattice = facts.lattice();
+        let mut buffered_steps = 0;
         let mut instance = 0u64;
         let mut next = || {
             instance += 1;
@@ -1893,6 +1928,18 @@ mod tests {
                     if lanes == 0 {
                         continue;
                     }
+                    for member in &mut wave {
+                        member.request.pads_to = pads_to(member, limits.shapes);
+                        if composition(member).treatment == ::engine::Treatment::Buffers {
+                            assert!(
+                                buffered_rungs.contains(&member.request.pads_to),
+                                "a buffered member asks its buffered rung"
+                            );
+                            assert!(member.request.rung_rows() >= member.request.pads_to as usize);
+                        } else {
+                            assert_eq!(member.request.pads_to, 0);
+                        }
+                    }
                     let (frame, flattened) =
                         build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
                     assert_eq!(flattened.len(), frame.steps.iter().map(|s| s.fire_stamps.len()).sum::<usize>());
@@ -1906,10 +1953,25 @@ mod tests {
                         shapes
                             .agrees(shape, &step.submission.lanes)
                             .unwrap_or_else(|why| panic!("{why}"));
+                        if shape.treatment != ::engine::Treatment::Buffers {
+                            continue;
+                        }
+                        buffered_steps += 1;
+                        let rung = shapes.shapes[shape.id as usize].rung;
+                        assert!(buffered_rungs.contains(&rung), "r{rung} is a buffered rung");
+                        let floor = ::engine::StepComposition::of(&step.submission.lanes).floor();
+                        let folded = *lattice.iter().find(|&&r| r >= floor).unwrap();
+                        assert!(
+                            u64::from(rung) * u64::from(lower)
+                                <= u64::from(upper) * u64::from(folded),
+                            "{floor} rows: r{rung} over folded r{folded} past {upper}/{lower}"
+                        );
+                        assert!(rung as usize <= limits.max_forward_tokens);
                     }
                 }
             }
         }
+        assert!(buffered_steps > 0, "buffered steps were formed");
     }
 
     /// A formed step carries the stated shape its composition is of
