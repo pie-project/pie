@@ -12,6 +12,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
             adapter_dir: adapter_dir(&doc),
             profiles,
             measure: measure(&doc)?,
+            top: None,
         },
         contract_for,
     ))

@@ -142,7 +142,14 @@ fn a_refused_lane_is_refused_alone() {
 
     let trace = poem::trace_hybrid(NAME, &Rows, Platform::Metal);
     let tokens = 16;
-    let mut engine = engine_metal::Metal::new(engine_metal::DeviceBoot::default(), contract_for);
+    // Every rung: the frames below are built by hand, three lanes wide,
+    // past the one-token top the ruling picks for this miniature (the
+    // runtime's step builder never forms a fire wider than the stated top).
+    let boot = engine_metal::DeviceBoot {
+        top: Some(engine_metal::Top::EveryRung),
+        ..engine_metal::DeviceBoot::default()
+    };
+    let mut engine = engine_metal::Metal::new(boot, contract_for);
     engine
         .load(LoadRequest {
             trace: trace.clone(),
