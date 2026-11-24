@@ -1260,7 +1260,7 @@ impl Build {
     /// none for. It holds nothing of the engine's and needs no context, so
     /// it runs on any thread while the engine fires on. Regions the same
     /// but for their names build once; those the disk holds none for
-    /// compile side by side, [`PARALLEL_COMPILES`] at a time.
+    /// compile side by side, a thread a core the process may run on.
     pub fn build(&mut self) -> std::result::Result<(), Failure> {
         let mut stages = std::mem::take(&mut self.stages);
         let built = self.build_regions(
@@ -1336,23 +1336,22 @@ impl Build {
     }
 }
 
-/// The most region compiles a build runs at once. HIP's runtime compiler
-/// runs one at a time.
-#[cfg(not(feature = "rocm"))]
-const PARALLEL_COMPILES: usize = 16;
+/// HIP's runtime compiler runs one compile at a time; elsewhere a build
+/// takes every core the process may run on (its CPU quota, which
+/// `available_parallelism` reads).
 #[cfg(feature = "rocm")]
-const PARALLEL_COMPILES: usize = 1;
+const SERIAL_COMPILER: bool = true;
+#[cfg(not(feature = "rocm"))]
+const SERIAL_COMPILER: bool = false;
 
 /// Each of `compiles`' sources `(key, source, ..)` compiled, in their
-/// order, side by side on at most [`PARALLEL_COMPILES`] threads.
+/// order, side by side, a thread a core the process may run on.
 fn side_by_side(
     compiles: &[(String, String, u32, String)],
     architecture: &str,
 ) -> Vec<std::result::Result<Vec<u8>, Failure>> {
-    let width = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(PARALLEL_COMPILES)
-        .min(compiles.len());
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let width = if SERIAL_COMPILER { 1 } else { cores }.min(compiles.len());
     if width < 2 {
         return compiles
             .iter()
