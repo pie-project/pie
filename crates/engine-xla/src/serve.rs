@@ -703,7 +703,9 @@ impl Shell {
             // One rung past the fire limit, for the padding lanes that
             // bring a full prefill fire's lane counts to their rungs
             // (`fire_inner`); the runtime still sends at most `max_tokens`.
-            if pad.room > 0 && budget.max_tokens >= 4 * pad.room {
+            // (on every load: without it, prompts filling the top rung have
+            // no rows for their padding lanes, and no layout)
+            if pad.room > 0 {
                 budget.max_tokens += pad.room;
                 budget.buckets.push(budget.max_tokens);
             }
