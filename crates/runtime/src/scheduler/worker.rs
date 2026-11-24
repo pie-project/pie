@@ -221,49 +221,6 @@ impl PendingRequest {
     }
 }
 
-pub(crate) fn wave_trace() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
-}
-
-pub(crate) fn wave_trace_emit(line: String) {
-    static BUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let buffered = *BUFFERED.get_or_init(|| {
-        #[cfg(target_arch = "wasm32")]
-        let on = false;
-        #[cfg(not(target_arch = "wasm32"))]
-        let on = std::env::var_os("PIE_WAVE_TRACE").is_some_and(|v| v == "buffer");
-        #[cfg(not(target_arch = "wasm32"))]
-        if on {
-            std::thread::spawn(|| {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let drained: Vec<String> =
-                        std::mem::take(&mut *LINES.lock().expect("lines lock poisoned"));
-                    for line in drained {
-                        eprintln!("{line}");
-                    }
-                }
-            });
-        }
-        on
-    });
-    if buffered {
-        LINES.lock().expect("lines lock poisoned").push(line);
-    } else {
-        eprintln!("{line}");
-    }
-}
-
-pub(crate) fn wave_trace_us() -> u128 {
-    static START: std::sync::OnceLock<crate::rt::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(crate::rt::Instant::now)
-        .elapsed()
-        .as_micros()
-}
-
 fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
     request.lanes.iter().any(|lane| lane.mask.is_some())
 }
@@ -1951,7 +1908,7 @@ impl BatchScheduler {
                     ?wait_hint,
                     "scheduler parked"
                 );
-                if parked.is_err() && crate::planner::trace_enabled() {
+                if parked.is_err() && tracing::enabled!(tracing::Level::DEBUG) {
                     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
                     let mut last = LAST.lock().unwrap();
                     let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
@@ -1960,11 +1917,10 @@ impl BatchScheduler {
                         || !in_flight_launches.is_empty();
                     if due && owed {
                         *last = Some(Instant::now());
-                        println!(
-                            "[sched-stall t_us={}] pending={} in_flight={} {}",
-                            crate::scheduler::fire_timing_now_us(),
-                            pending.len(),
-                            in_flight_launches.len(),
+                        tracing::debug!(
+                            pending = pending.len(),
+                            in_flight = in_flight_launches.len(),
+                            "scheduler stalled: {}",
                             frame_policy.debug_summary()
                         );
                     }
@@ -1978,35 +1934,6 @@ impl BatchScheduler {
                             .quorum
                             .idle_park_control_us
                             .fetch_add(slept, Relaxed);
-                        if slept >= frame::idle_dump_threshold_us() {
-                            let who: Vec<String> = in_flight_control
-                                .iter()
-                                .filter(|c| c.holds_launches)
-                                .map(|c| {
-                                    format!(
-                                        "{}({})",
-                                        c.operation,
-                                        match &c.state {
-                                            ControlSlotState::Posted { .. } => "posted",
-                                            ControlSlotState::Ready(comp) =>
-                                                if comp.is_settled() {
-                                                    "ready-settled"
-                                                } else {
-                                                    "ready-unsettled"
-                                                },
-                                        }
-                                    )
-                                })
-                                .collect();
-                            println!(
-                                "[idle-park] {slept}us woke={} holders=[{}]",
-                                match &parked {
-                                    Ok(_) => "channel",
-                                    Err(_) => "backstop",
-                                },
-                                who.join(",")
-                            );
-                        }
                     } else {
                         stats
                             .fire
@@ -2281,18 +2208,15 @@ impl BatchScheduler {
                             fires: 1,
                         });
                     }
-                    if wave_trace() {
-                        wave_trace_emit(format!(
-                            "[wave-trace] t={}us enq fire={} framed={} mask={} masks={} stm={} pipe={}",
-                            wave_trace_us(),
-                            launch.logical_fire_id,
-                            launch.frame.is_some(),
-                            launch.request.has_user_mask,
-                            has_wire_masks(&launch.request),
-                            launch.request.single_token_mode,
-                            launch.pipeline_id.is_some()
-                        ));
-                    }
+                    tracing::debug!(
+                        "enq fire={} framed={} mask={} masks={} stm={} pipe={}",
+                        launch.logical_fire_id,
+                        launch.frame.is_some(),
+                        launch.request.has_user_mask,
+                        has_wire_masks(&launch.request),
+                        launch.request.single_token_mode,
+                        launch.pipeline_id.is_some(),
+                    );
                     if let Some(stamp) = launch.frame {
                         // Read only for the seal trace: off, no lookup.
                         let program = if frame::seal_trace() {
@@ -2872,13 +2796,10 @@ impl BatchScheduler {
         };
         loop {
             if in_flight_control.holds_launches() {
-                if wave_trace() {
-                    wave_trace_emit(format!(
-                        "[wave-trace] t={}us hold control in_flight={}",
-                        wave_trace_us(),
-                        in_flight_launches.len()
-                    ));
-                }
+                tracing::debug!(
+                    "hold control in_flight={}",
+                    in_flight_launches.len(),
+                );
                 if in_flight_launches.is_empty() {
                     stats
                         .fire
@@ -2889,14 +2810,11 @@ impl BatchScheduler {
                 break;
             }
             if in_flight_launches.len() >= frame::configured_dispatch_depth() {
-                if wave_trace() {
-                    wave_trace_emit(format!(
-                        "[wave-trace] t={}us hold depth in_flight={} depth={}",
-                        wave_trace_us(),
-                        in_flight_launches.len(),
-                        frame::configured_dispatch_depth()
-                    ));
-                }
+                tracing::debug!(
+                    "hold depth in_flight={} depth={}",
+                    in_flight_launches.len(),
+                    frame::configured_dispatch_depth(),
+                );
                 if in_flight_launches.is_empty() {
                     stats
                         .fire
@@ -2908,13 +2826,10 @@ impl BatchScheduler {
             }
             let now = Instant::now();
             let scan = Self::scan_queue(scan_cache, pending, stopping);
-            if wave_trace() {
-                wave_trace_emit(format!(
-                    "[wave-trace] t={}us plan in_flight={}",
-                    wave_trace_us(),
-                    in_flight_launches.len()
-                ));
-            }
+            tracing::debug!(
+                "plan in_flight={}",
+                in_flight_launches.len(),
+            );
             let mut rider_batch = false;
             let waves: Vec<Vec<u64>> = if stopping {
                 if scan.drain_eligible.is_empty() {
@@ -2923,13 +2838,10 @@ impl BatchScheduler {
                 vec![scan.drain_eligible.clone()]
             } else if !scan.untracked.is_empty() {
                 rider_batch = true;
-                if wave_trace() {
-                    wave_trace_emit(format!(
-                        "[wave-trace] t={}us rider fires={:?}",
-                        wave_trace_us(),
-                        scan.untracked
-                    ));
-                }
+                tracing::debug!(
+                    "rider fires={:?}",
+                    scan.untracked,
+                );
                 vec![scan.untracked.clone()]
             } else {
                 match frame_policy.plan_dispatch(
@@ -2939,13 +2851,10 @@ impl BatchScheduler {
                     now,
                 ) {
                     FramePlan::Dispatch(waves) => {
-                        if wave_trace() {
-                            wave_trace_emit(format!(
-                                "[wave-trace] t={}us dispatch waves={:?}",
-                                wave_trace_us(),
-                                waves.iter().map(Vec::len).collect::<Vec<_>>()
-                            ));
-                        }
+                        tracing::debug!(
+                            "dispatch waves={:?}",
+                            waves.iter().map(Vec::len).collect::<Vec<_>>(),
+                        );
                         waves
                     }
                     FramePlan::Hold(hold) => {
@@ -3287,13 +3196,10 @@ impl BatchScheduler {
                 fire_us = retired.started.elapsed().as_micros() as u64,
                 "fire retired"
             );
-            if wave_trace() {
-                wave_trace_emit(format!(
-                    "[wave-trace] t={}us retire lanes={}",
-                    wave_trace_us(),
-                    retired.requests.len()
-                ));
-            }
+            tracing::debug!(
+                "retire lanes={}",
+                retired.requests.len(),
+            );
             frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {

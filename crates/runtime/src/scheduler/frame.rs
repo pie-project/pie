@@ -1,7 +1,7 @@
 use crate::rt::Instant;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::stats::SchedulerStats;
@@ -27,20 +27,10 @@ static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// says which, and again after each such span.
 const HOLD_SAYS_AFTER: Duration = Duration::from_secs(5);
 
-fn idle_dump_min_seats() -> usize {
-    static SEATS: OnceLock<usize> = OnceLock::new();
-    *SEATS.get_or_init(|| {
-        std::env::var("PIE_IDLE_DUMP_MIN_SEATS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(0)
-    })
-}
-
-/// Whether a seal says what it sealed: the wave trace, or the scheduler's
-/// debug level. Off, nothing on the hot path reads a fire's program.
+/// Whether a seal says what it sealed: the scheduler's debug level. Off,
+/// nothing on the hot path reads a fire's program.
 pub(crate) fn seal_trace() -> bool {
-    super::worker::wave_trace() || tracing::enabled!(tracing::Level::DEBUG)
+    tracing::enabled!(tracing::Level::DEBUG)
 }
 
 /// Says, on the seal trace, why `lane` stops being awaited: which
@@ -50,23 +40,7 @@ fn trace_unawait(cause: &str, lane: ProcessId, owner: Option<ProcessId>) {
         return;
     }
     let line = format!("unawait cause={cause} lane={lane} owner={owner:?}");
-    if super::worker::wave_trace() {
-        super::worker::wave_trace_emit(format!(
-            "[wave-trace] t={}us {line}",
-            super::worker::wave_trace_us()
-        ));
-    }
     tracing::debug!("{line}");
-}
-
-pub(super) fn idle_dump_threshold_us() -> u64 {
-    static THRESHOLD: OnceLock<u64> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var("PIE_IDLE_DUMP_US")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .unwrap_or(u64::MAX)
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,7 +222,6 @@ pub(crate) struct FramePolicy {
     sealed: VecDeque<SealedFrame>,
     executing_now: bool,
     last_retire_at: Option<Instant>,
-    idle_dumped: bool,
     pending_binds: BTreeMap<ProcessId, usize>,
     staged: BTreeSet<ProcessId>,
     /// The seal under way runs while lanes are coming off a prompt: no
@@ -463,7 +436,6 @@ impl FramePolicy {
             sealed: VecDeque::new(),
             executing_now: false,
             last_retire_at: None,
-            idle_dumped: false,
             pending_binds: BTreeMap::new(),
             staged: BTreeSet::new(),
             prompts_only: false,
@@ -1069,7 +1041,6 @@ impl FramePolicy {
             return;
         }
         self.strict_watchdog_deadline = None;
-        self.idle_dumped = false;
     }
 
     fn have_seal_candidate(&self) -> bool {
@@ -1350,12 +1321,6 @@ impl FramePolicy {
                     self.executing_now,
                     by_program.len(),
                 );
-                if super::worker::wave_trace() {
-                    super::worker::wave_trace_emit(format!(
-                        "[wave-trace] t={}us {line}",
-                        super::worker::wave_trace_us()
-                    ));
-                }
                 tracing::debug!("{line}");
             }
             if !mid_boundary && !self.prompts_only {
@@ -1480,90 +1445,6 @@ impl FramePolicy {
         now: Instant,
     ) -> FramePlan {
         self.executing_now = executing;
-        let threshold = idle_dump_threshold_us();
-        if threshold != u64::MAX
-            && !executing
-            && let Some(since) = self.last_retire_at
-        {
-            let idle = now.saturating_duration_since(since).as_micros() as u64;
-            let seated = self.lanes.values().filter(|lane| lane.awaited).count();
-            if idle >= threshold && !self.idle_dumped && seated >= idle_dump_min_seats() {
-                self.idle_dumped = true;
-                let (mut ready, mut empty_owed, mut empty_unowed, mut partial) = (0, 0, 0, 0);
-                let (mut unowed_fresh, mut unowed_between) = (0, 0);
-                let (mut turn_max, mut turn_sum, mut turn_n) = (0u64, 0u64, 0u64);
-                let mut oldest_ready_us = 0u64;
-                let mut newest_ready_us = u64::MAX;
-                for (lane_id, lane) in &self.lanes {
-                    if !lane.awaited {
-                        continue;
-                    }
-                    if lane.frames.front().is_some_and(PendingFrame::is_complete) {
-                        ready += 1;
-                        if let Some(at) = lane.frames.front().and_then(|f| f.complete_at) {
-                            let age = now.saturating_duration_since(at).as_micros() as u64;
-                            oldest_ready_us = oldest_ready_us.max(age);
-                            newest_ready_us = newest_ready_us.min(age);
-                        }
-                    } else if lane.frames.is_empty() {
-                        let owes = self.in_flight_lanes.contains(lane_id)
-                            || lane
-                                .owner
-                                .is_some_and(|owner| self.pending_binds.contains_key(&owner));
-                        if owes {
-                            empty_owed += 1;
-                        } else {
-                            empty_unowed += 1;
-                            if lane.served {
-                                unowed_between += 1;
-                                if let Some(at) = lane.retired_at {
-                                    let age = now.saturating_duration_since(at).as_micros() as u64;
-                                    turn_max = turn_max.max(age);
-                                    turn_sum += age;
-                                    turn_n += 1;
-                                }
-                            } else {
-                                unowed_fresh += 1;
-                            }
-                        }
-                    } else {
-                        partial += 1;
-                    }
-                }
-                let open = self.boundary_open();
-                let (mut fresh, mut continuing) = (0, 0);
-                for lane in self.lanes.values() {
-                    if lane.frames.front().is_some_and(PendingFrame::is_complete) {
-                        if open && lane.fired_this_boundary {
-                            continuing += 1;
-                        } else {
-                            fresh += 1;
-                        }
-                    }
-                }
-                println!(
-                    "[device-idle] {idle}us awaited={} ready={ready} empty+owed={empty_owed} \
-empty+unowed={empty_unowed}(fresh={unowed_fresh},between={unowed_between}) \
-partial_front={partial} sealed={} staged={} \
-pending_slots={} joins={} binds={} boundary_open={open} fresh={fresh} \
-continuing={continuing} turnaround_max={turn_max}us \
-turnaround_mean={}us ready_age_oldest={oldest_ready_us}us \
-ready_age_newest={}us",
-                    ready + empty_owed + empty_unowed + partial,
-                    self.sealed.len(),
-                    self.staged.len(),
-                    self.pending_slots,
-                    self.joins_in_flight.len(),
-                    self.pending_binds.values().sum::<usize>(),
-                    turn_sum.checked_div(turn_n).unwrap_or(0),
-                    if newest_ready_us == u64::MAX {
-                        0
-                    } else {
-                        newest_ready_us
-                    },
-                );
-            }
-        }
         loop {
             self.retire_parks();
             for frame in &mut self.sealed {
@@ -1594,7 +1475,6 @@ ready_age_newest={}us",
                     return FramePlan::Hold(Duration::from_micros(500));
                 }
                 let frame = self.sealed.pop_front().expect("front frame exists");
-                let mut starved_us = 0u64;
                 if !self.executing_now
                     && let Some(since) = self.last_retire_at
                     && let Some(stats) = &self.stats
@@ -1604,10 +1484,6 @@ ready_age_newest={}us",
                     stats.fire.quorum.device_idle_us.fetch_add(idle, Relaxed);
                     stats.fire.quorum.device_idle_gaps.fetch_add(1, Relaxed);
                     stats.record_bubble_us(idle);
-                    starved_us = idle;
-                }
-                if starved_us >= idle_dump_threshold_us() {
-                    println!("[idle-gap] {starved_us}us  {}", self.debug_summary());
                 }
                 self.dispatched_prompts = frame.prompts;
                 return FramePlan::Dispatch(frame.waves);
@@ -1623,7 +1499,6 @@ ready_age_newest={}us",
             }
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 self.strict_watchdog_deadline = None;
-                self.idle_dumped = false;
                 return FramePlan::Park;
             }
             let mut missing_decoders = 0usize;
@@ -1685,16 +1560,13 @@ ready_age_newest={}us",
                 }
                 continue;
             }
-            if super::worker::wave_trace() {
-                super::worker::wave_trace_emit(format!(
-                    "[wave-trace] t={}us gate missing={missing} executing={executing} candidate={} in_flight={} awaited={} lanes={}",
-                    super::worker::wave_trace_us(),
-                    self.have_seal_candidate(),
-                    self.in_flight_lanes.len(),
-                    self.lanes.values().filter(|lane| lane.awaited).count(),
-                    self.lanes.len()
-                ));
-            }
+            tracing::debug!(
+                "gate missing={missing} executing={executing} candidate={} in_flight={} awaited={} lanes={}",
+                self.have_seal_candidate(),
+                self.in_flight_lanes.len(),
+                self.lanes.values().filter(|lane| lane.awaited).count(),
+                self.lanes.len(),
+            );
             if missing > 0
                 && missing_decoders == 0
                 && !self.has_pending_binds()
@@ -1755,7 +1627,6 @@ ready_age_newest={}us",
                 return FramePlan::Hold(hold);
             }
             self.strict_watchdog_deadline = None;
-            self.idle_dumped = false;
             self.quiesce_mark = None;
             if !executing && self.is_joining() && self.have_seal_candidate() {
                 let until = *self
