@@ -55,6 +55,17 @@ struct Synthetic {
     window: Vec<u32>,
     held: Option<u32>,
     media: Option<SyntheticMedia>,
+    voxels: Option<SyntheticVoxels>,
+}
+
+/// A synthetic lane's voxel input, where its class reads one: a clip of one
+/// token patch and a zero payload at the input's width, so a composition
+/// over a voxel-reading class fires (and records) before ready like any
+/// other. What the clips fill is never read back.
+#[derive(Clone)]
+struct SyntheticVoxels {
+    clips: Vec<[u32; 3]>,
+    payload: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -583,6 +594,7 @@ impl Shell {
                         table
                     },
                     held: Some(0),
+                    voxels: self.synthetic_voxels(class),
                     media: media
                         .get(at)
                         .copied()
@@ -638,6 +650,24 @@ impl Shell {
                 lane
             })
             .collect()
+    }
+
+    /// The voxel input a synthetic lane of `class` feeds: `None` where its
+    /// class reads none or the load seats no voxel axis.
+    fn synthetic_voxels(&self, class: usize) -> Option<SyntheticVoxels> {
+        let seat = self.voxels.as_ref()?.seat();
+        let input = self
+            .feeds
+            .inputs
+            .iter()
+            .find(|(input, readers)| input.voxel() && readers.contains(class))
+            .map(|(input, _)| *input)?;
+        let patch = seat.token_patch.unwrap_or([1, 1, 1]).map(|p| p.max(1));
+        let voxels: u64 = patch.iter().map(|&p| u64::from(p)).product();
+        Some(SyntheticVoxels {
+            clips: vec![patch],
+            payload: vec![0u8; usize::try_from(voxels * input.row_bytes()).ok()?],
+        })
     }
 
     /// The class a lane of `class` lands in once it carries an adapter: the
@@ -752,10 +782,21 @@ impl Shell {
                 })
             })
             .collect();
+        let voxels: Vec<crate::voxels::Clips<'_>> = owned
+            .iter()
+            .enumerate()
+            .filter_map(|(at, lane)| {
+                lane.voxels.as_ref().map(|shot| crate::voxels::Clips {
+                    lane: at as u32,
+                    clips: &shot.clips,
+                    payload: &shot.payload,
+                })
+            })
+            .collect();
 
         self.arming = true;
         self.golden_arm = arm;
-        let armed = self.fire_media(&seated, &[], &media);
+        let armed = self.fire_view(&seated, &media, &voxels);
         self.golden_arm = crate::serve::Golden::Off;
         self.arming = false;
         armed
