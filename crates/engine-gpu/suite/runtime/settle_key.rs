@@ -1,20 +1,30 @@
-//! A model's first boot, which times its curves and settles, and its next,
-//! which reads them back, name the same kernels and look the settle up by
-//! the same key: the second weighs nothing. (A load that times its curves
-//! once named a decode's split walk out on wgpu: the admitted decodes were
-//! dropped with the tuning the curves rebuilt, and the key moved.)
+//! A model's first boot, which times its curves and leaves its settle to
+//! weigh behind serving, and its next, which reads them back, name the same
+//! kernels and look the settle up by the same key: the second weighs
+//! nothing. (A load that times its curves once named a decode's split walk
+//! out on wgpu: the admitted decodes were dropped with the tuning the
+//! curves rebuilt, and the key moved.) The first boot is ready without
+//! settling and serves its fallback picks while the settle runs behind it;
+//! a settle point another lane's work overlaps is never stored.
 
-use super::outputs::{Outputs, loaded_boot};
+use ::engine::Engine as _;
+
+use super::outputs::{Outputs, loaded_boot, measure_behind};
 use crate::backend;
 
-#[test]
-fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
+fn profiles_at(tag: &str) -> std::path::PathBuf {
     let profiles = std::env::temp_dir().join(format!(
-        "pie-{}-settle-key-profiles-{}",
+        "pie-{}-{tag}-profiles-{}",
         backend::NAME,
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&profiles);
+    profiles
+}
+
+#[test]
+fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
+    let profiles = profiles_at("settle-key");
     let boot = || backend::DeviceBoot {
         profiles: Some(profiles.clone()),
         ..crate::gpu::device_boot()
@@ -22,7 +32,7 @@ fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
     let read = |loaded: &mut super::outputs::Loaded| {
         let shell = loaded.engine.loaded_mut().expect("loaded");
         (
-            shell.settle_keyed().expect("the settle ran"),
+            shell.settle_keyed().expect("the settle's key was read"),
             shell.asked_kernels(),
             shell.settled().iter().any(|range| range.checked),
         )
@@ -30,11 +40,24 @@ fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
     let Some(mut first) = loaded_boot("settle-key", &Outputs, 4, boot()) else {
         return;
     };
-    let (key, kernels, weighed) = read(&mut first);
+    let (key, kernels, weighed_at_load) = read(&mut first);
+    assert!(!weighed_at_load, "a boot weighs nothing before ready");
+    assert!(first.engine.measures_behind(), "the settle is left behind serving");
+    let shell = first.engine.loaded_mut().expect("loaded");
+    let rows: Vec<u32> = shell.settled().iter().map(|r| r.top).chain([1, 2, 4]).collect();
+    let served: Vec<_> = rows.iter().map(|&r| shell.dense_tactics_at(r)).collect();
+    assert!(measure_behind(&mut first.engine) > 0, "the settle ran behind serving");
+    let shell = first.engine.loaded_mut().expect("loaded");
+    assert!(
+        shell.settled().iter().any(|range| range.checked),
+        "the settle weighed its ranges behind serving"
+    );
+    let after: Vec<_> = rows.iter().map(|&r| shell.dense_tactics_at(r)).collect();
+    assert_eq!(after, served, "the settle behind serving changes nothing this load serves");
     drop(first);
-    assert!(weighed, "the first boot settles");
     let mut second = loaded_boot("settle-key", &Outputs, 4, boot()).expect("the device opened once");
     let (again, kernels_again, weighed_again) = read(&mut second);
+    let pending = second.engine.measures_behind();
     drop(second);
     let _ = std::fs::remove_dir_all(&profiles);
     assert_eq!(
@@ -43,4 +66,61 @@ fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
     );
     assert_eq!(again, key, "one settle key");
     assert!(!weighed_again, "the stored settle is taken: nothing weighed again");
+    assert!(!pending, "the next boot reads the stored settle: nothing left behind serving");
+}
+
+/// Every timed settle point overlapped by another lane's submission (the
+/// runtime's count moves while it runs) is discarded: none is stored, and
+/// the settle stays pending.
+#[test]
+fn a_settle_point_overlapped_by_a_fire_is_not_stored() {
+    let profiles = profiles_at("settle-overlap");
+    let boot = || backend::DeviceBoot {
+        profiles: Some(profiles.clone()),
+        ..crate::gpu::device_boot()
+    };
+    let Some(mut loaded) = loaded_boot("settle-overlap", &Outputs, 4, boot()) else {
+        return;
+    };
+    let submitted = std::cell::Cell::new(0u64);
+    // Another lane submits at every read: each point sees the count move.
+    let busy = || {
+        submitted.set(submitted.get() + 1);
+        submitted.get()
+    };
+    let mut slices = 0;
+    while slices < 64 && loaded.engine.measure_behind(&busy).expect("measuring behind") {
+        slices += 1;
+    }
+    let shell = loaded.engine.loaded_mut().expect("loaded");
+    assert!(
+        shell.settled().iter().all(|range| !range.checked),
+        "no range was weighed from overlapped points: {:?}",
+        shell.settled()
+    );
+    let (_, _, discarded) = shell.behind_status().expect("the settle is still pending");
+    assert!(discarded > 0, "the overlapped points were discarded");
+    drop(loaded);
+    let stored = std::fs::read_dir(&profiles).is_ok()
+        && walk(&profiles)
+            .iter()
+            .any(|text| text.contains("dense_settled_keyed"));
+    let _ = std::fs::remove_dir_all(&profiles);
+    assert!(!stored, "no settle was stored from overlapped points");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = vec![dir.to_path_buf()];
+    while let Some(d) = at.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                at.push(path);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                out.push(text);
+            }
+        }
+    }
+    out
 }

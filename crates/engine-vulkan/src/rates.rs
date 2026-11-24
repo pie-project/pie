@@ -71,7 +71,10 @@ pub fn at_load(
         Some(device.left()),
         max_submit,
         measuring,
-        |max_submit| measure(device, &tuning, max_submit, &stated).map_err(|e| e.to_string()),
+        // A stale key's figure serves; the engine times it again behind
+        // serving (`engine_gpu::serve::Shell::measure_behind`).
+        true,
+        |max_submit, stated| measure(device, &tuning, max_submit, stated).map_err(|e| e.to_string()),
     )
     .map_err(|why| engine_gpu::error::Fault::Device {
         call: "rates at load",

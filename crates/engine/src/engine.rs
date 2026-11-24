@@ -668,6 +668,28 @@ pub trait Engine: Send {
         false
     }
 
+    /// Whether the load left measuring to run behind serving
+    /// ([`Engine::measure_behind`]): a dense settle no stored or committed
+    /// entry of its key decided. The default: none.
+    fn measures_behind(&self) -> bool {
+        false
+    }
+
+    /// One slice of the measuring the load left behind serving, at most
+    /// one fire. The engine's lane calls it only where it would otherwise
+    /// sleep (no fire or call waits, nothing landing is owed) and only while
+    /// the runtime holds no slot of the engine's pool, so the engine may
+    /// fire on its seat-addressed chunks. Nothing it does changes what the
+    /// load serves, records or builds; what it decides is stored for the
+    /// next load. `others` reads the runtime's count of every lane's
+    /// submissions: a timed point it sees move ran beside other work and is
+    /// discarded, never stored. Whether it fired (`false`: nothing left, or
+    /// nothing it can fire now).
+    fn measure_behind(&mut self, others: &dyn Fn() -> u64) -> Result<bool> {
+        let _ = others;
+        Ok(false)
+    }
+
     /// Where a step's outcome goes. An engine that settles asynchronously
     /// answers every step here. One that settles inside
     /// [`Engine::submit`] tells here, before `submit` returns, each step

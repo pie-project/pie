@@ -1124,6 +1124,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         }
     }
     active_guard.disarm();
+    // Ready: what an engine left to measure behind serving runs from here,
+    // where its lane idles.
+    crate::scheduler::open_behind();
     Ok(BootstrapHandle {
         port: bound_port,
         shutdown: Some(RuntimeShutdown {

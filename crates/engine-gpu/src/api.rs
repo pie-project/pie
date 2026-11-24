@@ -275,6 +275,67 @@ pub struct Gpu<B: Host> {
 }
 
 impl<B: Host> Gpu<B> {
+    /// One slice behind serving of a `[rates]` key the load serves by a
+    /// figure stored under a stale key (`profile::fire::Tuned::behind`):
+    /// the rates step timing that key alone, over the rates the load
+    /// serves by. Taken only where it had the device alone at a steady
+    /// clock (the device idle as it starts, no other lane submitting while
+    /// it runs, the step's own clock check not refusing it): stored for the
+    /// next load; else discarded and timed again in a later slice. This
+    /// load serves on by the stale figure.
+    fn rate_behind(&mut self, others: &dyn Fn() -> u64) -> EngineResult<bool> {
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        let Some(key) = shell.rates_behind() else {
+            return Ok(false);
+        };
+        if !crate::backend::Context::idle(shell.device()) {
+            return Ok(false);
+        }
+        let mut stated = {
+            use crate::backend::Tactics as _;
+            shell.tuning().profile().rates()
+        };
+        stated.unstate(&key);
+        let submitted = others();
+        let began = std::time::Instant::now();
+        let measured = B::measure_rates(
+            shell.device(),
+            shell.tuning(),
+            B::submit_bound(&self.boot),
+            &stated,
+        )
+        .map_err(fault)?;
+        let ms = began.elapsed().as_secs_f64() * 1e3;
+        let why = if others() != submitted {
+            Some("another lane submitted while it ran".to_string())
+        } else {
+            measured.throttled.map(|ratio| {
+                format!("the device's clock {ratio:.2}x slower at its end than its warmed start")
+            })
+        };
+        if let Some(why) = why {
+            tracing::info!(
+                key = %key,
+                ms,
+                "rates behind serving: `[rates] {key}` discarded ({why}); timed again later"
+            );
+            return Ok(true);
+        }
+        if let Err(why) = B::save_rates(shell.device(), &self.boot, &measured.rates) {
+            tracing::warn!(%why, key = %key, "rates behind serving: not kept in the profile");
+        }
+        let left = shell.rate_timed(&key);
+        tracing::info!(
+            key = %key,
+            ms,
+            left,
+            "rates behind serving: `[rates] {key}` timed and stored for the next load (this load \
+             serves on by its stale figure); {left} left"
+        );
+        Ok(true)
+    }
     /// `step` held to the platform's bound on one submission, where the
     /// load states one (`crate::submit`): the shell told to walk it a layer
     /// at a time where it is past the bound whole, and its lanes' refusal,
@@ -1029,28 +1090,18 @@ where
         shell
             .seat_disk_kv(disk_kv_budget, disk_kv_dir.as_deref())
             .map_err(fault)?;
-        // The dense kernel at each rung settled on the served step, once the
-        // load is whole (its programs placed, its kv seated); what a newly
-        // taken kernel binds is built by a second bind walk, and what either
-        // walked is the load's.
+        // The dense kernel at each rung as a stored or committed settle of
+        // the load's key decided it, else the nearest settle's or the
+        // curves': nothing fires before ready; what no settle decided is
+        // weighed behind serving (`Engine::measure_behind`) and stored for
+        // the next load. What a newly taken kernel binds is built by a
+        // second bind walk, and what it walked is the load's.
         let settling = std::time::Instant::now();
         shell.settle_dense().map_err(fault)?;
         tracing::info!(
             settle_ms = settling.elapsed().as_millis() as u64,
-            "load phases: the dense settle (after the shell stood; nothing fired where a stored \
-             or committed settle's key matched, or under measure = false)"
+            "load phases: the dense settle's picks (nothing fires before ready)"
         );
-        // The settle this load ran, kept in the user's profile for a later
-        // load of the same curves, model, rungs and build.
-        if let Some(settled) = shell.take_settled() {
-            let rates = profile::fire::Rates {
-                dense_settled: vec![settled],
-                ..profile::fire::Rates::default()
-            };
-            if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
-                tracing::warn!(%why, "the dense settle was not kept in the profile");
-            }
-        }
         shell.walk_binds().map_err(fault)?;
         shell.unkept_serving();
         shell.bound_serving();
@@ -1607,6 +1658,40 @@ where
 
     fn settles_asynchronously(&self) -> bool {
         B::settles_asynchronously(self)
+    }
+
+    fn measures_behind(&self) -> bool {
+        self.shell
+            .as_ref()
+            .is_some_and(|shell| shell.measures_behind() || shell.rates_behind().is_some())
+    }
+
+    fn measure_behind(&mut self, others: &dyn Fn() -> u64) -> EngineResult<bool> {
+        // A frame whose numbers are not yet taken holds its readout seats.
+        if self.pending.is_some() {
+            return Ok(false);
+        }
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(false);
+        };
+        // The settle's ranges first (decode's rows before the large ones),
+        // then each rate served by a stale figure.
+        if !shell.measures_behind() {
+            return self.rate_behind(others);
+        }
+        let fired = shell.measure_behind(others).map_err(fault)?;
+        // What the settle decided so far, kept in the user's profile for
+        // the next load of the same curves, model, rungs and build.
+        if let Some(settled) = shell.take_settled() {
+            let rates = profile::fire::Rates {
+                dense_settled: vec![settled],
+                ..profile::fire::Rates::default()
+            };
+            if let Err(why) = B::save_rates(shell.device(), &self.boot, &rates) {
+                tracing::warn!(%why, "the dense settle was not kept in the profile");
+            }
+        }
+        Ok(fired)
     }
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {
