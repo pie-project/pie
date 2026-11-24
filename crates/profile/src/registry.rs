@@ -1260,7 +1260,7 @@ impl<'a> Walk<'a> {
                                 .to_string(),
                         ),
                     }
-                    continue;
+                    return;
                 }
                 crate::fire::KERNEL_CURVES => {
                     rates.kernel_tflops_by_shape = self.kernel_curves(v);
@@ -1320,7 +1320,7 @@ impl<'a> Walk<'a> {
                             ),
                         ),
                     }
-                    continue;
+                    return;
                 }
                 "launch_ns" => {
                     match int(v.get_ref()).and_then(|i| u64::try_from(i).ok()) {
