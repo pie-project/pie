@@ -967,9 +967,11 @@ pub struct SharedPool {
     /// engine holds [`Self::told`], so that rung's activation stays set
     /// aside, no raise is taken past it and no cap is lifted.
     lowering: Option<u32>,
-    /// The engine refused the last `commit_span`: no span segment is asked
-    /// again until room is freed ([`Self::block_span_commit`]).
-    span_commit_blocked: bool,
+    /// The engine refused the last commit (a prefix segment's or the
+    /// span's) while the governor's target stood at this many segments: no
+    /// commit is asked again until something that can change the device's
+    /// answer happens ([`Self::block_commit`]).
+    commit_blocked: Option<u32>,
     /// The head of the guest binds waiting for room, its need as `(run,
     /// pieces)`: runs of `run` adjacent chunks inside one segment. The walk
     /// commits while they do not stand free ([`Self::walk_goal`]), not only
@@ -1272,7 +1274,7 @@ impl SharedPool {
             told: 0,
             told_from: None,
             lowering: None,
-            span_commit_blocked: false,
+            commit_blocked: None,
             guest_head: None,
             compact_for: None,
             compaction_answered: false,
@@ -2805,18 +2807,16 @@ impl SharedPool {
     /// prefix whole, the span the rung lends is backed next (span lending,
     /// [`SlotPool::span_lent`]), for a waiter short of live state as
     /// for the target alone: a fire whose rung needs it takes it back
-    /// first. Not while a refused commit waits for room to be freed.
+    /// first. Neither while a refused commit waits for an event that can
+    /// change the device's answer ([`Self::block_commit`]).
     #[must_use]
     pub fn grow_step(&self, goal: u32) -> Option<GrowStep> {
-        if self.mapped_segments() >= goal {
+        if self.mapped_segments() >= goal || self.commit_blocked.is_some() {
             return None;
         }
         let prefix = self.pool.prefix_segments();
         if prefix < self.pool.top_segment() && self.pool.backs(prefix) {
             return Some(GrowStep::Commit { prefix: prefix + 1 });
-        }
-        if self.span_commit_blocked() {
-            return None;
         }
         let n = self.pool.span_to_commit()?;
         Some(GrowStep::CommitSpan { n })
@@ -2877,11 +2877,24 @@ impl SharedPool {
         self.pool.undo_evacuation(evacuation);
     }
 
-    /// A `commit_span` was refused (`true`): none is asked again until room
-    /// is freed, which lifts it (`false`), the one event that can change the
-    /// answer.
-    pub fn block_span_commit(&mut self, blocked: bool) {
-        self.span_commit_blocked = blocked;
+    /// The engine refused a commit (a prefix segment's or the span's) with
+    /// the governor's target at `target` segments: none is asked again
+    /// until an event that can change what the device backs lifts it
+    /// ([`Self::lift_commit`]): the governor's target moving off `target`
+    /// (a fresh read of the system's memory), or device memory the engine
+    /// gave back landing (a release, a lowered rung's carve). Room freed
+    /// inside the pool (an eviction, a fire retired) and a governor tick
+    /// that leaves the target where it stood do not: they change nothing
+    /// the device backs, and re-asking on them spins the walk against the
+    /// same refusal.
+    pub fn block_commit(&mut self, target: u32) {
+        self.commit_blocked = Some(target);
+    }
+
+    /// An event that can change the device's answer to a refused commit
+    /// happened: the walk may ask again ([`Self::block_commit`]).
+    pub fn lift_commit(&mut self) {
+        self.commit_blocked = None;
     }
 
     /// The head guest bind's need, `(run, pieces)`; `None` where none waits
@@ -2952,10 +2965,12 @@ impl SharedPool {
         planner || self.guest_head.is_some()
     }
 
-    /// Whether a refused `commit_span` waits for room to be freed.
+    /// The governor's target a refused commit was refused at, while it
+    /// waits for an event that can change the device's answer
+    /// ([`Self::block_commit`]).
     #[must_use]
-    pub fn span_commit_blocked(&self) -> bool {
-        self.span_commit_blocked
+    pub fn commit_blocked(&self) -> Option<u32> {
+        self.commit_blocked
     }
 
     /// The engine backed the top `n` span segments: the chunks of theirs the

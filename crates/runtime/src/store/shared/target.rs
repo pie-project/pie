@@ -380,6 +380,9 @@ impl SharedGrow {
                         let mut pool = self.shared.lock().unwrap();
                         match landed {
                             Ok(()) => {
+                                // The carve above the rung given back: a
+                                // refused commit may be backed now.
+                                pool.lift_commit();
                                 if let Err(error) = pool.lower_landed(rung) {
                                     tracing::warn!(engine = self.engine, %error, "the activation rung stays");
                                 }
@@ -593,10 +596,11 @@ impl SharedGrow {
     }
 
     /// Room was freed (a fire retired, a slot let go): a raise refused for
-    /// room may be tried again, and the walk looks now.
+    /// room may be tried again, and the walk looks now. A refused commit
+    /// stays refused: room inside the pool changes nothing the device backs
+    /// ([`SharedPool::block_commit`]).
     pub fn room_freed(&self) {
         self.raise_blocked.store(false, Ordering::Release);
-        self.shared.lock().unwrap().block_span_commit(false);
         self.wake.notify_one();
     }
 
@@ -807,6 +811,7 @@ impl SharedGrow {
                 PoolOp::CommitSpan(n) => Some(*n),
                 _ => None,
             };
+            let gives_back = matches!(op, PoolOp::ReleaseSegments(_) | PoolOp::ReleaseSpan(_));
             let moved = matches!(op, PoolOp::Evacuate(_)).then(|| {
                 if compacting.is_some() { "a compaction" } else { "a segment's evacuation" }
             });
@@ -816,6 +821,11 @@ impl SharedGrow {
             };
             match landed {
                 Ok(()) => {
+                    // Device memory given back: a refused commit may be
+                    // backed now.
+                    if gives_back {
+                        self.shared.lock().unwrap().lift_commit();
+                    }
                     // A segment mapped: what was promised a waiter is
                     // kept, and `pages_freed` wakes the planner.
                     if commit.is_some() || span.is_some() {
@@ -844,10 +854,12 @@ impl SharedGrow {
                     if commit.is_some() || span.is_some() {
                         self.refused.store(true, Ordering::Release);
                     }
-                    // A refused lend is not asked again on the next wake,
-                    // only once room is freed.
-                    if span.is_some() {
-                        self.shared.lock().unwrap().block_span_commit(true);
+                    // A refused commit is not asked again on the next wake,
+                    // only on an event that can change the device's answer
+                    // (`SharedPool::block_commit`).
+                    if commit.is_some() || span.is_some() {
+                        let target = self.target.load(Ordering::Acquire);
+                        self.shared.lock().unwrap().block_commit(target);
                     }
                     // A refused evacuation copied nothing: the pool takes it
                     // back, and what the segment holds has no room to go to
@@ -951,10 +963,17 @@ impl PoolTarget for SharedGrow {
     /// idle cache for the difference.
     fn retarget(&mut self, segments: u64) -> Retarget {
         let could = self.shared.lock().unwrap().commit_can_come();
-        self.target.store(
-            u32::try_from(segments).unwrap_or(u32::MAX),
-            Ordering::Release,
-        );
+        let target = u32::try_from(segments).unwrap_or(u32::MAX);
+        self.target.store(target, Ordering::Release);
+        // The target moved off the one a commit was refused at: a fresh
+        // read of the system's memory, which may back it now. A tick that
+        // leaves it where it stood asks nothing again.
+        {
+            let mut pool = self.shared.lock().unwrap();
+            if pool.commit_blocked().is_some_and(|at| at != target) {
+                pool.lift_commit();
+            }
+        }
         self.wake.notify_one();
         // Risen past what the pool maps: room the target held back can come.
         // A head that waits on it (short of room no move makes) has no
@@ -979,7 +998,9 @@ impl PoolTarget for SharedGrow {
         self.refused.swap(false, Ordering::AcqRel)
     }
 
-    /// A governor tick: the walk looks again.
+    /// A governor tick: the walk looks again. A refused commit stays
+    /// refused ([`SharedPool::block_commit`]): a tick is no event of the
+    /// device's.
     fn ticked(&mut self) {
         self.wake.notify_one();
     }
@@ -1543,5 +1564,89 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(shared.lock().unwrap().rung(), 2048, "woken: it raises");
+    }
+
+    /// Mac's spin (Metal, the grow-time check refusing a prefix commit,
+    /// about 1,000 asks a minute): a refused commit is asked again on no
+    /// wake that cannot change what the device backs (room freed inside the
+    /// pool, a governor tick, a retarget to the target it was refused at)
+    /// and on no clock, its own walk loop running: only once the governor's
+    /// target moves, or device memory the engine gave back lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_commit_is_asked_again_only_on_an_event_of_the_device_s() {
+        const ENGINE: usize = 9402;
+        let mut pool = super::super::tests::pool();
+        // A waiter short of room: the walk's goal is past what is mapped.
+        pool.pool_mut().wait(1, 0, 1024);
+        let mapped = pool.mapped_segments();
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        let asks = Arc::new(AtomicU32::new(0));
+        let released = Arc::new(AtomicU32::new(0));
+        let (counted, gave) = (asks.clone(), released.clone());
+        let mut grow = SharedGrow::new(0, ENGINE, shared.clone()).with_lane(move |op| match op {
+            PoolOp::CommitSegments(_) | PoolOp::CommitSpan(_) => {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::anyhow!("the device backs no more"))
+            }
+            PoolOp::ReleaseSegments(_) | PoolOp::ReleaseSpan(_) => {
+                gave.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Ok(()),
+        });
+        let asked = || asks.load(Ordering::Relaxed);
+        let up = mapped + 2;
+        let _ = grow.retarget(u64::from(up));
+        grow.walk().await;
+        assert_eq!(asked(), 1, "asked once, and refused");
+        assert_eq!(shared.lock().unwrap().commit_blocked(), Some(up));
+        assert!(!grow.can_grow(), "a waiter is not told the pool grows");
+        assert!(!grow.promise_grow(), "nor promised a grow");
+
+        // Nothing the device backs changed: not asked again.
+        for _ in 0..64 {
+            grow.room_freed();
+            grow.walk().await;
+            grow.ticked();
+            grow.walk().await;
+            let _ = grow.retarget(u64::from(up));
+            grow.walk().await;
+        }
+        assert_eq!(asked(), 1, "no wake inside the pool asks the device again");
+        // Its own loop, woken by every one of them, asks nothing either.
+        grow.start();
+        for _ in 0..64 {
+            grow.room_freed();
+            grow.ticked();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(asked(), 1, "the walk's loop neither spins nor retries");
+
+        // The governor's target moved (a fresh read of the system): asked.
+        let _ = grow.retarget(u64::from(up + 1));
+        grow.walk().await;
+        assert!(asked() >= 2, "the target moved: asked again");
+        let after_move = asked();
+        assert_eq!(shared.lock().unwrap().commit_blocked(), Some(up + 1));
+
+        // Device memory given back lands, the target where it stood: the
+        // refused commit may be backed now.
+        {
+            let mut pool = shared.lock().unwrap();
+            pool.lift_commit();
+            let prefix = pool.pool().prefix_segments();
+            pool.committed(prefix + 2);
+        }
+        let high = shared.lock().unwrap().mapped_segments();
+        let _ = grow.retarget(u64::from(high - 1));
+        shared.lock().unwrap().block_commit(high - 1);
+        grow.walk().await;
+        assert!(released.load(Ordering::Relaxed) > 0, "a segment was given back");
+        assert_eq!(
+            shared.lock().unwrap().commit_blocked(),
+            None,
+            "device memory back: the refusal is lifted"
+        );
+        assert_eq!(asked(), after_move, "and nothing past the target is asked");
     }
 }
