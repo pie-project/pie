@@ -626,7 +626,7 @@ impl Sink<'_> {
                     "bake"
                 );
             }
-            self.frame.bake(&(
+            self.frame.bake_named(fire.entrypoint, &(
                 key,
                 &scratch.baked,
                 fired.map(|(place, _)| place),
