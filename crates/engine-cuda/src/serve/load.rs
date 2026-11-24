@@ -98,8 +98,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // lacks, measured once it has armed (`Staged::finish`).
     let products = chip.rates().product_ns.clone().unwrap_or_default();
     // The product times stored under a stale key (a kernel's code changed)
-    // answer what the matching ones lack: a fair estimate, served while
-    // the load times them again behind serving (`Shell::queue_behind`).
+    // answer what the matching ones lack: a fair estimate, served (and said,
+    // `Shell::queue_behind`) until `pie tune` or a re-export times them
+    // again; never timed before ready.
     let estimates = chip
         .rates()
         .stale

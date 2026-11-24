@@ -172,7 +172,7 @@ fn ensure_by(
         Some(room),
         None,
         measuring,
-        // A stale key's figure serves; the engine times it again behind
+        // A stale roofline key's figure serves; the engine times it again behind
         // serving (`Shell::measure_behind`).
         true,
         |_max_submit, _| {
@@ -354,6 +354,11 @@ pub fn measure(
     }
 }
 
+/// What a rates step behind serving fails with where a request arrived
+/// before one of its timings ([`measure_behind`]): it is abandoned there,
+/// the request waiting at most one burst, and timed again later.
+pub const YIELDED: &str = "yielded to an arriving request";
+
 /// One `[rates]` key timed behind serving: its figure, keyed by this
 /// build, and where the device's clock moved under it (its warm-up matmul
 /// read warmed before and again after, `engine::rates::clock_moved`), by
@@ -366,7 +371,9 @@ pub struct KeyTimed {
 /// `key` (of [`KEYS`]) of the device `device` serves on, timed on its
 /// stream through a context of slabs of its own
 /// (`crate::device::Context::apart`), so nothing serving launches through
-/// changes; the launch's cost taken off it as `launch_ns` states it. The
+/// changes; the launch's cost taken off it as `launch_ns` states it.
+/// `arrived` is read before every timed burst: once a request has arrived
+/// the step stops there, failing with [`YIELDED`]. The
 /// step's buffers are its own, laid where the device's free memory holds
 /// them (else refused by name), and given back to the driver after.
 pub fn measure_behind(
@@ -374,6 +381,7 @@ pub fn measure_behind(
     keys: &crate::stored::Keys,
     key: &str,
     launch_ns: Option<u64>,
+    arrived: &dyn Fn() -> bool,
 ) -> Result<KeyTimed, String> {
     #[cfg(feature = "device")]
     {
@@ -388,7 +396,7 @@ pub fn measure_behind(
             ));
         }
         let (ctx, slabs) = device.apart();
-        let measured = on_device::measure_on(device, &ctx, &[key], launch_ns, true);
+        let measured = on_device::measure_on(device, &ctx, &[key], launch_ns, true, arrived);
         // SAFETY: the step synchronized its stream before it returned (or
         // faulted out of it), and nothing launches through `ctx` again.
         #[allow(unsafe_code)]
@@ -405,73 +413,8 @@ pub fn measure_behind(
     }
     #[cfg(not(feature = "device"))]
     {
-        let _ = (device, keys, key, launch_ns);
+        let _ = (device, keys, key, launch_ns, arrived);
         Err(crate::error::Fault::Runtimeless.to_string())
-    }
-}
-
-/// One decode product point timed behind serving ([`time_product`]): the
-/// median ns of one dispatch over [`PRODUCT_ROUNDS`] rounds and their
-/// interquartile spread, between two reads of the same dispatch's clock.
-pub struct ProductTimed {
-    pub ns: f64,
-    pub spread: f64,
-    pub before: engine::rates::ClockRead,
-    pub after: engine::rates::ClockRead,
-}
-
-/// Why a product point was not timed to its end.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Unfinished {
-    /// A request arrived between two of its dispatches: the point is
-    /// abandoned and timed again later.
-    Yielded,
-    /// The device refused a dispatch, by name.
-    Fault(String),
-}
-
-/// Rounds a product point is timed in behind serving: the median kept,
-/// the interquartile range its spread.
-pub const PRODUCT_ROUNDS: usize = 5;
-
-/// Dispatches a round (and a clock read) of a product point.
-pub const PRODUCT_FIRES: usize = 10;
-
-/// `shape`'s product on `kernel` (a candidate's code), timed behind
-/// serving by launching it directly: one eager dispatch at a time on the
-/// device's stream, each timed by events, through a context of slabs of
-/// its own (`crate::device::Context::apart`) whose product table forces
-/// `kernel` for the bank (`Routes::forcing` over `served`). It reads the
-/// served weight at `weight` and lays its own activation and output.
-/// Nothing serving records or launches through changes. `arrived` is read
-/// before every dispatch: a request that arrived abandons the point
-/// ([`Unfinished::Yielded`]), so it waits at most one dispatch.
-pub fn time_product(
-    device: &crate::device::Context,
-    served: &kernels_cuda::linear::routes::Routes,
-    shape: kernels_cuda::linear::routes::Shape,
-    kernel: u32,
-    weight: u64,
-    arrived: &dyn Fn() -> bool,
-) -> Result<ProductTimed, Unfinished> {
-    #[cfg(feature = "device")]
-    {
-        let (mut ctx, slabs) = device.apart();
-        let timed = on_device::time_product(device, &mut ctx, served, shape, kernel, weight, arrived);
-        // SAFETY: the dispatches were waited on (each timing waits on its
-        // stop event, a fault synchronizes below), and nothing launches
-        // through `ctx` again.
-        #[allow(unsafe_code)]
-        unsafe {
-            let _ = crate::device::ctx::sync(device.stream());
-            slabs.release();
-        }
-        timed
-    }
-    #[cfg(not(feature = "device"))]
-    {
-        let _ = (device, served, shape, kernel, weight, arrived);
-        Err(Unfinished::Fault(crate::error::Fault::Runtimeless.to_string()))
     }
 }
 
@@ -526,105 +469,22 @@ mod on_device {
 
     type Kernel = kernels_cuda::Error;
 
-    /// [`super::time_product`] on `ctx`.
-    pub(super) fn time_product(
-        device: &Context,
-        ctx: &mut Ctx,
-        served: &kernels_cuda::linear::routes::Routes,
-        shape: kernels_cuda::linear::routes::Shape,
-        kernel: u32,
-        weight: u64,
-        arrived: &dyn Fn() -> bool,
-    ) -> Result<ProductTimed, Unfinished> {
-        let fault = |e: String| Unfinished::Fault(e);
-        let (m, n, k) = (shape.m, shape.rows, shape.k);
-        let stream = device.stream();
-        let clock = Clock::new(stream).map_err(fault)?;
-        let random = Random::new(stream).map_err(fault)?;
-        let act = random.operand(m as usize * k as usize * 2).map_err(fault)?;
-        let y = zeroed(m as usize * n as usize * 2).map_err(fault)?;
-        let fire = |ctx: &Ctx| {
-            kernels_cuda::linear::gemm::matmul(
-                ctx,
-                Tensor::new(act.ptr(), m, k, Dtype::Bf16),
-                Tensor::new(weight, n, k, Dtype::Bf16),
-                &mut Tensor::new(y.ptr(), m, n, Dtype::Bf16),
-            )
-        };
-        ctx.set_routes(std::sync::Arc::new(served.forcing(shape, kernel)));
-        let mut held = Vec::new();
-        lay(&mut held, || fire(ctx)).map_err(fault)?;
-        let timed = timed_dispatches(&*ctx, &clock, &fire, arrived);
-        // A forced library pick is laid process-wide for its shape: the
-        // served table's pick laid back by a walk that launches nothing.
-        ctx.set_routes(std::sync::Arc::new(served.with(&[])));
-        crate::sizing::begin();
-        let _ = fire(ctx);
-        let _ = crate::sizing::end();
-        timed
-    }
-
-    /// A product point's dispatches through `ctx`, each `fire` timed on
-    /// `clock`: its clock read warmed, [`PRODUCT_ROUNDS`] rounds, its clock
-    /// read again; abandoned before any dispatch once `arrived`.
-    fn timed_dispatches(
-        ctx: &Ctx,
-        clock: &Clock,
-        fire: &dyn Fn(&Ctx) -> Result<(), Kernel>,
-        arrived: &dyn Fn() -> bool,
-    ) -> Result<ProductTimed, Unfinished> {
-        // One dispatch, the unit: none starts once a request has arrived.
-        let dispatch = || -> Result<f64, Unfinished> {
-            if arrived() {
-                return Err(Unfinished::Yielded);
-            }
-            clock
-                .time(&mut || fire(ctx).map_err(say("the product")))
-                .map_err(Unfinished::Fault)
-        };
-        let read = || -> Result<engine::rates::ClockRead, Unfinished> {
-            let fires = (0..PRODUCT_FIRES)
-                .map(|_| dispatch())
-                .collect::<Result<Vec<f64>, Unfinished>>()?;
-            let fastest = fires.iter().copied().fold(f64::INFINITY, f64::min);
-            let slowest = fires.iter().copied().fold(0.0, f64::max);
-            Ok(engine::rates::ClockRead {
-                fastest_ns: fastest,
-                spread: (slowest - fastest) / fastest.max(f64::MIN_POSITIVE),
-            })
-        };
-        let before = engine::rates::warmed(read)?;
-        let mut rounds = Vec::with_capacity(PRODUCT_ROUNDS);
-        for _ in 0..PRODUCT_ROUNDS {
-            let mut sum = 0.0;
-            for _ in 0..PRODUCT_FIRES {
-                sum += dispatch()?;
-            }
-            rounds.push(sum / PRODUCT_FIRES as f64);
-        }
-        let after = read()?;
-        rounds.sort_by(f64::total_cmp);
-        Ok(ProductTimed {
-            ns: rounds[PRODUCT_ROUNDS / 2],
-            spread: rounds[3 * PRODUCT_ROUNDS / 4] - rounds[PRODUCT_ROUNDS / 4],
-            before,
-            after,
-        })
-    }
-
     fn say<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> String {
         move |e| format!("rates: {what}: {e}")
     }
 
     /// Two events on a stream, timing the work between them.
-    struct Clock {
+    struct Clock<'a> {
         start: rt::cudaEvent_t,
         stop: rt::cudaEvent_t,
         stream: *mut c_void,
+        /// Read before every timing: once it answers true, no timing
+        /// starts, the step is abandoned ([`super::YIELDED`]).
+        arrived: &'a dyn Fn() -> bool,
     }
 
-    impl Clock {
-        fn new(stream: *mut c_void) -> Result<Clock, String> {
+    impl<'a> Clock<'a> {
+        fn new(stream: *mut c_void, arrived: &'a dyn Fn() -> bool) -> Result<Clock<'a>, String> {
             let mut start: rt::cudaEvent_t = core::ptr::null_mut();
             let mut stop: rt::cudaEvent_t = core::ptr::null_mut();
             // SAFETY: live out-parameters; this thread bound the device.
@@ -638,11 +498,15 @@ mod on_device {
                 start,
                 stop,
                 stream,
+                arrived,
             })
         }
 
         /// The ns `work` takes on the stream.
         fn time(&self, work: &mut dyn FnMut() -> Result<(), String>) -> Result<f64, String> {
+            if (self.arrived)() {
+                return Err(super::YIELDED.to_string());
+            }
             let mut ms = 0f32;
             // SAFETY: the events are this clock's, the stream the context's.
             unsafe {
@@ -715,7 +579,7 @@ mod on_device {
         }
     }
 
-    impl Drop for Clock {
+    impl Drop for Clock<'_> {
         fn drop(&mut self) {
             // SAFETY: created by `new`, destroyed once, after the last sync.
             unsafe {
@@ -804,7 +668,7 @@ mod on_device {
     pub(super) fn measure(ordinal: i32, chip: &profile::Profile) -> Result<Measured, String> {
         let mut device = Context::bind(ordinal, None).map_err(say("the device"))?;
         device.set_tuning(kernels_cuda::tuning::Tuning::of(chip));
-        measure_on(&device, device.ctx(), &KEYS, None, false).map(|(measured, _)| measured)
+        measure_on(&device, device.ctx(), &KEYS, None, false, &|| false).map(|(measured, _)| measured)
     }
 
     /// The `wanted` rates of `device` (of [`KEYS`]), each launched through
@@ -818,10 +682,11 @@ mod on_device {
         wanted: &[&str],
         launch_ns: Option<u64>,
         clocked: bool,
+        arrived: &dyn Fn() -> bool,
     ) -> Result<(Measured, Option<(engine::rates::ClockRead, engine::rates::ClockRead)>), String> {
         let wants = |key: &str| wanted.contains(&key);
         let stream = device.stream();
-        let clock = Clock::new(stream)?;
+        let clock = Clock::new(stream, arrived)?;
         let mut held = Vec::new();
         let random = Random::new(stream)?;
         // The launch first: every rate below takes its dispatches' launches

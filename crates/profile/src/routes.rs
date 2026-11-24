@@ -68,8 +68,8 @@ pub struct Routes {
     /// while it times a body under each choice ([`Routes::forcing`]).
     forced: HashMap<(u32, u32, u32), u32>,
     /// The entries of `times` that are estimates: figures stored under a
-    /// stale key (`profile::fire::Rates::stale`), served until they are
-    /// timed again behind serving ([`Routes::estimating`]).
+    /// stale key (`profile::fire::Rates::stale`), served as they stand
+    /// ([`Routes::estimating`]).
     estimated: std::collections::HashSet<((u32, u32, u32), u32)>,
     /// The shapes [`Routes::pick`] answered by an estimate since the last
     /// call of [`Routes::behind`].
@@ -98,7 +98,7 @@ impl Routes {
     /// The table `measured` states, each entry it lacks answered by
     /// `estimates` (figures stored under a stale key): served as they
     /// stand, and noted where a pick reads one ([`Routes::behind`]) so the
-    /// load times it again behind serving.
+    /// load says which banks serve by them.
     #[must_use]
     pub fn estimating(
         measured: &[crate::fire::ProductTime],
@@ -112,14 +112,6 @@ impl Routes {
             }
         }
         routes
-    }
-
-    /// Whether `shape`'s time on `kernel` is measured under a matching key
-    /// (not an estimate, nor unstated).
-    #[must_use]
-    pub fn measured_at(&self, shape: Shape, kernel: u32) -> bool {
-        let at = ((shape.rows, shape.k, shape.m), kernel);
-        self.times.contains_key(&at) && !self.estimated.contains(&at)
     }
 
     /// How many entries of the table are estimates.
@@ -182,7 +174,7 @@ impl Routes {
         // Every candidate measured; or the bank has estimates (figures
         // stored under a stale key), which serve as they stand, a candidate
         // none states (its code changed) not taken, and the bank is noted
-        // to time again behind serving.
+        // as served by stale figures.
         if estimated {
             note(&self.behind, shape, weight, candidates);
         }
@@ -215,8 +207,8 @@ impl Routes {
     }
 
     /// The shapes [`Routes::pick`] answered by an estimate since the last
-    /// call, with their weights and candidates: what a load times again
-    /// behind serving. The notes are cleared.
+    /// call, with their weights and candidates: the banks a load serves by
+    /// stale figures. The notes are cleared.
     pub fn behind(&self) -> BTreeMap<Shape, Wanted> {
         std::mem::take(&mut *self.behind.lock().expect("routes lock poisoned"))
     }
@@ -336,7 +328,7 @@ mod tests {
     }
 
     /// A shape the measured table lacks is answered by its stale figures
-    /// (the same pick they made), noted to time again behind serving, not
+    /// (the same pick they made), noted as stale, not
     /// wanted before ready; once timed it is measured, no longer noted.
     #[test]
     fn a_stale_figure_answers_and_is_noted_behind() {
