@@ -46,6 +46,7 @@ seeded!(
 pub const COVERS: &[&str] = &[
     include_str!("../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"),
     include_str!("../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"),
+    include_str!("../profiles/adreno-tm-840.covers.json"),
 ];
 
 /// What a device no family file applies to runs.
