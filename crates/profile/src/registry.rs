@@ -1400,9 +1400,17 @@ impl<'a> Walk<'a> {
         let mut out: Vec<crate::fire::ProductTime> = Vec::with_capacity(entries.len());
         for entry in entries.iter() {
             let parsed = match entry.get_ref() {
-                DeValue::Array(f) if f.len() == 7 => {
+                DeValue::Array(f) if f.len() == 7 || f.len() == 8 => {
                     let whole = |i: usize| int(f[i].get_ref()).and_then(|v| u32::try_from(v).ok());
+                    let method = if f.len() == 8 {
+                        whole(7).filter(|m| {
+                            [crate::fire::PRODUCT_BODY, crate::fire::PRODUCT_DISPATCH].contains(m)
+                        })
+                    } else {
+                        Some(crate::fire::PRODUCT_BODY)
+                    };
                     match (
+                        method,
                         whole(0),
                         whole(1),
                         whole(2),
@@ -1412,6 +1420,7 @@ impl<'a> Walk<'a> {
                         number(f[6].get_ref()),
                     ) {
                         (
+                            Some(method),
                             Some(kind),
                             Some(rows),
                             Some(k),
@@ -1428,6 +1437,7 @@ impl<'a> Walk<'a> {
                                 kernel,
                                 ns,
                                 spread,
+                                method,
                             })
                         }
                         _ => None,

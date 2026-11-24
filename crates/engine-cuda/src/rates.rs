@@ -210,17 +210,21 @@ pub fn save_behind(
 pub type ProductTimes = Vec<(kernels_cuda::linear::routes::Shape, u32, f64, f64)>;
 
 /// `held` (the profile's product times under a matching key) with
-/// `measured` in place of each entry of the same key: the table a load's
-/// decode products are chosen from once it has measured.
+/// `measured` (timed by `method`, `profile::fire::PRODUCT_BODY` or
+/// `PRODUCT_DISPATCH`) in place of every entry of each bank it times,
+/// whatever method timed those: a bank's figures stay of one method. The
+/// table a load's decode products are chosen from once it has measured.
 #[must_use]
 pub fn joined_product_times(
     held: &[profile::fire::ProductTime],
     measured: &ProductTimes,
+    method: u32,
 ) -> Vec<profile::fire::ProductTime> {
-    let fresh = kernels_cuda::linear::routes::product_times(measured);
+    let fresh = kernels_cuda::linear::routes::product_times(measured, method);
+    let bank = |t: &profile::fire::ProductTime| (t.kind, t.rows, t.k, t.m);
     let mut joined: Vec<profile::fire::ProductTime> = held
         .iter()
-        .filter(|old| fresh.iter().all(|new| new.key() != old.key()))
+        .filter(|old| fresh.iter().all(|new| bank(new) != bank(old)))
         .cloned()
         .collect();
     joined.extend(fresh);
@@ -239,11 +243,12 @@ pub fn save_product_times(
     keys: &crate::stored::Keys,
     held: &[profile::fire::ProductTime],
     measured: &ProductTimes,
+    method: u32,
 ) -> Result<Option<String>, String> {
     let Some(profiles) = profiles else {
         return Ok(None);
     };
-    let joined = joined_product_times(held, measured);
+    let joined = joined_product_times(held, measured, method);
     let rates = keys.stamp(Rates {
         product_ns: Some(joined),
         ..Rates::default()
@@ -551,9 +556,20 @@ mod on_device {
                 &mut Tensor::new(y.ptr(), m, n, Dtype::Bf16),
             )
         };
-        ctx.set_routes(std::sync::Arc::new(served.forcing(shape, kernel)));
+        let forced = std::sync::Arc::new(served.forcing(shape, kernel));
+        ctx.set_routes(forced.clone());
         let mut held = Vec::new();
         lay(&mut held, || fire(ctx)).map_err(fault)?;
+        // Only a bank a plain product routes is timed so: one a fused
+        // epilogue routes (its kernel chosen inside its region) would time
+        // the same kernel under every candidate.
+        if forced.picked_at(shape) != Some(kernel) {
+            return Err(fault(format!(
+                "{}x{} m{m} is not a bank a plain product routes; its candidates are timed by \
+                 a load's bodies alone",
+                shape.rows, shape.k
+            )));
+        }
         let timed = timed_dispatches(&*ctx, &clock, &fire, arrived);
         // A forced library pick is laid process-wide for its shape: the
         // served table's pick laid back by a walk that launches nothing.
@@ -1691,7 +1707,7 @@ mod kept_routes_tests {
             })
             .collect();
         let keys = crate::stored::Keys::of(0, "test-device");
-        let saved = super::save_product_times(Some(&dir), "test-device", &keys, &[], &measured)
+        let saved = super::save_product_times(Some(&dir), "test-device", &keys, &[], &measured, profile::fire::PRODUCT_BODY)
             .expect("the times save")
             .expect("a profile directory was named");
 
@@ -1712,5 +1728,119 @@ mod kept_routes_tests {
         second.pick(shapes[0], 0x1000, &changed);
         assert_eq!(second.wanted().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// The decode products' two timing methods side by side on the device
+/// (`cargo test -p engine-cuda --features cuda --lib -- --ignored
+/// two_methods`): every plain bank the device's profile states body times
+/// for, each candidate timed again by direct dispatches
+/// ([`time_product`]), and the pick each method makes.
+#[cfg(all(test, feature = "cuda"))]
+mod two_methods {
+    use kernels_cuda::linear::routes::{Kind, Routes, Shape};
+
+    #[test]
+    #[ignore = "times every bank's candidates on the device"]
+    fn two_methods() {
+        let mut device = crate::device::Context::bind(0, None).expect("a device");
+        let (major, minor) = device.capability();
+        let facts = crate::chip::facts(major as u32, minor as u32, device.device().num_sm);
+        let keys = crate::stored::Keys::of(0, device.name());
+        let (chip, _) = crate::chip::resolve_keyed(device.name(), &facts, None, &keys);
+        device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
+        let mut body = chip.rates().product_ns.clone().unwrap_or_default();
+        if let Some(stale) = chip.rates().stale.as_ref().and_then(|s| s.product_ns.clone()) {
+            body.extend(stale);
+        }
+        let mut banks: std::collections::BTreeMap<(u32, u32, u32), Vec<&profile::fire::ProductTime>> =
+            Default::default();
+        for t in body.iter().filter(|t| t.kind == Kind::Plain as u32) {
+            banks.entry((t.rows, t.k, t.m)).or_default().push(t);
+        }
+        let body_routes = Routes::of(&body);
+        for ((rows, k, m), times) in banks {
+            let shape = Shape { kind: Kind::Plain, rows, k, m };
+            // The candidates as serving lists them (stated first): a walk
+            // under an empty table notes them.
+            let listing = std::sync::Arc::new(Routes::default());
+            let (mut ctx, slabs) = device.apart();
+            ctx.set_routes(listing.clone());
+            let weight = crate::device::Buffer::zeroed_apart(rows as usize * k as usize * 2).expect("weight");
+            let act = crate::device::Buffer::zeroed_apart(m as usize * k as usize * 2).expect("act");
+            let y = crate::device::Buffer::zeroed_apart(m as usize * rows as usize * 2).expect("y");
+            crate::sizing::begin();
+            let _ = kernels_cuda::linear::gemm::matmul(
+                &ctx,
+                kernels_cuda::Tensor::new(act.ptr(), m, k, poem_ir::Dtype::Bf16),
+                kernels_cuda::Tensor::new(weight.ptr(), rows, k, poem_ir::Dtype::Bf16),
+                &mut kernels_cuda::Tensor::new(y.ptr(), m, rows, poem_ir::Dtype::Bf16),
+            );
+            let _ = crate::sizing::end();
+            #[allow(unsafe_code)]
+            unsafe {
+                slabs.release()
+            };
+            let Some(codes) = listing.wanted().into_values().next().map(|w| w.candidates) else {
+                eprintln!("[two-methods] {rows}x{k} m{m}: no routed candidates now");
+                continue;
+            };
+            // A candidate whose code changed since the body times were
+            // taken (the skinny skeleton's, its source edited) stands for
+            // the one stored code no current candidate has, where exactly
+            // one of each is left.
+            let unmatched: Vec<u32> = codes.iter().copied().filter(|c| times.iter().all(|t| t.kernel != *c)).collect();
+            let orphans: Vec<u32> = times.iter().map(|t| t.kernel).filter(|k| !codes.contains(k)).collect();
+            let alias = match (unmatched.as_slice(), orphans.as_slice()) {
+                ([], _) => None,
+                ([now], [then]) => Some((*now, *then)),
+                _ => {
+                    eprintln!("[two-methods] {rows}x{k} m{m}: body times lack current candidates {unmatched:08x?} (stored {orphans:08x?})");
+                    continue;
+                }
+            };
+            let stored = |kernel: u32| match alias {
+                Some((now, then)) if kernel == now => then,
+                _ => kernel,
+            };
+            let times: Vec<profile::fire::ProductTime> = times
+                .iter()
+                .map(|t| {
+                    let mut t = (*t).clone();
+                    if let Some((now, then)) = alias && t.kernel == then {
+                        t.kernel = now;
+                    }
+                    t
+                })
+                .collect();
+            let _ = stored;
+            let mut eager = Vec::new();
+            for &kernel in &codes {
+                let timed = super::time_product(&device, &body_routes, shape, kernel, weight.ptr(), &|| false)
+                    .unwrap_or_else(|why| panic!("{rows}x{k} m{m} {kernel:08x}: {why:?}"));
+                eager.push((shape, kernel, timed.ns, timed.spread));
+            }
+            let eager_pick = Routes::default().with(&eager).pick(shape, 0, &codes);
+            let body_pick = Routes::of(&times).pick(shape, 0, &codes);
+            let body_ns = |kernel: u32| times.iter().find(|t| t.kernel == kernel).map_or(f64::NAN, |t| t.ns);
+            let body_spread = times.iter().map(|t| t.spread).fold(0.0, f64::max);
+            let cost = body_ns(eager_pick) - body_ns(body_pick);
+            let per: Vec<String> = codes
+                .iter()
+                .zip(&eager)
+                .map(|(c, e)| format!("{c:08x} body {:.1} us / eager {:.2} us", body_ns(*c) / 1e3, e.2 / 1e3))
+                .collect();
+            eprintln!(
+                "[two-methods] {rows}x{k} m{m}: body pick {body_pick:08x}, eager pick {eager_pick:08x} \
+                 {}; by body time the eager pick costs {:+.1} us of a {:.1} us step ({:+.2}%), body \
+                 spread {:.1} us; {}",
+                if body_pick == eager_pick { "SAME" } else { "DIFF" },
+                cost / 1e3,
+                body_ns(body_pick) / 1e3,
+                100.0 * cost / body_ns(body_pick),
+                body_spread / 1e3,
+                per.join("; ")
+            );
+        }
     }
 }

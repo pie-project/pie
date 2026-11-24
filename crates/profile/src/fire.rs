@@ -353,13 +353,24 @@ pub struct ProductTime {
     pub kernel: u32,
     pub ns: f64,
     pub spread: f64,
+    /// How it was timed ([`PRODUCT_BODY`], [`PRODUCT_DISPATCH`]): figures
+    /// of two methods are never compared (`profile::routes`).
+    pub method: u32,
 }
+
+/// A [`ProductTime`] timed as the decode step whose body serves it
+/// (a load's measuring): the entry's eighth column, unwritten.
+pub const PRODUCT_BODY: u32 = 1;
+
+/// A [`ProductTime`] timed by its kernel's own dispatches, launched
+/// directly (behind serving): the entry's eighth column.
+pub const PRODUCT_DISPATCH: u32 = 2;
 
 impl ProductTime {
     /// What the entry measures: everything but its time.
     #[must_use]
-    pub const fn key(&self) -> (u32, u32, u32, u32, u32) {
-        (self.kind, self.rows, self.k, self.m, self.kernel)
+    pub const fn key(&self) -> (u32, u32, u32, u32, u32, u32) {
+        (self.kind, self.rows, self.k, self.m, self.kernel, self.method)
     }
 }
 
@@ -963,8 +974,13 @@ impl Rates {
             let rows: Vec<String> = times
                 .iter()
                 .map(|t| {
+                    let method = if t.method == PRODUCT_BODY {
+                        String::new()
+                    } else {
+                        format!(", {}", t.method)
+                    };
                     format!(
-                        "  [{}, {}, {}, {}, {}, {:?}, {:?}],\n",
+                        "  [{}, {}, {}, {}, {}, {:?}, {:?}{method}],\n",
                         t.kind, t.rows, t.k, t.m, t.kernel, t.ns, t.spread
                     )
                 })

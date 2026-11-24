@@ -264,10 +264,11 @@ impl Shell {
             &self.keys,
             &self.products,
             &measured,
+            profile::fire::PRODUCT_DISPATCH,
         );
         // What the next bank's save joins: this load's picks stay as they
         // are (the served table is not touched).
-        self.products = crate::rates::joined_product_times(&self.products, &measured);
+        self.products = crate::rates::joined_product_times(&self.products, &measured, profile::fire::PRODUCT_DISPATCH);
         let times: Vec<String> = measured
             .iter()
             .map(|&(_, kernel, ns, _)| format!("{kernel:08x} {:.1} us", ns / 1e3))

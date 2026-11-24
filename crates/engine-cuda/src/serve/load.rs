@@ -2424,10 +2424,11 @@ impl Shell {
             &self.keys,
             &self.products,
             &measured,
+            profile::fire::PRODUCT_BODY,
         )
         .map_err(Fault::Card)?;
         // The table this load's products are chosen from from now on.
-        self.products = crate::rates::joined_product_times(&self.products, &measured);
+        self.products = crate::rates::joined_product_times(&self.products, &measured, profile::fire::PRODUCT_BODY);
         let chosen = self.device.ctx().routes().cloned();
         let said: Vec<String> = wanted
             .iter()
