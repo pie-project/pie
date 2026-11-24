@@ -285,14 +285,10 @@ pub fn gated_delta_carried(
     let seats = sms * resident;
     let split_room = carry.split != 0 && u64::from(seats) * CARRY_SPLIT_BYTES_PER_BLOCK <= carry_split_bytes(sms);
     let blocks = if split_room { seats } else { tiles.div_ceil(warps).min(seats) };
-    let entrypoint = if warps == FUSED_WARPS_WIDE {
-        "::pie::ssm::gdn_step_carried<8>"
-    } else {
-        "::pie::ssm::gdn_step_carried<4>"
-    };
+    let entrypoint = format!("::pie::ssm::gdn_step_carried<{warps}, {split_room}>");
     ctx.fire(
         OP,
-        Fire::at(kernel(GDN_RECURRENT, entrypoint)).apply(
+        Fire::at(kernel(GDN_RECURRENT, &entrypoint)).apply(
             Launch::grid([blocks, 1, 1], [32 * warps, 1, 1])
                 .smem(fused_smem(warps) + CARRIED_ROWS_SMEM),
         ),
