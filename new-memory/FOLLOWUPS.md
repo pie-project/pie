@@ -1637,3 +1637,7 @@ So no coarser lane rung is within 2% at any bucket, and the canonical power-of-t
 **What.** `crates/engine-gpu/src/serve.rs:10420` (`record_bodies`), `:1248` (`eager_classes`), `:5232` (`eager_kind`): a class whose lanes carry a score capture, an adapter or a guest input is stated eager at load, since its commands bind each attachment, which multiplies the bodies past what a device holds. It is armed once its commands read the attachment as data.
 
 **Why later.** Needs the attachment read as data in the recorded commands; until then those classes run eager, stated at load.
+
+## F98. SDK parity: beam search and the speculative / latent helpers outside Rust
+
+**What.** The JS and Python bridges never bind `parents` / `parentsEnd`, so JS and Python inferlets cannot run beam search (Rust has `BeamGroup`). Python also lacks the speculative verify and latent flow-match helpers, and JS has diffusion only.
