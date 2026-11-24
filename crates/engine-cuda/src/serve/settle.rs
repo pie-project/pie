@@ -267,7 +267,7 @@ impl Shell {
                         outcome.fault_lanes(
                             lane32..lane32 + 1,
                             Some(instance),
-                            &super::pages::fault_reason(word, lane),
+                            &engine::beam::fault_reason(word, lane, "engine-cuda"),
                         );
                     }
                 }

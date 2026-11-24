@@ -11,6 +11,47 @@ pub mod fault {
     pub const COPY_BOUNDS: u32 = 4;
     pub const PARENT: u32 = 5;
     pub const RESERVE_EXHAUSTED: u32 = 6;
+    pub const TOO_WIDE: u32 = 7;
+}
+
+/// Why lane `lane`'s fault word `code` (§7) fails it, named; `backend`
+/// names the engine in the log line a code that is a bug states.
+#[must_use]
+pub fn fault_reason(code: u32, lane: usize, backend: &str) -> String {
+    let why = match code {
+        fault::PAST_RESERVE => "names a page past its working set's pool",
+        fault::SHORT => "is shorter than the pages the lane reads",
+        fault::BELOW_FLOOR => {
+            "would land a row below its working set's frozen slots or past its reserve"
+        }
+        fault::COPY_BOUNDS => {
+            "states a page copy past its working set's pool, longer than a page, or into frozen \
+             slots"
+        }
+        fault::PARENT => "continues a parent past its beams",
+        fault::RESERVE_EXHAUSTED => {
+            tracing::error!(
+                lane,
+                "{backend}: BUG: a beam group found fewer free pages than it hands out; its pool \
+                 is sized exactly (BEAM-PAGE-LISTS.md §3)"
+            );
+            "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
+        }
+        fault::TOO_WIDE => {
+            tracing::error!(
+                lane,
+                "{backend}: BUG: a beam group wider than its step was laid for reached the \
+                 device; its bind admits its width and pool"
+            );
+            "belongs to a group wider than its step was laid for (a bug: refused at bind): \
+             nothing was stepped"
+        }
+        _ => "faulted",
+    };
+    format!(
+        "Overreach: lane {lane}'s page list {why}; nothing was written outside its own working \
+         set, and the lane is failed"
+    )
 }
 
 /// A beam group's resident state (§4), laid for `cap` columns and pool

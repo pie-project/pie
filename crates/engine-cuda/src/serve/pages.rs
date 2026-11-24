@@ -210,38 +210,6 @@ impl PageWork {
     }
 }
 
-/// Why a lane's fault word faults it (`BEAM-PAGE-LISTS.md` §7).
-#[must_use]
-pub fn fault_reason(code: u32, lane: usize) -> String {
-    use kernels_cuda::runtime::channel::{
-        PAGES_BELOW_FLOOR, PAGES_COPY_BOUNDS, PAGES_EXHAUSTED, PAGES_PARENT, PAGES_PAST_RESERVE,
-        PAGES_SHORT, PAGES_TOO_WIDE,
-    };
-    let why = match code {
-        PAGES_PAST_RESERVE => "names a page past its working set's pool",
-        PAGES_SHORT => "is shorter than the pages the lane reads",
-        PAGES_BELOW_FLOOR => "would land a row below its working set's frozen slots or past its reserve",
-        PAGES_COPY_BOUNDS => {
-            "states a page copy past its working set's pool, longer than a page, or into frozen \
-             slots"
-        }
-        PAGES_PARENT => "continues a parent past its beams",
-        PAGES_TOO_WIDE => "belongs to a group wider than its step was laid for",
-        PAGES_EXHAUSTED => {
-            eprintln!(
-                "engine-cuda: BUG: lane {lane}'s beam group found fewer free pages than it hands \
-                 out; its pool is sized exactly (BEAM-PAGE-LISTS.md §3)"
-            );
-            "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
-        }
-        _ => "faulted",
-    };
-    format!(
-        "Overreach: lane {lane}'s page list {why}; nothing was written outside its own working \
-         set, and the lane is failed"
-    )
-}
-
 /// Plans `groups` over the fire's staged `geometries` (`indptr` a seat each):
 /// `translation(source)` a lane's working set's whole table (runtime page
 /// ids) and `folded(source)` its frozen slots; `windowed` whether any table

@@ -61,44 +61,6 @@ pub fn backed(lanes: u32, slot: u32, folded: u32, page: u32, frames: u32, reserv
         .min(reserve)
 }
 
-/// Why a lane's fault word faults it (BEAM-PAGE-LISTS §7).
-#[must_use]
-pub fn fault_reason(code: u32, lane: usize) -> String {
-    let why = match code {
-        kbeam::PAGES_PAST_RESERVE => "names a page past its working set's pool",
-        kbeam::PAGES_SHORT => "is shorter than the pages the lane reads",
-        kbeam::PAGES_BELOW_FLOOR => {
-            "would land a row below its working set's frozen slots or past its reserve"
-        }
-        kbeam::PAGES_COPY_BOUNDS => {
-            "states a page copy past its working set's pool, longer than a page, or into frozen \
-             slots"
-        }
-        kbeam::PAGES_PARENT => "continues a parent past its beams",
-        kbeam::PAGES_EXHAUSTED => {
-            tracing::error!(
-                lane,
-                "engine-metal: BUG: a beam group found fewer free pages than it hands out; its \
-                 pool is sized exactly (BEAM-PAGE-LISTS.md §3)"
-            );
-            "found no free page of its working set's pool left (a bug: the pool is sized exactly)"
-        }
-        kbeam::PAGES_TOO_WIDE => {
-            tracing::error!(
-                lane,
-                "engine-metal: BUG: a beam group wider than the head step holds reached the \
-                 device; bind and the fire's records refuse it"
-            );
-            "belongs to a group wider than the head step holds (a bug: refused at bind)"
-        }
-        _ => "faulted",
-    };
-    format!(
-        "Overreach: lane {lane}'s page list {why}; nothing was written outside its own working \
-         set, and the lane is failed"
-    )
-}
-
 /// What [`plan`] reads of the fire as staged.
 pub struct Staged<'a> {
     /// Per staged table: its lanes' `indptr` (a seat a lane, in lane order).
