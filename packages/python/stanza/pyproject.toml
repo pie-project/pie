@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pie-stanza"
+version = "0.1.0"
+description = "Stanza by pie: train the adapter forms a Poem program declares, then serve them with pie."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "torch>=2.5",
+    "safetensors>=0.4",
+    "transformers>=4.51",
+    "pie-client",
+]
+
+[project.optional-dependencies]
+peft = ["peft>=0.15"]
+
+[project.scripts]
+stanza = "pie_stanza.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
