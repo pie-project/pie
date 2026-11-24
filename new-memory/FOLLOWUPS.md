@@ -1570,3 +1570,9 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F99. engine-vulkan / engine-wgpu: one guest run, session and program in engine-gpu
+
+**What.** `crates/engine-{vulkan,wgpu}/src/guest/run.rs`, `guest/session.rs` and `program.rs` repeat each other (run bookkeeping, claims and pair runs, envelope tokens / mask, register / publish), but each backend holds its own pass / outbox and session types, so they move to engine-gpu behind shared traits (a generic `OnDevice<B>`, a session book, `Programs` default methods), not as plain moves.
+
+**Why later.** The shared traits are a design of their own; out of this PR's cleanup.
