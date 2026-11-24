@@ -1644,8 +1644,8 @@ impl Shell {
     pub(crate) fn stated_steps(&self, shapes: engine::StepShapes) -> engine::StatedSteps {
         let mut eager = Vec::new();
         if self.arm_deferred {
-            eprintln!(
-                "engine-cuda: the arm walk runs at the starting weight residency: what it \
+            tracing::info!(
+                "the arm walk runs at the starting weight residency: what it \
                  leaves eager is named then"
             );
             return engine::StatedSteps { shapes, eager };
@@ -1659,8 +1659,8 @@ impl Shell {
                 })
                 .collect();
             if !missing.is_empty() {
-                eprintln!(
-                    "engine-cuda: step shape {at} [{shape}] runs eager: no body recorded at \
+                tracing::info!(
+                    "step shape {at} [{shape}] runs eager: no body recorded at \
                      bucket(s) {missing:?}"
                 );
                 eager.push(u32::try_from(at).unwrap_or(u32::MAX));
@@ -1900,8 +1900,8 @@ impl Shell {
             }
         }
         if kept < total {
-            eprintln!(
-                "engine-cuda: arming selects {kept} of {total} compositions by the user's rule: \
+            tracing::info!(
+                "arming selects {kept} of {total} compositions by the user's rule: \
                  the rest would back more of the activation span than the pool's spare holds"
             );
         }
@@ -2411,8 +2411,8 @@ impl Shell {
             refusals: stats.tally.refusals,
             seal,
         };
-        eprintln!(
-            "engine-cuda: {report}; armed in {:.1} s",
+        tracing::info!(
+            "{report}; armed in {:.1} s",
             st.began.elapsed().as_secs_f64()
         );
         // Every composition arming stopped before (the report above says
@@ -2420,8 +2420,8 @@ impl Shell {
         // statement, their fires tallied as such (`BodyTally::stated_eager`).
         let stated_now = self.cache.stated_eager();
         if !stated_now.is_empty() && self.arm_only.is_none() {
-            eprintln!(
-                "engine-cuda: {} composition key(s) walk eagerly by statement, arming stopped \
+            tracing::info!(
+                "{} composition key(s) walk eagerly by statement, arming stopped \
                  before them from bucket {}: {}",
                 stated_now.len(),
                 st.never_from,
@@ -2430,8 +2430,8 @@ impl Shell {
         }
         // The lattice the bodies armed over against the profile's: fewer
         // buckets is the allowance binding, each fire padded further.
-        eprintln!(
-            "engine-cuda: lattice armed over {} of the profile's {} buckets",
+        tracing::info!(
+            "lattice armed over {} of the profile's {} buckets",
             self.budget.buckets.len(),
             st.profiled
         );
@@ -2478,8 +2478,8 @@ impl Shell {
             ) {
                 Ok(Some(line)) => eprintln!("{line}"),
                 Ok(None) => {}
-                Err(why) => eprintln!(
-                    "engine-cuda: WARNING: the bodies' record at {} is not kept: {why}",
+                Err(why) => tracing::warn!(
+                    "the bodies' record at {} is not kept: {why}",
                     record.display()
                 ),
             }

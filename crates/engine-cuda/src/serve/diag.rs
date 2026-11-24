@@ -216,8 +216,8 @@ static PUBLISHED: OnceLock<Diagnostics> = OnceLock::new();
 pub(crate) fn publish(stated: &Diagnostics) {
     let published = PUBLISHED.get_or_init(|| stated.clone());
     if published != stated {
-        eprintln!(
-            "engine-cuda: this process already published a diagnostics record \
+        tracing::warn!(
+            "this process already published a diagnostics record \
              ({}), so the one this boot states ({}) is ignored; every rank of a \
              group traces the same thing",
             published.words().unwrap_or_else(|| "none".to_string()),

@@ -714,8 +714,8 @@ impl Shell {
                     engine::disk::derived_need(0, 0, pages.div_ceil(per_chunk) + state, chunk, guest);
                 let bytes = need.min(free / ranks);
                 // Its inputs, stated at load: what the field rules on.
-                eprintln!(
-                    "engine-cuda: the unstated disk tier: {bytes} bytes of a derived need of \
+                tracing::info!(
+                    "the unstated disk tier: {bytes} bytes of a derived need of \
                      {need} bytes ({seats} seats x {context} tokens: {pages} kv pages in {} \
                      chunks and {state} chunks of state ({} B a seat), and {guest} B of guest \
                      state the device holds live, chunks of {chunk} B), within {} bytes a rank \
@@ -744,8 +744,8 @@ impl Shell {
                 .map(|(id, per, bytes)| format!("shape {id}: {per} slots of {bytes} bytes"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            eprintln!(
-                "engine-cuda: the disk tier: {budget} bytes in {chunks} disk chunks of {} bytes, \
+            tracing::info!(
+                "the disk tier: {budget} bytes in {chunks} disk chunks of {} bytes, \
                  each laid out as the device's, any state shape's slots in any chunk ({division})",
                 self.pools.disk_chunk_bytes()
             );
@@ -961,8 +961,8 @@ impl Shell {
         }
         self.live.tally(engine::live::Tally::BuiltAtRegister, late);
         let total = self.live.tallied(engine::live::Tally::BuiltAtRegister);
-        eprintln!(
-            "engine-cuda: a program's registration built {late} guest region(s) no prewarm had; \
+        tracing::info!(
+            "a program's registration built {late} guest region(s) no prewarm had; \
              {total} since load (Tally::BuiltAtRegister)"
         );
     }

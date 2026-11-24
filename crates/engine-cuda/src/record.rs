@@ -117,8 +117,8 @@ impl Bodies {
         tally.eager_unbodied += 1;
         let count = tally.eager_unbodied;
         if count.is_power_of_two() {
-            eprintln!(
-                "engine-cuda: WARNING: a serving fire ran with no recorded body ({why}); \
+            tracing::warn!(
+                "a serving fire ran with no recorded body ({why}); \
                  {count} such fire(s) so far (BodyTally::eager_unbodied). Every serving \
                  composition of a load that records bodies should replay one"
             );
@@ -1110,8 +1110,8 @@ impl Bodies {
                 } else {
                     "the resident body is empty"
                 };
-                eprintln!(
-                    "engine-cuda: WARNING: the sealed map holds no body for {key} ({why}) — \
+                tracing::warn!(
+                    "the sealed map holds no body for {key} ({why}) — \
                      this shape walks eagerly for the life of the load \
                      (BodyTally::sealed_declines counts each such fire; {declines} so far) {}",
                     self.body_stats()
@@ -1127,8 +1127,8 @@ impl Bodies {
         }
         if !run.capturable() {
             if warmed == WARM_FIRES {
-                eprintln!(
-                    "engine-cuda: body {key} declines to capture ({}), so this \
+                tracing::info!(
+                    "body {key} declines to capture ({}), so this \
                      composition walks eagerly for good, each serving fire counted \
                      unrecorded.",
                     run.uncapturable_why().join("; ")

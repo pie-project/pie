@@ -662,8 +662,8 @@ impl Plane {
             .collect();
         let compiled_before = self.cache.stats().compilations;
         let regions = self.cache.warm(&Target::of(context)?, &kernels)?;
-        eprintln!(
-            "engine-cuda: guest regions prewarmed for {} standard program(s): {} region(s), \
+        tracing::info!(
+            "guest regions prewarmed for {} standard program(s): {} region(s), \
              {} compiled, in {} ms",
             registrations.len(),
             regions,

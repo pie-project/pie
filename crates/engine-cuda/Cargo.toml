@@ -15,6 +15,7 @@ path = "src/lib.rs"
 state = { path = "../state" }
 memmap2 = "0.9"
 toml = "1.1"
+tracing = "0.1"
 libc = "0.2"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-cuda = { path = "../kernels-cuda", optional = true }

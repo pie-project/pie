@@ -603,8 +603,8 @@ impl Engine for Cuda {
 
     fn cover_fingerprint(&self) -> Option<String> {
         let print = self.shell.as_ref()?.cover_fingerprint();
-        eprintln!(
-            "engine-cuda: the host cover's key: {print} (the device, its kernels' code, the \
+        tracing::info!(
+            "the host cover's key: {print} (the device, its kernels' code, the \
              guest emitter's version, the decode products' picks and a fire's lanes and tokens)"
         );
         Some(print)
@@ -729,8 +729,8 @@ impl Engine for Cuda {
         };
         if let Some(ring) = &ring {
             let size = ring.size();
-            eprintln!(
-                "engine-cuda: the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
+            tracing::info!(
+                "the host tier's staging ring: {} MiB pinned, {} pieces of {} MiB (a \
                  piece for each of 2 stages for each of {frames} frames in flight)",
                 size.bytes() >> 20,
                 size.pieces,
@@ -818,8 +818,8 @@ impl Engine for Cuda {
             )
             .map_err(fault)?;
         if memory.unified() {
-            eprintln!(
-                "engine-cuda: {} ({} disk kv pages)",
+            tracing::info!(
+                "{} ({} disk kv pages)",
                 engine::DeviceMemory::NO_HOST_TIER,
                 disk_pages
             );
@@ -943,16 +943,16 @@ impl Engine for Cuda {
         }
         let mut caps = caps;
         caps.steps = shell.stated_steps(stated);
-        eprintln!(
-            "engine-cuda: step set: {}; {} stated eager",
+        tracing::info!(
+            "step set: {}; {} stated eager",
             caps.steps.shapes.census(),
             caps.steps.eager.len(),
         );
 
         // A fire's lanes, rows and readouts bound the scheduler's waves: a
         // decode wave seats at most `max_lanes` lanes.
-        eprintln!(
-            "engine-cuda: fire limits: {} lanes, {} rows, {} readouts",
+        tracing::info!(
+            "fire limits: {} lanes, {} rows, {} readouts",
             caps.limits.max_lanes, caps.limits.max_tokens, caps.limits.max_readouts,
         );
         self.replay = crate::replay::Replay::of(&shell);

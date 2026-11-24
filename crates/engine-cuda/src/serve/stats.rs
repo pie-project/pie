@@ -367,8 +367,8 @@ impl Shell {
                 if self.pools.weights_located() {
                     // The recorded bodies keep the plain-load select they
                     // chose, which reads a located table as well.
-                    eprintln!(
-                        "engine-cuda: a held weight set arrived after lanes named slot refs; \
+                    tracing::info!(
+                        "a held weight set arrived after lanes named slot refs; \
                          the recorded bodies keep the per-route select (send the set before \
                          the first fire)"
                     );
@@ -404,8 +404,8 @@ impl Shell {
             let freed = tier.release_host(&held);
             if freed > 0 {
                 self.pools.drop_weight_hosts();
-                eprintln!(
-                    "engine-cuda: the weights the pool holds whole are read from it alone; \
+                tracing::info!(
+                    "the weights the pool holds whole are read from it alone; \
                      {} MiB of their host copy freed",
                     freed >> 20
                 );

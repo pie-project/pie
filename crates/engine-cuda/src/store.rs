@@ -446,8 +446,8 @@ fn longest(mut fits: u64, mut over: u64, seats: impl FnMut(u64) -> bool) -> u64 
 /// The line a load states when it serves a model's declared context cut
 /// to `serving` tokens, `why` the room that cut it.
 pub(crate) fn say_context_cut(declared: u32, serving: u32, why: &str) {
-    eprintln!(
-        "engine-cuda: the model declares a {declared}-token context and {why}; serving \
+    tracing::info!(
+        "the model declares a {declared}-token context and {why}; serving \
          {serving} tokens. State `[engine] max_context` to choose."
     );
 }
@@ -591,8 +591,8 @@ pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
         && let Some(terms) = crate::device::card::integrated()?
     {
         let mib = |bytes: u64| bytes >> 20;
-        eprintln!(
-            "engine-cuda: integrated device: capacity {} MiB = min(dedicated {} MiB - held {} MiB, Windows commit available {} MiB), less the driver's {} MiB floor; the system memory the driver lends it is not counted (state [engine.memory] budget_device to size by it)",
+        tracing::info!(
+            "integrated device: capacity {} MiB = min(dedicated {} MiB - held {} MiB, Windows commit available {} MiB), less the driver's {} MiB floor; the system memory the driver lends it is not counted (state [engine.memory] budget_device to size by it)",
             mib(terms.free()),
             mib(terms.dedicated),
             mib(terms.held),
@@ -1934,8 +1934,8 @@ impl Pools {
             one_slot
         } else {
             if settled {
-                eprintln!(
-                    "engine-cuda: the weights this card holds whole leave the cache rows {} MiB, \
+                tracing::info!(
+                    "the weights this card holds whole leave the cache rows {} MiB, \
                      under one sequence at the declared context ({} MiB): the kv pool states \
                      what they leave, and live demand takes chunks from the weight cache as it \
                      needs them. Lower `[engine] max_context` or raise `[engine.memory] \
@@ -3727,8 +3727,8 @@ impl Pools {
                 })
                 .count();
             if moved > 0 {
-                eprintln!(
-                    "engine-cuda: the first weight residency names {moved} of {} atoms a slot \
+                tracing::info!(
+                    "the first weight residency names {moved} of {} atoms a slot \
                      other than the one the load seated them in (`WeightShape::seated`); each \
                      is read from the serving file again",
                     residency.resident.len()
@@ -4246,8 +4246,8 @@ impl Pools {
             }
         }
         self.lay_lanes(core::ptr::null_mut(), &laid)?;
-        eprintln!(
-            "engine-cuda: the runtime streams weights this load was told it would hold; {} \
+        tracing::info!(
+            "the runtime streams weights this load was told it would hold; {} \
              MiB of them pinned on the host from the serving file, for misses",
             total >> 20
         );
@@ -4662,8 +4662,8 @@ impl Pools {
         // would fail mid-serve, at the first move past what the host holds.
         let free = crate::weights::available_memory();
         let budget = if budget > free {
-            eprintln!(
-                "engine-cuda: WARNING: the host tier's budget of {} MiB is more than this \
+            tracing::warn!(
+                "the host tier's budget of {} MiB is more than this \
                  machine has free ({} MiB); the tier is seated with {} MiB",
                 budget >> 20,
                 free >> 20,

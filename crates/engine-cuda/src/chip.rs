@@ -358,7 +358,7 @@ pub fn resolve_keyed(
 ) -> (Profile, Report) {
     let (profile, report) = SHELF.resolve_keyed(registry(), device, facts, profiles, keys);
     for line in &report.stored {
-        eprintln!("engine-cuda: {line}");
+        tracing::info!("{line}");
     }
     (profile, report)
 }
