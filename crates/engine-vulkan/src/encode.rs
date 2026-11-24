@@ -415,6 +415,21 @@ impl Sink<'_> {
                         rooms.push(None);
                         continue;
                     }
+                    // A lay-only walk binds nothing: what a buffer argument
+                    // is matters to the commands, not to the block.
+                    if self.frame.lay_only() {
+                        infos.push(
+                            vk::DescriptorBufferInfo::default()
+                                .buffer(dummy.buffer)
+                                .offset(0)
+                                .range(dummy.size),
+                        );
+                        writes_at.push(false);
+                        extents.push(0);
+                        segments.push(None);
+                        rooms.push(None);
+                        continue;
+                    }
                     let binding = self.handles.get(handle).ok_or_else(|| {
                         Sink::refuse(
                             fire,
@@ -578,6 +593,12 @@ impl Sink<'_> {
             ));
         }
 
+        // The kernel, in the frame's picks; a lay-only walk lays no more.
+        self.frame.pick(&key);
+        if self.frame.lay_only() {
+            self.frame.dispatches.set(self.frame.dispatches.get() + 1);
+            return Ok(());
+        }
         let (reads, writes) = (&mut scratch.reads, &mut scratch.writes);
         for (at, info) in infos.iter().enumerate().take(declared) {
             if !pipeline.used[at] || info.buffer == dummy.buffer || Some(at) == params_at {

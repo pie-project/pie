@@ -162,6 +162,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn frame_lay(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
     pub fn spanned(&self) -> Result<Frame> {
         match self.never {}
     }
@@ -256,6 +260,7 @@ pub struct Fill {
     pub copies: Vec<[u32; 3]>,
     pub image: Image,
     pub cuts: usize,
+    pub picks: u64,
     pub room_pasts: Vec<u64>,
 }
 
@@ -440,6 +445,11 @@ impl Kept {
 
     #[must_use]
     pub fn copies(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn picks(&self) -> u64 {
         match self.never {}
     }
 

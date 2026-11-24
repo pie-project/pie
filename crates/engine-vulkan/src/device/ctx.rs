@@ -2100,6 +2100,15 @@ impl Context {
         Ok(frame)
     }
 
+    /// A dry frame whose walk lays the fire's block alone: each dispatch's
+    /// scalars and group counts, and the kernels it runs (its picks), with
+    /// none of what it binds, its barriers or its hash.
+    pub fn frame_lay(&self) -> Result<Frame> {
+        let mut frame = self.frame_dry()?;
+        frame.lay_only = true;
+        Ok(frame)
+    }
+
     fn frame_with(&self, one_time: bool) -> Result<Frame> {
         let core = &self.core;
         let d = &core.device;
@@ -2225,6 +2234,8 @@ impl Context {
             copies: std::cell::RefCell::new(Vec::new()),
             baked: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
             trail: std::cell::RefCell::new(Vec::new()),
+            picks: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
+            lay_only: false,
         })
     }
 }
@@ -2639,6 +2650,13 @@ pub struct Frame {
     /// Each readout copy's mark (its most rows: its regions are the copier's
     /// table), in order.
     copies: std::cell::RefCell<Vec<[u32; 3]>>,
+
+    /// The kernels its dispatches run and its other commands, hashed
+    /// ([`Frame::pick`]).
+    picks: std::cell::RefCell<std::collections::hash_map::DefaultHasher>,
+
+    /// Lays the block alone ([`Context::frame_lay`]).
+    lay_only: bool,
 }
 
 impl Frame {
@@ -2891,6 +2909,7 @@ impl Frame {
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             image: self.block.borrow_mut().take_image().seal(),
+            picks: self.picks.borrow().finish(),
             cuts: self.cuts(),
             room_pasts: self.room_pasts.borrow().clone(),
         }
@@ -2907,10 +2926,27 @@ impl Frame {
         if tracing::enabled!(target: "vkbakeall", tracing::Level::TRACE) {
             tracing::trace!(target: "vkbakeall", what = ?what, "bake");
         }
+        // A command other than a dispatch picks itself whole: a copy's
+        // regions, a zeroed span (a dispatch picks its kernel, [`Self::pick`]).
+        if name.is_empty() {
+            self.pick(what);
+        }
         what.hash(&mut *self.baked.borrow_mut());
         if trailing() {
             self.trail.borrow_mut().push(format!("{what:?} {name}"));
         }
+    }
+
+    /// Folds `what` into the frame's picks: the kernels its dispatches
+    /// run and its other commands, in order, apart from what they bind. A
+    /// lay-only walk's picks name the family whose fill it lays.
+    pub(crate) fn pick(&self, what: &impl std::hash::Hash) {
+        what.hash(&mut *self.picks.borrow_mut());
+    }
+
+    /// A lay-only frame ([`Context::frame_lay`]).
+    pub(crate) fn lay_only(&self) -> bool {
+        self.lay_only
     }
 
     pub(crate) fn core(&self) -> &Arc<Core> {
@@ -3795,6 +3831,7 @@ impl Frame {
             trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
+            picks: self.picks.borrow().finish(),
             indirect: self.indirect.clone(),
             indirect_all: true,
         })
@@ -3842,6 +3879,8 @@ pub struct Fill {
     pub image: super::block::Image,
     pub cuts: usize,
     pub room_pasts: Vec<u64>,
+    /// The walk's picks ([`Frame::pick`]).
+    pub picks: u64,
 }
 
 pub struct Kept {
@@ -3864,6 +3903,7 @@ pub struct Kept {
     groups: Vec<[u32; 3]>,
 
     copies: Vec<[u32; 3]>,
+    picks: u64,
 
     indirect: Option<Arc<Vec<bool>>>,
 
@@ -3984,6 +4024,12 @@ impl Kept {
     #[must_use]
     pub fn groups(&self) -> &[[u32; 3]] {
         &self.groups
+    }
+
+    /// The walk's picks ([`Frame::pick`]).
+    #[must_use]
+    pub fn picks(&self) -> u64 {
+        self.picks
     }
 
     /// Each readout copy's mark (its most rows), in order.

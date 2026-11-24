@@ -349,6 +349,27 @@ pub trait Serve: Backend {
         Ok(false)
     }
 
+    /// The frame a lay-only pass walks into ([`Shell::lay_once`]): one that
+    /// lays the fire's block (its dispatches' scalars and group counts) and
+    /// names the kernels it runs, and binds, hashes and records nothing.
+    /// `None` where the backend lays none.
+    fn lay_frame(_device: &Self::Context, _arm: usize) -> Result<Option<Self::Frame>> {
+        Ok(None)
+    }
+
+    /// Takes what a lay-only pass of `prepared` laid in `frame`: where the
+    /// kernels it names are an armed family's, the fire's fill of it, which
+    /// the next [`Serve::plan`] replays. Whether one was.
+    fn lay_fill(
+        _shell: &mut Shell<Self>,
+        _frame: Self::Frame,
+        _prepared: &mut Prepared<'_, Self>,
+        _layout: &[ReadSpan],
+        _launches: u32,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// What a dispatch binds the backend has built and kept so far (its bind
     /// groups): read at ready and after, those built since are a fire's
     /// ([`engine::live::Tally::BoundInFire`]). 0 where it keeps none.
@@ -1261,6 +1282,10 @@ pub struct Shell<B: Serve> {
     pub arm_filled: bool,
     /// Serving fires that walked for their fill, since the last count.
     filled_in_fire: u64,
+    /// Serving fires whose fill a lay-only pass laid, since the last count,
+    /// and the host time those passes took, all told.
+    laid_at_first_fire: u64,
+    pub lay_ns: u64,
     /// The fires since the last count that ran eager as stated.
     eager: u64,
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
@@ -3149,6 +3174,8 @@ impl<B: Serve> Shell<B> {
             walk_at: None,
             arm_filled: false,
             filled_in_fire: 0,
+            laid_at_first_fire: 0,
+            lay_ns: 0,
             eager: 0,
             eager_next: false,
             armed: false,
@@ -5199,6 +5226,12 @@ impl<B: Serve> Shell<B> {
     /// ([`engine::live::Tally::FilledInFire`]).
     pub fn filled_serving(&mut self) -> u64 {
         std::mem::take(&mut self.filled_in_fire)
+    }
+
+    /// The serving fires since the last count whose fill a lay-only pass
+    /// laid ([`engine::live::Tally::LaidAtFirstFire`]).
+    pub fn laid_serving(&mut self) -> u64 {
+        std::mem::take(&mut self.laid_at_first_fire)
     }
 
     /// A step walked to be kept made no recording: its commands were a held
@@ -8552,6 +8585,54 @@ impl<B: Serve> Shell<B> {
         self.walk_into(frame, p, false, false, &place, &mut Cursor::new(&place))
     }
 
+    /// Lays `prepared`'s fill of the armed family whose kernels it runs
+    /// from a lay-only pass ([`Serve::lay_frame`]): the fire's dispatch
+    /// arguments and group counts, and its readout copies, computed on the
+    /// host from its own rows and reads, with nothing bound, hashed,
+    /// recorded or built. Whether a family took it.
+    fn lay_once(&mut self, prepared: &mut Prepared<'_, B>) -> Result<bool> {
+        let Some(frame) = B::lay_frame(&self.device, prepared.arm)? else {
+            return Ok(false);
+        };
+        let at = std::time::Instant::now();
+        // What the pass mints goes again after it; the fire's own staged
+        // rows stand, for a walk of it the pass fills no family for.
+        let mark = self.handles.len();
+        let place = At::new();
+        let walked = self.walk_into(frame, prepared, false, false, &place, &mut Cursor::new(&place));
+        let walked = match walked {
+            Ok(walked) => walked,
+            Err(fault) => {
+                self.handles.rewind_to(mark);
+                return Err(fault);
+            }
+        };
+        let mut frame = walked.frame.expect("the walk opened a frame");
+        let laid = self.readout_copies(prepared).and_then(|(layout, regions)| {
+            for (from, list, most) in &regions {
+                frame.copy_rows(from, &self.readout[prepared.arm], list, *most)?;
+            }
+            self.copy_pixels(&mut frame, prepared)?;
+            Ok(layout)
+        });
+        self.handles.rewind_to(mark);
+        let layout = laid?;
+        let filled = B::lay_fill(self, frame, prepared, &layout, walked.launches)?;
+        if filled {
+            let ns = at.elapsed().as_nanos() as u64;
+            self.lay_ns = self.lay_ns.saturating_add(ns);
+            self.laid_at_first_fire += 1;
+            tracing::info!(
+                rung = prepared.rung,
+                rows = ?prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
+                us = ns / 1000,
+                "a lay-only pass laid a fire's fill of its armed family (counted \
+                 laid_at_first_fire)"
+            );
+        }
+        Ok(filled)
+    }
+
     /// Fills an armed body for `prepared`'s shape from a walk that records
     /// nothing ([`Plan::Fill`]): the walk, the fire's readout copies and its
     /// pixels laid in a fill frame, and the backend's fill from what they
@@ -9287,7 +9368,21 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         // An armed body with no fill for the step's shape fills from a walk
         // that records nothing, then replays.
         let plan = match plan {
+            // A fire of an armed family whose fill the walk did not lay
+            // (a row count it enumerates no composition of) lays it on the
+            // host, once a length.
+            Plan::Fill if self.serving && self.lay_once(&mut prepared)? => {
+                match B::plan(self, &mut prepared)? {
+                    Plan::Fill => self.unarmed(&prepared, "its laid fill replays no body")?,
+                    plan => plan,
+                }
+            }
             Plan::Fill => {
+                // A lay-only pass that laid no fill took what the plan laid
+                // for the next frame: laid again for the fill walk's.
+                if self.serving {
+                    B::ready_fill(self, &prepared);
+                }
                 self.filled_in_fire += 1;
                 if self.serving {
                     let kind = format!(
