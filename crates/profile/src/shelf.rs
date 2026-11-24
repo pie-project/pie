@@ -217,7 +217,7 @@ impl Shelf {
             .then(|| crate::untuned_hint(device, self.backend, &id_of(device), report))
     }
 
-    /// Say once per device, on stderr, that it runs without a profile
+    /// Say once per device, as a warning, that it runs without a profile
     /// measured on it, and how to make one.
     pub fn tell_untuned(&self, device: &str, report: &Report) {
         use std::collections::BTreeSet;
@@ -228,7 +228,7 @@ impl Shelf {
         };
         let mut told = TOLD.lock().expect("told lock poisoned");
         if told.insert(format!("{}/{device}", self.backend)) {
-            eprintln!("{hint}");
+            tracing::warn!("{hint}");
         }
     }
 
@@ -307,7 +307,9 @@ impl Shelf {
                 .parse(text, name, Strict::Measured)
                 .map_err(|e| e.to_string())?;
             if file.tuned.rates == crate::fire::Rates::default() {
-                return Err(format!("{name} is a measured profile, and states no measurement"));
+                return Err(format!(
+                    "{name} is a measured profile, and states no measurement"
+                ));
             }
         }
         for (name, _) in self
@@ -370,7 +372,12 @@ impl Shelf {
 /// stored without a key, or a file naming no device it was measured on, is
 /// refused by name; so is a file that does not read, or states no
 /// measurement. The text reads back to the same entries.
-pub fn export(registry: &Registry, device: &str, user: &str, origin: &str) -> Result<String, String> {
+pub fn export(
+    registry: &Registry,
+    device: &str,
+    user: &str,
+    origin: &str,
+) -> Result<String, String> {
     export_reporting(registry, device, user, origin).map(|(text, _)| text)
 }
 
@@ -472,7 +479,11 @@ pub fn merge_committed(
     committed.stale = None;
     let mut refused: Vec<String> = Vec::new();
     for key in KEYED {
-        match (measured.states(key), committed.states(key), before.states(key)) {
+        match (
+            measured.states(key),
+            committed.states(key),
+            before.states(key),
+        ) {
             (true, _, _) => report.push(format!("`{key}`: measured")),
             (false, true, _) => report.push(format!("`{key}`: carried from the committed profile")),
             (false, false, true) => refused.push(format!("`{key}`")),
@@ -521,7 +532,10 @@ pub fn merge_committed(
             .filter(|d| !settles_mine.contains(&d.of))
             .count()
     ));
-    let measured_on = measured.measured_on.clone().or(committed.measured_on.clone());
+    let measured_on = measured
+        .measured_on
+        .clone()
+        .or(committed.measured_on.clone());
     let mut merged = measured.over(committed);
     merged.measured_on = measured_on;
     Ok((merged, report))

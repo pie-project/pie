@@ -741,29 +741,17 @@ impl Registry {
                 }
             };
             if !file.skipped_rates.is_empty() {
-                eprintln!(
-                    "WARN {origin}: skipped `[rates]` {}: each measured again, the rest of the file \
+                tracing::warn!(
+                    "{origin}: skipped `[rates]` {}: each measured again, the rest of the file \
                      read",
                     file.skipped_rates.join(", ")
                 );
             }
             if !file.ignored_rates.is_empty() {
-                eprintln!(
+                tracing::info!(
                     "{origin}: ignored `[rates]` {}, which this pie no longer reads; the rest is \
                      read and what it lacks is measured",
                     file.ignored_rates.join(", ")
-                );
-            }
-            if file
-                .ignored_rates
-                .iter()
-                .any(|key| key == crate::fire::KERNEL_CURVES_PER_DISPATCH)
-            {
-                eprintln!(
-                    "{origin}: the dense kernels' curves it states were timed per dispatch (~10x \
-                     long at few rows on a tiler): measured again this load, by frame spans \
-                     (`[rates] {}`)",
-                    crate::fire::KERNEL_CURVES
                 );
             }
             let spelled = match facts {

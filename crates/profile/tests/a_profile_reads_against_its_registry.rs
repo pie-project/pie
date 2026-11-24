@@ -1223,11 +1223,13 @@ fn product_times_read_back_and_accumulate() {
 
 /// How a machine lands weights (`[rates] landing`) is written and read
 /// back as stored, and a list of the wrong length, or a value not past
-/// nothing, is refused by name.
+/// nothing, is skipped by name in a user file and refused in a checked-in
+/// one.
 #[test]
 fn a_landing_reads_back_as_written() {
     let r = registry();
-    let landing = profile::fire::Landing::of([7411.0, 24.25, 2097152.0, 56.25, 217133.0, 1.81, 53.5]);
+    let landing =
+        profile::fire::Landing::of([7411.0, 24.25, 2097152.0, 56.25, 217133.0, 1.81, 53.5]);
     let rates = profile::fire::Rates {
         landing: Some(landing),
         ..profile::fire::Rates::default()
@@ -1235,9 +1237,22 @@ fn a_landing_reads_back_as_written() {
     let text = format!("api = 1\n{}", rates.toml());
     let file = r.parse(&text, "landing.toml", Strict::User).unwrap();
     assert_eq!(file.tuned.rates.landing, Some(landing), "{text}");
-    for bad in ["landing = [1.0, 2.0]\n", "landing = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0]\n"] {
+    for bad in [
+        "landing = [1.0, 2.0]\n",
+        "landing = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0]\n",
+    ] {
+        let text = format!("api = 1\n[rates]\n{bad}");
+        let file = r.parse(&text, "bad.toml", Strict::User).unwrap();
+        assert_eq!(file.tuned.rates.landing, None);
+        assert!(
+            file.skipped_rates
+                .iter()
+                .any(|s| s.contains("rates.landing")),
+            "{:?}",
+            file.skipped_rates
+        );
         let why = r
-            .parse(&format!("api = 1\n[rates]\n{bad}"), "bad.toml", Strict::User)
+            .parse(&text, "bad.toml", Strict::CheckedIn)
             .expect_err("refused")
             .to_string();
         assert!(why.contains("rates.landing"), "{why}");
