@@ -261,7 +261,7 @@ describe('eta state binding', () => {
   });
 });
 
-describe('final rows (CONTRACT-BC 25)', () => {
+describe('final rows', () => {
   const stub = (fwd: ForwardPass) => fwd.wit as unknown as ForwardPassStub;
   const pass = () => {
     const fwd = new ForwardPass();

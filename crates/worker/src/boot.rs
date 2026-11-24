@@ -242,10 +242,16 @@ impl Embedded {
 
 /// A model on its engine, the runtime not yet booted over it.
 pub struct Loaded {
-    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "net"),
+        allow(dead_code, reason = "only the networked worker names its model to peers")
+    )]
     pub(crate) model: String,
     /// The kv the engine exported, for peers to read in place.
-    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "net"),
+        allow(dead_code, reason = "only the networked worker offers its kv to peers")
+    )]
     pub(crate) kv_handle: Option<engine::KvHandle>,
     summary: Summary,
     config: runtime::bootstrap::Config,

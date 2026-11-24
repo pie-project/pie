@@ -14,10 +14,14 @@ use tarpc::serde_transport::unix;
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;
 
+/// Four beats inside the controller's default heartbeat timeout (8 s).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// The transport deadline on a long-poll watch: far past the controller's
+/// hang time (20 s), so only a lost controller trips it.
 const WATCH_DEADLINE: Duration = Duration::from_secs(300);
 
+/// The pause after a failed watch, so a down controller is not spun on.
 const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 pub trait GatewayControl: Clone + Send + Sync + 'static {

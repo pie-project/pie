@@ -43,32 +43,26 @@ pub use engine::Capabilities as EngineCapabilities;
 
 /// The fire ceilings of a shell with no planner to derive its rungs from
 /// the device: the most lanes and tokens one fire carries.
-#[cfg_attr(
-    not(any(
-        feature = "vulkan",
-        feature = "wgpu",
-        feature = "xla",
-        feature = "cerebras",
-        all(feature = "metal", target_vendor = "apple")
-    )),
-    allow(dead_code, reason = "only the shells without a planner take them")
-)]
+#[cfg(any(
+    feature = "vulkan",
+    feature = "wgpu",
+    feature = "xla",
+    feature = "cerebras",
+    all(feature = "metal", target_vendor = "apple")
+))]
 #[derive(Clone, Copy)]
 struct Fire {
     lanes: u32,
     tokens: u32,
 }
 
-#[cfg_attr(
-    not(any(
-        feature = "vulkan",
-        feature = "wgpu",
-        feature = "xla",
-        feature = "cerebras",
-        all(feature = "metal", target_vendor = "apple")
-    )),
-    allow(dead_code, reason = "only the shells without a planner take them")
-)]
+#[cfg(any(
+    feature = "vulkan",
+    feature = "wgpu",
+    feature = "xla",
+    feature = "cerebras",
+    all(feature = "metal", target_vendor = "apple")
+))]
 impl Fire {
     /// Its lanes and tokens.
     const fn of(self) -> (u32, u32) {
@@ -107,10 +101,7 @@ const CEREBRAS_FIRE: Fire = Fire {
 
 /// The index in a device name (`vulkan:1`, `tpu:0`), for a shell that drives
 /// one device; its family must be one of `families`.
-#[cfg_attr(
-    not(any(feature = "vulkan", feature = "wgpu", feature = "xla")),
-    allow(dead_code, reason = "only the one-device shells read an index")
-)]
+#[cfg(any(feature = "vulkan", feature = "wgpu", feature = "xla"))]
 fn device_index(devices: &[String], families: &[&str]) -> Result<u32> {
     let [device] = devices else {
         anyhow::bail!(

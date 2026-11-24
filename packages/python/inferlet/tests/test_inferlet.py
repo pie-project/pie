@@ -409,7 +409,7 @@ class TestForwardPassState:
 
 
 class TestFinalRows:
-    """A pass is final unless the program states it retractable (CONTRACT-BC 25)."""
+    """A pass is final unless the program states it retractable."""
 
     @staticmethod
     def _pass():

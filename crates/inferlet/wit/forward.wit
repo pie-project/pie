@@ -84,8 +84,8 @@ interface forward {
         /// States that this pass's sampled rows are final: once a fire of it
         /// samples a row, the program never retracts, truncates, rolls back
         /// or rewinds the working sets it writes below that row. Its lanes
-        /// then fold every row at fire and carry none into the next
-        /// (CONTRACT-BC 25). Unstated a pass is not final: on a set with a
+        /// then fold every row at fire and carry none into the next.
+        /// Unstated a pass is not final: on a set with a
         /// recurrent state or windows its run-ahead fires fold only what the
         /// program has accepted, so a stop can take the rest back. The
         /// runtime never infers this; only the statement counts. The SDKs

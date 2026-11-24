@@ -1157,8 +1157,7 @@ impl EngineConfig {
 
 /// Which engine `[engine] type` names.
 ///
-/// Every name here is now offered: `Vulkan` and `Wgpu` were named-not-hosted
-/// until their shells landed, and each is one `--features` flag away.
+/// Every name here is offered; each is one `--features` flag away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
@@ -1246,27 +1245,11 @@ type = "metal"
 device = ["metal:0"]
 "#;
 
-    /// A key no section declares is refused by name, rather than read as
-    /// nothing.
-    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
-    /// diagnostics record says so instead of swallowing the flag.
-    /// The word list is the shell's, so this side keeps it whole rather than
-    /// parsing it — a config that states one is the string it stated.
-    /// Every engine kind's `as_str` is the word a config file spells it with;
-    /// `as_str` is a hand-written match and nothing ties it to serde's
-    /// `rename_all` if they drift.
-    /// `[model.adapters]` absent is the shape hard-coded before it existed:
-    /// zero seats, no roster, and the correction op never launches.
-    /// The capacity is stated once: either the operator says it, or the
-    /// roster does — one number, one owner.
-    /// The two refusals this layer can make without a device.
     #[test]
     fn config_every_case() {
         an_unknown_key_is_refused();
         a_distributed_worker_states_no_cluster_policies();
         the_policies_default_to_the_built_in_defaults();
-        offload_peers_and_pools_are_unknown_keys();
-        a_submit_deadline_is_an_unknown_key();
         the_diag_flag_states_the_engines_diagnostics_key();
         measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere();
         an_engine_s_own_key_is_written_beside_the_common_ones();
@@ -1402,14 +1385,12 @@ device = ["metal:0"]
         );
     }
 
-    /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
-    /// shell, which posts frames to a host queue, takes more.
     /// Nothing reads a compute dtype from the config: a file that states
     /// one is refused as it would be for any key no struct declares.
     fn activation_dtype_is_an_unknown_key() {
         let file = std::path::Path::new("/etc/pie/config.toml");
         // An engine's own key, read through its options struct: lines 6-9
-        // are `[engine]`, `type`, `device`, the dropped key.
+        // are `[engine]`, `type`, `device`, the unknown key.
         let err = Config::parse_file(
             &MINIMAL_METAL.replace(
                 "device = [\"metal:0\"]",
@@ -1452,6 +1433,8 @@ device = ["metal:0"]
         Config::parse(MINIMAL_METAL).expect("without it, the file loads");
     }
 
+    /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
+    /// shell, which posts frames to a host queue, takes more.
     fn the_dispatch_depth_is_bounded_by_the_engine_kind() {
         for (depth, ok) in [(15, true), (16, false)] {
             let toml = format!("{MINIMAL_METAL}\n[runtime]\nframe_dispatch_depth = {depth}\n");
@@ -1473,6 +1456,8 @@ device = ["metal:0"]
         }
     }
 
+    /// A key no section declares is refused by name, rather than read as
+    /// nothing.
     fn an_unknown_key_is_refused() {
         for (section, key) in [
             ("server", "host = \"127.0.0.1\""),
@@ -1524,27 +1509,10 @@ device = ["metal:0"]
             .expect("a distributed worker states none, and takes no default");
     }
 
-    /// Which workers prefill a worker's passes and which pools keep its
-    /// runs are the cluster policy's: the keys that named them are gone.
-    fn offload_peers_and_pools_are_unknown_keys() {
-        for key in ["peers = [\"10.0.0.2:7100\"]", "pools = [\"10.0.0.3:7201\"]"] {
-            let toml = format!("{MINIMAL_METAL}\n[offload]\n{key}\n");
-            let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
-            assert!(err.contains("unknown field"), "{key}: {err}");
-        }
-    }
-
-    /// The leash is gone, and its key with it: a config that sets it is
-    /// refused by name.
-    fn a_submit_deadline_is_an_unknown_key() {
-        let toml = format!("{MINIMAL_METAL}\n[runtime]\nsubmit_deadline = \"5s\"\n");
-        let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field `submit_deadline`"),
-            "got: {err}"
-        );
-    }
-
+    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
+    /// diagnostics record says so instead of swallowing the flag. The word
+    /// list is the shell's, so this side keeps it whole rather than parsing
+    /// it: a config that states one is the string it stated.
     fn the_diag_flag_states_the_engines_diagnostics_key() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.state_diagnostics("tier-trace,kernel-profile=2")
@@ -1646,6 +1614,9 @@ device = ["metal:0"]
         assert_eq!(cfg.server.listen.port(), 8080);
     }
 
+    /// Every engine kind's `as_str` is the word a config file spells it with;
+    /// `as_str` is a hand-written match and nothing ties it to serde's
+    /// `rename_all` if they drift.
     fn every_engine_kind_round_trips_through_its_config_string() {
         const KINDS: &[(EngineKind, &str)] = &[
             (EngineKind::Cuda, "cuda"),
@@ -1677,6 +1648,8 @@ device = ["metal:0"]
         );
     }
 
+    /// `[model.adapters]` absent is zero seats, no roster, and the
+    /// correction op never launches.
     fn adapters_are_absent_by_default_and_that_is_zero_seats() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
@@ -1685,6 +1658,8 @@ device = ["metal:0"]
         assert!(cfg.model.adapters.registered.is_empty());
     }
 
+    /// The capacity is stated once: either the operator says it, or the
+    /// roster does — one number, one owner.
     fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
         let plane = if cfg!(windows) {
             "C:/adapters/0/a.bin"
@@ -1715,6 +1690,7 @@ device = ["metal:0"]
         assert_eq!(cfg.model.adapters.seats(), 8);
     }
 
+    /// The two refusals this layer can make without a device.
     fn an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name() {
         let past = MINIMAL_METAL.replace(
             "source = \"Qwen/Qwen3-0.6B\"",

@@ -212,7 +212,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
             }
         }
     };
-    // Its passes state their rows final (CONTRACT-BC 25), stop sequences or
+    // Its passes state their rows final, stop sequences or
     // none: a stop sequence only cuts the output (`Output::deliver`), the
     // set ends with the request, and nothing is taken back.
     let ran = generate(
