@@ -1526,10 +1526,16 @@ impl<B: Serve> Shell<B> {
                 rows.pieces,
                 capture,
                 rows.rs.as_ref().map(|rs| rs.tokens),
+                // A load landing snapshots inside a fire lays its rings'
+                // snapshot jobs too (their widest ring's rows), else none.
                 rows.buffer.is_some().then(|| {
                     (
                         u32::try_from(rows.windowed.len()).unwrap_or(u32::MAX),
-                        rows.windowed.iter().map(|layer| layer.window).max().unwrap_or(0),
+                        if crate::rs::snapshots(&boot.trace) > 0 {
+                            rows.windowed.iter().map(|layer| layer.window).max().unwrap_or(0)
+                        } else {
+                            0
+                        },
                     )
                 }),
                 binding,

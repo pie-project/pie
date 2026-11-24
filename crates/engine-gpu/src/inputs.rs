@@ -575,8 +575,8 @@ impl Laid {
             let most = crate::ring::most_jobs(budget.max_tokens, budget.max_tokens);
             let snaps =
                 crate::ring::most_snapshot_jobs(budget.max_lanes, budget.max_tokens, ring_rows);
-            // A lane's entry, and its snapshots' records'.
-            let entries = lanes * (1 + u64::from(kernels_slang::ssm::RS_SNAPSHOTS));
+            // A lane's entry, and its snapshots' records' where it lands any.
+            let entries = lanes * (1 + u64::from(kernels_slang::ssm::RS_SNAPSHOTS * u32::from(snaps > 0)));
             let lanes_at = take(entries * (crate::ring::LANE_INTS as u64 + u64::from(pieces)) * 4);
             let layer_ints = u64::from(rings) * u64::from(kernels_slang::attn::ring::LAYER_INTS);
             let jobs_at =
@@ -877,7 +877,8 @@ impl<B: Backend> Inputs<B> {
             Some((lanes_at, jobs_at, most, rings, snaps)) => {
                 let layer_ints = rings as usize * kernels_slang::attn::ring::LAYER_INTS as usize;
                 let entry_ints = (crate::ring::LANE_INTS as u32 + self.laid.pieces) as usize;
-                let entries = lanes as usize * (1 + kernels_slang::ssm::RS_SNAPSHOTS as usize);
+                let entries = lanes as usize
+                    * (1 + kernels_slang::ssm::RS_SNAPSHOTS as usize * usize::from(snaps > 0));
                 if fire.ring_lanes.len() > entry_ints * entries
                     || fire.ring_jobs.len() > 1 + 4 * most as usize
                     || fire.ring_snaps.len() > 1 + 4 * snaps as usize
@@ -930,13 +931,13 @@ impl<B: Backend> Inputs<B> {
             None => None,
         };
         let ring_lanes = match self.laid.ring {
-            Some((lanes_at, _, _, _, _)) => i32s(
+            Some((lanes_at, _, _, _, snaps)) => i32s(
                 handles,
                 &self.store,
                 lanes_at,
                 ((crate::ring::LANE_INTS as u32 + self.laid.pieces)
                     * lanes
-                    * (1 + kernels_slang::ssm::RS_SNAPSHOTS))
+                    * (1 + kernels_slang::ssm::RS_SNAPSHOTS * u32::from(snaps > 0)))
                     .max(1),
                 self.laid.room(lanes_at)?,
             )?,
