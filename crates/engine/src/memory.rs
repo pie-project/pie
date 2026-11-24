@@ -17,7 +17,7 @@
 //! allows, as several buffers under one budget where a buffer is bounded,
 //! or by measurement where it cannot lay a class out itself.
 
-/// The safety margin the user stated under every device's measured
+/// The safety margin kept under every device's measured
 /// capacity: what the driver is left beside everything a load places, and
 /// what a host sharing its memory with the device keeps free past what it
 /// reports available. One size, on every backend; each one imports it.
@@ -303,7 +303,7 @@ impl fmt::Display for Ledger {
 }
 
 /// The one rule every tier's target takes from the system's memory
-/// pressure (user ruling, 2026-11-15):
+/// pressure:
 /// `floor + (ceiling - floor) * (1 - yield * pressure)`, saturating.
 /// `yield` is the deployment's `[engine.memory] yield`, validated at config
 /// parse ([`crate::pressure::Yield::new`]); `pressure` the OS's reading

@@ -380,8 +380,8 @@ fn the_arena_holds_no_score_row() {
 /// layers and averaged over the query heads, and that summed a kv page of
 /// the load's own (its chunk recipe's, not the boot's). A fire as wide as the
 /// load carries, one lane capturing, lays that lane's rows alone. The boot
-/// asks for 256 lanes and 512 tokens, but the load's fire top is the rung its
-/// ruling picks on this device (`engine::load::fire_top`), which may be
+/// asks for 256 lanes and 512 tokens, but the load's fire top is the rung the
+/// fire-top rule picks on this device (`engine::load::fire_top`), which may be
 /// narrower: the fire takes the lanes and tokens the load states
 /// (`Shell::budget`), the capturing lane's prompt and a token each for the
 /// rest.

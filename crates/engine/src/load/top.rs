@@ -669,7 +669,7 @@ mod tests {
                 .contains("`pie tune <backend> --rates` measures it"),
             "{err}"
         );
-        // No feasible rung at all: the ruling's refusal.
+        // No feasible rung at all: the fire-top rule's refusal.
         let none = [rung(1024, 300 * MIB, Some("past one binding"))];
         let err = choose(&none, 1 << 33, u32::MAX, &rates(), "Card X", &counts()).unwrap_err();
         assert!(matches!(err, Refused::NoRung(_)), "{err}");

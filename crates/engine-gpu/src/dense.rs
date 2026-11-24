@@ -1650,7 +1650,7 @@ mod tests {
         assert_eq!(eager.at(3, 4096, 4096).vector, 1);
     }
 
-    /// The Adreno 840's curves for Qwen3-0.6B (022833c03, native), some
+    /// The Adreno 840's curves for Qwen3-0.6B (measured native), some
     /// stopped short (beaten, or by the buffer at the head): each rung's
     /// estimate for the kernel it takes only grows with the rows, and is the
     /// model's planes' flops over that kernel's measured rates (within a

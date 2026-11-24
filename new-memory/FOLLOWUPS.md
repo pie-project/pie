@@ -1570,3 +1570,15 @@ to 0.375 by row 600). Qwen3-0.6B moves 0.125-0.25 under the same cuts; gpt-oss-2
 **What.** Buffered bodies run +4–5% on AMD (~rsc, parked: F83), and the carried kernel cannot reach plain parity (n = 1, +8 µs). Since the SDK states rows final by default, buffered fires come only from beams, speculative decoding and rollback.
 
 **Why later.** User ruling (2026-11-24): beam performance goes to a follow-up PR.
+
+## F87. `ChunkFacts::act_span_chunks` goes once no engine pins its span's bottom at load
+
+**What.** `crates/engine/src/chunk.rs:143` `act_span_chunks`: the chunks from the range's end a rung's activation may take. The end state is `None` on every engine; engine-gpu (`store/layout.rs:412`) and engine-metal (`store/layout.rs:576`) still state it, as they pin their span's bottom at load. The field and the runtime's reads of it (`store/shared.rs`, `store/shared/programs.rs`) go with the last of them.
+
+**Why later.** Each engine's span has to be backed on demand first; the comment that called it interim moved here.
+
+## F88. engine-gpu: arm the request classes whose lanes carry an attachment
+
+**What.** `crates/engine-gpu/src/serve.rs:10420` (`record_bodies`), `:1248` (`eager_classes`), `:5232` (`eager_kind`): a class whose lanes carry a score capture, an adapter or a guest input is stated eager at load, since its commands bind each attachment, which multiplies the bodies past what a device holds. It is armed once its commands read the attachment as data.
+
+**Why later.** Needs the attachment read as data in the recorded commands; until then those classes run eager, stated at load.

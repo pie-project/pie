@@ -13,8 +13,8 @@ impl engine_gpu::Backend for Api {
 
     const COPY_GRAIN: u64 = 4;
 
-    /// The pool is laid whole at load and never resized, as XLA's (user
-    /// ruling, 2026-11-15): no `yield` applies.
+    /// The pool is laid whole at load and never resized, as XLA's: no
+    /// `yield` applies.
     const RESIZES_POOL: bool = false;
 
     const STORAGE: checkpoint::types::BackendKind = checkpoint::types::BackendKind::Wgpu;

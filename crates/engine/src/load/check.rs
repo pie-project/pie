@@ -313,7 +313,7 @@ pub fn check(
     }
     let e = &weighed.estimate;
     let est: Vec<f64> = rungs.iter().map(|r| e.ns(r)).collect();
-    // Both picks are the ruling's over every rung timed: the estimate's
+    // Both picks are the fire-top rule's over every rung timed: the estimate's
     // argmax (efficiency times live capacity) against the measured times'.
     // No cap stands between them: the load's fire top is this pick, one
     // function (`super::fire_top`), and a top set too low shows as a

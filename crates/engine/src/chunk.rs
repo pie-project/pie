@@ -138,9 +138,7 @@ pub struct ChunkFacts {
     /// The runtime sets aside no rung whose activation with the term is
     /// over it (fires are cut to the widest rung under it), and reads it
     /// where it fits a rung, keeping nothing derived from it: a later
-    /// statement replaces it. An interim: the end state is `None` on every
-    /// engine, and the field goes with the last engine that pins its span's
-    /// bottom at load.
+    /// statement replaces it.
     #[serde(default)]
     pub act_span_chunks: Option<u32>,
     /// Host chunks state can be parked in, one id space beside the device's

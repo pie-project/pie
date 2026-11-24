@@ -793,8 +793,8 @@ pub const ATTN_SET_BYTES: usize = WEIGHT_BYTES;
 /// The q / k / v sets the timed attentions of `shape` rotate through, its
 /// kv laid in pages of `page` keys: [`ATTN_SET_BYTES`] of the shape's q rows
 /// and of k and v over the pages as laid, whole (bf16), and never fewer
-/// than 2. (engine-cuda's sizing, 63876a684: a few-key point's page is
-/// laid whole, so its sets are counted by it.)
+/// than 2. A few-key point's page is laid whole, so its sets are counted by
+/// it (as engine-cuda sizes them).
 #[must_use]
 pub fn attn_sets_at(shape: AttnShape, page: u32) -> usize {
     let q_bytes = shape.rows as usize * (shape.q_heads * shape.head_dim) as usize * 2;
@@ -2950,7 +2950,7 @@ mod tests {
         assert!(ATTN_DIMS.windows(2).all(|w| w[0] < w[1]));
         // 512 keys at d 64: 1 MiB of q, 1 MiB of k and v; 16384 at 256: 256
         // MiB, three sets past 768 MiB.
-        // engine-cuda's sizing (63876a684), the pages laid whole: 512 keys
+        // The pages laid whole, as engine-cuda sizes them: 512 keys
         // at d 64, q 1 MiB and kv 1 MiB, 384 sets of 768 MiB; at 16384 and
         // d 256 three; one key lays its whole page of 16.
         assert_eq!(attn_sets_at(ATTN_SHAPE.at(512).with_dim(64), 16), 384);
@@ -3018,8 +3018,7 @@ mod tests {
     fn the_warm_up_runs_until_its_rate_stops_falling() {
         // A clock sinking 100, 90, 84, then 82 and 82.5: five rotations, to
         // the second step in a row that moves it by less than AGREEMENT
-        // (the stop rule every measurement settles by; it was the first
-        // rotation not slower than the one before).
+        // (the stop rule every measurement settles by).
         let mut rates = [100.0, 90.0, 84.0, 82.0, 82.5, 80.0].into_iter();
         let warmed = warm_up(|| Ok::<f64, ()>(rates.next().unwrap())).unwrap();
         assert_eq!((warmed.rotations, warmed.rate), (5, 82.5));
