@@ -196,6 +196,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-pause"
+version = "0.1.0"
+dependencies = [
+ "plex",
+]
+
+[[package]]
 name = "test-route"
 version = "0.1.0"
 dependencies = [

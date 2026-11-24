@@ -7,6 +7,7 @@
 resolver = "2"
 members = [
     "noop",
+    "test-pause",
     "test-route",
     "test-share",
     "test-trap",
