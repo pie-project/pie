@@ -48,8 +48,7 @@ pub enum RsPlan {
     /// share its folded window and fold it once.
     Groups(Vec<GroupPlan>),
     /// The model's state is window lists: each row lands its rows in each
-    /// list's slots, then moves its windows. Removed by the windowed-state
-    /// change: the integration commit deletes it, once every engine states
+    /// list's slots, then moves its windows: an engine that does not state
     /// `Capabilities::windowed_state`.
     Window(Vec<WindowRow>),
 }
@@ -348,7 +347,7 @@ impl PreparedRs {
 /// states one (`Lane::tables`, `Lane::fixed`, and the rs list slots a
 /// group's first lane copies before the fire, `Lane::slot_copies`, where it
 /// writes buffered rows into a slot it shares); nothing where `shared` is
-/// `None`. The legacy fields stay as they are. A lane's list table is its
+/// `None`. The lane's other fields stay as they are. A lane's list table is its
 /// translation where one is stated, else its pages (the list shape's slot
 /// refs either way), each window list's table its own (0 where trimmed)
 /// and the window slots it copies first among its `Lane::slot_copies`
@@ -673,8 +672,7 @@ pub fn prepare_many(
     }
     let groups = match plan {
         RsPlan::Window(rows) => {
-            // The window-list path's own refusal: removed by the
-            // windowed-state change with `RsPlan::Window`. An engine that
+            // The window-list path's own refusal. An engine that
             // states `windowed_state` plans `RsPlan::Groups`, its beams
             // sharing one folded window.
             for (index, ws) in working_sets.iter().enumerate() {

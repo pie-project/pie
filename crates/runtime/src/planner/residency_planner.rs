@@ -510,10 +510,9 @@ impl ResidencyPlanner {
         // all, that one does. The first is the finisher. An ask of any
         // other waits while it would leave someone ahead of it unable to
         // finish in turn; one in the finisher's place never waits. Held to
-        // the first alone, every ask past it was let in while the next
-        // process in line no longer fit (the simulation's field mix: the
-        // finisher ended, the oldest then needed 74 pages with 19 free, and
-        // every other ask was held while nothing could move).
+        // the first alone, every ask past it would be let in while the next
+        // process in line no longer fits, and once the finisher ends every
+        // other ask is held while nothing can move.
         let mut order: Vec<(u64, u64, super::inner::CapacityRead)> = candidates
             .iter()
             .map(|candidate| {
@@ -548,13 +547,12 @@ impl ResidencyPlanner {
         }
         // The finisher stays first while it still fits, or while no one
         // else does: it runs to its end. Read afresh each pass, the first
-        // flipped between two processes as a restore moved one's need:
-        // restored as the finisher, the other's next ask evicted it, which
-        // made it the finisher again, 914 times over one head in the field
-        // mix's wide shape (seed 7: many beam searches at once). A move
-        // under way opens chunks below for a step (the slack): read then,
-        // no one fitted, and the finisher passed to whoever needed least
-        // for that step, its own restore's victim among the rest.
+        // would flip between two processes as a restore moves one's need:
+        // restored as the finisher, the other's next ask evicts it, which
+        // makes it the finisher again, round and round. A move under way
+        // opens chunks below for a step (the slack): read then, no one
+        // fits, and the finisher would pass to whoever needs least for that
+        // step, its own restore's victim among the rest.
         let kept = self.with_inner(|inner| inner.capacity.map(|gate| gate.finisher));
         if let Some(at) = order.iter().position(|&(_, _, read)| Some(read.finisher) == kept)
             && (fits(&order[at]) || !order.iter().any(fits))
@@ -674,9 +672,8 @@ impl ResidencyPlanner {
         }
         // One map a generation, over every process the planner knows and
         // those asked: each candidate list (the eviction plan's, the stall
-        // line's, the parked map's) reads its own restriction of it. Built
-        // per list, a pass built it up to three times (the L40S's 14 s of
-        // map passes in a 334 s run).
+        // line's, the parked map's) reads its own restriction of it, so a
+        // pass builds it once, not once per list.
         let generation = self.generation();
         if let Some((at, of, map)) = self.restricted_cache.lock().as_ref()
             && *at == generation
@@ -730,15 +727,14 @@ impl ResidencyPlanner {
 
     pub(super) fn never_fits(&self, key: EntryKey) -> Option<super::PlannerError> {
         // One device figure on every path: the state room at the narrowest
-        // rung, lent span included (Mac Pro on ba229ff25 read 365 pages on
-        // one path and 428 on the other, the 63 lent chunks apart).
+        // rung, lent span included, so no two paths read figures the lent
+        // chunks apart.
         let most = self.port.state_chunks_most();
         let total = self.device_pages_most();
         // Its runs, its unpark's and its state's chunks together past every
         // chunk state may take: with every other process evicted and all
         // parked state moved down it still would not fit, and it is refused
-        // by name, never waited on (the L40S on 3b45462d4: a restore's 1,058
-        // slots of guest state against what the state limit leaves).
+        // by name, never waited on.
         if most != u32::MAX
             && let Some(room) = self.head_room_within(key, false)
             && room.chunks() > u64::from(most)
@@ -754,9 +750,8 @@ impl ResidencyPlanner {
             });
         }
         // A run longer than any segment lays for state is never laid,
-        // whatever moves: refused by name, never waited on (the M5 at beam
-        // w32: a restore of runs of 57 chunks, the planner finding no step
-        // 0.5 M times).
+        // whatever moves: refused by name, never waited on (waited on, the
+        // planner finds no step for it without end).
         let longest = self.port.longest_run_most();
         if longest != u32::MAX
             && let Some(room) = self.head_room_within(key, false)
@@ -813,10 +808,9 @@ impl ResidencyPlanner {
                     continue;
                 }
                 // Not on the policy's answer of nothing freed: nothing
-                // changed, and a pass taken on it said the shortfall again,
-                // drew the next such answer and planned again, sixty times a
-                // second with nothing to issue (the L40S: a stuck head, 98
-                // passes between two stall reports). What the policy does
+                // changed, and a pass taken on it would say the shortfall
+                // again, draw the next such answer and plan again, with
+                // nothing to issue. What the policy does
                 // free comes back through the pool's room signal.
                 tokio::select! {
                     () = notify.notified() => planner.plan(),
@@ -885,9 +879,8 @@ impl ResidencyPlanner {
     /// room no pass has planned it on since the fleet went quiet: the fleet
     /// going quiet is an event no store tells (the last fire landing, an
     /// eviction settling), and with no pass after it a restore head left
-    /// unfunded while fires were in flight waited for good (Mac Pro's
-    /// 2 GiB: one stall line in three minutes, 0 chunks free, 308
-    /// emptiable, no eviction issued). Once per head and room: the same
+    /// unfunded while fires were in flight would wait for good. Once per
+    /// head and room: the same
     /// room plans nothing again. Records the room it reads.
     fn quiet_unplanned(&self) -> bool {
         let room = [
@@ -911,8 +904,8 @@ impl ResidencyPlanner {
 
     /// A head unserved past [`super::plan::STALL_SAYS_AGAIN`], spinning or
     /// quiet: what is in flight and whose slots hold the opened chunks are
-    /// said, once per head each such span. Mac Pro's 2 GiB mix went silent
-    /// after one stall line, a head waiting on something no line named.
+    /// said, once per head each such span, so a head waiting on something
+    /// is never left unnamed after its first stall line.
     fn say_held_in_flight(&self) {
         let gives = self.port.room_gives();
         let held = self.with_inner(|inner| {
@@ -921,7 +914,7 @@ impl ResidencyPlanner {
                 .map(|(key, waiter)| (key, waiter.pid, waiter.kind_name()))?;
             // Once per head each STALL_SAYS_AGAIN, spinning or quiet: a
             // head re-planned continuously never goes quiet, and its line
-            // was never said (Mac Pro on 22b0a3e83).
+            // would never be said otherwise.
             let now = crate::rt::Instant::now();
             match inner.held_in_flight {
                 Some((at, _, since, _)) if at == key => {
@@ -969,7 +962,7 @@ impl ResidencyPlanner {
             let store = self.store_holders();
             // What the pool's walker awaits and for how long: a walk stuck
             // on a lane op's reply steps nothing, the head's asked
-            // compaction or grow never sent (the M1's run 10).
+            // compaction or grow never sent.
             let walk = crate::store::shared::walk_waiting(self.port.locus().1)
                 .map_or_else(|| "nothing".to_string(), |(what, since)| format!("{what} since {since:?} ago"));
             tracing::warn!(
@@ -1054,18 +1047,17 @@ impl ResidencyPlanner {
         // there): a count that room already meets moves nothing, so its
         // want is past what stands. Its chunk count met by the free chunks
         // (a restore short of a run of four, 231 chunks free), every chunk
-        // given back anywhere, the pass's own among them, woke a pass that
-        // found no step (Mac Pro's mx-3: ~470 a second, nothing in flight).
+        // given back anywhere, the pass's own among them, would wake a pass
+        // that finds no step.
         // A head never refused is tried against the room standing, its
         // want its need.
         let past = |count: u32| if refused { u64::from(count).saturating_add(1) } else { 0 };
         // Refused, it goes again on any chunk more than its refusal left
         // where its placement stands, which reads its own parked parts
         // retaken first: fewer chunks free than its whole need's count can
-        // stand it. A floor of that count left a chunk given back that
-        // stood it unwoken, the head waiting on a pass some other event
-        // ran (the simulation's lost wakes: "restore short of runs:
-        // something in flight, not funded", then sent at once).
+        // stand it. A floor of that count would leave a chunk given back
+        // that stands it unwoken, the head waiting on a pass some other
+        // event runs.
         let mut want_chunks = self.head_room(key).map_or(u64::MAX, |need| {
             if refused {
                 past(self.port.free_chunks())
@@ -1087,14 +1079,11 @@ impl ResidencyPlanner {
         // refused: slots of those shapes given back fill no chunk and move
         // no kv slot, so no count the signal carries measures them; any
         // room given back wakes it. Left to the free chunks' count, a
-        // restore short of its state waited for a fire landing's poke, up
-        // to 15 s (the L40S at 6 GiB on 22b0a3e83: restores served almost
-        // all by pokes, about one a run by the room signal).
+        // restore short of its state would wait for a fire landing's poke.
         // Refused before in its unpark or not: its step is state slots
         // (read ahead of its runs), and the refusal's want of more chunks
         // than stood was a count state given back inside open chunks never
-        // moves (the L40S at 6 GiB on 5120cbc3c: restore waits served by
-        // pokes, up to 16.5 s, a few by the room signal).
+        // moves.
         if rs_short && (!refused || kv_missing == 0) {
             want_chunks = 0;
         }
@@ -1150,7 +1139,7 @@ impl ResidencyPlanner {
     /// change the generation already reads (the pool's counts, the grant
     /// returns). A wake whose generation the last no-step pass ended on
     /// plans nothing ([`Self::settled_at`]): waking each parked KV-short
-    /// restore on every poke cost the L40S ~280 s of waits a run.
+    /// restore on every poke costs passes that plan nothing.
     pub(super) fn wake_planner(self: &Arc<Self>) {
         self.returns
             .wake_cause
@@ -1435,22 +1424,18 @@ impl ResidencyPlanner {
         // chunks the pages still need are asked in runs of its longest
         // length, laid after the runs (they need not be adjacent; asked so,
         // no page gathered first breaks a run the need counts on). Read as
-        // the runs alone, fitting runs stood (Mac Pro: a restore of (3, 3)
-        // and 41 kv pages, 8 runs open), the pages broke them as they were
-        // gathered, and the unpark came up short.
-        // Its state the serve takes first (Mac Pro's 2 GiB on 3b45462d4: a
-        // restore's records opened chunks between the map's read and its
-        // unpark, which came up short of a run of four with no chunk free,
-        // the map showing its need standing, round after round) is asked
-        // the same way.
+        // the runs alone, fitting runs stand, the pages break them as they
+        // are gathered, and the unpark comes up short.
+        // Its state the serve takes first (a restore's records open chunks
+        // between the map's read and its unpark, which would come up short
+        // with the map showing its need standing) is asked the same way.
         let (kv_missing, rs) = kv_missing;
         let pages = kv_missing.saturating_add(self.port.rs_as_pages(rs));
         let per_chunk = self.port.chunks_as_pages(1);
         // As single chunks beside its runs, never runs of their own: asked
         // as runs of the longest length, a restore with many pages to
-        // gather asked runs no pool of this size held (Mac Pro at 2 GiB on
-        // c10d7de5d: (7, 1) grew to (7, 31), 217 chunks against 30 free runs
-        // of 7, on a device 310 of 365 pages free, and nothing was moved).
+        // gather would ask runs no pool of this size holds, and nothing is
+        // moved.
         // Where its gathered pages break runs the map stood, the store's
         // placement (its kv taken first) places them first, and the map
         // lays its runs in what they leave ([`Self::head_placement`]).
@@ -1494,7 +1479,7 @@ impl ResidencyPlanner {
     /// list slots, [`PoolPort::chunk_occupants`] of them), the head's own
     /// once it is evicted. A move down a tier frees either
     /// ([`Self::park_down`]); counted as no one's, queued processes waiting
-    /// to be restored held chunks no move freed (Mac Pro on 22b0a3e83).
+    /// to be restored would hold chunks no move frees.
     pub(super) fn parked_map(&self, head: ProcessId) -> super::pool::ChunkMap {
         let except = self.parked_except(head);
         let evicted: Vec<ProcessId> = self.with_inner(|inner| {
@@ -1520,8 +1505,8 @@ impl ResidencyPlanner {
     /// resident (its state is live, whatever of it lies parked), nobody's
     /// once it is evicted. Nothing runs on an evicted head's state parked in
     /// place; moved down a tier, its restore lays it back compactly. Left
-    /// out, an evicted head's own tables and rings (126 instances on the
-    /// M1) held the chunks its bind's runs needed, and nothing moved them.
+    /// out, an evicted head's own tables and rings would hold the chunks
+    /// its bind's runs need, and nothing would move them.
     pub(super) fn parked_except(&self, head: ProcessId) -> ProcessId {
         let evicted = self.with_inner(|inner| {
             inner
@@ -1653,8 +1638,8 @@ impl ResidencyPlanner {
         });
         if pids.is_empty() || !self.port.move_parked_down(self, &pids, &order) {
             // Refused here as at its landing: not tried again on this room
-            // (its take and give-back of the slots below counted room freed,
-            // and the pass ran again on it, for good: seed 3392).
+            // (its take and give-back of the slots below count as room
+            // freed, and the pass would run again on it for good).
             if !pids.is_empty() {
                 self.park_down_failed
                     .store(self.park_down_room(), Ordering::Release);
@@ -2194,10 +2179,8 @@ impl ResidencyPlanner {
             });
             // The suspended bind it was restored for waits for room again:
             // its restore is over, and the next bind-suspended restore may
-            // go. Held for it, every other one waited on a bind that waits
-            // behind them (Mac Pro's beam mix: a restored process short at
-            // its bind again, the queue's head a bind-suspended restore,
-            // flat with every thread parked).
+            // go. Held for it, every other one would wait on a bind that
+            // waits behind them, every thread parked.
             let released = waiting && inner.bind_restoring == Some(pid);
             if released {
                 inner.bind_restoring = None;
@@ -2392,9 +2375,7 @@ impl ResidencyPlanner {
         let suspended = self.stats.evictions_started.load(Ordering::Relaxed) > before;
         // Its suspension begun changes who heads the queue (a restore ahead
         // of new work goes first only while the fleet runs): the waiters
-        // plan on it now, not on its landing (the simulation's lost wakes:
-        // allocations served at once by a pass forced after a bind's
-        // suspend, none planned since).
+        // plan on it now, not on its landing, or a wake is lost.
         if suspended && self.returns.waiters.load(Ordering::Acquire) != 0 {
             self.poke();
         }

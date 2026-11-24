@@ -404,48 +404,31 @@ pub fn conversion_contract(
     platform: Platform,
 ) -> Option<(String, ModelContract)> {
     let target = convert_target();
-    let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
-    let pinned = std::env::var("PIE_IMPORT_DEPLOYMENT").ok();
     for deployment in catalog().candidates_of(source, platform) {
-        let read = deployment.contract(source, platform);
-        if pinned
-            .as_deref()
-            .is_some_and(|name| name != deployment.name)
-        {
-            continue;
-        }
-        let contract = match read {
+        let contract = match deployment.contract(source, platform) {
             Ok(contract) => contract,
             Err(why) => {
-                if trace {
-                    eprintln!(
-                        "identify: {} does not read this source: {why}",
-                        deployment.name
-                    );
-                }
+                tracing::debug!(
+                    deployment = %deployment.name,
+                    "identify: does not read this source: {why}"
+                );
                 continue;
             }
         };
-        if pinned.is_none()
-            && let Some(plane) = poem_compiler::catalog::requantizes(&contract)
-        {
-            if trace {
-                eprintln!(
-                    "identify: {} reads it only by re-quantizing `{plane}`; not by identification",
-                    deployment.name
-                );
-            }
+        if let Some(plane) = poem_compiler::catalog::requantizes(&contract) {
+            tracing::debug!(
+                deployment = %deployment.name,
+                "identify: reads it only by re-quantizing `{plane}`; not by identification"
+            );
             continue;
         }
         match checkpoint::plan::compile(metadata, &contract, target.clone()) {
             Ok(_) => return Some((deployment.name, contract)),
             Err(why) => {
-                if trace {
-                    eprintln!(
-                        "identify: {} reads it but does not compile: {why}",
-                        deployment.name
-                    );
-                }
+                tracing::debug!(
+                    deployment = %deployment.name,
+                    "identify: reads it but does not compile: {why}"
+                );
             }
         }
     }

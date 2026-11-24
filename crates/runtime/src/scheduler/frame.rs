@@ -135,10 +135,9 @@ struct LaneState {
     /// (`forward.park()`, [`FramePolicy::on_lane_park`]), or its guest waits
     /// on outside input ([`FramePolicy::on_owner_away`]). Kept only while frames it submitted
     /// wait to go, and never expected again by its owner's unblock or
-    /// resume. Kept parked as any other, an unblock expected it again, and a
-    /// frame waited for good on a lane that would not submit (a verified
-    /// beam's rescoring pipelines, closed mid-run: the L40S's and the Mac's
-    /// beamx8 on de4712551, once no leash parked a silent lane).
+    /// resume. Kept parked as any other, an unblock would expect it again,
+    /// and a frame would wait for good on a lane that never submits (a
+    /// verified beam's rescoring pipelines, closed mid-run).
     own_submit: bool,
     /// The fire whose output its process waits on, having submitted
     /// nothing since ([`FramePolicy::on_lane_waits`]): until that fire
@@ -264,8 +263,8 @@ pub(crate) struct FramePolicy {
     /// Lanes whose pipeline closed, by lane, with their owner: kept until
     /// the owner leaves, so a fire that raced the close rides the next seal
     /// as a straggler and never makes the lane expected again (a closed
-    /// lane re-expected by such a fire held every later frame for good:
-    /// the Mac's verified beamx8 on 30de3bee6).
+    /// lane re-expected by such a fire would hold every later frame for
+    /// good).
     closed: BTreeMap<ProcessId, Option<ProcessId>>,
     /// Lanes a frame sealed past while their guests computed and the device
     /// would otherwise have gone idle: each rejoins with its next submit.
@@ -367,10 +366,9 @@ impl FramePolicy {
 
     /// [`Self::cut_owed`], and the process whose frame holds that widest
     /// fire: the lane's owner, whom a raise to it is funded for (the lane
-    /// where it names none). Named by its lane, the raise asked the
-    /// planner for a process it did not know, was told "planner request
-    /// cancelled" every pass, and the capped frames sat for good (Mac Pro
-    /// at 2 GiB on 4cef0c7d3: four lanes capped, 82 such refusals).
+    /// where it names none). Named by its lane, the raise would ask the
+    /// planner for a process it does not know, be told "planner request
+    /// cancelled" every pass, and the capped frames would sit for good.
     #[must_use]
     pub fn cut_owed_by(&self) -> (usize, Option<ProcessId>) {
         self.lanes
@@ -413,9 +411,8 @@ impl FramePolicy {
 
     /// The widest rung rows any fire queued in a lane's frames takes,
     /// complete or still gathering: the rung is not lowered under them
-    /// (a frame still gathering when the lower was granted completed wider
-    /// than the cap, capped, and waited on a raise: Mac Pro at 2 GiB on
-    /// dc1414ae8, rows 112 under a cap of 64).
+    /// (a frame still gathering when the lower is granted can complete
+    /// wider than the cap, capped, and wait on a raise).
     #[must_use]
     pub fn queued_widest(&self) -> usize {
         self.lanes
@@ -930,7 +927,7 @@ impl FramePolicy {
         policy.on_fire_enqueued(stamp(owner, 1), Some(owner), 3, 1, 1);
         let queued: QueuedFireIds = [3].into_iter().collect();
         // The control, with a frame in flight: the other lane's guest
-        // computes and is held for (F45: only an idle device seals past it).
+        // computes and is held for (only an idle device seals past it).
         let held = matches!(
             policy.plan_dispatch(&queued, &HashSet::new(), true, now),
             FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)
@@ -1901,8 +1898,8 @@ mod tests {
     }
 
     /// As [`plan`], with a frame of the policy's in flight on the device:
-    /// a lane whose guest computes is held for (F45: only an idle device
-    /// seals past a lone computing lane).
+    /// a lane whose guest computes is held for (only an idle device seals
+    /// past a lone computing lane).
     fn plan_in_flight(policy: &mut FramePolicy, queued: &QueuedFireIds, now: Instant) -> FramePlan {
         policy.plan_dispatch(queued, &HashSet::new(), true, now)
     }
@@ -2155,7 +2152,7 @@ mod tests {
         a_lane_waiting_on_its_output_holds_no_one_elses_next_frame();
     }
 
-    /// The Mac's verified beamx8 on 30de3bee6: a verify beam's lane is
+    /// A verified beam of eight: a verify beam's lane is
     /// unawaited as its owner waits, rides a seal, submits a frame of two
     /// fires and closes, a fire of its racing the close; the other lanes
     /// close or leave. Its queued frame is complete and nothing else is
@@ -2225,9 +2222,9 @@ mod tests {
         }
     }
 
-    /// More processes than execution permits arrive together (gemma-4-E2B
-    /// decode c256 on 43b4fa5ba: 37 lanes missing from the first frame, 37
-    /// waiters at the execution gate with no permit left). A lane is
+    /// More processes than execution permits arrive together (lanes would
+    /// be missing from the first frame, their processes waiting at the
+    /// execution gate with no permit left). A lane is
     /// expected from its opening, so it opens only once its process is
     /// admitted past the bind and execution gates (`Pipeline::new` admits
     /// first). Opened while its process waited at a gate, the frame waited
@@ -2368,7 +2365,7 @@ mod tests {
     /// alone, and each waiter, its pages sealed, is unblocked and rides the
     /// next frame with the rest.
     fn joiners_waiting_on_a_claimant_s_prefix_hold_no_frame() {
-        // Four greedy decodes (the Mac's greedy4 on 43b4fa5ba) and sixteen.
+        // Four greedy decodes and sixteen.
         for count in [3usize, 15] {
             let mut policy = FramePolicy::new(1, 64, 4096, None);
             let claimant = pid();
@@ -2467,10 +2464,10 @@ mod tests {
         }
     }
 
-    /// Mac Pro at 2 GiB on 4cef0c7d3: four lanes' complete frames wider
-    /// than the cap, their raise asked of the planner for the lane's id,
-    /// which no process has: "planner request cancelled" every pass. The
-    /// raise is funded for the lane's owner.
+    /// Lanes' complete frames wider than the cap: a raise asked of the
+    /// planner for the lane's id, which no process has, is told "planner
+    /// request cancelled" every pass. The raise is funded for the lane's
+    /// owner.
     #[test]
     fn a_capped_frame_s_raise_is_owed_by_its_lane_s_owner() {
         let mut policy =
@@ -2481,8 +2478,8 @@ mod tests {
         assert_eq!(policy.cut_owed_by(), (256, Some(owner)), "the owner, not the lane");
     }
 
-    /// Mac Pro at 2 GiB on dc1414ae8: a frame still gathering when the
-    /// lower was granted completed 112 rows wide under a cap of 64. The
+    /// A frame still gathering when the lower is granted completes 112 rows
+    /// wide under a cap of 64. The
     /// widest queued fire counts whether its frame is complete or not.
     #[test]
     fn a_frame_still_gathering_counts_toward_the_widest_queued() {
@@ -2936,9 +2933,9 @@ mod tests {
         assert_eq!(policy.cut_owed(), 0);
     }
 
-    /// Mac's beamx8 on e158f45d2: the rung lowered to 8, one lane's process
-    /// waited for a raise ("enqueue: the activation rung") while three
-    /// lanes' fronts stood complete, and the frame was held for the fourth.
+    /// The rung lowered to 8, one lane's process waits for a raise
+    /// ("enqueue: the activation rung") while three lanes' fronts stand
+    /// complete, and the frame is held for the fourth.
     /// Waiting on the raise, its owner is parked (`parks_here`, as
     /// owner-waits): the frame seals with the three, and once the raise
     /// comes the fourth submits and serves.
@@ -3423,8 +3420,8 @@ mod tests {
         assert_eq!(policy.admit_post(a, 1), Ok(()), "a pipeline that left is forgotten");
     }
 
-    /// A joining frame with lanes in a mixed state (the L40S's and the
-    /// Mac's beamx8 stall on de4712551): an owner's lane closes with a frame
+    /// A joining frame with lanes in a mixed state (a beam of eight): an
+    /// owner's lane closes with a frame
     /// still queued, so it is kept until that frame goes; the owner blocks
     /// on the planner and is unblocked again. Its closed lane is never
     /// expected again: the owner's live lane's next frame goes, never held
@@ -3557,8 +3554,8 @@ mod tests {
     /// A process whose bind found no room for its guest state (or whose
     /// pass waits for a raise of the activation rung) submits nothing
     /// until it is through: the frame its lane was awaited in
-    /// goes without it (the soak's 56-lane frame held 6 minutes on one
-    /// process stuck at bind). Its next submit brings the lane back.
+    /// goes without it (else a wide frame is held on one process stuck at
+    /// bind). Its next submit brings the lane back.
     fn a_frame_goes_without_a_lane_whose_process_waits() {
         let mut policy =
             FramePolicy::new(1, 64, 4096, None);

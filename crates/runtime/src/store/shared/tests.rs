@@ -1253,7 +1253,7 @@ async fn a_lower_seats_a_taker_short_of_records() {
     assert!(pool.take_records(1).is_some(), "the taker is seated");
 }
 
-/// The stack wedge (MI300X, 500 at once): the rung rose to the largest
+/// The stack wedge (500 processes at once): the rung rose to the largest
 /// while nothing waited, and took the committable room; guest binds then
 /// waited behind it, and the walk held the throughput rung (and asked to
 /// rise again) while they did. A throughput rung is ordered after every
@@ -1835,9 +1835,9 @@ fn the_state_room_leaves_out_the_weights_pinned_slots() {
 }
 
 /// A compaction the planner asked for that no window clears by the walk's
-/// turn is answered, never left pending (the M1's run 10: a restore's plan
-/// ended "compaction asked" every pass for ten minutes, the walk sending
-/// none, nothing in flight): the ask is dropped, and the walk tells the
+/// turn is answered, never left pending (else a restore's plan ends
+/// "compaction asked" every pass, the walk sending none, nothing in
+/// flight): the ask is dropped, and the walk tells the
 /// planner, whose next pass reads the pool as it stands.
 #[test]
 fn a_compaction_asked_that_no_window_clears_is_answered() {

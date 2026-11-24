@@ -1,10 +1,10 @@
 //! A process's fires on their way through the engine: while one is, the
 //! process is not stalled, whatever else of it is parked.
 //!
-//! A process whose lanes ask apart (text-completion-bench's batch) parked one
-//! lane while the others' fires ran; read as stalled, the fleet looked
-//! wedged and the process was reclaimed and replayed, often thousands of
-//! times, before the ask that could never fit parked and failed. A fire
+//! A process whose lanes ask apart parks one lane while the others' fires
+//! run; read as stalled, the fleet would look wedged and the process be
+//! reclaimed and replayed, often thousands of times, before the ask that
+//! could never fit parked and failed. A fire
 //! settles once the engine runs it, and its settling pokes the planner, so a
 //! parked lane waits for it instead.
 //!
@@ -87,8 +87,8 @@ impl ResidencyPlanner {
         // After the count drops: a poke read before it would see the fire
         // still in flight and wait on a settling that has passed. A head
         // refused on room that has not moved since is not planned again
-        // for it: fire landings re-planned such a head at hundreds a second
-        // (Mac Pro on 22b0a3e83: 838 no-step lines a second at peak).
+        // for it: fire landings would re-plan such a head at hundreds a
+        // second.
         if self.head_refused_on_room_unmoved() {
             self.pages_freed_quietly();
         } else {

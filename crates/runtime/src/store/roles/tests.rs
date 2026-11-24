@@ -1223,7 +1223,7 @@ fn a_shared_adapter_is_one_set_of_slots_freed_at_the_last_close() {
 /// one holder's park in flight, another's park leaves the adapter where it
 /// lies, so when the first park is taken back (the tier below full) its
 /// instance is resident on its adapter, never on slots given back (the
-/// pair's alias, the L40S's CUDA 700 on c8077be0f). Once every holder's
+/// pair's alias, a device fault). Once every holder's
 /// park has landed, the adapter is parked where it lies, for a move down.
 #[test]
 fn a_shared_adapter_stays_while_a_holder_may_still_fire() {
@@ -1643,12 +1643,11 @@ impl super::DiskSlots for FakeDisk {
     }
 }
 
-/// The M1 shape, a load on unified memory: no host tier. A park sends an
+/// A load on unified memory: no host tier. A park sends an
 /// instance's tables and rings straight to the disk tier's slot file, a
 /// slot of it a role slot, freeing every device slot; the restore copies
 /// them back into fresh device slots and gives the file's slots back. Left
-/// on the device at the park (the M1 on 0d96fb179: 379 opened chunks of the
-/// Instance shape after 107 evictions, no move down ever asked), they held
+/// on the device at the park (no move down ever asked), they would hold
 /// their chunks. With no slot file either, nothing below holds them: they
 /// stay, and are no movable room.
 #[test]
@@ -1840,9 +1839,9 @@ fn a_role_slot_wider_than_a_kv_slot_parks_to_disk_in_a_run_and_restores_whole() 
 /// before the lane ran them (an eviction while its restore waited on its
 /// rebinds): the rebind of the instance's old device refs is cancelled at
 /// the lane, never sent, while the park itself is said. Sent, the engine
-/// claimed slots the park's commit gave back, and the next bind there was
-/// refused (the L40S and the M1 on batch 3: slot 12537 rebound 4 ms after
-/// its park, at the same refs, bound to another instance 1 ms later).
+/// would claim slots the park's commit gave back, and the next bind there
+/// be refused (a slot rebound just after its park, at the same refs, then
+/// bound to another instance).
 #[test]
 fn a_rebind_read_before_a_park_is_cancelled_once_its_item_moved() {
     let Pools { roles, .. } = pools();

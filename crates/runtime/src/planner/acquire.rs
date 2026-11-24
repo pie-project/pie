@@ -495,9 +495,7 @@ impl ResidencyPlanner {
                 let proc = inner.procs.get_mut(&pid).expect("present");
                 // Parked owing its restore (it went idle): a process waiting
                 // to be resident asks for it again.
-                // Left parked, nothing queues it, and the wait never ends
-                // (the M1 / M5 stress: the earliest admitted sat evicted
-                // with no restore queued once the rest drained).
+                // Left parked, nothing queues it, and the wait never ends.
                 // Held below the schedule's floor (or seatless, its seat
                 // vacated for one the schedule chose), it stays parked
                 // until the policy lifts it ([`super::inner::Inner::reschedule`] queues

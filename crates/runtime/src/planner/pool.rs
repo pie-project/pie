@@ -45,9 +45,9 @@ pub struct ChunkStats {
 /// ([`PoolPort::chunk_occupants`]).
 /// The runs of adjacent chunks a head's step lays, one entry per run
 /// length, the longest first: `(run, pieces)`. Read as one length, a
-/// restore whose unpark lays a run of two and fourteen single chunks was
-/// asked sixteen single chunks, the map stood them, and the unpark was
-/// refused the run of two (the L40S).
+/// restore whose unpark lays a run of two and fourteen single chunks would
+/// be asked sixteen single chunks, the map stand them, and the unpark be
+/// refused the run of two.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunNeed(Vec<(u32, u32)>);
 
@@ -762,9 +762,8 @@ pub trait PoolPort: Send + Sync + 'static {
     /// one placement a restore is sent on ([`Self::restore_stands`]), its
     /// moves are planned by (the map lays [`RestorePlacement::short`] in
     /// the room its own takes leave) and the stall line reads: a check
-    /// that mirrored the takes stood runs the restore's own takes then
-    /// broke (Mac Pro at 2 GiB: PendingBindShort, free runs (3, 2) before
-    /// and one after, need_moves 0). Where the pool keeps no roles, `need`
+    /// that mirrored the takes would stand runs the restore's own takes
+    /// then break. Where the pool keeps no roles, `need`
     /// (the runs the planner reads its step as) is placed beside `state`.
     fn restore_placement(
         &self,
@@ -858,15 +857,15 @@ pub trait PoolPort: Send + Sync + 'static {
     /// Whether `pieces` free runs of `run` adjacent chunks stand beside
     /// the guest state `pid`'s restore retakes first (its parked dead
     /// parts, [`crate::store::roles::Roles::fits_beside_unpark`]): room for
-    /// the bind that suspended it, past its own (the M1 freeze: restored
-    /// straight back into the room its park gave, short again, 750 times
-    /// a second). Where the pool keeps no guest state, the runs alone.
+    /// the bind that suspended it, past its own (else it is restored
+    /// straight back into the room its park gave, short again). Where the
+    /// pool keeps no guest state, the runs alone.
     fn room_beside_own(&self, pid: ProcessId, run: u32, pieces: u32) -> bool {
         let _ = pid;
         self.guest_room_free(run, pieces)
     }
     /// Whether moving chunks will stand `pieces` free runs of `run`
-    /// adjacent chunks where free chunks are enough but scattered (F21): a
+    /// adjacent chunks where free chunks are enough but scattered: a
     /// compaction planned, the pool's walk asked to carry it out, or one on
     /// its way. Where it is, no resident is moved for the bind; where no
     /// moves could stand the runs, `false`. None where the pool keeps no
@@ -1844,9 +1843,8 @@ impl PoolPort for RegistryPool {
         // eviction by another reader or a key) is theirs together, counted
         // in the map as theirs (`chunk_occupants` of the evicted), and goes
         // down a tier once with their sets, every reader's refs pointing
-        // there. Passed over, it held its chunk for good, no process its
-        // holder (the L40S at 3 GiB disk-only: chunk 4, one slot, seven
-        // evicted forks' refs, a head short of it unserved).
+        // there. Passed over, it would hold its chunk for good, no process
+        // its holder, a head short of it unserved.
         let kv_sets: Vec<(crate::store::kv::page_table::WorkingSetId, u64)> = pids
             .iter()
             .flat_map(|&pid| {
@@ -1891,9 +1889,8 @@ impl PoolPort for RegistryPool {
         // An evicted process's state left on the device at its eviction
         // (records and rs list slots its suspend found no row for, or still
         // settling then) goes down with its parked role slots: left there,
-        // queued processes waiting to be restored held chunks no move
-        // freed (Mac Pro on 22b0a3e83: 85 chunks of one live slot each, all
-        // queued processes').
+        // queued processes waiting to be restored would hold chunks no move
+        // frees.
         let sets: HashSet<crate::store::rs::RsWorkingSetId> = pids
             .iter()
             .flat_map(|&pid| {
