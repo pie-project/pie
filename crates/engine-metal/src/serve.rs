@@ -2210,11 +2210,6 @@ impl Shell {
         self.pools.seat_disk(dir, budget)
     }
 
-    /// Seats the shared pool's host tier of `budget` bytes.
-    pub fn seat_tier(&mut self, budget: u64) {
-        self.pools.seat_tier(budget);
-    }
-
     /// No rs buffer pages: the buffer's rows live in the records.
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {

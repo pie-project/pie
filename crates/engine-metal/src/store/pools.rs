@@ -625,8 +625,6 @@ pub struct Pools {
     /// pool chunk on the direct I/O boundary, any shape's slots in any
     /// chunk, laid out as on the device.
     disk: Option<Spill>,
-    /// The shared pool's host tier, where one is stated.
-    tier: Option<HostTier>,
     /// The weight cache's row-streamed tables, a shape each (`super::rows`).
     weight_caches: Vec<super::streamed::Cache>,
     /// An evacuation moved the pool's table and restaging the weight
@@ -636,54 +634,6 @@ pub struct Pools {
     weights_stale: Option<String>,
     /// The runtime holds the weight set for the load's life.
     weights_held: bool,
-}
-
-/// The host tier: chunks of the pool's size in host memory apart from the
-/// pool, a slot of any shape at the place its host ref names, each chunk
-/// allocated as a copy first touches it. On unified memory it is the same
-/// DRAM, so a load seats one only where its budget is stated: what it buys
-/// is room in the pool's heap, not in memory.
-#[derive(Debug)]
-struct HostTier {
-    chunk_bytes: u64,
-    chunks: Vec<Option<Box<[u8]>>>,
-}
-
-impl HostTier {
-    /// Host ref `slot` of `shape`: its chunk and the byte range in it.
-    fn place(&self, shape: &Slots, slot: u32) -> Result<(usize, std::ops::Range<usize>)> {
-        let per_chunk = shape.per_chunk.max(1);
-        let chunk = (slot / per_chunk) as usize;
-        if chunk >= self.chunks.len() {
-            return Err(Fault::Ceiling {
-                what: "chunks of the host tier",
-                need: chunk as u64 + 1,
-                have: self.chunks.len() as u64,
-            });
-        }
-        let at = usize::try_from(u64::from(slot % per_chunk) * shape.slot_bytes).unwrap_or(0);
-        let len = usize::try_from(shape.slot_bytes).unwrap_or(0);
-        Ok((chunk, at..at + len))
-    }
-
-    /// The bytes of host ref `slot` of `shape`, its chunk allocated first.
-    fn slot(&mut self, shape: &Slots, slot: u32) -> Result<&mut [u8]> {
-        let (chunk, range) = self.place(shape, slot)?;
-        let bytes = usize::try_from(self.chunk_bytes).unwrap_or(usize::MAX);
-        let held = self.chunks[chunk].get_or_insert_with(|| vec![0u8; bytes].into_boxed_slice());
-        Ok(&mut held[range])
-    }
-
-    /// Copies host ref `slot` of `shape` into `into`: zeros where no copy
-    /// has touched its chunk yet (nothing is allocated for a read).
-    fn read(&self, shape: &Slots, slot: u32, into: &mut [u8]) -> Result<()> {
-        let (chunk, range) = self.place(shape, slot)?;
-        match &self.chunks[chunk] {
-            Some(held) => into.copy_from_slice(&held[range]),
-            None => into.fill(0),
-        }
-        Ok(())
-    }
 }
 
 /// The first byte of physical slot `slot` of `shape`.
@@ -827,7 +777,6 @@ impl Pools {
             pool,
             layout,
             disk: None,
-            tier: None,
             weight_caches: Vec::new(),
             weights_stale: None,
             weights_held: false,
@@ -1055,9 +1004,6 @@ impl Pools {
             facts.windowed.clone_from(&ring.layers);
             facts.record_bytes = ring.layers.iter().map(|layer| layer.bytes).sum();
         }
-        facts.host_chunks = self.tier.as_ref().map_or(0, |tier| {
-            u32::try_from(tier.chunks.len()).unwrap_or(u32::MAX)
-        });
         facts.weights = self
             .weight_caches
             .iter()
@@ -1065,111 +1011,6 @@ impl Pools {
             .collect();
         facts.disk_chunks = self.disk_chunks();
         facts
-    }
-
-    /// Seats a host tier of `budget` bytes, in whole chunks .
-    pub fn seat_tier(&mut self, budget: u64) {
-        let chunk_bytes = self.layout.chunk_bytes;
-        let chunks = budget.checked_div(chunk_bytes).unwrap_or(0);
-        self.tier = (chunks > 0).then(|| HostTier {
-            chunk_bytes,
-            chunks: (0..chunks).map(|_| None).collect(),
-        });
-    }
-
-    /// Copies whole slots of `id` between the pool (slot refs) and the host
-    /// tier (host refs), `(src, dst)` the way `to_host` says. The caller has
-    /// drained every frame.
-    fn park(&mut self, id: ShapeId, to_host: bool, pairs: &[(u32, u32)]) -> Result<()> {
-        let shape = *self.shape(id)?;
-        for &(src, dst) in pairs {
-            let (device, host) = if to_host { (src, dst) } else { (dst, src) };
-            let at = self.slot_offset(id, device)?;
-            self.pool
-                .admit(u32::try_from(at / self.layout.chunk_bytes).unwrap_or(u32::MAX))?;
-            let Some(tier) = self.tier.as_mut() else {
-                return Err(Fault::Ceiling {
-                    what: "chunks of the host tier",
-                    need: u64::from(host / shape.per_chunk.max(1)) + 1,
-                    have: 0,
-                });
-            };
-            let slot = tier.slot(&shape, host)?;
-            if to_host {
-                self.pool.read(at, slot)?;
-            } else {
-                self.pool.write(at, slot)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// See [`engine::Tiers::read`]: the bytes of host tier
-    /// slots, shape by shape, each laid out as `copy_slots` moves it (the
-    /// device slot's bytes). Unified memory: the host tier is plain host
-    /// memory, so this is one memcpy a slot, no staging. The caller has
-    /// drained every frame.
-    pub fn read_tier_slots(&self, slots: &[(ShapeId, Vec<u32>)]) -> Result<Vec<u8>> {
-        let tier = self.tier.as_ref().ok_or(Fault::Ceiling {
-            what: "chunks of the host tier",
-            need: 1,
-            have: 0,
-        })?;
-        let mut total = 0u64;
-        for (id, refs) in slots {
-            total += self.shape(*id)?.slot_bytes * refs.len() as u64;
-        }
-        let mut out = vec![0u8; usize::try_from(total).unwrap_or(usize::MAX)];
-        let mut at = 0usize;
-        for (id, refs) in slots {
-            let shape = *self.shape(*id)?;
-            let len = usize::try_from(shape.slot_bytes).unwrap_or(usize::MAX);
-            for &slot in refs {
-                tier.read(&shape, slot, &mut out[at..at + len])?;
-                at += len;
-            }
-        }
-        Ok(out)
-    }
-
-    /// See [`engine::Tiers::write`]: `bytes`, laid out as
-    /// [`Self::read_tier_slots`] returns them, into host tier slots; refused
-    /// whole when the byte count differs or a ref lies past the tier. The
-    /// caller has drained every frame.
-    pub fn write_tier_slots(&mut self, slots: &[(ShapeId, Vec<u32>)], bytes: &[u8]) -> Result<()> {
-        let mut need = 0u64;
-        for (id, refs) in slots {
-            let shape = *self.shape(*id)?;
-            need += shape.slot_bytes * refs.len() as u64;
-            if let Some(tier) = self.tier.as_ref() {
-                for &slot in refs {
-                    tier.place(&shape, slot)?;
-                }
-            }
-        }
-        if bytes.len() as u64 != need {
-            return Err(Fault::Ceiling {
-                what: "bytes of host tier slots",
-                need,
-                have: bytes.len() as u64,
-            });
-        }
-        let mut at = 0usize;
-        for (id, refs) in slots {
-            let shape = *self.shape(*id)?;
-            let len = usize::try_from(shape.slot_bytes).unwrap_or(usize::MAX);
-            for &slot in refs {
-                let tier = self.tier.as_mut().ok_or(Fault::Ceiling {
-                    what: "chunks of the host tier",
-                    need: 1,
-                    have: 0,
-                })?;
-                tier.slot(&shape, slot)?
-                    .copy_from_slice(&bytes[at..at + len]);
-                at += len;
-            }
-        }
-        Ok(())
     }
 
     fn shape(&self, id: ShapeId) -> Result<&Slots> {
@@ -2300,12 +2141,6 @@ impl Pools {
                     "token runs from {src:?} to {dst:?}: between tiers a slot moves whole"
                 ),
             }),
-            (src, MemoryDomain::HostPinned) if src == device => {
-                self.park(copy.shape, true, &copy.slots)
-            }
-            (MemoryDomain::HostPinned, dst) if dst == device => {
-                self.park(copy.shape, false, &copy.slots)
-            }
             (src, MemoryDomain::LocalDisk) if src == device => {
                 let (ids, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
                 self.spill(copy.shape, true, &ids, &slots)
@@ -2314,18 +2149,10 @@ impl Pools {
                 let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
                 self.spill(copy.shape, false, &ids, &slots)
             }
-            (MemoryDomain::HostPinned, MemoryDomain::LocalDisk) => {
-                let (hosts, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
-                self.spill_host(copy.shape, true, &hosts, &slots)
-            }
-            (MemoryDomain::LocalDisk, MemoryDomain::HostPinned) => {
-                let (slots, hosts): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
-                self.spill_host(copy.shape, false, &hosts, &slots)
-            }
             (src, dst) => Err(Fault::Unbound {
                 what: format!(
-                    "a slot copy from {src:?} to {dst:?}: this pool moves within itself, to \
-                     its host tier and to its slot files"
+                    "a slot copy from {src:?} to {dst:?}: this pool moves within itself and \
+                     to its slot files (unified memory has no host tier)"
                 ),
             }),
         }
@@ -2387,38 +2214,6 @@ impl Pools {
                     pool.read(at, slot)
                 } else {
                     pool.write(at, slot)
-                }
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Copies whole slots of `id` between the host tier (host refs
-    /// `hosts`) and disk refs `slots` the way `to_disk` says: the host
-    /// tier's idle state going on down to disk, and back.
-    fn spill_host(&mut self, id: ShapeId, to_disk: bool, hosts: &[u32], slots: &[u32]) -> Result<()> {
-        let shape = *self.shape(id)?;
-        let places = slots
-            .iter()
-            .map(|&slot| self.disk_place(id, slot))
-            .collect::<Result<Vec<_>>>()?;
-        let Some(spill) = self.disk.as_mut() else {
-            return Ok(());
-        };
-        let Some(tier) = self.tier.as_mut() else {
-            return Err(Fault::Ceiling {
-                what: "chunks of the host tier",
-                need: 1,
-                have: 0,
-            });
-        };
-        for (&host, &disk_at) in hosts.iter().zip(&places) {
-            spill.copy(disk_at, shape.slot_bytes, to_disk, |slot, out| {
-                if out {
-                    tier.read(&shape, host, slot)
-                } else {
-                    tier.slot(&shape, host)?.copy_from_slice(slot);
-                    Ok(())
                 }
             })?;
         }

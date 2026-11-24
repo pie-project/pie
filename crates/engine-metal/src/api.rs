@@ -1427,7 +1427,7 @@ impl engine::Tiers for Metal {
 
     /// A copy on the device rides a command buffer that may still be
     /// reading its sources when the call returns: told landed from that
-    /// buffer's completion. A move to or from the host tier or the slot
+    /// buffer's completion. A move to or from the slot
     /// files is a host copy done inside the call: its sources are read.
     fn copy_landing(
         &mut self,
@@ -1452,7 +1452,8 @@ impl engine::Tiers for Metal {
         &mut self,
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
     ) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
+        let _ = slots;
+        Err(no_host_slots())
     }
 
     fn write(
@@ -1460,9 +1461,8 @@ impl engine::Tiers for Metal {
         slots: &[(engine::chunk::ShapeId, Vec<u32>)],
         bytes: &[u8],
     ) -> EngineResult<()> {
-        self.loaded_mut()?
-            .write_tier_slots(slots, bytes)
-            .map_err(fault)
+        let _ = (slots, bytes);
+        Err(no_host_slots())
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
@@ -1926,6 +1926,16 @@ fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
         ))),
         None => Ok(()),
     }
+}
+
+/// A read or write of host tier slots: Metal seats no host tier
+/// ([`no_host_tier`]), so there are none to name.
+fn no_host_slots() -> Error {
+    Error::Invalid(
+        "host tier slots on Metal: the device's memory is the host's, so a load seats no host \
+         tier; suspended state goes to the disk tier"
+            .into(),
+    )
 }
 
 #[cfg(test)]
