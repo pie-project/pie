@@ -2350,7 +2350,8 @@ pub struct Frame {
     /// Each dispatch's group counts, in the walk's order.
     groups: std::cell::RefCell<Vec<[u32; 3]>>,
 
-    /// Each readout copy's regions, hashed ([`crate::record::rows_signature`]), in order.
+    /// Each readout copy's mark (its most rows: its regions are the copier's
+    /// table), in order.
     copies: std::cell::RefCell<Vec<[u32; 3]>>,
 }
 
@@ -2802,16 +2803,13 @@ impl Frame {
         let range = u64::from(limits.max_storage_buffer_range);
         let (src, dst) = (source.slab(), into.slab());
         let (src_range, dst_range) = (src.size.min(range), dst.size.min(range));
-        // Rows copied out of the fire's score room move with it: their
-        // regions are the copier's table (data), and the room is bound where
-        // the fire's lies ([`Kept::bind_room`]), so a fire at any room is the
-        // same commands.
+        // The rows a fire reads out are its lanes': a recording moves them
+        // with the copier, their regions its table (data), so one body serves
+        // every fire of its commands whatever its lanes read. Rows copied out
+        // of the fire's score room move with it too: the room is bound where
+        // the fire's lies ([`Kept::bind_room`]).
         let room_src = self.is_room(src.buffer);
-        let signature = if room_src {
-            [u32::MAX, u32::MAX, u32::try_from(most).unwrap_or(u32::MAX)]
-        } else {
-            crate::record::rows_signature(regions)
-        };
+        let signature = [u32::MAX, u32::MAX, u32::try_from(most).unwrap_or(u32::MAX)];
         self.copies.borrow_mut().push(signature);
         let words = |n: u64| n.is_multiple_of(4);
         let movable = regions.len() <= most
@@ -2863,7 +2861,7 @@ impl Frame {
         // family whose shapes move the same regions copies them as carried
         // commands; one whose shapes differ moves them with the copier, from
         // the table.
-        let indirect = self.dispatched(signature) || room_src;
+        let indirect = self.dispatched(signature) || room_src || self.kept;
         // The count is read from the fire block alone: the push block
         // carries none of it.
         let pushed = vec![0u8; self.copier.push_bytes as usize];
@@ -3532,7 +3530,7 @@ impl Kept {
         &self.groups
     }
 
-    /// Each readout copy's regions, hashed, in order ([`crate::record::rows_signature`]).
+    /// Each readout copy's mark (its most rows), in order.
     #[must_use]
     pub fn copies(&self) -> &[[u32; 3]] {
         &self.copies

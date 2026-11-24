@@ -362,13 +362,3 @@ impl Recorder {
     }
 }
 
-/// A readout copy's regions, hashed: what stands for them in a family's
-/// weighing and in a recorded body's fill.
-#[must_use]
-pub fn rows_signature(regions: &[(u64, u64, u64)]) -> [u32; 3] {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    regions.hash(&mut hasher);
-    let h = hasher.finish();
-    [h as u32, (h >> 32) as u32, regions.len() as u32]
-}

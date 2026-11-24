@@ -611,6 +611,41 @@ impl Serve for Api {
             return Ok(false);
         };
         if held.recording.cuts.len() != fill.cuts || !held.recording.serves(&fill.groups) {
+            if crate::device::ctx::trailing() {
+                let recorded = held.recording.kept.groups();
+                let parts: Vec<String> = (recorded.iter().zip(&fill.groups).enumerate())
+                    .filter(|&(at, (held, wanted))| {
+                        held != wanted && !held_indirect(&held_family_kept(shell, family), at)
+                    })
+                    .take(8)
+                    .map(|(at, (held, wanted))| {
+                        format!(
+                            "dispatch {at} ({}): held {held:?}, the fire's {wanted:?}",
+                            fill.trail
+                                .iter()
+                                .filter(|entry| !entry.starts_with('"'))
+                                .nth(at)
+                                .map_or("?", String::as_str)
+                                .chars()
+                                .take(160)
+                                .collect::<String>()
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "[vk-bake] arm {} rung {} rows {:?}: the armed family's commands are the fill \
+                     walk's, and its recording carries group counts the fire's differ from \
+                     ({} dispatches held, {} walked; cuts {} / {}):\n  {}",
+                    prepared.arm,
+                    prepared.rung,
+                    prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
+                    recorded.len(),
+                    fill.groups.len(),
+                    held.recording.cuts.len(),
+                    fill.cuts,
+                    parts.join("\n  ")
+                );
+            }
             return Ok(false);
         }
         shell.shelf.recorder.insert_fill(
@@ -910,8 +945,10 @@ fn fill_body(
         return Ok(());
     }
     let (layout, regions) = shell.readout_copies(prepared)?;
+    // A recording moves its readout rows with the copier, their regions the
+    // fire's table: each copy stands for its most rows alone.
     let copies: Vec<[u32; 3]> = (regions.iter())
-        .map(|(_, list, _)| crate::record::rows_signature(list))
+        .map(|(_, _, most)| [u32::MAX, u32::MAX, u32::try_from(*most).unwrap_or(u32::MAX)])
         .collect();
     if copies != recorded {
         return Ok(());
@@ -922,6 +959,20 @@ fn fill_body(
         crate::record::Fill::new(family, groups, image, layout, launches),
     );
     Ok(())
+}
+
+/// The kept frame of `family`, for a diagnostic.
+fn held_family_kept(shell: &Shell<Api>, family: crate::record::Key) -> Option<&crate::device::Kept> {
+    shell
+        .shelf
+        .recorder
+        .family(family)
+        .map(|held| &held.recording.kept)
+}
+
+/// Whether dispatch `at` of `kept` reads its group counts from the block.
+fn held_indirect(kept: &Option<&crate::device::Kept>, at: usize) -> bool {
+    kept.is_some_and(|kept| kept.indirect(at))
 }
 
 /// Says where a fill walk whose commands match no armed family parts from
