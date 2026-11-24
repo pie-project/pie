@@ -29,15 +29,6 @@ pub struct Diagnostics {
     /// cache would stream to the host tier: no table reads them, and each
     /// fire stages the experts it routes to (`experts::staging`).
     pub untabled_experts: bool,
-    /// Lays every windowed kv row in one window list, of the widest window:
-    /// a row of a narrower window then keeps pages its kernels no longer
-    /// read. The same logits as a list a window.
-    pub one_window: bool,
-    /// Serves the windowed kv rows as ring + buffer (CONTRACT-BC 19, 21):
-    /// each windowed layer's last folded rows a ring in the lane's record,
-    /// its unfolded rows in the window buffer. The window lists' path until
-    /// the windowed-state change integrates.
-    pub windowed_state: bool,
     /// Copies between the device and the host tier ride the compute stream,
     /// ahead of every fire after them, not the swap stream beside those
     /// fires: to weigh the overlap.
@@ -81,8 +72,6 @@ impl Default for Diagnostics {
             chunk_bytes: None,
             dense_experts: false,
             untabled_experts: false,
-            one_window: false,
-            windowed_state: false,
             tier_inline: false,
             unwritten_nan: false,
         }
@@ -142,12 +131,6 @@ impl Diagnostics {
         if self.untabled_experts {
             words.push("untabled-experts".to_string());
         }
-        if self.one_window {
-            words.push("one-window".to_string());
-        }
-        if self.windowed_state {
-            words.push("windowed-state".to_string());
-        }
         if self.tier_inline {
             words.push("tier-inline".to_string());
         }
@@ -173,8 +156,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, \
      `sync-guard[=panic]`, `chunk-bytes=<bytes>`, \
-     `dense-experts`, `untabled-experts`, `one-window`, `windowed-state`, `tier-inline`, \
-     `unwritten-nan`";
+     `dense-experts`, `untabled-experts`, `tier-inline`, `unwritten-nan`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -200,8 +182,6 @@ impl std::str::FromStr for Diagnostics {
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "dense-experts" => diag.dense_experts = switch(word, value)?,
                 "untabled-experts" => diag.untabled_experts = switch(word, value)?,
-                "one-window" => diag.one_window = switch(word, value)?,
-                "windowed-state" => diag.windowed_state = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
                 "unwritten-nan" => diag.unwritten_nan = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
