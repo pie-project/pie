@@ -25,6 +25,14 @@ pub const AXES: &[&str] = &["rows"];
 #[decision(id = "engine.max_live_command_buffers", constant(range(0..=1_000_000)), default = 0, tune = never)]
 pub struct MaxLiveCommandBuffers(pub u32);
 
+/// The most memory maps the device's host lets a process hold
+/// (vm.max_map_count), stated in its profile for a host that does not let
+/// the process read it (Android): the arm walk keeps its recordings' maps
+/// under it. 0: none stated (read from the host where it can be).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.max_map_count", constant(range(0..=100_000_000)), default = 0, tune = never)]
+pub struct MaxMapCount(pub u32);
+
 /// The kernel a dense affine-quantised matmul runs: the first rung whose
 /// shape it fits that can run. `fill` is how full the device is: eighths of
 /// a wave of 32x64 output tiles over its cores, so a rung can say "fills the
@@ -188,7 +196,8 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeSplitMinKeys>()
         .add::<DecodeThreads>()
         .add::<SdpaTileRows>()
-        .add::<MaxLiveCommandBuffers>();
+        .add::<MaxLiveCommandBuffers>()
+        .add::<MaxMapCount>();
 }
 
 /// The point a dense matmul is chosen at on a device with `cores` cores.
