@@ -232,6 +232,7 @@ impl Run<'_> {
                     {
                         return ssm::gated_delta_carried(
                             self.ctx(),
+                            self.tuning(),
                             ext_qkv,
                             self.qo_indptr(),
                             &self.rs_committed(&seat, *state),
@@ -288,6 +289,7 @@ impl Run<'_> {
                     {
                         ssm::gated_delta_carried(
                             self.ctx(),
+                            self.tuning(),
                             ext_qkv,
                             self.qo_indptr(),
                             &self.rs_committed(&seat, *state),
