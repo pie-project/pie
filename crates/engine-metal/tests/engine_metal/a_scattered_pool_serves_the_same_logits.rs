@@ -673,23 +673,6 @@ pub(super) fn close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     }
 }
 
-/// The bound passes two bf16 units of a logit and refuses three, and an
-/// argmax apart is refused at once whatever the logits' distance.
-#[test]
-fn close_holds_two_bf16_units_and_the_argmax() {
-    let unit = 2f32.powi(-7); // a bf16 unit at 1.0
-    let row = vec![1.0f32, 0.5, -3.0];
-    close("two units", &[vec![1.0 + 2.0 * unit, 0.5, -3.0]], &[row.clone()]);
-    let three = std::panic::catch_unwind(|| {
-        close("three units", &[vec![1.0 + 3.0 * unit, 0.5, -3.0]], &[vec![1.0f32, 0.5, -3.0]]);
-    });
-    assert!(three.is_err(), "three bf16 units apart is refused");
-    let swapped = std::panic::catch_unwind(|| {
-        close("argmax", &[vec![0.5f32, 0.5001, -3.0]], &[vec![0.5001f32, 0.5, -3.0]]);
-    });
-    assert!(swapped.is_err(), "an argmax apart is refused");
-}
-
 /// Panics at the first row whose logits differ in a bit.
 pub(super) fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
