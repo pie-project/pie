@@ -57,18 +57,10 @@ pub struct Wanted {
     pub candidates: Vec<u32>,
 }
 
-/// Where an entry lies: its bank, its kernel, its method.
-type At = ((u32, u32, u32), u32, u32);
-
-/// The methods a bank's figures may be of, the load's first.
-const METHODS: [u32; 2] = [crate::fire::PRODUCT_BODY, crate::fire::PRODUCT_DISPATCH];
-
 /// A device's measured product times and the shapes they lacked.
 #[derive(Debug, Default)]
 pub struct Routes {
-    /// Each entry under its bank, kernel and method
-    /// (`profile::fire::PRODUCT_BODY`, `PRODUCT_DISPATCH`).
-    times: HashMap<At, (Kind, f64, f64)>,
+    times: HashMap<((u32, u32, u32), u32), (Kind, f64, f64)>,
     wanted: Mutex<BTreeMap<Shape, Wanted>>,
     /// Every shape answered by one kernel: a test's table ([`Routes::all`]).
     all: Option<u32>,
@@ -76,9 +68,9 @@ pub struct Routes {
     /// while it times a body under each choice ([`Routes::forcing`]).
     forced: HashMap<(u32, u32, u32), u32>,
     /// The entries of `times` that are estimates: figures stored under a
-    /// stale key (`profile::fire::Rates::stale`), served until they are
-    /// timed again behind serving ([`Routes::estimating`]).
-    estimated: std::collections::HashSet<At>,
+    /// stale key (`profile::fire::Rates::stale`), served as they stand
+    /// ([`Routes::estimating`]).
+    estimated: std::collections::HashSet<((u32, u32, u32), u32)>,
     /// The shapes [`Routes::pick`] answered by an estimate since the last
     /// call of [`Routes::behind`].
     behind: Mutex<BTreeMap<Shape, Wanted>>,
@@ -97,7 +89,7 @@ impl Routes {
         let mut table = HashMap::new();
         for t in times {
             if let Some(kind) = Kind::ALL.into_iter().find(|k| *k as u32 == t.kind) {
-                table.entry(((t.rows, t.k, t.m), t.kernel, t.method)).or_insert((kind, t.ns, t.spread));
+                table.entry(((t.rows, t.k, t.m), t.kernel)).or_insert((kind, t.ns, t.spread));
             }
         }
         Self { times: table, ..Self::default() }
@@ -106,7 +98,7 @@ impl Routes {
     /// The table `measured` states, each entry it lacks answered by
     /// `estimates` (figures stored under a stale key): served as they
     /// stand, and noted where a pick reads one ([`Routes::behind`]) so the
-    /// load times it again behind serving.
+    /// load says which banks serve by them.
     #[must_use]
     pub fn estimating(
         measured: &[crate::fire::ProductTime],
@@ -120,27 +112,6 @@ impl Routes {
             }
         }
         routes
-    }
-
-    /// Whether `shape`'s time on `kernel` is measured under a matching key
-    /// (not an estimate, nor unstated).
-    #[must_use]
-    pub fn measured_at(&self, shape: Shape, kernel: u32) -> bool {
-        METHODS.iter().any(|&method| {
-            let at = ((shape.rows, shape.k, shape.m), kernel, method);
-            self.times.contains_key(&at) && !self.estimated.contains(&at)
-        })
-    }
-
-    /// The kernel `shape`'s bank was last picked, if a pick of this table
-    /// answered it (a forced table's own picks included).
-    #[must_use]
-    pub fn picked_at(&self, shape: Shape) -> Option<u32> {
-        self.picked
-            .lock()
-            .expect("routes lock poisoned")
-            .get(&(shape.rows, shape.k, shape.m))
-            .copied()
     }
 
     /// How many entries of the table are estimates.
@@ -190,28 +161,12 @@ impl Routes {
             return kernel;
         }
         let bank = (shape.rows, shape.k, shape.m);
-        // One method's figures decide a bank, never two compared: the one
-        // that states the most candidates, fresh ones first, the load's on
-        // a tie.
-        let of = |method: u32| -> Vec<(u32, f64, f64, bool)> {
-            candidates
-                .iter()
-                .filter_map(|&kernel| {
-                    let at = (bank, kernel, method);
-                    self.times
-                        .get(&at)
-                        .map(|&(_, ns, spread)| (kernel, ns, spread, self.estimated.contains(&at)))
-                })
-                .collect()
-        };
-        let known = METHODS
+        let time = |kernel| self.times.get(&(bank, kernel)).copied();
+        let known: Vec<(u32, f64, f64)> = candidates
             .iter()
-            .map(|&method| of(method))
-            .max_by_key(|known| {
-                (known.len(), known.iter().filter(|(.., estimate)| !estimate).count())
-            })
-            .unwrap_or_default();
-        let estimated = known.iter().any(|&(.., estimate)| estimate);
+            .filter_map(|&kernel| time(kernel).map(|(_, ns, spread)| (kernel, ns, spread)))
+            .collect();
+        let estimated = candidates.iter().any(|&kernel| self.estimated.contains(&(bank, kernel)));
         if known.len() < candidates.len() && !estimated {
             note(&self.wanted, shape, weight, candidates);
             return stated;
@@ -219,20 +174,17 @@ impl Routes {
         // Every candidate measured; or the bank has estimates (figures
         // stored under a stale key), which serve as they stand, a candidate
         // none states (its code changed) not taken, and the bank is noted
-        // to time again behind serving.
+        // as served by stale figures.
         if estimated {
             note(&self.behind, shape, weight, candidates);
         }
-        let Some(&(_, stated_ns, stated_spread, _)) =
-            known.iter().find(|&&(kernel, ..)| kernel == stated)
+        let Some(&(_, stated_ns, stated_spread)) = known.iter().find(|&&(kernel, ..)| kernel == stated)
         else {
             return stated;
         };
         known
             .iter()
-            .filter(|&&(kernel, ns, spread, _)| {
-                kernel != stated && stated_ns - ns > spread.max(stated_spread)
-            })
+            .filter(|&&(kernel, ns, spread)| kernel != stated && stated_ns - ns > spread.max(stated_spread))
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map_or(stated, |&(kernel, ..)| kernel)
     }
@@ -255,8 +207,8 @@ impl Routes {
     }
 
     /// The shapes [`Routes::pick`] answered by an estimate since the last
-    /// call, with their weights and candidates: what a load times again
-    /// behind serving. The notes are cleared.
+    /// call, with their weights and candidates: the banks a load serves by
+    /// stale figures. The notes are cleared.
     pub fn behind(&self) -> BTreeMap<Shape, Wanted> {
         std::mem::take(&mut *self.behind.lock().expect("routes lock poisoned"))
     }
@@ -265,16 +217,10 @@ impl Routes {
     /// longer an estimate).
     #[must_use]
     pub fn with(&self, measured: &[(Shape, u32, f64, f64)]) -> Self {
-        self.with_as(measured, crate::fire::PRODUCT_BODY)
-    }
-
-    /// [`Routes::with`], `measured` timed by `method`.
-    #[must_use]
-    pub fn with_as(&self, measured: &[(Shape, u32, f64, f64)], method: u32) -> Self {
         let mut times = self.times.clone();
         let mut estimated = self.estimated.clone();
         for &(shape, kernel, ns, spread) in measured {
-            let at = ((shape.rows, shape.k, shape.m), kernel, method);
+            let at = ((shape.rows, shape.k, shape.m), kernel);
             times.insert(at, (shape.kind, ns, spread));
             estimated.remove(&at);
         }
@@ -314,16 +260,12 @@ fn note(notes: &Mutex<BTreeMap<Shape, Wanted>>, shape: Shape, weight: u64, candi
     }
 }
 
-/// `measured`, timed by `method`, as `[rates] product_ns` entries.
+/// `measured` as `[rates] product_ns` entries.
 #[must_use]
-pub fn product_times(
-    measured: &[(Shape, u32, f64, f64)],
-    method: u32,
-) -> Vec<crate::fire::ProductTime> {
+pub fn product_times(measured: &[(Shape, u32, f64, f64)]) -> Vec<crate::fire::ProductTime> {
     measured
         .iter()
         .map(|&(s, kernel, ns, spread)| crate::fire::ProductTime {
-            method,
             kind: s.kind as u32,
             rows: s.rows,
             k: s.k,
@@ -386,12 +328,11 @@ mod tests {
     }
 
     /// A shape the measured table lacks is answered by its stale figures
-    /// (the same pick they made), noted to time again behind serving, not
+    /// (the same pick they made), noted as stale, not
     /// wanted before ready; once timed it is measured, no longer noted.
     #[test]
     fn a_stale_figure_answers_and_is_noted_behind() {
         let time = |kernel, ns| crate::fire::ProductTime {
-            method: crate::fire::PRODUCT_BODY,
             kind: Kind::NormedGated as u32,
             rows: GATE_UP.rows,
             k: GATE_UP.k,
@@ -425,38 +366,6 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         a.forcing(GATE_UP, STATED).pick(GATE_UP, 1, &[STATED, OTHER]);
         assert_eq!(a.fingerprint(), b.fingerprint(), "a probe's pick is its own");
-    }
-
-    /// A bank's figures of two methods are never compared: the method
-    /// that states every candidate decides; where both do, the fresh one,
-    /// so a bank timed again by its dispatches behind serving replaces its
-    /// stale body figures.
-    #[test]
-    fn two_methods_are_never_compared() {
-        let time = |kernel, ns, method| crate::fire::ProductTime {
-            kind: Kind::NormedGated as u32,
-            rows: GATE_UP.rows,
-            k: GATE_UP.k,
-            m: GATE_UP.m,
-            kernel,
-            ns,
-            spread: 10.0,
-            method,
-        };
-        let body = crate::fire::PRODUCT_BODY;
-        let dispatch = crate::fire::PRODUCT_DISPATCH;
-        // Body figures pick OTHER; dispatch figures (thousands of times
-        // shorter) pick STATED. Compared across methods, OTHER's body time
-        // would never win.
-        let stale = [time(STATED, 9500.0, body), time(OTHER, 9000.0, body)];
-        let fresh = [time(STATED, 20.0, dispatch), time(OTHER, 30.0, dispatch)];
-        assert_eq!(Routes::estimating(&[], &stale).pick(GATE_UP, 1, &[STATED, OTHER]), OTHER);
-        let retimed = Routes::estimating(&fresh, &stale);
-        assert_eq!(retimed.pick(GATE_UP, 1, &[STATED, OTHER]), STATED);
-        assert!(retimed.behind().is_empty(), "the fresh method decides");
-        // One dispatch figure beside whole body figures: the body decides.
-        let mixed = Routes::of(&[stale[0], stale[1], fresh[0]]);
-        assert_eq!(mixed.pick(GATE_UP, 1, &[STATED, OTHER]), OTHER);
     }
 
     #[test]

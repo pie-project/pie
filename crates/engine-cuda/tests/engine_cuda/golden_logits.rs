@@ -692,7 +692,6 @@ fn read_picks(cache: &Path) -> Vec<profile::fire::ProductTime> {
                 kernel: kernel.parse().ok()?,
                 ns: ns.parse().ok()?,
                 spread: spread.parse().ok()?,
-                method: profile::fire::PRODUCT_BODY,
             })
         })
         .collect()

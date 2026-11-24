@@ -1350,10 +1350,10 @@ impl Engine for Cuda {
         self.shell.as_ref().is_some_and(Shell::measures_behind)
     }
 
-    /// One point of what the load serves from a stale figure, timed on the
+    /// One roofline key the load serves from a stale figure, timed on the
     /// shell's own stream where nothing of a frame is pending and the
-    /// stream is idle, a product point a dispatch at a time, yielding to an
-    /// arrival ([`Shell::measure_behind`]).
+    /// stream is idle, yielding to an arrival between its bursts
+    /// ([`Shell::measure_behind`]).
     fn measure_behind(&mut self, behind: &engine::BehindServing<'_>) -> EngineResult<bool> {
         if self.pending.is_some() {
             return Ok(false);
