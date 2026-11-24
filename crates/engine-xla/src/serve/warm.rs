@@ -522,17 +522,25 @@ impl Shell {
             parts.push(("buffered", shapes.len()));
             shapes.extend(buffered);
         }
-        // the stated compositions no shape of the ladder lays: each would
-        // compile in its first fire, after ready
+        // Every composition the stated set holds is laid (nothing compiles
+        // after ready): one the ladder's shapes leave out is laid here as its
+        // own shape, and one canonical_pads finds no layout for (a fire of it
+        // keys on its own counts) refuses the load by name.
         let gaps = self.unlaid_compositions(&shapes, decode, prefill);
-        if !gaps.unlaid.is_empty() || gaps.uncanonical > 0 {
-            tracing::warn!(
-                unlaid = gaps.unlaid.len(),
-                first_unlaid = ?gaps.unlaid.iter().take(4).map(|u| u.0.as_str()).collect::<Vec<_>>(),
-                uncanonical = gaps.uncanonical,
-                first_uncanonical = ?gaps.first_uncanonical,
-                "xla warm ladder: compositions the stated set holds that it lays no program for (unlaid: a canonical layout no ladder shape takes; uncanonical: one canonical_pads finds no layout for, keyed by its own counts)"
-            );
+        if gaps.uncanonical > 0 {
+            return Err(crate::error::Fault::Program {
+                at: "serve::warm",
+                why: format!(
+                    "{} compositions the step set states take no padded layout (the first: {}): \
+                     a fire of one would compile after ready",
+                    gaps.uncanonical,
+                    gaps.first_uncanonical.join("; ")
+                ),
+            });
+        }
+        if !gaps.unlaid.is_empty() {
+            parts.push(("stated", shapes.len()));
+            shapes.extend(gaps.unlaid.into_iter().map(|(_, shape)| shape));
         }
         let mut added: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         let started = std::time::Instant::now();
@@ -1146,7 +1154,14 @@ impl Shell {
             }
             let buffered = (stated.treatment == engine::Treatment::Buffers).then_some(stated.rung);
             let mixed = stated.kind == engine::StepKind::Mixed;
-            for n in stated.prompt_lanes.lo.max(1)..=stated.prompt_lanes.hi {
+            // (a fire of prompts alone carries `prefill_lanes` at most: the
+            // runtime forms no wider one)
+            let widest = if mixed {
+                stated.prompt_lanes.hi
+            } else {
+                stated.prompt_lanes.hi.min(self.prefill_lanes())
+            };
+            for n in stated.prompt_lanes.lo.max(1)..=widest {
                 // a fire's lanes are the load's at most
                 let most = self.budgets.tokens.max_lanes.saturating_sub(n);
                 for d in stated.decode_lanes.lo..=stated.decode_lanes.hi.min(most) {
@@ -1329,7 +1344,7 @@ fn use_rank(part: &str) -> u8 {
         "decode" => 0,
         "draft windows" => 1,
         "draft prompts" => 2,
-        "mixed" => 3,
+        "mixed" | "stated" => 3,
         "prefill" => 4,
         _ => 5,
     }

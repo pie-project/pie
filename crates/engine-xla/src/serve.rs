@@ -2134,6 +2134,17 @@ impl Shell {
         engine::MixedLanes::Laid(rungs)
     }
 
+    /// The most prompts a fire of prompts alone lays out with: their count
+    /// and a rest lane padded to their lane rung (`canonical_pads`), within
+    /// the lanes a fire takes (`FireLimits::prefill_lanes`).
+    pub fn prefill_lanes(&self) -> u32 {
+        let max = self.budgets.tokens.max_lanes;
+        (1..=max)
+            .rev()
+            .find(|&n| self.pad.rung(n + 1) <= max)
+            .unwrap_or(0)
+    }
+
     /// Holds the fire limits the load stated (`Capabilities::limits`): a
     /// mixed fire within them and [`Self::mixed_lanes`] is one the load
     /// states laid.
