@@ -20,6 +20,10 @@ test-slot-fill = []
 # injection path; engine-metal's own tests turn it on (the dev-dependency
 # on this crate below).
 fault-injection = []
+# Tests only: `DeviceBoot::top`, a load's top rung stated in place of the
+# ruling's (a test hand-building frames past a miniature's ruled top). Off
+# by default, so no served load can name it.
+test-limits = []
 
 [dependencies]
 toml = "1.1"
@@ -90,7 +94,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-engine-metal = { path = ".", features = ["fault-injection"] }
+engine-metal = { path = ".", features = ["fault-injection", "test-limits"] }
 engine-cpu = { path = "../engine-cpu" }
 media = { path = "../media" }
 poem = { package = "pie-poem", path = "../poem" }
