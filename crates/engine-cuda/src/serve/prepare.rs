@@ -1322,7 +1322,10 @@ impl Shell {
                     ),
                 ));
             }
-            for snap in seated.rs_snapshots {
+            // A load of rings alone lands them itself (`super::ring`): no
+            // kernel reads the table, and its length bounds no fire.
+            let in_table = self.lands_snapshots();
+            for snap in seated.rs_snapshots.iter().filter(|_| in_table) {
                 snapshots.rows.push(narrow(u64::from(snap.row)));
                 snapshots.slots.push(narrow(u64::from(snap.slot)));
             }
@@ -1827,6 +1830,19 @@ impl Shell {
                     ring_work.add(&composed, &planes);
                     self.ring_seen.snapshots += snapshots.len() as u64;
                 } else {
+                    // A record's ring work is its first lane's; another's
+                    // snapshot would be dropped with the rest of its work.
+                    // (The runtime snapshots a pass of one lane only.)
+                    if !snapshots.is_empty() {
+                        return Err(Fault::program(
+                            "serve::ring",
+                            format!(
+                                "lane {} snapshots the rings of a record another lane of the \
+                                 fire folds: a record's snapshots are its folding lane's",
+                                seat_sources[lane]
+                            ),
+                        ));
+                    }
                     ring_work.fills.extend_from_slice(&composed.fills);
                 }
                 composed_tables.push(composed.table.iter().map(|&id| id as u32).collect());
