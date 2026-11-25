@@ -18,9 +18,7 @@
 //!
 //! A lane's scratch is one piece: a grouped kernel addresses every value
 //! of the lane from its one base, so the lane's stage scratch lies whole
-//! in one contiguous run (an `eta_exec::lay_out` layout). A chunked layout
-//! (`eta_exec::lay_out_chunked`, several pieces a lane) is not one a
-//! grouped kernel reads; an engine that would place a lane's scratch in
+//! in one contiguous run (an `eta_exec::lay_out` layout). An engine that would place a lane's scratch in
 //! several pieces refuses that by name.
 //!
 //! The WGSL / SPIR-V steps and XLA's lowering run no grouped kernel: each

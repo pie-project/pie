@@ -7,7 +7,7 @@ use eta_ir::op::tags;
 use eta_ir::types::MAX_RANK;
 
 use super::{
-    Area, ChunkLayout, Layout, Lifetime, Pieces, TooLarge, chunked_with, reusing_with,
+    Area, Layout, Lifetime, TooLarge, reusing_with,
 };
 use crate::extent::{Extents, Unresolvable, ValueDesc, describe, element_bytes};
 
@@ -357,27 +357,6 @@ pub fn lay_out(
         run.reserve,
         run.temporary,
         &launch_areas(run),
-    )
-}
-
-/// `plan`'s scratch under `run` in `pieces` ([`layout_chunked`]): values
-/// share bytes where their lifetimes part, each piece a run of adjacent
-/// chunks inside a segment that holds the widest item whole, and each
-/// value holds its own bytes where a node is neither launched nor idle.
-pub fn lay_out_chunked(
-    plan: &LaunchStagePlan,
-    descriptors: &[ValueDesc],
-    run: &Launches<'_>,
-    pieces: Pieces,
-) -> Result<ChunkLayout, TooLarge> {
-    let lifetimes = value_lifetimes(plan, run).unwrap_or_default();
-    chunked_with(
-        descriptors,
-        &lifetimes,
-        run.reserve,
-        run.temporary,
-        &launch_areas(run),
-        pieces,
     )
 }
 
