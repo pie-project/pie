@@ -222,18 +222,6 @@ impl Site {
     }
 
     #[must_use]
-    pub const fn bit(self) -> u32 {
-        match self {
-            Site::Q => 1 << 0,
-            Site::K => 1 << 1,
-            Site::V => 1 << 2,
-            Site::O => 1 << 3,
-            Site::GateUp => 1 << 4,
-            Site::Down => 1 << 5,
-        }
-    }
-
-    #[must_use]
     pub fn parse(word: &str) -> Option<Site> {
         Site::ALL.into_iter().find(|site| site.spelled() == word)
     }
@@ -389,26 +377,8 @@ pub struct Stamp {
 pub enum Key {
     Shared(Stamp),
     Own(engine::InstanceId),
-    /// An instance's own planes, by their contents: every pass that carries
-    /// the same adapter shares one slot, landed once.
-    Planes(u64),
     /// A bundle, by the digest of its bytes (`engine::bundle::Bundle::key`).
     Content([u8; 32]),
-}
-
-/// A fingerprint of an adapter's planes: every bank name and byte.
-fn planes_fingerprint(planes: &[AdapterPlane<'_>]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |w: u64| h = (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
-    for plane in planes {
-        for chunk in plane.bank.as_bytes().chunks(8).chain(plane.bytes.chunks(8)) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            mix(u64::from_le_bytes(word));
-        }
-        mix(plane.bytes.len() as u64);
-    }
-    h
 }
 
 /// Lands a bundle's planes into `slot`; `land` zeroes the banks it does not
@@ -569,10 +539,6 @@ pub enum Source<'a> {
     Shared {
         name: &'a str,
     },
-    Own {
-        instance: engine::InstanceId,
-        planes: &'a [AdapterPlane<'a>],
-    },
     /// A bundle, cut to this rank's share; every bind of the same bytes
     /// shares one slot.
     Bundle {
@@ -639,7 +605,6 @@ impl Adapters {
             });
         }
         let landed = match source {
-            Source::Own { planes, .. } => land(grant.slot, planes).map(|()| 0),
             Source::Shared { name } => self.land_shared(name, seats, grant.slot, land),
             Source::Bundle { bundle, rank } => {
                 land_bundle(bundle, rank, seats, grant.slot, land).map(|()| 0)
@@ -667,7 +632,6 @@ impl Adapters {
 
     pub fn key(&self, source: &Source<'_>) -> Result<Key> {
         match source {
-            Source::Own { planes, .. } => Ok(Key::Planes(planes_fingerprint(planes))),
             Source::Bundle { bundle, .. } => Ok(Key::Content(bundle.key())),
             Source::Shared { name } => {
                 let dir = self.vfs.resolve(name)?;

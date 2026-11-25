@@ -464,66 +464,29 @@ fn adapter_of(
     shell: &mut Shell,
     world: World,
     program: engine::program::ProgramId,
-    instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
 ) -> EngineResult<Option<crate::Binding>> {
-    if let Some(channel) = shell.program_adapter_bundle(program).map_err(fault)? {
-        let wire = seeds
-            .iter()
-            .find(|(seeded, _)| *seeded == channel)
-            .map(|(_, bytes)| bytes.as_slice())
-            .ok_or_else(|| {
-                Error::Load(format!(
-                    "this program's `adapter` sink reads its bundle out of channel \
-                     {channel} and this bind seeded nothing into it"
-                ))
-            })?;
-        let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
-        return shell
-            .bind_adapter(crate::AdapterSource::Bundle {
-                bundle: &bundle,
-                rank: engine::bundle::Rank {
-                    rank: world.rank,
-                    world: world.size,
-                },
-            })
-            .map(Some)
-            .map_err(fault);
-    }
-    let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
+    let Some(channel) = shell.program_adapter_bundle(program).map_err(fault)? else {
         return Ok(None);
     };
-    let seats = shell.bank_seats();
-    let site = sink.site().map_err(fault)?;
-    let mut built: Vec<(String, Vec<u8>)> = Vec::new();
-    for (role, channel) in &sink.planes {
-        let wire = seeds
-            .iter()
-            .find(|(seeded, _)| seeded == channel)
-            .map(|(_, bytes)| bytes.as_slice())
-            .ok_or_else(|| {
-                Error::Load(format!(
-                    "this program's `lora` sink reads its `{}` plane out of channel \
-                     {channel} and this bind seeded nothing into it; an adapter's \
-                     weights are the seed, because the fire path never reads the cell \
-                     (alto adapter §6.1), so an unseeded plane is a correction of zero \
-                     that nobody asked for",
-                    role.bank()
-                ))
-            })?;
-        built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
-    }
-    let planes: Vec<crate::AdapterPlane<'_>> = built
+    let wire = seeds
         .iter()
-        .map(|(bank, bytes)| crate::AdapterPlane {
-            bank: bank.as_str(),
-            bytes,
-        })
-        .collect();
+        .find(|(seeded, _)| *seeded == channel)
+        .map(|(_, bytes)| bytes.as_slice())
+        .ok_or_else(|| {
+            Error::Load(format!(
+                "this program's `adapter` sink reads its bundle out of channel \
+                 {channel} and this bind seeded nothing into it"
+            ))
+        })?;
+    let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
     shell
-        .bind_adapter(crate::AdapterSource::Own {
-            instance,
-            planes: &planes,
+        .bind_adapter(crate::AdapterSource::Bundle {
+            bundle: &bundle,
+            rank: engine::bundle::Rank {
+                rank: world.rank,
+                world: world.size,
+            },
         })
         .map(Some)
         .map_err(fault)
@@ -1001,7 +964,7 @@ impl Programs for Cuda {
                 &binding.channels,
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, world, binding.program, id, &seeds);
+        let landed = adapter_of(shell, world, binding.program, &seeds);
         let bound = match landed {
             Ok(bound) => bound,
             Err(why) => {

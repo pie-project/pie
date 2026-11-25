@@ -1849,7 +1849,6 @@ impl<B: Serve> Shell<B> {
         source: crate::adapter::Source<'_>,
     ) -> Result<crate::adapter::Binding> {
         let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
             crate::adapter::Source::Shared { name } => {
                 crate::adapter::Key::Shared(self.blobs.stamp(name)?)
             }
@@ -1867,9 +1866,6 @@ impl<B: Serve> Shell<B> {
         }
 
         let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights.register_adapter(grant.slot, planes)
-            }
             crate::adapter::Source::Shared { name } => {
                 let seats = self.weights.bank_seats();
                 match self.blobs.planes(name, &seats) {

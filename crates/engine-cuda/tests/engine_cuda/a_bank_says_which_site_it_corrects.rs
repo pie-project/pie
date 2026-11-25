@@ -100,10 +100,6 @@ fn both_spellings_of_a_bank_name_parse() {
     }
 
     assert_eq!(site_of("layer.0.gate_up.lora_a"), Some(Site::GateUp));
-
-    assert_eq!(Site::Q.bit(), 1 << 0);
-    assert_eq!(Site::O.bit(), 1 << 3);
-    assert_eq!(Site::Down.bit(), 1 << 5);
 }
 
 fn a_manifest_that_states_a_site_lands_into_that_sites_banks() {

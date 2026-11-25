@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use engine::InstanceId;
 use engine_cuda::blob::{Adapters, Blobs, Layout, Source};
 use engine_cuda::{AdapterPlane, BankSeat};
 
@@ -108,7 +107,6 @@ impl Landings {
 #[test]
 fn a_shared_adapter_is_one_slot_and_one_load_every_case() {
     two_instances_of_one_blob_share_one_slot_and_one_landing();
-    a_byte_seeded_instance_gets_a_slot_of_its_own();
     a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest();
     every_slot_pinned_is_refused_and_nothing_live_is_evicted();
     a_rewritten_adapter_is_a_new_identity_and_the_old_one_stays();
@@ -154,53 +152,6 @@ fn two_instances_of_one_blob_share_one_slot_and_one_landing() {
         1,
         "and one occupied slot in the whole table"
     );
-}
-
-fn a_byte_seeded_instance_gets_a_slot_of_its_own() {
-    let (_mount, mut adapters) = mounted("own");
-    let seats = seats();
-    let landings = Landings::default();
-    let slot = usize::try_from(seats[0].slot).expect("a slot fits this host");
-    let bytes = vec![0u8; slot];
-    let planes: Vec<AdapterPlane<'_>> = seats
-        .iter()
-        .map(|seat| AdapterPlane {
-            bank: seat.name.as_str(),
-            bytes: &bytes,
-        })
-        .collect();
-
-    let shared = adapters
-        .bind(Source::Shared { name: "alice-v2" }, &seats, landings.land())
-        .expect("the file binds");
-    let own = adapters
-        .bind(
-            Source::Own {
-                instance: InstanceId(7),
-                planes: &planes,
-            },
-            &seats,
-            landings.land(),
-        )
-        .expect("and so do the caller's own bytes");
-
-    assert_ne!(shared.slot, own.slot, "a private adapter shares nothing");
-    assert!(shared.shared);
-    assert!(!own.shared);
-    assert!(own.landed, "its bytes are its own and it pays for them");
-    assert_eq!(landings.calls(), 2);
-    let again = adapters
-        .bind(
-            Source::Own {
-                instance: InstanceId(7),
-                planes: &planes,
-            },
-            &seats,
-            landings.land(),
-        )
-        .expect("re-binding one instance");
-    assert_eq!(again.slot, own.slot);
-    assert!(!again.landed);
 }
 
 fn a_released_slot_keeps_its_bytes_and_pressure_takes_the_oldest() {
