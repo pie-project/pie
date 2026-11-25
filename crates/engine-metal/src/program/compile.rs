@@ -186,6 +186,7 @@ impl Module {
         source: &str,
         entry: &str,
         steps: usize,
+        threads: &Threads,
     ) -> std::result::Result<Module, Failure> {
         let options = crate::device::ctx::compile_options();
         set_safe_math(&options);
@@ -198,10 +199,10 @@ impl Module {
         let library = device
             .newLibraryWithSource_options_error(&text, Some(&options))
             .map_err(|error| classify(entry, &error))?;
-        let name = crate::device::ctx::nsstring(entry);
         // A streamed kernel declares its step as a function constant: the
         // pipeline for every step leaves it undefined, a step's states it.
-        let pipeline_for = |step: Option<u32>| {
+        let pipeline_for = |library: &ProtocolObject<dyn MTLLibrary>, step: Option<u32>| {
+            let name = crate::device::ctx::nsstring(entry);
             let constants = objc2_metal::MTLFunctionConstantValues::new();
             if let Some(step) = step {
                 // SAFETY: a uint constant at this index, read from a live u32.
@@ -225,19 +226,167 @@ impl Module {
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|error| classify(entry, &error))
         };
-        let pipeline = pipeline_for(None)?;
+        let made = pipeline_for(&library, None).map(Made)?;
         // Every step's pipeline is built here, with the region's library, as
         // the registration compiles: none is built where a step fires.
-        let steps = (0..steps)
-            .map(|step| pipeline_for(Some(u32::try_from(step).unwrap_or(u32::MAX))))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let shared = Made(&*library);
+        let steps = in_parallel(threads, steps, |step| {
+            let shared = &shared;
+            pipeline_for(shared.0, Some(u32::try_from(step).unwrap_or(u32::MAX))).map(Made)
+        })
+        .into_iter()
+        .map(|made| made.map(|Made(pipeline)| pipeline))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
         STEP_PIPELINES.fetch_add(steps.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(Module {
+            pipeline: made.0,
             library,
-            pipeline,
             steps,
             entry: entry.to_string(),
         })
+    }
+}
+
+/// A library or a pipeline state, made on one thread and taken on another:
+/// `MTLLibrary` and `MTLComputePipelineState` are documented thread-safe.
+#[cfg(target_vendor = "apple")]
+struct Made<T>(T);
+// SAFETY: as stated above; `Made` holds nothing else.
+#[cfg(target_vendor = "apple")]
+unsafe impl<T> Send for Made<T> {}
+// SAFETY: as above.
+#[cfg(target_vendor = "apple")]
+unsafe impl<T> Sync for Made<T> {}
+
+/// The threads a prewarm may still start. Nested fans ([`in_parallel`]) share
+/// it, so however they nest no more run than the device compiles at once.
+pub struct Threads {
+    spare: std::sync::atomic::AtomicUsize,
+}
+
+impl Threads {
+    /// `count` threads in all, the calling one among them.
+    #[must_use]
+    pub fn of(count: usize) -> Threads {
+        Threads {
+            spare: std::sync::atomic::AtomicUsize::new(count.saturating_sub(1)),
+        }
+    }
+
+    fn take(&self) -> bool {
+        use std::sync::atomic::Ordering::AcqRel;
+        self.spare
+            .try_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    fn give(&self) {
+        self.spare.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// One fan's work: the next index, its answers and what makes them.
+struct Fan<'a, T, F> {
+    threads: &'a Threads,
+    next: std::sync::atomic::AtomicUsize,
+    slots: Vec<std::sync::Mutex<Option<T>>>,
+    make: F,
+}
+
+impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
+    /// Makes answers until none are left, starting another thread at each
+    /// while one is spare and work remains.
+    fn work<'s>(&'s self, scope: &'s std::thread::Scope<'s, '_>) {
+        loop {
+            let at = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(slot) = self.slots.get(at) else { break };
+            if at + 1 < self.slots.len() && self.threads.take() {
+                scope.spawn(move || {
+                    self.work(scope);
+                    self.threads.give();
+                });
+            }
+            let made = pooled(|| (self.make)(at));
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
+        }
+    }
+}
+
+/// `run` in an autorelease pool of its own: what Metal autoreleases goes
+/// when it returns, not when the thread ends.
+fn pooled<T>(run: impl FnOnce() -> T) -> T {
+    #[cfg(target_vendor = "apple")]
+    {
+        objc2::rc::autoreleasepool(|_| run())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        run()
+    }
+}
+
+/// `make` of every index below `count`, on the calling thread and those
+/// `threads` has spare, answered in index order whatever order they ran in.
+pub(crate) fn in_parallel<T: Send>(
+    threads: &Threads,
+    count: usize,
+    make: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
+    let fan = Fan {
+        threads,
+        next: std::sync::atomic::AtomicUsize::new(0),
+        slots: (0..count).map(|_| std::sync::Mutex::new(None)).collect(),
+        make,
+    };
+    std::thread::scope(|scope| fan.work(scope));
+    fan.slots
+        .into_iter()
+        .filter_map(|slot| slot.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
+        .collect()
+}
+
+/// The modules jobs run at once share, by text: each text is built by the
+/// first job to ask, and the others wait for it.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub struct Sharing {
+    modules: std::sync::Mutex<std::collections::HashMap<u64, SharedModule>>,
+    pub(crate) threads: Threads,
+}
+
+type SharedModule = Arc<std::sync::OnceLock<std::result::Result<Arc<Module>, Failure>>>;
+
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+impl Sharing {
+    /// `threads`: the compiles the device runs at once.
+    #[must_use]
+    pub fn over(threads: usize) -> Sharing {
+        Sharing {
+            modules: std::sync::Mutex::default(),
+            threads: Threads::of(threads),
+        }
+    }
+
+    /// The module of `key`, and whether this call built it.
+    fn module(
+        &self,
+        key: u64,
+        build: impl FnOnce() -> std::result::Result<Arc<Module>, Failure>,
+    ) -> (std::result::Result<Arc<Module>, Failure>, bool) {
+        let slot = self
+            .modules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .clone();
+        let mut built = false;
+        let module = slot
+            .get_or_init(|| {
+                built = true;
+                build()
+            })
+            .clone();
+        (module, built)
     }
 }
 
@@ -312,6 +461,22 @@ pub struct CompileDevice {
 unsafe impl Send for CompileDevice {}
 
 impl CompileDevice {
+    /// Has the device compile on as many threads as the OS lets it
+    /// (`on`), or as it does by default, and answers how many that is.
+    #[must_use]
+    pub fn compile_wide(&self, on: bool) -> usize {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.device.setShouldMaximizeConcurrentCompilation(on);
+            self.device.maximumConcurrentCompilationTaskCount().max(1)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = on;
+            1
+        }
+    }
+
     #[must_use]
     pub fn of(context: &Context) -> CompileDevice {
         #[cfg(target_vendor = "apple")]
@@ -382,8 +547,15 @@ impl Job {
     /// pipelines, on whatever thread runs it.
     #[must_use]
     pub fn run(self) -> Built {
+        self.run_sharing(&Sharing::over(1))
+    }
+
+    /// [`Job::run`], its modules shared with the jobs run beside it.
+    #[must_use]
+    pub fn run_sharing(self, sharing: &Sharing) -> Built {
         let mut builder = Builder {
             device: &self.device,
+            sharing,
             modules: &self.modules,
             made: std::collections::HashMap::new(),
             compilations: 0,
@@ -433,6 +605,8 @@ impl Job {
 struct Builder<'a> {
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     device: &'a CompileDevice,
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    sharing: &'a Sharing,
     modules: &'a std::collections::HashMap<u64, Arc<Module>>,
     made: std::collections::HashMap<u64, Arc<Module>>,
     compilations: u64,
@@ -930,9 +1104,17 @@ impl Builder<'_> {
         #[cfg(target_vendor = "apple")]
         {
             let began = std::time::Instant::now();
-            let module = Arc::new(Module::build(&self.device.device, &expanded, entry, steps)?);
-            self.compile_nanos += u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.compilations += 1;
+            let (module, built) = self.sharing.module(key, || {
+                Module::build(&self.device.device, &expanded, entry, steps, &self.sharing.threads)
+                    .map(Arc::new)
+            });
+            let module = module?;
+            if built {
+                self.compile_nanos += u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.compilations += 1;
+            } else {
+                self.memory_hits += 1;
+            }
             self.made.insert(key, module.clone());
             Ok(module)
         }
@@ -1021,5 +1203,60 @@ mod tests {
                 Versions::from_compiler(Emitter::Cuda.emitter_version()),
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel {
+    use super::*;
+
+    /// Answers come in index order, each index made once, at any thread
+    /// count; a text's failure is every asker's and is built once.
+    #[test]
+    fn parallel_builds_answer_in_order_and_build_a_text_once() {
+        for threads in [1, 2, 18] {
+            let made = std::sync::atomic::AtomicUsize::new(0);
+            let out = in_parallel(&Threads::of(threads), 40, |at| {
+                made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                at
+            });
+            assert_eq!(out, (0..40).collect::<Vec<_>>());
+            assert_eq!(made.into_inner(), 40);
+            let sharing = Sharing::over(threads);
+            let asked = in_parallel(&sharing.threads, 8, |_| {
+                sharing.module(7, || {
+                    Err(Failure::Deterministic { reason: "`e`: refused".into() })
+                })
+            });
+            assert_eq!(asked.iter().filter(|(_, built)| *built).count(), 1);
+            for (module, _) in asked {
+                let refused = Failure::Deterministic { reason: "`e`: refused".into() };
+                assert_eq!(module.map(|_| ()), Err(refused));
+            }
+        }
+    }
+
+    /// Fans inside a fan run on no more threads than were stated, and give
+    /// back every one they took.
+    #[test]
+    fn nested_fans_share_their_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        for count in [1, 4, 18] {
+            let threads = Threads::of(count);
+            let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let sums = in_parallel(&threads, 30, |outer| {
+                in_parallel(&threads, 20, |inner| {
+                    most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                    now.fetch_sub(1, SeqCst);
+                    outer * inner
+                })
+                .into_iter()
+                .sum::<usize>()
+            });
+            assert_eq!(sums, (0..30).map(|outer| outer * 190).collect::<Vec<_>>());
+            assert!(most.into_inner() <= count);
+            assert_eq!(threads.spare.into_inner(), count - 1);
+        }
     }
 }
