@@ -265,6 +265,7 @@ fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
     let unrecorded = shell.tallied(Tally::Unrecorded);
     eprintln!("census: {:?}; unrecorded {unrecorded}", shell.body_stats().tally);
     assert_eq!(unrecorded, 0, "every serving fire replayed a body or was stated eager");
+    assert_eq!(shell.tallied(Tally::Compiled), 0, "no serving fire captured a body");
 
     // The adapter is read: the adapted lane's prompt without it answers
     // otherwise than with it.
