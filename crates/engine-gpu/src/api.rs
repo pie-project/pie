@@ -911,10 +911,7 @@ fn adapter_of<B: Host>(
         })
         .collect();
     shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
+        .bind_adapter(instance, &planes)
         .map(Some)
         .map_err(fault)
 }
