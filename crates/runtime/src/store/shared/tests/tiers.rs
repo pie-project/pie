@@ -603,3 +603,57 @@ fn a_list_compaction_frees_whole_chunks_of_scattered_pages() {
     }
     assert_eq!(chunks_now.len(), 1, "every page in one chunk");
 }
+
+/// Idle cache whose pages interleave: a chunk opens by what holds its pages
+/// going together, the chunks used longest ago first, and no other entry.
+#[test]
+fn a_whole_chunk_opens_from_what_holds_its_pages_alone() {
+    use crate::store::chunks::ShapePool;
+    use crate::store::kv::hash::{Hash256, chain_slots, page_hash};
+    let facts = fixed_facts();
+    let seed: Hash256 = [9; 32];
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let list = shared.lock().unwrap().list().unwrap();
+    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, seed);
+    kv.set_page_size(16);
+    kv.set_keeps(true);
+    let per_chunk = list.slots_per_chunk as usize;
+    assert!(per_chunk >= 2);
+    let free = || shared.lock().unwrap().pool().free_chunks();
+    let pages = kv.reserve_device_pages(4 * per_chunk).unwrap();
+    let left = free();
+    // Entries 0 and 1 halve two chunks, 2 and 3 two others; used in the
+    // order 0, 2, 1, 3.
+    let halves: Vec<Vec<PhysicalKvPageId>> = (0..4)
+        .map(|entry| {
+            pages[(entry / 2) * 2 * per_chunk..(entry / 2 + 1) * 2 * per_chunk]
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(at, _)| at % 2 == entry % 2)
+                .map(|(_, page)| page)
+                .collect()
+        })
+        .collect();
+    let mut keys_of = Vec::new();
+    for entry in [0usize, 2, 1, 3] {
+        let first = 1000 * entry as u32;
+        let rows: Vec<u32> = (first..first + halves[entry].len() as u32 * 16).collect();
+        let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&seed, None, 0, &rows)
+            .chunks(16)
+            .map(|page| page.iter().map(|hash| Some(*hash)).collect())
+            .collect();
+        let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+        keys_of.push((entry, keys.clone()));
+        let backings = halves[entry].iter().map(|&page| KvPageBacking::Resident(page)).collect();
+        assert!(kv.import_cached_at(&[], tokens, keys, backings));
+    }
+    let fire = kv.begin_fire();
+    kv.settle(fire);
+    assert_eq!(kv.reclaim_chunks(1, |_| 0), 2 * per_chunk, "the two that share its chunk");
+    kv.retire_idle();
+    assert_eq!(free(), left + 2, "and both their chunks open");
+    for (entry, keys) in keys_of {
+        assert_eq!(!kv.cached_run(&keys).is_empty(), entry >= 2, "entry {entry}");
+    }
+}

@@ -793,6 +793,12 @@ impl ResidencyPlanner {
         true
     }
 
+    /// The whole chunks an ask of `chunks` is short of: one at least, where
+    /// those free lie in no run it takes.
+    fn chunks_short(&self, chunks: u32) -> u32 {
+        chunks.saturating_sub(self.port.free_chunks()).max(1)
+    }
+
     /// One pass over the queue's heads; true where it ends waiting on a
     /// grow. Heads passed over this pass ([`Self::stuck_head`]) stay passed
     /// until [`Self::plan`] clears them.
@@ -1099,6 +1105,7 @@ impl ResidencyPlanner {
                     let short = IdleShort {
                         kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
                         rs: true,
+                        chunks: self.chunks_short(run.saturating_mul(pieces).saturating_add(singles)),
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1197,6 +1204,9 @@ impl ResidencyPlanner {
                     let short = IdleShort {
                         kv_pages: self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
                         rs: true,
+                        chunks: self.chunks_short(
+                            need.run.saturating_mul(need.pieces).saturating_add(need.singles),
+                        ),
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1345,6 +1355,7 @@ impl ResidencyPlanner {
                             .port
                             .chunks_as_pages(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
                         rs: true,
+                        chunks: self.chunks_short(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1422,6 +1433,7 @@ impl ResidencyPlanner {
                     let short = IdleShort {
                         kv_pages: count.max(queued),
                         rs: false,
+                        chunks: 0,
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1485,6 +1497,7 @@ impl ResidencyPlanner {
                     let short = IdleShort {
                         kv_pages: as_pages,
                         rs: true,
+                        chunks: 0,
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {

@@ -16,6 +16,10 @@ pub struct IdleShort {
     pub kv_pages: u32,
     /// Whether state is short too: one owner's checkpoints at one key go.
     pub rs: bool,
+    /// Whole chunks short, where pages freed anywhere are no room: idle
+    /// cache that opens them goes first
+    /// ([`crate::store::kv::KvStore::reclaim_chunks`]).
+    pub chunks: u32,
 }
 
 /// What [`PoolPort::reclaim_idle`] did: pages and slots it freed, and the
@@ -685,6 +689,13 @@ pub trait PoolPort: Send + Sync + 'static {
     fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
+    /// Whether idle cache may hold device room, read without counting it.
+    fn holds_idle(&self) -> bool {
+        self.reclaimable_idle() > 0
+    }
+    /// Idle cache gives a waiter no more: what comes after it (the rung
+    /// lowered) is looked at now.
+    fn idle_out(&self) {}
     /// The device room a reclaim could make now as kv pages, counted now:
     /// what the kv cache alone holds, and on a shared pool the chunks
     /// checkpoints alone hold (their slots' whole chunks).
@@ -2024,6 +2035,17 @@ impl PoolPort for RegistryPool {
     }
 
     fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim {
+        if short.chunks > 0 {
+            let freed = self.with_kv_tagged("planner-reclaim-chunks", |kv| {
+                kv.reclaim_chunks(short.chunks, crate::policy::retention::Installed)
+            });
+            if freed > 0 {
+                return IdleReclaim {
+                    freed: freed as u32,
+                    returning: 0,
+                };
+            }
+        }
         let (pages, returning) = if short.kv_pages > 0 {
             self.with_kv_tagged("planner-reclaim-idle", |kv| {
                 let pages = kv.reclaim_cache(
@@ -2061,6 +2083,17 @@ impl PoolPort for RegistryPool {
         });
         *last = Some((crate::rt::Instant::now(), pages));
         pages
+    }
+
+    fn holds_idle(&self) -> bool {
+        self.with_kv_tagged("planner-holds-idle", |kv| kv.holds_cache())
+            || self.with_rs(|rs| rs.holds_checkpoints())
+    }
+
+    fn idle_out(&self) {
+        if let Some(shared) = &self.shared {
+            shared.wake();
+        }
     }
 
     fn idle_room(&self) -> u32 {

@@ -1141,6 +1141,81 @@ impl KvStore {
         freed
     }
 
+    /// Opens `want` whole device chunks from idle cache, as
+    /// [`Self::reclaim_cache`] frees pages: the lowest retention key first,
+    /// as far as the keys let it, and of one key's chunks the one whose
+    /// newest entry was used longest ago. A chunk opens once every page in
+    /// it goes, so what holds its pages goes together; dropped an entry at
+    /// a time, each a page of many chunks, nearly a key's whole cache goes
+    /// before one opens. Answers the device pages freed: 0 where no chunk is
+    /// idle cache's whole.
+    pub fn reclaim_chunks(&mut self, want: u32, keys: impl Keys) -> usize {
+        if want == 0 || self.persisted.as_ref().is_some_and(|p| !p.by_key.is_empty()) {
+            return 0;
+        }
+        let Some((shared, shape)) = self.pool.shared_shape() else {
+            return 0;
+        };
+        let (spc, chunks) = shared.lock().unwrap().single_chunks(shape);
+        if spc == 0 {
+            return 0;
+        }
+        let order = self.kept_order(&keys);
+        let reads = self.table.live_reads();
+        let base = self.pool.base();
+        let mut ids: Vec<u64> = Vec::new();
+        let mut opens: Vec<(Instant, HashSet<u64>)> = Vec::new();
+        for level in order.chunk_by(|a, b| a.0 == b.0) {
+            for (_, group) in level {
+                ids.extend(self.at_rest(group, &reads));
+            }
+            if ids.is_empty() {
+                continue;
+            }
+            let mut holders: HashMap<TriePageLocation, Vec<u64>> = HashMap::new();
+            for &id in &ids {
+                for (at, _) in self.table.path_pages(self.cache[&id].path.terminal) {
+                    holders.entry(at).or_default().push(id);
+                }
+            }
+            let mut held: HashMap<u32, (u32, HashSet<u64>)> = HashMap::new();
+            let above = self.above(level[0].0, &keys);
+            for (at, page) in self.table.cache_only_pages(&self.roots(&ids), &above) {
+                let (pages, by) = held.entry(page.0.saturating_sub(base) / spc).or_default();
+                *pages += 1;
+                by.extend(holders.get(&at).into_iter().flatten());
+            }
+            opens = chunks
+                .iter()
+                .filter(|chunk| chunk.settled && chunk.used > 0)
+                .filter_map(|chunk| {
+                    let (_, by) = held.remove(&chunk.logical).filter(|(pages, _)| *pages == chunk.used)?;
+                    let newest = by.iter().map(|id| self.cache[id].last_use).max()?;
+                    Some((newest, by))
+                })
+                .collect();
+            if opens.len() >= want as usize {
+                break;
+            }
+        }
+        self.keep_order(order, &keys);
+        opens.sort_by_key(|(newest, _)| *newest);
+        let mut freed = 0;
+        for (_, by) in opens.into_iter().take(want as usize) {
+            freed += self.drop_entries(
+                by.into_iter().filter(|id| self.cache.contains_key(id)).collect(),
+                By::Host,
+            );
+        }
+        tracing::debug!(target: "pie::kv", want, freed, "reclaimed whole chunks");
+        freed
+    }
+
+    /// Whether anything is cached here.
+    pub fn holds_cache(&self) -> bool {
+        !self.cache.is_empty()
+    }
+
     /// The device pages reclaims freed that still wait on a fire's
     /// retirement: returning, with nothing more to do but wait for it (a
     /// fire's settle retires them, and tells the planner).

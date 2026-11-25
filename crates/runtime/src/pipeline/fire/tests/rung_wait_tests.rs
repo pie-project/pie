@@ -233,3 +233,47 @@ async fn a_bind_waiting_in_the_planner_takes_the_span_back_and_the_rung_rises_af
     assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
     drop(want);
 }
+
+/// A kv ask parked short while idle cache holds the room: the rung stays
+/// where it stands until the planner has asked idle cache and found it out,
+/// and comes down then.
+#[tokio::test(flavor = "current_thread")]
+async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
+    use crate::store::kv::hash::{Hash256, chain_slots, page_hash};
+    use crate::store::kv::page_table::KvPageBacking;
+    const ENGINE: usize = 75;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let (model, stores) = super::unfolded_tests::pool_with_rungs_of(vec![(1, 2), (512, 8)]);
+    let shared = stores.shared.clone().expect("a shared pool");
+    let planner = crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
+        crate::planner::RegistryPool::new(model, 0, false),
+    ));
+    crate::planner::init_planner(model, ENGINE, planner);
+    let planner = crate::planner::planner_for(model, ENGINE).expect("installed");
+    let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
+        .with_live_lanes(|| 1);
+    // Idle cache, every page there is; a waiter is short of two.
+    crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        let pages = kv.reserve_device_pages(kv.available_pages()).unwrap();
+        let rows: Vec<u32> = (0..pages.len() as u32 * 16).collect();
+        let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&[3; 32], None, 0, &rows)
+            .chunks(16)
+            .map(|page| page.iter().map(|hash| Some(*hash)).collect())
+            .collect();
+        let keys = tokens.iter().map(|page| page_hash(page)).collect();
+        let backings = pages.into_iter().map(KvPageBacking::Resident).collect();
+        assert!(kv.import_cached_at(&[], tokens, keys, backings));
+        kv.note_short(2);
+    });
+    grow.walk_rung().await;
+    assert_eq!(
+        crate::store::shared::fire_cap(ENGINE),
+        u32::MAX,
+        "idle cache is asked first"
+    );
+    // The planner asks it, all of it, and finds no more.
+    planner.yield_idle(64);
+    planner.yield_idle(64);
+    grow.walk_rung().await;
+    assert_eq!(crate::store::shared::fire_cap(ENGINE), 1, "then the rung comes down");
+}

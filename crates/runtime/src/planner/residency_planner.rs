@@ -70,6 +70,9 @@ pub struct ResidencyPlanner {
     /// off it (the policy port's thread) runs.
     runtime: Option<tokio::runtime::Handle>,
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
+    /// One reclaim at a time: one under way on another thread is not idle
+    /// cache found out.
+    idle_reclaim: parking_lot::Mutex<()>,
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
     pub(super) demoting: AtomicBool,
@@ -160,6 +163,7 @@ impl ResidencyPlanner {
             returns,
             runtime: tokio::runtime::Handle::try_current().ok(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
+            idle_reclaim: parking_lot::Mutex::new(()),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
             demoting: AtomicBool::new(false),
@@ -826,6 +830,7 @@ impl ResidencyPlanner {
         let _ = self.reclaim_idle_once(super::pool::IdleShort {
             kv_pages: pages,
             rs: true,
+            chunks: 0,
         });
     }
 
@@ -833,19 +838,56 @@ impl ResidencyPlanner {
     /// reclaims freed that is still returning, and no more
     /// ([`super::pool::PoolPort::reclaim_idle`]).
     pub(super) fn reclaim_idle_once(&self, short: super::pool::IdleShort) -> IdleOutcome {
-        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel) {
+        let _one = self.idle_reclaim.lock();
+        if self.idle_reclaim_exhausted.load(Ordering::Acquire) {
             return IdleOutcome::Nothing;
         }
         let reclaim = self.port.reclaim_idle(short);
         if reclaim.freed > 0 {
-            self.idle_reclaim_exhausted.store(false, Ordering::Release);
             return IdleOutcome::Freed;
         }
         if reclaim.returning > 0 {
-            self.idle_reclaim_exhausted.store(false, Ordering::Release);
             return IdleOutcome::Returning;
         }
+        self.idle_reclaim_exhausted.store(true, Ordering::Release);
+        self.port.idle_out();
         IdleOutcome::Nothing
+    }
+
+    /// Whether idle cache may still give what a waiter is short of: no
+    /// reclaim found it out since room last moved. The activation rung is
+    /// not lowered for the waiter before that.
+    pub fn idle_gives(&self) -> bool {
+        !self.idle_reclaim_exhausted.load(Ordering::Acquire) && self.port.holds_idle()
+    }
+
+    /// Makes room for an ask of `pages` from idle cache at once, in the
+    /// order a plan does (what the pool can still open, then what moves
+    /// down a tier, are waited on instead): an ask idle cache covers parks
+    /// no one and is no demand that waits for room.
+    pub(super) fn take_idle_room(self: &Arc<Self>, pages: u32) {
+        let short = pages.saturating_sub(self.port.device_stats().0);
+        if short == 0
+            || pages > self.device_pages_most()
+            || !self.port.holds_idle()
+            || self.port.commit_room() > 0
+            || self.demote_idle(short)
+        {
+            return;
+        }
+        loop {
+            let short = pages.saturating_sub(self.port.device_stats().0);
+            if short == 0 {
+                return;
+            }
+            let short = super::pool::IdleShort {
+                kv_pages: short,
+                ..Default::default()
+            };
+            if self.reclaim_idle_once(short) != IdleOutcome::Freed {
+                return;
+            }
+        }
     }
 
     /// Idle cache the device is short of room for moves down a tier, host
@@ -866,6 +908,9 @@ impl ResidencyPlanner {
         if !self.port.suspend_capable() {
             return false;
         }
+        // One look at a time: one under way on another thread may find
+        // nothing to move, with no landing to wake who took it for a move.
+        let _one = self.idle_reclaim.lock();
         if self.demoting.swap(true, Ordering::AcqRel) {
             return true;
         }
