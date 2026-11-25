@@ -4455,15 +4455,12 @@ impl KvStore {
     }
 
     fn disk_swap_free(&self, keys: &impl Keys) -> usize {
-        let (spare, whole) = self.disk_yield_plan(keys);
+        // With no copies kept, what idle cache would give is counted apart
+        // ([`Self::droppable_below_device`]).
         if self.persisted.is_none() {
-            let roots: Vec<NodeId> = whole
-                .iter()
-                .filter_map(|(_, id)| Some(self.cache.get(id)?.path.terminal))
-                .collect();
-            let idle = self.table.cache_only_below_device(&roots, &[]).1;
-            return self.disk_pool.available() + idle as usize;
+            return self.disk_pool.available();
         }
+        let (spare, whole) = self.disk_yield_plan(keys);
         let mut backing: HashSet<DiskKvSlotId> = HashSet::new();
         if let Some(persisted) = &self.persisted {
             for (_, id) in &whole {
