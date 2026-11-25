@@ -240,7 +240,8 @@ mod tests {
     /// coopmat, register tiles on Adreno and PowerVR, then tiled, from 12 rows over whole
     /// 32-code tiles; for one row, the one-row kernel on Adreno (32 lanes a
     /// row) and on PowerVR (8 lanes a row, two rows a lane); else
-    /// four vectors a workgroup.
+    /// four vectors a workgroup. Adreno's 64-row tile walks 32 codes a step
+    /// (measured on an Adreno 840).
     fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> Qmm {
         let qualcomm = d.vendor == "qualcomm";
         let tiles = rows >= 12 && k.is_multiple_of(32);
