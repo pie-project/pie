@@ -619,6 +619,9 @@ impl Port {
             }
             Event::CacheEmptied(owner, by) => {
                 // A live process's working set ends with the process.
+                if self.procs.contains_key(&owner) {
+                    return;
+                }
                 if self.retained.remove(&owner).is_some() || self.put.contains(&owner) {
                     self.forget(owner, by);
                 }
