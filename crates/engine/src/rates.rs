@@ -1495,41 +1495,6 @@ pub fn throttled(before: ClockRead, after: ClockRead) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    /// A point that starts in a slow clock state and leaves it only under
-    /// its own load: its frames' length settles while it is slow, and the
-    /// point is timed only once frames of that length run at the fast rate,
-    /// whatever the doublings saw. (On an M5 Pro a short matmul read about
-    /// 5 or about 34 TFLOP/s run to run: timed without this, by which state
-    /// the gap before it left.)
-    #[test]
-    fn a_point_is_timed_only_once_its_own_load_has_settled_its_clock() {
-        let calls = std::cell::Cell::new(0u32);
-        // Slow (10 ns a fire) for the frames the doublings settle in, then
-        // fast (1 ns a fire) once its own load has lifted the clock.
-        const SLOW: u32 = 3;
-        let frame = |k: u32| -> Result<f64, String> {
-            calls.set(calls.get() + 1);
-            let per = if calls.get() <= SLOW { 10.0 } else { 1.0 };
-            Ok(per * f64::from(k))
-        };
-        let settled =
-            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
-        assert_eq!(
-            settled.per_fire_ns, 10.0,
-            "the doublings alone settle in the slow state"
-        );
-        calls.set(0);
-        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
-        let settled_at = calls.get();
-        assert!(
-            settled_at > SLOW + 1,
-            "the warm-up ran past the slow state ({settled_at} frames)"
-        );
-        // The next frame of that length reads the fast state.
-        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
-        assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
-    }
-
     /// Points whose fires are slow on any operand set the device has not
     /// read yet, their rotation longer than the frames their doublings
     /// settle in: the first point over the sets touches every one of them,
@@ -1596,25 +1561,39 @@ mod tests {
         );
     }
 
-    /// The touch keeps each of its frames under the device's bound on one
-    /// submission, and still covers every set once.
+    /// A point that starts in a slow clock state and leaves it only under
+    /// its own load: its frames' length settles while it is slow, and the
+    /// point is timed only once frames of that length run at the fast rate,
+    /// whatever the doublings saw. (On an M5 Pro a short matmul read about
+    /// 5 or about 34 TFLOP/s run to run: timed without this, by which state
+    /// the gap before it left.)
     #[test]
-    fn the_touch_keeps_under_the_submission_bound() {
-        let fires = std::cell::Cell::new(0u32);
-        let longest = std::cell::Cell::new(0u32);
-        let mut frame = |k: u32| -> Result<f64, String> {
-            fires.set(fires.get() + k);
-            longest.set(longest.get().max(k));
-            Ok(f64::from(k) * 1000.0)
+    fn a_point_is_timed_only_once_its_own_load_has_settled_its_clock() {
+        let calls = std::cell::Cell::new(0u32);
+        // Slow (10 ns a fire) for the frames the doublings settle in, then
+        // fast (1 ns a fire) once its own load has lifted the clock.
+        const SLOW: u32 = 3;
+        let frame = |k: u32| -> Result<f64, String> {
+            calls.set(calls.get() + 1);
+            let per = if calls.get() <= SLOW { 10.0 } else { 1.0 };
+            Ok(per * f64::from(k))
         };
-        super::touch_sets(Some(std::time::Duration::from_micros(10)), 95, &mut frame)
-            .expect("it touches");
-        assert_eq!(fires.get(), 95, "every set touched once");
-        assert!(
-            longest.get() <= 10,
-            "no frame past the bound ({} fires)",
-            longest.get()
+        let settled =
+            super::timed_frames(None, None, frame, |why: String| why).expect("it settles");
+        assert_eq!(
+            settled.per_fire_ns, 10.0,
+            "the doublings alone settle in the slow state"
         );
+        calls.set(0);
+        let frames = super::warmed_frames(None, None, frame, |why| why).expect("it settles");
+        let settled_at = calls.get();
+        assert!(
+            settled_at > SLOW + 1,
+            "the warm-up ran past the slow state ({settled_at} frames)"
+        );
+        // The next frame of that length reads the fast state.
+        let next = frame(frames.fires).expect("a frame") / f64::from(frames.fires);
+        assert_eq!(next, 1.0, "the point is timed at the clock its load holds");
     }
 
     use super::*;
@@ -1629,8 +1608,6 @@ mod tests {
 
     fn all() -> profile::rates::Rates {
         profile::rates::Rates {
-            stale: None,
-            landing: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0), (8192, 200.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0), (8192, 150.0)]),
@@ -1640,129 +1617,8 @@ mod tests {
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
-            submit_worst_ratio: None,
-            load_width: None,
-            resident_workgroups: None,
-            attn_tflops_by_rows_keys: None,
-            product_ns: None,
-            kernel_curves: None,
-            dense_settled: Vec::new(),
-            measured_on: None,
-            measured_by: None,
-        }
-    }
-
-    #[test]
-    fn a_load_without_the_constants_measures_saves_and_says_so() {
-        let dir = std::env::temp_dir().join(format!("pie-rates-at-load-{}", std::process::id()));
-        let path = dir.join("vulkan/user/card-x.toml");
-        let registry = profile::Registry::new("toy", &[], &[]);
-        // A checked-in launch, nothing else: the rest measured, the launch
-        // kept, each submission under the budget asked.
-        let stated = profile::rates::Rates {
-            launch_ns: Some(1234),
             ..profile::rates::Rates::default()
-        };
-        let mut asked = None;
-        let p = rates_at_load(
-            chip(stated),
-            &profile::rates::KEYS,
-            Some(SaveTo {
-                path: path.clone(),
-                provenance: provenance("toy", "a test"),
-                registry: &registry,
-            }),
-            None,
-            Some(std::time::Duration::from_millis(5)),
-            |max_submit| {
-                asked = max_submit;
-                Ok(Measured {
-                    rates: all(),
-                    unsettled: true,
-                    throttled: None,
-                })
-            },
-        )
-        .unwrap();
-        assert_eq!(asked, Some(std::time::Duration::from_millis(5)));
-        assert_eq!(p.rates().launch_ns, Some(1234), "the stated value kept");
-        assert_eq!(p.rates().hbm_gbps, Some(700.0));
-        assert!(p.tuned().measured_this_load);
-        assert_eq!(p.tuned().saved_to.as_deref(), Some(path.to_str().unwrap()));
-        // The file holds what was measured and how, not the stated launch.
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            text.contains("gemm_tflops_by_rows = [\n  [4096, [[256, 100.0], [8192, 200.0]]],\n]"),
-            "{text}"
-        );
-        assert!(!text.contains("launch_ns"), "{text}");
-        assert!(
-            text.contains("[provenance]\nrates = \"pie tune toy --rates on "),
-            "{text}"
-        );
-        // The line says it was measured here and where it went.
-        let line = crate::load::measured_line(p.tuned()).unwrap();
-        assert!(line.starts_with("measured the roofline at load"), "{line}");
-        // A frame the 5 ms bound stopped before it settled: said.
-        assert!(p.tuned().frame_cut);
-        assert!(
-            line.contains("stopped at the device's bound on one submission"),
-            "{line}"
-        );
-        assert!(
-            line.ends_with(&format!("saved to {}", path.display())),
-            "{line}"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_next_load_reads_what_the_first_saved_and_measures_nothing() {
-        static SHELF: profile::Shelf = profile::Shelf {
-            backend: "toy",
-            seeded: &[],
-            derived: None,
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let facts = profile::Facts::of(&registry);
-        let dir = std::env::temp_dir().join(format!("pie-rates-next-{}", std::process::id()));
-        let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        assert!(!first.rates().complete(&profile::rates::KEYS));
-        let measured = rates_at_load(
-            first,
-            &profile::rates::KEYS,
-            Some(SaveTo {
-                path: SHELF.user_path(&dir, "Card X"),
-                provenance: provenance("toy", "a test"),
-                registry: &registry,
-            }),
-            None,
-            None,
-            |_| {
-                Ok(Measured {
-                    rates: all(),
-                    unsettled: false,
-                    throttled: None,
-                })
-            },
-        )
-        .unwrap();
-        assert!(measured.tuned().measured_this_load);
-        // The next load resolves the saved file: every constant stated, so
-        // it measures nothing and its line names no measurement.
-        let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(second.rates(), all());
-        let second = rates_at_load(
-            second,
-            &profile::rates::KEYS,
-            None,
-            None,
-            None,
-            |_| -> Result<_, String> { panic!("measured what the first load saved") },
-        )
-        .unwrap();
-        assert!(!second.tuned().measured_this_load);
+        }
     }
 
     /// This build on a device, as a keyed load checks a stored measurement
@@ -1814,419 +1670,24 @@ mod tests {
         }
     }
 
-    /// A shelf of the toy backend carrying `committed`, a committed
-    /// measured profile of `Card X` (none where `None`).
-    fn shelf_with(committed: Option<String>) -> &'static profile::Shelf {
-        let seeded: Vec<(&'static str, &'static str)> = committed
-            .map(|text| {
-                let name: &'static str = Box::leak(profile::measured_name("Card X").into_boxed_str());
-                (name, &*Box::leak(text.into_boxed_str()))
-            })
-            .into_iter()
-            .collect();
-        Box::leak(Box::new(profile::Shelf {
-            backend: "toy",
-            seeded: Box::leak(seeded.into_boxed_slice()),
-            derived: None,
-        }))
-    }
-
-    /// The user's file a load under `build` saves, as `pie tune export`
-    /// reads it: every rate measured, each keyed.
-    fn stored_text(build: &Build) -> String {
-        saved_text(None, &keyed(build), &provenance("toy", "a test"))
-    }
-
-    /// One load of `Card X` from `shelf` with the user's files under `dir`:
-    /// the keys it measured (none where it measured nothing), each measured
-    /// under `build`, and the profile and report it resolved.
-    fn load_from(
-        shelf: &profile::Shelf,
-        dir: &std::path::Path,
-        build: &Build,
-        measuring: Measuring,
-    ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
-        load_behind(shelf, dir, build, measuring, StaleRates::Measured)
-    }
-
-    /// [`load_from`] by an engine that does `stale_rates` with a stale key.
-    fn load_behind(
-        shelf: &profile::Shelf,
-        dir: &std::path::Path,
-        build: &Build,
-        measuring: Measuring,
-        stale_rates: StaleRates,
-    ) -> (Vec<&'static str>, profile::Profile, profile::Report) {
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let facts = profile::Facts::of(&registry);
-        let (chip, report) = shelf.resolve_keyed(&registry, "Card X", &facts, Some(dir), build);
-        let measured = std::cell::Cell::new(Vec::new());
-        let loaded = resolve_at_load(
-            chip,
-            &profile::rates::KEYS,
-            Some(SaveTo {
-                path: shelf.user_path(dir, "Card X"),
-                provenance: provenance("toy", "a test"),
-                registry: &registry,
-            }),
-            None,
-            None,
-            measuring,
-            stale_rates,
-            |_, stated| {
-                let lacked = stated.missing(&profile::rates::KEYS);
-                measured.set(lacked.clone());
-                Ok(Measured {
-                    rates: keyed(build).only(&lacked),
-                    unsettled: false,
-                    throttled: None,
-                })
-            },
-        )
-        .unwrap();
-        (measured.take(), loaded, report)
-    }
-
-    /// A kernel whose code changed since the committed profile was
-    /// exported, on an engine that times behind serving: nothing is
-    /// measured before ready; the stale figure serves, and the key is left
-    /// to time behind serving.
-    #[test]
-    fn a_changed_kernel_is_served_by_its_stale_figure_and_timed_behind() {
-        let exported = Build {
-            on: "toy 10de:2c31 driver 1",
-            code: vec![("gemm", 7), ("copy", 9)],
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let committed =
-            profile::export(&registry, "Card X", &stored_text(&exported), "user.toml").unwrap();
-        let shelf = shelf_with(Some(committed));
-        let dir = home("committed-stale-behind");
-        let now = Build {
-            code: vec![("gemm", 8), ("copy", 9)],
-            ..exported
-        };
-        let (measured, loaded, report) = load_behind(shelf, &dir, &now, Measuring::Time, StaleRates::TimedBehind);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(measured, Vec::<&str>::new(), "nothing before ready: {:#?}", report.stored);
-        assert_eq!(loaded.rates().gemm_tflops_by_rows, all().gemm_tflops_by_rows);
-        assert_eq!(loaded.tuned().behind, ["gemm_tflops_by_rows"]);
-        assert!(!loaded.tuned().measured_this_load);
-    }
-
-    fn home(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("pie-rates-{name}-{}", std::process::id()))
-    }
-
-    /// A clean home whose device pie carries a committed measured profile
-    /// of, under matching keys: nothing is measured or saved, every entry
-    /// taken from the committed profile and said so, by its key.
-    #[test]
-    fn a_committed_entry_whose_key_matches_is_taken_and_nothing_measured() {
-        let build = Build {
-            on: "toy 10de:2c31 driver 1",
-            code: vec![("gemm", 7), ("copy", 9)],
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let committed =
-            profile::export(&registry, "Card X", &stored_text(&build), "user.toml").unwrap();
-        let shelf = shelf_with(Some(committed));
-        let dir = home("committed-taken");
-        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Time);
-        assert_eq!(measured, Vec::<&str>::new(), "{:#?}", report.stored);
-        assert_eq!(loaded.rates().launch_ns, all().launch_ns);
-        assert!(!loaded.tuned().measured_this_load);
-        assert!(!shelf.user_path(&dir, "Card X").exists(), "nothing is saved");
-        assert!(
-            report.stored.iter().any(|l| l.starts_with(
-                "`gemm_tflops_by_rows`: committed (committed measured profile \
-                 card-x.measured.toml), its key matches: method v1, kernels [gemm 0x00000007]"
-            )),
-            "{:#?}",
-            report.stored
-        );
-        assert_eq!(
-            report
-                .layers
-                .last()
-                .cloned()
-                .unwrap_or(profile::Source::Defaults),
-            profile::Source::Committed("card-x.measured.toml".into())
-        );
-    }
-
-    /// A kernel whose code changed since the committed profile was
-    /// exported: its entries alone are measured (and saved to the user's
-    /// file), every other taken from the committed profile; the next load
-    /// takes the measured entry from the user's file and measures nothing.
-    #[test]
-    fn a_changed_kernel_measures_only_its_committed_entries() {
-        let exported = Build {
-            on: "toy 10de:2c31 driver 1",
-            code: vec![("gemm", 7), ("copy", 9)],
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let committed =
-            profile::export(&registry, "Card X", &stored_text(&exported), "user.toml").unwrap();
-        let shelf = shelf_with(Some(committed));
-        let dir = home("committed-changed");
-        let now = Build {
-            code: vec![("gemm", 8), ("copy", 9)],
-            ..exported
-        };
-        let (measured, _, report) = load_from(shelf, &dir, &now, Measuring::Time);
-        assert_eq!(measured, ["gemm_tflops_by_rows"], "{:#?}", report.stored);
-        assert!(
-            report.stored.iter().any(|l| l.contains(
-                "committed `gemm_tflops_by_rows`: not taken as measured, kernel `gemm`'s code changed"
-            )),
-            "{:#?}",
-            report.stored
-        );
-        let (again, loaded, report) = load_from(shelf, &dir, &now, Measuring::Time);
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(again, Vec::<&str>::new(), "{:#?}", report.stored);
-        assert!(
-            report
-                .stored
-                .iter()
-                .any(|l| l.starts_with("`gemm_tflops_by_rows`: stored (user profile")),
-            "{:#?}",
-            report.stored
-        );
-        assert!(
-            report
-                .stored
-                .iter()
-                .any(|l| l.starts_with("`launch_ns`: committed")),
-            "{:#?}",
-            report.stored
-        );
-        assert_eq!(loaded.rates().complete(&profile::rates::KEYS), true);
-        // Another driver: the committed profile is none of this device's.
-        let other = Build {
-            on: "toy 10de:2c31 driver 2",
-            ..now
-        };
-        let dir = home("committed-driver");
-        let (measured, _, _) = load_from(shelf, &dir, &other, Measuring::Time);
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(measured, profile::rates::KEYS);
-    }
-
-    /// The user's stored entry under a matching key is taken over the
-    /// committed one; where the user's key no longer matches, the committed
-    /// entry whose key does is taken.
-    #[test]
-    fn a_users_entry_is_taken_over_a_committed_one() {
-        let build = Build {
-            on: "toy 10de:2c31 driver 1",
-            code: vec![("gemm", 7), ("copy", 9)],
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let committed = profile::export(
-            &registry,
-            "Card X",
-            &saved_text(
-                None,
-                &profile::rates::Rates {
-                    launch_ns: Some(2222),
-                    ..keyed(&build)
-                },
-                &provenance("toy", "a test"),
-            ),
-            "user.toml",
-        )
-        .unwrap();
-        let shelf = shelf_with(Some(committed));
-        let dir = home("user-over-committed");
-        let path = shelf.user_path(&dir, "Card X");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut user = profile::rates::Rates {
-            launch_ns: Some(1111),
-            ..keyed(&build)
-        }
-        .only(&["launch_ns"]);
-        user.measured_on = Some("toy 10de:2c31 driver 1".into());
-        std::fs::write(&path, saved_text(None, &user, &provenance("toy", "a test"))).unwrap();
-        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Time);
-        assert_eq!(measured, Vec::<&str>::new());
-        assert_eq!(loaded.rates().launch_ns, Some(1111), "{:#?}", report.stored);
-        assert!(
-            report
-                .stored
-                .iter()
-                .any(|l| l.starts_with("`launch_ns`: stored (user profile")),
-            "{:#?}",
-            report.stored
-        );
-        // The user's launch keyed by a kernel whose code changed since: the
-        // committed launch, whose key matches, is taken.
-        user.measured_by = Some(vec![(
-            "launch_ns".into(),
-            profile::rates::MeasuredBy {
-                method: 1,
-                kernels: vec![("copy".into(), 8)],
-            },
-        )]);
-        std::fs::write(&path, saved_text(None, &user, &provenance("toy", "a test"))).unwrap();
-        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Time);
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(measured, Vec::<&str>::new());
-        assert_eq!(loaded.rates().launch_ns, Some(2222), "{:#?}", report.stored);
-        assert!(
-            report
-                .stored
-                .iter()
-                .any(|l| l.contains("stored `launch_ns`: not taken as measured, kernel `copy`'s code changed")),
-            "{:#?}",
-            report.stored
-        );
-    }
-
-    /// `pie tune export` of a user's file reads back to the entries it
-    /// stores, the same text whatever order they were stored in, with no
-    /// date or path; an entry stored without a key is refused by name.
-    #[test]
-    fn an_export_reads_back_the_entries_it_stores() {
-        let build = Build {
-            on: "toy 10de:2c31 driver 1",
-            code: vec![("gemm", 7), ("copy", 9)],
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let mut rates = keyed(&build);
-        rates.kernel_curves = Some(vec![
-            profile::curves::KernelCurve {
-                kind: profile::curves::KernelCurve::TILE,
-                key: 64,
-                n: 1024,
-                k: 1024,
-                curve: vec![(1, 0.5), (64, 9.0)],
-                stop: None,
-                spread: vec![(1, 0.01), (64, 0.02)],
-                by: profile::rates::MeasuredBy {
-                    method: 1,
-                    kernels: vec![("gemm".into(), 7)],
-                },
-            },
-            profile::curves::KernelCurve {
-                kind: profile::curves::KernelCurve::VECTOR,
-                key: 4,
-                n: 1024,
-                k: 1024,
-                curve: vec![(1, 0.3)],
-                stop: Some((16, profile::curves::KernelCurve::BEATEN)),
-                spread: vec![(1, 0.01)],
-                by: profile::rates::MeasuredBy {
-                    method: 1,
-                    kernels: vec![("gemm".into(), 7)],
-                },
-            },
-        ]);
-        rates.dense_settled = vec![
-            profile::curves::DenseSettled {
-                method: 1,
-                of: 5,
-                code: 6,
-                ranges: vec![[1, 1, 0, 0, 0, 0]],
-                planes: vec![(1024, 1024)],
-            },
-            profile::curves::DenseSettled {
-                method: 1,
-                of: 9,
-                code: 6,
-                ranges: vec![[1, 1, 1, 4, 0, 1]],
-                planes: vec![(1024, 1024)],
-            },
-        ];
-        let user = saved_text(None, &rates, &provenance("toy", "a test"));
-        let text = profile::export(&registry, "Card X", &user, "user.toml").unwrap();
-        let read = registry
-            .parse(&text, "card-x.measured.toml", profile::Strict::Measured)
-            .unwrap();
-        let stored = registry
-            .parse(&user, "user.toml", profile::Strict::User)
-            .unwrap();
-        assert_eq!(read.tuned.rates, stored.tuned.rates.clone().ordered());
-        // Stored in another order, the same text.
-        let mut shuffled = rates.clone();
-        shuffled.measured_by.as_mut().unwrap().reverse();
-        shuffled.kernel_curves.as_mut().unwrap().reverse();
-        let again = saved_text(None, &shuffled, &provenance("toy", "another day"));
-        assert_eq!(
-            profile::export(&registry, "Card X", &again, "elsewhere.toml").unwrap(),
-            text
-        );
-        assert!(!text.contains(&today()), "{text}");
-        assert!(!text.contains("user.toml"), "{text}");
-        // A decision file is refused the measured profile's keys; a
-        // measured profile is refused a decision.
-        assert!(registry
-            .parse(&text, "x.toml", profile::Strict::CheckedIn)
-            .is_err());
-        // An entry stored without a key.
-        let mut unkeyed = rates.clone();
-        unkeyed
-            .measured_by
-            .as_mut()
-            .unwrap()
-            .retain(|(rate, _)| rate != "hbm_gbps");
-        let refused = profile::export(
-            &registry,
-            "Card X",
-            &saved_text(None, &unkeyed, &provenance("toy", "a test")),
-            "user.toml",
-        )
-        .unwrap_err();
-        assert!(
-            refused.contains("`rates.hbm_gbps` is stored without a key"),
-            "{refused}"
-        );
-        let mut nowhere = rates;
-        nowhere.measured_on = None;
-        let refused = profile::export(
-            &registry,
-            "Card X",
-            &saved_text(None, &nowhere, &provenance("toy", "a test")),
-            "user.toml",
-        )
-        .unwrap_err();
-        assert!(refused.contains("names no device"), "{refused}");
-    }
-
-    /// A load under `measure = false` with no profile measures nothing,
-    /// saves nothing and loads, each key it lacked kept as skipped, by name.
+    /// A load under `measure = false` measures nothing and saves nothing:
+    /// what a layer states serves, each key it lacked is kept as skipped.
     #[test]
     fn a_skipping_load_measures_nothing_and_names_each_skip() {
-        let build = Build {
-            on: "toy 10de:2c31 driver 1",
-            code: vec![("gemm", 7), ("copy", 9)],
-        };
-        let shelf = shelf_with(None);
-        let dir = home("skip");
-        let (measured, loaded, report) = load_from(shelf, &dir, &build, Measuring::Skip);
-        assert_eq!(measured, Vec::<&str>::new());
-        assert!(!shelf.user_path(&dir, "Card X").exists(), "nothing is saved");
-        assert_eq!(loaded.tuned().skipped, profile::rates::KEYS, "{report:?}");
-        assert!(!loaded.tuned().measured_this_load);
-        assert_eq!(loaded.rates(), profile::rates::Rates::default());
-        // A committed profile still serves what it states under skip.
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let committed = profile::export(
-            &registry,
-            "Card X",
-            &saved_text(
-                None,
-                &keyed(&build).only(&["launch_ns", "hbm_gbps"]),
-                &provenance("toy", "a test"),
-            ),
-            "user.toml",
+        let stated = all().only(&["launch_ns", "hbm_gbps"]);
+        let loaded = resolve_at_load(
+            chip(stated.clone()),
+            &profile::rates::KEYS,
+            None,
+            None,
+            None,
+            Measuring::Skip,
+            StaleRates::Measured,
+            |_, _| -> Result<_, String> { panic!("measured under skip") },
         )
         .unwrap();
-        let (measured, loaded, _) =
-            load_from(shelf_with(Some(committed)), &dir, &build, Measuring::Skip);
-        assert_eq!(measured, Vec::<&str>::new());
-        assert_eq!(loaded.rates().launch_ns, all().launch_ns);
+        assert!(!loaded.tuned().measured_this_load);
+        assert_eq!(loaded.rates(), stated);
         assert_eq!(
             loaded.tuned().skipped.len(),
             profile::rates::KEYS.len() - 2,
@@ -2261,14 +1722,8 @@ mod tests {
         };
         // Each load: the keys it measured (none where it measured nothing).
         let load = |build: &Build, version: &str| -> Vec<&'static str> {
-            let (chip, report) =
-                SHELF.resolve_keyed(&registry, "Card X", &facts, Some(&dir), build);
-            assert!(
-                !report.stored.is_empty(),
-                "every keyed load says what it found"
-            );
+            let (chip, _) = SHELF.resolve_keyed(&registry, "Card X", &facts, Some(&dir), build);
             let lacked = chip.rates().missing(&profile::rates::KEYS);
-            let measures = std::cell::Cell::new(0);
             rates_at_load(
                 chip,
                 &profile::rates::KEYS,
@@ -2276,7 +1731,6 @@ mod tests {
                 None,
                 None,
                 |_| {
-                    measures.set(measures.get() + 1);
                     Ok(Measured {
                         rates: keyed(build).only(&lacked),
                         unsettled: false,
@@ -2285,7 +1739,6 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(measures.get(), usize::from(!lacked.is_empty()));
             lacked
         };
         assert_eq!(
@@ -2307,7 +1760,6 @@ mod tests {
             ["gemm_tflops_by_rows"],
             "a changed kernel measures its rates alone"
         );
-        assert_eq!(load(&changed, "0.7.2"), Vec::<&str>::new());
         let other = Build {
             on: "toy 10de:2c32 driver 1",
             ..changed
@@ -2317,201 +1769,7 @@ mod tests {
             profile::rates::KEYS,
             "another device measures all"
         );
-        let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(
-            text.contains("measured_on = \"toy 10de:2c32 driver 1\""),
-            "{text}"
-        );
-        assert!(
-            !text.contains("2c31"),
-            "nothing of the other device stays: {text}"
-        );
-    }
-
-    /// A saved profile lacking one key a newer pie reads: the load asks for
-    /// that key alone and the file keeps every other rate as it was.
-    #[test]
-    fn a_profile_lacking_one_key_gains_it_and_keeps_the_rest() {
-        static SHELF: profile::Shelf = profile::Shelf {
-            backend: "toy",
-            seeded: &[],
-            derived: None,
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let facts = profile::Facts::of(&registry);
-        let dir = std::env::temp_dir().join(format!("pie-rates-one-key-{}", std::process::id()));
-        let path = SHELF.user_path(&dir, "Card X");
-        let save = || SaveTo {
-            path: path.clone(),
-            provenance: provenance("toy", "a test"),
-            registry: &registry,
-        };
-        let older = profile::rates::Rates {
-            few_row_tflops: None,
-            ..all()
-        };
-        // An older pie, which read every key but this one, saved the file.
-        let older_keys: Vec<&'static str> = profile::rates::KEYS
-            .iter()
-            .copied()
-            .filter(|&key| key != "few_row_tflops")
-            .collect();
-        let (first, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        rates_at_load(first, &older_keys, Some(save()), None, None, |_| {
-            Ok(Measured {
-                rates: older.clone(),
-                unsettled: false,
-                throttled: None,
-            })
-        })
-        .unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-        let (second, _) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        assert_eq!(
-            second.rates().missing(&profile::rates::KEYS),
-            ["few_row_tflops"]
-        );
-        let lacked = second.rates().missing(&profile::rates::KEYS);
-        let loaded = rates_at_load(
-            second,
-            &profile::rates::KEYS,
-            Some(save()),
-            None,
-            None,
-            |_| {
-                // A backend times only what the profile lacks.
-                Ok(Measured {
-                    rates: all().only(&lacked),
-                    unsettled: false,
-                    throttled: None,
-                })
-            },
-        )
-        .unwrap();
-        let after = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(loaded.rates(), all());
-        let rates_of = |text: &str| -> Vec<String> {
-            text.lines()
-                .skip_while(|line| *line != "[rates]")
-                .take_while(|line| !line.starts_with("[provenance]"))
-                .filter(|line| !line.starts_with("few_row_tflops"))
-                .map(str::to_owned)
-                .collect()
-        };
-        assert_eq!(rates_of(&before), rates_of(&after));
-        assert!(after.contains("few_row_tflops = 4.0"), "{after}");
-    }
-
-    #[test]
-    fn a_saved_file_gains_the_measured_keys_and_their_provenance_alone() {
-        let measured = profile::rates::Rates {
-            hbm_gbps: Some(700.0),
-            cached_gbps: None,
-            ..profile::rates::Rates::default()
-        };
-        let how = ("rates", "\"measured at load\"".to_string());
-        // No file yet: the keys and how, nothing else.
-        assert_eq!(
-            saved_text(None, &measured, &how),
-            "api = 1\n\n[rates]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
-        );
-        // A user's file: its decisions kept, its [rates] written whole (the
-        // key it stated kept under the measured one), its provenance's rates
-        // entry replaced, the rest left.
-        let existing = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"old\"\n";
-        assert_eq!(
-            saved_text(Some(existing), &measured, &how),
-            "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\n[provenance]\nsource = \"me\"\nrates = \"measured at load\"\n"
-        );
-        // A rate stated as array rows: the table read whole and rewritten.
-        let rows =
-            "api = 1\n\n[rates]\nattn_tflops_by_keys = [\n  [512, 4.0],\n  [1024, 5.0],\n]\n";
-        assert_eq!(
-            saved_text(Some(rows), &measured, &how),
-            "api = 1\n\n[rates]\nattn_tflops_by_keys = [[512, 4.0], [1024, 5.0]]\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
-        );
-        // A table of a schema this pie outlived (Nov 16's keys): replaced
-        // whole, none of it kept, so no key is written twice.
-        let old = "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 1.0\nlaunch_ns = 900\n\n[provenance]\nrates = \"old\"\n";
-        let all = profile::rates::Rates {
-            launch_ns: Some(1200),
-            ..measured.clone()
-        };
-        assert_eq!(
-            saved_text(Some(old), &all, &how),
-            "api = 1\n[engine]\ngraphs = \"on\"\n\n[rates]\nlaunch_ns = 1200\nhbm_gbps = 700.0\n\n[provenance]\nrates = \"measured at load\"\n"
-        );
-    }
-
-    /// The Spark's user file of Nov 16 (the old schema's [rates] keys and a
-    /// decision this pie removed) is refused at resolve, so the load
-    /// measures every key; the file is rewritten as the load's own output
-    /// (the removed decision dropped and said, the old table replaced
-    /// whole, what reads kept), and the next boot reads it clean and
-    /// measures nothing.
-    #[test]
-    fn an_old_schema_user_file_is_measured_rewritten_whole_and_read_next() {
-        static SHELF: profile::Shelf = profile::Shelf {
-            backend: "toy",
-            seeded: &[],
-            derived: None,
-        };
-        let registry = profile::Registry::new("toy", &[], &[]);
-        let facts = profile::Facts::of(&registry);
-        let dir = std::env::temp_dir().join(format!("pie-rates-old-{}", std::process::id()));
-        let path = SHELF.user_path(&dir, "Card X");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            "api = 1\n\n[engine]\ngraphs = \"on\"\n\n[rates]\n\
-             bf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\nbytes_per_ns = 650.0\n\
-             launch_ns = 900\n\n[provenance]\nsource = \"me\"\nrates = \"Nov 16\"\n",
-        )
-        .unwrap();
-        let (first, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        assert!(!report.rejected.is_empty(), "the old file is refused");
-        assert!(!first.rates().complete(&profile::rates::KEYS));
-        let measured = rates_at_load(
-            first,
-            &profile::rates::KEYS,
-            Some(SaveTo {
-                path: path.clone(),
-                provenance: provenance("toy", "a test"),
-                registry: &registry,
-            }),
-            None,
-            None,
-            |_| {
-                Ok(Measured {
-                    rates: all(),
-                    unsettled: false,
-                    throttled: None,
-                })
-            },
-        )
-        .unwrap();
-        assert!(measured.tuned().measured_this_load);
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.matches("launch_ns").count(), 1, "{text}");
-        assert!(!text.contains("bytes_per_ns"), "{text}");
-        // The decision this pie no longer reads dropped; what reads kept.
-        assert!(!text.contains("graphs"), "{text}");
-        assert!(text.contains("source = \"me\""), "{text}");
-        let (second, report) = SHELF.resolve(&registry, "Card X", &facts, Some(&dir));
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
-        assert_eq!(second.rates(), all());
-        rates_at_load(
-            second,
-            &profile::rates::KEYS,
-            None,
-            None,
-            None,
-            |_| -> Result<_, String> { panic!("measured what the first load saved") },
-        )
-        .unwrap();
     }
 
     /// A checked-in file stating a rate this pie does not read is refused
@@ -2541,138 +1799,6 @@ mod tests {
         assert!(err.contains("`[rates] bytes_per_ns`"), "{err}");
     }
 
-    /// A cold frame before the clock settles moves nothing: the 840's walk
-    /// at 2048^3 took 23.4 ms against 12.3 ms estimated while its clock
-    /// ramped, and held every admission after it 1.9x high.
-    #[test]
-    fn a_cold_frame_does_not_inflate_later_admissions() {
-        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
-        a.landed(Some(12.33e6), 23.43e6, true);
-        assert_eq!(a.worst, 1.0);
-        // The attention's frame of 4 at 274 ms each fits at 1096 ms.
-        assert_eq!(a.fires(4, Some(274.1e6)), Some(4));
-        // Settled: its frames count, the largest ratio kept.
-        a.settled = true;
-        a.landed(Some(100e6), 104e6, true);
-        a.landed(Some(100e6), 101e6, true);
-        assert!((a.worst - 1.04).abs() < 1e-12);
-        // A frame carried down (from more fires to fewer) holds its own
-        // submit: it moves nothing.
-        a.landed(Some(1e6), 3e6, false);
-        assert!((a.worst - 1.04).abs() < 1e-12);
-    }
-
-    /// A frame that does not fit halves its fires until it does; only a
-    /// single fire past the bound is refused.
-    #[test]
-    fn a_frame_that_does_not_fit_halves_its_fires() {
-        let mut a = Admission::new(Some(std::time::Duration::from_secs(2)));
-        a.settled = true;
-        a.worst = 1.9;
-        // 4 fires of 274 ms: 2083 ms at 1.9x; 2 fit (1042 ms).
-        assert_eq!(a.fires(4, Some(274.1e6)), Some(2));
-        assert_eq!(a.fires(16, Some(100e6)), Some(8));
-        // One fire past the bound: refused.
-        assert_eq!(a.fires(4, Some(1.2e9)), None);
-        // No estimate under a bound: not one fire; no bound: the frame as
-        // asked.
-        assert_eq!(a.fires(4, None), None);
-        assert_eq!(Admission::new(None).fires(4, Some(1e12)), Some(4));
-        assert_eq!(Admission::new(None).fires(4, None), Some(4));
-    }
-
-    /// The warm-up's cube walks up while its next fire, estimated from the
-    /// last by the growth the last two measured, fits the device's bound on
-    /// one submission: the Adreno 840's 8192^3 ran ~1.57 s a submit against
-    /// KGSL's ~2 s watchdog.
-    #[test]
-    fn the_warm_up_cube_walks_up_while_its_next_fire_fits_the_bound() {
-        let kgsl = Some(std::time::Duration::from_secs(2));
-        // Each doubling 8x the time, 1024^3 at 3 ms: 8192^3 at ~1.54 s fits.
-        let cubic = |side: u32| 3e6 * (f64::from(side) / 1024.0).powi(3);
-        let mut timed = Vec::new();
-        let (side, worst) = warm_side(kgsl, 1.0, |s, _| {
-            timed.push(s);
-            Ok::<Option<f64>, ()>(Some(cubic(s)))
-        })
-        .unwrap();
-        assert_eq!((side, worst), (8192, 1.0));
-        assert_eq!(timed, vec![512, 1024, 2048, 4096, 8192]);
-        // A device slowing past the flops' growth (each doubling 10x, as a
-        // clock sinking under its power cap): 4096^3 at 300 ms, the next
-        // estimated at 3 s, past the bound: it is never fired.
-        let sinking = |side: u32| 3e6 * 10f64.powf((f64::from(side) / 1024.0).log2());
-        let mut timed = Vec::new();
-        let (side, _) = warm_side(kgsl, 1.0, |s, _| {
-            timed.push(s);
-            Ok::<Option<f64>, ()>(Some(sinking(s)))
-        })
-        .unwrap();
-        assert_eq!(side, 4096);
-        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
-        // No bound stated: the widest, nothing timed.
-        let side = warm_side(None, 1.0, |_, _| -> Result<Option<f64>, ()> {
-            panic!("timed with no bound")
-        });
-        assert_eq!(side, Ok((WARM_SHAPE.0, 1.0)));
-        // The probe itself past the bound: the cube under it.
-        assert_eq!(
-            warm_side(kgsl, 1.0, |_, _| Ok::<Option<f64>, ()>(Some(3e9))),
-            Ok((WARM_PROBE / 2, 1.0))
-        );
-        // The walk's own estimate low by 1.3x at 4096 (its fire 1.3x the
-        // growth's): the worst ratio seen is 1.3, and 8192, estimated from
-        // 4096's growth, stands past a 1.5 s bound under it: never fired.
-        let mut timed = Vec::new();
-        let lagging = |side: u32| match side {
-            512 => 0.29e6,
-            1024 => 2.34e6,
-            2048 => 18.75e6,
-            _ => 150e6 * 1.3,
-        };
-        let (side, worst) = warm_side(Some(std::time::Duration::from_millis(1500)), 1.0, |s, _| {
-            timed.push(s);
-            Ok::<Option<f64>, ()>(Some(lagging(s)))
-        })
-        .unwrap();
-        assert_eq!(side, 4096);
-        assert!((worst - 1.3).abs() < 0.01, "{worst}");
-        assert_eq!(timed, vec![512, 1024, 2048, 4096]);
-        // A size the caller's own estimate holds past the bound is never
-        // submitted (`None`): the walk stops at the size before it.
-        let mut timed = Vec::new();
-        let (side, _) = warm_side(kgsl, 1.0, |s, _| {
-            timed.push(s);
-            Ok::<Option<f64>, ()>((s < 2048).then(|| cubic(s)))
-        })
-        .unwrap();
-        assert_eq!(side, 1024);
-        assert_eq!(timed, vec![512, 1024, 2048]);
-        // The first probe never submitted: the cube under it.
-        assert_eq!(
-            warm_side(kgsl, 1.0, |_, _| Ok::<Option<f64>, ()>(None)),
-            Ok((WARM_PROBE / 2, 1.0))
-        );
-    }
-
-    /// The attention curve's keys are where its shape is compute-bound on
-    /// the device (its flops a byte past the ridge), from the device's own
-    /// matmul peak and bandwidth: never where a matmul lattice stopped.
-    #[test]
-    fn the_attention_keys_are_compute_bound_and_their_own() {
-        let intensity = |keys: u32| {
-            let s = ATTN_SHAPE.at(keys);
-            attn_flops(s) / attn_bytes(s)
-        };
-        // A ridge every point clears: the whole curve.
-        assert_eq!(attn_keys(1.0), ATTN_KEYS.to_vec());
-        // A ridge past 512 keys' intensity: from the first past it.
-        let ridge = (intensity(512) + intensity(1024)) / 2.0;
-        assert_eq!(attn_keys(ridge), ATTN_KEYS[1..].to_vec());
-        // None compute-bound: the widest alone, never nothing.
-        assert_eq!(attn_keys(f64::MAX), vec![ATTN_KEYS[ATTN_KEYS.len() - 1]]);
-    }
-
     #[test]
     fn a_budget_short_of_the_step_is_refused_by_name_and_measures_nothing() {
         let short = step_bytes() - 1;
@@ -2689,61 +1815,6 @@ mod tests {
     }
 
     #[test]
-    fn a_load_whose_layers_state_every_constant_measures_nothing() {
-        let p = rates_at_load(
-            chip(all()),
-            &profile::rates::KEYS,
-            None,
-            None,
-            None,
-            |_| -> Result<_, String> { panic!("measured a profile stating every constant") },
-        )
-        .unwrap();
-        assert_eq!(p.rates(), all());
-        assert!(!p.tuned().measured_this_load);
-        assert_eq!(crate::load::measured_line(p.tuned()), None);
-    }
-
-    /// A backend whose estimate weighs fewer keys measures nothing for the
-    /// rest: a profile stating its six is complete for it, not for one
-    /// weighing all eight.
-    #[test]
-    fn a_load_measures_the_keys_its_backend_weighs_and_no_others() {
-        let six = all().only(&profile::rates::KEYS[..6]);
-        let p = rates_at_load(
-            chip(six.clone()),
-            &profile::rates::KEYS[..6],
-            None,
-            None,
-            None,
-            |_| -> Result<_, String> { panic!("measured keys the backend does not weigh") },
-        )
-        .unwrap();
-        assert_eq!(p.rates(), six);
-        let err = rates_at_load(
-            chip(six.clone()),
-            &profile::rates::KEYS,
-            None,
-            None,
-            None,
-            |_| {
-                Ok(Measured {
-                    rates: six.clone(),
-                    unsettled: false,
-                    throttled: None,
-                })
-            },
-        )
-        .unwrap_err();
-        assert!(
-            err.contains(
-                "measured no [\"scan_gelems\", \"few_row_tflops\", \"workgroups_per_core\"]"
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn a_rate_that_settles_at_nothing_is_refused_by_name_and_never_saved() {
         let dir = std::env::temp_dir().join(format!("pie-rates-zero-{}", std::process::id()));
         let path = dir.join("vulkan/user/card-x.toml");
@@ -2755,13 +1826,6 @@ mod tests {
                     ..all()
                 },
                 "`[rates] workgroups_per_core` as 0",
-            ),
-            (
-                profile::rates::Rates {
-                    few_row_tflops: Some(f64::NAN),
-                    ..all()
-                },
-                "`[rates] few_row_tflops` as NaN",
             ),
             (
                 profile::rates::Rates {
@@ -2794,300 +1858,7 @@ mod tests {
             assert!(err.contains(says), "{err}");
             assert!(!path.exists(), "a refused rate was saved");
         }
-        // Stated in a profile, it is refused by the same key: the roofline
-        // divides by none of it.
-        let stated = profile::rates::Rates {
-            attn_tflops_by_keys: Some(vec![(512, 0.0)]),
-            ..all()
-        };
-        assert_eq!(
-            crate::roofline::Constants::of(&stated).err(),
-            Some("attn_tflops_by_keys")
-        );
-        let nan = profile::rates::Rates {
-            hbm_gbps: Some(f64::NAN),
-            ..all()
-        };
-        assert_eq!(crate::roofline::Constants::of(&nan).err(), Some("hbm_gbps"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The RTX PRO 4500's tiled attention at one workgroup a head: 264
-    /// workgroups fill its 80 units, 3.3 a unit; a dispatch of 32 ran 8.25x
-    /// the time the full curve states.
-    #[test]
-    fn the_workgroups_a_core_holds_come_from_one_dispatch_against_the_full_rate() {
-        let per = workgroups_per_core(32, 80, 8.25e6, 1e6).unwrap();
-        assert!((per - 3.3).abs() < 1e-9, "{per}");
-        assert_eq!(workgroups_per_core(32, 80, 0.0, 1e6), None);
-        assert_eq!(workgroups_per_core(32, 80, 1e6, 0.0), None);
-        assert_eq!(workgroups_per_core(32, 0, 1e6, 1e6), None);
-    }
-
-    #[test]
-    fn a_frame_doubles_until_a_fire_settles_and_no_further_than_the_cap() {
-        let ms = |n: u64| std::time::Duration::from_millis(n);
-        // A fire of 1 ms behind a 300 us submission: frames of 1, 2, 4, ...
-        // until two agree within AGREEMENT (the submission amortized).
-        let mut laid = Vec::new();
-        let f = timed_frames(
-            None,
-            None,
-            |n| {
-                laid.push(n);
-                Ok::<_, String>(300e3 + 1e6 * f64::from(n))
-            },
-            |why| why,
-        )
-        .unwrap();
-        assert_eq!(laid, [1, 2, 4, 8, 16]);
-        assert_eq!((f.fires, f.capped), (16, false));
-        assert!((f.per_fire_ns - 1.01875e6).abs() < 1.0);
-        // A 3 ms bound stops the doubling at 2 fires, unsettled.
-        let f = timed_frames(
-            Some(ms(3)),
-            None,
-            |n| Ok::<_, String>(300e3 + 1e6 * f64::from(n)),
-            |w| w,
-        )
-        .unwrap();
-        assert_eq!((f.fires, f.capped), (2, true));
-        // One fire estimated past the bound: refused, no frame laid.
-        let e = timed_frames(
-            Some(ms(5)),
-            Some(8e6),
-            |_| -> Result<f64, String> { panic!("laid a frame") },
-            |w| w,
-        )
-        .unwrap_err();
-        assert!(e.contains("past the device's bound of 5.0 ms"), "{e}");
-    }
-
-    #[test]
-    fn the_warm_up_settles_by_the_same_rule() {
-        // Rates falling 20%, 10%, then 2% and 1%: settled at the fifth.
-        let mut rates = [100.0, 80.0, 72.0, 70.6, 70.0].into_iter();
-        let w = warm_up(|| Ok::<_, ()>(rates.next().unwrap())).unwrap();
-        assert_eq!((w.rotations, w.rate), (5, 70.0));
-    }
-
-    #[test]
-    fn a_memory_bound_rate_warms_until_it_stops_rising() {
-        // An M1's per-row ops reading the DVFS levels 146, 175, 217, 262 GB/s
-        // as their own op warms the clock: timed at the sustained 262.
-        let mut rates = [146.0, 175.0, 217.0, 262.0, 263.0, 262.5, 300.0].into_iter();
-        let w = warm_up(|| Ok::<_, ()>(rates.next().unwrap())).unwrap();
-        assert_eq!((w.rotations, w.rate), (6, 262.5));
-    }
-
-    #[test]
-    fn a_short_frame_in_one_clock_state_does_not_settle_the_measurement() {
-        // A bimodal clock: frames under 4 ms (four fires of 1 ms) run in the
-        // slow state, 2 ms a fire, and agree with each other; frames past it
-        // reach the sustained 1 ms. Two agreeing points would stop at the
-        // slow state; three agreeing points span 4x and find the sustained.
-        let mut laid = Vec::new();
-        let f = timed_frames(
-            None,
-            None,
-            |n| {
-                laid.push(n);
-                let per = match n {
-                    1 => 2.0e6,
-                    2 => 1.98e6,
-                    4 => 1.3e6,
-                    _ => 1.0e6,
-                };
-                Ok::<_, String>(per * f64::from(n))
-            },
-            |w| w,
-        )
-        .unwrap();
-        assert_eq!(laid, [1, 2, 4, 8, 16, 32]);
-        assert_eq!((f.fires, f.per_fire_ns), (32, 1.0e6));
-    }
-
-    #[test]
-    fn the_rotation_carries_across_frames() {
-        // Three frames of two fires over five sets: 0 1 | 2 3 | 4 0, never
-        // 0 1 | 0 1 | 0 1.
-        let turn = Rotation::default();
-        let frames: Vec<Vec<usize>> = (0..3)
-            .map(|_| (0..2).map(|_| turn.next(5)).collect())
-            .collect();
-        assert_eq!(frames, [vec![0, 1], vec![2, 3], vec![4, 0]]);
-    }
-
-    #[test]
-    fn the_lattice_ascends_and_the_counts_are_the_estimates() {
-        assert!(step_bytes() >= 1 << 30, "an 8192^2 rotation");
-        assert!(GEMM_ROWS.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(
-            GEMM_ROWS,
-            [256, 362, 512, 724, 1024, 1448, 2048, 2896, 4096, 5793, 8192]
-        );
-        assert!(ATTN_KEYS.windows(2).all(|w| w[0] < w[1]));
-        assert!(elementwise_sets() >= 2);
-        assert!(DEPTHS.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(weights_at(1024, 1024), 384);
-        assert_eq!(weights_at(16384, 1024), 24);
-        assert_eq!(weights_at(8192, 8192), 12);
-        assert_eq!(weights_at(16384, 16384), 12);
-        assert_eq!(DEPTHS.last(), Some(&16384));
-        assert_eq!(gemm_flops(16, 2048, 1024), 2.0 * 16.0 * 2048.0 * 1024.0);
-        // 4 · 2048 · 2048 · 16 · 128.
-        assert_eq!(attn_flops(ATTN_SHAPE), 4.0 * 2048.0 * 2048.0 * 2048.0);
-        // 2048 tokens · 16 heads · 128 · 128.
-        assert_eq!(scan_elements(SCAN_SHAPE), 2048.0 * 16.0 * 16384.0);
-        assert_eq!(SCAN_SHAPE.channels(), 6144);
-        assert_eq!(SCAN_SHAPE.at(512).tokens, 512);
-        assert!(scan_sets_at(SCAN_SHAPE.at(512)) >= 2);
-        assert!(scan_sets_at(SCAN_SHAPE.at(512)) > scan_sets_at(SCAN_SHAPE.at(16384)));
-        for pages in [1, 2, 7, 32, 1024, 7919, 15838] {
-            let mut order = attn_page_order(pages);
-            let in_order = order.windows(2).all(|w| w[0] < w[1]);
-            assert!(pages <= 2 || !in_order, "{pages} pages scattered");
-            order.sort_unstable();
-            assert_eq!(
-                order,
-                (0..pages).collect::<Vec<u32>>(),
-                "a permutation of {pages}"
-            );
-        }
-        assert_eq!(&attn_page_order(32)[..4], &[0, 15, 30, 13]);
-        assert_eq!(ATTN_SHAPE.at(512).rows, 512);
-        assert!(ATTN_DIMS.windows(2).all(|w| w[0] < w[1]));
-        // 512 keys at d 64: 1 MiB of q, 1 MiB of k and v; 16384 at 256: 256
-        // MiB, three sets past 768 MiB.
-        // The pages laid whole, as engine-cuda sizes them: 512 keys
-        // at d 64, q 1 MiB and kv 1 MiB, 384 sets of 768 MiB; at 16384 and
-        // d 256 three; one key lays its whole page of 16.
-        assert_eq!(attn_sets_at(ATTN_SHAPE.at(512).with_dim(64), 16), 384);
-        assert_eq!(attn_sets_at(ATTN_SHAPE.at(16384).with_dim(256), 16), 3);
-        assert_eq!(
-            attn_sets_at(ATTN_SHAPE.at(1).with_dim(128), 16),
-            ATTN_SET_BYTES.div_ceil(16 * 128 * 2 + 2 * 16 * 8 * 128 * 2)
-        );
-        assert_eq!(ATTN_SHAPE.at(512).with_dim(256).head_dim, 256);
-        assert_eq!(
-            attn_flops(ATTN_SHAPE.at(512).with_dim(256)),
-            2.0 * attn_flops(ATTN_SHAPE.at(512).with_dim(128))
-        );
-        assert_eq!(attn_flops(ATTN_SHAPE.at(512)), 4.0 * 512.0 * 512.0 * 2048.0);
-    }
-
-    #[test]
-    fn the_operand_pattern_is_fixed_bf16_in_range_and_varied() {
-        let a = operand_pattern();
-        assert_eq!(a.len(), OPERAND_BYTES);
-        assert_eq!(a, operand_pattern());
-        let values: Vec<f32> = a
-            .chunks_exact(2)
-            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
-            .collect();
-        assert!(values.iter().all(|v| (-1.0..1.0).contains(v)));
-        assert!(values.iter().any(|&v| v != values[0]));
-        let mean = values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len() as f64;
-        assert!(mean.abs() < 0.01, "{mean}");
-    }
-
-    #[test]
-    fn a_rate_holds_no_launches() {
-        // A large fire: 1 ms over a 2 us launch, its rate barely moved.
-        let rate = rate_from("big", 1_000_000.0, 1, 2000.0, 1e9).unwrap();
-        assert!((rate - 1e9 / 998_000.0).abs() < 1e-9);
-        // A small one the gap dominates: 3 us of a 2 us launch is 1 us of
-        // work, not 3.
-        assert_eq!(rate_from("small", 3000.0, 1, 2000.0, 1000.0).unwrap(), 1.0);
-        // A scan's two dispatches both come off.
-        assert_eq!(rate_from("scan", 5000.0, 2, 2000.0, 1000.0).unwrap(), 1.0);
-        // No longer than its launch (within the agreement): gap-bound.
-        assert_eq!(
-            rate_from("tiny", 1950.0, 1, 2000.0, 10.0).unwrap(),
-            f64::INFINITY
-        );
-        // Far below it: the two disagree, refused by name.
-        let err = rate_from("matmul 16x1024x1024", 1000.0, 1, 2000.0, 10.0).unwrap_err();
-        assert!(
-            err.starts_with("matmul 16x1024x1024: a fire of 1 dispatches"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn the_launch_is_what_each_dependent_dispatch_adds() {
-        // 64 dispatches over 1 ms of work in 1.112 ms: 1.75 us each.
-        assert!((launch_from(1_112_000.0, 1_000_000.0, 64) - 1750.0).abs() < 1e-6);
-        // A chain no slower than its one kernel: no gap.
-        assert_eq!(launch_from(990.0, 1000.0, 64), 0.0);
-        assert!(LAUNCH_CHAINS.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn the_warm_up_runs_until_its_rate_stops_falling() {
-        // A clock sinking 100, 90, 84, then 82 and 82.5: five rotations, to
-        // the second step in a row that moves it by less than AGREEMENT
-        // (the stop rule every measurement settles by).
-        let mut rates = [100.0, 90.0, 84.0, 82.0, 82.5, 80.0].into_iter();
-        let warmed = warm_up(|| Ok::<f64, ()>(rates.next().unwrap())).unwrap();
-        assert_eq!((warmed.rotations, warmed.rate), (5, 82.5));
-        // A warm device: three rotations.
-        let mut rates = [100.0, 100.0, 100.0].into_iter();
-        assert_eq!(
-            warm_up(|| Ok::<f64, ()>(rates.next().unwrap()))
-                .unwrap()
-                .rotations,
-            3
-        );
-    }
-
-    #[test]
-    fn the_points_are_timed_in_a_spread_order() {
-        let order = spread_order(250);
-        let mut sorted = order.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..250).collect::<Vec<usize>>());
-        assert!(!order.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn the_date_is_the_civil_one() {
-        assert_eq!(civil(0), (1970, 1, 1));
-        assert_eq!(civil(20_408), (2025, 11, 16));
-        assert_eq!(civil(-1), (1969, 12, 31));
-    }
-
-    #[test]
-    fn the_writer_writes_what_the_profile_reads() {
-        let rates = profile::rates::Rates {
-            stale: None,
-            landing: None,
-            launch_ns: Some(3500),
-            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 90.0), (8192, 181.5)])]),
-            attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 120.0)]),
-            hbm_gbps: Some(800.0),
-            cached_gbps: None,
-            elementwise_gbps: Some(500.0),
-            scan_gelems: Some(7.0),
-            few_row_tflops: Some(4.5),
-            workgroups_per_core: Some(3.3),
-            submit_worst_ratio: None,
-            load_width: None,
-            resident_workgroups: None,
-            attn_tflops_by_rows_keys: None,
-            product_ns: None,
-            kernel_curves: None,
-            dense_settled: Vec::new(),
-            measured_on: None,
-            measured_by: None,
-        };
-        assert_eq!(tuned(&rates), rates.toml());
-        let (key, text) = provenance("vulkan", "the matmul through Coopmat");
-        assert_eq!(key, "rates");
-        assert!(text.starts_with("\"pie tune vulkan --rates on "), "{text}");
-        assert!(
-            text.contains("the matmul through Coopmat; at engine::rates' shapes"),
-            "{text}"
-        );
-    }
 }

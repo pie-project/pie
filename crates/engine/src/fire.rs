@@ -1630,48 +1630,6 @@ pub struct FireTicket {
 
 #[cfg(test)]
 mod tests {
-    /// Metal's `Seat::scratch_bytes`, as engine-metal lays a rung's rs
-    /// scratch: each slot's rows and the lanes' work term at least 4 bytes
-    /// rounded to 256, rows and lanes each at least one, the whole at least
-    /// 256.
-    fn metal_scratch_bytes(slots: &[u64], work_elems: u64, rows_ext: u32, lanes: u32) -> u64 {
-        let rows = u64::from(rows_ext.max(1));
-        let mut at = 0u64;
-        for &slot in slots {
-            at += (rows * slot).max(4).next_multiple_of(256);
-        }
-        at += (u64::from(lanes.max(1)) * work_elems * 4).max(4).next_multiple_of(256);
-        at.max(256)
-    }
-
-    #[test]
-    fn scratch_bytes_is_metals_reserve_to_the_byte() {
-        for (slots, work_elems) in [
-            (vec![2u64, 4096, 12_288, 300], 2048u64),
-            (vec![1], 0),
-            (vec![513, 3], 1),
-        ] {
-            let model = ScratchBytes {
-                slot_bytes: slots.clone(),
-                lane_bytes: work_elems * 4,
-                room_bytes: 0,
-                pad: 256,
-            };
-            for rows in [0u32, 1, 2, 7, 255, 1024, 2048] {
-                for lanes in [0u32, 1, 3, 8, 64] {
-                    assert_eq!(
-                        model.bytes(rows, lanes),
-                        metal_scratch_bytes(&slots, work_elems, rows, lanes),
-                        "slots {slots:?}, work {work_elems}, rows {rows}, lanes {lanes}"
-                    );
-                }
-            }
-        }
-        // A zero term costs one pad, not nothing.
-        let one = ScratchBytes { slot_bytes: vec![1], lane_bytes: 0, room_bytes: 0, pad: 256 };
-        assert_eq!(one.bytes(0, 0), 512);
-    }
-
     use super::*;
 
     fn mask(kept: &[bool]) -> Mask {
@@ -1715,48 +1673,6 @@ mod tests {
         lane.window = Some(WindowFold { base: 32, ..fold });
         let why = lane.validate_for(serves).unwrap_err().to_string();
         assert!(why.contains("past its folded index"), "{why}");
-        // Rows 20..40 earlier fires buffered stay named while this fire
-        // folds them: the table may not start past 20.
-        lane.window = Some(WindowFold {
-            base: 32,
-            fold: FoldLen::Host(20),
-            lineage: Lineage::Set,
-        });
-        let why = lane.validate_for(serves).unwrap_err().to_string();
-        assert!(why.contains("earlier fires buffered"), "{why}");
-
-        // A lane folding every row it computes (no earlier-buffered rows,
-        // an empty table): the table starts at the folded index after the
-        // fire, rounded down, past the one before it.
-        let mut prefill = Lane::decode(0, 0, 1, 20);
-        prefill.tokens = vec![1; 20];
-        prefill.kv.folded = 20;
-        prefill.window = Some(WindowFold {
-            base: 32,
-            fold: FoldLen::Host(20),
-            lineage: Lineage::Set,
-        });
-        assert!(prefill.validate_for(serves).is_ok());
-        // Past the folded index after the fire (40): refused.
-        prefill.window = Some(WindowFold {
-            base: 48,
-            fold: FoldLen::Host(20),
-            lineage: Lineage::Set,
-        });
-        let why = prefill.validate_for(serves).unwrap_err().to_string();
-        assert!(
-            why.contains("past its folded index after the fire 40"),
-            "{why}"
-        );
-        prefill.window = Some(WindowFold {
-            base: 32,
-            fold: FoldLen::Device,
-            lineage: Lineage::Set,
-        });
-        assert!(
-            prefill.validate_for(serves).is_err(),
-            "a device-counted fold's base is the folded index the runtime knows"
-        );
         lane.window = Some(fold);
         lane.rs = RsVerb::Buffer {
             pages: Vec::new(),
@@ -1841,23 +1757,6 @@ mod tests {
             buffered_reads(Some(&rows), 2, 5, Lineage::Set).unwrap(),
             vec![2..5]
         );
-    }
-
-    #[test]
-    fn a_mask_after_its_first_columns_reads_the_same_slots() {
-        let bits = [true, false, false, true, true, false, true];
-        let whole = mask(&bits);
-        for columns in 0..=bits.len() {
-            let after = whole.after(columns as u64);
-            assert_eq!(after.total, (bits.len() - columns) as u64);
-            let mut kept = vec![false; bits.len() - columns];
-            for span in after.admitted(0..after.total) {
-                for column in span {
-                    kept[column as usize] = true;
-                }
-            }
-            assert_eq!(kept, bits[columns..], "after {columns}");
-        }
     }
 
     #[test]

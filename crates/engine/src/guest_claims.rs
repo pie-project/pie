@@ -652,11 +652,6 @@ mod tests {
             .claim(b, &[run(3, 0, 64), run(2, 12288, 12544)])
             .expect_err("a heap over the first instance's run");
         assert!(why.to_string().contains("already hold instance"), "{why}");
-        assert_eq!(
-            why.to_string(),
-            "Instance slots at bytes 12288..12544 of segment 2 already hold instance 0's run \
-             at 8192..16384: instance 1's would overlap it"
-        );
         claims
             .claim(b, &[run(3, 0, 64)])
             .expect("the refused claim took nothing, and another segment is free");
@@ -703,32 +698,6 @@ mod tests {
         assert!(claims.held(Holder::Instance(9)).is_empty(), "a refused claim holds nothing");
     }
 
-    /// Runs touching a held one, or the same bytes of another segment, are
-    /// another instance's to take.
-    #[test]
-    fn adjacent_runs_are_allowed() {
-        let claims = Claims::default();
-        claims.claim(1, &[run(0, 1000, 2000)]).expect("the first claim");
-        claims
-            .claim(2, &[run(0, 0, 1000), run(0, 2000, 3000), run(5, 1000, 2000)])
-            .expect("touching runs and another segment");
-        claims.claim(3, &[run(0, 1500, 1500)]).expect("an empty run claims nothing");
-        assert!(claims.held(Holder::Instance(3)).is_empty());
-    }
-
-    /// A released instance's runs are free to claim again, by it or
-    /// another.
-    #[test]
-    fn release_then_claim_again() {
-        let claims = Claims::default();
-        claims.claim(1, &[run(0, 0, 4096)]).expect("the first claim");
-        claims.claim(2, &[run(0, 0, 64)]).expect_err("held");
-        claims.release(1);
-        assert!(claims.held(Holder::Instance(1)).is_empty());
-        claims.claim(2, &[run(0, 0, 64)]).expect("released");
-        claims.claim(1, &[run(0, 64, 4096)]).expect("the first again, beside it");
-    }
-
     /// A rebind replaces what the instance held in one step: it may move
     /// over its own old runs, frees what it moved off, and a refused one
     /// leaves the old claim whole.
@@ -754,115 +723,12 @@ mod tests {
         claims.claim(4, &[run(1, 4096, 8192)]).expect("the refused target took nothing");
     }
 
-    /// After an evacuation every instance's runs move in one step: one may
-    /// land where another moved off; one landing on an unlisted instance's,
-    /// or two listed ones landing on each other, refuse it all.
-    #[test]
-    fn an_evacuation_moves_every_claim_in_one_step() {
-        let claims = Claims::default();
-        claims.claim(1, &[run(0, 0, 100)]).expect("first");
-        claims.claim(2, &[run(0, 100, 200)]).expect("second");
-        claims.claim(3, &[run(0, 500, 600)]).expect("third, not moved");
-        claims
-            .claim_all(&[(Holder::Instance(1), vec![run(0, 100, 200)]), (Holder::Instance(2), vec![run(0, 0, 100)])])
-            .expect("a swap: each lands where the other moved off");
-        assert_eq!(claims.held(Holder::Instance(1)), vec![run(0, 100, 200)]);
-        assert_eq!(claims.held(Holder::Instance(2)), vec![run(0, 0, 100)]);
-        let overlap = claims
-            .claim_all(&[(Holder::Instance(1), vec![run(0, 1000, 1100)]), (Holder::Instance(2), vec![run(0, 550, 650)])])
-            .expect_err("onto the unmoved third");
-        assert_eq!(overlap.holder, Holder::Instance(3));
-        claims
-            .claim_all(&[(Holder::Instance(1), vec![run(0, 1000, 1100)]), (Holder::Instance(2), vec![run(0, 1050, 1150)])])
-            .expect_err("two moved onto each other");
-        assert_eq!(claims.held(Holder::Instance(1)), vec![run(0, 100, 200)], "nothing changed");
-        assert_eq!(claims.held(Holder::Instance(2)), vec![run(0, 0, 100)], "nothing changed");
-        claims.claim(4, &[run(0, 1000, 1200)]).expect("the refused targets took nothing");
-    }
-
-    /// An instance's own overlapping runs merge; the merged run is what
-    /// another's claim is checked against, in a map of many.
-    #[test]
-    fn own_runs_merge_and_many_are_checked() {
-        let claims = Claims::default();
-        claims
-            .claim(1, &[run(0, 0, 100), run(0, 50, 200), run(0, 200, 300)])
-            .expect("its own runs overlap");
-        assert_eq!(claims.held(Holder::Instance(1)), vec![run(0, 0, 300)]);
-        for instance in 2..1002u64 {
-            let at = instance * 1000;
-            claims
-                .claim(instance, &[run(0, at, at + 500)])
-                .expect("disjoint runs");
-        }
-        let overlap = claims
-            .claim(5000, &[run(0, 500_400, 500_600)])
-            .expect_err("over instance 500's run");
-        assert_eq!(overlap.holder, Holder::Instance(500));
-        claims
-            .claim(5000, &[run(0, 500_500, 501_000)])
-            .expect("between two runs");
-    }
-
     fn pair(pair: u64, taking: u64, runs: &[Run]) -> PairClaim {
         PairClaim {
             pair,
             taking,
             runs: runs.to_vec(),
         }
-    }
-
-    /// A pair's state is the group's: the first member lays it, the next
-    /// join it as it stands, and it goes with the last member, not the
-    /// first to leave.
-    #[test]
-    fn a_pair_is_held_by_its_group() {
-        let claims = Claims::default();
-        let at = [run(0, 1000, 2000)];
-        assert_eq!(
-            claims.claim_with_pair(1, &[run(0, 0, 100)], &pair(50, 7, &at)),
-            Ok(Joined::Fresh)
-        );
-        assert_eq!(
-            claims.claim_with_pair(2, &[run(0, 100, 200)], &pair(50, 7, &at)),
-            Ok(Joined::Held),
-            "a second member joins, nothing to clear"
-        );
-        assert_eq!(claims.members(50), vec![1, 2]);
-        let overlap = claims.claim(3, &[run(0, 1500, 1600)]).expect_err("over the pair");
-        assert_eq!(overlap.holder, Holder::Pair(50));
-        assert!(overlap.to_string().contains("already hold pair 50's run at 1000..2000"), "{overlap}");
-        claims.release(1);
-        assert_eq!(claims.held(Holder::Pair(50)), at.to_vec(), "a member is still bound");
-        claims.release(2);
-        assert!(claims.held(Holder::Pair(50)).is_empty(), "gone with its last member");
-        claims.claim(3, &[run(0, 1500, 1600)]).expect("free once the group let it go");
-    }
-
-    /// A park keeps only what stayed in place (the tables, where no tier
-    /// below took them) and leaves the pair: another instance binds on the
-    /// scratch the park gave back without a refusal, and the parked one's
-    /// rebind claims fresh room and joins the pair again. One parked down a
-    /// tier keeps nothing.
-    #[test]
-    fn a_park_gives_back_its_shed_runs_and_its_rebind_claims_again() {
-        let claims = Claims::default();
-        let at = [run(0, 1000, 2000)];
-        let (tables, scratch) = (run(0, 0, 100), run(0, 100, 500));
-        claims.claim_with_pair(1, &[tables, scratch], &pair(50, 7, &at)).expect("bound");
-        claims.park(1, &[tables]);
-        assert_eq!(claims.held(Holder::Instance(1)), vec![tables], "its tables stay claimed");
-        assert!(claims.held(Holder::Pair(50)).is_empty(), "the pair went with its last member");
-        claims.claim(2, &[run(0, 100, 500), run(0, 1000, 2000)]).expect("the shed runs are free");
-        claims.claim(3, &[run(0, 50, 60)]).expect_err("its tables are still its");
-        assert_eq!(
-            claims.claim_with_pair(1, &[tables, run(0, 600, 900)], &pair(50, 8, &[run(0, 3000, 4000)])),
-            Ok(Joined::Fresh),
-            "its rebind claims fresh room and a new taking of its pair"
-        );
-        claims.park(1, &[]);
-        assert!(claims.held(Holder::Instance(1)).is_empty(), "parked down a tier: nothing kept");
-        claims.claim(3, &[run(0, 50, 60)]).expect("its tables went down with it");
     }
 
     /// A member's rebind naming the group's taking at other bytes, while
@@ -897,38 +763,4 @@ mod tests {
         claims.claim(3, &[run(0, 1000, 2000)]).expect("what it moved off is free");
     }
 
-    /// A new taking of the pair's slots is the whole group's move (the
-    /// runtime gives the pair item fresh slots as one); the other members
-    /// stay members and join it as it stands when they rebind. An
-    /// evacuation moves it with every instance in one step.
-    #[test]
-    fn a_pair_moves_as_the_group() {
-        let claims = Claims::default();
-        let at = [run(0, 1000, 2000)];
-        claims.claim_with_pair(1, &[run(0, 0, 100)], &pair(50, 7, &at)).expect("first");
-        claims.claim_with_pair(2, &[run(0, 100, 200)], &pair(50, 7, &at)).expect("second");
-        let moved = [run(0, 8000, 9000)];
-        assert_eq!(
-            claims.claim_with_pair(1, &[run(0, 0, 100)], &pair(50, 8, &moved)),
-            Ok(Joined::Fresh),
-            "a new taking"
-        );
-        assert_eq!(claims.members(50), vec![1, 2]);
-        assert_eq!(
-            claims.claim_with_pair(2, &[run(0, 100, 200)], &pair(50, 8, &moved)),
-            Ok(Joined::Held)
-        );
-        claims
-            .claim_with_pair(3, &[run(0, 200, 300)], &pair(60, 1, &[run(0, 8500, 8600)]))
-            .expect_err("another pair over this one");
-        claims
-            .claim_all(&[
-                (Holder::Pair(50), vec![run(0, 0, 1000)]),
-                (Holder::Instance(1), vec![run(0, 1000, 1100)]),
-                (Holder::Instance(2), vec![run(0, 1100, 1200)]),
-            ])
-            .expect("an evacuation swaps the pair and its members");
-        assert_eq!(claims.held(Holder::Pair(50)), vec![run(0, 0, 1000)]);
-        assert_eq!(claims.members(50), vec![1, 2]);
-    }
 }

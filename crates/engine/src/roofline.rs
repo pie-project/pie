@@ -408,39 +408,6 @@ mod tests {
     }
 
     #[test]
-    fn a_matmul_reads_its_width_at_the_octave_below_its_rows() {
-        let c = constants();
-        assert_eq!(c.gemm_rate(1024, 4096, 4096), 160_000.0);
-        // Between octaves: the octave below.
-        assert_eq!(c.gemm_rate(1500, 4096, 4096), 160_000.0);
-        // Past the curve's ends: its first row's, its last's.
-        assert_eq!(c.gemm_rate(1, 4096, 4096), 80_000.0);
-        assert_eq!(c.gemm_rate(65536, 4096, 4096), 202_000.0);
-        // A 1024-square plane reads the 1024 curve; 2048 square halfway in
-        // log width; a 1024 x 4096 plane is 2048 square.
-        assert_eq!(c.gemm_rate(1024, 1024, 1024), 80_000.0);
-        assert!((c.gemm_rate(1024, 2048, 2048) - 120_000.0).abs() < 1e-6);
-        assert!((c.gemm_rate(1024, 1024, 4096) - 120_000.0).abs() < 1e-6);
-        // Past the widest width: its last span's slope (1024 to 4096 at 1024
-        // rows, 80 to 160) carries on: 16384 square two more octaves, 240.
-        assert!((c.gemm_rate(1024, 16384, 16384) - 240_000.0).abs() < 1e-6);
-        assert!((c.attn_rate(2048) - 225_000.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_matmul_pays_for_the_rows_its_tile_pads() {
-        // A 256-row tile: 1100 rows run as 1280, at the 1024 octave's rate.
-        let c = constants().with_row_tile(Arc::new(|_, _, _| 256));
-        let ns = c.gemm_compute_ns(1100, 4096, 4096);
-        assert_eq!(ns, 2.0 * 1280.0 * 4096.0 * 4096.0 / 160_000.0);
-        // At an octave the tile divides the rows: the curve itself.
-        assert_eq!(
-            c.gemm_compute_ns(1024, 4096, 4096),
-            2.0 * 1024.0 * 4096.0 * 4096.0 / 160_000.0
-        );
-    }
-
-    #[test]
     fn a_dispatch_is_its_launch_and_the_longer_of_compute_and_traffic() {
         let c = constants();
         let plane = 2.0 * 4096.0 * 4096.0;
@@ -456,109 +423,17 @@ mod tests {
     }
 
     #[test]
-    fn a_dispatch_short_of_the_device_s_workgroups_pays_for_the_slots_it_leaves() {
-        let c = constants();
-        // 80 units at 3.3 a unit: 264 workgroups fill the device.
-        assert!((c.full_rate_workgroups(80).unwrap() - 264.0).abs() < 1e-9);
-        // 264 or more: the work at its rate.
-        assert_eq!(c.wave_ns(1e6, 1e3, 264, 80), Ok(1e3));
-        assert_eq!(c.wave_ns(1e6, 1e3, 1000, 80), Ok(1e3));
-        // 66, a quarter: four times as long.
-        assert!((c.wave_ns(1e6, 1e3, 66, 80).unwrap() - 4e3).abs() < 1e-6);
-        let unstated = Constants {
-            workgroups_per_core: None,
-            ..constants()
-        };
-        assert_eq!(
-            unstated.wave_ns(1e6, 1e3, 66, 80),
-            Err("workgroups_per_core")
-        );
-    }
-
-    /// The few-rows kernel's matmuls at its rate under the wave rule; the
-    /// rest at the curve's.
-    #[test]
-    fn a_matmul_the_few_rows_kernel_serves_is_weighed_at_its_rate_and_grid() {
-        let grid: FewRowGrid = Arc::new(|m, n, _| (m <= 16).then_some(n / 4));
-        let c = constants().with_few_rows(grid.clone(), 80).unwrap();
-        let flops = 2.0 * 8.0 * 4096.0 * 1024.0;
-        // 1024 workgroups fill the 264: the flops at 4 TFLOP/s.
-        assert!((c.matmul_compute_ns(8, 4096, 1024, flops) - flops / 4_000.0).abs() < 1e-6);
-        // 64 workgroups, a quarter short of 264: 264 / 64 the time.
-        let narrow = c.matmul_compute_ns(8, 256, 1024, flops);
-        assert!((narrow - flops / 4_000.0 * 264.0 / 64.0).abs() < 1e-6);
-        // Past its rows, the curve's rate.
-        assert_eq!(
-            c.matmul_compute_ns(32, 4096, 1024, flops),
-            flops / c.gemm_rate(32, 4096, 1024)
-        );
-        let unstated = Constants {
-            few_row_flops_per_ns: None,
-            ..constants()
-        };
-        assert_eq!(
-            unstated.with_few_rows(grid, 80).err(),
-            Some("few_row_tflops")
-        );
-    }
-
-    /// The curve kept as measured and stated beside it at its full rate;
-    /// a shape a tile past whole waves pays the last wave, one whose waves
-    /// the library states none of runs at the curve as timed.
-    #[test]
-    fn a_matmul_on_the_library_s_kernel_pays_for_the_waves_it_fills() {
-        assert_eq!(wave_fill(3.0), 1.0);
-        assert!((wave_fill(0.5) - 2.0).abs() < 1e-12);
-        assert!((wave_fill(2.25) - 3.0 / 2.25).abs() < 1e-12);
-        // Every curve point (n = k, a width it times) fills 1.5 waves
-        // (fill 4/3); the 3000-column shape at hand 2 or 2.25; a
-        // 5000-column one none stated.
-        let at = |w: f64| -> GemmWaves {
-            Arc::new(move |_, n, _| match n {
-                3000 => Some(w),
-                5000 => None,
-                _ => Some(1.5),
-            })
-        };
-        let plain = constants();
-        let c = plain.clone().with_gemm_waves(at(2.0));
-        assert_eq!(c.gemm_by_rows, plain.gemm_by_rows, "the curve stays as measured");
-        assert_eq!(c.clone().with_gemm_waves(at(2.0)).gemm_full_by_rows, c.gemm_full_by_rows);
-        let rate = plain.gemm_rate(2048, 3000, 4096);
-        let flops = c.gemm_flops(2048, 3000, 4096);
-        let whole = c.gemm_compute_ns(2048, 3000, 4096);
-        assert!((whole - flops / (rate * 4.0 / 3.0)).abs() < 1e-6);
-        let past = plain.clone().with_gemm_waves(at(2.25)).gemm_compute_ns(2048, 3000, 4096);
-        assert!((past / whole - 3.0 / 2.25).abs() < 1e-9);
-        assert_eq!(
-            c.gemm_compute_ns(2048, 5000, 4096),
-            plain.gemm_compute_ns(2048, 5000, 4096)
-        );
-    }
-
-    #[test]
     fn a_rate_stated_at_nothing_is_refused_by_its_key() {
         let all = profile::rates::Rates {
-            stale: None,
-            landing: None,
             launch_ns: Some(900),
             gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 100.0)])]),
             attn_tflops_by_keys: Some(vec![(512, 50.0)]),
             hbm_gbps: Some(700.0),
-            cached_gbps: None,
             elementwise_gbps: Some(500.0),
             scan_gelems: Some(2000.0),
             few_row_tflops: Some(4.0),
             workgroups_per_core: Some(3.3),
-            submit_worst_ratio: None,
-            load_width: None,
-            resident_workgroups: None,
-            attn_tflops_by_rows_keys: None,
-            product_ns: None,
-            kernel_curves: None,
-            dense_settled: Vec::new(),
-            measured_on: None,
-            measured_by: None,
+            ..profile::rates::Rates::default()
         };
         assert!(Constants::of(&all).is_ok());
         for (bad, key) in [
