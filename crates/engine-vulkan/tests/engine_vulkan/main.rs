@@ -112,6 +112,7 @@ mod gather;
 mod gpu;
 #[path = "../../../engine-gpu/suite/linear/mod.rs"]
 mod linear;
+mod fills_verified;
 mod rates_bound;
 mod replay;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]

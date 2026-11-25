@@ -100,7 +100,6 @@ impl Actor {
         );
         if let Some(worker) = self.cluster.workers.get_mut(&id) {
             worker.engine = info.engine;
-            worker.pid = info.pid;
         }
         self.cluster.worker_epoch += 1;
         self.cluster.gateway_epoch += 1;

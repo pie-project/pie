@@ -330,8 +330,11 @@ pub fn load_with(
     chunk: Option<u64>,
     residency: engine::load::Residency,
 ) -> Option<Shell> {
-    let _alone = loading();
-    load_alone(fixture, page, context, chunk, residency)
+    let device = DeviceBoot {
+        chunk_bytes: chunk,
+        ..crate::gpu::device_boot()
+    };
+    load_on(fixture, page, context, &device, residency, engine::runahead::Runahead::F1)
 }
 
 /// [`load`] as the engine raises a served load: one whose programs it
@@ -362,9 +365,38 @@ fn load_alone(
         chunk_bytes: chunk,
         ..crate::gpu::device_boot()
     };
-    let residency = allowed(&device, residency)?;
+    load_booted(fixture, page, context, &device, residency, engine::runahead::Runahead::F1)
+}
+
+/// [`load_with`] on the device `device` boots, running ahead by `runahead`
+/// (an arm a frame in flight).
+pub fn load_on(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    device: &DeviceBoot,
+    residency: engine::load::Residency,
+    runahead: engine::runahead::Runahead,
+) -> Option<Shell> {
+    let _alone = loading();
+    load_booted(fixture, page, context, device, residency, runahead)
+}
+
+/// [`load_on`], [`LOADING`] held by the caller.
+fn load_booted(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    device: &DeviceBoot,
+    residency: engine::load::Residency,
+    runahead: engine::runahead::Runahead,
+) -> Option<Shell> {
+    let residency = allowed(device, residency)?;
     Some(
-        Shell::load(boot(fixture, page, context, &device, residency))
+        Shell::load(Boot {
+            runahead,
+            ..boot(fixture, page, context, device, residency)
+        })
             .unwrap_or_else(|why| panic!("the shell loads: {why}")),
     )
 }
