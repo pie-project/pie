@@ -3676,6 +3676,12 @@ impl<B: Serve> Shell<B> {
         })
     }
 
+    /// The dense matmul's tactic at each rung.
+    #[must_use]
+    pub fn dense_picks(&self) -> &crate::dense::Dense {
+        &self.dense
+    }
+
     /// Whether a dense settle is left to weigh behind serving
     /// ([`Shell::measure_behind`]).
     #[must_use]

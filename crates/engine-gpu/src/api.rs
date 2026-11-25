@@ -1087,15 +1087,20 @@ where
         // curves': nothing fires before ready; what no settle decided is
         // weighed behind serving (`Engine::measure_behind`) and stored for
         // the next load. What a newly taken kernel binds is built by a
-        // second bind walk, and what it walked is the load's.
+        // second bind walk, and what it walked is the load's; where the
+        // settle changed no pick, every shape binds what the first walk
+        // built, and there is none.
         let settling = std::time::Instant::now();
+        let picks = shell.dense_picks().clone();
         shell.settle_dense().map_err(fault)?;
         shell.lay_behind_probe().map_err(fault)?;
         tracing::info!(
             settle_ms = settling.elapsed().as_millis() as u64,
             "load phases: the dense settle's picks (nothing fires before ready)"
         );
-        shell.walk_binds().map_err(fault)?;
+        if *shell.dense_picks() != picks {
+            shell.walk_binds().map_err(fault)?;
+        }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let weights_resident = !shell.weights_stream();
