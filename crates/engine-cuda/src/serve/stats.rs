@@ -54,7 +54,9 @@ impl Shell {
     /// libraries' code ([`crate::stored::Keys`]; the device a part of its
     /// own, as `pie tune export` finds a device's covers by), the guest emitter's
     /// version, the decode products' kernels as picked (their routes'
-    /// table) and the lanes and tokens a fire spans.
+    /// table) and the lanes a fire spans. Not its tokens: the cover is timed
+    /// over a lone lane's one-row decode frames, and the widest rung follows
+    /// the memory a load finds.
     #[must_use]
     pub fn cover_fingerprint(&self) -> String {
         let routes = self
@@ -63,12 +65,11 @@ impl Shell {
             .routes()
             .map_or(0, |routes| routes.fingerprint());
         format!(
-            "cuda|{}|kernels {}|emitter {}|routes {routes:#010x}|lanes {} tokens {}",
+            "cuda|{}|kernels {}|emitter {}|routes {routes:#010x}|lanes {}",
             profile::rates::Now::on(&self.keys),
             self.keys.codes_said(),
             eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION,
             self.budget.max_lanes,
-            self.budget.max_tokens,
         )
     }
 

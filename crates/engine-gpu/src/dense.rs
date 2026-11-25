@@ -155,6 +155,21 @@ impl Dense {
         self.by_rows.iter().map(|&(at, _)| at).collect()
     }
 
+    /// The kernel a one-row fire takes at each plane, in canonical words: the
+    /// part of the picks a lone lane's decode runs by, whatever rungs the
+    /// load lays past it.
+    #[must_use]
+    pub fn one_row(&self) -> String {
+        let said = |t: Tactic| format!("{}.{}.{}", t.vector, u8::from(t.wide), tier_code(t.tier));
+        let mut planes: Vec<&((u32, u32), Vec<(u32, Tactic)>)> = self.planes.iter().collect();
+        planes.sort_by_key(|(at, _)| *at);
+        let mut out = format!("all:{}", said(at_rows(&self.by_rows, 1)));
+        for ((n, k), by) in planes {
+            out.push_str(&format!(" {n}x{k}:{}", said(at_rows(by, 1))));
+        }
+        out
+    }
+
     /// Every tactic a fire of `rows` runs at some plane: what its rows are
     /// padded for (the most any of them pads).
     #[must_use]
@@ -1323,6 +1338,31 @@ mod tests {
         );
         // An untimed candidate takes no part.
         assert_eq!(settle_pick(&[vec![100.0, 101.0], Vec::new(), vec![60.0, 61.0]]), Some(2));
+    }
+
+    /// What the host cover is keyed by of the picks: the one-row kernel of
+    /// each plane. The rungs a load lays, and the kernels its wider fires
+    /// take, leave it (a phone's rung follows its available memory).
+    #[test]
+    fn a_cover_s_picks_are_the_one_row_kernels() {
+        let of = |vector| Tactic {
+            tier: kernels_slang::Tier::Baseline,
+            vector,
+            wide: false,
+        };
+        let pick = |rungs: &[u32], one, wide| {
+            let by: Vec<(u32, Tactic)> =
+                rungs.iter().map(|&r| (r, of(if r == 1 { one } else { wide }))).collect();
+            Dense {
+                by_rows: by.clone(),
+                planes: vec![((1024, 2048), by)],
+            }
+            .one_row()
+        };
+        let at_128 = pick(&[1, 8, 128], 1, 8);
+        assert_eq!(pick(&[1, 8, 128, 256], 1, 8), at_128, "another rung");
+        assert_eq!(pick(&[1, 8, 128], 1, 4), at_128, "another kernel at wide rows");
+        assert_ne!(pick(&[1, 8, 128], 4, 8), at_128, "another one-row kernel");
     }
 
     /// A settle is keyed by its model alone and checked by the picks it was
