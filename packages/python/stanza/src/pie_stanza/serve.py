@@ -5,7 +5,8 @@ the model source, weight reload allowed), starts `pie serve`, waits until it
 is ready, and stops it on exit. `Pie` installs the two stanza programs and
 runs them: `stanza-chat` generates greedily from token ids, and
 `stanza-score` returns the log-prob and the argmax of each next token. An
-adapter travels with each launch as its bundle bytes.
+adapter's bundle bytes follow its launch by the chunked file transfer, which
+carries bundles of any size.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from pie_client import PieClient
+from pie_client import Event, PieClient
 
 from .data import prompt
 
@@ -117,7 +118,13 @@ class Pie:
             await client.authenticate(USER)
 
             async def one(kind, input, adapter):
-                files = {"adapter.safetensors": adapter.bytes} if adapter is not None else {}
-                return await (await client.launch_process(self.programs[kind], input, files=files)).result()
+                process = await client.launch_process(self.programs[kind], input | {"adapter": adapter is not None})
+                if adapter is not None:
+                    # The inferlet says "ready" once it waits for the bundle; a file sent earlier is dropped.
+                    event, value = await process.recv()
+                    if (event, value) != (Event.Message, "ready"):
+                        raise RuntimeError(f"stanza-{kind} did not ask for the adapter bundle: {event.value} {value}")
+                    await process.transfer_file(adapter.bytes)
+                return await process.result()
 
             return await asyncio.gather(*(one(*launch) for launch in launches))
