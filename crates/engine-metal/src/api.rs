@@ -778,10 +778,11 @@ impl Engine for Metal {
         if crate::diag::on().tier_trace {
             let audit = shell.audit();
             eprintln!(
-                "ledger: {}; device {} MiB, {} KiB beside the entries",
+                "ledger: {}; device {} MiB, {} KiB beside the entries; process footprint {} MiB",
                 shell.ledger(),
                 audit.device >> 20,
-                audit.gap() / 1024
+                audit.gap() / 1024,
+                crate::device::ctx::host_resident(0) >> 20
             );
         }
         let trace_name = shell.trace().name.clone();
