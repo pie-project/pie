@@ -60,10 +60,10 @@ pub struct WindowSpare;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.walk_fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct WalkFireRows(pub u32);
-/// The most rows a fire takes when `max_forward_tokens` is unset, below the
-/// fixed 8192 even over sparse experts: a batch's prompts then end over two
-/// fires, and those that finish in the first are answered, and replaced,
-/// while the second runs. 0: the fire width above.
+/// The fire top this device serves at, from a measured sweep of prefill at
+/// each top (`max_forward_tokens` unset): the widest feasible rung at or
+/// under it, the estimate not weighed; what the room leaves only lowers it.
+/// 0: the fire-top rule weighs it (`engine::load::fire_top`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct FireRows(pub u32);

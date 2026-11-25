@@ -135,6 +135,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         Some(super::EveryRung::To(rows)) => rows,
         _ => prompt_rows,
     };
+    // A serving load on a device whose profile states its fire top
+    // (`engine.fire_rows`, from a measured sweep) takes it; else the rule
+    // weighs it below. A check's load lays its rungs as it asks.
+    let stated_top = (boot.budget.max_tokens == 0
+        && boot.knobs.every_rung.is_none()
+        && engine.fire_rows > 0)
+        .then_some(engine.fire_rows);
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = lattice_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
@@ -492,50 +499,65 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             device.name(),
             &counts,
         );
-        let top_tokens = match choice {
-            // A load that skips measuring (`[engine] measure = false`) on a
-            // card whose layers state no rate this model is weighed by: its
-            // fire top is the narrowest rung a decode fire takes, a prompt
-            // chunked to it; said by name.
-            Err(engine::load::Refused::NoRates { key, .. })
-                if boot.knobs.measuring == engine::rates::Measuring::Skip =>
-            {
-                let rung = crate::top::narrowest(&rungs, fire_lanes).map_err(refused)?;
-                tracing::info!(
-                    "skipped: the roofline `[rates] {key}` (`[engine] measure = false`, no layer \
-                     states it): the fire top is {rung}, the narrowest rung a decode fire of \
-                     {fire_lanes} lanes takes, a prompt chunked to it"
-                );
-                weighed = None;
-                rung
-            }
-            Err(why) => return Err(refused(Fault::Card(why.to_string()))),
-            Ok((top, estimate)) => {
-                // Which pricing the estimate gave the dense matmuls, said
-                // once: the waves of the kernels hipBLASLt states, or the
-                // measured curve as timed and why its solutions went unread.
-                #[cfg(feature = "rocm")]
-                tracing::info!(
-                    "the matmuls weighed by {}",
-                    kernels_cuda::hip::lt_kernel::pricing()
-                );
-                tracing::info!(
-                    "{}",
-                    engine::load::line_of(
-                        &top,
-                        top.tokens,
-                        top.span_bytes,
-                        after_weights,
-                        chip.tuned()
-                    )
-                );
-                weighed = Some(crate::top::Weighed {
-                    rungs: rungs.clone(),
-                    estimate,
-                    live: after_weights,
-                    fire_top: top.tokens,
-                });
-                top.tokens
+        let top_tokens = if let Some(asked) = stated_top {
+            let top = crate::top::stated(&rungs, asked).map_err(refused)?;
+            tracing::info!(
+                "top rung {top}: the device's profile states a fire top of {asked} rows \
+                 (`engine.fire_rows`); the estimate is not weighed"
+            );
+            weighed = choice.ok().map(|(_, estimate)| crate::top::Weighed {
+                rungs: rungs.clone(),
+                estimate,
+                live: after_weights,
+                fire_top: top,
+            });
+            top
+        } else {
+            match choice {
+                // A load that skips measuring (`[engine] measure = false`) on a
+                // card whose layers state no rate this model is weighed by: its
+                // fire top is the narrowest rung a decode fire takes, a prompt
+                // chunked to it; said by name.
+                Err(engine::load::Refused::NoRates { key, .. })
+                    if boot.knobs.measuring == engine::rates::Measuring::Skip =>
+                {
+                    let rung = crate::top::narrowest(&rungs, fire_lanes).map_err(refused)?;
+                    tracing::info!(
+                        "skipped: the roofline `[rates] {key}` (`[engine] measure = false`, no layer \
+                         states it): the fire top is {rung}, the narrowest rung a decode fire of \
+                         {fire_lanes} lanes takes, a prompt chunked to it"
+                    );
+                    weighed = None;
+                    rung
+                }
+                Err(why) => return Err(refused(Fault::Card(why.to_string()))),
+                Ok((top, estimate)) => {
+                    // Which pricing the estimate gave the dense matmuls, said
+                    // once: the waves of the kernels hipBLASLt states, or the
+                    // measured curve as timed and why its solutions went unread.
+                    #[cfg(feature = "rocm")]
+                    tracing::info!(
+                        "the matmuls weighed by {}",
+                        kernels_cuda::hip::lt_kernel::pricing()
+                    );
+                    tracing::info!(
+                        "{}",
+                        engine::load::line_of(
+                            &top,
+                            top.tokens,
+                            top.span_bytes,
+                            after_weights,
+                            chip.tuned()
+                        )
+                    );
+                    weighed = Some(crate::top::Weighed {
+                        rungs: rungs.clone(),
+                        estimate,
+                        live: after_weights,
+                        fire_top: top.tokens,
+                    });
+                    top.tokens
+                }
             }
         };
         let widest = crate::top::widest(&rungs).unwrap_or(top_tokens);
