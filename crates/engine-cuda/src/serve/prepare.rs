@@ -718,15 +718,15 @@ impl Shell {
             .zip(&lane_rows)
             .enumerate()
             .map(|(at, (seated, &rows))| match (media_of[at], clips_of[at]) {
-                (None, None) => FireLane::new(self.class_word(seated.lane.word), rows),
+                (None, None) => FireLane::new(seated.lane.word, rows),
                 (Some(shot), _) => FireLane::with_images(
-                    self.class_word(seated.lane.word),
+                    seated.lane.word,
                     rows,
                     shot.rows.len() as u32,
                     shot.rows.iter().sum(),
                 ),
                 (None, Some(clips)) => FireLane::with_clips(
-                    self.class_word(seated.lane.word),
+                    seated.lane.word,
                     rows,
                     clips.clips.len() as u32,
                     u32::try_from(clips.voxels()).unwrap_or(u32::MAX),
@@ -1122,10 +1122,7 @@ impl Shell {
             ..Default::default()
         };
         let mut adapter_routes: Vec<i32> = Vec::new();
-        // A load folding adapters stages every fire's routes: its bodies'
-        // corrections read them, a lane carrying no adapter routing -1.
-        let any_adapter =
-            self.adapter_fold.is_some() || lanes.iter().any(|seated| seated.adapter.is_some());
+        let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
             adapter_routes.reserve(rows as usize);
         }
@@ -1501,10 +1498,7 @@ impl Shell {
                     .compiled
                     .classes
                     .correction_reaches(&self.corrected, lane.word);
-            // A plain lane in a correcting class is a load folding adapters:
-            // its rows route -1 and correct nothing.
-            let folded = seated.adapter.is_none() && self.adapter_fold.is_some();
-            if seated.adapter.is_some() != runs_correction && !unreachable && !folded {
+            if seated.adapter.is_some() != runs_correction && !unreachable {
                 return Err(Fault::AdapterWord {
                     lane: row.source,
                     word: lane.word,
@@ -2330,7 +2324,16 @@ impl Shell {
         // A tapped fire is walked, so the walk can mark where each layer
         // ends on the stream.
         let snapshots_fit = snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize;
+        // A fire with an adapted lane is stated eager: it keys no body, and
+        // its key past the plain classes is its bucket alone, which names
+        // another composition's.
+        let stated_eager = composition
+            .axis(poem_ir::RowAxis::Tokens)
+            .classes
+            .present_in_order()
+            .any(|class| self.eager_classes.contains(class as usize));
         let bodied = records_bodies
+            && !stated_eager
             && !tapped
             && snapshots_fit
             && Self::keyable_units(&self.compiled)
@@ -2396,7 +2399,7 @@ impl Shell {
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
         let unbodied =
-            (records_bodies && !arming && !(bodied && readouts_fit && lanes_fit)).then(|| {
+            (records_bodies && !arming && !stated_eager && !(bodied && readouts_fit && lanes_fit)).then(|| {
                 let why = if tapped {
                     "it is tapped"
                 } else if !snapshots_fit {
@@ -2579,6 +2582,7 @@ impl Shell {
             kv_reports,
             bodied,
             unbodied,
+            stated_eager,
             admits,
             key,
             lane_ceiling,
