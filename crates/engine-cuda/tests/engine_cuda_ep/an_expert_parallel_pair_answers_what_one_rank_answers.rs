@@ -96,7 +96,7 @@ fn stage(
         context_declared: false,
         ordinal,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::profile("")),
+            chip: Some(crate::micro::chip()),
             pin: (!graphs).then_some((engine_cuda::Graphs::Off, None)),
             diagnostics: crate::micro::diagnostics(),
             ..engine_cuda::Knobs::default()
