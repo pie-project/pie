@@ -832,11 +832,6 @@ impl Engine for Cuda {
         let weights_from_cache = shell.weights_from_cache();
         let weights_resident = shell.weights_resident();
         let paging = shell.paging();
-        let state_rows = shell
-            .trace()
-            .caches
-            .iter()
-            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
         let trace = shell.trace();
         let drafter = trace.drafter;
 
@@ -899,16 +894,7 @@ impl Engine for Cuda {
             media_encode: false,
             rs_verbs: true,
             windowed_state,
-            // A load of rings alone lands its snapshots itself
-            // (`serve::ring`); one of recurrent state too, as its state
-            // lands them.
-            rs_snapshots: if (state_rows && shell.lands_snapshots())
-                || (windowed_state && !state_rows)
-            {
-                crate::store::rs::SNAPSHOTS
-            } else {
-                0
-            },
+            rs_snapshots: shell.rs_snapshots(),
             bidirectional_attention: true,
             adapter_attachments: true,
             facts: shell.trace().facts.clone(),
@@ -932,10 +918,10 @@ impl Engine for Cuda {
             &steps,
             &engine::StepFacts::stated(&caps, &readout_facts()),
         );
-        if stated != *shell.steps() {
+        if let Some(apart) = stated.apart(shell.steps()) {
             return Err(Error::Load(format!(
                 "the load states the step set {} and its arm walk took {}: a fire's stated \
-                 shape would name another walk's shape",
+                 shape would name another walk's shape ({apart})",
                 stated.census(),
                 shell.steps().census()
             )));
