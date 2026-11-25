@@ -177,27 +177,6 @@ pub trait Serve: Backend {
     /// The chunk size the pool's recipe aims at in place of the profile's.
     fn chunk_bytes(boot: &Self::DeviceBoot) -> Option<u64>;
 
-    /// Where a load keeps what it armed before ready, for a later load of
-    /// the same build, device and model ([`crate::armed`]): the user's
-    /// profiles. `None` keeps nothing.
-    fn records_dir(_boot: &Self::DeviceBoot) -> Option<std::path::PathBuf> {
-        None
-    }
-
-    /// What keys what a load armed ([`crate::armed`]) beside the device, the
-    /// model, the lattice and the dense picks: the version of the layout a
-    /// recording's commands take, and the code of the kernels the load
-    /// built (`pipelines`).
-    fn armed_build(_pipelines: &Self::Pipelines) -> u64 {
-        0
-    }
-
-    /// The armed records the build carries (`profiles/bodies/<key>`), by
-    /// key: a load that keeps none of its own of that key takes one.
-    fn committed_armed() -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
     /// The host covers committed for this backend's devices (each a
     /// `<device>.covers.json`'s text, `engine::Engine::committed_covers`):
     /// none where the backend carries none.
@@ -1387,9 +1366,6 @@ pub struct Shell<B: Serve> {
     /// The load armed its bodies ([`Shell::record_bodies`]): a fire of an
     /// armed kind fills a body, never records one.
     pub armed: bool,
-    /// The record the load armed from, where it armed from one
-    /// ([`crate::armed`]): a serving fire it left unarmed makes it stale.
-    armed_from: Option<std::path::PathBuf>,
     /// The load is done and serving: a fire the load neither armed nor
     /// stated eager is a bug from here ([`Shell::unarmed`]).
     pub serving: bool,
@@ -3279,7 +3255,6 @@ impl<B: Serve> Shell<B> {
             eager: 0,
             eager_next: false,
             armed: false,
-            armed_from: None,
             serving: false,
             unarmed_named: std::collections::BTreeSet::new(),
             drained: 0,
@@ -8835,18 +8810,6 @@ impl<B: Serve> Shell<B> {
             prepared.rung,
             prepared.arm,
         );
-        // A load armed from a record that left this fire unarmed armed from
-        // a stale one: the next load measures its lattice again.
-        if let Some(path) = self.armed_from.take() {
-            // Written over, not removed: a committed record of the key is
-            // passed over too while the home's own entry stands.
-            let _ = std::fs::write(&path, "stale\n");
-            tracing::warn!(
-                path = %path.display(),
-                "the record this load armed from left a serving fire unarmed: dropped, the next \
-                 load arms its whole lattice (a committed one is exported again)"
-            );
-        }
         if cfg!(debug_assertions) && self.serving {
             return Err(Fault::Unbound {
                 what: format!(
@@ -10652,13 +10615,6 @@ impl<B: Serve> Shell<B> {
     /// refs and write nothing), so a fire runs as a serving one of its shape
     /// does and is recorded. The bodies recorded.
     ///
-    /// `records`, where given, is the directory a load keeps what it armed
-    /// in ([`crate::armed`]): the shapes whose walks recorded a family, and
-    /// the rows its allowance stated eager from. A later load of the same
-    /// build, device, model and lattice records only those shapes, measures
-    /// no allowance, and states the same rows eager; every other shape of
-    /// the lattice fills a body those recorded, at its first fire.
-    ///
     /// `steps`, where the load states them (CONTRACT-BC 24), is the set of
     /// compositions its step builder forms: the walk arms only compositions
     /// of a stated shape, in the set's order (smallest first across kinds),
@@ -10666,7 +10622,6 @@ impl<B: Serve> Shell<B> {
     /// stated eager by its index ([`Shell::eager_shapes_from`]).
     pub fn record_bodies(
         &mut self,
-        records: Option<&std::path::Path>,
         steps: Option<&engine::StepShapes>,
     ) -> Result<u64> {
         if !B::RECORDS {
@@ -10976,40 +10931,8 @@ impl<B: Serve> Shell<B> {
         let page = self.pools.paging().page_size.max(1);
         let depth = self.arms.depth();
         let mut recorded = 0u64;
-        // What a load of this build, device, model and lattice armed before.
-        let build = B::armed_build(&self.pipelines);
-        let record = records.map(|dir| {
-            crate::armed::path(
-                dir,
-                &format!(
-                    "{} {} {:?} {:?} {:?} {depth}",
-                    crate::backend::Context::name(&self.device),
-                    self.trace.name,
-                    shapes,
-                    self.span.rungs().iter().map(|rung| rung.tokens).collect::<Vec<_>>(),
-                    self.dense,
-                ),
-                build,
-            )
-        });
-        let known = record
-            .as_deref()
-            .and_then(|path| crate::armed::read(path, build, B::committed_armed()));
-        if known.is_some() {
-            self.armed_from.clone_from(&record);
-        }
-        if let (Some(known), Some(path)) = (&known, &record) {
-            tracing::info!(
-                path = %path.display(),
-                shapes = known.shapes.len(),
-                of = shapes.len(),
-                eager_from = ?known.eager,
-                "the load arms the bodies a load of this build, device, model and lattice \
-                 recorded, and measures no allowance"
-            );
-        }
-        // The shapes whose walks recorded a family, for the record.
-        let mut armed_shapes: Vec<usize> = Vec::new();
+        // The shapes whose walks recorded a family.
+        let mut armed_shapes = 0usize;
         // Bodies are recorded, not run: a recording's commands need no
         // execution, and the widest prefills would take the load seconds.
         self.arming = true;
@@ -11103,31 +11026,15 @@ impl<B: Serve> Shell<B> {
         // The most command buffers one composition's bodies took.
         let mut dearest_cmds = 0u64;
         let _ = B::spent();
-        if let Some(known) = &known {
-            match steps {
-                Some(_) => self.eager_from = known.eager.map(|at| at as usize),
-                None => self.eager_rows = known.eager,
-            }
-        }
         // `flags`: 1 a capturing lane of the pageless form (its key rows
         // alone), 2 every lane reading out its class's outputs.
         for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
-            // A known lattice states eager what its allowance did; every shape
-            // short of it is walked, the ones whose family an earlier shape
-            // recorded filling it (their fills kept before ready).
-            let rows = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
-            if known.as_ref().and_then(|known| known.eager).is_some_and(|from| match tags[at] {
-                Some(shape) => shape >= from as usize,
-                None => rows >= from,
-            }) {
-                break;
-            }
             let used = rss().saturating_sub(before);
             // The next shape's bodies cost what the dearest so far did, on
             // each arm: on the host (its resident bytes) and on the device
             // (what the driver's budget says the process took, live). The
-            // walk stops where either would not hold them, known record or
-            // not: a body the device cannot hold faults the driver.
+            // walk stops where either would not hold them: a body the device
+            // cannot hold faults the driver.
             let next = dearest.saturating_mul(depth as u64);
             let next_device = dearest_device.saturating_mul(depth as u64);
             let device_short = next_device > 0 && self.device.left() < next_device;
@@ -11182,7 +11089,7 @@ impl<B: Serve> Shell<B> {
                 tracing::info!(
                     walked = at,
                     of = shapes.len(),
-                    families = armed_shapes.len(),
+                    families = armed_shapes,
                     host_bytes = rss().saturating_sub(before),
                     "the arm walk so far"
                 );
@@ -11191,7 +11098,7 @@ impl<B: Serve> Shell<B> {
                 tracing::info!(
                     walked = at,
                     of = shapes.len(),
-                    shapes_recording = armed_shapes.len(),
+                    shapes_recording = armed_shapes,
                     host_bytes = rss().saturating_sub(before),
                     dearest,
                     maps = ?map_count(),
@@ -11306,7 +11213,7 @@ impl<B: Serve> Shell<B> {
                 recorded += 1;
             }
             if self.recorded > families {
-                armed_shapes.push(at);
+                armed_shapes += 1;
             }
             if let Some(at) = spent_at {
                 match tags[at] {
@@ -11320,30 +11227,6 @@ impl<B: Serve> Shell<B> {
         }
         self.arming = false;
         self.armed = true;
-        if known.is_none()
-            && let Some(path) = &record
-        {
-            let written = crate::armed::write(
-                path,
-                &crate::armed::Armed {
-                    shapes: armed_shapes.clone(),
-                    eager: match steps {
-                        Some(_) => self.eager_from.map(|at| u32::try_from(at).unwrap_or(u32::MAX)),
-                        None => self.eager_rows,
-                    },
-                },
-                build,
-            );
-            match written {
-                Ok(()) => tracing::info!(
-                    path = %path.display(),
-                    shapes = armed_shapes.len(),
-                    of = shapes.len(),
-                    "the shapes that recorded a family kept for a later load"
-                ),
-                Err(why) => tracing::warn!(%why, "what the load armed was not kept"),
-            }
-        }
         tracing::info!(
             allowance,
             bodies = recorded,

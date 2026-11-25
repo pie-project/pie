@@ -63,7 +63,7 @@ fn served(lag: u32) -> Option<Served> {
     let mut shell = load(&fixture, CONTEXT)?;
     // The bodies armed before the load serves, as an engine's load arms them:
     // a serving fire fills one and replays it, recording nothing.
-    shell.record_bodies(None, None).expect("the load arms its bodies");
+    shell.record_bodies(None).expect("the load arms its bodies");
     let _ = (shell.recorded_serving(), shell.unkept_serving(), shell.eager_serving());
     shell.serving = true;
     let page = shell.pools().rs_rows().expect("the pool lays an rs list").tokens;

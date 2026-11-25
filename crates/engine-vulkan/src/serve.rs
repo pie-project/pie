@@ -342,19 +342,6 @@ impl Serve for Api {
         boot.chunk_bytes
     }
 
-    /// Beside the pipeline cache, in the engine's cache.
-    fn records_dir(boot: &crate::api::DeviceBoot) -> Option<std::path::PathBuf> {
-        crate::armed::dir(boot)
-    }
-
-    fn armed_build(pipelines: &Pipelines) -> u64 {
-        crate::armed::build(pipelines)
-    }
-
-    fn committed_armed() -> &'static [(&'static str, &'static str)] {
-        crate::armed::COMMITTED
-    }
-
     fn committed_covers() -> &'static [&'static str] {
         crate::chip::COVERS
     }

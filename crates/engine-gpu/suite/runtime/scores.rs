@@ -147,7 +147,7 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<(usize, Moved)>) {
     let first = room(&shell);
     let mut room = first.clone();
     if moved.is_some() {
-        shell.record_bodies(None, None).expect("the load arms its bodies");
+        shell.record_bodies(None).expect("the load arms its bodies");
         shell.recorded_serving();
         shell.unkept_serving();
         shell.eager_serving();
@@ -361,7 +361,7 @@ fn an_idle_capture_needs_no_chunk() {
         let run = u32::try_from(bytes.div_ceil(layout.chunk_bytes)).expect("a run of chunks");
         layout.total_chunks - shell.pools().span_chunks() - run
     };
-    shell.record_bodies(None, None).expect("the load arms its bodies");
+    shell.record_bodies(None).expect("the load arms its bodies");
     shell.recorded_serving();
     shell.unkept_serving();
     shell.eager_serving();

@@ -1236,9 +1236,8 @@ where
         // The bodies are armed last, once every kernel a fire takes is
         // settled: a body records the kernels its fires walk.
         let started = std::time::Instant::now();
-        let records = <B as crate::serve::Serve>::records_dir(&self.boot);
         let bodies = shell
-            .record_bodies(records.as_deref(), Some(&caps.steps.shapes))
+            .record_bodies(Some(&caps.steps.shapes))
             .map_err(fault)?;
         if bodies > 0 {
             tracing::info!(
