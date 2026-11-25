@@ -1114,6 +1114,10 @@ impl<'a, B: Serve> Rig<'a, B> {
         }
         // Submitted: the device is no longer idle as the probe found it.
         self.retimed.set(false);
+        // What the host spent laying and committing a queue's frames, its
+        // waits aside: the host and the device run at once, so a queue's
+        // time is the longer of the two.
+        let mut host_ns = 0u64;
         let timed = if queued {
             // Each fire its own frame, all but the last committed behind
             // one another unawaited; the last, `then` on it, timed; the
@@ -1129,6 +1133,7 @@ impl<'a, B: Serve> Rig<'a, B> {
                 {
                     crate::backend::Pending::wait(&oldest)?;
                 }
+                let laying = std::time::Instant::now();
                 let f = self.device.frame()?;
                 {
                     let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
@@ -1138,7 +1143,9 @@ impl<'a, B: Serve> Rig<'a, B> {
                     })?;
                 }
                 pending.push_back(crate::backend::Frame::commit_async(f, None)?);
+                host_ns += laying.elapsed().as_nanos() as u64;
             }
+            let laying = std::time::Instant::now();
             let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
@@ -1148,6 +1155,7 @@ impl<'a, B: Serve> Rig<'a, B> {
                 })?;
             }
             then(&mut f)?;
+            host_ns += laying.elapsed().as_nanos() as u64;
             timer(f)?;
             for p in &pending {
                 crate::backend::Pending::wait(p)?;
@@ -1193,7 +1201,11 @@ impl<'a, B: Serve> Rig<'a, B> {
         let took = timed.0.unwrap_or(timed.1) as f64;
         if !self.worst_held.get() {
             let mut admission = self.admission.get();
-            admission.landed(estimate, took, count >= self.basis.get());
+            admission.landed(
+                estimate.map(|e| engine::rates::queued_estimate(e, host_ns as f64)),
+                took,
+                count >= self.basis.get(),
+            );
             self.admission.set(admission);
         }
         // Kept at the clock the first probe read.
