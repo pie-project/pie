@@ -3375,7 +3375,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
 /// One runs under the built-in `default` policy's seat-to-end holds
 /// ([`Workload::default_policy`]) and one with the engine refusing
 /// evacuations past its table swap ([`Workload::late_refuse`]).
-const SEEDS: [u64; 8] = [19, 25, 30, 42, 44, 66, 401, 729];
+const SEEDS: [u64; 8] = [19, 30, 44, 431, 1610, 3243, 401, 729];
 
 /// Every seed settles every step: no process waits for good, no slot is
 /// read where another lies, every process ends.

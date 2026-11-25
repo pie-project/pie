@@ -1530,6 +1530,37 @@ fn a_refused_lane_fails_its_own_fire_alone_inside_the_submit() {
     one_refused_lane_fails_its_own_fire_alone(false);
 }
 
+/// A lane refused at a frame's second step: the first step fired whole
+/// (its fires commit, once), and the second fires again without the
+/// refused fire, whose earlier fire stands.
+fn a_lane_refused_past_the_first_step_stops_the_frame_there(asynchronous: bool) {
+    let (frame, fires, fed) = fire_refusing(
+        asynchronous,
+        &[
+            &[(100, false), (101, false), (102, false)],
+            &[(100, false), (101, true), (102, false)],
+        ],
+    );
+    assert_eq!(frame, Ok(()));
+    assert!(fires[0].iter().all(Result::is_ok), "the first step commits: {fires:?}");
+    assert!(refused(&fires[1][1]), "the refused fire fails: {:?}", fires[1][1]);
+    assert_eq!(fires[1][0], Ok(()));
+    assert_eq!(fires[1][2], Ok(()));
+    assert_eq!(
+        fed,
+        vec![
+            vec![(100, 100), (101, 101), (102, 102)],
+            vec![(100, 1100), (102, 1102)],
+        ],
+        "no step fires twice, and none of the others' tokens is lost"
+    );
+}
+
+#[test]
+fn a_lane_refused_past_the_first_step_stops_the_frame_there_inside_the_submit() {
+    a_lane_refused_past_the_first_step_stops_the_frame_there(false);
+}
+
 /// A launch split into two engine frames whose second lands before its
 /// first is refused by name: every fire of the launch fails, none on
 /// another frame's tokens.

@@ -621,6 +621,13 @@ impl SharedGrow {
         pool.grow_step(self.goal_in(&pool)).is_some()
     }
 
+    /// The walk's next grow step for a live waiter; for a test.
+    #[cfg(test)]
+    pub(crate) fn live_step_for_test(&self) -> Option<super::GrowStep> {
+        let pool = self.shared.lock().unwrap();
+        pool.grow_step(self.goal_in(&pool))
+    }
+
     /// Promises a waiter a grow where [`Self::can_grow`]: the walk is woken
     /// to make it, and a walk that ends without mapping a segment since
     /// tells the planner no grow is coming. False, promising nothing,
@@ -633,6 +640,12 @@ impl SharedGrow {
         self.grow_waiter.store(true, Ordering::Release);
         self.wake();
         true
+    }
+
+    /// Whether a promised grow stands; for a test.
+    #[cfg(test)]
+    pub(crate) fn grow_promised(&self) -> bool {
+        self.grow_waiter.load(Ordering::Acquire)
     }
 
     /// Starts moving; the scheduler that takes the moves is up.
@@ -649,6 +662,15 @@ impl SharedGrow {
                 (kv.current_epoch(), kv.retired_through())
             })
         })
+    }
+
+    /// The segments to be at: the governor's target, and on the way up no
+    /// further than what stands ready ahead of the waiters asks.
+    /// The segments the walk moves toward now; for a test that walks the
+    /// segments itself.
+    #[cfg(test)]
+    pub(crate) fn goal_for_test(&self) -> u32 {
+        self.goal()
     }
 
     fn goal(&self) -> u32 {

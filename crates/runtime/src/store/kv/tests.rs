@@ -101,6 +101,7 @@ fn tests_every_case() {
     among_equal_keys_the_least_recently_used_goes_first_answer_or_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
     a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
+    a_cut_waits_out_a_move();
     new_weights_find_no_page_the_old_ones_sealed();
 }
 
@@ -138,6 +139,21 @@ fn a_beams_finish_waits_out_a_suspend_and_names_each_page_once() {
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.free_committed(), total, "every page back once");
+}
+
+/// A cut of a set in a move is refused until the move ends: cut under it,
+/// what the cut freed went back again as the move committed.
+fn a_cut_waits_out_a_move() {
+    let mut store = KvStore::new_with_swap(16, 16, 0, h(63));
+    let ws = store.create_working_set();
+    commit_fresh(&mut store, ws, 4, 1);
+    let sets = HashSet::from([ws]);
+    let txn = store.prepare_suspend(&sets, floor).unwrap().expect("private pages suspend");
+    assert!(matches!(store.truncate(ws, 0), Err(super::KvStoreError::MoveInFlight)));
+    assert_eq!(store.mapped_len(ws).unwrap(), 4, "nothing cut while it moves");
+    store.abort_suspend(txn);
+    store.truncate(ws, 0).unwrap();
+    assert_eq!(store.mapped_len(ws).unwrap(), 0);
 }
 
 /// A reload in place rekeys the cache: what the old weights sealed is

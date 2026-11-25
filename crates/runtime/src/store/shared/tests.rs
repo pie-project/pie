@@ -717,6 +717,44 @@ fn no_slot_is_handed_out_past_what_the_engine_binds() {
     assert!(chunk_of(&pool, more[0].0) >= 8);
 }
 
+/// A segment that straddles the ceiling is not committed while the engine
+/// holds anything back, by the weights' commit, the walker's ahead or its
+/// grow: what is mapped never passes the range less what is held, not for
+/// a moment.
+#[test]
+fn a_segment_straddling_the_ceiling_is_never_mapped() {
+    let mut pool = pool();
+    let top = TOTAL - pool.pool().act_max();
+    // Held back: 19 chunks under the activation, so the ceiling (at 33)
+    // falls inside segment 4.
+    let held = 19;
+    assert!(!pool.hold_back(u64::from(held) * CHUNK));
+    let ceiling = pool.pool().ceiling();
+    assert_eq!(ceiling, top - held);
+    assert_ne!(ceiling % SEGMENT, 0, "the ceiling straddles a segment");
+    let list = pool.list().expect("a kv list").pool;
+    let committed = pool.pool_mut().commit_for(&[(list, u64::MAX / 2)], 0);
+    assert!(
+        committed
+            .iter()
+            .all(|&segment| (segment + 1) * SEGMENT <= ceiling),
+        "committed {committed:?} past the ceiling at chunk {ceiling}"
+    );
+    assert!(pool.pool().commit_ahead(u64::MAX / 2).is_empty());
+    let mut grows = 0;
+    while let Some(SegmentMove::Commit { prefix }) = pool.next_move(u32::MAX, 0) {
+        pool.pool_mut().commit_segment(prefix - 1).unwrap();
+        grows += 1;
+        assert!(grows < 16, "the walk keeps committing");
+    }
+    let bound = pool.bound_bytes();
+    assert!(
+        pool.held() <= bound,
+        "mapped {} past what the engine binds {bound}",
+        pool.held()
+    );
+}
+
 /// A load that holds recurrent state states every lane's record: the one
 /// its working set binds, or none, never left unsaid; a load without
 /// state states none.

@@ -280,6 +280,115 @@ fn a_fire_too_wide_for_the_free_buffer_slots_is_cut_not_refused() {
     assert!(asked > free, "more than stood free at once");
 }
 
+/// A ring at chunk starts (CONTRACT-BC 21, `SlotRole::Ring`): one slot a
+/// chunk.
+const RINGS: EngineShape = EngineShape(7);
+/// A hybrid's window buffer holds 8 rows a slot, its rs list 4.
+const HY_WB_TOKENS: u32 = 8;
+
+/// A hybrid of recurrent and windowed layers: the kv list, the ring shape
+/// (before the state's), the recurrent state (`CONV`), the rs list (4 rows
+/// a slot) and the window buffer (8 rows a slot).
+fn hybrid_facts() -> ChunkFacts {
+    let mut facts = facts();
+    facts.shapes.retain(|shape| shape.id == LIST || shape.id == CONV);
+    facts.shapes.insert(
+        1,
+        Facts {
+            role: SlotRole::Ring,
+            ..shape(RINGS, SlotKind::Fixed { pieces: 1 }, CHUNK)
+        },
+    );
+    facts.shapes.push(Facts {
+        role: SlotRole::RsBuffer,
+        ..shape(
+            RS,
+            SlotKind::List {
+                tokens: RS_TOKENS,
+                rate: 1,
+                window: None,
+            },
+            MIB / 8,
+        )
+    });
+    facts.shapes.push(Facts {
+        role: SlotRole::WindowBuffer,
+        ..shape(
+            WB,
+            SlotKind::List {
+                tokens: HY_WB_TOKENS,
+                rate: 1,
+                window: None,
+            },
+            MIB / 4,
+        )
+    });
+    facts.windowed = vec![WindowedLayer {
+        layer: 1,
+        window: 8,
+        bytes: 8 * 256,
+        ..WindowedLayer::default()
+    }];
+    facts.record_bytes = facts.ring_bytes() + 4096;
+    // Each rung's rs scratch: its rows only, nothing past them laid.
+    facts.act_replay = facts
+        .act_chunks
+        .iter()
+        .map(|&(tokens, _)| super::rows_only(tokens))
+        .collect();
+    facts.validate().unwrap();
+    facts
+}
+
+/// A hybrid parks whole: its record (ring and state pieces), its rs list
+/// slots and its window-buffer slots each to host rows of their own shape,
+/// and back; an export names both buffers.
+#[test]
+fn a_hybrid_parks_both_buffers_and_its_whole_record() {
+    let mut facts = hybrid_facts();
+    facts.host_chunks = 8;
+    let tiers = Tiers::of(&facts).unwrap();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut rs = RsStore::shared(&shared, tiers.host.as_ref());
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: facts.record_bytes,
+        buffer_page_tokens: 16,
+    });
+    let out = prepare(&mut rs, ws, 6).unwrap();
+    settle(&mut rs, out.txn);
+    let out = prepare_many(&mut rs, &[ws], &one(vec![0], 6..10, GroupFold::None), None).unwrap();
+    settle(&mut rs, out.txn);
+    let export = rs.export(ws).unwrap();
+    assert_eq!(export.buffer.iter().flatten().count(), 2, "rs 4..8, 8..12");
+    assert_eq!(export.wbuffer.iter().flatten().count(), 2, "window 0..8, 8..16");
+    let sets = HashSet::from([ws]);
+    let held = rs.suspendable(&sets);
+    assert_eq!(
+        held,
+        RsUnits {
+            slots: 1,
+            pages: 4,
+            wbuf: 2,
+            ..RsUnits::default()
+        }
+    );
+    let txn = rs.prepare_suspend(&sets).expect("the host takes it");
+    let moved: Vec<EngineShape> = txn
+        .copy_plan()
+        .shared
+        .iter()
+        .map(|(shape, _)| *shape)
+        .collect();
+    for shape in [RINGS, CONV, RS, WB] {
+        assert!(moved.contains(&shape), "{shape:?} in {moved:?}");
+    }
+    assert_eq!(rs.commit_suspend(txn), held);
+    let mut grant = rs.reserve(rs.swapped_units(&sets)).expect("room to come back");
+    let txn = rs.prepare_restore(&sets, &mut grant).expect("it comes back");
+    rs.commit_restore(txn);
+    assert_eq!(rs.suspendable(&sets), held, "on the device again");
+}
+
 /// Two frames in flight: lane A's fire folds its buffered rows (frame N,
 /// still running), and every slot then free is handed to the next frame.
 /// The slots A's fold frees are not among them: its fire still reads them

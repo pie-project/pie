@@ -455,6 +455,26 @@ async fn a_stop_takes_back_what_ran_ahead_once_it_lands() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Under the lagged fold a run-ahead past a stop on a set with a
+/// recurrent state folded none of its rows: the take-back is a buffer
+/// truncate, the state untouched, the set usable for the next turn.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stop_on_a_recurrent_set_takes_back_its_buffered_rows() -> anyhow::Result<()> {
+    let mut run = run_ahead(6, Some(20))?;
+    for completion in &run.completions {
+        resolve_test_completion(completion, false);
+    }
+    let pipeline = run.pipeline;
+    pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 3)
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(run.failure(), None);
+    let (folded, logged, _) = run.length();
+    assert_eq!((folded, logged), (20, 23), "the three rows kept stay buffered");
+    assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
+    Ok(())
+}
+
 /// A retract reaching a fire whose pass stated its rows final (a
 /// default pass: the SDK states it unless the program declared the pass
 /// retractable) is refused by name before anything is cut: the set

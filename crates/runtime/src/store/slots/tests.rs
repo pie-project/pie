@@ -393,6 +393,48 @@ fn a_move_s_destination_is_handed_to_no_one_until_its_copy_lands() {
     pool.check();
 }
 
+/// Runs of adjacent chunks are taken inside one segment, lowest first,
+/// never across a segment's end; a run past a segment is refused by
+/// name, and too few free runs are refused naming what was free. An
+/// evacuation moves a run whole onto adjacent free chunks of one lower
+/// segment, its chunks in order.
+/// An unpark's two runs of two beside a bind's run of three, the
+/// two-stretches lowest. The placement is the takes' own: the runs of
+/// three it leaves are those the real takes leave.
+/// A device fault on an eviction's queued kv-to-disk copy: a segment a residency copy still reads is neither
+/// evacuated nor released (unmapped) until the copy lands.
+#[test]
+fn a_segment_under_a_copy_is_neither_evacuated_nor_released() {
+    let fixed = [(ShapeKind::Fixed, 4)];
+    let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 4)]));
+    let holder = Holder::WorkingSet(1);
+    let held = pool
+        .acquire_chunk_runs(holder, 0, 1, pool.free_chunk_runs(1))
+        .unwrap();
+    // Segment 1 (chunks 4..8) keeps one held chunk, 5; the rest of the
+    // pool below it free enough to take it.
+    let (five, freed): (Vec<Slot>, Vec<Slot>) = held
+        .iter()
+        .copied()
+        .partition(|slot| pool.physical(slot.chunk).unwrap() == 5);
+    pool.release(holder, &freed, 0);
+    assert!(
+        pool.plan_evacuation(1).is_some(),
+        "unfenced, it is evacuated"
+    );
+    pool.moving_out(&[5]);
+    assert!(pool.plan_evacuation(1).is_none(), "under a copy, it is not");
+    // Its chunk given back (the copy's commit) while the copy's fence
+    // still stands: the empty segment is not released.
+    pool.release(holder, &five, 0);
+    assert!(
+        pool.release_segment(1).is_err(),
+        "not released under a copy"
+    );
+    pool.moved_out(&[5]);
+    assert!(pool.release_segment(1).is_ok(), "released once it landed");
+}
+
 /// The pool's table after its moves, one by one, is the engine's after
 /// `ChunkTable::apply` of the same list: held chunks moved into holes
 /// among free ones, free logicals swapped up in their place, and moves

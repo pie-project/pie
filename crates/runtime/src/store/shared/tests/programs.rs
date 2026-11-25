@@ -370,6 +370,278 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
 
 // ---- ruling 2: the rung the engine holds, and the span it states ----
 
+/// Two chunks of batch tables a set: what [`SetEngine`] keeps standing for
+/// every program with a live instance.
+const SET: u64 = 2 * CHUNK;
+
+/// An engine that keeps one set of tables standing a program, shared by
+/// every live instance of it (Metal's batch tables), and states the total
+/// as `Programs::standing_after`, `BoundInstance::standing_guest_bytes` and
+/// `Programs::close` do.
+#[derive(Default)]
+struct SetEngine {
+    /// The bytes of each program's set.
+    sets: std::collections::HashMap<ProgramId, u64>,
+    live: std::collections::HashMap<InstanceId, ProgramId>,
+    next: u64,
+    /// The binds the engine was asked for.
+    binds: u32,
+}
+
+impl SetEngine {
+    fn with(sets: &[(ProgramId, u64)]) -> Self {
+        Self {
+            sets: sets.iter().copied().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The total over the programs `live` holds an instance of, each set
+    /// once.
+    fn total(&self, live: impl Iterator<Item = ProgramId>) -> u64 {
+        let programs: std::collections::HashSet<ProgramId> = live.collect();
+        programs.iter().map(|program| self.sets[program]).sum()
+    }
+}
+
+impl ::engine::Engine for SetEngine {
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn measured_at_load(&self) -> Vec<String> {
+
+        Vec::new()
+
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
+    fn kind(&self) -> &'static str {
+        "fake-sets"
+    }
+
+    fn load(&mut self, _request: ::engine::LoadRequest) -> ::engine::Result<::engine::Loaded> {
+        Err(::engine::Error::Load("no model".into()))
+    }
+
+    fn submit(
+        &mut self,
+        _frame: &::engine::FrameSubmission,
+    ) -> ::engine::Result<::engine::FrameTicket> {
+        unreachable!("nothing fires here")
+    }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for SetEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "close_program"))
+    }
+
+    fn standing_after(&self, binding: &::engine::InstanceBinding) -> ::engine::Result<u64> {
+        Ok(self.total(
+            self.live
+                .values()
+                .copied()
+                .chain(std::iter::once(binding.program)),
+        ))
+    }
+
+    fn bind(
+        &mut self,
+        binding: &::engine::InstanceBinding,
+    ) -> ::engine::Result<::engine::BoundInstance> {
+        self.binds += 1;
+        self.next += 1;
+        let id = InstanceId(self.next);
+        self.live.insert(id, binding.program);
+        Ok(::engine::BoundInstance {
+            id,
+            program: binding.program,
+            geometry: binding.geometry,
+            standing_guest_bytes: self.total(self.live.values().copied()),
+        })
+    }
+
+    fn close(&mut self, id: InstanceId) -> ::engine::Result<u64> {
+        self.live.remove(&id);
+        Ok(self.total(self.live.values().copied()))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_program"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for SetEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for SetEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_kv"))
+    }
+}
+
+
+fn binding(program: ProgramId) -> ::engine::InstanceBinding {
+    ::engine::InstanceBinding {
+        program,
+        extents: key(program).extents,
+        ..::engine::InstanceBinding::default()
+    }
+}
+
+/// A bind as the scheduler orders it: the engine asked the total it would
+/// hold (on the lane), the pair and what the bind adds held, then the bind,
+/// its total booked. Refused by name before the engine's bind where the
+/// smallest rung cannot hold the total with the term.
+fn bind_through(
+    shared: &Shared,
+    engine: &mut SetEngine,
+    program: ProgramId,
+) -> Result<InstanceId, String> {
+    let total = <SetEngine as ::engine::Programs>::standing_after(&engine, &binding(program))
+        .map_err(|error| error.to_string())?;
+    let added = shared.lock().unwrap().standing_added(total);
+    let open = ProgramOpen::new(shared, key(program), added)?;
+    let bound = <SetEngine as ::engine::Programs>::bind(engine, &binding(program))
+        .map_err(|error| error.to_string())?;
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.instance_bound(bound.id, key(program));
+        pool.standing_stated(bound.standing_guest_bytes);
+    }
+    drop(open);
+    Ok(bound.id)
+}
+
+/// A bind's standing bytes are backed below the carve before the engine is
+/// asked to bind, and a total no rung can hold refuses the bind by name
+/// before the engine's bind is entered, the pool as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_s_standing_bytes_are_backed_before_its_bind_and_a_total_past_the_span_is_refused() {
+    let (pool, fake) = pool_at_256();
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let mut engine = SetEngine::with(&[(PROGRAM, SET), (ProgramId(9), 63 * CHUNK)]);
+
+    // Backed first: the span widens by the set while the bind is held.
+    let total = <SetEngine as ::engine::Programs>::standing_after(&engine, &binding(PROGRAM)).unwrap();
+    let added = shared.lock().unwrap().standing_added(total);
+    assert_eq!(added, SET);
+    let open = ProgramOpen::new(&shared, key(PROGRAM), added).unwrap();
+    fund_span(
+        &shared,
+        || 256,
+        &NoPlanner,
+        &Lane(Arc::new(Mutex::new(fake))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 4 + 2);
+    assert_eq!(engine.binds, 0, "backed before the engine binds");
+    let bound = <SetEngine as ::engine::Programs>::bind(&mut engine, &binding(PROGRAM)).unwrap();
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.instance_bound(bound.id, key(PROGRAM));
+        pool.standing_stated(bound.standing_guest_bytes);
+    }
+    drop(open);
+    assert_eq!(shared.lock().unwrap().pool().standing(), SET);
+
+    // 63 chunks more: the smallest rung's one and the 65 standing are past
+    // the 63 the device has.
+    let why = bind_through(&shared, &mut engine, ProgramId(9))
+        .err()
+        .expect("a total past the span is refused");
+    assert!(why.contains("standing guest bytes"), "{why}");
+    assert_eq!(engine.binds, 1, "the engine's bind was not entered");
+    let pool = shared.lock().unwrap();
+    assert_eq!(pool.pool().standing(), SET, "a refused bind holds nothing");
+    assert_eq!(pool.pool().act_chunks(256), 4 + 2);
+}
 
 /// `program` bound with lanes that read out `rows` rows each.
 fn reading(program: ProgramId, rows: u32) -> FireKey {

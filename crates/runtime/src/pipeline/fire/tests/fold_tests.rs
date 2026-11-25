@@ -417,6 +417,117 @@ fn a_fold_never_reported_leaves_the_folded_length_a_bound() {
     }
 }
 
+/// What a fire froze as it was prepared stands when the fire does not
+/// follow, so the pipeline fails however the call that prepared it
+/// ends: here by a trap between the freeze and the submit, on a pass
+/// gone, and dropped where it waits. What [`reserve`] returns says so
+/// until the engine takes the fire.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fire_prepared_and_never_submitted_fails_its_pipeline() {
+    use crate::store::{PipelineScope, ScopeRefusal};
+
+    async fn prepared(
+        ctx: &mut TestContext,
+        model: usize,
+        stores: &Stores,
+        failure: &PipelineFailure,
+    ) -> Unfired {
+        let none = || Ok(rs::RsPlan::Groups(Vec::new()));
+        let id = uuid::Uuid::new_v4();
+        let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], &[], none);
+        reserved.await.unwrap().unfired
+    }
+    /// A piece prepared as a pass prepares one, whose call then asks
+    /// for a pass gone, as each path does before its submit.
+    async fn trapped(
+        ctx: &mut TestContext,
+        model: usize,
+        stores: &Stores,
+        ws: WorkingSetId,
+        failure: &PipelineFailure,
+    ) -> Anyhow<()> {
+        let unfired = prepared(ctx, model, stores, failure).await;
+        begin_piece(&mut stores.kv.lock(), ws, 4, Some(7))?;
+        let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+        ctx.resources().get_mut(&gone)?;
+        drop(unfired.submitted());
+        Ok(())
+    }
+
+    let (model, stores, ws) = frozen_at(4);
+    let mut ctx = Flight::context();
+    let failure = PipelineFailure::default();
+    let scope = PipelineScope::failing_as(failure.clone(), || true);
+    let set = KvWorkingSet::new(model, 0, ws, 4);
+    set.claim_pipeline_scope(&scope).unwrap();
+    assert!(
+        trapped(&mut ctx, model, &stores, ws, &failure)
+            .await
+            .is_err()
+    );
+    assert_eq!(folded(&stores, ws), (7, true), "the freeze stands");
+    assert_eq!(set.pipeline_failure().as_deref(), Some(UNFIRED));
+    let child = stores.kv.lock().fork(ws).unwrap();
+    scope.close();
+    let next = PipelineScope::failing_as(Default::default(), || true);
+    let refused = Err(ScopeRefusal::Failed {
+        owner: scope.id(),
+        reason: UNFIRED.to_string(),
+    });
+    assert_eq!(set.claim_pipeline_scope(&next), refused);
+    assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
+
+    // A refusal that said why keeps its reason.
+    let failure = PipelineFailure::default();
+    let unfired = prepared(&mut ctx, model, &stores, &failure).await;
+    let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+    record_submit_failure(&mut ctx, &gone, &failure, "pipeline: submit failed");
+    drop(unfired);
+    assert_eq!(
+        failure.lock().unwrap().as_deref(),
+        Some("pipeline: submit failed")
+    );
+
+    // A call dropped where it waits, its fire prepared.
+    let failure = PipelineFailure::default();
+    let unfired = prepared(&mut ctx, model, &stores, &failure).await;
+    let mut waiting = Box::pin(async move {
+        let _unfired = unfired;
+        std::future::pending::<()>().await;
+    });
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(*failure.lock().unwrap(), None);
+    drop(waiting);
+    assert_eq!(failure.lock().unwrap().as_deref(), Some(UNFIRED));
+
+    // A fire the engine took leaves this one no more (what it leaves
+    // until it is queued is its own), and a reserve refused leaves none.
+    let failure = PipelineFailure::default();
+    let unqueued = prepared(&mut ctx, model, &stores, &failure)
+        .await
+        .submitted();
+    assert_eq!(*failure.lock().unwrap(), None);
+    drop(unqueued);
+    assert_eq!(failure.lock().unwrap().as_deref(), Some(UNQUEUED));
+    let failure = PipelineFailure::default();
+    let refused = || Err("no mode".to_string());
+    let id = uuid::Uuid::new_v4();
+    let reserved = reserve(
+        &mut ctx,
+        (model, 0),
+        &stores,
+        id,
+        &failure,
+        &[],
+        &[],
+        &[],
+        refused,
+    );
+    assert!(reserved.await.is_err());
+    assert_eq!(*failure.lock().unwrap(), None);
+}
+
 /// `tokens` written into `ws` from row 0, 16 rows a page, by a pass
 /// whose fires have not landed yet; their rows' hashes.
 fn written(
@@ -1193,3 +1304,4 @@ async fn a_fire_that_ran_and_reported_no_fold_fails_its_set_by_name() -> Anyhow<
 // arrived. A fire behind one that folds by a count the device computes
 // is therefore staged before that count exists.
 
+use crate::scheduler::frame::{FramePlan, FramePolicy, FrameStamp, QueuedFireIds};

@@ -1680,3 +1680,116 @@ fn chunk_picks(
         None => (candidates, deficit, Vec::new()),
     }
 }
+
+#[cfg(test)]
+mod chunk_picks_tests {
+    use super::super::pool::{ChunkHeld, ChunkMap};
+    use super::*;
+
+    fn pid(n: u128) -> ProcessId {
+        ProcessId::from_u128(n)
+    }
+
+    fn held(chunk: u32, used: u32, by: &[(u128, u32)]) -> ChunkHeld {
+        ChunkHeld {
+            chunk,
+            used,
+            by: by.iter().map(|&(p, pages)| (pid(p), pages)).collect(),
+        }
+    }
+
+    /// Chunk 1 is held by A alone (5 pages), chunk 2 by B and a cache
+    /// entry (B's 2 of 4: not emptiable), chunk 3 by C (3 pages): a bind
+    /// short of one chunk evicts C, the cheapest chunk that empties.
+    #[test]
+    fn a_bind_short_of_a_chunk_evicts_the_occupants_of_the_cheapest_emptiable_one() {
+        let map = ChunkMap {
+            held: vec![held(1, 5, &[(1, 5)]), held(2, 4, &[(2, 2)]), held(3, 3, &[(3, 3)])],
+            free: vec![],
+            headroom: None,
+            segment_chunks: 0,
+        };
+        assert_eq!(map.cheapest_runs(1, 1), Some(vec![pid(3)]));
+        // Two chunks: C's and A's, B's never.
+        let mut two = map.cheapest_runs(1, 2).unwrap();
+        two.sort_unstable();
+        assert_eq!(two, vec![pid(1), pid(3)]);
+        assert_eq!(map.cheapest_runs(1, 3), None, "B's chunk does not empty");
+    }
+
+    /// 1867 chunks free and runs of 4 standing in the planner's map (cost
+    /// 0), the head short all the same (its need understates what its
+    /// unpark takes). The cheapest runs are "no one", and evicting by pages
+    /// instead frees nothing the run could take, one resident after
+    /// another. A run standing free moves no one; nor does a map where no
+    /// candidate's eviction empties a run.
+    #[test]
+    fn a_head_short_of_a_run_moves_no_one_whose_eviction_makes_none() {
+        let rank = |seq: u64| super::super::rank::Rank::of(0, seq);
+        let candidates = vec![(pid(1), rank(1)), (pid(2), rank(2))];
+        let deficit = Reclaim::default();
+        // Free 4..8 and 12..16: runs of 4 stand; the residents hold 9 and 11.
+        let standing = ChunkMap {
+            held: vec![held(9, 2, &[(1, 2)]), held(11, 1, &[(2, 1)])],
+            free: (4..8).chain(12..16).collect(),
+            headroom: Some(64),
+            segment_chunks: 0,
+        };
+        assert_eq!(standing.cheapest_runs(4, 1), Some(vec![]), "a run stands");
+        let (kept, _, occupants) =
+            chunk_picks(candidates.clone(), deficit, Some(&RunNeed::one(4, 1)), Some(&standing));
+        assert!(kept.is_empty() && occupants.is_empty(), "a free run: no one moved");
+        // No candidate's chunk lies where a run could form: none moved.
+        let scattered = ChunkMap {
+            held: vec![held(1, 3, &[(1, 1)]), held(3, 3, &[(2, 1)])],
+            free: vec![0, 2, 4],
+            headroom: Some(64),
+            segment_chunks: 0,
+        };
+        assert_eq!(scattered.cheapest_runs(3, 1), None, "their chunks do not empty");
+        let (kept, _, _) = chunk_picks(candidates, deficit, Some(&RunNeed::one(3, 1)), Some(&scattered));
+        assert!(kept.is_empty(), "evicting them makes no run: none moved");
+        assert!(scattered.explain(3).contains("stuck=2"), "{}", scattered.explain(3));
+    }
+
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::super::pool::{ChunkHeld, ChunkMap, RunNeed};
+    use super::*;
+
+    fn pid(n: u128) -> ProcessId {
+        ProcessId::from_u128(n)
+    }
+
+    /// A15: of the runs that serve a bind, those whose highest-priority
+    /// occupant is lowest, then the cheapest; equal priorities leave the
+    /// cheapest.
+    #[test]
+    fn a_run_is_emptied_of_its_lowest_priority_occupants_before_its_cheapest() {
+        let held = |chunk: u32, by: u128, pages: u32| ChunkHeld {
+            chunk,
+            used: pages,
+            by: vec![(pid(by), pages)],
+        };
+        let map = ChunkMap {
+            held: vec![held(1, 1, 1), held(2, 2, 5)],
+            free: vec![],
+            headroom: None,
+            segment_chunks: 0,
+        };
+        let need = RunNeed::one(1, 1);
+        assert_eq!(map.cheapest_need(&need), Some(vec![pid(1)]), "no priorities: the cheapest");
+        let priority = |p: ProcessId| if p == pid(1) { (5, 0) } else { (0, 0) };
+        assert_eq!(
+            map.cheapest_need_by(&need, &priority),
+            Some(vec![pid(2)]),
+            "the low-priority occupant moves, though its chunk holds more"
+        );
+        // Both chunks wanted: whatever their priority, both move.
+        let mut both = map.cheapest_need_by(&RunNeed::one(1, 2), &priority).unwrap();
+        both.sort_unstable();
+        assert_eq!(both, vec![pid(1), pid(2)]);
+    }
+}

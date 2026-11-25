@@ -856,3 +856,56 @@ fn a_shared_adapter_parks_only_once_every_holder_has() {
     assert_eq!(held(&device), before);
     assert_eq!(held(&host), 0);
 }
+
+/// What the lane does for a `CloseInstance`: the engine closes it, then
+/// the roles give its slots back.
+fn close_on_lane(roles: &RolesHandle, engine: &mut FakeEngine, id: InstanceId) {
+    <FakeEngine as ::engine::Programs>::close(engine, id).unwrap();
+    roles.lock().unwrap().close_instance(id);
+}
+
+#[test]
+fn an_instance_closed_while_evicted_or_coming_back_is_never_rebound() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+
+    // Closed while parked: its host slots go back, and the restore has
+    // nothing of it to rebind.
+    let parked = bind(&roles, &mut engine, Vec::new(), 1);
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    roles.lock().unwrap().commit(park);
+    close_on_lane(&roles, &mut engine, parked);
+    assert_eq!(held(&host), 0);
+    assert!(
+        roles
+            .lock()
+            .unwrap()
+            .prepare_unpark(holder(1))
+            .unwrap()
+            .is_none()
+    );
+    assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+
+    // Closed while its copy back is in flight: once it lands, its slots go
+    // back and it is not among the rebinds.
+    let moving = bind(&roles, &mut engine, Vec::new(), 2);
+    let park = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    roles.lock().unwrap().commit(park);
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .unwrap();
+    close_on_lane(&roles, &mut engine, moving);
+    roles.lock().unwrap().commit(unpark);
+    assert!(roles.lock().unwrap().stale(holder(2)).is_empty());
+    assert!(engine.rebinds.is_empty());
+    assert_eq!(held(&host), 0);
+    assert_eq!(held(&device), before);
+}

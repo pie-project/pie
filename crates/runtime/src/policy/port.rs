@@ -1084,13 +1084,19 @@ mod tests {
     fn the_call_about_a_process_exit_still_reads_it() {
         let mut port = port(NO_CACHE);
         let id = arrive(&mut port, "t", None);
+        port.apply(Event::PropsChanged(id, props(json!({"a": 1})), vec!["a".into()]));
         seen(&mut port);
         port.apply(Event::Exited(id, Outcome::Completed));
         let saw = seen(&mut port);
         assert!(has(&saw, &format!("exited {id}")), "{saw:?}");
         let of = process(id, &saw).expect("the call about its exit reads it");
         assert!(of.contains("tenant=t ") && of.contains("state=ProcessState::Exited"), "{of}");
-        assert_eq!(process(id, &seen(&mut port)), None, "the next call does not");
+        let saw = seen(&mut port);
+        assert_eq!(process(id, &saw), None, "the next call does not");
+        assert!(has(&saw, &format!("has process:{id} a=none")), "{saw:?}");
+        port.apply(Event::PropsChanged(id, props(json!({"a": 2})), vec!["a".into()]));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("has process:{id} a=none")), "{saw:?}");
     }
 
     #[test]
