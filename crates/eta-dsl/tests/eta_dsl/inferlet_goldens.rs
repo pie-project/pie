@@ -179,17 +179,14 @@ fn coverage() -> Traced {
 fn sinks() -> Traced {
     let tok: &'static Channel = leak(Channel::from([1i32]));
     let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]));
-    let a: &'static Channel = leak(Channel::new([2, 4, 8], dtype::f32));
-    let bch: &'static Channel = leak(Channel::new([2, 8, 4], dtype::f32));
+    let bundle: &'static Channel = leak(Channel::from([0u32; 4]));
     let out: &'static Channel = leak(Channel::new([1], dtype::i32));
-    a.put(vec![0.0f32; 64]);
-    bch.put(vec![0.0f32; 64]);
     let mut b = Builder::new(VOCAB, PAGE);
     b.outputs(crate::outputs::logits(VOCAB));
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr_ch);
     b.stage(Stage::Prologue, move || {
-        intrinsics::kernel::lora(a.read(), bch.read(), Tensor::constant(1u32 | 4u32));
+        intrinsics::kernel::adapter(bundle.read());
         intrinsics::kernel::attn_page_mask(iota(4));
     });
     b.stage(Stage::Epilogue, move || {

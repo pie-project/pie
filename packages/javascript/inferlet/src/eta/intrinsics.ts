@@ -58,21 +58,12 @@ export const kernel = {
     recordSink('attn_page_mask');
   },
 
-  lora(a: Operand, b: Operand, sites: Operand): void {
-    const [aid] = materialize(a);
-    const [bid] = materialize(b);
-    const [sid] = materialize(sites);
-    const name = internName('lora');
-    emit(Op.sinkCall(name, [aid, bid, sid]), []);
-    recordSink('lora');
-  },
-
-  adapterScale(l: Operand, sites: Operand): void {
-    const [lid] = materialize(l);
-    const [sid] = materialize(sites);
-    const name = internName('lora');
-    emit(Op.sinkCall(name, [lid, sid]), []);
-    recordSink('lora');
+  /** Attach an adapter bundle: one u32 channel holding a safetensors file's bytes; the engine fills each bank the file names. */
+  adapter(bundle: Operand): void {
+    const [bid] = materialize(bundle);
+    const name = internName('adapter');
+    emit(Op.sinkCall(name, [bid]), []);
+    recordSink('adapter');
   },
 };
 

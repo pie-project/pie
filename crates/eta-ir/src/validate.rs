@@ -451,7 +451,7 @@ fn check_second_party_names(
                     let n = resolve_name(container, *name);
                     let served = match n {
                         "attn_page_mask" => caps.attn_page_mask,
-                        "lora" => caps.lora,
+                        "adapter" => caps.lora,
                         _ => true,
                     };
                     if !served || !KNOWN_SINKS.contains(&n) {

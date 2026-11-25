@@ -32,9 +32,7 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
                 };
                 mask.dims.len() == 1 && stage.normalized.stage == Stage::Prologue
             }
-            "lora" => {
-                (args.len() == 3 || args.len() == 2) && stage.normalized.stage == Stage::Prologue
-            }
+            "adapter" => args.len() == 1 && stage.normalized.stage == Stage::Prologue,
             _ => false,
         };
     }

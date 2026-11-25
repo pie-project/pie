@@ -142,7 +142,7 @@ fn validate_every_case() {
     geometry_ports_are_optional();
     spsc_second_producer_rejected();
     sink_precedence_t11();
-    lora_honour_gate_and_placement();
+    adapter_honours_gate_and_placement();
     name_table_must_be_strictly_sorted_and_unique();
 }
 
@@ -173,7 +173,7 @@ fn spsc_second_producer_rejected() {
 
 fn sink_precedence_t11() {
     let mk = |stage: Stage| TraceContainer {
-        names: vec!["lora".to_string()],
+        names: vec!["adapter".to_string()],
         channels: vec![chan(Shape::vector(4), Dtype::F32, HostRole::None, true)],
         ports: vec![],
         stages: vec![StageProgram {
@@ -240,34 +240,18 @@ fn sink_precedence_t11() {
     ));
 }
 
-fn lora_honour_gate_and_placement() {
+fn adapter_honours_gate_and_placement() {
     let mk = |stage: Stage| TraceContainer {
-        names: vec!["lora".to_string()],
-        channels: vec![
-            chan(
-                Shape::new(&[2, 2, 4]).unwrap(),
-                Dtype::F32,
-                HostRole::None,
-                true,
-            ),
-            chan(
-                Shape::new(&[2, 4, 2]).unwrap(),
-                Dtype::F32,
-                HostRole::None,
-                true,
-            ),
-            chan(Shape::vector(4), Dtype::U32, HostRole::None, true),
-        ],
+        names: vec!["adapter".to_string()],
+        channels: vec![chan(Shape::vector(4), Dtype::U32, HostRole::None, true)],
         ports: vec![],
         stages: vec![StageProgram {
             stage,
             ops: vec![
                 Op::ChanRead(0),
-                Op::ChanRead(1),
-                Op::ChanRead(2),
                 Op::SinkCall {
                     name: 0,
-                    args: vec![0, 1, 2],
+                    args: vec![0],
                 },
             ],
         }],
@@ -281,7 +265,7 @@ fn lora_honour_gate_and_placement() {
     };
     assert!(matches!(
         served(mk(Stage::Prologue), no_lora),
-        Err(ValidateError::KernelUnavailable { name, .. }) if name == "lora"
+        Err(ValidateError::KernelUnavailable { name, .. }) if name == "adapter"
     ));
     assert!(matches!(
         served(mk(Stage::Epilogue), EVERY),

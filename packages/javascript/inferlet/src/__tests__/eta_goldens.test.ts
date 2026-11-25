@@ -308,17 +308,14 @@ describe('eta goldens', () => {
   it('sinks', () => {
     const tok = chFrom([1], dtype.i32);
     const ind = chFrom([0, 1], dtype.u32);
-    const a = chNew([2, 4, 8], dtype.f32);
-    const bch = chNew([2, 8, 4], dtype.f32);
+    const bundle = chFrom([0, 0, 0, 0], dtype.u32);
     const out = chNew([1], dtype.i32);
-    hostPut(a, new Array(64).fill(0.0), dtype.f32);
-    hostPut(bch, new Array(64).fill(0.0), dtype.f32);
     const b = new Builder(VOCAB, PAGE);
     b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
     b.bindPort(Port.EMBED_INDPTR, ind);
     b.stage(Stage.PROLOGUE, () => {
-      intrinsics.kernel.lora(a.read(), bch.read(), Tensor.constant(1 | 4, Dtype.U32));
+      intrinsics.kernel.adapter(bundle.read());
       intrinsics.kernel.attnPageMask(iota(4));
     });
     b.stage(Stage.EPILOGUE, () => {

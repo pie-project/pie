@@ -14,6 +14,9 @@ use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::pie::inferlet::working_set as wit_ws;
 
+mod bundle;
+
+pub use bundle::Adapter;
 pub use eta_dsl::intrinsics;
 
 pub use eta_dsl::Dtype;
@@ -495,75 +498,6 @@ impl StateGeometry<'_> {
 
 type StageClosure = Box<dyn Fn()>;
 
-pub mod adapter {
-    use super::Channel;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Site {
-        Q,
-        K,
-        V,
-        O,
-        GateUp,
-        Down,
-    }
-
-    impl Site {
-        pub fn bit(self) -> u32 {
-            match self {
-                Site::Q => 1 << 0,
-                Site::K => 1 << 1,
-                Site::V => 1 << 2,
-                Site::O => 1 << 3,
-                Site::GateUp => 1 << 4,
-                Site::Down => 1 << 5,
-            }
-        }
-    }
-
-    pub struct Expr {
-        pub(crate) kind: ExprKind,
-    }
-
-    pub(crate) enum ExprKind {
-        X,
-        Y,
-        Mm(Channel, Box<Expr>),
-        Add(Box<Expr>, Box<Expr>),
-        Scale(Channel, Box<Expr>),
-    }
-
-    impl Expr {
-        pub(crate) fn x() -> Self {
-            Expr { kind: ExprKind::X }
-        }
-        pub(crate) fn y() -> Self {
-            Expr { kind: ExprKind::Y }
-        }
-    }
-
-    pub fn mm(w: &Channel, e: Expr) -> Expr {
-        Expr {
-            kind: ExprKind::Mm(*w, Box::new(e)),
-        }
-    }
-
-    pub fn scale(e: Expr, l: &Channel) -> Expr {
-        Expr {
-            kind: ExprKind::Scale(*l, Box::new(e)),
-        }
-    }
-
-    impl std::ops::Add for Expr {
-        type Output = Expr;
-        fn add(self, rhs: Expr) -> Expr {
-            Expr {
-                kind: ExprKind::Add(Box::new(self), Box::new(rhs)),
-            }
-        }
-    }
-}
-
 /// A forward pass: its lanes' bindings and switches, and the program its fires run.
 pub struct ForwardPass {
     wit: wit_forward::ForwardPass,
@@ -578,8 +512,8 @@ struct ForwardInner {
     lanes: Vec<Rc<wit_ws::WorkingSet>>,
     fold_all: Option<Channel>,
     program_attached: bool,
-    adapter_lowrank_sites: u32,
-    adapter_scale_sites: u32,
+    /// Whether an [`Adapter`] is attached; a pass carries at most one.
+    adapted: bool,
     inputs: Vec<(u32, String, DslChannel)>,
     switches: Vec<(u32, String, String)>,
     bound: Vec<u64>,
@@ -615,8 +549,7 @@ impl ForwardPass {
                 lanes: Vec::new(),
                 fold_all: None,
                 program_attached: false,
-                adapter_lowrank_sites: 0,
-                adapter_scale_sites: 0,
+                adapted: false,
                 inputs: Vec::new(),
                 switches: Vec::new(),
                 bound: Vec::new(),
@@ -788,95 +721,20 @@ impl ForwardPass {
         self.wit.media(lane, spans)
     }
 
-    pub fn adapter(
-        &self,
-        site: adapter::Site,
-        f: impl FnOnce(adapter::Expr, adapter::Expr) -> adapter::Expr,
-    ) -> Result<(), String> {
-        use adapter::ExprKind as K;
-        let expr = f(adapter::Expr::x(), adapter::Expr::y());
-        if let K::Scale(l, inner) = &expr.kind
-            && let K::Add(lhs, rhs) = &inner.kind
-        {
-            let delta = match (&lhs.kind, &rhs.kind) {
-                (K::Y, _) => &rhs.kind,
-                (_, K::Y) => &lhs.kind,
-                _ => &inner.kind,
-            };
-            if let K::Mm(b, mid) = delta
-                && let K::Mm(a, x) = &mid.kind
-                && matches!(x.kind, K::X)
-            {
-                let (a, b, l) = (*a, *b, *l);
-                {
-                    let mut st = self.inner.borrow_mut();
-                    if (st.adapter_lowrank_sites | st.adapter_scale_sites) & site.bit() != 0 {
-                        return Err(format!(
-                            "adapter: site {site:?} already carries an \
-                                         adapter on this pass"
-                        ));
-                    }
-                    st.adapter_lowrank_sites |= site.bit();
-                    st.adapter_scale_sites |= site.bit();
-                }
-                self.prologue(move || {
-                    intrinsics::kernel::lora(a.read(), b.read(), Tensor::constant(site.bit()));
-                    intrinsics::kernel::adapter_scale(l.read(), Tensor::constant(site.bit()));
-                });
-                return Ok(());
-            }
-        }
-        if let K::Scale(l, inner) = &expr.kind
-            && matches!(inner.kind, K::Y)
-        {
-            let l = *l;
-            {
-                let mut inner_state = self.inner.borrow_mut();
-                if inner_state.adapter_scale_sites & site.bit() != 0 {
-                    return Err(format!(
-                        "adapter: site {site:?} already carries a scale on \
-                             this pass"
-                    ));
-                }
-                inner_state.adapter_scale_sites |= site.bit();
-            }
-            self.prologue(move || {
-                intrinsics::kernel::adapter_scale(l.read(), Tensor::constant(site.bit()));
-            });
-            return Ok(());
-        }
-        let (lhs, rhs) = match expr.kind {
-            K::Add(l, r) => (*l, *r),
-            _ => {
-                return Err("adapter: form not lowerable (v0 lowers the low-rank \
-                     form `y + mm(b, mm(a, x))` only)"
-                    .to_string());
-            }
-        };
-        let delta = match (&lhs.kind, &rhs.kind) {
-            (K::Y, _) => rhs.kind,
-            (_, K::Y) => lhs.kind,
-            _ => return Err("adapter: the base output `y` must be one addend".to_string()),
-        };
-        let (b, a) = match delta {
-            K::Mm(b, inner) => match inner.kind {
-                K::Mm(a, x) if matches!(x.kind, K::X) => (b, a),
-                _ => return Err("adapter: the delta must be mm(b, mm(a, x))".to_string()),
-            },
-            _ => return Err("adapter: the delta must be mm(b, mm(a, x))".to_string()),
-        };
+    /// Attaches `adapter` to this pass's rows. The engine fills every bank
+    /// the bundle names and zero-fills the rest, so the pass never says
+    /// where or how the adapter attaches. The bundle's sink is the pass's
+    /// prologue.
+    pub fn adapter(&self, adapter: &Adapter) -> Result<(), String> {
         {
             let mut inner = self.inner.borrow_mut();
-            if inner.adapter_lowrank_sites & site.bit() != 0 {
-                return Err(format!(
-                    "adapter: site {site:?} already carries an adapter on this pass"
-                ));
+            if inner.adapted {
+                return Err("adapter: this pass already carries an adapter".to_string());
             }
-            inner.adapter_lowrank_sites |= site.bit();
+            inner.adapted = true;
         }
-        self.prologue(move || {
-            intrinsics::kernel::lora(a.read(), b.read(), Tensor::constant(site.bit()));
-        });
+        let bundle = adapter.bundle;
+        self.prologue(move || intrinsics::kernel::adapter(bundle.read()));
         Ok(())
     }
 

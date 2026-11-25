@@ -74,21 +74,11 @@ class kernel:  # noqa: N801 — spelled like `intrinsics::kernel::*`.
         record_sink("attn_page_mask")
 
     @staticmethod
-    def lora(a, b, sites) -> None:
-        """Pass-wide sink: apply the low-rank delta `B(Ax)` at `sites`.
-        Legal only in the prologue."""
-        aid, _ = materialize(a)
-        bid, _ = materialize(b)
-        sid, _ = materialize(sites)
-        name = intern_name("lora")
-        emit(Op.sink_call(name, [aid, bid, sid]), ())
-        record_sink("lora")
-
-    @staticmethod
-    def adapter_scale(l, sites) -> None:  # noqa: E741
-        """The scale form of the adapter sink (IA3): `y = l ⊙ y` at `sites`."""
-        lid, _ = materialize(l)
-        sid, _ = materialize(sites)
-        name = intern_name("lora")
-        emit(Op.sink_call(name, [lid, sid]), ())
-        record_sink("lora")
+    def adapter(bundle) -> None:
+        """Pass-wide sink: attach an adapter bundle, one u32 channel holding
+        a safetensors file's bytes; the engine fills each bank the file
+        names. Legal only in the prologue."""
+        bid, _ = materialize(bundle)
+        name = intern_name("adapter")
+        emit(Op.sink_call(name, [bid]), ())
+        record_sink("adapter")

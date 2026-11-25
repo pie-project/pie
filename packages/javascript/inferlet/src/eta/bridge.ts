@@ -482,8 +482,6 @@ function laneOutputs(switches: [string, string][]): OutputDecl[] {
 // ForwardPass
 // ---------------------------------------------------------------------------
 
-const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16, down: 32 };
-
 /**
  * The forward-pass builder over `pie:inferlet/forward`.
  */
@@ -495,8 +493,8 @@ export class ForwardPass {
   private readonly vocab: number;
   private readonly pageSize: number;
   private programAttached = false;
-  private adapterLowrankSites = 0;
-  private adapterScaleSites = 0;
+  /** Whether an `Adapter` is attached; a pass carries at most one. */
+  private adapted = false;
   /** Keeps the bound working sets alive while the pass is bound. */
   private lanes: WorkingSet[] = [];
   private foldAll: Channel | undefined;
@@ -608,49 +606,16 @@ export class ForwardPass {
     this.ports.push([Port.ATTN_MASK, rows]);
   }
 
-  /** Attach a PEFT adapter at `site` ("q"|"k"|"v"|"o"|"gate_up"|"down"). */
-  adapter(site: string, f: (x: AdapterExpr, y: AdapterExpr) => AdapterExpr): void {
-    const bit = SITE_BITS[site];
-    if (bit === undefined) throw new InferletError(`adapter: unknown site ${site}`);
-    const expr = f(new AdapterExpr('x'), new AdapterExpr('y'));
-    const isLowrank = (e: AdapterExpr): [Channel, Channel] | null => {
-      if (e.kind !== 'add') return null;
-      const [lhs, rhs] = e.args as [AdapterExpr, AdapterExpr];
-      const delta = lhs.kind === 'y' ? rhs : rhs.kind === 'y' ? lhs : null;
-      if (!delta || delta.kind !== 'mm') return null;
-      const [b, mid] = delta.args as [Channel, AdapterExpr];
-      if (mid.kind !== 'mm') return null;
-      const [a, x] = mid.args as [Channel, AdapterExpr];
-      if (x.kind !== 'x') return null;
-      return [a, b];
-    };
-    if (expr.kind === 'scale') {
-      const [l, inner] = expr.args as [Channel, AdapterExpr];
-      const lr = isLowrank(inner);
-      if (lr) {
-        const [a, b] = lr;
-        if ((this.adapterLowrankSites | this.adapterScaleSites) & bit) throw new InferletError(`adapter: site ${site} already carries an adapter on this pass`);
-        this.adapterLowrankSites |= bit;
-        this.adapterScaleSites |= bit;
-        this.prologue(() => {
-          kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32));
-          kernel.adapterScale(l.read(), Tensor.constant(bit, Dtype.U32));
-        });
-        return;
-      }
-      if (inner.kind === 'y') {
-        if (this.adapterScaleSites & bit) throw new InferletError(`adapter: site ${site} already carries a scale on this pass`);
-        this.adapterScaleSites |= bit;
-        this.prologue(() => kernel.adapterScale(l.read(), Tensor.constant(bit, Dtype.U32)));
-        return;
-      }
-    }
-    const lr = isLowrank(expr);
-    if (!lr) throw new InferletError('adapter: form not lowerable (v0 lowers `y + mm(b, mm(a, x))`, `scale(y, l)`)');
-    const [a, b] = lr;
-    if (this.adapterLowrankSites & bit) throw new InferletError(`adapter: site ${site} already carries an adapter on this pass`);
-    this.adapterLowrankSites |= bit;
-    this.prologue(() => kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32)));
+  /**
+   * Attach `adapter` to this pass's rows. The engine fills every bank the
+   * bundle names and zero-fills the rest, so the pass never says where or
+   * how the adapter attaches. The bundle's sink is the pass's prologue.
+   */
+  adapter(adapter: Adapter): void {
+    if (this.adapted) throw new InferletError('adapter: this pass already carries an adapter');
+    this.adapted = true;
+    const bundle = adapter.bundle;
+    this.prologue(() => kernel.adapter(bundle.read()));
   }
 
   private setStage(stage: Stage, body: () => void): void {
@@ -709,27 +674,54 @@ export class ForwardPass {
   }
 }
 
-export class AdapterExpr {
-  readonly args: unknown[];
-  constructor(
-    readonly kind: string,
-    ...args: unknown[]
-  ) {
-    this.args = args;
-  }
-  add(other: AdapterExpr): AdapterExpr {
-    return new AdapterExpr('add', this, other);
+/**
+ * A trained adapter, ready to attach to forward passes with
+ * `ForwardPass.adapter`. Passes that attach the same bytes share one engine
+ * slot.
+ */
+export class Adapter {
+  private constructor(readonly bundle: Channel) {}
+
+  /**
+   * Checks that `bytes` is a safetensors file whose tensors are F32, BF16 or
+   * F16 and lie inside it, then packs it, zero-padded to 4, into one u32
+   * channel.
+   */
+  static fromBundle(bytes: Uint8Array): Adapter {
+    checkBundle(bytes);
+    const padded = new Uint8Array(Math.ceil(bytes.length / 4) * 4);
+    padded.set(bytes);
+    return new Adapter(Channel.from(padded, Dtype.U32));
   }
 }
 
-/** `mm(w, e)` — multiply by the channel-borne weight. */
-export function mm(w: Channel, e: AdapterExpr): AdapterExpr {
-  return new AdapterExpr('mm', w, e);
-}
-
-/** `scale(e, l)` — elementwise multiply by the channel-borne vector. */
-export function scale(e: AdapterExpr, l: Channel): AdapterExpr {
-  return new AdapterExpr('scale', l, e);
+/** Refuses bytes that are not a safetensors file of F32, BF16 or F16 tensors, naming the tensor at fault. */
+function checkBundle(bytes: Uint8Array): void {
+  if (bytes.length < 8) throw new InferletError('adapter bundle: shorter than a safetensors header');
+  const end = 8 + Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, true));
+  if (end > bytes.length) throw new InferletError('adapter bundle: its header runs past the file');
+  let header: unknown;
+  try {
+    header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, end)));
+  } catch (e) {
+    throw new InferletError(`adapter bundle: its header is not JSON: ${e}`);
+  }
+  if (typeof header !== 'object' || header === null || Array.isArray(header)) {
+    throw new InferletError('adapter bundle: its header is not a JSON object');
+  }
+  const size = bytes.length - end;
+  for (const [name, tensor] of Object.entries(header as Record<string, { dtype?: string; shape?: number[]; data_offsets?: number[] }>)) {
+    if (name === '__metadata__') continue;
+    const width = ({ F32: 4, BF16: 2, F16: 2 } as Record<string, number>)[tensor.dtype ?? ''];
+    if (width === undefined) {
+      throw new InferletError(`adapter bundle: tensor \`${name}\` is ${tensor.dtype}; a bank is F32, BF16 or F16`);
+    }
+    const count = (tensor.shape ?? []).reduce((a, b) => a * b, 1);
+    const [begin, stop] = tensor.data_offsets ?? [];
+    if (!(Number.isInteger(begin) && Number.isInteger(stop) && 0 <= begin && begin <= stop && stop <= size && stop - begin === count * width)) {
+      throw new InferletError(`adapter bundle: tensor \`${name}\` spans bytes ${begin}..${stop} of ${size} for ${count} elements of ${width} bytes`);
+    }
+  }
 }
 
 /** Submit ONE FRAME on `on`: up to `frameSize()` slots. */

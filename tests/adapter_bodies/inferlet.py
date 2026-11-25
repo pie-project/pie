@@ -1,12 +1,9 @@
 from inferlet import eta as E
 from inferlet import model as M
+from inferlet import session as S
 
 
-def plane(n, salt, scale):
-    return [((i + salt) * 2654435761 % 1000 - 500) * scale for i in range(n)]
-
-
-async def read(pipe, sets, seqs, lora):
+async def read(pipe, sets, seqs, adapter):
     toks, indptr, readout = [], [0], []
     for s in seqs:
         toks += s
@@ -17,9 +14,8 @@ async def read(pipe, sets, seqs, lora):
     fwd.embed(E.Channel.from_(toks, E.dtype.i32), E.Channel.from_(indptr, E.dtype.u32))
     fwd.state(list(sets), E.StateGeometry.folding())
     fwd.readout(E.Channel.from_(readout, E.dtype.u32))
-    if lora:
-        a, b = lora
-        fwd.adapter("o", lambda x, y: y + E.mm(b, E.mm(a, x)))
+    if adapter:
+        fwd.adapter(adapter)
     tok_out, lp_out = E.Channel([k], E.dtype.i32), E.Channel([k], E.dtype.f32)
 
     def body():
@@ -34,19 +30,14 @@ async def read(pipe, sets, seqs, lora):
 
 
 async def main(inp):
-    layers, rank, hidden, scale = inp["layers"], inp["rank"], inp["hidden"], inp["scale"]
-    lora = None
-    if inp["adapter"]:
-        n = layers * rank * hidden
-        lora = (E.Channel.from_shaped([layers, rank, hidden], plane(n, 0, scale), E.dtype.f32),
-                E.Channel.from_shaped([layers, hidden, rank], plane(n, n, scale), E.dtype.f32))
+    adapter = E.Adapter.from_bundle(S.file("adapter.safetensors")) if inp["adapter"] else None
     pipe = E.Pipeline()
     sets = [E.WorkingSet() for _ in inp["prompts"]]
     toks, lps = [[] for _ in sets], [[] for _ in sets]
-    t, lp = await read(pipe, sets, inp["prompts"], lora)
+    t, lp = await read(pipe, sets, inp["prompts"], adapter)
     for _ in range(inp["decode"]):
         for i in range(len(sets)):
             toks[i].append(t[i]), lps[i].append(lp[i])
-        t, lp = await read(pipe, sets, [[x] for x in t], lora)
+        t, lp = await read(pipe, sets, [[x] for x in t], adapter)
     pipe.close()
     return {"tokens": toks, "logprobs": lps}
