@@ -1165,8 +1165,8 @@ impl FireCtx<'_> {
 
     /// What kernels-rocm did on this thread across a serving fire, counted
     /// as the fire's: a code object built or loaded is Compiled (once a
-    /// fire, with a body it captured as it served), a faster route that
-    /// declined is Fallback, and a code object refused is Refused when the
+    /// fire, with a body it captured as it served), and a code object
+    /// refused is Refused when the
     /// fire still served (a fire that failed is counted where its frame is
     /// refused).
     #[cfg(feature = "rocm")]
@@ -1175,9 +1175,6 @@ impl FireCtx<'_> {
         let after = kernels_rocm::tally::counts();
         if after.built > before.built && self.live.tallied(Tally::Compiled) == compiled_before {
             self.live.tally(Tally::Compiled, 1);
-        }
-        if after.declined > before.declined {
-            self.live.tally(Tally::Fallback, 1);
         }
         if served && after.refused > before.refused {
             self.live.tally(Tally::Refused, 1);
