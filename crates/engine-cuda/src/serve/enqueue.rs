@@ -1093,12 +1093,16 @@ impl FireCtx<'_> {
                 fired
             } else {
                 self.cache.eager_walk(p.rs.body.buffers());
-                self.live.tally(engine::live::Tally::Unrecorded, 1);
-                self.cache.eager_unbodied(
-                    p.unbodied
-                        .as_deref()
-                        .unwrap_or("its composition is one a body does not carry"),
-                );
+                if p.stated_eager {
+                    self.live.tally(engine::live::Tally::Eager, 1);
+                } else {
+                    self.live.tally(engine::live::Tally::Unrecorded, 1);
+                    self.cache.eager_unbodied(
+                        p.unbodied
+                            .as_deref()
+                            .unwrap_or("its composition is one a body does not carry"),
+                    );
+                }
                 let mut cursor = Cursor::new(&place);
                 lay_gate(&run).and_then(|()| {
                     walk(

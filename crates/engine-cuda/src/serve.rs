@@ -149,10 +149,9 @@ pub struct Shell {
     staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
     adapter_fact: Option<u32>,
-    /// The adapter fact's bit where the load folds adapters into every
-    /// lane's class word (`exports::class_word`): it seats adapters and one
-    /// fact decides the correction.
-    adapter_fold: Option<u32>,
+    /// The classes only adapted requests land in (`exports::adapted_of`): a
+    /// fire with a lane of one is stated eager at load.
+    eager_classes: poem_ir::ClassSet,
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
@@ -956,12 +955,6 @@ impl Shell {
             .adapted_word(&self.corrected, bit, word)
     }
 
-    /// The word a lane of `word` is classed by (`exports::class_word`).
-    #[must_use]
-    pub(crate) fn class_word(&self, word: u64) -> u64 {
-        crate::exports::class_word(&self.compiled.classes, &self.corrected, self.adapter_fold, word)
-    }
-
     #[must_use]
     pub fn adapters(&self) -> &crate::blob::Adapters {
         &self.adapters
@@ -1629,6 +1622,8 @@ pub struct Prepared<'a> {
     bodied: bool,
     /// Why not, in a load that records bodies: the key and the reason.
     unbodied: Option<String>,
+    /// The load stated the fire eager: a lane of it is of an adapted class.
+    stated_eager: bool,
     admits: std::sync::Arc<[crate::window::Admit]>,
     /// The body's key as prepared: the fire records and replays under it.
     key: record::BodyKey,

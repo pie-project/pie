@@ -1,9 +1,7 @@
 #![cfg(feature = "device")]
-//! A lane's adapter is data, not a class: on a load that seats adapters
-//! every lane fires its class's correcting program, and a lane carrying no
-//! adapter routes -1, whose correction does no work. An adapted lane and a
-//! plain one share one fire and one body, each answers what it answers
-//! alone, and no serving fire walks uncaptured.
+//! A plain lane runs its class's plain body whether or not the load seats
+//! adapters; a fire with an adapted lane, alone or beside a plain one, walks
+//! eager, as the load states, and each lane answers what it answers alone.
 
 use std::path::Path;
 
@@ -170,7 +168,7 @@ fn worst(a: &[f32], b: &[f32]) -> (f32, f32) {
 }
 
 #[test]
-fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
+fn an_adapted_lane_beside_a_plain_one_answers_as_alone() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
         return;
@@ -231,10 +229,12 @@ fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
     shell.open(4).expect("a slot opens");
     let bare = fire(&mut shell, &[(4, &prompt(1), 0, None)]).swap_remove(0);
 
+    // Every fire with the adapter walks eager, counted as stated.
+    let mut adapted_fires = 2u64;
     for step in 0..STEPS {
         let held = PROMPT + step;
         let next: Vec<[u32; 1]> = (0..2).map(|lane| [tokens[lane][0]]).collect();
-        let before = shell.body_stats().tally.hits;
+        let hits = shell.body_stats().tally.hits;
         let batched = fire(
             &mut shell,
             &[
@@ -242,17 +242,15 @@ fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
                 (1, &next[1][..], held, adapter_of(1)),
             ],
         );
-        let key = shell
-            .replayed_body()
-            .expect("the mixed fire replays a body")
-            .to_string();
-        assert!(
-            shell.body_stats().tally.hits > before && key.contains(':'),
-            "step {step}: the mixed fire replayed no body keyed by its classes (last {key})"
-        );
+        adapted_fires += 1;
+        assert_eq!(shell.body_stats().tally.hits, hits, "step {step}: the mixed fire replayed a body");
         for lane in 0..2u32 {
             let token = [tokens[lane as usize][1]];
+            let hits = shell.body_stats().tally.hits;
             let alone = fire(&mut shell, &[(2 + lane, &token, held, adapter_of(lane))]).swap_remove(0);
+            let replayed = shell.body_stats().tally.hits > hits;
+            assert_eq!(replayed, lane == 0, "step {step}: the plain lane alone replays its body");
+            adapted_fires += u64::from(lane == 1);
             let (worst, span) = worst(&batched[lane as usize], &alone);
             eprintln!("step {step} lane {lane}: worst {worst} of a span {span}");
             assert!(
@@ -262,18 +260,35 @@ fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
             tokens[lane as usize] = [argmax(&batched[lane as usize]), argmax(&alone)];
         }
     }
-    let unrecorded = shell.tallied(Tally::Unrecorded);
-    eprintln!("census: {:?}; unrecorded {unrecorded}", shell.body_stats().tally);
-    assert_eq!(unrecorded, 0, "every serving fire replayed a body or was stated eager");
-    assert_eq!(shell.tallied(Tally::Compiled), 0, "no serving fire captured a body");
+
+    // Two lanes of one prompt, both adapted, answer as one does alone.
+    for slot in [5, 6, 7] {
+        shell.open(slot).expect("a slot opens");
+    }
+    let both = fire(
+        &mut shell,
+        &[(5, &prompt(1), 0, Some(adapter)), (6, &prompt(1), 0, Some(adapter))],
+    );
+    let alone = fire(&mut shell, &[(7, &prompt(1), 0, Some(adapter))]).swap_remove(0);
+    adapted_fires += 2;
+    for (at, lane) in both.iter().enumerate() {
+        let (worst, span) = worst(lane, &alone);
+        eprintln!("all adapted, lane {at}: worst {worst} of a span {span}");
+        assert!(worst <= span * 1e-2, "lane {at} ({worst} of {span})");
+    }
 
     // The adapter is read: the adapted lane's prompt without it answers
     // otherwise than with it.
-    shell.open(5).expect("a slot opens");
-    let with = fire(&mut shell, &[(5, &prompt(1), 0, Some(adapter))]).swap_remove(0);
+    let with = alone;
     let (moved, span) = worst(&with, &bare);
     eprintln!("the adapter moves the prompt's logits {moved} of a span {span}");
     assert!(moved > span * 5e-2, "the adapter moves the logits ({moved} of {span})");
+
+    eprintln!("census: {:?}", shell.body_stats().tally);
+    assert_eq!(shell.tallied(Tally::Eager), adapted_fires, "every adapted fire is stated eager");
+    assert_eq!(shell.tallied(Tally::Unrecorded), 0, "no fire walked unstated");
+    assert_eq!(shell.tallied(Tally::Compiled), 0, "no serving fire captured a body");
+    assert_eq!(shell.tallied(Tally::BuiltInFire), 0, "no fire built a kernel");
 }
 
 fn argmax(row: &[f32]) -> u32 {
