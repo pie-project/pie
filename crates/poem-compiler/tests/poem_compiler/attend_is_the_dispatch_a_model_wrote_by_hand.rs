@@ -33,7 +33,7 @@ def forward(m, inputs):
         o = attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w, adapt)
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        return swiglu(x, w, adapt = adapt, residual = y)
+        return ops.elemwise.residual_add(swiglu(x, w, adapt = adapt), y)
 
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)

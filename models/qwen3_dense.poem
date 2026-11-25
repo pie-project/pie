@@ -276,7 +276,7 @@ def forward(m, inputs):
         o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head", adapt = adapt)
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        y = swiglu(x, w, adapt = adapt, residual = y)
+        y = ops.elemwise.residual_add(swiglu(x, w, adapt = adapt), y)
         return (y, tap(m.mtp, l, y, fused))
 
     y, fused = inputs.fold_layers(m.layers, (y, None), block)

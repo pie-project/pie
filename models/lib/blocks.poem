@@ -39,10 +39,9 @@ def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_
     out = ops.linear.matmul(o, w.o)
     return out if adapt == None else adapt.correct("o", o, out)
 
-def swiglu(x, w, adapt = None, residual = None):
-    """The SwiGLU MLP through `w.gate`, `w.up` and `w.down`, added to
-    `residual` when one is given. `adapt` corrects gate, up and down on the
-    rows that carry an adapter."""
+def swiglu(x, w, adapt = None):
+    """The SwiGLU MLP through `w.gate`, `w.up` and `w.down`. `adapt`
+    corrects gate, up and down on the rows that carry an adapter."""
 
     def mlp(x, correct):
         gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
@@ -52,9 +51,7 @@ def swiglu(x, w, adapt = None, residual = None):
         y = ops.linear.matmul(h, w.down)
         if correct != None:
             y = correct("down", h, y)
-        if residual == None:
-            return y
-        return ops.elemwise.residual_add(y, residual)
+        return y
 
     return branched(x, mlp, adapt)
 
