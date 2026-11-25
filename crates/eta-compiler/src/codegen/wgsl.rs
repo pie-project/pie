@@ -1097,6 +1097,46 @@ mod stepwise_tests {
         );
     }
 
+    /// The runtime's temporaries are what [`super::temporary_bytes`] states
+    /// of them: a sort's, top-k's or pivot's two buffers of two words an
+    /// element of the value it runs over, a reduction's two buffers of two
+    /// words a 32-element group of a row, and a pivot's select state below
+    /// the area ([`super::selects`]).
+    #[test]
+    fn the_runtimes_temporaries_lie_within_what_each_node_states() {
+        use super::{selects, temporary_bytes};
+        for tag in [tags::SORT_DESC, tags::TOP_K, tags::PIVOT_THRESHOLD] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 151_936 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 151_936 * 16);
+        }
+        for tag in [tags::REDUCE_SUM, tags::REDUCE_MAX, tags::REDUCE_MIN, tags::REDUCE_ARGMAX] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
+        }
+        // A draw's first level folds 8 lanes a job.
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 151_936, 1), 18_992 * 16);
+        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4), 4 * 18_992 * 16);
+        assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
+        assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
+        assert!(selects(tags::PIVOT_THRESHOLD) && selects(tags::TOP_K));
+        assert!(!selects(tags::SORT_DESC) && !selects(tags::REDUCE_ARGMAX));
+        for cell in [
+            "return tmp_base + ((buf * n) + c) * 2u;",
+            "return tmp_base + (buf * span + row * stride + c) * 2u;",
+            "fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }",
+            "fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }",
+            "fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }",
+            "fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }",
+            "fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }",
+        ] {
+            assert!(RUNTIME.contains(cell), "the runtime no longer lays `{cell}`");
+        }
+        let named = RUNTIME.matches("tmp_base +").count() + RUNTIME.matches("tmp_base -").count();
+        assert_eq!(named, 7, "a temporary cell this statement has not read");
+        assert!(RUNTIME.contains(&alloc::format!("const SEL_WORDS : u32 = {}u;", super::SELECT_WORDS)));
+    }
+
     fn a_stepwise_entry_point_strides_by_the_whole_grid() {
         let stage = plan(
             vec![op(tags::IOTA, 0, &[])],
@@ -1346,5 +1386,36 @@ mod select_tests {
         // State, a histogram per workgroup, a tally pair per workgroup, and
         // the candidates' keys and indices.
         assert_eq!(SELECT_WORDS, 16 + 32 * 256 + 32 * 2 + 1024 * 2);
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::RUNTIME;
+
+    /// The WGSL `step_jobs` mirrors, line for line: where the runtime's
+    /// loop bounds or fans change, this fails, and `step_jobs` follows.
+    #[test]
+    fn the_job_counts_mirror_the_runtime() {
+        for line in [
+            "fn red_fan0(kind : u32) -> u32 { return select(32u, 8u, kind == RED_GUMBEL); }",
+            "    let fan = select(32u, red_fan0(kind), l == 0u);",
+            "    n = (n + fan - 1u) / fan;",
+            "  let n_in = red_n_in(len, kind, level);",
+            "  if (n_in <= 1u) { return; }",
+            "  let fan = select(32u, red_fan0(kind), level == 0u);",
+            "  let n_out = (n_in + fan - 1u) / fan;",
+            "  let total = rows * n_out;",
+            "  for (var job : u32 = tid; job < total; job = job + lanes) {",
+            "  for (var row : u32 = tid; row < rows; row = row + lanes) {",
+            "  let len = d_len(a) / max(rows, 1u);",
+            "  if (rank < 2u) { return 1u; }",
+            "  for (var k : u32 = 0u; k + 1u < rank; k = k + 1u) { n = n * d_dim(v, k); }",
+        ] {
+            assert!(
+                RUNTIME.lines().any(|have| have == line),
+                "the runtime no longer reads `{line}`: step_jobs mirrors it"
+            );
+        }
     }
 }

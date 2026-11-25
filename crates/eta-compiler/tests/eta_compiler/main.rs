@@ -7,7 +7,9 @@ mod msl_mutations;
 #[path = "common/traces.rs"]
 mod traces;
 
+mod a_streamed_step_publishes_the_nodes_it_stores;
 mod a_whole_read_is_one_view_of_its_region;
+mod an_integer_scatter_add_runs_on_every_thread;
 mod bf16_emits_two_byte_storage;
 mod cuda_region_rejection;
 mod emitted_source_shape;
