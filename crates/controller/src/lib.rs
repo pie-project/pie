@@ -202,6 +202,7 @@ impl ControllerHandle {
             && report.disk_added.is_empty()
             && report.disk_removed.is_empty()
             && report.disk_tier.is_none()
+            && report.off_device.is_none()
             && report.link.is_none();
         self.directory.report_state(worker, report);
         if !quiet {
@@ -567,6 +568,22 @@ mod tests {
                 .await
                 .is_err(),
             "a quiet report publishes nothing"
+        );
+        // A copy that moved off the device is a change of its own.
+        handle.report_state(
+            WorkerId(4),
+            StateReport {
+                off_device: Some(vec![([1; 32], controller_api::OffDevice::Host)]),
+                ..StateReport::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(2), views.changed())
+            .await
+            .expect("published")
+            .unwrap();
+        assert_eq!(
+            views.borrow_and_update().groups[0].1.site_tiers,
+            [(WorkerId(4), controller_api::OffDevice::Host)]
         );
         handle.forget_state(WorkerId(4));
         tokio::time::timeout(Duration::from_secs(2), views.changed())

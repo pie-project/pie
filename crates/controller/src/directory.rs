@@ -258,6 +258,7 @@ impl Directory {
         inner.pools.remove(&worker);
         inner.disk.remove(&worker);
         inner.disk_tiers.remove(&worker);
+        inner.off.remove(&worker);
     }
 
     pub fn pools(&self) -> Vec<WorkerId> {
@@ -525,7 +526,27 @@ mod tests {
 
         directory.report_state(WorkerId(3), StateReport::default());
         assert_eq!(directory.view(5), view, "a quiet report");
+        let off = |directory: &Directory| directory.view(5).groups[0].1.site_tiers.len();
+        directory.report_state(
+            WorkerId(3),
+            StateReport {
+                off_device: Some(vec![(key(1), OffDevice::Host)]),
+                ..StateReport::default()
+            },
+        );
+        assert_eq!(off(&directory), 1);
         directory.forget(WorkerId(3));
         assert!(directory.view(6).groups.is_empty());
+        // Back, it has said nothing is off its device.
+        directory.report_state(
+            WorkerId(3),
+            StateReport {
+                added: run.clone(),
+                full: true,
+                runs_added: vec![run],
+                ..StateReport::default()
+            },
+        );
+        assert_eq!(off(&directory), 0);
     }
 }
