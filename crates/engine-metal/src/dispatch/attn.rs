@@ -6,13 +6,14 @@ use crate::run::{Run, StructSlot};
 
 impl DispatchAttn for Run<'_> {
     fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
-        self.attention(op).map_err(crate::error::kernel)
+        let ran = self.attention(op);
+        self.settled(ran).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn requests(&self) -> u32 {
-        u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
+    fn requests(&self) -> crate::run::Ran<u32> {
+        Ok(u32::try_from(self.qo_indptr_host()?.len().saturating_sub(1)).unwrap_or(u32::MAX))
     }
 
     /// The fire's capturing lanes' rows: a score op runs only in a fire one
@@ -41,9 +42,9 @@ impl Run<'_> {
                 let seat = self.capture_seat()?;
                 attn::score::capture(
                     self.ctx(),
-                    self.ragged(*q),
-                    &self.prefill_plan_over(*plan, *cache),
-                    self.pool(*cache),
+                    self.ragged(*q)?,
+                    &self.prefill_plan_over(*plan, *cache)?,
+                    self.pool(*cache)?,
                     *head_dim,
                     *kv_heads,
                     *sm_scale,
@@ -51,10 +52,10 @@ impl Run<'_> {
                     seat.keys,
                     *q_heads,
                     into.is_none(),
-                    self.requests(),
+                    self.requests()?,
                     attn::score::CaptureRows {
                         rows: seat.keys_at,
-                        first: self.window().span.lane_offset,
+                        first: self.window()?.span.lane_offset,
                     },
                 )
             }
@@ -64,10 +65,10 @@ impl Run<'_> {
                     self.ctx(),
                     seat.keys_at,
                     seat.pages_at,
-                    self.window().span.lane_offset,
+                    self.window()?.span.lane_offset,
                     seat.keys,
                     seat.page_size,
-                    self.requests(),
+                    self.requests()?,
                 )
             }
             Attn::Voxel {
@@ -80,17 +81,17 @@ impl Run<'_> {
                 o,
             } => attn::voxel::attention(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*v)?,
+                self.tensor(*grid)?,
                 match segment {
                     poem_ir::VoxelSegment::Clip => attn::voxel::Segment::Clip,
                     poem_ir::VoxelSegment::Frames(n) => attn::voxel::Segment::Frames(*n),
                 },
                 *sm_scale,
-                self.tensor(*o),
-                self.grid_base(*grid, *q),
+                self.tensor(*o)?,
+                self.grid_base(*grid, *q)?,
             ),
             Attn::PlanDecode {
                 kv_indptr: _,
@@ -103,7 +104,7 @@ impl Run<'_> {
                 window: _,
                 plan,
             } => {
-                match self.declared(*plan) {
+                match self.declared(*plan)? {
                     StructKind::AttnDecodePlan => {}
                     other => {
                         return Err(kernels_metal::Error::Backend {
@@ -114,16 +115,16 @@ impl Run<'_> {
                         });
                     }
                 }
-                let kv_len = self.tensor(*kv_len);
+                let kv_len = self.tensor(*kv_len)?;
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
                 let built = attn::plan_decode(
                     self.ctx(),
                     kv_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
+                    self.cut_rows(positions)?,
+                    self.cut_rows(t.request_of_token)?,
+                    self.cut_rows(t.mask)?,
+                    self.cut_rows(t.mask_enabled)?,
                     t.mask_stride,
                 )?;
                 self.put(*plan, StructSlot::Decode(built));
@@ -140,7 +141,7 @@ impl Run<'_> {
                 window: _,
                 plan,
             } => {
-                match self.declared(*plan) {
+                match self.declared(*plan)? {
                     StructKind::AttnPrefillPlan => {}
                     other => {
                         return Err(kernels_metal::Error::Backend {
@@ -151,16 +152,16 @@ impl Run<'_> {
                         });
                     }
                 }
-                let last_page_len = self.tensor(*last_page_len);
+                let last_page_len = self.tensor(*last_page_len)?;
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
                 let built = attn::plan_prefill(
                     self.ctx(),
                     last_page_len,
-                    self.cut_rows(positions),
-                    self.cut_rows(t.request_of_token),
-                    self.cut_rows(t.mask),
-                    self.cut_rows(t.mask_enabled),
+                    self.cut_rows(positions)?,
+                    self.cut_rows(t.request_of_token)?,
+                    self.cut_rows(t.mask)?,
+                    self.cut_rows(t.mask_enabled)?,
                     t.mask_stride,
                 )?;
                 self.put(*plan, StructSlot::Prefill(built));
@@ -186,19 +187,19 @@ impl Run<'_> {
             } => attn::arbiter::decode_with_scratch(
                 self.ctx(),
                 self.tuning(),
-                self.tensor(*q),
+                self.tensor(*q)?,
                 &if self.reads_out(*q) {
-                    self.readout_plan(*plan)
+                    self.readout_plan(*plan)?
                 } else {
-                    *self.decode_plan(*plan)
+                    *self.decode_plan(*plan)?
                 },
-                self.pool(*cache),
+                self.pool(*cache)?,
                 *window,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.requests(),
-                &|rows, width| self.partials(rows, width),
+                self.tensor(*o)?,
+                self.requests()?,
+                &|rows, width| self.partials_for(rows, width),
             ),
             Attn::Prefill {
                 q,
@@ -219,17 +220,17 @@ impl Run<'_> {
                 lse: None,
             } => attn::arbiter::prefill_with_scratch(
                 self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.pool(*cache),
+                self.ragged(*q)?,
+                self.prefill_plan(*plan)?,
+                self.pool(*cache)?,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
-                self.tensor(*o),
-                self.requests(),
+                self.tensor(*o)?,
+                self.requests()?,
                 self.tuning(),
-                &|rows, width| self.partials(rows, width),
+                &|rows, width| self.partials_for(rows, width),
             ),
             Attn::ReplayFloor {
                 positions,
@@ -238,10 +239,10 @@ impl Run<'_> {
                 floor,
             } => attn::pool::replay_floor(
                 self.ctx(),
-                self.ragged(*positions),
-                &self.recurrent(*state),
+                self.ragged(*positions)?,
+                &self.recurrent(*state)?,
                 *mark,
-                self.tensor(*floor),
+                self.tensor(*floor)?,
             ),
             // A DSpark stage's windows are served on CUDA.
             Attn::KvEnds { .. } | Attn::WindowSink { .. } => {
@@ -266,16 +267,16 @@ impl Run<'_> {
                 lse: None,
             } => attn::decode_selected(
                 self.ctx(),
-                self.tensor(*q),
-                self.decode_plan(*plan),
-                self.tensor(*selection),
-                self.pool(*cache),
+                self.tensor(*q)?,
+                self.decode_plan(*plan)?,
+                self.tensor(*selection)?,
+                self.pool(*cache)?,
                 *window,
                 *head_dim,
                 *sm_scale,
                 *ratio,
                 *per_head,
-                self.tensor(*o),
+                self.tensor(*o)?,
             ),
             Attn::Prefill {
                 q,
@@ -299,17 +300,17 @@ impl Run<'_> {
                 lse: None,
             } => attn::prefill_selected(
                 self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.tensor(*selection),
-                self.pool(*cache),
+                self.ragged(*q)?,
+                self.prefill_plan(*plan)?,
+                self.tensor(*selection)?,
+                self.pool(*cache)?,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
                 *ratio,
                 *per_head,
-                self.tensor(*o),
+                self.tensor(*o)?,
             ),
             Attn::Dense {
                 q,
@@ -321,13 +322,13 @@ impl Run<'_> {
                 o,
             } => attn::dense::bidirectional(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*segments),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*v)?,
+                self.tensor(*segments)?,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
+                self.tensor(*o)?,
             ),
             Attn::Prefill {
                 kv_heads: _,
@@ -350,18 +351,18 @@ impl Run<'_> {
                 lse: None,
             } if mask.is_some() || !*causal => attn::arbiter::masked_with_scratch(
                 self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.mask_bits(*mask)),
-                self.pool(*cache),
+                self.ragged(*q)?,
+                self.prefill_plan(*plan)?,
+                self.cut_rows(self.mask_bits(*mask)?)?,
+                self.pool(*cache)?,
                 *window,
                 *causal,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.requests(),
+                self.tensor(*o)?,
+                self.requests()?,
                 self.tuning(),
-                &|rows, width| self.partials(rows, width),
+                &|rows, width| self.partials_for(rows, width),
             ),
             Attn::Prefill {
                 kv_heads: _,
@@ -384,17 +385,17 @@ impl Run<'_> {
                 rel: None,
             } if mask.is_some() || !*causal => attn::arbiter::masked_lse(
                 self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.cut_rows(self.mask_bits(*mask)),
-                self.pool(*cache),
+                self.ragged(*q)?,
+                self.prefill_plan(*plan)?,
+                self.cut_rows(self.mask_bits(*mask)?)?,
+                self.pool(*cache)?,
                 *window,
                 *causal,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
-                self.requests(),
+                self.tensor(*o)?,
+                self.tensor(*lse)?,
+                self.requests()?,
                 self.tuning(),
             ),
             Attn::Decode {
@@ -417,14 +418,14 @@ impl Run<'_> {
             } => attn::decode_lse(
                 self.ctx(),
                 self.tuning(),
-                self.tensor(*q),
-                self.decode_plan(*plan),
-                self.pool(*cache),
+                self.tensor(*q)?,
+                self.decode_plan(*plan)?,
+                self.pool(*cache)?,
                 *window,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
+                self.tensor(*o)?,
+                self.tensor(*lse)?,
             ),
             Attn::Prefill {
                 q,
@@ -446,16 +447,16 @@ impl Run<'_> {
                 rel: None,
             } => attn::arbiter::prefill_lse(
                 self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.pool(*cache),
+                self.ragged(*q)?,
+                self.prefill_plan(*plan)?,
+                self.pool(*cache)?,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
-                self.requests(),
+                self.tensor(*o)?,
+                self.tensor(*lse)?,
+                self.requests()?,
                 self.tuning(),
             ),
             Attn::Sink {
@@ -466,9 +467,9 @@ impl Run<'_> {
                 o_out: _,
             } => attn::sink(
                 self.ctx(),
-                self.tensor(*o),
-                self.tensor(*lse),
-                self.tensor(*sink),
+                self.tensor(*o)?,
+                self.tensor(*lse)?,
+                self.tensor(*sink)?,
                 *head_dim,
             ),
             Attn::MergeLse {
@@ -482,14 +483,14 @@ impl Run<'_> {
                 lse,
             } => attn::merge_lse(
                 self.ctx(),
-                self.tensor(*o1),
-                self.tensor(*lse1),
-                self.tensor(*o2),
-                self.tensor(*lse2),
+                self.tensor(*o1)?,
+                self.tensor(*lse1)?,
+                self.tensor(*o2)?,
+                self.tensor(*lse2)?,
                 *heads,
                 *head_dim,
-                self.tensor(*o),
-                self.tensor(*lse),
+                self.tensor(*o)?,
+                self.tensor(*lse)?,
             ),
             Attn::KvAppend {
                 k,
@@ -499,11 +500,11 @@ impl Run<'_> {
                 write_offset,
             } => attn::kv_append(
                 self.ctx(),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
+                self.tensor(*k)?,
+                self.tensor(*v)?,
+                self.pool(*cache)?,
+                self.tensor(*write_page)?,
+                self.tensor(*write_offset)?,
             ),
             Attn::KvAppend {
                 k: plane,
@@ -513,10 +514,10 @@ impl Run<'_> {
                 write_offset,
             } => attn::kv_append_shared(
                 self.ctx(),
-                self.tensor(*plane),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
+                self.tensor(*plane)?,
+                self.pool(*cache)?,
+                self.tensor(*write_page)?,
+                self.tensor(*write_offset)?,
             ),
 
             Attn::MlaPlan {
@@ -530,10 +531,10 @@ impl Run<'_> {
             } => {
                 let built = attn::mla::plan(
                     self.ctx(),
-                    self.tensor(*kv_indptr),
-                    self.tensor(*kv_indices),
-                    self.tensor(*last_page_len),
-                    self.tensor(*kv_len),
+                    self.tensor(*kv_indptr)?,
+                    self.tensor(*kv_indices)?,
+                    self.tensor(*last_page_len)?,
+                    self.tensor(*kv_len)?,
                 )?;
                 self.put(*plan, StructSlot::Mla(built));
                 Ok(())
@@ -547,12 +548,12 @@ impl Run<'_> {
                 k_pe,
             } => attn::mla::latents(
                 self.ctx(),
-                self.tensor(*kv_a),
-                self.tensor(*weight),
+                self.tensor(*kv_a)?,
+                self.tensor(*weight)?,
                 *eps,
                 *kv_lora_rank,
-                self.tensor(*kv_c),
-                self.tensor(*k_pe),
+                self.tensor(*kv_c)?,
+                self.tensor(*k_pe)?,
             ),
             Attn::MlaLatentsRope {
                 kv_a,
@@ -566,15 +567,15 @@ impl Run<'_> {
                 k_pe,
             } => attn::mla::latents_rope(
                 self.ctx(),
-                self.tensor(*kv_a),
-                self.tensor(*positions),
-                self.tensor(*weight),
+                self.tensor(*kv_a)?,
+                self.tensor(*positions)?,
+                self.tensor(*weight)?,
                 *eps,
                 *kv_lora_rank,
                 *rope_dim,
                 *theta,
-                self.tensor(*kv_c),
-                self.tensor(*k_pe),
+                self.tensor(*kv_c)?,
+                self.tensor(*k_pe)?,
             ),
             Attn::MlaSplitQB {
                 q_b,
@@ -585,12 +586,12 @@ impl Run<'_> {
                 q_pe,
             } => attn::mla::split_q_b(
                 self.ctx(),
-                self.tensor(*q_b),
+                self.tensor(*q_b)?,
                 *heads,
                 *nope_dim,
                 *rope_dim,
-                self.tensor(*q_nope),
-                self.tensor(*q_pe),
+                self.tensor(*q_nope)?,
+                self.tensor(*q_pe)?,
             ),
             Attn::MlaAbsorbQ {
                 q_nope,
@@ -602,13 +603,13 @@ impl Run<'_> {
                 q_latent,
             } => attn::mla::absorb_q(
                 self.ctx(),
-                self.tensor(*q_nope),
-                self.tensor(*kv_b),
+                self.tensor(*q_nope)?,
+                self.tensor(*kv_b)?,
                 *heads,
                 *kv_lora_rank,
                 *nope_dim,
                 *v_head_dim,
-                self.tensor(*q_latent),
+                self.tensor(*q_latent)?,
             ),
             Attn::MlaAbsorbOut {
                 latent,
@@ -620,13 +621,13 @@ impl Run<'_> {
                 o,
             } => attn::mla::absorb_out(
                 self.ctx(),
-                self.tensor(*latent),
-                self.tensor(*kv_b),
+                self.tensor(*latent)?,
+                self.tensor(*kv_b)?,
                 *heads,
                 *kv_lora_rank,
                 *v_head_dim,
                 *nope_dim,
-                self.tensor(*o),
+                self.tensor(*o)?,
             ),
             Attn::MlaKvAppend {
                 kv_c,
@@ -636,11 +637,11 @@ impl Run<'_> {
                 write_offset,
             } => attn::mla::kv_append(
                 self.ctx(),
-                self.tensor(*kv_c),
-                self.tensor(*k_pe),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
+                self.tensor(*kv_c)?,
+                self.tensor(*k_pe)?,
+                self.pool(*cache)?,
+                self.tensor(*write_page)?,
+                self.tensor(*write_offset)?,
             ),
             // The per-head log-sum-exp a sink rescales by is landed for a selection alone.
             Attn::MlaDecode {
@@ -682,15 +683,15 @@ impl Run<'_> {
                 };
                 attn::mla::attention_decode(
                     self.ctx(),
-                    self.tensor(*q),
-                    self.tensor(*q_pe),
-                    self.pool(*cache),
-                    self.cut_rows(positions),
-                    self.cut_rows(request_of_token),
+                    self.tensor(*q)?,
+                    self.tensor(*q_pe)?,
+                    self.pool(*cache)?,
+                    self.cut_rows(positions)?,
+                    self.cut_rows(request_of_token)?,
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    self.tensor(*o),
+                    self.tensor(*o)?,
                 )
             }
             Attn::MlaPrefill {
@@ -712,15 +713,15 @@ impl Run<'_> {
                 };
                 attn::mla::attention_prefill(
                     self.ctx(),
-                    self.ragged(*q),
-                    self.tensor(*q_pe),
-                    self.pool(*cache),
-                    self.cut_rows(positions),
-                    self.cut_rows(request_of_token),
+                    self.ragged(*q)?,
+                    self.tensor(*q_pe)?,
+                    self.pool(*cache)?,
+                    self.cut_rows(positions)?,
+                    self.cut_rows(request_of_token)?,
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    self.tensor(*o),
+                    self.tensor(*o)?,
                 )
             }
             Attn::MlaDecode {
@@ -742,17 +743,17 @@ impl Run<'_> {
                 };
                 attn::mla::attention_decode_selected(
                     self.ctx(),
-                    self.tensor(*q),
-                    self.tensor(*q_pe),
-                    self.tensor(*selection),
-                    self.pool(*cache),
-                    self.cut_rows(positions),
-                    self.cut_rows(request_of_token),
+                    self.tensor(*q)?,
+                    self.tensor(*q_pe)?,
+                    self.tensor(*selection)?,
+                    self.pool(*cache)?,
+                    self.cut_rows(positions)?,
+                    self.cut_rows(request_of_token)?,
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    self.tensor(*o),
-                    lse.map(|lse| self.tensor(lse)),
+                    self.tensor(*o)?,
+                    lse.map(|lse| self.tensor(lse)).transpose()?,
                 )
             }
             Attn::MlaPrefill {
@@ -774,17 +775,17 @@ impl Run<'_> {
                 };
                 attn::mla::attention_prefill_selected(
                     self.ctx(),
-                    self.ragged(*q),
-                    self.tensor(*q_pe),
-                    self.tensor(*selection),
-                    self.pool(*cache),
-                    self.cut_rows(positions),
-                    self.cut_rows(request_of_token),
+                    self.ragged(*q)?,
+                    self.tensor(*q_pe)?,
+                    self.tensor(*selection)?,
+                    self.pool(*cache)?,
+                    self.cut_rows(positions)?,
+                    self.cut_rows(request_of_token)?,
                     *heads,
                     *kv_lora_rank,
                     *sm_scale,
-                    self.tensor(*o),
-                    lse.map(|lse| self.tensor(lse)),
+                    self.tensor(*o)?,
+                    lse.map(|lse| self.tensor(lse)).transpose()?,
                 )
             }
 
@@ -845,23 +846,23 @@ impl Run<'_> {
                     }
                     (RaggedMask::RelativeBias { table, max_len }, None) => {
                         attn::ragged::RaggedMask::RelativeBias {
-                            table: self.tensor(*table),
+                            table: self.tensor(*table)?,
                             max_len: *max_len,
                         }
                     }
                 };
                 attn::ragged::forward(
                     self.ctx(),
-                    self.uncut(*q),
-                    self.uncut(*k),
-                    self.uncut(*v),
-                    self.uncut(*q_indptr),
-                    self.uncut(*kv_indptr),
+                    self.uncut(*q)?,
+                    self.uncut(*k)?,
+                    self.uncut(*v)?,
+                    self.uncut(*q_indptr)?,
+                    self.uncut(*kv_indptr)?,
                     *head_dim,
                     *kv_heads,
                     *sm_scale,
                     &mask,
-                    self.uncut(*o),
+                    self.uncut(*o)?,
                 )
             }
 
@@ -876,10 +877,10 @@ impl Run<'_> {
                 k_out: _,
             } => attn::index::layernorm_rope(
                 self.ctx(),
-                self.tensor(*k),
-                self.tensor(*positions),
-                self.tensor(*weight),
-                self.tensor(*bias),
+                self.tensor(*k)?,
+                self.tensor(*positions)?,
+                self.tensor(*weight)?,
+                self.tensor(*bias)?,
                 *eps,
                 *rope_dim,
                 *theta,
@@ -894,8 +895,8 @@ impl Run<'_> {
                 q_out: _,
             } => attn::index::rope(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*positions)?,
                 *heads,
                 *head_dim,
                 *rope_dim,
@@ -912,7 +913,7 @@ impl Run<'_> {
                 score: score @ (IndexScore::Pooled | IndexScore::PooledTokens),
                 selection,
             } => {
-                let Some(scores) = self.index_scores() else {
+                let Some(scores) = self.index_scores()? else {
                     return Err(kernels_metal::Error::Unsupported {
                         op: "attn.index_topk",
                     });
@@ -926,17 +927,17 @@ impl Run<'_> {
                 };
                 topk(
                     self.ctx(),
-                    self.tensor(*q),
-                    weights.map(|w| self.tensor(w)),
-                    self.pool(*keys),
-                    self.cut_rows(positions),
-                    self.cut_rows(request_of_token),
+                    self.tensor(*q)?,
+                    weights.map(|w| self.tensor(w)).transpose()?,
+                    self.pool(*keys)?,
+                    self.cut_rows(positions)?,
+                    self.cut_rows(request_of_token)?,
                     scores,
                     *heads,
                     *head_dim,
                     *top_k,
                     *ratio,
-                    self.tensor(*selection),
+                    self.tensor(*selection)?,
                 )
             }
             Attn::IndexTopk {
@@ -950,7 +951,7 @@ impl Run<'_> {
                 score: IndexScore::BlockMax,
                 selection,
             } => {
-                let Some(scores) = self.index_scores() else {
+                let Some(scores) = self.index_scores()? else {
                     return Err(kernels_metal::Error::Unsupported {
                         op: "attn.index_topk",
                     });
@@ -959,16 +960,16 @@ impl Run<'_> {
                 let (positions, request_of_token) = (fire.positions, fire.tables.request_of_token);
                 attn::index::topk_block_max(
                     self.ctx(),
-                    self.tensor(*q),
-                    self.pool(*keys),
-                    self.cut_rows(positions),
-                    self.cut_rows(request_of_token),
+                    self.tensor(*q)?,
+                    self.pool(*keys)?,
+                    self.cut_rows(positions)?,
+                    self.cut_rows(request_of_token)?,
                     scores,
                     *heads,
                     *head_dim,
                     *top_k,
                     *ratio,
-                    self.tensor(*selection),
+                    self.tensor(*selection)?,
                 )
             }
             Attn::IndexTopk {
@@ -982,10 +983,10 @@ impl Run<'_> {
                 write_offset,
             } => attn::index::kv_append(
                 self.ctx(),
-                self.tensor(*k),
-                self.pool(*keys),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
+                self.tensor(*k)?,
+                self.pool(*keys)?,
+                self.tensor(*write_page)?,
+                self.tensor(*write_offset)?,
             ),
             Attn::IndexBlockMean {
                 boundary_pos,
@@ -996,12 +997,12 @@ impl Run<'_> {
                 entries,
             } => attn::index::block_mean(
                 self.ctx(),
-                self.tensor(*boundary_pos),
-                self.tensor(*boundary_req),
-                self.pool(*keys),
+                self.tensor(*boundary_pos)?,
+                self.tensor(*boundary_req)?,
+                self.pool(*keys)?,
                 *head_dim,
                 *ratio,
-                self.tensor(*entries),
+                self.tensor(*entries)?,
             ),
 
             Attn::PoolBoundary {
@@ -1014,13 +1015,13 @@ impl Run<'_> {
                 decode: true,
             } => attn::pool::boundary_decode(
                 self.ctx(),
-                self.tensor(*positions),
-                self.cut_rows(self.bindings().tables.request_of_token),
-                self.tensor(*row_valid),
+                self.tensor(*positions)?,
+                self.cut_rows(self.bindings().tables.request_of_token)?,
+                self.tensor(*row_valid)?,
                 *ratio,
-                self.tensor(*boundary_pos),
-                self.tensor(*boundary_req),
-                self.tensor(*boundary_rope),
+                self.tensor(*boundary_pos)?,
+                self.tensor(*boundary_req)?,
+                self.tensor(*boundary_rope)?,
             ),
             Attn::PoolBoundary {
                 positions,
@@ -1032,13 +1033,13 @@ impl Run<'_> {
                 decode: false,
             } => attn::pool::boundary_prefill(
                 self.ctx(),
-                self.ragged(*positions),
-                self.cut_rows(self.bindings().tables.request_of_token),
-                self.tensor(*row_valid),
+                self.ragged(*positions)?,
+                self.cut_rows(self.bindings().tables.request_of_token)?,
+                self.tensor(*row_valid)?,
                 *ratio,
-                self.tensor(*boundary_pos),
-                self.tensor(*boundary_req),
-                self.tensor(*boundary_rope),
+                self.tensor(*boundary_pos)?,
+                self.tensor(*boundary_req)?,
+                self.tensor(*boundary_rope)?,
             ),
             Attn::PoolGather {
                 boundary_pos,
@@ -1049,21 +1050,21 @@ impl Run<'_> {
                 ratio,
                 entries,
             } => {
-                let Some(state) = self.pool_state(*pages) else {
+                let Some(state) = self.pool_state(*pages)? else {
                     return Err(kernels_metal::Error::Unsupported {
                         op: "attn.pool_gather",
                     });
                 };
                 attn::pool::gather(
                     self.ctx(),
-                    self.tensor(*boundary_pos),
-                    self.tensor(*boundary_req),
-                    self.pool(*pages),
+                    self.tensor(*boundary_pos)?,
+                    self.tensor(*boundary_req)?,
+                    self.pool(*pages)?,
                     *head_dim,
                     *ratio,
                     state,
-                    ape.map(|id| self.tensor(id)),
-                    self.tensor(*entries),
+                    ape.map(|id| self.tensor(id)).transpose()?,
+                    self.tensor(*entries)?,
                 )
             }
             Attn::PoolStateWrite {
@@ -1075,18 +1076,18 @@ impl Run<'_> {
                 head_dim,
                 ratio,
             } => {
-                let Some(state) = self.pool_state(*pages) else {
+                let Some(state) = self.pool_state(*pages)? else {
                     return Err(kernels_metal::Error::Unsupported {
                         op: "attn.pool_state_write",
                     });
                 };
                 attn::pool::state_write(
                     self.ctx(),
-                    self.tensor(*kv),
-                    self.tensor(*score),
-                    self.pool(*pages),
-                    self.tensor(*write_page),
-                    self.tensor(*write_offset),
+                    self.tensor(*kv)?,
+                    self.tensor(*score)?,
+                    self.pool(*pages)?,
+                    self.tensor(*write_page)?,
+                    self.tensor(*write_offset)?,
                     *head_dim,
                     *ratio,
                     state,
@@ -1101,12 +1102,12 @@ impl Run<'_> {
                 write_offset,
             } => attn::pool::kv_append(
                 self.ctx(),
-                self.tensor(*entries),
-                self.tensor(*boundary_pos),
-                self.tensor(*boundary_req),
-                self.pool(*into),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
+                self.tensor(*entries)?,
+                self.tensor(*boundary_pos)?,
+                self.tensor(*boundary_req)?,
+                self.pool(*into)?,
+                self.tensor(*write_page)?,
+                self.tensor(*write_offset)?,
             ),
             Attn::PoolLse {
                 q,
@@ -1123,16 +1124,16 @@ impl Run<'_> {
                 top_k: None,
             } => attn::pool::attention_lse(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
-                self.tensor(*request_of_token),
-                self.pool(*entries),
+                self.tensor(*q)?,
+                self.tensor(*positions)?,
+                self.tensor(*request_of_token)?,
+                self.pool(*entries)?,
                 *ratio,
                 *heads,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
+                self.tensor(*o)?,
+                self.tensor(*lse)?,
             ),
             Attn::PoolLse {
                 q,
@@ -1149,18 +1150,18 @@ impl Run<'_> {
                 lse,
             } => attn::pool::attention_lse_selected(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
-                self.tensor(*request_of_token),
-                self.tensor(*selection),
-                self.pool(*entries),
+                self.tensor(*q)?,
+                self.tensor(*positions)?,
+                self.tensor(*request_of_token)?,
+                self.tensor(*selection)?,
+                self.pool(*entries)?,
                 *ratio,
                 *top_k,
                 *heads,
                 *head_dim,
                 *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
+                self.tensor(*o)?,
+                self.tensor(*lse)?,
             ),
             // A selection, a window, a relative bias and a mask no kernel here
             // combines.

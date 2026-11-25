@@ -243,6 +243,9 @@ fn a_refused_lane_is_refused_alone() {
         .map(|(slot, tokens)| Seated {
             replay_stated: None,
             kv_less: true,
+            // A kv-less lane names no slot; on a load placed for the
+            // runtime every lane names its slots by ref.
+            refs: true,
             ..Seated::of(engine_metal::Lane {
                 slot: slot as u32,
                 word: trace.facts.word(&Request::new(1, false)),
