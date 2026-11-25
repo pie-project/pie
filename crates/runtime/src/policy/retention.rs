@@ -36,6 +36,8 @@ pub struct Table {
     /// `retention/tiers` rows: where KV may sit, by owner and prefix.
     tiers: HashMap<ProcessId, Vec<(Option<u64>, u8)>>,
     tiers_default: Option<u8>,
+    /// The tiers rows that keep KV off the device.
+    off_device: usize,
 }
 
 impl Table {
@@ -54,6 +56,7 @@ impl Table {
         tiers: HashMap<ProcessId, Vec<(Option<u64>, u8)>>,
         default: Option<u8>,
     ) -> Self {
+        self.off_device = tiers.values().flatten().filter(|(_, row)| row & DEVICE == 0).count();
         self.tiers = tiers;
         self.tiers_default = default;
         self
@@ -222,15 +225,24 @@ impl Change {
 }
 
 /// One owner's rows of a column with the row at `upto` set or deleted.
-fn put<V>(rows: &mut HashMap<ProcessId, Vec<(Option<u64>, V)>>, (owner, upto): Prefix, row: Option<V>) {
+/// Answers the row that stood there.
+fn put<V>(
+    rows: &mut HashMap<ProcessId, Vec<(Option<u64>, V)>>,
+    (owner, upto): Prefix,
+    row: Option<V>,
+) -> Option<V> {
     let list = rows.entry(owner).or_default();
-    list.retain(|(at, _)| *at != upto);
+    let stood = list
+        .iter()
+        .position(|(at, _)| *at == upto)
+        .map(|at| list.remove(at).1);
     if let Some(value) = row {
         list.push((upto, value));
     }
     if list.is_empty() {
         rows.remove(&owner);
     }
+    stood
 }
 
 /// Enacts a round's changes in place: only the rows named change, and only
@@ -255,7 +267,10 @@ pub(crate) fn apply(change: Change) {
             put(&mut table.steps, prefix, row);
         }
         for (prefix, row) in change.tiers {
-            put(&mut table.tiers, prefix, row);
+            let off = |row: &Option<u8>| usize::from(row.is_some_and(|row| row & DEVICE == 0));
+            table.off_device += off(&row);
+            let stood = put(&mut table.tiers, prefix, row);
+            table.off_device -= off(&stood);
         }
         if let Some(default) = change.key_default {
             table.default = default;
@@ -293,6 +308,14 @@ pub(crate) fn take_idle_cache_new() -> bool {
             .read()
             .as_ref()
             .is_some_and(|table| !table.tiers.is_empty() || table.tiers_default.is_some())
+}
+
+/// Whether a tiers row or the default keeps KV off the device: with none,
+/// no cache leaves the device but for its room.
+pub(crate) fn keeps_off_device() -> bool {
+    CURRENT.read().as_ref().is_some_and(|table| {
+        table.off_device > 0 || table.tiers_default.is_some_and(|row| row & DEVICE == 0)
+    })
 }
 
 /// What the tiers rows keep off a tier leaves it now: on every planner,
@@ -339,6 +362,25 @@ mod tests {
 
     /// A table whose tiers default is the device alone (the shipped
     /// default policy's idle cache) holds every owner no row names there.
+    #[test]
+    fn rows_that_keep_kv_off_the_device_are_counted_as_they_come_and_go() {
+        let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();
+        let owner = ProcessId::from_u128(0xf6);
+        install(None);
+        let row = |tiers| Change {
+            tiers: vec![((owner, None), tiers)],
+            ..Change::default()
+        };
+        apply(row(Some(DEVICE)));
+        assert!(!keeps_off_device());
+        apply(row(Some(HOST)));
+        apply(row(Some(HOST | DISK)));
+        assert!(keeps_off_device());
+        apply(row(None));
+        assert!(!keeps_off_device());
+        install(None);
+    }
+
     #[test]
     fn a_device_only_tiers_default_holds_unnamed_owners_on_the_device() {
         let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();

@@ -693,6 +693,10 @@ pub trait PoolPort: Send + Sync + 'static {
     fn holds_idle(&self) -> bool {
         self.reclaimable_idle() > 0
     }
+    /// Whether kv slots below the device are in use: cache may lie there.
+    fn holds_below_device(&self) -> bool {
+        true
+    }
     /// A reader outside the fleet (a peer's read, an export, a snapshot)
     /// holds pages of the kv store: its end gives them back, and is told
     /// ([`Self::set_room_signal`]).
@@ -2101,6 +2105,10 @@ impl PoolPort for RegistryPool {
     fn holds_idle(&self) -> bool {
         self.with_kv_tagged("planner-holds-idle", |kv| kv.holds_cache())
             || self.with_rs(|rs| rs.holds_checkpoints())
+    }
+
+    fn holds_below_device(&self) -> bool {
+        self.with_kv_tagged("planner-below", |kv| kv.holds_below_device())
     }
 
     fn readers_hold(&self) -> bool {
