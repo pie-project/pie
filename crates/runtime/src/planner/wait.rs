@@ -54,7 +54,18 @@ pub(super) enum WaitKind {
         /// leaves): no head behind it is served into the room it was
         /// funded.
         rise: Option<u32>,
+        /// It waits for what idle cache gives alone
+        /// ([`super::ResidencyPlanner::wait_idle_room`]).
+        idle: Option<IdleWait>,
     },
+}
+
+/// Where a bind's wait for idle cache's room stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IdleWait {
+    Waits,
+    /// Idle cache gives no more.
+    Out,
 }
 
 pub(super) struct Waiter {

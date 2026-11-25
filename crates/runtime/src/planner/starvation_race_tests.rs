@@ -1795,6 +1795,7 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
         || None,
         |_, _, _| false,
+        |_, _, _| std::future::ready(Ok(crate::planner::BindRoomWait::IdleOut)),
         |_, _, _| false,
         |_, _, _| {
             std::future::ready(Err::<crate::planner::BindRoomWait, String>(
@@ -4065,6 +4066,7 @@ async fn a_bind_waiting_for_room_yields_to_its_own_eviction_and_binds_after_the_
         |_, _| std::future::ready(Err::<(), String>("no grow here".into())),
         || None,
         |_, _, _| false,
+        |_, _, _| std::future::ready(Ok(crate::planner::BindRoomWait::IdleOut)),
         |_, _, _| false,
         move |run, pieces, singles| {
             let p = p.clone();
@@ -5053,6 +5055,7 @@ async fn a_blocked_victim_is_a_candidate_again_once_the_pool_moves() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
         inner.host_swap_blocked.insert(resident);
@@ -5927,6 +5930,7 @@ async fn a_stuck_state_is_said_once_and_costs_no_pass_until_an_event() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
     });
@@ -6617,6 +6621,7 @@ fn a_process_evicted_while_queued_is_restored_only_behind_the_queue_ahead_of_it(
         served: false,
         withdrawn: false,
         rise: None,
+        idle: None,
     };
     let youngest = pids[3];
     let keys = planner.with_inner(|inner| {
@@ -7448,6 +7453,7 @@ fn with_nothing_in_flight_a_process_not_yet_admitted_is_a_victim() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
     });
@@ -7489,6 +7495,7 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
     });

@@ -810,8 +810,7 @@ pub(crate) fn take_behind(
     // work; then once more.
     let short = (pages as usize).saturating_mul(lanes);
     let freed = crate::store::registry::with_kv_lock(&stores.kv, "behind-reclaim-idle", |kv| {
-        let epoch = kv.current_epoch();
-        kv.reclaim_cache(epoch, short, crate::policy::retention::Installed)
+        kv.reclaim_cache(short, crate::policy::retention::Installed)
     });
     let rs_freed = if records {
         stores

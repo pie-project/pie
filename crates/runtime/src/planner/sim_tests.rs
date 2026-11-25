@@ -2254,6 +2254,18 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             roles.lock().unwrap().room_free(run, pieces, singles)
         },
         |run, pieces, singles| {
+            let holds = roles.lock().unwrap().holds_guest_state(pid);
+            async move {
+                if !holds {
+                    return Ok(crate::planner::BindRoomWait::IdleOut);
+                }
+                planner
+                    .wait_idle_room(pid, run, pieces, singles)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        },
+        |run, pieces, singles| {
             roles.lock().unwrap().holds_guest_state(pid)
                 && planner.suspend_for_room(pid, run, pieces, singles)
         },
