@@ -1030,6 +1030,36 @@ pub struct SaveTo<'a> {
     pub registry: &'a profile::Registry,
 }
 
+/// The tuned decisions `file` with the keyed measurements `existing` (the
+/// user's file it replaces, read by `registry`) stores in place of its own
+/// unkeyed rates: a tune times decisions, and what loads measured of the
+/// device (its rates, the dense kernels' curves, the settles) still stands.
+#[must_use]
+pub fn keeping_stored(
+    registry: &profile::Registry,
+    file: String,
+    existing: Option<&str>,
+) -> String {
+    let Some(stored) = existing.and_then(|text| {
+        registry.parse(text, "the user's file", profile::Strict::User).ok()
+    }) else {
+        return file;
+    };
+    let rates = stored.tuned.rates;
+    if rates.measured_on.is_none() {
+        return file;
+    }
+    let how = stored
+        .provenance
+        .into_iter()
+        .find(|(key, _)| key == "rates")
+        .map_or_else(
+            || "\"stored by loads, kept by pie tune\"".to_string(),
+            |(_, how)| how,
+        );
+    saved_text(Some(&file), &rates, &("rates", how))
+}
+
 /// The user's file of a device, `existing` (none where there is none yet),
 /// with its `[rates]` table written whole: the rates the file's own table
 /// states where it reads (every key one this pie reads), under `measured`

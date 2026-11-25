@@ -67,6 +67,13 @@ fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLad
     )
 }
 
+/// The user's file of `device`, pruned of what this pie does not read;
+/// `None` where there is none.
+fn user_file(profiles: Option<&Path>, device: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::chip::SHELF.user_path(profiles?, device)).ok()?;
+    Some(crate::chip::registry().prune(&text).0)
+}
+
 /// Serve `artifact` with `file` as the user's profile for `device`.
 fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<Serving, String> {
     use poem::{Platform, Request};
@@ -513,6 +520,11 @@ pub fn run(
         &provenance,
         ASSUME,
     )?;
+    let file = engine::rates::keeping_stored(
+        crate::chip::registry(),
+        file,
+        user_file(profiles, &name).as_deref(),
+    );
     Ok(Outcome {
         device: name,
         file,
@@ -563,5 +575,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A tune over the user's file keeps what loads stored in it: the keyed
+    /// rates and the dense settles, beside the tuned decision.
+    #[test]
+    fn a_tune_keeps_the_measurements_the_users_file_stores() {
+        const DECISION: &str = "kernel.sdpa.decode.threads";
+        let facts = profile::Facts::of(crate::chip::registry())
+            .word("vendor", "nvidia")
+            .int("subgroup", 32)
+            .int("cores", 142)
+            .flag("coopmat", true);
+        let (base, _) = crate::chip::resolve_facts("Test GPU", &facts, None);
+        let rates = profile::rates::Rates {
+            launch_ns: Some(4321),
+            measured_on: Some("vulkan 10de:1".to_string()),
+            dense_settled: vec![profile::curves::DenseSettled {
+                method: 1,
+                of: 7,
+                code: 9,
+                ranges: vec![[1, 1, 1, 8, 0, 0]],
+                planes: vec![(1024, 2048)],
+            }],
+            ..profile::rates::Rates::default()
+        };
+        let how = ("rates", "\"a load\"".to_string());
+        let stored = engine::rates::saved_text(None, &rates, &how);
+        let knob = search::knobs(&base, SEARCH_SKIPS, "")
+            .into_iter()
+            .find(|knob| knob.id == DECISION)
+            .expect("the decision is searched");
+        let entries = vec![(DECISION.to_string(), knob.candidates[0].0.clone())];
+        let tuned = search::assemble(
+            crate::chip::registry(),
+            &base,
+            "Test GPU",
+            &facts,
+            &search::render_overrides(&entries),
+            &[("source", "\"a test\"".to_string())],
+            ASSUME,
+        )
+        .expect("the tuned file");
+        let registry = crate::chip::registry();
+        let read = |text: &str| registry.parse(text, "kept", profile::Strict::User).expect("reads");
+        let kept = read(&engine::rates::keeping_stored(registry, tuned.clone(), Some(&stored)));
+        assert!(kept.entries.contains_key(DECISION), "the tuned decision");
+        assert_eq!(kept.tuned.rates.launch_ns, Some(4321));
+        assert_eq!(kept.tuned.rates.dense_settled, rates.dense_settled);
+        assert_eq!(kept.tuned.rates.measured_on, rates.measured_on);
+        assert_eq!(engine::rates::keeping_stored(registry, tuned.clone(), None), tuned);
     }
 }
