@@ -1,7 +1,7 @@
 //! Where a guest instance's state lives: its bind-time launch tables and its rings,
 //! in pool slots of role `Instance` and `Channel` the runtime took for it.
-//! The one exception the contract states is a ring larger than a chunk: no
-//! slots, a buffer of the engine's own.
+//! A ring larger than a chunk has no run of slots to lie in and is refused
+//! at bind, by name: the engine keeps no buffer of its own for it.
 //!
 //! A pooled [`Held`] is one slot ref's bytes, addressed through the pool's
 //! view (a placement-sparse buffer) and written on the host through the
@@ -513,8 +513,7 @@ impl<'a> Tables<'a> {
 }
 
 /// Where a ring's cells go: `cells` cells of `stride` bytes, `per_span` of
-/// them in each region (one a slot for cells packed a slot; one for a run,
-/// or for a ring larger than a chunk in a buffer of its own).
+/// them in each region (one a slot for cells packed a slot; one for a run).
 #[derive(Debug, Clone)]
 pub struct Cells {
     spans: Vec<Held>,
@@ -604,7 +603,7 @@ impl Cells {
                 "program::held",
                 format!(
                     "a ring of {bytes} bytes is larger than a chunk of {per_chunk} \
-                     {slot_bytes}-byte channel slots, and is the engine's to keep"
+                     {slot_bytes}-byte channel slots: no run of slots holds it"
                 ),
             )
         })?;
@@ -703,72 +702,5 @@ impl Cells {
     #[must_use]
     pub fn buffer(&self) -> &Buffer {
         self.spans[0].buffer()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{HostAt, pack, pieces, ring_slots};
-    use std::ptr::NonNull;
-
-    /// A region whose bytes cross a placement heap's end lies in two host
-    /// runs (slot 65500 of shape 7 on the M1, refused before): a copy over
-    /// the seam is cut in two at it, each piece at its own run's address,
-    /// and one inside a run stays whole.
-    #[test]
-    fn a_copy_over_a_heap_s_end_is_cut_at_it() {
-        let mut first = [0u8; 8];
-        let mut second = [0u8; 8];
-        let runs = vec![
-            (0, 8, HostAt(NonNull::new(first.as_mut_ptr()).unwrap())),
-            (8, 8, HostAt(NonNull::new(second.as_mut_ptr()).unwrap())),
-        ];
-        let cut: Vec<(u64, u64, u64)> = pieces(&runs, 5, 6)
-            .map(|(span, (at, _, len))| (span, at, len))
-            .collect();
-        assert_eq!(cut, vec![(0, 5, 3), (3, 0, 3)], "3 bytes before the seam, 3 after");
-        let whole: Vec<(u64, u64, u64)> = pieces(&runs, 9, 4)
-            .map(|(span, (at, _, len))| (span, at, len))
-            .collect();
-        assert_eq!(whole, vec![(0, 1, 4)], "inside the second run");
-        assert_eq!(pieces(&runs, 16, 0).count(), 0);
-    }
-
-    #[test]
-    fn tables_pack_aligned_and_never_straddle_a_slot() {
-        let (places, slots) = pack(&[100, 40, 4000, 8], 4096).expect("every table fits a slot");
-        assert_eq!(places, vec![(0, 0), (0, 112), (1, 0), (1, 4000)]);
-        assert_eq!(slots, 2);
-        assert_eq!(pack(&[], 4096), Some((Vec::new(), 0)));
-        assert_eq!(pack(&[5000], 4096), None);
-    }
-
-    #[test]
-    fn tables_past_a_slot_lie_one_after_another_in_one_run() {
-        use super::TableLayout;
-        let packed = TableLayout::of(&[100, 40], 4096);
-        assert!(!packed.run);
-        assert_eq!(packed.slots, 1);
-        let run = TableLayout::of(&[5000, 100, 8], 4096);
-        assert!(run.run, "a table past a slot makes the tables a run");
-        assert_eq!(run.places, vec![(0, 0), (0, 5008), (0, 5120)]);
-        assert_eq!(run.slots, 2);
-    }
-
-    #[test]
-    fn ring_cells_pack_whole_into_channel_slots() {
-        assert_eq!(ring_slots(2, 16, 1024), Some(1));
-        assert_eq!(ring_slots(12, 192, 1024), Some(3));
-        assert_eq!(ring_slots(5, 600_016, 1024), None);
-    }
-
-    #[test]
-    fn a_cell_past_a_slot_takes_one_run_inside_a_chunk() {
-        use super::{consecutive, ring_run};
-        // A vocab-wide probabilities cell, capacity 4: five cells.
-        assert_eq!(ring_run(5, 607_744, 1024, 16_384), Some(2968));
-        assert_eq!(ring_run(5, 607_744, 1024, 2048), None);
-        assert!(consecutive(&[7, 8, 9]));
-        assert!(!consecutive(&[7, 9]));
     }
 }

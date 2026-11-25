@@ -354,8 +354,12 @@ pub fn waves(s: Shape) -> Result<Option<f64>, String> {
 }
 
 /// Enqueues `y = x · wᵀ (+ bias)` on `stream`. `Ok(false)` when hipBLASLt
-/// offers no algorithm for the shape, which the caller then runs on
-/// rocBLAS; a hipBLASLt that did not load is refused.
+/// offers no algorithm for the shape: the shape's route is then the
+/// caller's other one (rocBLAS, the routed select), every fire of it alike.
+/// The plan, and with it the route, is the shape's, made where the load's
+/// size-only walk first reaches it (every rung of the lattice, those later
+/// stated eager too), so no serving fire chooses one. A hipBLASLt that did
+/// not load is refused.
 ///
 /// # Safety
 /// `x`, `w`, `y` (and `bias` when the shape has one) must be live device
@@ -384,8 +388,6 @@ pub unsafe fn matmul(
         }
     };
     let Some(plan) = plan else {
-        // rocBLAS takes the product hipBLASLt has no algorithm for.
-        crate::tally::declined();
         return Ok(false);
     };
     if s.bias {

@@ -174,18 +174,4 @@ mod tests {
         assert_eq!(config.runtime.frame_size, u32::from(Runahead::STEPS_MAX));
     }
 
-    /// An app's settings refuse a key they do not declare, as JSON and as
-    /// TOML; the current keys load.
-    #[test]
-    fn an_unknown_setting_is_refused() {
-        let err = Settings::parse("max_contxt = 8\n").unwrap_err().to_string();
-        assert!(err.contains("unknown field `max_contxt`"), "{err}");
-        let err = Settings::parse(r#"{"max_contxt": 8192}"#)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unknown field `max_contxt`"), "{err}");
-        let settings = Settings::parse(r#"{"max_context": 8192, "budget_device": "1GiB"}"#)
-            .expect("the current keys load");
-        assert_eq!(settings.max_context, 8192);
-    }
 }

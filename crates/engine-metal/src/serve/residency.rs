@@ -247,7 +247,7 @@ impl Shell {
     }
 
     /// `copy` drained behind every frame and encoded (a host copy to or
-    /// from the host tier or the slot files done here); the frame to
+    /// from the slot files done here); the frame to
     /// commit, `None` for an empty copy.
     pub(super) fn encode_copy(
         &mut self,
@@ -278,7 +278,7 @@ impl Shell {
     /// `landed`'s sink is called with its token from that buffer's
     /// completion; with no sink installed (the runtime installs it before
     /// any copy) it is refused by name, before anything is encoded. A move
-    /// to or from the host tier or the slot files is a host copy done here,
+    /// to or from the slot files is a host copy done here,
     /// past the drain: `true`.
     pub fn copy_slots_landing(
         &mut self,
@@ -351,22 +351,4 @@ impl Shell {
         Ok(())
     }
 
-    /// See `Engine::read_tier_slots`: every frame and copy lands first.
-    pub fn read_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> Result<Vec<u8>> {
-        self.drain()?;
-        self.pools.read_tier_slots(slots)
-    }
-
-    /// See `Engine::write_tier_slots`: every frame and copy lands first.
-    pub fn write_tier_slots(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> Result<()> {
-        self.drain()?;
-        self.pools.write_tier_slots(slots, bytes)
-    }
 }

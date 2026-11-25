@@ -1029,7 +1029,7 @@ impl ResidencyPlanner {
         // A fire that landed while the pass ran was in flight when the
         // wait was chosen: its landing plans again, and the wait is no
         // bug (the restored one's bind fired under the pass).
-        ptrace!("plan ended head={head:?} ended={ended}");
+        tracing::debug!("plan ended head={head:?} ended={ended}");
         let landed_since = self.stats.fires_landed.load(Ordering::Acquire)
             != self.pass_landed.load(Ordering::Acquire);
         if WAITS_ON_FLIGHT.iter().any(|wait| ended.contains(wait))
@@ -1351,7 +1351,7 @@ impl ResidencyPlanner {
         });
         let any = !spawned.is_empty();
         for pid in &spawned {
-            ptrace!("evict pid={} head={:?}", pid, head_key);
+            tracing::debug!("evict pid={} head={:?}", pid, head_key);
         }
         self.start_evictions(wake, spawned);
         any
@@ -1612,11 +1612,22 @@ impl ResidencyPlanner {
     }
 }
 
-/// The order victims go in: the lowest priority first (the policy's
-/// `schedule/priority`, a holder's retention key after it; PLEX 1.1 §4.1).
-/// `first` (quiescent, or fresh) only orders equal priorities, ahead of the
-/// engine's own tie: first come, first served, reversed for victims, so the
-/// youngest goes first.
+/// The order victims go in, each key only ordering what the ones before it
+/// leave equal:
+///
+/// 1. PLEX priority, lowest first: the policy's `schedule/priority`, a
+///    holder's retention key after it (PLEX 1.1 §4.1).
+/// 2. `first` (quiescent, or fresh): feasibility, as a lane with a fire in
+///    flight cannot move until it lands; and anti-thrash, as a lane just
+///    restored must progress before it is a victim again, or two lanes go
+///    round, each evicted for the other.
+/// 3. The fewest moves that free the whole chunk runs the head needs
+///    ([`chunk_picks`], over this order).
+/// 4. The engine's own tie: first come, first served, reversed for
+///    victims, so the youngest (least recently admitted) goes first.
+///
+/// 2 and 3 are mechanism, not a preference among tenants: neither
+/// reorders priorities the policy states.
 pub(super) fn victim_order(rank: Rank, first: bool) -> impl Ord {
     (rank.priority(), !first, std::cmp::Reverse(rank))
 }
@@ -1633,7 +1644,8 @@ fn chunk_picks(
     map: Option<&super::pool::ChunkMap>,
 ) -> (Vec<(ProcessId, super::rank::Rank)>, Reclaim, Vec<ProcessId>) {
     // Of the runs that serve it, those whose highest-priority occupant is
-    // lowest (the policy's order), then the cheapest.
+    // lowest (PLEX priority first, [`victim_order`]), then the set that
+    // frees the whole chunk runs the head needs with the fewest moves.
     let priority: std::collections::HashMap<ProcessId, (i64, i64)> = candidates
         .iter()
         .map(|&(pid, rank)| (pid, rank.priority()))

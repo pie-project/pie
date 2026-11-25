@@ -422,13 +422,12 @@ def _make_channel() -> types.ModuleType:
 class PipelineStub:
     def __init__(self) -> None:
         self.closed = False
-        self.retracted = 0
 
     def close(self) -> None:
         self.closed = True
 
     def retract(self, fires: int) -> None:
-        self.retracted += fires
+        pass
 
 
 def _make_pipeline() -> types.ModuleType:

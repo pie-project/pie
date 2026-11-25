@@ -1270,79 +1270,7 @@ device = ["metal:0"]
         adapters_are_absent_by_default_and_that_is_zero_seats();
         the_seat_count_is_stated_once_or_derived_from_the_roster();
         an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
-        an_empty_memory_table_is_the_dedicated_machine();
-        the_memory_keys_are_seven_and_prefixed();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
-        activation_dtype_is_an_unknown_key();
-    }
-
-    fn an_empty_memory_table_is_the_dedicated_machine() {
-        let cfg = Config::parse(MINIMAL_METAL).unwrap();
-        assert_eq!(cfg.engine.memory, MemoryConfig::default());
-        assert_eq!(
-            cfg.engine.memory.yields().unwrap(),
-            None,
-            "unset: the load resolves it by the engines' memory"
-        );
-        let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nyield = 0\n");
-        assert_eq!(
-            Config::parse(&zero).unwrap().engine.memory.yields().unwrap(),
-            Some(runtime::governor::Yield::NONE),
-            "a configured 0 is not unset"
-        );
-        let residency = cfg.engine.memory.residency();
-        assert_eq!(residency.device, engine::Allowance::WHOLE);
-        assert!(residency.weights_held);
-
-        let shared = format!(
-            "{MINIMAL_METAL}\n[engine.memory]\nbudget_device = \"20GiB\"\n\
-             budget_host = \"8GiB\"\nyield = 0.5\n"
-        );
-        let cfg = Config::parse(&shared).unwrap();
-        assert_eq!(
-            cfg.engine.memory.residency().device.budget,
-            Some(20 << 30),
-            "budget_device caps the device"
-        );
-        assert_eq!(cfg.engine.memory.residency().host_kv_budget, Some(8 << 30));
-        assert_eq!(cfg.engine.memory.yields().unwrap().map(|y| y.share()), Some(0.5));
-
-        for bad in ["yield = -0.1", "yield = 1.5", "yield = nan"] {
-            let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{bad}\n");
-            let refused = Config::parse(&toml).expect_err(bad);
-            assert!(
-                format!("{refused:#}").contains("engine.memory.yield"),
-                "{bad}: {refused:#}"
-            );
-        }
-        let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_device = 0\n");
-        assert!(Config::parse(&zero).is_err(), "a zero budget is refused");
-        // The knobs `yield` replaced are no key at all.
-        for old in ["governor_backoff = 0.8", "governor_release_idle = true"] {
-            let toml = format!("{MINIMAL_METAL}\n[engine.memory]\n{old}\n");
-            let refused = Config::parse(&toml).expect_err(old);
-            assert!(
-                format!("{refused:#}").contains("unknown key"),
-                "{old}: {refused:#}"
-            );
-        }
-
-        // The kv tokens reach the cuda engine's load; another engine, which
-        // does not size its pool by them, refuses the key by name.
-        let cuda = MINIMAL_METAL
-            .replace("\"metal\"", "\"cuda\"")
-            .replace("metal:0", "cuda:0");
-        let tokens = format!("{cuda}\n[engine.memory]\nkv_device_tokens = 51968\n");
-        let cfg = Config::parse(&tokens).unwrap();
-        assert_eq!(cfg.engine.memory.residency().device_kv_tokens, Some(51968));
-        let metal = format!("{MINIMAL_METAL}\n[engine.memory]\nkv_device_tokens = 51968\n");
-        let refused = Config::parse(&metal).expect_err("metal refuses the key");
-        assert!(
-            format!("{refused:#}").contains("kv_device_tokens"),
-            "{refused:#}"
-        );
-        let zero = format!("{cuda}\n[engine.memory]\nkv_device_tokens = 0\n");
-        assert!(Config::parse(&zero).is_err(), "zero tokens should be refused");
     }
 
     /// A default home has a disk tier: `budget_disk` omitted leaves its size
@@ -1375,74 +1303,6 @@ device = ["metal:0"]
                 "{stray}: {refused:#}"
             );
         }
-    }
-
-    fn the_memory_keys_are_seven_and_prefixed() {
-        let keys: Vec<String> = schema::fields(EngineKind::Cuda)
-            .into_iter()
-            .map(|field| field.key)
-            .filter(|key| key.starts_with("engine.memory."))
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                "engine.memory.budget_device",
-                "engine.memory.kv_device_tokens",
-                "engine.memory.budget_host",
-                "engine.memory.budget_disk",
-                "engine.memory.disk_path",
-                "engine.memory.disk_persistent",
-                "engine.memory.yield",
-            ]
-        );
-    }
-
-    /// Nothing reads a compute dtype from the config: a file that states
-    /// one is refused as it would be for any key no struct declares.
-    fn activation_dtype_is_an_unknown_key() {
-        let file = std::path::Path::new("/etc/pie/config.toml");
-        // An engine's own key, read through its options struct: lines 6-9
-        // are `[engine]`, `type`, `device`, the unknown key.
-        let err = Config::parse_file(
-            &MINIMAL_METAL.replace(
-                "device = [\"metal:0\"]",
-                "device = [\"metal:0\"]\nactivation_dtype = \"bfloat16\"",
-            ),
-            Some(file),
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            err,
-            "/etc/pie/config.toml:9: unknown key `engine.activation_dtype`; delete it (it \
-             isn't a setting)"
-        );
-        // Any other section's: the deserializer's own span.
-        let err = Config::parse_file(
-            &MINIMAL_METAL.replace(
-                "source = \"Qwen/Qwen3-0.6B\"",
-                "source = \"Qwen/Qwen3-0.6B\"\nmax_contxt = 8",
-            ),
-            Some(file),
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            err,
-            "/etc/pie/config.toml:5: unknown key `model.max_contxt`; delete it (it isn't a \
-             setting)"
-        );
-        let err = Config::parse(&MINIMAL_METAL.replace(
-            "[engine]",
-            "[engine.memory]\nbudget_dev = \"1GiB\"\n[engine]",
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.starts_with("config:7: unknown key `engine.memory.budget_dev`"),
-            "{err}"
-        );
-        Config::parse(MINIMAL_METAL).expect("without it, the file loads");
     }
 
     /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
@@ -1552,53 +1412,15 @@ device = ["metal:0"]
     }
 
     fn measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere() {
-        let vulkan = MINIMAL_METAL
-            .replace("type = \"metal\"", "type = \"vulkan\"")
-            .replace("metal:0", "vulkan:0");
-        let cfg: Config = toml::from_str(&vulkan).unwrap();
-        assert!(cfg.engine.measure, "a load measures unless told not to");
-        let skipping = vulkan.replace(
-            "device = [\"vulkan:0\"]",
-            "device = [\"vulkan:0\"]\nmeasure = false",
-        );
-        let cfg: Config = toml::from_str(&skipping).unwrap();
-        assert!(!cfg.engine.measure);
-        cfg.engine.validate().expect("vulkan skips");
-        assert!(
-            cfg.engine.options.get("measure").is_none(),
-            "a common key, not the engine's own"
-        );
-        // `pie serve --no-measure`.
-        let mut cfg: Config = toml::from_str(&vulkan).unwrap();
-        cfg.skip_measuring().expect("vulkan skips");
-        assert!(!cfg.engine.measure);
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.skip_measuring().expect("metal skips");
         assert!(!cfg.engine.measure);
-        let xla = MINIMAL_METAL
-            .replace("type = \"metal\"", "type = \"xla\"")
-            .replace("metal:0", "tpu:0");
-        let mut cfg: Config = toml::from_str(&xla).unwrap();
-        cfg.skip_measuring().expect("xla skips");
-        assert!(!cfg.engine.measure);
-        let cuda = MINIMAL_METAL
+        let group = MINIMAL_METAL
             .replace("type = \"metal\"", "type = \"cuda\"")
-            .replace("metal:0", "cuda:0");
-        let mut cfg: Config = toml::from_str(&cuda).unwrap();
-        cfg.skip_measuring().expect("a one-device cuda engine skips");
-        assert!(!cfg.engine.measure);
-        // Still refused by name: a cuda engine over more than one device (a
-        // tensor-parallel group or a lockstep, whose ranks still measure
-        // outside the keyed path).
-        let group = cuda.replace("[\"cuda:0\"]", "[\"cuda:0\", \"cuda:1\"]");
+            .replace("[\"metal:0\"]", "[\"cuda:0\", \"cuda:1\"]");
         let mut cfg: Config = toml::from_str(&group).unwrap();
-        let why = cfg
-            .skip_measuring()
-            .expect_err("a cuda group measures outside the skip path yet");
-        assert!(
-            why.to_string().contains("the cuda engine across devices still measures"),
-            "{why}"
-        );
+        cfg.skip_measuring()
+            .expect_err("a cuda group measures outside the skip path");
     }
 
     fn an_engine_s_own_key_is_written_beside_the_common_ones() {

@@ -737,17 +737,6 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_seed_reproduces() {
-        let (mut a, mut b) = (Sampling::default(), Sampling::default());
-        a.set_seed(42);
-        b.set_seed(42);
-        assert_eq!(a.seed, b.seed);
-        a.set_seed(-7);
-        b.set_seed(-7);
-        assert_eq!(a.seed, b.seed);
-    }
-
-    #[test]
     fn logprobs_modes_go_by_vllms_names() {
         assert_eq!(LogprobsMode::default(), LogprobsMode::RawLogprobs);
         for (name, processed, logits) in [

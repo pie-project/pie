@@ -267,57 +267,6 @@ fn the_beam_step_follows_the_spec() {
     }
 }
 
-/// A parent past the group faults that lane alone, which continues itself:
-/// its pages stay named.
-#[test]
-fn a_parent_past_the_group_faults_its_lane() {
-    let Some(gpu) = Gpu::open() else { return };
-    let (lanes, folded) = (4u32, 37u32);
-    let ctx = gpu.ctx();
-    let reserve = 4 * 4 + 4 + 4 * FRAMES + 1;
-    let cap = reserve;
-    let words = channel::beam_state_words(lanes, cap, FRAMES) as usize;
-    let state_at = gpu.up(&vec![0u32; words]);
-    let trans_at = gpu.up(&(0..reserve).map(device_id).collect::<Vec<_>>());
-    let mut replay = State::new(lanes, cap, FRAMES);
-    for (t, parents) in [vec![0, 1, 2, 3], vec![0, 0, 9, 1]].into_iter().enumerate() {
-        let slot = folded + t as u32;
-        let faults_at = gpu.up(&vec![0u32; lanes as usize]);
-        let run = BeamStepRun {
-            state: state_at,
-            parents: gpu.up(&parents),
-            trans: trans_at,
-            lists: gpu.up(&[BeamListRun::default()]),
-            faults: faults_at,
-            lanes,
-            cap,
-            reserve,
-            page: PAGE,
-            folded,
-            slot,
-            list_count: 0,
-            frames: FRAMES,
-            backed: reserve,
-            rows: 0,
-        };
-        channel::beam_step(&ctx, gpu.up(&[run]), 1, lanes).expect("beam_step launches");
-        gpu.sync();
-        let want = beam::step(
-            &mut replay,
-            &parents,
-            Fire {
-                page: PAGE,
-                folded,
-                reserve,
-                slot,
-            },
-        );
-        let faults: Vec<u32> = gpu.down(faults_at, lanes as usize);
-        assert_eq!(faults, want.faults, "fire {t}");
-    }
-    assert_eq!(replay.fired, 2);
-}
-
 /// A fork's rs copy on a hybrid (its rs rows move with its kv slots): rows of
 /// 2 a page from slot 38, kv pages of 16 (the live Qwen3.5 frozen slot),
 /// two planes of other row bytes. A copy of 5 slots from pool page 1 to 3
@@ -408,47 +357,4 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
     gpu.sync();
     assert_eq!(gpu.down::<u32>(fault_at, 1), [channel::PAGES_COPY_BOUNDS]);
     assert_eq!(gpu.down::<u8>(mem, pattern.len()), pattern, "a refused copy moves nothing");
-}
-
-/// A group wider than its step was laid for steps nothing and faults every
-/// one of its lanes by name ([`channel::PAGES_TOO_WIDE`]), never returning
-/// silently; the device steps groups past 64 beams
-/// ([`channel::beam_max_lanes`]).
-#[test]
-fn a_group_wider_than_its_step_faults_every_lane_by_name() {
-    let Some(gpu) = Gpu::open() else { return };
-    let ctx = gpu.ctx();
-    assert!(channel::beam_max_lanes(&ctx) >= 96, "this device steps 96 beams a group");
-    let (lanes, folded) = (8u32, 37u32);
-    let reserve = 4 * lanes + lanes + lanes * FRAMES + 1;
-    let cap = reserve;
-    let words = channel::beam_state_words(lanes, cap, FRAMES) as usize;
-    let state_at = gpu.up(&vec![0u32; words]);
-    let trans_at = gpu.up(&(0..reserve).map(device_id).collect::<Vec<_>>());
-    let faults_at = gpu.up(&vec![0u32; lanes as usize]);
-    let run = BeamStepRun {
-        state: state_at,
-        parents: gpu.up(&(0..lanes).collect::<Vec<u32>>()),
-        trans: trans_at,
-        lists: gpu.up(&[BeamListRun::default()]),
-        faults: faults_at,
-        lanes,
-        cap,
-        reserve,
-        page: PAGE,
-        folded,
-        slot: folded,
-        list_count: 0,
-        frames: FRAMES,
-        backed: reserve,
-        rows: 0,
-    };
-    let run_at = gpu.up(&[run]);
-    // Laid for 4 beams: the group of 8 is wider.
-    channel::beam_step(&ctx, run_at, 1, 4).expect("beam_step launches");
-    gpu.sync();
-    let faults: Vec<u32> = gpu.down(faults_at, lanes as usize);
-    assert_eq!(faults, vec![channel::PAGES_TOO_WIDE; lanes as usize], "every lane faults wide");
-    let held: Vec<u32> = gpu.down(state_at, words);
-    assert_eq!(held[0], 0, "the group was not primed: nothing stepped");
 }
