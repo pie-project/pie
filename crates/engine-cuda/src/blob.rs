@@ -376,7 +376,6 @@ pub struct Stamp {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
     Shared(Stamp),
-    Own(engine::InstanceId),
     /// A bundle, by the digest of its bytes (`engine::bundle::Bundle::key`).
     Content([u8; 32]),
 }
