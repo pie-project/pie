@@ -1451,7 +1451,6 @@ pub struct Shell<B: Serve> {
 
     adapters: crate::adapter::Slots,
 
-    blobs: crate::blob::Store,
 
     held: Vec<u32>,
 
@@ -3264,7 +3263,6 @@ impl<B: Serve> Shell<B> {
             adapters: adapter_slots,
 
             beam_appended: std::sync::Mutex::new(std::collections::HashMap::new()),
-            blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             bound: 0,
             rs_layout,
@@ -5925,52 +5923,26 @@ impl<B: Serve> Shell<B> {
         self.weights.banks()
     }
 
+    /// Binds instance `instance`'s adapter, `planes` its program's lora
+    /// sink laid at bind: a slot of its own, its planes registered there
+    /// the first time it is taken.
     pub fn bind_adapter(
         &mut self,
-        source: crate::adapter::Source<'_>,
+        instance: engine::program::InstanceId,
+        planes: &[crate::weights::AdapterPlane<'_>],
     ) -> Result<crate::adapter::Binding> {
-        let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
-            crate::adapter::Source::Shared { name } => {
-                crate::adapter::Key::Shared(self.blobs.stamp(name)?)
-            }
-        };
-        let shared = matches!(source, crate::adapter::Source::Shared { .. });
+        let key = crate::adapter::Key::Instance(instance);
         let grant = self.adapters.acquire(key.clone())?;
         if !grant.fresh {
             return Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: false,
                 key,
             });
         }
-
-        let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights.register_adapter(grant.slot, planes)
-            }
-            crate::adapter::Source::Shared { name } => {
-                let seats = self.weights.bank_seats();
-                match self.blobs.planes(name, &seats) {
-                    Ok((built, _fingerprint)) => {
-                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-                            .iter()
-                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
-                                bank: bank.as_str(),
-                                bytes,
-                            })
-                            .collect();
-                        self.weights.register_adapter(grant.slot, &planes)
-                    }
-                    Err(why) => Err(why),
-                }
-            }
-        };
-        match landed {
+        match self.weights.register_adapter(grant.slot, planes) {
             Ok(()) => Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: true,
                 key,
             }),
@@ -5979,10 +5951,6 @@ impl<B: Serve> Shell<B> {
                 Err(why)
             }
         }
-    }
-
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.blobs.mount(root);
     }
 
     #[must_use]
