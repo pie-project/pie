@@ -7,9 +7,9 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::Subcommand;
 
-use crate::local::hf::runtime_snapshot_allow_patterns;
 use crate::ui::{Align, Answer, Mark, Palette, Row, Table};
 
+pub mod check;
 pub mod facts;
 pub mod import;
 pub mod reload;
@@ -29,15 +29,24 @@ pub enum ModelCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Every architecture this build's packages hold models of.
+    Families,
+    /// Whether an import takes a repository or a folder, and whether this Mac holds it, before a weight is downloaded.
+    Check(check::CheckArgs),
+    /// An adapter's files at a pinned commit, hash-checked, linked into a folder.
+    Fetch(check::FetchArgs),
 }
 
-pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs) -> Result<Answer> {
+pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs, json: bool) -> Result<Answer> {
     match cmd {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),
-        ModelCmd::Import(args) => import::run(args, global),
+        ModelCmd::Import(args) => import::run(args, global, json),
         ModelCmd::Reload(args) => reload::run(args, global),
         ModelCmd::Remove { name, yes } => remove(name, yes),
+        ModelCmd::Families => check::families(),
+        ModelCmd::Check(args) => check::run(args),
+        ModelCmd::Fetch(args) => check::fetch(args, json),
     }
 }
 
@@ -525,7 +534,12 @@ impl crate::ui::Report for ModelInfo {
     }
 }
 
-pub(crate) fn fetch_snapshot(repo_id: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn fetch_snapshot(
+    repo_id: &str,
+    revision: Option<&str>,
+    allow: &[String],
+    json: bool,
+) -> Result<std::path::PathBuf> {
     parse_repo_id(repo_id)?;
     println!("Fetching {repo_id}");
 
@@ -533,10 +547,12 @@ pub(crate) fn fetch_snapshot(repo_id: &str) -> Result<std::path::PathBuf> {
         .enable_all()
         .build()?;
     let label = repo_id.to_string();
-    let progress = ProgressBar::new();
+    let revision = revision.map(str::to_string);
+    let allow = allow.to_vec();
+    let progress = ProgressBar::new(json);
     let sink = progress.sink();
     let snapshot_path = runtime.block_on(async move {
-        crate::local::hf::snapshot_download(&label, &runtime_snapshot_allow_patterns(), sink).await
+        crate::local::hf::snapshot_download(&label, revision.as_deref(), &allow, sink).await
     });
     progress.finish();
     let snapshot_path = snapshot_path?;
@@ -568,14 +584,26 @@ struct ProgressBarInner {
     total_files: AtomicU64,
     total_bytes: AtomicU64,
     bytes_done: AtomicU64,
+    /// The wanted bytes already on disk when the download started.
+    held: AtomicU64,
     started: Instant,
     last_draw: Mutex<Instant>,
     finished: AtomicBool,
     is_tty: bool,
+    /// Under the global `--json`, progress is JSON lines on stdout instead of the bar.
+    json: Option<crate::ui::JsonProgress>,
 }
 
 impl ProgressBarInner {
     fn draw(&self) {
+        if let Some(json) = &self.json {
+            let held = self.held.load(Ordering::Relaxed);
+            json.emit(
+                held + self.bytes_done.load(Ordering::Relaxed),
+                held + self.total_bytes.load(Ordering::Relaxed),
+            );
+            return;
+        }
         if !self.is_tty {
             return;
         }
@@ -619,9 +647,10 @@ impl ProgressBarInner {
 }
 
 impl crate::local::hf::Progress for ProgressBarInner {
-    fn start(&self, files: u64, bytes: u64) {
+    fn start(&self, files: u64, bytes: u64, held: u64) {
         self.total_files.store(files, Ordering::Relaxed);
         self.total_bytes.store(bytes, Ordering::Relaxed);
+        self.held.store(held, Ordering::Relaxed);
         self.draw();
     }
 
@@ -632,16 +661,18 @@ impl crate::local::hf::Progress for ProgressBarInner {
 }
 
 impl ProgressBar {
-    fn new() -> Self {
+    fn new(json: bool) -> Self {
         Self {
             inner: std::sync::Arc::new(ProgressBarInner {
                 total_files: AtomicU64::new(0),
                 total_bytes: AtomicU64::new(0),
                 bytes_done: AtomicU64::new(0),
+                held: AtomicU64::new(0),
                 started: Instant::now(),
                 last_draw: Mutex::new(Instant::now()),
                 finished: AtomicBool::new(false),
                 is_tty: std::io::stderr().is_terminal(),
+                json: json.then(|| crate::ui::JsonProgress::new("download")),
             }),
         }
     }
