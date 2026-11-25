@@ -269,6 +269,28 @@ struct Chunk {
     alias: Retained<ProtocolObject<dyn MTLBuffer>>,
     bytes: u64,
     mapped: u64,
+    /// In the mapping side's residency set. A heap kept spare is not: every
+    /// heap in the set is backed whole by the first frame committed.
+    resident: bool,
+}
+
+#[cfg(target_vendor = "apple")]
+impl Chunk {
+    /// Names the heap in the residency set (`resident`) or takes it out; the
+    /// caller commits the set. Answers whether it changed.
+    fn reside(&mut self, sparse: &Sparse, resident: bool) -> bool {
+        if self.resident == resident {
+            return false;
+        }
+        let heap = ProtocolObject::from_ref(&*self.heap);
+        if resident {
+            sparse.residency().addAllocation(heap);
+        } else {
+            sparse.residency().removeAllocation(heap);
+        }
+        self.resident = resident;
+        true
+    }
 }
 
 // SAFETY: the only thing in here that is not a plain integer is a `Retained`
@@ -662,10 +684,25 @@ impl Elastic {
                 continue;
             }
             let bytes = CHUNK.min(end - (from + slot as u64 * CHUNK));
-            let chunk = make_chunk(&self.sparse, bytes)?;
+            let chunk = place_chunk(&self.sparse, bytes)?;
             self.spare.push(Pending { through: 0, chunk });
         }
         Ok(())
+    }
+
+    /// Takes the spare heaps whose unmap has landed out of the residency
+    /// set. They stay allocated, so a map of the top makes none.
+    fn rest_spare(&mut self) {
+        let signalled = self.sparse.signalled();
+        let mut changed = false;
+        for spare in &mut self.spare {
+            if spare.through <= signalled {
+                changed |= spare.chunk.reside(&self.sparse, false);
+            }
+        }
+        if changed {
+            self.sparse.residency().commit();
+        }
     }
 
     /// Maps the top's slots `first..last` that are not mapped, charged to
@@ -700,6 +737,7 @@ impl Elastic {
         let target_buffer = self.buffer.clone();
         let mut mapped = 0;
         let mut fault = None;
+        let mut named = false;
         for slot in (first..last).rev() {
             if self.top[slot].is_some() {
                 continue;
@@ -731,10 +769,11 @@ impl Elastic {
                     }
                     Ok(chunk)
                 }
-                None => make_chunk(&self.sparse, bytes),
+                None => place_chunk(&self.sparse, bytes),
             };
             match made {
                 Ok(mut chunk) => {
+                    named |= chunk.reside(&self.sparse, true);
                     self.sparse.issue(
                         &target_buffer,
                         Some(&chunk.heap),
@@ -753,6 +792,9 @@ impl Elastic {
                 }
             }
         }
+        if named {
+            self.sparse.residency().commit();
+        }
         {
             let mut state = arena.lock();
             state.budget.reserved = state.budget.reserved.saturating_sub(bytes - mapped);
@@ -761,6 +803,7 @@ impl Elastic {
         }
         let through = self.sparse.flush()?;
         self.fence_at(through);
+        self.rest_spare();
         fault.map_or(Ok(()), Err)
     }
 
@@ -862,6 +905,7 @@ impl Elastic {
         // Kept, not freed: the next map of the top takes them back.
         self.spare
             .extend(emptied.into_iter().map(|chunk| Pending { through, chunk }));
+        self.rest_spare();
         Ok(())
     }
 
@@ -1179,6 +1223,7 @@ impl Drop for Elastic {
                 .iter()
                 .chain(self.top.iter().flatten())
                 .chain(self.spare.iter().map(|spare| &spare.chunk))
+                .filter(|chunk| chunk.resident)
             {
                 residency.removeAllocation(ProtocolObject::from_ref(&*chunk.heap));
             }
@@ -1244,9 +1289,19 @@ pub fn heaps_made() -> u64 {
     HEAPS_MADE.with(std::cell::Cell::get)
 }
 
-/// Make a placement heap of `bytes` and a buffer aliasing all of it.
+/// Make a placement heap of `bytes` named in the residency set.
 #[cfg(target_vendor = "apple")]
 fn make_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
+    let mut chunk = place_chunk(sparse, bytes)?;
+    chunk.reside(sparse, true);
+    sparse.residency().commit();
+    Ok(chunk)
+}
+
+/// Make a placement heap of `bytes` and a buffer aliasing all of it, not yet
+/// in the residency set.
+#[cfg(target_vendor = "apple")]
+fn place_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
     let descriptor = MTLHeapDescriptor::new();
     descriptor.setType(MTLHeapType::Placement);
     // Shared, not Private: on this hardware there is one pool of memory, and
@@ -1281,15 +1336,12 @@ fn make_chunk(sparse: &Sparse, bytes: u64) -> Result<Chunk> {
         why: format!("an alias over a {bytes}-byte placement heap was refused"),
     })?;
 
-    let residency = sparse.residency();
-    residency.addAllocation(ProtocolObject::from_ref(&*heap));
-    residency.commit();
-
     Ok(Chunk {
         heap,
         alias,
         bytes,
         mapped: 0,
+        resident: false,
     })
 }
 
