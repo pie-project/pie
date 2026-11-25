@@ -11,6 +11,8 @@ use crate::record;
 use super::{Lane, MROPE_COORDS, Media, PATCH_ROUTE_DROP, Seated, Shell};
 
 struct Ballot {
+    /// Whether other ranks vote with this one.
+    grouped: bool,
     slip: Option<crate::device::Buffer>,
 }
 
@@ -18,6 +20,7 @@ impl Ballot {
     fn open(device: &crate::device::Context) -> Ballot {
         let grouped = device.ctx().comm("arming ballot").is_ok();
         Ballot {
+            grouped,
             slip: grouped
                 .then(|| crate::device::Buffer::zeroed(4).ok())
                 .flatten(),
@@ -120,6 +123,11 @@ pub(super) struct Arming {
     unfireable: Vec<String>,
     verify: bool,
     group: bool,
+    /// No peer fires these compositions with this rank: what it gives back
+    /// or selects by its own room is its own business. A rank with peers
+    /// (expert or tensor parallel) votes on what stops every rank's captures,
+    /// and never skips a composition its peers fire.
+    alone: bool,
     records: bool,
     dropped: std::collections::BTreeSet<u32>,
     weighed: [(usize, usize); Kind::COUNT],
@@ -497,6 +505,7 @@ impl Shell {
         if let Some(bucket) = self.arm_only {
             targets.retain(|(at, ..)| *at == bucket);
         }
+        let ballot = Ballot::open(&self.device);
         // By rows, every kind's fewest first (`lattice_targets`): the
         // allowance running out leaves the largest rungs, stated eager.
         Some(Arming {
@@ -506,6 +515,7 @@ impl Shell {
             unfireable,
             verify,
             group,
+            alone: !group && !ballot.grouped,
             records,
             dropped: std::collections::BTreeSet::new(),
             weighed: [(0usize, 0usize); Kind::COUNT],
@@ -528,7 +538,7 @@ impl Shell {
             took: Some(0),
             began: std::time::Instant::now(),
             profiled: self.budget.buckets.len(),
-            ballot: Ballot::open(&self.device),
+            ballot,
         })
     }
 
@@ -545,7 +555,7 @@ impl Shell {
     /// base order is unchanged; the bodies themselves are weighed as they
     /// capture ([`Shell::arm_target`]).
     fn select_within_headroom(&mut self, st: &mut Arming) {
-        if st.verify || st.group || self.ep.is_some() || st.from_record {
+        if st.verify || !st.alone || st.from_record {
             return;
         }
         let mut spare = self
@@ -678,7 +688,7 @@ impl Shell {
         // none does, this composition is the one left eager (stated after
         // the loop) and arming goes on: a composition later in capture order
         // may rank above what is held.
-        if !st.verify && !st.group && self.ep.is_none() {
+        if !st.verify && st.alone {
             let rank = self.rule_rank(bucket, &target, treatment);
             loop {
                 // The room a capture has is the allowance net of what is
@@ -742,7 +752,7 @@ impl Shell {
         // A single rank gave back what it could above: only the bodies'
         // count stops it here. An expert-parallel group stops every rank's
         // captures where one runs out (the allowance or the headroom).
-        let single = !st.group && self.ep.is_none();
+        let single = st.alone;
         let mine = !st.verify
             && (spent.census.bodies >= record::MAX_BODIES
                 || (!single
@@ -883,7 +893,7 @@ impl Shell {
             // the user's rule ranks last among those held (this one or an
             // earlier) is given back, its weight off what the bodies took,
             // until they fit; each is stated eager after the loop.
-            if st.capped && !st.group && !st.verify {
+            if st.capped && st.alone && !st.verify {
                 while allowance_spent(self.cache.body_stats().census.bytes, self.bodies_mem) {
                     let Some(worst) = st
                         .held
