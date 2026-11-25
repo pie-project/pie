@@ -340,6 +340,9 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             };
             match cut {
                 Some((0, _)) => vec![Dist::Partial; outs.len()],
+                // A table cut along its columns: each rank a share of every
+                // row it looks up.
+                Some((1, blocks)) => vec![Dist::Split(blocks); outs.len()],
                 Some((axis, _)) => {
                     return Err(format!(
                         "`{}` reads a table split along axis {axis}",
@@ -408,6 +411,24 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                 .collect::<Result<_, _>>()?;
             if held.iter().all(|d| *d == held[0]) {
                 vec![held[0].clone(); outs.len()]
+            } else if let Some(rows) = spread_rows(pass, &followed, &held) {
+                // A bank's row added to partial sums: each rank adds its
+                // share, the row over the count of ranks, so the sum holds
+                // it once.
+                let k = 1.0 / pass.world as f32;
+                for v in rows {
+                    let ty = pass.trace.values[v.0 as usize].ty.clone();
+                    let share = pass.value(ty, Dist::Partial);
+                    pass.pending.push(Operation::Elemwise(Elemwise::Act {
+                        s: None,
+                        x: v,
+                        act: ActFn::Identity,
+                        scale: Some(k),
+                        x_out: share,
+                    }));
+                    at.replace(v, share);
+                }
+                vec![Dist::Partial; outs.len()]
             } else {
                 for v in followed {
                     at.make_whole(pass, v)?;
@@ -535,6 +556,15 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
     Ok((tree::op(at.tree), dists))
 }
 
+/// The whole rows of registered banks among `followed`, each read once, when
+/// the rest are partial sums: what a sum spreads across the ranks.
+fn spread_rows(pass: &Pass, followed: &[ValueId], held: &[Dist]) -> Option<Vec<ValueId>> {
+    let (rows, rest): (Vec<usize>, Vec<usize>) =
+        (0..followed.len()).partition(|i| held[*i] == Dist::Whole && pass.bank_row(followed[*i]));
+    (!rows.is_empty() && !rest.is_empty() && rest.iter().all(|i| held[*i] == Dist::Partial))
+        .then(|| rows.into_iter().map(|i| followed[i]).collect())
+}
+
 /// A row norm over `x`, a row the ranks split in `blocks`, as one rank
 /// runs it: its share's sum of squares, summed across the ranks, norms the
 /// share (Megatron's norm over a row of heads the ranks split). The ops
@@ -628,13 +658,18 @@ impl At {
     fn make_whole(&mut self, pass: &mut Pass, v: ValueId) -> Result<(), String> {
         let whole = pass.whole(v)?;
         if whole != v {
-            let swap = |id: ValueId| if id == v { whole } else { id };
-            self.tree = tree::renumbered(std::mem::replace(&mut self.tree, Tree::Unit), &swap);
-            for id in &mut self.ins {
-                *id = swap(*id);
-            }
+            self.replace(v, whole);
         }
         Ok(())
+    }
+
+    /// The op reading `with` where it read `v`.
+    fn replace(&mut self, v: ValueId, with: ValueId) {
+        let swap = |id: ValueId| if id == v { with } else { id };
+        self.tree = tree::renumbered(std::mem::replace(&mut self.tree, Tree::Unit), &swap);
+        for id in &mut self.ins {
+            *id = swap(*id);
+        }
     }
 
     /// An op on whole values reads no weight the ranks split, and a cache it

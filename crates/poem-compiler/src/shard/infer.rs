@@ -8,6 +8,11 @@
 //! of the sum, which the shard pass reduces. A weight an op reads beside a
 //! share (a bias, a head's sink) is cut as that share is.
 //!
+//! A registered bank's row a route picks (an adapter's scale or shift), read
+//! once, is held as its reader holds the rest: cut as a share it is read
+//! beside is, or a share of the partial sums it is added to, so an adapted
+//! row shards as the plain row does.
+//!
 //! A row norm over a share no product reads norms it where it is, each
 //! rank's sum of squares summed across the ranks, its gain cut as the
 //! share is; a pre-norm, whose row a product reads, wants it whole.
@@ -33,7 +38,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem_ir::{CacheRow, Def, Dim, Operands, Operation, ParamPlacement, Shard, Trace, Ty, ValueId};
+use poem_ir::{
+    CacheRow, Def, Dim, Gather, Operands, Operation, ParamPlacement, ParamSource, Shard, Trace, Ty,
+    ValueId,
+};
 
 use super::rules::{self, Rule};
 use crate::tree::{self, Tree};
@@ -205,6 +213,8 @@ struct Reading<'t> {
     logits: BTreeSet<usize>,
     /// Values a product contracts as its activation.
     contracted: BTreeSet<ValueId>,
+    /// A registered bank's rows a route picks, read once: each by its bank.
+    rows: BTreeMap<ValueId, usize>,
 }
 
 impl<'t> Reading<'t> {
@@ -265,8 +275,53 @@ impl<'t> Reading<'t> {
             tied: looked.intersection(&contracted_params).copied().collect(),
             logits,
             contracted,
+            rows: bank_rows(trace),
         }
     }
+}
+
+/// The rows of registered banks a route picks (`gather.embed` of a bank),
+/// each read by one op and by nothing else: each by its bank.
+pub(super) fn bank_rows(trace: &Trace) -> BTreeMap<ValueId, usize> {
+    let mut reads = vec![0u32; trace.values.len()];
+    let mut ins = Vec::new();
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        for v in &ins {
+            reads[v.0 as usize] += 1;
+        }
+    }
+    for decl in &trace.values {
+        if let Def::Merge(arms) = &decl.def {
+            for (arm, _) in arms {
+                reads[arm.0 as usize] += 1;
+            }
+        }
+    }
+    for output in &trace.outputs {
+        for v in output.values() {
+            reads[v.0 as usize] += 1;
+        }
+    }
+    let mut rows = BTreeMap::new();
+    for node in &trace.nodes {
+        if let Operation::Gather(Gather::Embed {
+            table,
+            weights: None,
+            scales: None,
+            concat: false,
+            y,
+            ..
+        }) = &node.op
+            && let Def::Weight(p) = trace.values[table.0 as usize].def
+            && trace.params[p as usize].source == ParamSource::Registered
+            && reads[y.0 as usize] == 1
+        {
+            rows.insert(*y, p as usize);
+        }
+    }
+    rows
 }
 
 fn param_of(trace: &Trace, t: &Tree, field: &str) -> Option<usize> {
@@ -580,6 +635,10 @@ impl<'r, 't> Walk<'r, 't> {
                         || self.trace().params[p].placement == ParamPlacement::Host
                 };
                 match tied {
+                    // A bank's row is held as the op that reads it says.
+                    _ if outs.iter().any(|o| self.reading.rows.contains_key(o)) => {
+                        vec![Held::Whole; outs.len()]
+                    }
                     Some(p) if banded(p) && self.decide(p, Cut::Column(0)) => {
                         vec![Held::Partial(BTreeSet::new()); outs.len()]
                     }
@@ -595,7 +654,8 @@ impl<'r, 't> Walk<'r, 't> {
                     self.read_whole(v);
                 }
                 let followed: Vec<ValueId> = follow.iter().flat_map(|n| field(n)).collect();
-                let helds: Vec<Held> = followed.iter().map(|v| self.held(*v)).collect();
+                let mut helds: Vec<Held> = followed.iter().map(|v| self.held(*v)).collect();
+                self.place_rows(&followed, &mut helds, true);
                 let held = self.joined(&helds);
                 // Partial sums added to what is not are reduced first.
                 if !matches!(held, Held::Partial(_)) {
@@ -729,6 +789,36 @@ impl<'r, 't> Walk<'r, 't> {
         }
     }
 
+    /// The banks' rows among `values` an op reads with the rest held as
+    /// `helds`: beside shares, each cut as they are; added to partial sums
+    /// (`sums`, an op linear in them), each a share of the sum, as the shard
+    /// pass spreads it across the ranks. A bank no reader cuts is whole.
+    fn place_rows(&mut self, values: &[ValueId], helds: &mut [Held], sums: bool) {
+        let rows: Vec<usize> = (0..values.len())
+            .filter(|i| helds[*i] == Held::Whole && self.reading.rows.contains_key(&values[*i]))
+            .collect();
+        if rows.is_empty() || rows.len() == values.len() {
+            return;
+        }
+        let rest = || (0..values.len()).filter(|i| !rows.contains(i));
+        if rest().all(|i| matches!(helds[i], Held::Split(_))) {
+            let like = rest().next().map(|i| values[i]);
+            let share = Held::Split(shares(helds));
+            for i in rows {
+                let p = self.reading.rows[&values[i]];
+                self.beside(p, like, &share, false);
+                if matches!(self.cuts[p], Some(Cut::Beside(..))) {
+                    self.held[values[i].0 as usize] = Some(share.clone());
+                    helds[i] = share.clone();
+                }
+            }
+        } else if sums && rest().all(|i| matches!(helds[i], Held::Partial(_))) {
+            for i in rows {
+                helds[i] = Held::Partial(BTreeSet::new());
+            }
+        }
+    }
+
     /// Weight `p`, read beside `like` (a value held as `share`): cut along
     /// its axis as wide as that share, its leading one if `rows` lets a
     /// narrower one hold a row a head, else whole.
@@ -784,7 +874,9 @@ impl<'r, 't> Walk<'r, 't> {
                 self.want_whole(*v);
             }
         }
-        let helds: Vec<Held> = followed.iter().map(|(_, v)| self.held(*v)).collect();
+        let mut helds: Vec<Held> = followed.iter().map(|(_, v)| self.held(*v)).collect();
+        let values: Vec<ValueId> = followed.iter().map(|(_, v)| *v).collect();
+        self.place_rows(&values, &mut helds, false);
         let split = helds.iter().any(|h| matches!(h, Held::Split(_)));
         let cut = others.iter().filter_map(|v| self.cache(*v)).any(cache_cut);
         let reads_cache = others.iter().any(|v| self.cache(*v).is_some());

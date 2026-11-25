@@ -159,6 +159,8 @@ struct Pass {
     /// The ops the rule being applied lands before its node.
     pending: Vec<Operation>,
     whole: BTreeMap<ValueId, ValueId>,
+    /// The rows of registered banks a route picks, each by its bank.
+    rows: BTreeMap<ValueId, usize>,
 }
 
 impl Pass {
@@ -172,6 +174,7 @@ impl Pass {
             after: vec![Vec::new(); n],
             pending: Vec::new(),
             whole: BTreeMap::new(),
+            rows: infer::bank_rows(&trace),
             trace,
         }
     }
@@ -330,6 +333,14 @@ impl Pass {
 
     fn is_weight(&self, v: ValueId) -> bool {
         matches!(self.trace.values[v.0 as usize].def, Def::Weight(_))
+    }
+
+    /// Whether `v` is a row a route picks of a registered bank every rank
+    /// holds whole, read by one op: an adapter's per-row scale or shift.
+    fn bank_row(&self, v: ValueId) -> bool {
+        self.rows
+            .get(&v)
+            .is_some_and(|p| self.trace.params[*p].shard == Shard::Replicated)
     }
 
     fn cache_split(&self, v: ValueId) -> Option<bool> {
