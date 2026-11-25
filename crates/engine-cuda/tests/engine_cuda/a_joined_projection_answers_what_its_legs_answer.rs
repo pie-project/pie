@@ -237,6 +237,25 @@ const ROWS: [&str; 11] = [
     "inkling-mini-l7-e8-bf16-kv-bf16",
 ];
 
+/// Rows whose legs apart this engine does not yet answer as joined: the
+/// apart form is what serves only where the compiler cannot join them.
+/// Muse's apart answers 0.17 off over a spread of 3.2, as its joined trace
+/// does with its qkv write unfused: its unit-RMS q and k heads, unscaled,
+/// score keys 3.9 apart under its softmax scale, and its eight layers carry
+/// a last-place rounding 5% of the spread.
+const APART_OPEN: [&str; 1] = ["muse-glimmer-30b-mini-l8-bf16-kv-bf16"];
+
+#[test]
+#[ignore = "the engine's apart forms of these rows are open"]
+fn the_open_rows_answer_apart_what_they_answer_joined() {
+    if !engine_cuda::device::present() {
+        return;
+    }
+    for name in APART_OPEN {
+        check(name);
+    }
+}
+
 #[test]
 fn a_joined_projection_answers_what_its_legs_answer() {
     if !engine_cuda::device::present() {

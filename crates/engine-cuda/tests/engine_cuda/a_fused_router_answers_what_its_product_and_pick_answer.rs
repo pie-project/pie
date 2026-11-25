@@ -118,6 +118,8 @@ fn logits(trace: &Trace, container: &Path, fused: bool, prompt: &[u32]) -> Vec<f
             chip: Some(chip),
             ..Knobs::default()
         },
+        // One context's kv beside the shapes every working set binds.
+        kv_budget: Some(engine_cuda::store::KvSize::Tokens(u64::from(CEILING))),
         ..crate::common::boot(
             trace.clone(),
             &contract,

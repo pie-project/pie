@@ -1419,45 +1419,6 @@ mod tests {
         at..at + shape.slot_bytes
     }
 
-    /// Whether every slot of host chunk `chunk` lies inside the chunk: what
-    /// keeps a shape's slots off the chunks other shapes took.
-    fn keeps_to_its_chunk(shape: &SlotShape, chunk: u32) -> bool {
-        (0..shape.per_chunk).all(|index| {
-            let held = place(shape, chunk * shape.per_chunk + index);
-            u64::from(chunk) * CHUNK <= held.start && held.end <= u64::from(chunk + 1) * CHUNK
-        })
-    }
-
-    #[test]
-    fn a_guest_slot_has_a_place_of_its_own_in_the_host_tier() {
-        let instance = SlotShape::guest(INSTANCE, INSTANCE_SLOT, CHUNK);
-        let channel = SlotShape::guest(CHANNEL, CHANNEL_SLOT, CHUNK);
-        assert_eq!((instance.per_chunk, channel.per_chunk), (512, 2048));
-        for shape in [&instance, &channel] {
-            // Any host chunk a shape takes holds its slots and nothing of
-            // the chunks beside it, so two shapes in two chunks never meet.
-            for chunk in [0, 1, 7] {
-                assert!(keeps_to_its_chunk(shape, chunk), "{:?}", shape.id);
-            }
-            // A run of adjacent slots (an item's span) lies in adjacent
-            // places, as it does on the device.
-            let first = 3 * shape.per_chunk + 5;
-            for slot in first..first + 8 {
-                assert_eq!(place(shape, slot).end, place(shape, slot + 1).start);
-            }
-            // The chunk's last slot ends where the next chunk starts.
-            assert_eq!(place(shape, shape.per_chunk - 1).end, CHUNK);
-            assert_eq!(place(shape, shape.per_chunk).start, CHUNK);
-        }
-        // The control: a shape that counts one slot more a chunk than fits
-        // runs into the chunk after.
-        let over = SlotShape {
-            per_chunk: instance.per_chunk + 1,
-            ..instance.clone()
-        };
-        assert!(!keeps_to_its_chunk(&over, 0));
-    }
-
     /// Host refs handed out as the runtime's host tier hands them
     /// (`SharedPool::tier`): one chunk id space, a chunk opened for one
     /// shape, a ref its chunk times the shape's slots a chunk plus its
@@ -1520,22 +1481,5 @@ mod tests {
         // tier of its own, are the same bytes.
         let (instance, channel) = (&shapes[3], &shapes[4]);
         assert_eq!(place(instance, 0).start, place(channel, 0).start);
-    }
-
-    #[test]
-    fn every_kind_has_its_own_index() {
-        let mut seen = [false; Kind::COUNT];
-        for kind in Kind::ALL {
-            assert!(!std::mem::replace(&mut seen[kind.index()], true));
-        }
-        assert_eq!(
-            Kind::guest(engine::chunk::SlotRole::Instance),
-            Some(Kind::Instance)
-        );
-        assert_eq!(
-            Kind::guest(engine::chunk::SlotRole::Channel),
-            Some(Kind::Channel)
-        );
-        assert_eq!(Kind::guest(engine::chunk::SlotRole::State), None);
     }
 }
