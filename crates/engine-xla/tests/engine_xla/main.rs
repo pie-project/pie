@@ -1,10 +1,15 @@
 //! engine-xla's integration tests, one binary: each module was a test file.
 
 mod a_batched_decode_answers_what_each_lane_answers_alone;
+mod a_beam_step_matches_the_host_replay;
+mod a_corrupt_recorded_program_is_built_again;
 mod a_device_fold_replays_what_a_host_fold_replays;
 mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
+mod a_pool_view_reads_the_packed_rows_order;
+mod a_readout_lands_in_one_plane_shape;
 mod a_registered_channel_carries_one_cell_across_its_instances;
+mod a_stale_trace_record_is_traced_again;
 mod an_adapter_lies_in_its_slots;
 mod an_output_less_run_fences_the_slot_it_read;
 mod common;
@@ -25,6 +30,7 @@ mod a_mask_reads_from_the_committed_boundary;
 mod a_tier_read_lands_every_slot_whole;
 mod a_prompt_length_reuses_its_programs;
 mod an_epilogue_agrees_with_the_host_interpreter;
+mod host_bank;
 mod kernels_act;
 mod kernels_attn;
 mod kernels_collective;
@@ -50,3 +56,5 @@ mod nemotron_traces_on_a_dry_device;
 mod pjrt_runs_a_built_module;
 mod snapshots;
 mod speed;
+
+mod streamed_weights;

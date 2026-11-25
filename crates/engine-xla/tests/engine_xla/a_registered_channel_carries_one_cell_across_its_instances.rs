@@ -181,3 +181,89 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
         "every pass ran on the device"
     );
 }
+
+/// Takes a cell the host wrote, adds `[0, 1]`, and puts the sum on the
+/// reader ring: an instance the host gave no cell blocks.
+fn incrementer() -> TraceContainer {
+    let mut program = counter();
+    program.channels[0].host_role = HostRole::Writer;
+    program.stages[0].ops = vec![
+        Op::ChanTake(0),
+        Op::Iota { len: 2 },
+        Op::Add(0, 1),
+        Op::ChanPut { chan: 1, value: 2 },
+    ];
+    program
+}
+
+/// One instance's pass faulting in a step faults its lanes alone: the
+/// step's outcome names that instance's lane, and the other instance's
+/// pass in the same step commits its output.
+#[test]
+fn a_guest_fault_fails_its_own_lanes_alone() {
+    let Some(_device) = common_dit::device() else {
+        return;
+    };
+    let plan = plan();
+    let weights = Weights::random(&plan, 17);
+    let mut rig = Rig::load(plan, &weights, 64, vec![1, 2, 16, 32, 64], None);
+    let mut refs = crate::common_llm::Refs::of_facts(rig.loaded.caps.chunks.clone());
+    let kv = refs.shapes(|s| s.role == engine::chunk::SlotRole::State)[0].id;
+    let (page_a, page_b) = (refs.take(kv), refs.take(kv));
+    let program = rig.register(incrementer());
+    let bound = |rig: &mut Rig, seeded: bool| -> InstanceId {
+        let input = rig.channel_of(vec![2], Dtype::U32, HostRole::Writer);
+        let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
+        engine::Programs::bind(&mut rig.engine, &InstanceBinding {
+                program,
+                channels: vec![input, out],
+                seeds: if seeded {
+                    vec![ChannelSeed {
+                        channel: 0,
+                        bytes: words(&SEED),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                geometry: GeometryClass::Host,
+                device_resolved: Default::default(),
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
+                extents: BindExtents::default(),
+                scratch: engine::ScratchPlace::None,
+                pair: engine::ScratchPlace::None,
+                pair_generation: 0,
+            })
+            .expect("the instance binds")
+            .id
+    };
+    let fed = bound(&mut rig, true);
+    let starved = bound(&mut rig, false);
+    let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = std::sync::Arc::clone(&outcomes);
+    engine::Completion::on_complete(&mut rig.engine, std::sync::Arc::new(move |_, outcome| {
+        heard.lock().expect("outcomes lock").push(outcome);
+    }));
+    rig.fire(
+        vec![
+            host_lane(kv, 1, vec![3], vec![page_a], 0),
+            host_lane(kv, 2, vec![3], vec![page_b], 0),
+        ],
+        vec![attach(0, fed), attach(1, starved)],
+        Vec::new(),
+    );
+    let outcomes = outcomes.lock().expect("outcomes lock").clone();
+    assert_eq!(outcomes.len(), 1, "the step lands once: {outcomes:?}");
+    let faulted = &outcomes[0].faulted;
+    assert_eq!(faulted.len(), 1, "one lane faults: {faulted:?}");
+    assert_eq!(faulted[0].lane, 1, "the starved instance's lane");
+    assert_eq!(faulted[0].instance, Some(starved));
+    let bytes = engine::Channels::take(&mut rig.engine, fed, 1)
+        .expect("the reader ring reads")
+        .expect("the fed instance's pass committed its cell");
+    let cell: Vec<u32> = (bytes.as_chunks::<4>().0.iter())
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    assert_eq!(cell, vec![SEED[0], SEED[1] + 1], "the fed instance's sum");
+}

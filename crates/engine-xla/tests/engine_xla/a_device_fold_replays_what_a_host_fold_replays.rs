@@ -268,3 +268,49 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
         "a pipelined device fold leaves what the host fold leaves"
     );
 }
+
+/// A KV-only set (no recurrent state) is folded by its program's `fold`
+/// count just the same: each reporting lane's fire reports that count as
+/// its `fold`, two frames in flight included (the second submitted before
+/// the first settles), so the runtime's cursor comes to rest at the tokens
+/// folded. A reporting lane no program is attached to reports none (the
+/// negative control).
+#[test]
+fn a_kv_only_device_fold_reports_its_count() {
+    if crate::common_dit::device().is_none() {
+        return;
+    }
+    let mut model = Model::load_with("qwen3-micro-text", None, 256, 7, None);
+    let mut refs = Refs::of(&model);
+    let instance = bind_fold(&mut model);
+    let heard: std::sync::Arc<std::sync::Mutex<Vec<engine::KvWrites>>> = Default::default();
+    let into = std::sync::Arc::clone(&heard);
+    engine::Completion::on_complete(&mut model.engine, std::sync::Arc::new(move |_, outcome| {
+        into.lock().expect("heard").extend(outcome.wrote);
+    }));
+    let mut seq = Seq::new(0);
+    let mut lane = |model: &Model, refs: &mut Refs, seed: u64, tag: u64| {
+        let mut lane = seq.lane(model, refs, tokens(seed, ROWS as usize, model.vocab));
+        seq.held += ROWS;
+        lane.reports = tag;
+        lane
+    };
+    let a = lane(&model, &mut refs, 41, 101);
+    tell(&mut model, instance, &a);
+    let first = submit(&mut model, a, Some(instance));
+    let b = lane(&model, &mut refs, 42, 102);
+    tell(&mut model, instance, &b);
+    let second = submit(&mut model, b, Some(instance));
+    drop(first);
+    let _ = settled(&mut model, second);
+    let mut other = Seq::new(1);
+    let mut plain = other.lane(&model, &mut refs, tokens(43, ROWS as usize, model.vocab));
+    plain.reports = 103;
+    let ticket = submit(&mut model, plain, None);
+    let _ = settled(&mut model, ticket);
+    let heard = heard.lock().expect("heard");
+    let fold = |tag: u64| heard.iter().find(|w| w.tag == tag).map(|w| w.fold);
+    assert_eq!(fold(101), Some(Some(N)), "the first fire reports its count");
+    assert_eq!(fold(102), Some(Some(N)), "the second, in flight with it, its own");
+    assert_eq!(fold(103), Some(None), "a lane no program folds reports no count");
+}
