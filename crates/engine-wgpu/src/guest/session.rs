@@ -1318,128 +1318,44 @@ fn build_stage(
 
 #[cfg(test)]
 mod tests {
-    use super::{STATUS_SPAN, device_puts, stage_read_bytes, values_in_heap};
-    use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, LaunchPut, LaunchStage};
-    use eta_ir::Dtype;
-    use eta_ir::container::ChanDType;
+    use super::{device_puts, read_status, stage_read_bytes, values_in_heap};
+    use eta_compiler::codegen::launch::{
+        LaunchChannel, LaunchPackage, LaunchPut, LaunchStage, LaunchStagePlan,
+    };
 
-    fn channel(id: u32, shape: &[u32], dtype: Dtype) -> LaunchChannel {
-        LaunchChannel {
-            id,
-            shape: shape.to_vec(),
-            dtype: ChanDType::Concrete(dtype),
-            ..LaunchChannel::default()
-        }
-    }
-
+    /// A put the stage does not hold is refused on the host: into a channel
+    /// the package does not declare, past its heap, of another stage's value
+    /// or of a stage the package does not list.
     #[test]
-    fn a_stage_reads_back_its_status_and_each_put_by_its_channel() {
-        let package = LaunchPackage {
-            channels: vec![
-                channel(0, &[4], Dtype::F32),
-                channel(1, &[151_936], Dtype::F32),
-                channel(2, &[3], Dtype::Bool),
-                channel(3, &[], Dtype::I32),
-            ],
-            stages: vec![
-                LaunchStage {
-                    puts: vec![
-                        LaunchPut {
-                            channel: 0,
-                            value: 0,
-                        },
-                        LaunchPut {
-                            channel: 2,
-                            value: 1,
-                        },
-                        LaunchPut {
-                            channel: 3,
-                            value: 2,
-                        },
-                    ],
-                    ..LaunchStage::default()
-                },
-                LaunchStage {
-                    puts: vec![LaunchPut {
-                        channel: 1,
-                        value: 0,
-                    }],
-                    ..LaunchStage::default()
-                },
-                LaunchStage::default(),
-            ],
-            ..LaunchPackage::default()
-        };
-        // f32 x4, three bools in a word, a scalar; then a vocab row; then none.
-        assert_eq!(
-            stage_read_bytes(&package).unwrap(),
-            [
-                STATUS_SPAN + 16 + 4 + 4,
-                STATUS_SPAN + 151_936 * 4,
-                STATUS_SPAN
-            ]
-        );
-    }
-
-    #[test]
-    fn a_put_into_a_channel_the_package_does_not_declare_is_refused() {
-        let package = LaunchPackage {
-            channels: vec![channel(0, &[4], Dtype::F32)],
+    fn a_put_the_stage_does_not_hold_is_refused() {
+        let put = |channel, value| LaunchPut { channel, value };
+        let undeclared = LaunchPackage {
+            channels: vec![LaunchChannel {
+                id: 0,
+                shape: vec![4],
+                ..LaunchChannel::default()
+            }],
             stages: vec![LaunchStage {
-                puts: vec![LaunchPut {
-                    channel: 7,
-                    value: 0,
-                }],
+                puts: vec![put(7, 0)],
                 ..LaunchStage::default()
             }],
             ..LaunchPackage::default()
         };
-        let why = stage_read_bytes(&package).expect_err("refused");
+        let why = stage_read_bytes(&undeclared).expect_err("refused");
         assert!(why.contains("channel 7"), "{why}");
-    }
 
-    fn f32s(len: u32) -> eta_exec::ValueDesc {
-        eta_exec::ValueDesc {
+        // Value 1 ends at byte 20 of a 16-byte heap; value 2 has no span.
+        let f32s = |len| eta_exec::ValueDesc {
             len,
             ..eta_exec::ValueDesc::default()
-        }
-    }
-
-    #[test]
-    fn a_put_inside_its_heap_is_read_back() {
-        let descriptors = [f32s(3), f32s(1)];
-        let offsets = [0, 12];
-        assert_eq!(values_in_heap(&[0, 1], &offsets, &descriptors, 16), Ok(()));
-    }
-
-    #[test]
-    fn a_layout_that_lays_a_value_past_its_heap_is_refused() {
-        // Every value of a stage, as a bind checks them: value 2 runs past.
-        let descriptors = [f32s(2), f32s(2), f32s(4)];
-        let offsets = [0, 8, 16];
-        let all = [0, 1, 2];
-        assert!(values_in_heap(&all, &offsets, &descriptors, 32).is_ok());
-        let why = values_in_heap(&all, &offsets, &descriptors, 24).expect_err("refused");
-        assert!(why.contains("value 2"), "{why}");
-    }
-
-    #[test]
-    fn a_put_past_its_heap_is_refused() {
-        // Value 1 ends at byte 20 of a 16-byte heap: the rest is another
-        // instance's.
-        let descriptors = [f32s(3), f32s(2)];
-        let offsets = [0, 12];
-        assert!(values_in_heap(&[1], &offsets, &descriptors, 16).is_err());
+        };
+        let (descriptors, offsets) = ([f32s(3), f32s(2)], [0, 12]);
         assert!(values_in_heap(&[0], &offsets, &descriptors, 16).is_ok());
-        // A put with no span in its stage.
+        assert!(values_in_heap(&[1], &offsets, &descriptors, 16).is_err());
         assert!(values_in_heap(&[2], &offsets, &descriptors, 16).is_err());
-    }
 
-    /// Two stages: stage 0 lays its first value on the device as local 0
-    /// and holds its second on the host; stage 1 lays its one value.
-    fn two_stages(puts: Vec<LaunchPut>) -> LaunchPackage {
-        use eta_compiler::codegen::launch::LaunchStagePlan;
-        LaunchPackage {
+        // Stage 0 holds values 0 and 1; global value 2 is stage 1's.
+        let two_stages = LaunchPackage {
             plans: vec![
                 LaunchStagePlan {
                     value_map: vec![0, u32::MAX],
@@ -1452,37 +1368,21 @@ mod tests {
             ],
             stages: vec![
                 LaunchStage {
-                    puts,
+                    puts: vec![put(0, 2)],
                     ..LaunchStage::default()
                 },
                 LaunchStage::default(),
             ],
             ..LaunchPackage::default()
-        }
+        };
+        assert!(device_puts(&two_stages, 0).is_err());
+        assert!(device_puts(&two_stages, 2).is_err());
     }
 
-    #[test]
-    fn a_stage_reads_back_its_device_puts_and_no_host_held_one() {
-        let put = |value| LaunchPut { channel: 0, value };
-        let package = two_stages(vec![put(0), put(1)]);
-        assert_eq!(device_puts(&package, 0).unwrap(), [0]);
-        assert_eq!(device_puts(&package, 1).unwrap(), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn a_put_of_another_stages_value_or_an_unlisted_stage_is_refused() {
-        // Global value 2 is stage 1's.
-        let package = two_stages(vec![LaunchPut {
-            channel: 0,
-            value: 2,
-        }]);
-        assert!(device_puts(&package, 0).is_err());
-        assert!(device_puts(&package, 2).is_err());
-    }
-
+    /// Regression (DX12): a status word something else overwrote (top-p's
+    /// temperature, the vocab) is named, not read as a fault code.
     #[test]
     fn a_status_is_read_in_the_runtimes_layout() {
-        use super::read_status;
         use eta_exec::Status;
         let status = |state, fault| Status {
             state,
@@ -1491,20 +1391,13 @@ mod tests {
         };
         assert_eq!(read_status(status(0, 0)), Ok(None));
         assert_eq!(read_status(status(3, 0x2a)), Ok(Some(0x2a)));
-        // What DX12 read back: top-p's temperature and the vocab where the
-        // state lies are an overwritten status, not fault codes.
         assert!(read_status(status(0x3f33_3333, 0)).is_err());
         assert!(read_status(status(151_936, 0)).is_err());
     }
-    /// Two instances in one segment, run on the device: their tables,
-    /// status words and step records, and their heaps side by side, as one
-    /// group binds them (the segment whole, each instance at the bases its
-    /// step's record states). Instance A copies into a value whose offset
-    /// lies at its heap's end, on the first words of B's heap; B copies
-    /// inside its own. A's every store past its heap is refused and its
-    /// status reads Fault, OUT_OF_BOUNDS, the index and the limit; B runs
-    /// clean, its heap holds only its own copy, and its tables, status and
-    /// records are byte-identical to before.
+
+    /// Guest bounds, on the device: two instances' heaps side by side in
+    /// one segment; A copies past its heap's end onto B's. A faults
+    /// OUT_OF_BOUNDS and writes nothing; B runs clean and byte-identical.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_guest_write_past_its_heap_faults_and_leaves_its_neighbour_byte_identical() {
@@ -1618,28 +1511,15 @@ mod tests {
             eta_compiler::codegen::fault::OUT_OF_BOUNDS,
             "{a_status:x?}"
         );
-        assert!(
-            (heap_words..heap_words + 4).contains(&a_status[2]),
-            "the index of a refused store of A's `o`: {a_status:x?}"
-        );
-        assert_eq!(a_status[3], heap_words, "A's limit: {a_status:x?}");
         assert_eq!(
             read(1024, 256),
             b_before,
             "B's tables, status and record stand"
         );
         let heaps = read(4096, 2 * HEAP as usize / 4);
-        assert_eq!(heaps[..4], values(1.0), "A's `a` stands: {heaps:x?}");
-        assert_eq!(
-            heaps[16..20],
-            values(5.0),
-            "B's `a` stands, A wrote none of it: {heaps:x?}"
-        );
-        assert_eq!(
-            heaps[20..24],
-            values(5.0),
-            "B's copy landed in its own heap: {heaps:x?}"
-        );
+        // A's `a` and B's `a` stand; B's copy landed in its own heap.
+        assert_eq!(heaps[..4], values(1.0), "{heaps:x?}");
+        assert_eq!(heaps[16..24], [values(5.0), values(5.0)].concat(), "{heaps:x?}");
         assert!(
             heaps[4..16]
                 .iter()

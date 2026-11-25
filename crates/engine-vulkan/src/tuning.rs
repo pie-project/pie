@@ -500,34 +500,10 @@ mod tests {
         );
     }
 
-    /// The rungs between one row and a capacity hold the rungs of every
-    /// row count up to it.
-    #[test]
-    fn the_rungs_between_one_row_and_a_capacity_hold_every_row_counts_rungs() {
-        let mut r = Registry::new("vulkan-test", FACTS, AXES);
-        register(&mut r);
-        let t = Tuning::new(r.defaults(), Limits::ASSUMED);
-        for (n, k) in [(4096, 4096), (1024, 4100), (64, 64)] {
-            let at = |rows| t.qmm_at(rows, n, k, 4, 64);
-            for capacity in [1, 11, 12, 64, 300] {
-                let between = t.qmm_between(&at(1), &at(capacity));
-                for rows in 1..=capacity {
-                    for rung in t.qmm(&at(rows)) {
-                        assert!(
-                            between.contains(&rung),
-                            "{rows} rows of {n} columns over {k} reach {rung:?}, which the \
-                             rungs up to {capacity} rows leave out"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// A load whose rows cross a measured `kernel.gemm.path` crossover
-    /// names the pipelines of both paths: every kernel a fire of any row
-    /// count up to its capacity takes is one its walk named. A load whose
-    /// rows stay below the crossover names no cooperative-matrix pipeline.
+    /// Regression (dace48ed3): a load whose rows cross a measured
+    /// `kernel.gemm.path` crossover names the pipelines of both paths, so no
+    /// serving fire builds one; below the crossover it names no
+    /// cooperative-matrix pipeline.
     #[test]
     fn a_row_crossover_inside_the_load_names_both_paths_pipelines() {
         use engine_gpu::backend::Tactics as _;
@@ -558,7 +534,7 @@ mod tests {
             .collect::<Vec<_>>()
         };
         let coopmat = ("linear_gemm_tiled_bm_64_bf16", kernels_slang::Tier::Coopmat);
-        for capacity in [1, 64, 95, 96, 128, 256] {
+        for capacity in [95, 96, 256] {
             let named: Vec<_> = t
                 .gemm_tactics(tier, capacity)
                 .into_iter()

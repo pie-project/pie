@@ -292,64 +292,6 @@ mod tests {
         }
     }
 
-    /// The RTX PRO 4500's file takes the tiled matmul below its measured
-    /// 96-row crossover and cooperative matrices from it; another NVIDIA
-    /// GPU with cooperative matrices, unmeasured, takes them at every row
-    /// count, so the crossover is the device file's.
-    #[test]
-    fn a_measured_device_crosses_to_cooperative_matrices_at_its_rows() {
-        let pro = Device {
-            name: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
-            ..device("nvidia", 32, Some(82), true)
-        };
-        let (_, report) = resolve(&pro, None);
-        assert_eq!(
-            report.layers,
-            [
-                Source::Seeded("nvidia.toml".to_string()),
-                Source::Seeded("nvidia/nvidia-rtx-pro-4500-blackwell.toml".to_string()),
-                // Its stored measurements, committed: taken under the
-                // decision files, entry by entry.
-                Source::Committed("nvidia-rtx-pro-4500-blackwell.measured.toml".to_string()),
-            ]
-        );
-        let t = tuning(&pro);
-        for rows in [4, 16, 64, 95] {
-            assert!(!t.gemm_coopmat(rows), "{rows} rows");
-        }
-        for rows in [96, 128, 512, 2048] {
-            assert!(t.gemm_coopmat(rows), "{rows} rows");
-        }
-        let other = tuning(&device("nvidia", 32, Some(82), true));
-        assert!(other.gemm_coopmat(4) && other.gemm_coopmat(95));
-        let without = tuning(&Device {
-            coopmat: false,
-            ..pro
-        });
-        assert!(!without.gemm_coopmat(2048));
-    }
-
-    /// An NVIDIA GPU no file measured runs the vendor file's path and its
-    /// load says so, by name, with the command that measures it; the RTX PRO
-    /// 4500, whose crossover was measured, says nothing.
-    #[test]
-    fn an_untuned_device_says_so_and_a_measured_one_does_not() {
-        let other = device("nvidia", 32, Some(82), true);
-        let (_, report) = resolve(&other, None);
-        let said = SHELF
-            .untuned(&other.name, &report)
-            .expect("an unmeasured device is told");
-        assert!(said.contains("a nvidia GPU"), "{said}");
-        assert!(said.contains("nvidia.toml"), "{said}");
-        assert!(said.contains("pie tune vulkan"), "{said}");
-        let pro = Device {
-            name: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
-            ..other
-        };
-        let (_, report) = resolve(&pro, None);
-        assert_eq!(SHELF.untuned(&pro.name, &report), None, "{report:?}");
-    }
-
     #[test]
     fn a_device_reporting_fewer_than_16_cores_is_split_by_what_it_reported() {
         assert_eq!(

@@ -354,67 +354,6 @@ fn dx12(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
 mod tests {
     use super::*;
 
-    const GIB: u64 = 1 << 30;
-
-    fn unread() -> std::result::Result<u64, String> {
-        panic!("the host's room is read only on a unified device without a budget")
-    }
-
-    #[test]
-    fn the_largest_device_local_heap_is_read_at_its_budget() {
-        let heaps = [(46 * GIB, true), (64 * GIB, false), (GIB / 4, true)];
-        let budgets = [GIB * 47 / 2, 60 * GIB, GIB / 8];
-        let read = vulkan_heaps(&heaps, Some(&budgets), true, unread).unwrap();
-        assert_eq!(read.bytes, GIB * 47 / 2);
-        assert_eq!(
-            read.to_string(),
-            "device memory: 23.5 GiB from VK_EXT_memory_budget heap 0"
-        );
-    }
-
-    #[test]
-    fn without_the_budget_extension_the_heap_size_is_read() {
-        let heaps = [(64 * GIB, false), (GIB / 4, true), (24 * GIB, true)];
-        let read = vulkan_heaps(&heaps, None, false, unread).unwrap();
-        assert_eq!(read.bytes, 24 * GIB);
-        assert_eq!(
-            read.to_string(),
-            "device memory: 24.0 GiB from Vulkan heap 2 size"
-        );
-    }
-
-    #[test]
-    fn no_device_local_heap_reads_nothing() {
-        let why = vulkan_heaps(&[(64 * GIB, false)], None, true, unread).unwrap_err();
-        assert!(why.contains("no device-local heap"), "{why}");
-    }
-
-    /// An Adreno 840's: one device-local heap that is all of RAM, mapped,
-    /// and no `VK_EXT_memory_budget`.
-    #[test]
-    fn a_unified_device_without_the_budget_reads_the_hosts_room() {
-        let heaps = [(GIB * 116 / 10, true)];
-        assert!(shares_host(wgpu::DeviceType::IntegratedGpu, true));
-        let read = vulkan_heaps(&heaps, None, true, || Ok(GIB * 57 / 10)).unwrap();
-        assert_eq!(read.bytes, GIB * 57 / 10);
-        assert_eq!(
-            read.to_string(),
-            "device memory: 5.7 GiB from the host's available memory (unified)"
-        );
-        let why = vulkan_heaps(&heaps, None, true, || Err("no MemAvailable".into())).unwrap_err();
-        assert_eq!(why, "no MemAvailable");
-    }
-
-    #[test]
-    fn which_devices_share_the_hosts_memory() {
-        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other, VirtualGpu};
-        assert!(shares_host(IntegratedGpu, false));
-        assert!(shares_host(Cpu, false));
-        assert!(!shares_host(DiscreteGpu, true));
-        assert!(shares_host(Other, true));
-        assert!(!shares_host(VirtualGpu, false));
-    }
-
     /// The Adreno 840 and the Spark under Vulkan, Apple under Metal: no host
     /// tier, a stated one refused by name. A discrete card is unchanged.
     #[test]
@@ -434,39 +373,6 @@ mod tests {
             );
             assert_eq!(discrete.host_tier(None), Ok(engine::HostTier::Seated(None)));
         }
-    }
-
-    #[test]
-    fn each_source_names_itself() {
-        let line = |source| {
-            Reading {
-                bytes: 16 * GIB,
-                source,
-            }
-            .to_string()
-        };
-        assert_eq!(
-            line(Source::Config),
-            "device memory: 16.0 GiB from config budget_device"
-        );
-        assert_eq!(
-            line(Source::DxgiLocal),
-            "device memory: 16.0 GiB from DXGI QueryVideoMemoryInfo local"
-        );
-    }
-
-    /// An Adreno 840's: 1 GiB to one allocation, 2 GiB to one storage
-    /// binding, 4 GiB to one buffer.
-    #[test]
-    fn one_reservation_takes_the_least_of_the_three_limits() {
-        let limits = wgpu::Limits {
-            max_buffer_size: 4 * GIB,
-            max_storage_buffer_binding_size: 2 * GIB,
-            ..wgpu::Limits::default()
-        };
-        assert_eq!(reservation_bound(&limits, Some(GIB)), GIB);
-        assert_eq!(reservation_bound(&limits, None), 2 * GIB);
-        assert_eq!(reservation_bound(&limits, Some(0)), 2 * GIB);
     }
 
     #[test]

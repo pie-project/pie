@@ -17,36 +17,6 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
-    /// A timed step's frame committed as a serving step is, and its device
-    /// time read as the landing reads it: filled by its work-done callback
-    /// (its timestamps' readback mapped, or the host's clock from its
-    /// submit), awaited here only by the test.
-    pub fn fired_time(frame: engine_wgpu::device::Frame, _keep: bool) -> Option<u64> {
-        let pending = frame.commit_async(None).expect("the frame is submitted");
-        pending.wait().expect("the frame lands");
-        let time = pending.device_time();
-        loop {
-            if let Some(ns) = time.get() {
-                return ns;
-            }
-            std::thread::yield_now();
-        }
-    }
-
-    /// wgpu times no frame apart from its own fires here: nothing to watch.
-    pub fn watch_frames(_on: bool) {}
-
-    /// `None`: wgpu keeps no longest frame span.
-    pub fn longest_frame_ns() -> Option<u64> {
-        None
-    }
-
-    /// The backend's profile registry: what a user's or a committed file is
-    /// read against.
-    pub fn registry() -> &'static profile::Registry {
-        engine_wgpu::chip::registry()
-    }
-
     pub const NAME: &str = "wgpu";
     pub const PLATFORM: poem::Platform = poem::Platform::Wgpu;
     /// Kernels compile to WGSL: no register-tiled or cooperative-matrix

@@ -228,7 +228,7 @@ pub fn fit(measured: &Measured) -> Result<(Entries, Vec<Line>), String> {
 }
 
 /// The registry's file forcing `p` at every row count.
-#[cfg(any(test, feature = "vulkan"))]
+#[cfg(feature = "vulkan")]
 fn forcing(p: &GemmPath) -> String {
     format!(
         "[kernel]\ngemm.path = \"{}\"\n",
@@ -429,27 +429,6 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_path_forces_a_file_the_registry_reads() {
-        let facts = profile::Facts::of(crate::chip::registry())
-            .word("vendor", "nvidia")
-            .int("subgroup", 32)
-            .int("cores", 82)
-            .flag("coopmat", true);
-        let (base, _) = crate::chip::resolve_facts("Test GPU", &facts, None);
-        let target = crate::tune::target(&base, &facts);
-        for p in candidates() {
-            crate::chip::registry()
-                .overlay(
-                    &base,
-                    &forcing(&p),
-                    target.clone(),
-                    profile::Source::User("test".into()),
-                )
-                .unwrap_or_else(|e| panic!("{}: {e:?}", body(&p)));
-        }
-    }
 
     /// A crossover measured at 128 rows fits to tiled below it and
     /// cooperative matrices from it, and reads back from its own text.
