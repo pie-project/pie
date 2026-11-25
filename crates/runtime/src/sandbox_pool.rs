@@ -39,12 +39,28 @@ pub fn note_maps_before_engines() {
     if BEFORE_ENGINES.get().is_some() {
         return;
     }
-    if let Ok(space) = read_address_space() {
-        let _ = BEFORE_ENGINES.set(BeforeEngines {
-            mapped: space.mapped,
-            maps: space.maps.map(|maps| maps.used),
-        });
+    if let Ok(held) = held_now() {
+        let _ = BEFORE_ENGINES.set(held);
     }
+}
+
+/// What this process holds now.
+#[cfg(target_os = "macos")]
+fn held_now() -> Result<BeforeEngines> {
+    Ok(BeforeEngines {
+        mapped: mapped_now()?,
+        maps: None,
+    })
+}
+
+/// What this process holds now.
+#[cfg(not(target_os = "macos"))]
+fn held_now() -> Result<BeforeEngines> {
+    let space = read_address_space()?;
+    Ok(BeforeEngines {
+        mapped: space.mapped,
+        maps: space.maps.map(|maps| maps.used),
+    })
 }
 
 /// Keeps for the rest of the process what it held before its engines
@@ -437,17 +453,28 @@ pub(crate) fn parse_maps(maps: &str, floor: Option<u64>) -> Result<AddressSpace>
     })
 }
 
+/// The lowest address 64-bit macOS maps: past the 4 GiB page zero.
+#[cfg(target_os = "macos")]
+const PAGE_ZERO: u64 = 1 << 32;
+/// `MACH_VM_MAX_ADDRESS`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MAX_ADDRESS: u64 = 0x0000_7FFF_FE00_0000;
+/// `MACH_VM_MAX_ADDRESS`.
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+const MAX_ADDRESS: u64 = 0x0000_7FFF_FFE0_0000;
+
+/// What this process maps: its task's virtual size.
+#[cfg(target_os = "macos")]
+fn mapped_now() -> Result<u64> {
+    runtime_sys::address::task_virtual_size()
+        .map_err(|error| anyhow::anyhow!("proc_pidinfo(PROC_PIDTASKINFO): {error}"))
+}
+
 /// 64-bit macOS gives a process the addresses from its 4 GiB page zero to
 /// `MACH_VM_MAX_ADDRESS`; what it maps is its task's virtual size.
 #[cfg(target_os = "macos")]
 pub(crate) fn read_address_space() -> Result<AddressSpace> {
-    const PAGE_ZERO: u64 = 1 << 32;
-    #[cfg(target_arch = "aarch64")]
-    const MAX_ADDRESS: u64 = 0x0000_7FFF_FE00_0000;
-    #[cfg(not(target_arch = "aarch64"))]
-    const MAX_ADDRESS: u64 = 0x0000_7FFF_FFE0_0000;
-    let mapped = runtime_sys::address::task_virtual_size()
-        .map_err(|error| anyhow::anyhow!("proc_pidinfo(PROC_PIDTASKINFO): {error}"))?;
+    let mapped = mapped_now()?;
     let free = (MAX_ADDRESS - PAGE_ZERO).saturating_sub(mapped);
     // What the process maps does not lie in one place (the shared region,
     // the GPU's ranges, the weights), so the range free in one piece is
@@ -455,7 +482,7 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     // process its reserve, that range less the reserve: the rest's later
     // mappings may land in it.
     let mut space = AddressSpace {
-        largest_free: largest_reservation(free),
+        largest_free: largest_gap()?.min(free),
         free,
         mapped,
         reserve: 0,
@@ -467,24 +494,23 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     Ok(space)
 }
 
-/// The largest range, to the GiB and at most `upper`, an address-only
-/// reservation takes now: each try reserved without access or backing and
-/// let go at once.
+/// The largest range no mapping of this process lies in, down to a whole
+/// GiB, read off its mappings.
 #[cfg(target_os = "macos")]
-fn largest_reservation(upper: u64) -> u64 {
+fn largest_gap() -> Result<u64> {
     const GIB: u64 = 1 << 30;
-    let reserves = runtime_sys::address::reserves;
-    let (mut fits, mut over) = (0u64, upper.saturating_add(GIB));
-    while over - fits > GIB {
-        let mid = fits + (over - fits) / 2 / GIB * GIB;
-        let mid = mid.max(fits + GIB);
-        if reserves(mid) {
-            fits = mid;
-        } else {
-            over = mid;
-        }
+    let (mut cursor, mut largest) = (PAGE_ZERO, 0u64);
+    while cursor < MAX_ADDRESS {
+        let mapping = runtime_sys::address::mapping_from(cursor)
+            .map_err(|code| anyhow::anyhow!("mach_vm_region_recurse: {code}"))?;
+        let Some(mapping) = mapping.filter(|mapping| mapping.size > 0) else {
+            break;
+        };
+        largest = largest.max(mapping.address.min(MAX_ADDRESS).saturating_sub(cursor));
+        cursor = cursor.max(mapping.address.saturating_add(mapping.size));
     }
-    fits
+    largest = largest.max(MAX_ADDRESS.saturating_sub(cursor));
+    Ok(largest / GIB * GIB)
 }
 
 /// Windows: the process's user address space, region by region
@@ -867,6 +893,30 @@ ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]
             "reserving the pool's {} failed: {}",
             show(bytes),
             std::io::Error::last_os_error()
+        );
+    }
+
+    /// The range read off the process's mappings is the one an address-only
+    /// reservation takes, found here by halving to the GiB.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_largest_gap_is_what_a_reservation_takes() {
+        let reserves = runtime_sys::address::reserves;
+        let (mut fits, mut over) = (0u64, MAX_ADDRESS);
+        while over - fits > GIB {
+            let mid = (fits + (over - fits) / 2 / GIB * GIB).max(fits + GIB);
+            if reserves(mid) {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        let gap = largest_gap().unwrap();
+        assert!(
+            gap.abs_diff(fits) <= GIB,
+            "{} read, {} reserved",
+            show(gap),
+            show(fits)
         );
     }
 }
