@@ -3,5 +3,6 @@
 mod deadline;
 mod defaults;
 mod fair;
+mod keep_session;
 mod priority;
 mod rig;

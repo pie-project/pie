@@ -13,6 +13,7 @@ members = [
     "default",
     "default-cluster",
     "fair",
+    "keep-session",
     "noop",
     "priority",
     "test-pause",
