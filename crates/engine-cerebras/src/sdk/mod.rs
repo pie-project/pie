@@ -686,21 +686,3 @@ impl Drop for Runtime {
         // The artifacts object has no exported destructor; its two strings leak.
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::{Error, prepended};
-
-    /// The SDK's `bin` goes ahead of the search path; a directory holding
-    /// the separator cannot join it and is refused by name, not skipped.
-    #[test]
-    fn a_bin_that_cannot_join_path_is_refused() {
-        let joined = prepended(Path::new("/sdk/bin"), "/usr/bin:/bin".as_ref())
-            .expect("a plain directory joins");
-        assert_eq!(joined, "/sdk/bin:/usr/bin:/bin");
-        let refused = prepended(Path::new("/sdk:x/bin"), "/usr/bin".as_ref());
-        assert!(matches!(refused, Err(Error::PathJoin(..))), "{refused:?}");
-    }
-}

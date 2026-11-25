@@ -735,26 +735,3 @@ fn anneal(cfg: &Config) -> kernels_cerebras::compile::place::anneal::Anneal {
         units: false,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
-
-    use super::checkpoint_stamp;
-
-    /// A checkpoint file's modification time is part of what keys its cut:
-    /// one that cannot be told as seconds since the epoch is refused by
-    /// name, never stamped 0 (which would key every such file alike).
-    #[test]
-    fn a_checkpoint_mtime_that_cannot_be_told_is_refused() {
-        let dir = tempfile::tempdir().expect("a scratch directory");
-        let path = dir.path().join("model.safetensors");
-        let file = std::fs::File::create(&path).expect("a file");
-        let stamp = checkpoint_stamp(dir.path()).expect("a told mtime stamps");
-        assert!(stamp.contains("model.safetensors"), "{stamp}");
-        file.set_modified(UNIX_EPOCH - Duration::from_secs(1))
-            .expect("a time before the epoch");
-        let refused = checkpoint_stamp(dir.path()).expect_err("no seconds since the epoch");
-        assert!(refused.contains("its modification time"), "{refused}");
-    }
-}

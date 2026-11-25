@@ -252,6 +252,8 @@ impl Shell {
         let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
         let mut facts = self.pools.chunk_facts(max_tokens, &rungs)?;
         (facts.held_bytes, facts.outside_bytes) = self.held_and_outside();
+        facts.record_bytes = self.record_bytes();
+        facts.windowed = self.windowed_layers();
         // Each rung's replay scratch, from the extended run's reserve
         // (`store::rs::Buffers::reserve`): `RsScratch::need(rows_ext, row)`,
         // `(rows_ext + 64) * row + 4 MiB`, laid for the widest bucket's

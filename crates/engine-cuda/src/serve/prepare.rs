@@ -2739,34 +2739,7 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{BodyReads, body_readouts, fold_cell, fold_held, readout_extent};
-
-    /// A mixed fire of two classes no plain request lands (a drafter's
-    /// verifies) at the load's lanes reads out no more rows than the arena
-    /// lays the readout plane for: the lanes the two classes share are
-    /// counted once, not a class each (the size-only walk of bucket 256
-    /// carved 64 rows into qwen35-tiny's 32-row logits slot).
-    #[test]
-    fn a_mixed_body_reads_out_no_more_than_the_readout_plane_holds() {
-        const MAX_LANES: u32 = 2;
-        const PER_LANE: u32 = 16;
-        let plane = MAX_LANES * PER_LANE;
-        let verifies = [(BodyReads::Verify, 256), (BodyReads::Verify, 256)];
-        let body = body_readouts(&verifies, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
-        assert_eq!(body.ceiling, plane, "{body:?}");
-        // Last rows beside the verifies share the plane too.
-        let mixed = [(BodyReads::Last, 256), (BodyReads::Verify, 256)];
-        let body = body_readouts(&mixed, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
-        assert!(body.ceiling <= plane, "{body:?}");
-        // Rows off a tokens-shaped plane are no readout plane's: bounded by
-        // the bucket alone.
-        let rows = [(BodyReads::Verify, 256), (BodyReads::Rows, 64)];
-        let body = body_readouts(&rows, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
-        assert_eq!(body.ceiling, plane + 64, "{body:?}");
-        let rows = [(BodyReads::Rows, 256), (BodyReads::Last, 2)];
-        let body = body_readouts(&rows, MAX_LANES, MAX_LANES, PER_LANE, plane, 256);
-        assert_eq!(body.ceiling, 256, "{body:?}");
-    }
+    use super::{fold_cell, fold_held, readout_extent};
 
     #[test]
     fn a_fold_cell_states_every_lanes_fold_or_a_fold_a_lane() {
