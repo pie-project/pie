@@ -712,6 +712,9 @@ function checkBundle(bytes: Uint8Array): void {
   const size = bytes.length - end;
   for (const [name, tensor] of Object.entries(header as Record<string, { dtype?: string; shape?: number[]; data_offsets?: number[] }>)) {
     if (name === '__metadata__') continue;
+    if (typeof tensor !== 'object' || tensor === null) {
+      throw new InferletError(`adapter bundle: tensor \`${name}\` is not a JSON object`);
+    }
     const width = ({ F32: 4, BF16: 2, F16: 2 } as Record<string, number>)[tensor.dtype ?? ''];
     if (width === undefined) {
       throw new InferletError(`adapter bundle: tensor \`${name}\` is ${tensor.dtype}; a bank is F32, BF16 or F16`);

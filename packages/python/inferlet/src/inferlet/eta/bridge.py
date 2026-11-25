@@ -777,11 +777,18 @@ def _check_bundle(data: bytes) -> None:
     for name, tensor in header.items():
         if name == "__metadata__":
             continue
+        if not isinstance(tensor, dict):
+            raise InferletError(f"adapter bundle: tensor `{name}` is not a JSON object")
         width = {"F32": 4, "BF16": 2, "F16": 2}.get(tensor.get("dtype"))
         if width is None:
             raise InferletError(f"adapter bundle: tensor `{name}` is {tensor.get('dtype')!r}; a bank is F32, BF16 or F16")
-        begin, stop = tensor.get("data_offsets", (None, None))
-        count = math.prod(tensor.get("shape", ()))
+        shape, offsets = tensor.get("shape"), tensor.get("data_offsets")
+        if not (isinstance(shape, list) and all(isinstance(d, int) and d >= 0 for d in shape)):
+            raise InferletError(f"adapter bundle: tensor `{name}` has no shape")
+        if not (isinstance(offsets, list) and len(offsets) == 2):
+            raise InferletError(f"adapter bundle: tensor `{name}` has no data offsets")
+        begin, stop = offsets
+        count = math.prod(shape)
         if not (isinstance(begin, int) and isinstance(stop, int) and 0 <= begin <= stop <= size and stop - begin == count * width):
             raise InferletError(f"adapter bundle: tensor `{name}` spans bytes {begin}..{stop} of {size} for {count} elements of {width} bytes")
 

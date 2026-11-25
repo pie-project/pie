@@ -65,14 +65,20 @@ fn check(bytes: &[u8]) -> Result<(), String> {
         let numel = tensor
             .get("shape")
             .and_then(Value::as_array)
-            .and_then(|dims| dims.iter().map(Value::as_u64).product::<Option<u64>>())
+            .and_then(|dims| {
+                dims.iter()
+                    .try_fold(1u64, |all, dim| all.checked_mul(dim.as_u64()?))
+            })
             .ok_or_else(|| refuse("has no shape"))?;
         let span = tensor
             .get("data_offsets")
             .and_then(Value::as_array)
             .and_then(|at| Some((at.first()?.as_u64()?, at.get(1)?.as_u64()?)))
             .ok_or_else(|| refuse("has no data offsets"))?;
-        if span.0 > span.1 || span.1 > data as u64 || span.1 - span.0 != numel * width {
+        if span.0 > span.1
+            || span.1 > data as u64
+            || numel.checked_mul(width) != Some(span.1 - span.0)
+        {
             return Err(refuse(&format!(
                 "spans bytes {}..{} of {data} for {numel} elements of {width} bytes",
                 span.0, span.1
