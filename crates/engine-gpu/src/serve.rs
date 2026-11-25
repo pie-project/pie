@@ -4485,8 +4485,12 @@ impl<B: Serve> Shell<B> {
     /// (vendor, device id, driver), the code of every kernel the load's
     /// fires can ask for, the guest emitter's and planner's versions, and
     /// the tuning its fires run by (the profile's decisions, the dense
-    /// kernel each rung takes, the tier and the load's lanes and rows).
-    /// Nothing of the build but these: a version bump reuses the cover.
+    /// kernel a one-row fire takes at each plane, the tier and the load's
+    /// lanes). The cover is timed over a lone lane's one-row decode frames
+    /// (two warm rounds' difference, which cancels the prompt), so neither
+    /// the rows its widest rung holds nor the kernels its wider fires take
+    /// key it: they follow the memory a load finds. Nothing of the build but
+    /// these: a version bump reuses the cover.
     pub fn cover_fingerprint(&self, on: &str) -> Result<String> {
         use crate::backend::Tactics as _;
         let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
@@ -4500,15 +4504,14 @@ impl<B: Serve> Shell<B> {
             .collect();
         // The picks as resolved, whichever layer decided them (a user's
         // stored entry, a committed one, a measurement, the estimate under
-        // skip): the dense kernel each rung takes after the settle, and the
-        // workgroups a guest step strides over; never which file stated them.
+        // skip): the dense kernel a one-row fire takes after the settle, and
+        // the workgroups a guest step strides over; never which file stated them.
         let tuning = profile::rates::fingerprint(
             format!(
-                "{decisions:?}|{:?}|{:?}|{}|{}|cores {} resident {:?}",
-                self.dense,
+                "{decisions:?}|{}|{:?}|{}|cores {} resident {:?}",
+                self.dense.one_row(),
                 self.tier,
                 self.budgets.tokens.max_lanes,
-                self.budgets.tokens.max_tokens,
                 crate::backend::Context::cores(&self.device),
                 crate::backend::Context::resident(&self.device),
             )
