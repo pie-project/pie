@@ -13,7 +13,6 @@ pub(super) struct FireRows {
 }
 
 impl FireRows {
-
     pub(super) fn of(lanes: impl IntoIterator<Item = FireRows>) -> FireRows {
         lanes
             .into_iter()

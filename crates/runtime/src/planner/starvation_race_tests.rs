@@ -9,9 +9,9 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::proc::Residency;
+use super::proc::{PendingBind, Proc, Residency};
 use super::reclaim::Reclaim;
-use super::wait::WaitKind;
+use super::wait::{EntryKey, WaitKind};
 
 use crate::planner::grant::Demand;
 use crate::store::kv::page_table::PhysicalKvPageId;
@@ -184,6 +184,1211 @@ impl PoolPort for RacePool {
     fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
         None
     }
+}
+
+#[test]
+fn a_younger_process_is_not_admitted_while_an_older_one_is_preempted() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    use futures::FutureExt;
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>
+    ));
+    let [evicted, killed, younger] = [(); 3].map(|_| ProcessId::new_v4());
+    for pid in [evicted, killed, younger] {
+        planner.register(pid);
+    }
+    planner.with_inner(|inner| inner.procs.get_mut(&evicted).unwrap().state = Residency::Evicted);
+    let mut admit = Box::pin(planner.admit(younger));
+    assert!(admit.as_mut().now_or_never().is_none());
+
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&evicted).unwrap().state = Residency::Resident;
+        inner.killing.insert(killed);
+    });
+    assert!(admit.as_mut().now_or_never().is_none());
+
+    let respawn = ProcessId::new_v4();
+    planner.register_with_seq(respawn, planner.spawn_seq(killed).unwrap());
+    planner.unregister(killed);
+    assert!(planner.admit(respawn).now_or_never().is_some());
+    assert!(admit.as_mut().now_or_never().is_none());
+    planner.note_admitted(respawn);
+    assert!(admit.as_mut().now_or_never().is_some());
+}
+
+#[test]
+fn a_head_short_of_state_beside_free_pages_is_funded_by_eviction() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    // The head lacks a state slot while the device has kv pages to
+    // spare: the pages a queued decode step asks for are supply, not a
+    // deficit the eviction planner should defer on.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let stores = crate::store::registry::get(model, 0);
+    {
+        let mut rs = stores.rs.lock().unwrap();
+        let ws = rs.create_working_set(crate::store::rs::RsGeometry {
+            state_size: 64,
+            buffer_page_tokens: 4,
+        });
+        let folded = rs.prepare_group(ws, true, false, None, None, None).unwrap();
+        let published = rs.publish_prepared(folded).unwrap();
+        rs.settle(published);
+    }
+    let pool = Arc::new(RacePool {
+        rs_model: Some(model),
+        ..RacePool::new(64)
+    });
+    pool.refill_after_stall(64, 0);
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, younger) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [head, younger] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    planner.with_inner(|inner| {
+        for (pid, kv_pages, slots) in [(head, 0, 2), (younger, 1, 0)] {
+            let rs = RsUnits {
+                slots,
+                pages: 0,
+                ..RsUnits::default()
+            };
+            inner.enqueue(pid, allocation(Demand { kv_pages, rs }));
+        }
+    });
+    let victims = planner.victim_set().expect("the head is short");
+    assert_eq!(
+        victims.deficit,
+        Reclaim {
+            pages: 0,
+            rs: RsUnits {
+                slots: 1,
+                pages: 0,
+                ..RsUnits::default()
+            }
+        }
+    );
+    assert_eq!(victims.members.len(), 1);
+    assert_eq!(victims.members[0].pid, younger);
+}
+
+#[test]
+fn a_wedged_head_short_of_state_alone_still_reclaims_by_restart() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    // The head asks for a state slot and no pages: the pages it has
+    // do not cover it, so a stalled fleet with nothing to evict reclaims
+    // the youngest ask rather than waiting on a serve that cannot come.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let stores = crate::store::registry::get(model, 0);
+    let held = stores
+        .rs
+        .lock()
+        .unwrap()
+        .reserve(RsUnits {
+            slots: 2,
+            pages: 0,
+            ..RsUnits::default()
+        })
+        .unwrap();
+    let pool = Arc::new(RacePool {
+        rs_model: Some(model),
+        ..RacePool::new(8)
+    });
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let (head, younger) = (ProcessId::new_v4(), ProcessId::new_v4());
+    let mut keys = Vec::new();
+    planner.with_inner(|inner| {
+        for (pid, kv_pages, slots) in [(head, 0, 1), (younger, 1, 0)] {
+            let rs = RsUnits {
+                slots,
+                pages: 0,
+                ..RsUnits::default()
+            };
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            let mut proc = Proc::new(seq);
+            proc.admitted = true;
+            inner.procs.insert(pid, proc);
+            keys.push(inner.enqueue(pid, allocation(Demand { kv_pages, rs })));
+        }
+    });
+    assert!(planner.is_wedged());
+    planner.check_starvation(StarveCause::NoEligibleVictim);
+    planner.with_inner(|inner| {
+        assert!(matches!(
+            inner.queue[&keys[0]].kind,
+            WaitKind::Allocation { outcome: None, .. }
+        ));
+        assert!(matches!(
+            inner.queue[&keys[1]].kind,
+            WaitKind::Allocation {
+                outcome: Some(Err(PlannerError::Starved { .. })),
+                ..
+            }
+        ));
+    });
+    stores.rs.lock().unwrap().release_reservation(held);
+}
+
+/// A dry pool of eight pages, an older lane's growth and a younger prompt
+/// waiting on it, neither holding a page a kill could free: the off run's
+/// moment, when a third process had just finished.
+fn dry_pool_two_asks(planner: &ResidencyPlanner) -> Vec<EntryKey> {
+    planner.with_inner(|inner| {
+        [(ProcessId::new_v4(), 1), (ProcessId::new_v4(), 3)]
+            .into_iter()
+            .map(|(pid, kv_pages)| {
+                let seq = inner.next_seq;
+                inner.next_seq += 1;
+                let mut proc = Proc::new(seq);
+                proc.admitted = true;
+                inner.procs.insert(pid, proc);
+                inner.enqueue(
+                    pid,
+                    allocation(Demand {
+                        kv_pages,
+                        rs: RsUnits::default(),
+                    }),
+                )
+            })
+            .collect()
+    })
+}
+
+fn unfailed(planner: &ResidencyPlanner, keys: &[EntryKey]) -> usize {
+    planner.with_inner(|inner| {
+        keys.iter()
+            .filter(|key| {
+                matches!(
+                    inner.queue[key].kind,
+                    WaitKind::Allocation { outcome: None, .. }
+                )
+            })
+            .count()
+    })
+}
+
+type HeldResidency = Arc<std::sync::Mutex<crate::inferlet::process::residency::ProcessResidency>>;
+
+/// A process about to leave: registered and admitted, its residency naming
+/// one KV working set that holds two device pages. With `hold`, the set
+/// holds the process's [`crate::planner::Departure`] as its context gives
+/// it one.
+struct Leaving {
+    pid: ProcessId,
+    ws: crate::store::kv::working_set::KvWorkingSet,
+    departure: Arc<crate::planner::Departure>,
+    residency: HeldResidency,
+}
+
+fn leaving(planner: &Arc<ResidencyPlanner>, model: usize, hold: bool) -> Leaving {
+    use crate::inferlet::process::residency::{ProcessResidency, register_residency};
+    let stores = crate::store::registry::get(model, 0);
+    let id = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        let id = kv.create_working_set();
+        kv.reserve(id, 2).unwrap();
+        let mut granted = kv.reserve_device_pages(2).unwrap();
+        kv.ensure_backed_reserved(id, 2, &mut granted).unwrap();
+        id
+    });
+    let ws = crate::store::kv::working_set::KvWorkingSet::new(model, 0, id, 16);
+    let pid = ProcessId::new_v4();
+    let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+    residency
+        .lock()
+        .unwrap()
+        .kv_working_sets
+        .insert((model, 0, id), ws.suspend_handle());
+    register_residency(pid, Arc::downgrade(&residency));
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let departure = planner.departure(pid).expect("a registered process");
+    assert!(Arc::ptr_eq(&departure, &planner.departure(pid).unwrap()));
+    if hold {
+        ws.hold_departure(departure.clone());
+    }
+    Leaving {
+        pid,
+        ws,
+        departure,
+        residency,
+    }
+}
+
+/// `Process::terminate`'s planner steps: the planner forgets it, it gives
+/// its own hold up, its residency goes. Its working set, still in the
+/// resource table the teardown holds, is what is left.
+fn terminate(
+    planner: &Arc<ResidencyPlanner>,
+    leaving: Leaving,
+) -> (ProcessId, crate::store::kv::working_set::KvWorkingSet) {
+    planner.unregister(leaving.pid);
+    drop(leaving.departure);
+    crate::inferlet::process::residency::unregister_residency(leaving.pid);
+    drop(leaving.residency);
+    assert!(planner.departure(leaving.pid).is_none(), "it has left");
+    (leaving.pid, leaving.ws)
+}
+
+/// A dry pool of eight pages at `model`'s locus, where the departing
+/// processes' working sets live.
+fn departure_pool(model: usize) -> Arc<dyn PoolPort> {
+    Arc::new(RacePool {
+        rs_model: Some(model),
+        ..RacePool::new(8)
+    })
+}
+
+fn on_its_way_back(planner: &ResidencyPlanner, pid: ProcessId) -> Option<u32> {
+    planner.with_inner(|inner| inner.evicting.get(&pid).map(|mark| mark.pages))
+}
+
+fn youngest_starved(planner: &ResidencyPlanner, keys: &[EntryKey]) {
+    planner.with_inner(|inner| {
+        assert!(matches!(
+            inner.queue[&keys[0]].kind,
+            WaitKind::Allocation { outcome: None, .. }
+        ));
+        assert!(matches!(
+            inner.queue[&keys[1]].kind,
+            WaitKind::Allocation {
+                outcome: Some(Err(PlannerError::Starved { .. })),
+                ..
+            }
+        ));
+    });
+}
+
+#[test]
+fn a_departure_s_pages_are_waited_for_before_an_ask_holding_nothing_fails() {
+    // The finished process has left the planner, but its working set still
+    // holds its pages until the teardown drops its resources: nothing fails
+    // while it does. Once the set is released, a stall that remains is a
+    // wedge, and the youngest ask fails as before.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let keys = dry_pool_two_asks(&planner);
+    let (pid, ws) = terminate(&planner, leaving(&planner, model, true));
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    assert!(!planner.is_wedged(), "its pages are on their way back");
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(
+        unfailed(&planner, &keys),
+        2,
+        "an ask fails while a departure's pages come back"
+    );
+    // The release itself pokes the planner, which finds the wedge: no
+    // later event is needed to fail the youngest ask.
+    drop(ws);
+    assert_eq!(on_its_way_back(&planner, pid), None, "its set is released");
+    youngest_starved(&planner, &keys);
+}
+
+#[test]
+fn a_departure_held_behind_a_long_fire_is_waited_for_however_long() {
+    // The departed process's working set is released while a fire still
+    // leases it (a launch can take minutes): its pages come back only when
+    // the lease drops. No clock is involved: the planner waits for the
+    // release itself, so the empty asker does not fail before it.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    crate::planner::init_planner(model, 0, ResidencyPlanner::new(departure_pool(model)));
+    let planner = crate::planner::planner_for(model, 0).expect("the test model's planner");
+    let keys = dry_pool_two_asks(&planner);
+    let gone = leaving(&planner, model, true);
+    let lease = gone.ws.fire_lease().expect("a fire leases the working set");
+    let (pid, ws) = terminate(&planner, gone);
+    ws.release();
+    drop(ws);
+    for _ in 0..100 {
+        planner.check_starvation(StarveCause::NoSwapRoom);
+    }
+    assert_eq!(
+        unfailed(&planner, &keys),
+        2,
+        "an ask fails while the departure's release waits on a fire"
+    );
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    drop(lease);
+    assert_eq!(
+        on_its_way_back(&planner, pid),
+        None,
+        "the fire's end releases the working set"
+    );
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    assert_eq!(
+        unfailed(&planner, &keys),
+        1,
+        "a stall that outlasts the release is a wedge"
+    );
+}
+
+#[test]
+fn a_departure_never_waits_on_its_pages_nor_outlives_its_holds() {
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+
+    // Its exit is not held up by a set a fire leases: its asks and its
+    // place go at once, and the completion is credited.
+    let gone = leaving(&planner, model, true);
+    let ask = planner.with_inner(|inner| {
+        inner.enqueue(
+            gone.pid,
+            allocation(Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            }),
+        )
+    });
+    let lease = gone.ws.fire_lease().unwrap();
+    let credit = planner.with_inner(|inner| inner.completion_credit);
+    let (pid, ws) = terminate(&planner, gone);
+    planner.with_inner(|inner| {
+        assert!(!inner.procs.contains_key(&pid));
+        assert!(!inner.queue.contains_key(&ask));
+        assert_eq!(inner.completion_credit, credit + 1);
+    });
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    drop((ws, lease));
+    assert_eq!(on_its_way_back(&planner, pid), None);
+
+    // A set released before its process leaves leaves nothing on the way.
+    let gone = leaving(&planner, model, true);
+    gone.ws.release();
+    let (pid, _ws) = terminate(&planner, gone);
+    assert_eq!(on_its_way_back(&planner, pid), None);
+
+    // A suspend in flight as it leaves: the suspend's end does not settle
+    // the departure, its set's release does.
+    let gone = leaving(&planner, model, true);
+    let wake = planner.with_inner(|inner| {
+        inner.begin_eviction(
+            gone.pid,
+            Reclaim {
+                pages: 2,
+                rs: RsUnits::default(),
+            },
+        )
+    });
+    drop(wake);
+    let (pid, ws) = terminate(&planner, gone);
+    planner.report_evicted(pid, 2, RsUnits::default());
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    planner.eviction_failed(pid);
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    drop(ws);
+    assert_eq!(on_its_way_back(&planner, pid), None);
+}
+
+#[test]
+fn a_state_set_a_handle_takes_gives_its_owner_s_hold_back() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    // A process's sets go to a handle (`Held::park`): its kv set gives the
+    // departed owner's hold back, and so must its state set. Kept, the
+    // owner's pages and slot stood "on their way back" for as long as the
+    // handle lived, and a head short of a slot planned no eviction again
+    // (t_evict hung on Qwen3.5 at 176 MiB).
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let gone = leaving(&planner, model, true);
+    let geom = crate::store::rs::RsGeometry {
+        state_size: 64,
+        buffer_page_tokens: 4,
+    };
+    let id = crate::store::registry::get(model, 0)
+        .rs
+        .lock()
+        .unwrap()
+        .create_working_set(geom);
+    let rs = crate::store::rs::working_set::RsWorkingSet::new(model, 0, id, geom);
+    rs.hold_departure(gone.departure.clone());
+    let (pid, ws) = terminate(&planner, gone);
+    assert_eq!(on_its_way_back(&planner, pid), Some(2));
+    ws.leave_owner();
+    assert_eq!(
+        on_its_way_back(&planner, pid),
+        Some(2),
+        "the state set still holds the owner"
+    );
+    rs.leave_owner();
+    assert_eq!(
+        on_its_way_back(&planner, pid),
+        None,
+        "both sets gave it back"
+    );
+    drop((ws, rs));
+}
+
+#[test]
+fn pages_no_hold_watches_are_not_waited_for() {
+    // A set its context never saw holds no departure: no release would
+    // clear a mark for it, so none is made, and the stall is a wedge.
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let keys = dry_pool_two_asks(&planner);
+    let (pid, _ws) = terminate(&planner, leaving(&planner, model, false));
+    assert_eq!(on_its_way_back(&planner, pid), None);
+    youngest_starved(&planner, &keys);
+}
+
+#[test]
+fn a_burst_serves_exactly_the_fundable_prefix_in_one_pass() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let pool = Arc::new(RacePool::new(64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+
+    let holder = ProcessId::new_v4();
+    planner.register(holder);
+    planner.note_admitted(holder);
+
+    let demand = Demand {
+        kv_pages: 1,
+        rs: RsUnits::default(),
+    };
+    let pids: Vec<ProcessId> = (0..6)
+        .map(|_| {
+            let pid = ProcessId::new_v4();
+            planner.register(pid);
+            planner.note_admitted(pid);
+            pid
+        })
+        .collect();
+    let keys: Vec<EntryKey> = planner.with_inner(|inner| {
+        pids.iter()
+            .map(|&pid| inner.enqueue(pid, allocation(demand)))
+            .collect()
+    });
+
+    planner.with_inner(|inner| {
+        let waiter = inner.queue.get_mut(&keys[2]).expect("parked");
+        let WaitKind::Allocation { yielded, .. } = &mut waiter.kind else {
+            unreachable!()
+        };
+        *yielded = true;
+    });
+
+    pool.refill_after_stall(4, 0);
+    pool.pulls.lock().clear();
+    planner.plan();
+
+    let served: Vec<bool> = planner.with_inner(|inner| {
+        keys.iter()
+            .map(
+                |key| match &inner.queue.get(key).expect("still queued").kind {
+                    WaitKind::Allocation { outcome, .. } => outcome.is_some(),
+                    WaitKind::Restore { .. } | WaitKind::BindRoom { .. } => unreachable!(),
+                },
+            )
+            .collect()
+    });
+    assert_eq!(
+        served,
+        vec![true, true, false, true, true, false],
+        "exactly the fundable FCFS prefix is served, the yielded entry is \
+         passed over rather than funded, and the ask past the supply waits"
+    );
+    assert_eq!(
+        planner.diagnostics().serves_total,
+        4,
+        "one grant per served waiter"
+    );
+    let pulls = pool.pulls.lock().clone();
+    assert_eq!(
+        pulls,
+        vec![1, 4, 1],
+        "the head is covered by the ordinary absorb rung (1), the REST of \
+         the run is asked for in a SINGLE pull (4 — the four live asks \
+         behind the head), and the one ask the supply did not reach \
+         re-enters the absorb rung (1). The pre-burst drain took one \
+         absorb round trip per served waiter (vec![1, 1, 1, 1, 1]), which \
+         is the serialization this removes"
+    );
+    assert_eq!(
+        planner.diagnostics().device_pages_free,
+        0,
+        "the burst consumed what it pulled"
+    );
+    assert_eq!(
+        planner.diagnostics().accumulation,
+        0,
+        "and stranded nothing in the accumulation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_host_swap_full_victim_is_parked_until_host_room_returns() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::new(4));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
+
+    let head = ProcessId::new_v4();
+    let victim = ProcessId::new_v4();
+    for pid in [head, victim] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+
+    // A newcomer whose first ask does not fit now is refused at
+    // admission; asked again as an admitted lane's growth, it waits.
+    refused_at_admission_then_seated(&planner, head, 1);
+    let p = planner.clone();
+    let head_task = crate::rt::spawn(async move {
+        p.acquire(
+            head,
+            head,
+            Demand {
+                kv_pages: 1,
+                rs: RsUnits::default(),
+            },
+        )
+        .await
+    });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(planner.diagnostics().queue.len(), 1, "the head must park");
+
+    let members = |planner: &Arc<ResidencyPlanner>| {
+        planner
+            .victim_set()
+            .map(|set| set.members.iter().map(|v| v.pid).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        members(&planner),
+        vec![victim],
+        "the younger resident is the head's victim"
+    );
+
+    planner.eviction_failed_host_swap_full(victim);
+    assert!(
+        members(&planner).is_empty(),
+        "a host-swap-blocked victim must not be re-picked"
+    );
+    assert_eq!(planner.diagnostics().host_swap_exhaustions_total, 1);
+
+    planner.clear_host_swap_blocks();
+    assert_eq!(
+        members(&planner),
+        vec![victim],
+        "returned host room must re-arm the parked victim"
+    );
+    assert_eq!(planner.diagnostics().host_swap_unblocks_total, 1);
+
+    head_task.abort();
+}
+
+#[test]
+fn a_wake_restores_a_parked_process_that_stays_idle() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let agent = ProcessId::new_v4();
+    planner.register(agent);
+    planner.note_admitted(agent);
+    planner.set_idle(agent, true);
+    planner.with_inner(|inner| inner.procs.get_mut(&agent).unwrap().state = Residency::Evicting);
+    planner.report_evicted(agent, 3, RsUnits::default());
+    assert!(planner.diagnostics().queue.is_empty());
+
+    planner.wake(agent);
+    let (idle, restores) = planner.with_inner(|inner| {
+        let restores = inner
+            .queue
+            .values()
+            .map(|w| match w.kind {
+                WaitKind::Restore { demand } if w.pid == agent => demand.kv_pages,
+                _ => 0,
+            })
+            .collect::<Vec<_>>();
+        (inner.procs[&agent].idle, restores)
+    });
+    assert_eq!(
+        restores,
+        vec![3],
+        "a message on its way restores what it parked"
+    );
+    assert!(
+        idle,
+        "and it stays idle, the first victim, until it reads the message"
+    );
+
+    planner.wake(agent);
+    assert_eq!(
+        planner.diagnostics().queue.len(),
+        1,
+        "a second wake queues nothing more"
+    );
+}
+
+#[test]
+fn an_idle_eviction_asks_for_its_pages_back_only_on_waking() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let planner = Arc::new(ResidencyPlanner::new(
+        Arc::new(RacePool::new(4)) as Arc<dyn PoolPort>
+    ));
+    let agent = ProcessId::new_v4();
+    planner.register(agent);
+    planner.note_admitted(agent);
+    assert!(!planner.with_inner(|inner| inner.fleet_stalled()));
+
+    planner.set_idle(agent, true);
+    assert!(
+        planner.with_inner(|inner| inner.fleet_stalled()),
+        "a resident waiting on its client does not keep the fleet running"
+    );
+
+    planner.with_inner(|inner| inner.procs.get_mut(&agent).unwrap().state = Residency::Evicting);
+    planner.report_evicted(agent, 3, RsUnits::default());
+    assert!(
+        planner.diagnostics().queue.is_empty(),
+        "an idle eviction queues no restore"
+    );
+
+    planner.set_idle(agent, false);
+    let restores = planner.with_inner(|inner| {
+        inner
+            .queue
+            .values()
+            .map(|w| match w.kind {
+                WaitKind::Restore { demand } if w.pid == agent => demand.kv_pages,
+                _ => 0,
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(restores, vec![3], "waking asks for what the eviction freed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_exhausted_pool_evicts_even_while_the_fleet_still_runs() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::with_swap(4, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
+
+    let holder = ProcessId::new_v4();
+    planner.register(holder);
+    planner.note_admitted(holder);
+
+    let head = ProcessId::new_v4();
+    planner.register(head);
+    planner.note_admitted(head);
+    for _ in 0..3 {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+
+    let demand = Demand {
+        kv_pages: 1,
+        rs: RsUnits::default(),
+    };
+    let p = planner.clone();
+    let parked = crate::rt::spawn(async move { p.acquire(head, head, demand).await });
+    for _ in 0..200 {
+        crate::rt::yield_now().await;
+        if planner.diagnostics().queue.len() == 1 {
+            break;
+        }
+    }
+    let d = planner.diagnostics();
+    assert_eq!(
+        d.queue.len(),
+        1,
+        "the ask must park (starved={} salvaged={} free={}/{})",
+        d.starvations_total,
+        d.salvages_total,
+        d.device_pages_free,
+        d.device_pages_total
+    );
+
+    let set = planner.victim_set().expect("an unmet head yields a set");
+    assert_eq!(set.deficit.pages, 1, "the round is demand-exact");
+    assert!(
+        !set.members.is_empty(),
+        "younger residents are legal victims"
+    );
+
+    assert!(!planner.is_wedged(), "a running holder is not a wedge");
+    assert!(planner.supply_stalled(), "an empty pool with an unmet head");
+    assert_eq!(
+        planner.diagnostics().eviction_deferrals_total,
+        0,
+        "the rung must not have deferred"
+    );
+
+    let mark = ProcessId::new_v4();
+    planner.with_inner(|inner| {
+        inner.evicting.insert(
+            mark,
+            Reclaim {
+                pages: 1,
+                rs: RsUnits::default(),
+            },
+        );
+    });
+    assert!(
+        !planner.supply_stalled(),
+        "a victim already in flight must hold the rung shut"
+    );
+    planner.with_inner(|inner| {
+        inner.evicting.remove(&mark);
+    });
+    assert!(planner.supply_stalled(), "and open again once it lands");
+
+    parked.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lane_holding_the_whole_state_pool_is_told_so() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    use crate::inferlet::process::residency::{ProcessResidency, register_residency};
+    use crate::store::rs::RsGeometry;
+
+    // One process holds both slots of a two-slot pool and asks for a
+    // third: nobody else's to come back, so the refusal names it (#686).
+    let model = crate::store::registry::register_model(16, &[4], &[2]);
+    let stores = crate::store::registry::get(model, 0);
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(RsGeometry {
+                state_size: 64,
+                buffer_page_tokens: 4,
+            });
+            let folded = rs.prepare_group(ws, true, false, None, None, None).unwrap();
+            let published = rs.publish_prepared(folded).unwrap();
+            rs.settle(published);
+            ws
+        })
+        .collect();
+    let pid = ProcessId::new_v4();
+    let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+    residency
+        .lock()
+        .unwrap()
+        .rs_working_sets
+        .extend(held.into_iter().map(|ws| (model, 0, ws)));
+    register_residency(pid, Arc::downgrade(&residency));
+
+    let pool = RacePool {
+        rs_model: Some(model),
+        ..RacePool::new(0)
+    };
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(pool)));
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let error = planner
+        .acquire(
+            pid,
+            pid,
+            Demand {
+                kv_pages: 0,
+                rs: RsUnits {
+                    slots: 1,
+                    pages: 0,
+                    ..RsUnits::default()
+                },
+            },
+        )
+        .await
+        .err()
+        .expect("a pool the lane already holds cannot serve it");
+    assert!(
+        matches!(
+            error,
+            PlannerError::RsHog { need, held, total }
+                if need.slots == 1 && held.slots == 2 && total.slots == 2
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_seated_lane_grows_before_a_prompt_waiting_to_be_seated() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let planner = Arc::new(
+        ResidencyPlanner::new(Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>),
+    );
+    let [older, seated, younger] = [(); 3].map(|_| ProcessId::new_v4());
+    for pid in [older, seated, younger] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let ring = RsUnits {
+        slots: 0,
+        pages: 2,
+        ..RsUnits::default()
+    };
+    let prompt = RsUnits {
+        slots: 0,
+        pages: 3,
+        ..RsUnits::default()
+    };
+    // The seated lane decodes: a fire of its in flight.
+    let decoding = planner.fire_in_flight(seated);
+    planner.with_inner(|inner| {
+        inner.procs.get_mut(&seated).unwrap().seated = true;
+        let roomy = RsUnits {
+            slots: 0,
+            pages: 320,
+            ..RsUnits::default()
+        };
+        assert_eq!(
+            inner.seating_reserve(older, ring, prompt, roomy),
+            ring,
+            "a prompt is seated only past the decoding lane's growth"
+        );
+        assert_eq!(
+            inner.seating_reserve(
+                older,
+                ring,
+                prompt,
+                RsUnits {
+                    slots: 0,
+                    pages: 32,
+                    ..RsUnits::default()
+                }
+            ),
+            ring,
+            "and a small ring holds back the lane's growth too, no fraction of it in its place"
+        );
+        assert_eq!(
+            inner.seating_reserve(
+                older,
+                ring,
+                prompt,
+                RsUnits {
+                    slots: 0,
+                    pages: 1,
+                    ..RsUnits::default()
+                }
+            ),
+            RsUnits {
+                slots: 0,
+                pages: 1,
+                ..RsUnits::default()
+            },
+            "never more than the ring"
+        );
+        assert!(inner.seating_reserve(seated, ring, prompt, roomy).is_zero());
+        assert!(
+            inner
+                .seating_reserve(older, RsUnits::default(), prompt, roomy)
+                .is_zero()
+        );
+
+        // A higher-ranked prompt waiting to be seated does not hold the
+        // lane's growth back; a higher-ranked seated waiter does.
+        inner.enqueue(
+            older,
+            allocation(Demand {
+                kv_pages: 4,
+                rs: prompt,
+            }),
+        );
+        assert!(inner.growth_first(seated));
+        inner.procs.get_mut(&older).unwrap().seated = true;
+        assert!(!inner.growth_first(seated));
+        inner.procs.get_mut(&older).unwrap().seated = false;
+    });
+
+    // The prompt is short of pages: the lane with a fire in flight is
+    // spared; one between fires is a candidate (the one rule: any resident
+    // not in a fire in flight), idle or not.
+    let victims = planner.victim_set().expect("the prompt is short");
+    assert_eq!(
+        victims.members.iter().map(|v| v.pid).collect::<Vec<_>>(),
+        [younger],
+        "no lane is suspended mid-fire"
+    );
+    planner.with_inner(|inner| inner.procs.get_mut(&younger).unwrap().idle = true);
+    let victims = planner.victim_set().expect("the prompt is short");
+    assert_eq!(
+        victims.members.iter().map(|v| v.pid).collect::<Vec<_>>(),
+        [younger]
+    );
+    drop(decoding);
+}
+
+/// A window ring alone, its room read a moment before it is handed back,
+/// as a busy pool's is.
+struct RingPool {
+    free: AtomicU32,
+    total: u32,
+}
+
+impl PoolPort for RingPool {
+    fn chunk_stats(&self) -> ChunkStats {
+        ChunkStats {
+            pages: (0, 0),
+            rs: self.rs_stats(),
+        }
+    }
+    fn host_stats(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn disk_stats(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn rs_stats(&self) -> (RsUnits, RsUnits) {
+        let free = self.free.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_micros(200));
+        (
+            RsUnits {
+                slots: 0,
+                pages: free,
+                ..RsUnits::default()
+            },
+            RsUnits {
+                slots: 0,
+                pages: self.total,
+                ..RsUnits::default()
+            },
+        )
+    }
+    fn rs_host_stats(&self) -> (RsUnits, RsUnits) {
+        Default::default()
+    }
+    fn reclaim_idle(&self, _: super::pool::IdleShort) -> super::pool::IdleReclaim {
+        super::pool::IdleReclaim::default()
+    }
+    fn reclaimable_idle(&self) -> u32 {
+        0
+    }
+    fn idle_below_device(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn suspend_capable(&self) -> bool {
+        false
+    }
+    fn locus(&self) -> (usize, usize) {
+        (0, 0)
+    }
+    fn rs_growth(&self) -> RsUnits {
+        RsUnits {
+            slots: 0,
+            pages: 2,
+            ..RsUnits::default()
+        }
+    }
+    fn reserve_device(&self, _count: u32) -> Option<Vec<PhysicalKvPageId>> {
+        Some(Vec::new())
+    }
+    fn reserve_device_up_to(&self, _count: u32) -> Vec<PhysicalKvPageId> {
+        Vec::new()
+    }
+    fn release_device(&self, _pages: Vec<PhysicalKvPageId>) {}
+    fn reserve_rs(&self, need: RsUnits) -> Option<crate::store::rs::RsGrant> {
+        self.free
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |free| {
+                free.checked_sub(need.pages)
+            })
+            .ok()
+            .map(|_| Default::default())
+    }
+    fn release_rs(&self, _grant: crate::store::rs::RsGrant) {}
+    fn reclaim_sharing(&self, _working_sets: &[crate::store::rs::RsWorkingSetId]) -> usize {
+        0
+    }
+    fn prepare_sweep(
+        &self,
+        _keep: &HashSet<crate::store::kv::page_table::WorkingSetId>,
+        _room: usize,
+        _order: &[(crate::store::kv::page_table::WorkingSetId, u64)],
+        _wanted: usize,
+    ) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+    fn drop_disallowed(&self) -> usize {
+        0
+    }
+    fn prepare_demote(&self, _room: usize) -> Option<crate::store::kv::KvResidencyTxn> {
+        None
+    }
+}
+
+/// Prompts seated at once each see the others' pages gone: the ring keeps
+/// the seated lanes' growth however many arrive together.
+#[test]
+fn prompts_seated_at_once_leave_the_seated_lanes_their_growth() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    const PROMPT: u32 = 64;
+    const RING: u32 = 6400;
+    let pool = Arc::new(RingPool {
+        free: AtomicU32::new(RING),
+        total: RING,
+    });
+    let planner =
+        Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pids: Vec<ProcessId> = (0..120).map(|_| ProcessId::new_v4()).collect();
+    for &pid in &pids {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    let demand = Demand {
+        kv_pages: 0,
+        rs: RsUnits {
+            slots: 0,
+            pages: PROMPT,
+            ..RsUnits::default()
+        },
+    };
+    // One lane seated and decoding before the rest arrive together.
+    let first = planner.grant_now(pids[0], demand).expect("the ring seats one");
+    let decoding = planner.fire_in_flight(pids[0]);
+    let start = std::sync::Barrier::new(pids.len() - 1);
+    let grants = parking_lot::Mutex::new(vec![first]);
+    std::thread::scope(|scope| {
+        for &pid in &pids[1..] {
+            let (planner, start, grants) = (&planner, &start, &grants);
+            scope.spawn(move || {
+                start.wait();
+                if let Some(grant) = planner.grant_now(pid, demand) {
+                    grants.lock().push(grant);
+                }
+            });
+        }
+    });
+    drop(decoding);
+    let seated = u32::try_from(grants.lock().len()).expect("a few lanes");
+    let free = pool.free.load(Ordering::SeqCst);
+    let held_back = (2 * seated.saturating_sub(1)).min(RING);
+    assert!(seated > 0, "the ring seats prompts");
+    assert!(
+        free >= held_back,
+        "{seated} prompts seated left {free} pages for the lanes' growth, short of {held_back}"
+    );
+}
+
+#[test]
+fn a_holder_goes_before_every_process_and_oldest_first() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let process = ProcessId::new_v4();
+    planner.register(process);
+    let (older, newer) = (ProcessId::new_v4(), ProcessId::new_v4());
+    planner.register_holder(older, None);
+    planner.register_holder(newer, None);
+    planner.with_inner(|inner| {
+        let rank = |pid: &ProcessId| inner.procs[pid].rank();
+        assert!(rank(&newer) > rank(&process), "a process stays");
+        assert!(rank(&older) > rank(&newer), "the larger rank goes first");
+    });
+}
+
+#[test]
+fn a_claimed_holder_is_no_one_s_victim_and_owes_nothing_of_its_own() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let holder = ProcessId::new_v4();
+    planner.register_holder(holder, None);
+    planner.claim_holder(holder);
+    planner.with_inner(|inner| {
+        assert!(!inner.procs[&holder].idle);
+        inner.procs.get_mut(&holder).unwrap().state = Residency::Evicting;
+    });
+    assert!(planner.holder_moving(holder), "the claim waits for this");
+    planner.report_evicted(holder, 3, Default::default());
+    assert!(!planner.holder_moving(holder));
+    planner.with_inner(|inner| {
+        assert!(
+            !inner.queue.values().any(|waiter| waiter.pid == holder),
+            "a holder restores nothing: the process that takes the set does"
+        );
+    });
+    planner.unclaim_holder(holder);
+    planner.with_inner(|inner| assert!(inner.procs[&holder].idle));
+}
+
+#[test]
+fn a_process_that_took_sets_off_the_device_owes_them_as_one_ask() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    let process = ProcessId::new_v4();
+    planner.register(process);
+    let demand = Demand {
+        kv_pages: 3,
+        rs: Default::default(),
+    };
+    planner.owe(process, demand);
+    assert!(!planner.is_resident(process), "it waits before it runs");
+    planner.with_inner(|inner| {
+        let asks = inner.queue.values().filter(|waiter| waiter.pid == process);
+        assert_eq!(asks.count(), 1);
+    });
+}
+
+#[test]
+fn a_handle_at_rest_off_the_device_is_no_contention() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
+    planner.register_holder(ProcessId::new_v4(), Some(Demand::default()));
+    planner.with_inner(|inner| assert_eq!(inner.nonresident_count(), 0));
+}
+
+fn park_asks(planner: &ResidencyPlanner, pid: ProcessId, asks: &[u32]) -> Vec<EntryKey> {
+    planner.with_inner(|inner| {
+        asks.iter()
+            .map(|&kv_pages| {
+                inner.enqueue(
+                    pid,
+                    allocation(Demand {
+                        kv_pages,
+                        rs: RsUnits::default(),
+                    }),
+                )
+            })
+            .collect()
+    })
+}
+
+/// text-completion-bench, 96 MiB, a 5,000-token lane beside seven short
+/// ones: once nothing of the process ran, its sixth short lane parked for a
+/// state slot its own five held sets and scattered pages left no chunk for.
+/// It held all the pool held, so the restart freed only its own and the
+/// replay stalled in the same place, hundreds of times a minute. A stalled
+/// victim that alone holds anything fails instead, saying so.
+#[test]
+fn a_stalled_process_that_alone_holds_the_pool_fails_instead_of_restarting() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    let model = crate::store::registry::register_model(16, &[64], &[2]);
+    let planner = Arc::new(ResidencyPlanner::new(departure_pool(model)));
+    let process = leaving(&planner, model, false);
+    let pid = process.pid;
+    crate::inferlet::process::declare_restartable(pid);
+    let keys = park_asks(&planner, pid, &[4]);
+    assert!(planner.sole_holder(pid));
+    planner.check_starvation(StarveCause::NoSwapRoom);
+    planner.with_inner(|inner| {
+        let WaitKind::Allocation {
+            outcome: Some(Err(error)),
+            ..
+        } = &inner.queue[&keys[0]].kind
+        else {
+            panic!("the parked ask fails");
+        };
+        assert!(
+            matches!(
+                error,
+                PlannerError::Starved {
+                    cause: StarveCause::SoleHolder,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("this process alone holds"),
+            "{error}"
+        );
+    });
+    assert_eq!(
+        planner.stats.starvation_restarts.load(Ordering::Relaxed),
+        0,
+        "no replay into the same wall"
+    );
+    drop(terminate(&planner, process));
 }
 
 /// An eviction whose copy to the host fails is never tried again: the
@@ -1095,8 +2300,9 @@ async fn a_grant_dropped_under_the_planner_lock_does_not_deadlock() {
 }
 
 
-/// A restore whose guest state and runs pass what the state limit leaves
-/// would wait with nothing evictable. A head whose whole step takes more chunks than state
+/// The L40S on 3b45462d4: a restore whose guest state (1,058 slots, about
+/// sixteen chunks) and runs past what the state limit leaves, waiting with
+/// nothing evictable. A head whose whole step takes more chunks than state
 /// may ever take is refused by name as never fitting alone; one that fits
 /// waits.
 #[test]
@@ -1123,6 +2329,192 @@ fn a_restore_past_every_state_chunk_is_refused_as_never_fitting_alone() {
         matches!(planner.never_fits(key), Some(super::PlannerError::PastDevice { .. })),
         "past every state chunk: refused by name"
     );
+}
+
+/// The test-pause policy (`crates/builtins/policies/test-pause`), built and
+/// run as PLEX 1.1 runs it: a process that states `pause-at-ms: 200` and
+/// `pause-for-ms: 300` is held from 200 ms after its arrival to 500 ms, by
+/// its `schedule/hold` row, and lifted at the alarm it set for 500 ms. The
+/// rows go to the schedule table as the port enacts them, and the planner
+/// reads them: before its window it runs, inside it its set stays parked
+/// (no restore, even with its lanes asking), and once lifted its restore is
+/// queued. Another process, stating none, is never held; one stating the
+/// prop as text is terminated with a reason naming it, and never held.
+#[tokio::test(flavor = "current_thread")]
+async fn the_test_pause_policy_parks_a_set_in_its_window_and_resumes_it_after() {
+    use plex_host::host::{Config, Host};
+    use plex_host::tables::Value;
+    use std::str::FromStr;
+
+    const MS: u64 = 1_000_000;
+    let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
+    crate::policy::schedule::install(None);
+    let host = Host::new(Config {
+        supported: vec![plex_host::tables::SCHEDULE_HOLD.to_string()],
+        manual: true,
+        ..Config::default()
+    });
+    let component = builtins::policy("test-pause").expect("built with test-policies");
+    let imports = host.load("test-pause", component.component).unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| i == plex_host::tables::SCHEDULE_HOLD),
+        "it writes schedule/hold: {imports:?}"
+    );
+    // Each round's committed hold rows, enacted as the port enacts them.
+    let round = |at_ms: u64| {
+        host.set_now(at_ms * MS);
+        host.run(false);
+        let delta = host.poll_delta();
+        let holds = delta
+            .schedule_hold
+            .rows
+            .into_iter()
+            .map(|(id, row)| (ProcessId::from_str(&id).unwrap(), row))
+            .collect();
+        crate::policy::schedule::apply(crate::policy::schedule::Change {
+            holds,
+            hold_default: delta.schedule_hold.default,
+            ..Default::default()
+        });
+    };
+
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(64))));
+    let (paused, other) = (ProcessId::new_v4(), ProcessId::new_v4());
+    for pid in [paused, other] {
+        planner.register(pid);
+        planner.note_admitted(pid);
+    }
+    host.set_now(10 * MS);
+    let hints = |at: Value| {
+        vec![
+            ("pause-at-ms".to_string(), at),
+            ("pause-for-ms".to_string(), Value::Int(300)),
+        ]
+    };
+    host.arrived(
+        &paused.to_string(),
+        None,
+        None,
+        Some("self".into()),
+        None,
+        None,
+        hints(Value::Int(200)),
+        0,
+    );
+    host.arrived(
+        &other.to_string(),
+        None,
+        None,
+        Some("self".into()),
+        None,
+        None,
+        vec![],
+        0,
+    );
+    host.started(&paused.to_string());
+    host.started(&other.to_string());
+
+    let restore_queued = |planner: &ResidencyPlanner| {
+        planner.with_inner(|inner| {
+            inner.queue.values().any(|waiter| {
+                waiter.pid == paused && matches!(waiter.kind, WaitKind::Restore { .. })
+            })
+        })
+    };
+    let held = |pid| crate::policy::schedule::held(pid);
+
+    // Before its window: it runs, and the policy asks to be woken at 210.
+    round(10);
+    assert!(
+        !held(paused) && !held(other),
+        "before its window nothing is held"
+    );
+    assert_eq!(host.alarm(), Some(210 * MS), "woken where its window opens");
+    round(100);
+    assert!(!held(paused), "still before its window");
+
+    // Inside it: held, and the planner pauses it (its set parked below the
+    // device, as the pause path leaves it).
+    round(210);
+    assert!(held(paused), "held inside its window");
+    assert!(!held(other), "one stating no pause is never held");
+    assert_eq!(
+        host.alarm(),
+        Some(510 * MS),
+        "woken where its window closes"
+    );
+    planner.reschedule();
+    planner.with_inner(|inner| {
+        assert!(inner.procs[&paused].held, "the planner reads the hold");
+        assert!(!inner.procs[&other].held);
+        let proc = inner.procs.get_mut(&paused).unwrap();
+        proc.state = Residency::Evicted;
+        proc.parked = Some(Demand {
+            kv_pages: 2,
+            rs: RsUnits::default(),
+        });
+    });
+    let p = planner.clone();
+    let waiting = crate::rt::spawn(async move { p.wait_resident(paused).await });
+    for _ in 0..50 {
+        crate::rt::yield_now().await;
+    }
+    round(400);
+    planner.reschedule();
+    assert!(held(paused), "still inside its window");
+    assert!(
+        !restore_queued(&planner),
+        "held: its set stays parked though its lanes ask"
+    );
+    assert_eq!(
+        planner.with_inner(|inner| inner.procs[&paused].state),
+        Residency::Evicted
+    );
+
+    // Its window closes at the alarm: lifted, its restore queued.
+    round(510);
+    assert!(!held(paused), "lifted once its window closed");
+    assert_eq!(host.alarm(), None, "no later edge: no alarm");
+    planner.reschedule();
+    assert!(restore_queued(&planner), "lifted: its restore is queued");
+    waiting.abort();
+
+    // A prop stated as text ("300") is refused by name: the process is
+    // terminated with a reason naming it, and nothing is held.
+    let text = ProcessId::new_v4();
+    host.set_now(600 * MS);
+    host.arrived(
+        &text.to_string(),
+        None,
+        None,
+        Some("self".into()),
+        None,
+        None,
+        hints(Value::Text("300".into())),
+        0,
+    );
+    host.run(false);
+    let delta = host.poll_delta();
+    assert!(
+        delta
+            .terminate
+            .iter()
+            .any(|(id, why)| *id == text.to_string() && why.contains("pause-at-ms")),
+        "refused by name: {:?}",
+        delta.terminate
+    );
+    assert!(
+        !delta
+            .schedule_hold
+            .rows
+            .iter()
+            .any(|(id, row)| *id == text.to_string() && *row == Some(true)),
+        "and never held"
+    );
+    assert_eq!(host.stats().traps, 0, "no call traps");
+    crate::policy::schedule::install(None);
 }
 
 /// ENOSPC on an eviction's write (the disk tier's slot file full): nothing

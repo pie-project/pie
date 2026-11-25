@@ -6,8 +6,29 @@ fn cut_every_case() {
     only_the_last_cut_runs_the_program();
     a_masked_pass_is_cut_with_its_rows_masks();
     the_last_piece_holds_what_the_program_reads();
+    several_lanes_are_cut_and_end_together();
     every_lane_of_a_pass_rides_its_last_fire();
+    a_lane_only_in_the_last_piece_is_not_written_before_it();
     a_pass_with_media_is_cut_before_its_first_span();
+    a_pass_with_media_keys_the_rows_before_it();
+    the_rest_of_a_pass_is_cut_again_wider();
+}
+
+/// A raise landing mid-pass: what is left from the last cut is cut at
+/// the wider share, on the same page boundaries and checkpoint rows.
+fn the_rest_of_a_pass_is_cut_again_wider() {
+    let req = prefill_lane(5, 200, 16);
+    let narrow = host_cuts(&req, true, 32, 16, &[123], 0);
+    assert_eq!(narrow[..2], [(0, 27), (27, 59)]);
+    assert_eq!(
+        host_cuts_from(&req, true, 160, 16, &[123], 0, 59),
+        [(59, 123), (123, 200)],
+        "the checkpoint row still cuts"
+    );
+    assert_eq!(
+        host_cuts_from(&req, true, 64, 16, &[], 0, 59),
+        [(59, 123), (123, 187), (187, 200)]
+    );
 }
 
 fn prefill_lane(held: u32, rows: u32, page: u32) -> crate::engine::FireRequest {
@@ -101,6 +122,27 @@ fn a_pass_with_media_is_cut_before_its_first_span() {
     assert_eq!(tail.media[0].token_positions[0], 3 * 59);
 }
 
+fn a_pass_with_media_keys_the_rows_before_it() {
+    let mut req = prefill_lane(5, 100, 16);
+    assert_eq!(keyed_rows(&req), 100);
+    req.media.push(::engine::fire::StepMedia {
+        lane: 0,
+        rows: vec![10],
+        routes: (60..70).collect(),
+        ..Default::default()
+    });
+    assert_eq!(keyed_rows(&req), 60, "up to its first media row");
+    let cuts = host_cuts(&req, true, 128, 16, &[], 0);
+    assert_eq!(cuts, [(0, 59), (59, 100)]);
+    let first = rows_of_lanes(&req, &[Some(cuts[0])], false, 16);
+    assert!(first.media.is_empty(), "it logs its rows and seals");
+    assert_eq!(keyed_rows(&first), 59);
+    let tail = rows_of_lanes(&req, &[Some(cuts[1])], true, 16);
+    assert!(!tail.media.is_empty(), "it cuts the log");
+    req.lanes[0].positions = (0..100).collect();
+    assert_eq!(keyed_rows(&req), 0, "rows rotated off their slots");
+}
+
 /// The pieces a pass is cut into end together: its last fire holds
 /// every lane, and a last piece that left one out is refused by name.
 fn every_lane_of_a_pass_rides_its_last_fire() {
@@ -116,6 +158,83 @@ fn every_lane_of_a_pass_rides_its_last_fire() {
         refusal.contains("a pass of 2 lanes carries 1"),
         "{refusal}"
     );
+}
+
+fn several_lanes_are_cut_and_end_together() {
+    let mut req = prefill_lane(5, 100, 16);
+    let other = prefill_lane(0, 40, 16).lanes.remove(0);
+    req.lanes.push(other);
+    let pieces = pass_pieces(&req, true, true, 32, 16, &[], &[]);
+    let last = pieces.last().unwrap();
+    assert_eq!(
+        last,
+        &[Some((91, 100)), Some((32, 40))],
+        "both lanes' tails"
+    );
+    assert_eq!(
+        pieces[0],
+        [Some((0, 11)), None],
+        "the short lane starts later"
+    );
+    for lane in 0..2 {
+        let rows: u32 = pieces
+            .iter()
+            .filter_map(|p| p[lane])
+            .map(|(a, b)| b - a)
+            .sum();
+        assert_eq!(rows, [100, 40][lane], "every row once");
+    }
+    let first = rows_of_lanes(&req, &pieces[0], false, 16);
+    assert_eq!(first.lanes.len(), 1);
+    assert!(!first.boundary_program);
+    let tail = rows_of_lanes(&req, last, true, 16);
+    assert_eq!(tail.lanes.len(), 2);
+    assert!(tail.boundary_program);
+    assert_eq!(
+        pass_pieces(&req, true, false, 32, 16, &[], &[]).len(),
+        1,
+        "not where the lanes carry recurrent state"
+    );
+}
+
+fn a_lane_only_in_the_last_piece_is_not_written_before_it() {
+    // A prompt cut into pieces beside a decode lane whose one row rides only in the last.
+    let mut req = prefill_lane(0, 100, 16);
+    let decode = prefill_lane(17, 1, 16).lanes.remove(0);
+    req.lanes.push(decode);
+    let pieces = pass_pieces(&req, true, true, 32, 16, &[], &[]);
+    assert!(pieces.len() > 1, "the prompt is cut");
+    let groups = [(0u32, vec![0]), (1u32, vec![1])];
+    for (at, piece) in pieces.iter().enumerate() {
+        let kept: Vec<usize> = (0..req.lanes.len())
+            .filter(|&lane| piece[lane].is_some())
+            .collect();
+        let piece_groups: Vec<(u32, Vec<usize>)> = groups
+            .iter()
+            .map(|(ws, lanes)| {
+                (
+                    *ws,
+                    lanes
+                        .iter()
+                        .filter_map(|lane| kept.iter().position(|k| k == lane))
+                        .collect(),
+                )
+            })
+            .collect();
+        let last = at + 1 == pieces.len();
+        let written = written_groups(&piece_groups);
+        assert_eq!(
+            written,
+            if last { vec![0, 1] } else { vec![0] },
+            "piece {at}"
+        );
+        if !last {
+            // what the decode lane's set would have logged here: a write at slot 0, inside
+            // the 17 slots it already froze
+            let rows = rows_of_lanes(&req, piece, false, 16);
+            assert_eq!(written_span_of(&rows, &piece_groups[1].1, 16), (0..0, 0..0));
+        }
+    }
 }
 
 fn the_last_piece_holds_what_the_program_reads() {

@@ -615,6 +615,34 @@ pub fn with_host_codegen<'a>(
 }
 
 #[cfg(test)]
+mod pricing_tests {
+    use super::price;
+    use eta_ir::container::{StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::Stage;
+    use eta_ir::types::{Dtype, Shape};
+
+    #[test]
+    fn a_float_lane_is_priced_by_its_output_rows() {
+        let container = TraceContainer {
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![Op::Output {
+                    index: 0,
+                    lane: 0,
+                    shape: Shape::matrix(256, 64),
+                    dtype: Dtype::F32,
+                }],
+            }],
+            ..TraceContainer::default()
+        };
+        assert_eq!(price(&container).unwrap().rows, 256);
+        assert_eq!(price(&TraceContainer::default()).unwrap().rows, 1);
+    }
+
+}
+
+#[cfg(test)]
 mod budget_tests {
     use super::{RegisterError, Registry};
     use eta_ir::container::{StageProgram, TraceContainer};
@@ -814,4 +842,17 @@ mod register_tests {
             .hash;
         assert!(super::lookup(hash).is_some());
     }
+}
+
+#[cfg(test)]
+mod row_extent_tests {
+    use super::Registry;
+    use eta_ir::container::{
+        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
+    use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
+    use eta_ir::validate::Budget;
+    
+
 }

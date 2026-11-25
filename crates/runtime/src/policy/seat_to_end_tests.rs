@@ -73,6 +73,33 @@ fn past_the_lanes_to_the_end_a_start_is_held_and_the_running_run_on() {
     assert!(held(ProcessId::from_u128(0x5eff)), "the hold's default is true");
 }
 
+/// A lane finishes: the oldest waiting one is let go, first come, first
+/// served; the next still waits.
+#[test]
+fn a_lane_that_ends_lets_the_oldest_waiting_start() {
+    let _alone = alone();
+    let [a, b, c, d] = pids::<4>(0x5e10);
+    run(&worker(2, false, None), events(&[a, b], &[c, d], &[a]));
+    assert!(!held(c), "the oldest waiting is let go");
+    assert!(held(d), "the next waits on");
+    assert!(!held(b));
+}
+
+/// Below the bound nothing is held: arrivals start at once, and the
+/// column's own default (false) stands.
+#[test]
+fn below_the_lanes_to_the_end_nothing_is_held() {
+    let _alone = alone();
+    let [a, b, c, d] = pids::<4>(0x5e20);
+    run(&worker(4, false, None), events(&[a, b], &[c, d], &[]));
+    for pid in [a, b, c, d, ProcessId::from_u128(0x5e2f)] {
+        assert!(!held(pid), "no hold below the bound");
+    }
+    // Unknown lanes (nothing has finished yet): no hold either.
+    run(&Worker::default(), events(&[a, b], &[c, d], &[]));
+    assert!(!held(c) && !held(d));
+}
+
 /// Where starting together runs short (`pie/starts-spread`), two lanes
 /// freed at once let one start, the next a step later.
 #[test]

@@ -604,6 +604,8 @@ mod tests {
     fn load_every_case() {
         an_unknown_row_name_is_refused_with_the_catalog();
         a_row_that_does_not_read_the_checkpoint_refuses_by_name();
+        the_unnamed_door_still_answers_nothing_for_a_checkpoint_no_row_reads();
+        the_rows_first_fits_wins_hides_are_reachable_by_name();
     }
 
     fn an_unknown_row_name_is_refused_with_the_catalog() {
@@ -651,4 +653,26 @@ mod tests {
         );
     }
 
+    fn the_unnamed_door_still_answers_nothing_for_a_checkpoint_no_row_reads() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("stranger.zt");
+        a_checkpoint_no_row_reads(&path);
+        let source = ztensor::Source::open(&path).expect("open the checkpoint");
+        let metadata = checkpoint_metadata(&path).expect("read the checkpoint");
+
+        assert!(conversion_contract(&source, &metadata, Platform::Cuda).is_none());
+    }
+
+    fn the_rows_first_fits_wins_hides_are_reachable_by_name() {
+        for name in [
+            "gemma4-e4b-vision-bf16-kv-bf16",
+            "glm53-flash-u8g64-u2g64-kv-bf16",
+        ] {
+            assert!(
+                catalog().deployment(name).is_some(),
+                "`{name}` is the row this override exists to reach, and the \
+                 catalog no longer ships it under that name"
+            );
+        }
+    }
 }

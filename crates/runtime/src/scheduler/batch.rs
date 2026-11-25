@@ -765,6 +765,7 @@ mod tests {
     use super::*;
     use crate::engine::{FireRequest, WorkItemCompletion};
     use ::engine::InstanceId;
+    use eta_ir::registry::GeometryClass;
 
     fn pending(request: FireRequest, instance_id: InstanceId) -> Box<PendingRequest> {
         Box::new(PendingRequest {
@@ -806,8 +807,15 @@ mod tests {
 
     #[test]
     fn batch_every_case() {
+        every_member_owns_a_span_of_the_steps_lanes();
+        a_multi_lane_member_arrives_lane_for_lane();
         members_cobatch_by_concatenation();
         two_passes_groups_never_meet();
+        a_masked_lane_carries_its_own_mask_and_a_peer_carries_none();
+        two_seated_members_batch_into_a_fire_the_contract_accepts();
+        a_device_geometry_member_seriates_into_the_suffix();
+        a_frames_cells_are_one_per_member_and_never_shared();
+        a_device_resolved_lane_counts_against_the_token_cap();
         a_step_carries_no_more_than_its_rungs_tokens();
     }
 
@@ -845,6 +853,45 @@ mod tests {
             assert!(plain.accepts(&carrying(at, 0), limits(), 16));
             assert!(!plain.push(&carrying(at, 0), limits(), 16));
         }
+    }
+
+    fn every_member_owns_a_span_of_the_steps_lanes() {
+        let placeholder = FireRequest::default();
+        let mut requests = vec![
+            pending(decode(11, 3), InstanceId(1)),
+            pending(placeholder, InstanceId(2)),
+            pending(decode(22, 4), InstanceId(3)),
+        ];
+        let step = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        assert_eq!(step.member_lane_indptr, vec![0, 1, 1, 2]);
+        assert_eq!(
+            step.instance_ids,
+            vec![InstanceId(1), InstanceId(2), InstanceId(3)]
+        );
+        assert_eq!(step.lanes.len(), 2, "the placeholder contributes no lane");
+        assert_eq!(step.lanes[0].tokens, vec![11]);
+        assert_eq!(step.lanes[1].tokens, vec![22]);
+    }
+
+    fn a_multi_lane_member_arrives_lane_for_lane() {
+        let mut two = FireRequest {
+            lanes: vec![
+                crate::engine::fire::lane_of(0, vec![11], 0, vec![3]),
+                crate::engine::fire::lane_of(1, vec![22], 0, vec![4]),
+            ],
+            ..FireRequest::default()
+        };
+        two.lanes[1].rs_reset = engine::fire::RsReset::Fresh;
+        let expected: Vec<::engine::Lane> =
+            two.lanes.iter().map(|lane| lane.lane.clone()).collect();
+
+        let step = build_batch_request(
+            &mut [pending(two, InstanceId(1))],
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(step.member_lane_indptr, vec![0, 2]);
+        assert_eq!(step.lanes, expected);
     }
 
     fn members_cobatch_by_concatenation() {
@@ -894,6 +941,154 @@ mod tests {
             groups,
             [0, 0, 1, 1, 2, 2, 3, 3].map(Some).to_vec(),
             "each pass keeps its own groups"
+        );
+    }
+
+    fn a_masked_lane_carries_its_own_mask_and_a_peer_carries_none() {
+        let mut masked = decode(11, 3);
+        masked.has_user_mask = true;
+        masked.single_token_mode = false;
+        masked.lanes[0].mask = Some(::engine::Masking::Extent(::engine::Mask::new(
+            vec![0, 1],
+            1,
+        )));
+
+        let mut requests = [
+            pending(masked, InstanceId(20)),
+            pending(decode(22, 4), InstanceId(21)),
+        ];
+        let step = build_batch_request(&mut requests, 16, &SchedulerStats::default());
+        assert_eq!(
+            step.lanes[0].mask,
+            Some(::engine::Masking::Extent(::engine::Mask::new(
+                vec![0, 1],
+                1
+            )))
+        );
+        assert_eq!(step.lanes[1].mask, None, "an unmasked peer stays unmasked");
+    }
+
+    fn two_seated_members_batch_into_a_fire_the_contract_accepts() {
+        let model = crate::store::registry::register_model(16, &[8], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let (first_ws, second_ws) =
+            crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+                (kv.create_working_set(), kv.create_working_set())
+            });
+
+        let mut first = decode(11, 3);
+        let mut second = decode(22, 4);
+        assert_eq!(
+            (first.lanes[0].slot, second.lanes[0].slot),
+            (0, 0),
+            "both fires arrive at the seat stamp unseated — this is the defect's shape"
+        );
+        crate::pipeline::fire::stamp_lane_slots(&mut first, &stores, &vec![(first_ws, vec![0])])
+            .expect("a two-slot pool seats one sequence");
+        crate::pipeline::fire::stamp_lane_slots(&mut second, &stores, &vec![(second_ws, vec![0])])
+            .expect("and its peer");
+
+        let (frame, _) = build_frame_submission(
+            vec![vec![
+                pending(first, InstanceId(41)),
+                pending(second, InstanceId(42)),
+            ]],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        let step = &frame.steps[0];
+        assert_eq!(step.submission.lanes.len(), 2, "both members co-batch");
+        assert_ne!(
+            step.submission.lanes[0].slot, step.submission.lanes[1].slot,
+            "two concurrent sequences, two pool slots"
+        );
+        step.submission
+            .validate()
+            .expect("the contract accepts a fire whose lanes are seated apart");
+    }
+
+    fn a_device_geometry_member_seriates_into_the_suffix() {
+        let mut pooled = decode(11, 3);
+        pooled.geometry = GeometryClass::DeviceGeometry;
+        pooled.lanes[0].pages.clear();
+
+        let (frame, flattened) = build_frame_submission(
+            vec![vec![
+                pending(pooled, InstanceId(13)),
+                pending(decode(22, 4), InstanceId(12)),
+            ]],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        let step = &frame.steps[0];
+        assert_eq!(step.submission.lanes.len(), 2);
+        assert_eq!(
+            flattened
+                .iter()
+                .map(|req| req.request.geometry)
+                .collect::<Vec<_>>(),
+            vec![GeometryClass::Host, GeometryClass::DeviceGeometry],
+            "host first, device-resolved as the suffix run"
+        );
+        assert_eq!(step.instances, vec![InstanceId(12), InstanceId(13)]);
+    }
+
+    fn a_device_resolved_lane_counts_against_the_token_cap() {
+        // A decode whose token the device resolves carries no tokens here,
+        // and the engine still runs its row: with a prefill filling the cap
+        // they cannot share a step.
+        let mut pooled = decode(11, 3);
+        pooled.geometry = GeometryClass::DeviceGeometry;
+        pooled.lanes[0].tokens.clear();
+        let prefill = FireRequest::one(crate::engine::fire::lane_of(
+            1,
+            vec![7; limits().max_forward_tokens],
+            0,
+            vec![4, 5, 6, 7],
+        ));
+        let (frame, _) = build_frame_submission(
+            vec![vec![
+                pending(pooled, InstanceId(1)),
+                pending(prefill, InstanceId(2)),
+            ]],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        assert_eq!(frame.steps.len(), 2, "the prefill takes a step of its own");
+        for step in &frame.steps {
+            let rows: usize = step
+                .submission
+                .lanes
+                .iter()
+                .map(|lane| lane.tokens.len().max(1))
+                .sum();
+            assert!(rows <= limits().max_forward_tokens, "{rows} rows in a step");
+        }
+    }
+
+    fn a_frames_cells_are_one_per_member_and_never_shared() {
+        let (frame, flattened) = build_frame_submission(
+            vec![
+                vec![pending(decode(11, 3), InstanceId(1))],
+                vec![pending(decode(22, 4), InstanceId(2))],
+            ],
+            limits(),
+            16,
+            &SchedulerStats::default(),
+        );
+        let cells: Vec<_> = frame.terminal_cells().collect();
+        assert_eq!(cells.len(), flattened.len());
+        assert_eq!(
+            cells
+                .iter()
+                .map(|cell| std::sync::Arc::as_ptr(&cell.0))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            cells.len(),
+            "no cell is owned by two members"
         );
     }
 

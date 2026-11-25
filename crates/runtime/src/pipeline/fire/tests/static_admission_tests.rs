@@ -25,8 +25,11 @@ fn slot(cells: &[Arc<Mutex<ChannelCell>>], accesses: &[(bool, bool)]) -> SlotAcc
 #[test]
 fn admission_every_case() {
     a_device_ring_frame_that_overflows_is_refused_by_name();
+    a_seeded_descriptor_ring_is_not_walked();
     a_frame_that_drains_more_writer_cells_than_are_staged_is_refused();
+    a_latest_value_word_with_no_committed_cell_is_refused();
     a_reader_ring_too_small_for_the_frames_writes_is_refused();
+    a_slot_that_consumes_what_an_earlier_slot_published_is_admitted();
     two_passes_putting_one_ring_get_distinct_cells_in_dispatch_order();
 }
 
@@ -165,6 +168,15 @@ fn a_device_ring_frame_that_overflows_is_refused_by_name() {
     assert!(refusal.contains("frame slot 1"), "{refusal}");
 }
 
+fn a_seeded_descriptor_ring_is_not_walked() {
+    let seeded = channel(HostRole::None, 1, true);
+    let slots = [
+        slot(std::slice::from_ref(&seeded), &[(false, true)]),
+        slot(std::slice::from_ref(&seeded), &[(false, true)]),
+    ];
+    assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
+}
+
 fn a_frame_that_drains_more_writer_cells_than_are_staged_is_refused() {
     let writer = channel(HostRole::Writer, 4, false);
     writer
@@ -187,6 +199,22 @@ fn a_frame_that_drains_more_writer_cells_than_are_staged_is_refused() {
     assert!(refusal.contains("only 1 are staged"), "{refusal}");
 }
 
+fn a_latest_value_word_with_no_committed_cell_is_refused() {
+    let word = channel(HostRole::Writer, 1, false);
+    let slots = [
+        slot(std::slice::from_ref(&word), &[(false, false)]),
+        slot(std::slice::from_ref(&word), &[(false, false)]),
+    ];
+    let refusal = prove_frame_admissible(2, &slots).expect_err("never set");
+    assert!(refusal.contains("latest-value control word"), "{refusal}");
+
+    word.lock()
+        .unwrap()
+        .put_ref(&[0u8; 4])
+        .expect("the host writes the word");
+    assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
+}
+
 fn a_reader_ring_too_small_for_the_frames_writes_is_refused() {
     let reader = channel(HostRole::Reader, 1, false);
     let slots = [
@@ -206,4 +234,13 @@ fn a_reader_ring_too_small_for_the_frames_writes_is_refused() {
         slot(std::slice::from_ref(&roomy), &[(false, true)]),
     ];
     assert_eq!(prove_frame_admissible(2, &ok), Ok(()));
+}
+
+fn a_slot_that_consumes_what_an_earlier_slot_published_is_admitted() {
+    let chained = channel(HostRole::None, 2, false);
+    let slots = [
+        slot(std::slice::from_ref(&chained), &[(false, true)]),
+        slot(std::slice::from_ref(&chained), &[(true, false)]),
+    ];
+    assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
 }

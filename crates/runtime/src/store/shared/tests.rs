@@ -304,6 +304,20 @@ fn fixed_facts() -> ChunkFacts {
     facts
 }
 
+/// `fixed_facts`' rs list's pool id: the shapes' last.
+const RS_POOL: ShapeId = 3;
+
+/// The rs list's slots the store holds now (CONTRACT-BC 18), checking that
+/// each of `refs` is one of them.
+fn rs_live(shared: &Shared, refs: &[u32]) -> u64 {
+    let pool = shared.lock().unwrap();
+    for &r in refs {
+        let chunk = pool.slot(RS_POOL, r).chunk;
+        assert_eq!(pool.pool().chunk_shape(chunk), Some(RS_POOL), "ref {r}");
+    }
+    pool.pool().shape_demand(RS_POOL).live
+}
+
 /// The lanes of `out` as a shared pool's engine gets them.
 fn shared_lanes(
     out: &crate::pipeline::fire::rs::PreparedRs,
@@ -319,6 +333,103 @@ fn shared_lanes(
     out.apply_to(&mut req);
     crate::pipeline::fire::rs::apply_shared(&mut req, Some(shared), Some(out));
     req.lanes.into_iter().map(|lane| lane.lane).collect()
+}
+
+fn buffer_of(lane: &Lane) -> (Vec<u32>, u32, u32) {
+    match &lane.rs {
+        ::engine::fire::RsVerb::Buffer {
+            pages,
+            base,
+            folded,
+            ..
+        } => (pages.clone(), *base, *folded),
+        ::engine::fire::RsVerb::Fold => panic!("a buffering lane"),
+    }
+}
+
+/// CONTRACT-BC 18: beam lanes on one working set leave 36 rows unfolded
+/// (past the 16 a record once buffered), in rs list slots taken as the rows
+/// accumulate, `base` aligned to the slot; folding gives the slots wholly
+/// below the state back, and releasing the set the rest.
+#[test]
+fn beam_lanes_leave_their_rows_unfolded_in_rs_list_slots() {
+    use crate::pipeline::fire::rs::{
+        GroupFold, GroupPlan, RsPlan, demand, prepare, prepare_many, settle,
+    };
+    use crate::store::rs::{RsGeometry, RsUnits};
+
+    let facts = fixed_facts();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, &Tiers::default(), 16, 256);
+    let mut rs = stores.rs.lock().unwrap();
+    // The geometry's page is not the rs list's: the list's slot holds 4.
+    let ws = rs.create_working_set(RsGeometry {
+        state_size: 1024,
+        buffer_page_tokens: 16,
+    });
+    let first = prepare(&mut rs, ws, 5).unwrap();
+    settle(&mut rs, first.txn);
+    assert_eq!(rs_live(&shared, &[]), 0, "a folded state buffers nothing");
+
+    // Three lanes of twelve rows each past the state's five.
+    let plan = RsPlan::Groups(vec![GroupPlan {
+        lanes: vec![0, 1, 2],
+        writes: Some(5..41),
+        fold: GroupFold::None,
+        snapshots: Vec::new(),
+        beams: false,
+    }]);
+    assert_eq!(
+        demand(&rs, &[ws; 3], &plan),
+        Ok(RsUnits {
+            slots: 0,
+            pages: 10,
+            ..RsUnits::default()
+        }),
+        "rows 4..44 in slots of 4"
+    );
+    let out = prepare_many(&mut rs, &[ws; 3], &plan, None).unwrap();
+    let lanes = shared_lanes(&out, &shared, 3);
+    let (pages, base, folded) = buffer_of(&lanes[0]);
+    assert_eq!(
+        (base, folded),
+        (4, 5),
+        "base aligned to T_rs below the state"
+    );
+    assert_eq!(pages.len(), 10);
+    let distinct: BTreeSet<u32> = pages.iter().copied().collect();
+    assert_eq!(distinct.len(), 10);
+    for lane in &lanes {
+        assert_eq!(buffer_of(lane).0, pages, "every lane reads one buffer");
+        assert!(lane.slot_copies.is_empty(), "fresh slots copy nothing");
+        assert!(
+            matches!(&lane.record, ::engine::LaneRecord::Pieces(pieces)
+                if !pieces.is_empty() && pieces.iter().all(|(_, p)| !p.is_empty())),
+            "a lane bound to a record names it"
+        );
+        lane.validate_chunks(&facts).unwrap();
+    }
+    assert!(out.state_copy().is_none());
+    settle(&mut rs, out.txn);
+    assert_eq!(rs_live(&shared, &pages), 10);
+
+    // A fold of 30 of them: the slots wholly below row 35 go.
+    let fold = RsPlan::Groups(vec![GroupPlan {
+        lanes: vec![0],
+        writes: Some(41..42),
+        fold: GroupFold::Host(30),
+        snapshots: Vec::new(),
+        beams: false,
+    }]);
+    let out = prepare_many(&mut rs, &[ws], &fold, None).unwrap();
+    settle(&mut rs, out.txn);
+    assert_eq!(rs.frozen(ws), Ok(35));
+    assert_eq!(rs.base(ws), Ok(32));
+    assert_eq!(rs_live(&shared, &pages[7..]), 3);
+
+    rs.release_working_set(ws);
+    rs.retire_idle();
+    assert_eq!(rs_live(&shared, &[]), 0, "every slot back");
 }
 
 mod programs;
@@ -496,6 +607,50 @@ fn the_rung_walk_caps_fires_then_lowers_and_raises_back_with_an_evacuation() {
         walk.step(&pool, 1, u32::MAX, u32::MAX, 10, 10).unwrap(),
         RungStep::Cap(16)
     );
+}
+
+/// Rungs by demand: the rung a pass's rows ask for, and what a raise lacks
+/// while state fills the span the larger rung's fires take; once some of it
+/// goes, the raise moves what is left in the span down.
+#[test]
+fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung_for(0), 16, "no ask: the smallest");
+    assert_eq!(pool.rung_for(16), 16);
+    assert_eq!(pool.rung_for(17), 256);
+    assert_eq!(pool.rung_for(5000), 2048, "past every rung: the largest");
+    pool.lower_rung(16).unwrap();
+    assert_eq!(
+        pool.raise_short(2048),
+        (0, 0),
+        "an empty pool raises at once"
+    );
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    let (chunks, pages) = pool.raise_short(2048);
+    assert!(chunks > 0, "state fills the span: the raise lacks room");
+    assert!(
+        pages >= chunks * 16,
+        "16 kv pages a chunk, and the partly filled chunks' free slots on top"
+    );
+    assert!(pool.plan_raise(2048).is_err());
+    pool.give_records(&all[..all.len() / 2]);
+    pool.pool_mut().retire_through(u64::MAX);
+    assert_eq!(pool.raise_short(2048), (0, 0));
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert!(!evacuation.moves.is_empty(), "the span's state moves down");
+    engine
+        .evacuate(&SharedPool::rung_moves(&evacuation))
+        .unwrap();
+    pool.apply_rung(&evacuation, 1).unwrap();
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
 }
 
 /// While the engine holds back part of the range it stated, no slot it

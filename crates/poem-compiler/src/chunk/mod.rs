@@ -810,8 +810,8 @@ pub enum ChunkError {
 
 /// Decides how `trace`'s states pack into chunks on the device `profile`
 /// describes: a pure function of the unsplit trace. Windowed rows pack as
-/// window lists (removed by the windowed-state change; an engine stating
-/// `windowed_state` asks [`plan_windowed`]).
+/// window lists; an engine stating `windowed_state` asks
+/// [`plan_windowed`].
 pub fn plan(
     trace: &Trace,
     budgets: &Budgets,

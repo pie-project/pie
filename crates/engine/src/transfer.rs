@@ -135,8 +135,8 @@ pub struct KvCopy {
     pub moves: Vec<KvMove>,
     /// Windowed kv pages `(src, dst)` moved in the copy's direction, in the
     /// windowed planes' own page ids: a ring's pages parking on the host.
-    /// Removed by the windowed-state change; do not use in new code (a
-    /// windowed layer's ring parks with its record).
+    /// Empty from the runtime: a windowed layer's ring parks with its
+    /// record.
     #[serde(default)]
     pub windowed: Vec<(u32, u32)>,
 }

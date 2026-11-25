@@ -115,6 +115,12 @@ impl Roles {
         out
     }
 
+    /// The slots `owner` holds now, in binding order; none where it holds
+    /// none.
+    #[must_use]
+    pub fn slots(&self, owner: Owner) -> Vec<u32> {
+        self.items.get(&owner).map_or_else(Vec::new, Item::refs)
+    }
 }
 
 /// Registers channel `plan` by `register`, over the `Channel` slots

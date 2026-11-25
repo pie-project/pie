@@ -22,7 +22,7 @@ use ::engine::{
 };
 
 use super::{
-    Pump, Roles, RolesError, RolesHandle, bind_instance, learn_program, pump, rebind,
+    Owner, Pump, Roles, RolesError, RolesHandle, bind_instance, learn_program, pump, rebind,
     register_channel,
 };
 use crate::store::shared::{Shared, SharedPool};
@@ -544,6 +544,102 @@ fn a_bind_takes_the_slots_its_facts_count_and_a_close_gives_them_back() {
     assert_eq!(held(&device), before, "every slot is back");
 }
 
+#[test]
+fn a_park_and_unpark_moves_through_the_host_and_rebinds_the_new_refs() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = FakeEngine::default();
+    let before = held(&device);
+    let channel = registered(&roles, &mut engine, 1, 1);
+    let instance = bind(&roles, &mut engine, vec![channel], 1);
+    // Another process's instance on a channel of its own: it stays.
+    let other_channel = registered(&roles, &mut engine, 2, 2);
+    let other = bind(&roles, &mut engine, vec![other_channel], 2);
+    let others = roles.lock().unwrap().slots(Owner::Instance(other));
+    let resident = held(&device);
+    let was = roles.lock().unwrap().slots(Owner::Instance(instance));
+
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    let copies = park.copies().to_vec();
+    assert_eq!(copies.len(), 2, "an instance and a channel shape");
+    let instance_copy = copies.iter().find(|copy| copy.shape == INSTANCE).unwrap();
+    assert_eq!(&instance_copy.device, &was[..3]);
+    roles.lock().unwrap().commit(park);
+    let parked = (3 * 4 + 3 + 2) * KIB;
+    assert_eq!(
+        resident - held(&device),
+        parked,
+        "its device slots are free"
+    );
+    assert_eq!(held(&host), parked);
+    assert_eq!(roles.lock().unwrap().slots(Owner::Instance(other)), others);
+    assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+
+    // Something else takes the freed slots meanwhile, so the item comes
+    // back elsewhere.
+    let instance_pool = device.lock().unwrap().roles().instance.unwrap().pool;
+    let squatter = device.lock().unwrap().take_refs(instance_pool, 3).unwrap();
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    for copy in unpark.copies() {
+        assert_eq!(copy.device.len(), copy.host.len());
+    }
+    roles.lock().unwrap().commit(unpark);
+    assert_eq!(held(&host), 0, "the host slots are back");
+    let now = roles.lock().unwrap().slots(Owner::Instance(instance));
+    assert_ne!(now, was);
+
+    // The restore's rebind: every moved item, its new refs.
+    let stale = roles.lock().unwrap().stale(holder(1));
+    assert_eq!(stale.len(), 2);
+    for rebind in stale {
+        let owner = Owner::of(&rebind);
+        <FakeEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
+        roles.lock().unwrap().rebound(owner);
+    }
+    assert!(roles.lock().unwrap().stale(holder(1)).is_empty());
+    // Each shape apart: the tables, then its own ring (channel index 1;
+    // index 0 is the registered channel's).
+    assert!(engine.rebinds.contains(&Rebind::Instance {
+        id: instance,
+        instance: now[..3].to_vec(),
+        rings: vec![::engine::RingSlots {
+            channel: 1,
+            slots: now[3..].to_vec(),
+        }],
+        adapter: Vec::new(),
+        scratch: ::engine::ScratchPlace::None,
+        pair: ::engine::ScratchPlace::None,
+        pair_generation: 0,
+    }));
+    assert!(engine.rebinds.contains(&Rebind::Channel {
+        id: channel,
+        slots: roles.lock().unwrap().slots(Owner::Channel(channel)),
+    }));
+    assert!(
+        !engine
+            .rebinds
+            .iter()
+            .any(|rebind| Owner::of(rebind) == Owner::Instance(other))
+    );
+
+    device.lock().unwrap().give_refs(instance_pool, &squatter);
+    for id in [instance, other] {
+        roles.lock().unwrap().close_instance(id);
+    }
+    for id in [channel, other_channel] {
+        roles.lock().unwrap().close_channel(id);
+    }
+    assert_eq!(held(&device), before);
+}
+
 /// A ring of `slots` 1 KiB slots (cells past a slot) that must be one run.
 fn run_ring(slots: u32) -> RingFacts {
     RingFacts {
@@ -654,4 +750,109 @@ fn host_writes_into_a_parked_ring_wait_and_replay_in_order_after_the_rebind() {
     assert_eq!(engine.rebinds.len(), 2);
     write(instance, Pump::In, 6);
     assert_eq!(written.borrow().last(), Some(&(instance, Pump::In, 6)));
+}
+
+/// An engine whose program lands an adapter of four planes, a slot each,
+/// keyed `key`.
+fn adapting(key: u128) -> FakeEngine {
+    FakeEngine {
+        adapter: Footprint {
+            bytes: 4 * 48 * KIB,
+            slots: 4,
+            contiguous: false,
+        },
+        key: Some(key),
+        ..FakeEngine::default()
+    }
+}
+
+/// The device bytes an instance of [`PROGRAM`] holds beside its adapter:
+/// its tables and its two own rings.
+const INSTANCE_BYTES: u64 = 3 * 4 * KIB + (1 + 3) * KIB;
+const ADAPTER_BYTES: u64 = 4 * 64 * KIB;
+
+#[test]
+fn a_shared_adapter_parks_only_once_every_holder_has() {
+    let Pools {
+        device,
+        host,
+        roles,
+    } = pools();
+    let mut engine = adapting(7);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, Vec::new(), 1);
+    let second = bind(&roles, &mut engine, Vec::new(), 2);
+    let was = engine.bindings[0].adapter_slots.clone();
+
+    // The first holder parks: its tables move, the adapter stays for the
+    // second.
+    let park = roles.lock().unwrap().prepare_park(holder(1)).unwrap();
+    assert!(
+        park.copies().iter().all(|copy| copy.shape != ADAPTER),
+        "a holder is left on the device"
+    );
+    roles.lock().unwrap().commit(park);
+    assert_eq!(held(&host), INSTANCE_BYTES);
+    assert_eq!(roles.lock().unwrap().slots(Owner::Adapter(7)), was);
+
+    // The second parks too: the adapter goes with it, copied, not dropped.
+    let park = roles.lock().unwrap().prepare_park(holder(2)).unwrap();
+    let copy = park
+        .copies()
+        .iter()
+        .find(|copy| copy.shape == ADAPTER)
+        .cloned()
+        .expect("the last holder takes the adapter along");
+    assert_eq!(copy.device, was);
+    roles.lock().unwrap().commit(park);
+    assert_eq!(held(&device), before, "parked whole");
+    assert_eq!(held(&host), 2 * INSTANCE_BYTES + ADAPTER_BYTES);
+
+    // The first unparks: the adapter comes back with it, elsewhere, and only
+    // the holder on the device is rebound now.
+    let adapter_pool = device.lock().unwrap().roles().adapter.unwrap().pool;
+    let squatter = device.lock().unwrap().take_refs(adapter_pool, 4).unwrap();
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .unwrap();
+    roles.lock().unwrap().commit(unpark);
+    let now = roles.lock().unwrap().slots(Owner::Adapter(7));
+    assert!(now.iter().all(|slot| !was.contains(slot)));
+    let stale = roles.lock().unwrap().stale(holder(1));
+    assert_eq!(stale.len(), 1);
+    assert!(matches!(
+        &stale[0],
+        Rebind::Instance { id, adapter, .. } if *id == first && *adapter == now
+    ));
+    for rebind in stale {
+        let owner = Owner::of(&rebind);
+        roles.lock().unwrap().rebound(owner);
+    }
+
+    // The second unparks later: it is rebound to the same slots.
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(2))
+        .unwrap()
+        .unwrap();
+    assert!(
+        unpark.copies().iter().all(|copy| copy.shape != ADAPTER),
+        "the adapter is back already"
+    );
+    roles.lock().unwrap().commit(unpark);
+    let stale = roles.lock().unwrap().stale(holder(2));
+    assert!(matches!(
+        &stale[..],
+        [Rebind::Instance { id, adapter, .. }] if *id == second && *adapter == now
+    ));
+    device.lock().unwrap().give_refs(adapter_pool, &squatter);
+    for id in [first, second] {
+        roles.lock().unwrap().close_instance(id);
+    }
+    assert_eq!(held(&device), before);
+    assert_eq!(held(&host), 0);
 }

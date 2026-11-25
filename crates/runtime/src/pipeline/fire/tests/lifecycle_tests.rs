@@ -88,6 +88,111 @@ pub(crate) fn resolve_test_completion(
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_full_drain_keeps_pending_kv_for_teardown() -> anyhow::Result<()> {
+    use std::future::Future;
+    for failed in [false, true] {
+        let (fires, completion, ws, stores, failure) = pending_fire_fixture(Vec::new());
+        let mut context = TestContext {
+            id: uuid::Uuid::new_v4(),
+            resources: ResourceTable::new(),
+        };
+        context.resources.push(ws)?;
+        {
+            let mut drain = Box::pin(finalize_all(&mut context, &fires, false));
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(drain.as_mut().poll(&mut task).is_pending());
+            // Dropping the real host future models guest-task cancellation.
+        }
+        assert_eq!(
+            fires.lock().expect("test FIFO").len(),
+            1,
+            "cancelled drain must leave its unresolved operation in the FIFO"
+        );
+        context.resources = ResourceTable::new();
+        assert_eq!(
+            stores.kv.lock().available_pages(),
+            0,
+            "resource destruction must not recycle pages before completion"
+        );
+        resolve_test_completion(&completion, failed);
+        finalize_all(&mut context, &fires, true).await?;
+        assert!(fires.lock().expect("test FIFO").is_empty());
+        assert_eq!(
+            stores.kv.lock().available_pages(),
+            1,
+            "teardown must settle the original transaction and release its page"
+        );
+        assert_eq!(failure.lock().expect("test failure").is_some(), failed);
+    }
+    Ok(())
+}
+
+struct Flag(std::sync::atomic::AtomicBool);
+
+impl std::task::Wake for Flag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Lanes that all wait on one front fire register their wakers on its
+/// completion before it settles: settling it wakes every one of them,
+/// not only the last to register (else all but one lane sleep for good
+/// on a settled fire while the last decodes alone).
+#[tokio::test(flavor = "current_thread")]
+async fn every_lane_waiting_on_the_front_fire_wakes_when_it_settles() -> anyhow::Result<()> {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (fires, completion, ws, _stores, _failure) = pending_fire_fixture(Vec::new());
+    let mut context = TestContext {
+        id: uuid::Uuid::new_v4(),
+        resources: ResourceTable::new(),
+    };
+    context.resources.push(ws)?;
+    let flag = || Arc::new(Flag(AtomicBool::new(false)));
+    // Three lanes at the front fire, and a drain awaiting its completion.
+    let flags: Vec<Arc<Flag>> = (0..4).map(|_| flag()).collect();
+    let mut woken = Vec::new();
+    {
+        let mut lanes: Vec<_> = flags[..3]
+            .iter()
+            .map(|flag| {
+                (
+                    Box::pin(fires.await_front_completion()),
+                    std::task::Waker::from(flag.clone()),
+                )
+            })
+            .collect();
+        let mut drain = completion.clone();
+        let drain_waker = std::task::Waker::from(flags[3].clone());
+        for (wait, waker) in &mut lanes {
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(
+                wait.as_mut().poll(&mut cx).is_pending(),
+                "nothing settled yet"
+            );
+        }
+        let mut cx = std::task::Context::from_waker(&drain_waker);
+        assert!(std::pin::Pin::new(&mut drain).poll(&mut cx).is_pending());
+
+        resolve_test_completion(&completion, false);
+        woken.extend(flags.iter().map(|flag| flag.0.load(Ordering::Acquire)));
+        for (wait, waker) in &mut lanes {
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(wait.as_mut().poll(&mut cx).is_ready(), "the fire settled");
+        }
+    }
+    finalize_all(&mut context, &fires, true).await?;
+    assert_eq!(
+        woken,
+        vec![true; 4],
+        "every waiter registered before the settle is woken by it (three lanes, then the \
+         drain)"
+    );
+    Ok(())
+}
+
 /// A decode run ahead on a closed pipeline: `fires` fires after a
 /// 20-token prompt, each writing one row and folding it as it is
 /// prepared (a decode's fold, frozen at once, not sealed), their
@@ -376,5 +481,31 @@ async fn a_retract_over_a_final_fire_is_refused_by_name() -> anyhow::Result<()> 
         .map_err(anyhow::Error::msg)?;
     assert_eq!(run.failure(), None);
     assert_eq!(run.cursor.lock().unwrap().tail, Some(23), "the final row kept");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<()> {
+    let mut context = TestContext {
+        id: uuid::Uuid::new_v4(),
+        resources: ResourceTable::new(),
+    };
+    let pipeline = context.resources.push(Pipeline::new())?;
+    let rep = pipeline.rep();
+    let borrowed: Resource<Pipeline> = Resource::new_borrow(rep);
+    let fires = context.resources.get(&borrowed)?.fires.clone();
+    fires
+        .lock()
+        .unwrap()
+        .extend([test_pending_op_stub(), test_pending_op_stub()]);
+
+    pipeline_close(&mut context, Resource::new_borrow(rep)).await?;
+    assert!(context.resources.get(&borrowed)?.scope.is_closed());
+    assert!(fires.lock().unwrap().is_empty());
+    pipeline_close(&mut context, Resource::new_borrow(rep)).await?;
+    assert!(fires.lock().unwrap().is_empty());
+
+    pipeline_drop(&mut context, pipeline).await?;
+    assert!(context.resources.get(&borrowed).is_err());
     Ok(())
 }

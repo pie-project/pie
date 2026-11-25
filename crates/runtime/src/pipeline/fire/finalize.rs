@@ -71,6 +71,11 @@ pub async fn finalize_op<C: FireContext>(ctx: &mut C, op: PendingOp) -> Anyhow<(
 pub(crate) async fn finalize_op_await(op: PendingOp) -> FinalizeOutcome {
     match op {
         PendingOp::Fire(fire) => finalize_fire_await(fire).await,
+        #[cfg(test)]
+        PendingOp::TestStub => FinalizeOutcome {
+            action: FinalizeAction::None,
+            ws_guard: Vec::new(),
+        },
     }
 }
 

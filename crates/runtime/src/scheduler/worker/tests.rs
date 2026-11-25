@@ -1,6 +1,503 @@
 use super::*;
 
+struct PanickingEngine;
 
+impl ::engine::Engine for PanickingEngine {
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn measured_at_load(&self) -> Vec<String> {
+
+        Vec::new()
+
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
+    fn kind(&self) -> &'static str {
+        "panicking"
+    }
+
+    fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+        Err(engine::Error::Load("no model".into()))
+    }
+
+    fn submit(
+        &mut self,
+        _frame: &engine::FrameSubmission,
+    ) -> engine::Result<engine::FrameTicket> {
+        panic!("the shape of an interpreter reading lane zero of an empty cell");
+    }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for PanickingEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for PanickingEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for PanickingEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
+
+#[test]
+fn worker_every_case() {
+    a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
+    a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
+    a_launch_waits_for_the_copy_queued_ahead_of_it();
+    a_pass_that_only_reorders_lets_the_worker_park();
+}
+
+/// A browser's single thread lands the batch a close waits on only after
+/// the worker parks, so a pass that reports progress here never ends.
+fn a_pass_that_only_reorders_lets_the_worker_park() {
+    let instance = ::engine::InstanceId(1);
+    let mut pending = PendingQueue::default();
+    pending.push_back(QueuedItem::CloseInstance {
+        id: instance,
+        pacing_wait_id: 0,
+    });
+    pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(
+        PendingRequest {
+            queued: std::time::Instant::now(),
+            lora_program: false,
+            logical_fire_id: 9,
+            request: crate::engine::FireRequest::default(),
+            instance_id: instance,
+            completion: crate::engine::WorkItemCompletion::new(1, 0),
+            process_id: None,
+            pipeline_id: None,
+            prelaunch_copy: None,
+            prelaunch_state_copy: None,
+            frame: Some(FrameStamp {
+                lane: ProcessId::from_u128(5),
+                seq: 0,
+                slot: 0,
+                fires: 1,
+            }),
+        },
+    ))));
+    let stats = Arc::new(SchedulerStats::default());
+    let mut lane = Lane::spawn(0, Some(Box::new(PanickingEngine)), Arc::clone(&stats));
+    let (progress, _) = BatchScheduler::dispatch_ready_items(
+        &lane,
+        &mut LaneReplies::default(),
+        &mut HashMap::new(),
+        &mut pending,
+        &mut VecDeque::new(),
+        &mut InFlightControls::default(),
+        16,
+        SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+            max_context: 0,
+            prefill_rows: 0,
+            prefill_lanes: 0,
+            max_readouts: 0,
+            readout_store: 0,
+            max_replayed_rows: 0,
+            shapes: None,
+        },
+        &stats,
+        &mut FramePolicy::new(1, 64, 4096, None),
+        &mut ScanCache::default(),
+        &mut SlotBuffer::new(),
+        false,
+    );
+    assert!(!progress, "nothing left the queue");
+    assert_eq!(pending.len(), 2);
+    lane.shutdown();
+}
+
+fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
+    let pipeline = ProcessId::from_u128(5);
+    let request = PendingRequest {
+        queued: std::time::Instant::now(),
+        lora_program: false,
+        logical_fire_id: 9,
+        request: crate::engine::FireRequest::default(),
+        instance_id: ::engine::InstanceId(1),
+        completion: crate::engine::WorkItemCompletion::new(1, 0),
+        process_id: None,
+        pipeline_id: Some(pipeline),
+        prelaunch_copy: None,
+        prelaunch_state_copy: Some(StateCopy::default()),
+        frame: None,
+    };
+    let mut pending = PendingQueue::default();
+    BatchScheduler::queue_attempt(&mut pending, request);
+    let mut cache = ScanCache::default();
+    let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+    assert!(scan.untracked.is_empty(), "behind its copy");
+    // The copy is dispatched: the launch rides.
+    let copy = pending.pop_front();
+    assert!(matches!(copy, Some(QueuedItem::PreLaunchCopy { .. })));
+    let mut cache = ScanCache::default();
+    let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+    assert_eq!(scan.untracked, [9]);
+}
+
+fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
+    let mut lane = Lane::spawn(
+        0,
+        Some(Box::new(PanickingEngine)),
+        Arc::new(SchedulerStats::default()),
+    );
+
+    let mut answers = Vec::new();
+    for token in [7_u64, 8] {
+        let answer_rx = lane.fire(
+            crate::engine::FrameFire {
+                steps: vec![crate::engine::StepFire {
+                    fire_stamps: Vec::new(),
+        lane_sets: Vec::new(),
+                    shapes: None,
+                    submission: ::engine::Step {
+                        lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
+                        attachments: Vec::new(),
+                        media: Vec::new(),
+                        voxels: Vec::new(),
+                        shape: None,
+                    },
+                    terminal_cells: Vec::new(),
+                    completions: Vec::new(),
+                    member_lanes: Vec::new(),
+                    instances: vec![::engine::InstanceId(0)],
+                }],
+            },
+            false,
+        );
+        answers.push((token, answer_rx));
+    }
+
+    for (want, answer_rx) in answers {
+        let result = crate::rt::block_on(async {
+            crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
+        })
+        .unwrap_or_else(|_| panic!("token {want} was never answered"))
+        .unwrap_or_else(|_| panic!("token {want} was never answered"));
+        let Err(err) = result else {
+            panic!("a panicking engine cannot have launched anything");
+        };
+        assert!(
+            err.contains("panic"),
+            "the failure must say what happened, so an operator restarts \
+             rather than retries: {err}"
+        );
+    }
+
+    let (engine, channels) = lane.shutdown();
+    assert!(engine.is_none(), "a poisoned lane hands back no engine");
+    assert!(channels.is_empty());
+}
+
+struct ExhaustedEngine {
+    submits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ::engine::Engine for ExhaustedEngine {
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn measured_at_load(&self) -> Vec<String> {
+
+        Vec::new()
+
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
+    fn kind(&self) -> &'static str {
+        "exhausted"
+    }
+
+    fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
+        Err(engine::Error::Load("no model".into()))
+    }
+
+    fn submit(
+        &mut self,
+        _frame: &engine::FrameSubmission,
+    ) -> engine::Result<engine::FrameTicket> {
+        self.submits.fetch_add(1, Ordering::Relaxed);
+        Err(engine::Error::Exhausted {
+            resource: "guest channel cells",
+            wanted: 2,
+            available: 1,
+        })
+    }
+
+    fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    fn programs(&mut self) -> Option<&mut dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn programs_ref(&self) -> Option<&dyn ::engine::Programs> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn ::engine::Pool> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn ::engine::Tiers> {
+        Some(self)
+    }
+}
+
+impl ::engine::Programs for ExhaustedEngine {
+    fn prepare(
+        &mut self,
+        _registration: &::engine::program::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramCompile> {
+        Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
+    }
+
+    fn finish(
+        &mut self,
+        _prepared: ::engine::Prepared,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "finish_program"))
+    }
+
+    fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "close_program"))
+    }
+
+    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    }
+
+    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
+    }
+
+    fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
+        Err(::engine::Error::unsupported(self.kind(), "close_instance"))
+    }
+
+    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    }
+}
+
+impl ::engine::Pool for ExhaustedEngine {
+    fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
+        Err(::engine::Error::unsupported(self.kind(), "chunk_table"))
+    }
+
+    fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "commit_segments"))
+    }
+
+    fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+    }
+
+    fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "evacuate"))
+    }
+}
+
+impl ::engine::Tiers for ExhaustedEngine {
+    /// A test engine's copies land inside the call: nothing to wait for.
+    fn settle(&mut self) -> ::engine::Result<()> {
+        Ok(())
+    }
+
+    /// A test engine's copies complete inside the call: their sources are
+    /// read by the time it returns.
+    fn copy_landing(
+        &mut self,
+        copy: &::engine::chunk::SlotCopy,
+        _token: u64,
+    ) -> ::engine::Result<bool> {
+        ::engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
+    fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
+    }
+
+    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
+    }
+
+    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    }
+
+    fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
+    }
+}
+
+
+fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
+    let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut lane = Lane::spawn(
+        0,
+        Some(Box::new(ExhaustedEngine {
+            submits: Arc::clone(&submits),
+        })),
+        Arc::new(SchedulerStats::default()),
+    );
+
+    let answer_rx = lane.fire(
+        crate::engine::FrameFire {
+            steps: vec![crate::engine::StepFire {
+                fire_stamps: Vec::new(),
+        lane_sets: Vec::new(),
+                shapes: None,
+                submission: ::engine::Step {
+                    lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
+                    attachments: Vec::new(),
+                    media: Vec::new(),
+                    voxels: Vec::new(),
+                    shape: None,
+                },
+                terminal_cells: Vec::new(),
+                completions: Vec::new(),
+                member_lanes: Vec::new(),
+                instances: vec![::engine::InstanceId(0)],
+            }],
+        },
+        false,
+    );
+
+    let result = crate::rt::block_on(async {
+        crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
+    })
+    .expect("the launch must be answered, not slept on")
+    .expect("the launch must be answered, not slept on");
+    let Err(error) = result else {
+        panic!("an engine that refuses everything cannot have admitted a frame");
+    };
+    assert!(
+        error.contains("frame contract forbids"),
+        "the failure must say which promise was broken, so the fix is to \
+         static admission rather than to the retry budget: {error}"
+    );
+    assert!(error.contains("guest channel cells"), "{error}");
+    assert_eq!(
+        submits.load(Ordering::Relaxed),
+        1,
+        "the frame is offered ONCE; a second offer is the sleep-retry loop \
+         growing back"
+    );
+
+    let (_engine, _channels) = lane.shutdown();
+}
 
 
 

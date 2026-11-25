@@ -203,4 +203,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_freed_low_id_is_handed_out_before_any_higher_one() {
+        let mut pool = Pool::<u32>::new_range(10, 130);
+        assert_eq!(pool.try_alloc_n(3), Some(vec![10, 11, 12]));
+        pool.release_reserved(vec![11]);
+        assert_eq!(pool.try_alloc_n(2), Some(vec![11, 13]));
+        assert_eq!(pool.available(), 126);
+    }
+
+    #[test]
+    fn taking_an_id_keeps_the_count_and_refuses_a_stranger() {
+        let mut pool = Pool::<u32>::new_range(4, 4);
+        assert!(pool.take(5));
+        assert!(!pool.take(5));
+        assert!(!pool.take(3));
+        assert!(!pool.take(8));
+        assert_eq!(pool.available(), 3);
+        assert_eq!(pool.try_alloc_n(3), Some(vec![4, 6, 7]));
+    }
+
+    #[test]
+    fn an_empty_pool_hands_out_nothing_and_stays_whole() {
+        let mut pool = Pool::<u32>::new(0);
+        assert_eq!(pool.try_alloc_n(0), Some(vec![]));
+        assert_eq!(pool.try_alloc_n(1), None);
+    }
 }

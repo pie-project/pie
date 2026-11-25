@@ -35,7 +35,15 @@ fn fires(plan: &FramePlan) -> Vec<u64> {
 fn frame_every_case() {
     seals_complete_lanes_and_orders_waves_by_slot();
     incomplete_lane_holds_the_seal_until_it_completes();
+    sealed_frame_dispatches_whole_and_frames_overlap();
+    a_fire_racing_the_suspend_seals_alone_without_rejoining_the_wait_set();
+    a_lane_parked_mid_frame_seals_what_it_submitted();
+    truncated_frame_seals_with_submitted_fires_only();
     graceful_close_releases_the_wait();
+    no_prompt_waits_for_a_lane_off_a_prompt();
+    consumed_release_leaves_no_phantom_hold_for_bystander();
+    a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
+    a_wave_reads_out_no_more_than_the_engine_carves();
     a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name();
     processes_over_the_execution_permits_joining_together_all_finish();
 }
@@ -434,6 +442,107 @@ fn a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name() {
     assert_eq!(policy.admit_post(a, 1), Ok(()), "a pipeline that left is forgotten");
 }
 
+/// Lanes that read out several rows each (a verified draft block) share
+/// a wave only within the engine's readout ceiling; the rest wait a
+/// frame instead of the fire being refused, and a fire past the ceiling
+/// alone still takes a wave of its own.
+fn a_wave_reads_out_no_more_than_the_engine_carves() {
+    let mut policy = FramePolicy::new(1, 64, 4096, None).with_max_wave_readouts(8);
+    let lanes: Vec<ProcessId> = (0..3).map(|_| pid()).collect();
+    for (at, &lane) in lanes.iter().enumerate() {
+        policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(lane), 10 + at as u64, 5, 1, 5, 5, 0);
+    }
+    let mut sealed_ids = Vec::new();
+    for _ in 0..3 {
+        let queued: QueuedFireIds = (10..13).filter(|id| !sealed_ids.contains(id)).collect();
+        let sealed = fires(&plan(&mut policy, &queued, Instant::now()));
+        assert_eq!(
+            sealed.len(),
+            1,
+            "two lanes of five readouts each pass a ceiling of eight"
+        );
+        sealed_ids.extend(sealed);
+        policy.on_frame_retired(lanes.iter().copied());
+    }
+    sealed_ids.sort_unstable();
+    assert_eq!(sealed_ids, vec![10, 11, 12], "every lane seals in its turn");
+
+    let lone = pid();
+    policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12, 12, 0);
+    let queued: QueuedFireIds = [20].into_iter().collect();
+    assert_eq!(
+        fires(&plan(&mut policy, &queued, Instant::now())),
+        vec![20],
+        "a fire past the ceiling alone takes a wave of its own"
+    );
+}
+
+/// Concurrent prompts whose prefills are cut at checkpoints, each lane's
+/// pieces submitted together: a lane's pieces fill the steps of its
+/// frames in order (`piece_frames`), so the pieces of every lane seal
+/// into one frame, each piece in its own step, not one unframed launch
+/// at a time.
+fn a_burst_of_cut_prefills_seals_its_pieces_step_by_step() {
+    const LANES: usize = 8;
+    let mut policy = FramePolicy::new(2, 64, 4096, None);
+    let lanes: Vec<ProcessId> = (0..LANES).map(|_| pid()).collect();
+    let mut ids = Vec::new();
+    for (at, &lane) in lanes.iter().enumerate() {
+        let mut seq = 0u64;
+        let framed =
+            crate::pipeline::fire::piece_frames(Some(stamp(lane, 0, 0, 1)), 2, 2, || {
+                seq += 1;
+                seq
+            });
+        assert_eq!(
+            framed,
+            vec![Some(stamp(lane, 0, 0, 2)), Some(stamp(lane, 0, 1, 2))],
+            "two pieces are one frame's two steps"
+        );
+        for (piece, frame) in framed.into_iter().enumerate() {
+            let id = 100 + 2 * at as u64 + piece as u64;
+            policy.on_fire_enqueued(frame.expect("framed"), Some(lane), id, 128, 1);
+            ids.push(id);
+        }
+    }
+    let queued: QueuedFireIds = ids.iter().copied().collect();
+    let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+        panic!("expected a whole-frame dispatch");
+    };
+    for (step, wave) in waves.iter().enumerate() {
+        let mut wave = wave.clone();
+        wave.sort_unstable();
+        let want: Vec<u64> = (0..LANES as u64)
+            .map(|at| 100 + 2 * at + step as u64)
+            .collect();
+        assert_eq!(wave, want, "step {step} holds piece {step} of every lane");
+    }
+
+    let mut seq = 0u64;
+    let three =
+        crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 4, 0, 1)), 3, 2, || {
+            seq += 1;
+            seq
+        });
+    assert_eq!(
+        three,
+        vec![
+            Some(stamp(lanes[0], 4, 0, 2)),
+            Some(stamp(lanes[0], 4, 1, 2)),
+            Some(stamp(lanes[0], 1, 0, 1)),
+        ],
+        "a third piece opens the next frame, alone"
+    );
+
+    let shared =
+        crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 9, 1, 2)), 3, 2, || 0);
+    assert_eq!(
+        shared,
+        vec![None, None, Some(stamp(lanes[0], 9, 1, 2))],
+        "a shared frame keeps its last piece"
+    );
+}
+
 fn seals_complete_lanes_and_orders_waves_by_slot() {
     let mut policy = FramePolicy::new(4, 64, 4096, None);
     let (a, b) = (pid(), pid());
@@ -486,6 +595,116 @@ fn incomplete_lane_holds_the_seal_until_it_completes() {
     assert!(waves[0].contains(&1) && waves[0].contains(&3));
 }
 
+fn sealed_frame_dispatches_whole_and_frames_overlap() {
+    let mut policy = FramePolicy::new(2, 64, 4096, None);
+    let (a, b) = (pid(), pid());
+    policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
+    policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
+    let queued: QueuedFireIds = [50, 51].into_iter().collect();
+    let FramePlan::Dispatch(frame0) = plan(&mut policy, &queued, Instant::now()) else {
+        panic!("expected lane a's whole frame");
+    };
+    assert_eq!(frame0, vec![vec![50], vec![51]]);
+    policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 60, 1, 1);
+    policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1);
+    policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1);
+    policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1);
+    let queued: QueuedFireIds = [52, 53, 60, 61].into_iter().collect();
+    let FramePlan::Dispatch(merged) =
+        policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())
+    else {
+        panic!("the overlapped next frame must seal and dispatch whole");
+    };
+    assert_eq!(merged[0].len(), 2, "wave 0 must hold BOTH lanes");
+    assert!(merged[0].contains(&52) && merged[0].contains(&60));
+    assert_eq!(merged[1].len(), 2);
+    assert!(merged[1].contains(&53) && merged[1].contains(&61));
+}
+
+fn a_fire_racing_the_suspend_seals_alone_without_rejoining_the_wait_set() {
+    let mut policy = FramePolicy::new(2, 64, 4096, None);
+    let (victim, healthy) = {
+        let (x, y) = (pid(), pid());
+        if x < y { (x, y) } else { (y, x) }
+    };
+    policy.on_fire_enqueued(stamp(victim, 0, 0, 2), Some(victim), 100, 1, 1);
+    policy.on_fire_enqueued(stamp(victim, 0, 1, 2), Some(victim), 101, 1, 1);
+    policy.on_fire_enqueued(stamp(healthy, 0, 0, 2), Some(healthy), 102, 1, 1);
+    policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1);
+    let queued: QueuedFireIds = [100, 101, 102, 103].into_iter().collect();
+    assert!(matches!(
+        plan(&mut policy, &queued, Instant::now()),
+        FramePlan::Dispatch(_)
+    ));
+
+    policy.on_process_suspend(victim);
+    policy.on_fire_enqueued(stamp(victim, 1, 0, 2), Some(victim), 200, 1, 1);
+    policy.on_fire_enqueued(stamp(healthy, 1, 0, 2), Some(healthy), 300, 1, 1);
+    policy.on_fire_enqueued(stamp(healthy, 1, 1, 2), Some(healthy), 301, 1, 1);
+    assert!(
+        policy.lanes.get(&victim).is_none_or(|lane| !lane.awaited),
+        "a suspended owner's arrival must not rejoin the wait-set"
+    );
+
+    // The victim's stranded slot rides the healthy lane's frame (its
+    // lease has to drain), which seals without waiting for the victim.
+    let queued: QueuedFireIds = [200, 300, 301].into_iter().collect();
+    let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+        panic!("the boundary must seal without waiting for the victim");
+    };
+    let mut sent = fires(&FramePlan::Dispatch(waves));
+    sent.sort_unstable();
+    assert_eq!(sent, vec![200, 300, 301], "one frame: the straggler rides it");
+
+    policy.on_process_resume(victim);
+    policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1);
+    policy.on_fire_enqueued(stamp(healthy, 2, 0, 2), Some(healthy), 302, 1, 1);
+    policy.on_fire_enqueued(stamp(healthy, 2, 1, 2), Some(healthy), 303, 1, 1);
+    let queued: QueuedFireIds = [201, 302, 303].into_iter().collect();
+    let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+        panic!("the late slot must seal");
+    };
+    assert!(
+        waves.iter().flatten().any(|&id| id == 302) && waves.iter().flatten().any(|&id| id == 303),
+        "the healthy lane's frame goes: {waves:?}"
+    );
+
+    policy.on_fire_enqueued(stamp(victim, 2, 0, 2), Some(victim), 400, 1, 1);
+    policy.on_fire_enqueued(stamp(victim, 2, 1, 2), Some(victim), 401, 1, 1);
+    assert!(
+        policy.lanes[&victim].awaited,
+        "a resumed process rejoins on its next frame"
+    );
+}
+
+fn a_lane_parked_mid_frame_seals_what_it_submitted() {
+    let mut policy = FramePolicy::new(2, 64, 4096, None);
+    let lane = pid();
+    policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1);
+    policy.on_lane_leave(lane, Some(lane), false);
+    let queued: QueuedFireIds = [10].into_iter().collect();
+    let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+        panic!("a parked lane's submitted slot must still seal");
+    };
+    assert_eq!(waves[0], vec![10]);
+    assert!(waves[1].is_empty());
+}
+
+fn truncated_frame_seals_with_submitted_fires_only() {
+    let mut policy = FramePolicy::new(4, 64, 4096, None);
+    let lane = pid();
+    policy.on_fire_enqueued(stamp(lane, 0, 0, 4), Some(lane), 30, 1, 1);
+    policy.on_fire_enqueued(stamp(lane, 0, 1, 4), Some(lane), 31, 1, 1);
+    policy.on_frame_truncated(lane, 0, 2);
+    let queued: QueuedFireIds = [30, 31].into_iter().collect();
+    let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
+        panic!("truncated frame must still seal");
+    };
+    assert_eq!(waves[0], vec![30]);
+    assert_eq!(waves[1], vec![31]);
+    assert!(waves[2].is_empty() && waves[3].is_empty());
+}
+
 fn graceful_close_releases_the_wait() {
     let mut policy = FramePolicy::new(2, 64, 4096, None);
     let (a, b) = (pid(), pid());
@@ -512,5 +731,54 @@ fn graceful_close_releases_the_wait() {
     assert!(
         !matches!(plan(&mut policy, &empty, Instant::now()), FramePlan::Dispatch(_)),
         "nothing is left to seal once a closes"
+    );
+}
+
+fn no_prompt_waits_for_a_lane_off_a_prompt() {
+    let mut policy = FramePolicy::new(2, 64, 4096, None);
+    let (a, b, c) = (pid(), pid(), pid());
+    policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 512, 1);
+    policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
+    let queued: QueuedFireIds = [90, 91].into_iter().collect();
+    assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
+
+    policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
+    policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 93, 256, 1);
+    let queued: QueuedFireIds = [92, 93].into_iter().collect();
+    let mut sealed =
+        fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()));
+    sealed.sort_unstable();
+    assert_eq!(
+        sealed,
+        vec![92, 93],
+        "c's prompt seals behind a's on the card, b's decode rides beside it"
+    );
+    policy.on_frame_retired([a, b]);
+    policy.on_fire_enqueued(stamp(b, 2, 0, 1), Some(b), 94, 1, 1);
+    let queued: QueuedFireIds = [94].into_iter().collect();
+    assert!(
+        !matches!(plan_in_flight(&mut policy, &queued, Instant::now()), FramePlan::Dispatch(_)),
+        "with no prompt to ride, b's decode waits for a's next pass"
+    );
+}
+
+fn consumed_release_leaves_no_phantom_hold_for_bystander() {
+    let mut policy = FramePolicy::new(2, 64, 4096, None);
+    let executing = pid();
+    let bystander = pid();
+    policy.on_bind_enqueued(Some(executing));
+    policy.on_bind_completed(Some(executing));
+    policy.on_execution_slot_consumed(executing);
+    policy.on_fire_enqueued(stamp(executing, 0, 0, 1), Some(executing), 95, 1, 1);
+    policy.on_execution_slot_released(pid());
+    policy.on_execution_slot_consumed(executing);
+    policy.on_bind_enqueued(Some(bystander));
+    let queued: QueuedFireIds = [95].into_iter().collect();
+    assert!(
+        matches!(
+            plan(&mut policy, &queued, Instant::now()),
+            FramePlan::Dispatch(_)
+        ),
+        "a drained release must not hold for a staged bystander"
     );
 }

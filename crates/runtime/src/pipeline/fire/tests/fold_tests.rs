@@ -1,6 +1,7 @@
 use super::*;
 use crate::inferlet::host::working_set::Cursor;
-use crate::store::kv::page_table::WorkingSetId;
+use crate::store::kv::KvStoreError;
+use crate::store::kv::page_table::{KvTableError, WorkingSetId};
 use crate::store::registry::Stores;
 
 fn cursor(reserved: u32) -> CursorCell {
@@ -124,6 +125,46 @@ fn report(tag: u64, fold: u32) -> ::engine::KvWrites {
         fold: Some(fold),
         ..::engine::KvWrites::default()
     }
+}
+
+#[test]
+fn fold_every_case() {
+    a_fire_carrying_a_span_leaves_its_lag();
+}
+
+fn a_fire_carrying_a_span_leaves_its_lag() {
+    let cell = cursor(0);
+    cell.lock().unwrap().spans = vec![(10, 14, 2), (50, 60, 4)];
+    let span = Arc::new(media::front::EncodedSpan {
+        token_count: 20,
+        position_span: 5,
+        grid: media::front::Grid::still(4, 5),
+        patch_grid: media::front::Grid::still(8, 10),
+        uses_mrope: true,
+        payload: Vec::new(),
+        rows: 80,
+        positions: Vec::new(),
+        prefix: Vec::new(),
+        placeholder: 0,
+        suffix: Vec::new(),
+    });
+    let run = crate::pipeline::media::MatchedRun {
+        lane: 0,
+        anchor: 3,
+        rows: 20,
+        span,
+    };
+    let landings = [landing(40, 30)];
+    let spans = lagging_spans(&landings, &[run], &[0], &(40..70));
+    advance_cursor(&cell, Some(70), Some((40, spans)));
+    let now = cell.lock().unwrap().clone();
+    assert_eq!((now.tail, now.reserved, now.written), (Some(70), 70, 70));
+    assert_eq!(
+        now.spans,
+        [(10, 14, 2), (43, 63, 15)],
+        "the write from slot 40 replaces what lay past it"
+    );
+    assert_eq!(crate::inferlet::host::working_set::lag(&now.spans, 70), 17);
 }
 
 /// `tokens` written into `ws` from row 0, 16 rows a page, by a pass
@@ -296,6 +337,8 @@ struct Flight {
     rs: RsWorkingSetId,
     /// Where the pass's fires are staged from.
     cursor: CursorCell,
+    /// What its first lane reports under, where the device counts.
+    tag: u64,
 }
 
 impl Flight {
@@ -339,7 +382,7 @@ fn in_flight_on(fold: &geometry::Fold, exact: bool, recurrent: bool) -> Flight {
     let failure: PipelineFailure = Arc::new(Mutex::new(None));
     let fires = Arc::new(PendingFireQueue::new());
     let part = recurrent.then_some(rs);
-    let (completion, _) = submit(&kv, part, &cell, &fires, &failure, fold);
+    let (completion, tag) = submit(&kv, part, &cell, &fires, &failure, fold);
     Flight {
         stores,
         fires,
@@ -348,6 +391,7 @@ fn in_flight_on(fold: &geometry::Fold, exact: bool, recurrent: bool) -> Flight {
         kv,
         rs,
         cursor: cell,
+        tag,
     }
 }
 
@@ -637,3 +681,10 @@ async fn a_fold_that_is_never_placed_refuses_the_fork_by_name() -> Anyhow<()> {
     assert_eq!(refused.map(|_| ()), Err(unreported.to_string()));
     Ok(())
 }
+
+// A pass that runs ahead submits a frame's fires one after another, and
+// the scheduler dispatches none of them before the frame's last has
+// arrived. A fire behind one that folds by a count the device computes
+// is therefore staged before that count exists.
+
+use crate::scheduler::frame::{FramePlan, FramePolicy, FrameStamp, QueuedFireIds};
