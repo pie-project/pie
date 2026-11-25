@@ -219,6 +219,7 @@ impl Split {
         }
     }
 
+    #[cfg(unix)]
     fn workers(&self, len: usize) -> usize {
         let rate = self.rate.get();
         if rate <= 0.0 {
@@ -251,6 +252,7 @@ impl Split {
     }
 
     /// What one thread's spawn and join cost on this machine.
+    #[cfg(unix)]
     fn spawn(&self) -> f64 {
         if let Some(spawn) = self.spawn.get() {
             return spawn;

@@ -547,8 +547,7 @@ impl Bytes {
 /// span segments backed from the top. A physical chunk holds state only
 /// below the bottom's end (never past the span's first chunk) or in a
 /// backed span segment; a fire or a move naming any other is refused as an
-/// impossible submission (the M1 at beamx40: "this fire wants 357
-/// committed chunks of the state pool and the load reserved 350").
+/// impossible submission.
 #[derive(Debug)]
 struct EngineView {
     total: u32,
@@ -702,23 +701,8 @@ struct Resolved {
 /// taken back after some of its copies landed (the tier below full for the
 /// next) leaves its process reading them where they lie, and slots a
 /// committed move gave back are rewritten by whoever takes them next.
-fn land_bytes(bytes: &Mutex<Bytes>, copy: &::engine::chunk::SlotCopy, resolved: &Resolved) {
-    trace(|| {
-        format!(
-            "copy {:?} {:?}->{:?} {:?} at {:?}",
-            copy.shape, copy.src, copy.dst, copy.slots, resolved.slots
-        )
-    });
+fn land_bytes(bytes: &Mutex<Bytes>, resolved: &Resolved) {
     bytes.lock().unwrap().land(resolved);
-}
-
-/// `PIE_SIM_TRACE`: every copy landed, bind and rebind said, to diff two
-/// runs of a seed by.
-fn trace(line: impl FnOnce() -> String) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("PIE_SIM_TRACE").is_some()) {
-        eprintln!("SIMTRACE {}", line());
-    }
 }
 
 /// The `Instance` slot refs `place` covers. A piece of whole chunks is
@@ -1073,7 +1057,6 @@ impl ::engine::Programs for SimEngine {
             }
         }
         self.lay_pair(places.program, places.pair_generation, &places.pair);
-        trace(|| format!("bind {id} {places:?}"));
         self.instances.insert(id, places);
         Ok(BoundInstance {
             id: InstanceId(self.next),
@@ -1107,7 +1090,6 @@ impl ::engine::Programs for SimEngine {
                 };
                 self.claim(id.0, &places, "a rebind")?;
                 self.parked.remove(&id.0);
-                trace(|| format!("rebind {} {places:?}", id.0));
                 let (program, place) = (places.program, places.pair.clone());
                 self.instances.insert(id.0, places);
                 self.lay_pair(program, pair_generation, &place);
@@ -1121,7 +1103,6 @@ impl ::engine::Programs for SimEngine {
                     };
                     self.claims.park(id.0, &runs);
                     self.parked.insert(id.0, kept);
-                    trace(|| format!("parked {} kept={kept}", id.0));
                 }
             }
             _ => {}
@@ -1252,7 +1233,7 @@ struct Script {
     raise: Option<u32>,
     /// A verifier's rescore per hypothesis, every `.1` steps: an instance
     /// of program `.0` bound beside the beam group's (its pair shared),
-    /// fired once and closed (the M1's beam w17 verify groups).
+    /// fired once and closed, as a beam's verify groups are.
     verify: Option<(u32, u32)>,
 }
 
@@ -1302,15 +1283,6 @@ struct Workload {
 
 impl Workload {
     fn of(seed: u64) -> Self {
-        // `PIE_SIM_FIELD`: every seed the field's mix, drawn from a stream
-        // of its own ([`Self::field_mix`]).
-        if std::env::var_os("PIE_SIM_FIELD").is_some() {
-            return Self::field(seed);
-        }
-        // `PIE_SIM_METAL`: the M1's pool, scaled ([`Self::metal`]).
-        if std::env::var_os("PIE_SIM_METAL").is_some() {
-            return Self::metal(seed);
-        }
         let mut rng = Rng(seed);
         let pool = PoolShape::of(&mut rng);
         let state = pool.state_chunks();
@@ -1396,8 +1368,7 @@ impl Workload {
         // A crowd of plain decodes beside the rest (beams, binds, rescores)
         // on the same small pool, drawn from a stream of its own: each must
         // finish within the run's bound, never starved by the others'
-        // restores and binds (the L40S at 3 GiB: 0 of 150 decodes done in
-        // 553 s while beams verified).
+        // restores and binds.
         let mut crowd_rng = Rng(seed ^ 0xc0_7d_de_c0);
         if crowd_rng.chance(1, 4) {
             for _ in 0..crowd_rng.range(12, 24) {
@@ -1465,234 +1436,6 @@ impl Workload {
             default_policy: false,
             late_refuse: false,
         }
-    }
-
-    /// The L40S's 3 GiB disk-only stress mix: a small device, no host tier,
-    /// a small disk, verified beam searches (forks over a shared prompt, a
-    /// resident beam group's guest state bound early, a rescore that closes
-    /// it and binds a second program) beside a crowd of plain greedy
-    /// decodes. Every process must finish within the run's bound: beams
-    /// verified while every decode starved (150 of 150 unfinished in 527 s,
-    /// evictions and restores 1:1) is a liveness failure.
-    fn field(seed: u64) -> Self {
-        Self::field_mix(seed, Rng(seed ^ 0xf1e1_d0a1))
-    }
-
-    fn field_mix(seed: u64, mut rng: Rng) -> Self {
-        let mut pool = PoolShape::of(&mut rng);
-        pool.total = rng.range(14, 24);
-        pool.segment = [4, 6, pool.total][rng.below(3) as usize];
-        pool.host_chunks = 0;
-        // A small disk, or one roomy beside the device (the L40S's).
-        pool.disk_chunks = if rng.chance(1, 2) { rng.range(6, 16) } else { rng.range(32, 96) };
-        pool.programs.retain(|program| program.run * 2 <= pool.total / 4);
-        let most = pool.most_pages();
-        let horizon = rng.range(4, 30);
-        let beam_programs: Vec<u32> = (0..pool.programs.len() as u32).collect();
-        // The beam pool's fire is bound after the prompt beside the
-        // prefill's, both open in one pipeline until the search ends (the
-        // beam-search inferlet): a bind short of room with guest state of
-        // its own suspends its process. Drawn from a stream of its own, so
-        // every other draw of a seed stands as it was.
-        let mut pool_rng = Rng(seed ^ 0xbea_9001);
-        // A beam's frame cut wider than the rung's cap, its raise owed:
-        // drawn from a stream of its own too.
-        let mut raise_rng = Rng(seed ^ 0x2a15_e0ed);
-        let mut scripts = Vec::new();
-        for _ in 0..rng.range(2, 6) {
-            let decode = rng.range(4, 16);
-            let beam_pool = beam_programs[pool_rng.below(beam_programs.len() as u64) as usize];
-            let mut script = Script {
-                at: rng.range(0, horizon),
-                prompt: rng.range(4, 16),
-                decode,
-                grow_every: rng.range(1, 2),
-                beams: 4,
-                bind: vec![
-                    (1.min(beam_programs.len() as u32 - 1), false),
-                    (beam_pool, true),
-                ],
-                idle: None,
-                rescore: Some((
-                    rng.range(0, decode - 1),
-                    beam_programs[rng.below(beam_programs.len() as u64) as usize],
-                )),
-                raise: raise_rng.chance(1, 2).then(|| raise_rng.range(0, decode - 1)),
-                verify: None,
-            };
-            while script.pages() > most && script.decode > 1 {
-                script.decode -= 1;
-            }
-            while script.pages() > most && script.prompt > 1 {
-                script.prompt -= 1;
-            }
-            while script.pages() > most && script.beams > 1 {
-                script.beams -= 1;
-            }
-            if let Some((when, program)) = script.rescore {
-                script.rescore = Some((when.min(script.decode.saturating_sub(1)), program));
-            }
-            script.raise = script.raise.map(|when| when.min(script.decode.saturating_sub(1)));
-            scripts.push(script);
-        }
-        for _ in 0..rng.range(12, 40) {
-            let mut script = Script {
-                at: rng.range(0, horizon),
-                prompt: rng.range(1, 4),
-                decode: rng.range(20, 120),
-                grow_every: rng.range(1, 3),
-                beams: 1,
-                bind: Vec::new(),
-                idle: None,
-                rescore: None,
-                raise: None,
-                verify: None,
-            };
-            while script.pages() > most && script.decode > 0 {
-                script.decode -= 1;
-            }
-            scripts.push(script);
-        }
-        // Wide: many beam searches at once beside the decodes (the M1's
-        // beamx40, 80 verified beam-4 searches), drawn from a stream of its
-        // own so every other draw of a seed stands as it was.
-        let mut wide_rng = Rng(seed ^ 0x80_81de);
-        if wide_rng.chance(1, 4) {
-            let template = scripts[0].clone();
-            for _ in 0..wide_rng.range(40, 80) {
-                let mut script = template.clone();
-                script.at = wide_rng.range(0, horizon);
-                if let Some((_, program)) = script.rescore {
-                    script.rescore =
-                        Some((wide_rng.range(0, script.decode.saturating_sub(1)), program));
-                }
-                script.raise = raise_rng
-                    .chance(1, 2)
-                    .then(|| raise_rng.range(0, script.decode.saturating_sub(1)));
-                scripts.push(script);
-            }
-        }
-        let late = [0, 4][rng.below(2) as usize];
-        // The device's room shrinks under the mix and comes back: its
-        // evacuations move parked state kept in place, claims and all.
-        let mut target = Vec::new();
-        let segments = pool.segments();
-        if segments >= 3 && rng.chance(1, 2) {
-            pool.governed = true;
-            pool.span_on_demand = Rng(seed ^ 0x5ba_e2d0).chance(1, 2);
-            let mut from = rng.range(0, horizon + 4);
-            for _ in 0..rng.range(1, 3) {
-                let to = from + rng.range(2, 24);
-                target.push((from, to, rng.range(segments - 1, segments - 1).max(2)));
-                from = to + rng.range(0, 12);
-            }
-        }
-        Self {
-            seed,
-            pool,
-            scripts,
-            tier_full: Vec::new(),
-            late,
-            target,
-            ring: None,
-            landing_fails: None,
-            default_policy: false,
-            late_refuse: false,
-        }
-    }
-
-    /// The M1's pool at 16 beam w17 searches beside 16 greedy decodes
-    /// (Qwen3-0.6B), scaled down tenfold: 14 bottom segments of 3 chunks
-    /// and a span of 4 (a partial last segment), Metal's two-ended pool
-    /// with its span backed on demand, rungs of 1, 3 and 4 chunks (the
-    /// M1's 7, 34 and 40), the governor's target under what is held. The
-    /// field mix's scripts, beams widened toward 17 where they fit.
-    fn metal(seed: u64) -> Self {
-        let mut workload = Self::field_mix(seed, Rng(seed ^ 0x3e7a_1001));
-        let mut rng = Rng(seed ^ 0x3e7a_1002);
-        let pool = &mut workload.pool;
-        pool.total = 46;
-        pool.segment = 3;
-        pool.act = vec![(16, 1), (64, 3), (128, 4)];
-        pool.governed = true;
-        pool.span_on_demand = true;
-        pool.disk_chunks = rng.range(24, 96);
-        // A guest run of a whole segment beside the field's.
-        if !pool.programs.iter().any(|program| program.run == 3) {
-            pool.programs.push(Program {
-                run: 3,
-                scratch: 3 * MIB,
-                resident: 0,
-                per_pair: 3 * MIB,
-            });
-        }
-        let programs = pool.programs.len() as u32;
-        let most = pool.most_pages();
-        // Sixteen beam searches and sixteen greedy decodes, arriving at
-        // once (the M1's load), each beam's pool one of every program.
-        let beams: Vec<Script> = workload.scripts.iter().filter(|s| s.beams > 1).cloned().collect();
-        let greedy: Vec<Script> = workload.scripts.iter().filter(|s| s.beams == 1).cloned().collect();
-        let mut scripts = Vec::new();
-        for k in 0..16 {
-            if let Some(template) = beams.get(k % beams.len().max(1)) {
-                let mut script = template.clone();
-                script.at = rng.range(0, 4);
-                if let Some(slot) = script.bind.last_mut() {
-                    slot.0 = rng.below(u64::from(programs)) as u32;
-                    if let Some(verify) = &mut script.verify {
-                        verify.0 = slot.0;
-                    }
-                }
-                scripts.push(script);
-            }
-            if let Some(template) = greedy.get(k % greedy.len().max(1)) {
-                let mut script = template.clone();
-                script.at = rng.range(0, 4);
-                scripts.push(script);
-            }
-        }
-        workload.scripts = scripts;
-        let segments = pool.segments();
-        // Small disks for some: a park finding no room below keeps its
-        // tables and rings in place on the device.
-        if rng.chance(1, 2) {
-            pool.disk_chunks = rng.range(6, 16);
-        }
-        for script in &mut workload.scripts {
-            if script.beams > 1 {
-                script.beams = 17;
-                // Its verifier: the beam pool's program, a hypothesis
-                // rescored every step or few.
-                let beam_pool = script.bind.last().map_or(0, |&(program, _)| program);
-                script.verify = Some((beam_pool, rng.range(1, 3)));
-            }
-            while script.pages() > most && script.beams > 2 {
-                script.beams -= 1;
-            }
-            while script.pages() > most && script.decode > 1 {
-                script.decode -= 1;
-            }
-            while script.pages() > most && script.prompt > 1 {
-                script.prompt -= 1;
-            }
-            if let Some((when, program)) = script.rescore {
-                script.rescore = Some((when.min(script.decode.saturating_sub(1)), program));
-            }
-            script.raise = script.raise.map(|when| when.min(script.decode.saturating_sub(1)));
-        }
-        // The governor's shrink and regrow under live state (the M1's
-        // target toggling 12 and 11 segments every few seconds): short
-        // windows a segment or two under the pool, close together.
-        workload.target = Vec::new();
-        let mut from = rng.range(0, 8);
-        for _ in 0..rng.range(4, 14) {
-            let to = from + rng.range(2, 8);
-            workload
-                .target
-                .push((from, to, rng.range(segments - 4, segments - 1)));
-            from = to + rng.range(1, 5);
-        }
-        workload
     }
 
     /// The governor's target at `step`, in segments.
@@ -2064,8 +1807,7 @@ impl Progress {
     /// per arrival of that head (its first ask, a restore, or a request
     /// after an idle wait). Restored beside the head it was evicted for, a
     /// lane went back down for the head's next page, round and round while
-    /// about three lanes stepped (the L40S at 3 GiB: 1,923 evictions, 150
-    /// decodes unfinished in 542 s).
+    /// about three lanes stepped.
     fn moved(&mut self, ctx: &Ctx, step: u32) {
         for pid in std::mem::take(&mut ctx.log.lock().unwrap().requests) {
             self.owed.retain(|&(_, head)| head != pid);
@@ -2399,7 +2141,6 @@ async fn fire(
             let mut bytes = ctx.bytes.lock().unwrap();
             for (set, pages) in sets.iter().zip(written) {
                 for (index, page) in pages {
-                    trace(|| format!("write set {} index {index} page {page}", set.tag));
                     bytes.write(TIER_DEVICE, LIST, page, pattern(5, set.tag, index));
                 }
             }
@@ -2408,7 +2149,6 @@ async fn fire(
         drop(grant);
         ctx.log.lock().unwrap().fires += 1;
         ctx.at(pid, "fire in flight");
-        trace(|| format!("fire {pid} pages={pages} step={}", ctx.step.load(Ordering::Relaxed)));
         ctx.next_step().await;
         with_kv_lock(&ctx.stores.kv, "sim-land", |kv| {
             for seq in seqs {
@@ -2882,7 +2622,6 @@ fn walk(ctx: &Ctx) -> bool {
     };
     let moved = match step {
         Some(crate::store::shared::SegmentMove::Compact { applied, epoch, .. }) => {
-            trace(|| format!("compact {applied:?}"));
             let total = shared.lock().unwrap().pool().total_chunks();
             ctx.bytes.lock().unwrap().moved(total, &applied);
             ctx.engine.lock().unwrap().rebase();
@@ -2957,13 +2696,11 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     }
     // Every holder's chunks lie where the engine's state pool holds state
     // under the rung in force: below the activation the current rung
-    // carves, in memory the engine backs (the M1 at beamx40: a raise that
-    // left a holder's refs past the committed chunks, a fire refused as
-    // an impossible submission, the chunk maps diverging after).
+    // carves, in memory the engine backs: a holder's ref past the
+    // committed chunks is a fire the engine refuses.
     if let Some(shared) = &ctx.stores.shared {
         // The pool's own bookkeeping holds: every run whole, every held
-        // chunk's slots counted (the M1 on 5fd1e46e8: "Slot { chunk: 277,
-        // index: 0 } lies in a free chunk" seconds into a beam w17 load).
+        // chunk's slots counted.
         if let Some(why) = pool_check(shared) {
             return Err(fail("bookkeeping", why));
         }
@@ -2971,8 +2708,7 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         // held: the kv trie's resident pages, the roles' live parts on the
         // device, and the engine's bound instances' tables, rings and
         // scratch (a parked one's kept tables and rings). A slot named past
-        // its release is read and written as another's (the M1's fires on
-        // free logical chunks swapped onto a released segment).
+        // its release is read and written as another's.
         if let Some(why) = stray_holders(ctx, shared) {
             return Err(fail("stale ref", why));
         }
@@ -3023,8 +2759,7 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         .map(|(pid, why)| fail("refused", format!("process {pid}: {why}")))
         .collect();
     // A wait only something in flight could end, chosen with nothing in
-    // flight: the planner found no step (said in the field as a warning,
-    // the L40S at 3 GiB on df488038b: 111 of them).
+    // flight: the planner found no step.
     if let Some(ended) = super::eviction::QUIET_WAITS
         .with(|waits| std::mem::take(&mut *waits.borrow_mut()))
         .into_iter()
@@ -3081,8 +2816,7 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
             return Err(fail("store", format!("{leaked} role slots leaked")));
         }
         // No ref two items hold, none an item holds that the pool counts
-        // free (the L40S on batch 3: instance slot 12537 handed to a
-        // restore's rebind and a fresh bind 1 ms apart).
+        // free (one slot handed to a restore's rebind and a fresh bind).
         if let Some(line) = roles.lock().unwrap().audit_device_slots().into_iter().next() {
             return Err(fail("double", line));
         }
@@ -3318,7 +3052,6 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 }
                 if let crate::scheduler::worker::PoolOp::Evacuate(evacuation) = op {
                     ops[1].fetch_add(1, Ordering::Relaxed);
-                    trace(|| format!("evacuate {:?}", evacuation.moves));
                     lane_bytes
                         .lock()
                         .unwrap()
@@ -3438,8 +3171,8 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 }
                 copy.fail_landing("the device event faulted (simulated)");
             } else {
-                if let (Some(slots), Some(resolved)) = (&copy.slots, &resolved) {
-                    land_bytes(&ctx.bytes, slots, resolved);
+                if let (Some(_), Some(resolved)) = (&copy.slots, &resolved) {
+                    land_bytes(&ctx.bytes, resolved);
                 }
                 copy.land();
             }
@@ -3589,8 +3322,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         // ([`Progress::moved`]).
         // A bind suspends its process for its own room at most once:
         // restored only once that room stands free beside its kv, it binds
-        // (the M1 at beamx40: bind suspensions 1,996 over 201 processes,
-        // some suspended 58 to 68 times, unfinished in 45 minutes).
+        // (else a bind's process is suspended for it again and again).
         coverage.most_suspended = u64::from(log.most_suspended);
         for &(pid, program, suspended) in &log.bind_thrash {
             progress.again += u64::from(suspended - 1);
@@ -3638,644 +3370,29 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     (failures, coverage)
 }
 
-/// Shrinks `workload`'s scripts to the fewest that still fail with
-/// `shape`, within a budget of runs: the scripts kept.
-fn shrink(workload: &Workload, shape: &str) -> (Vec<usize>, Failure) {
-    let mut keep: Vec<usize> = (0..workload.scripts.len()).collect();
-    let mut last = None;
-    let mut budget = 80;
-    let mut chunk = keep.len().div_ceil(2).max(1);
-    while chunk >= 1 && budget > 0 {
-        let mut removed_any = false;
-        let mut at = 0;
-        while at < keep.len() && budget > 0 {
-            let trial: Vec<usize> = keep
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i < at || *i >= at + chunk)
-                .map(|(_, &s)| s)
-                .collect();
-            if trial.is_empty() {
-                at += chunk;
-                continue;
-            }
-            budget -= 1;
-            match run(workload, Some(&trial))
-                .0
-                .into_iter()
-                .find(|failure| shape_of(failure) == shape)
-            {
-                Some(failure) if shape_of(&failure) == shape => {
-                    keep = trial;
-                    last = Some(failure);
-                    removed_any = true;
-                }
-                _ => at += chunk,
-            }
-        }
-        if chunk == 1 && !removed_any {
-            break;
-        }
-        chunk = (chunk / 2).max(1);
-    }
-    let failure = last.unwrap_or_else(|| {
-        run(workload, Some(&keep))
-            .0
-            .into_iter()
-            .find(|failure| shape_of(failure) == shape)
-            .expect("still fails")
-    });
-    (keep, failure)
-}
+/// The liveness seeds: each a fleet of processes over a pool, its tiers,
+/// its governor's target and its engine's landings, drawn from the seed.
+/// One runs under the built-in `default` policy's seat-to-end holds
+/// ([`Workload::default_policy`]) and one with the engine refusing
+/// evacuations past its table swap ([`Workload::late_refuse`]).
+const SEEDS: [u64; 8] = [19, 30, 44, 431, 1610, 3243, 401, 729];
 
-/// Runs seeds `seeds`: the failures (seed, failure) and the coverage.
-fn sweep(seeds: std::ops::Range<u64>) -> (Vec<(u64, Failure)>, Coverage) {
-    sweep_with(seeds, |_| {})
-}
-
-/// [`sweep`] with each seed's workload changed by `tweak`.
-fn sweep_with(
-    seeds: std::ops::Range<u64>,
-    tweak: impl Fn(&mut Workload),
-) -> (Vec<(u64, Failure)>, Coverage) {
+/// Every seed settles every step: no process waits for good, no slot is
+/// read where another lies, every process ends.
+#[test]
+fn the_simulated_fleet_settles_every_step_on_its_seeds() {
     let mut failures = Vec::new();
     let mut coverage = Coverage::default();
-    for seed in seeds {
+    for (index, &seed) in SEEDS.iter().enumerate() {
         let mut workload = Workload::of(seed);
-        tweak(&mut workload);
+        workload.default_policy = index == SEEDS.len() - 2;
+        workload.late_refuse = index == SEEDS.len() - 1;
         let (found, covered) = run(&workload, None);
         coverage.add(&covered);
-        for failure in found {
-            eprintln!(
-                "SIM seed={seed} processes={} step={} kind={} shape=[{}]\n    {}",
-                workload.scripts.len(),
-                failure.step,
-                failure.kind,
-                shape_of(&failure),
-                failure.line
-            );
-            failures.push((seed, failure));
-        }
+        failures.extend(found.into_iter().map(|failure| (seed, failure)));
     }
-    (failures, coverage)
-}
-
-/// The distinct shapes of `failures`, each with its seeds, each first seed
-/// shrunk to its minimal reproduction.
-fn report(failures: &[(u64, Failure)], coverage: &Coverage, shrinking: bool) -> String {
-    let mut shapes: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    for (seed, failure) in failures {
-        shapes.entry(shape_of(failure)).or_default().push(*seed);
-    }
-    let mut out = format!("SIM coverage: {coverage:?}\n");
-    out += &format!(
-        "SIM progress: {:.1} requests finished a 1,000 steps, {:.2} fires a live step, {:.2} \
-         evictions and {:.2} bind suspensions a finished process, at most {} suspensions a bind\n",
-        coverage.finished as f64 * 1000.0 / coverage.steps.max(1) as f64,
-        coverage.fires as f64 / coverage.live_steps.max(1) as f64,
-        coverage.evictions as f64 / coverage.finished.max(1) as f64,
-        coverage.bind_suspends as f64 / coverage.finished.max(1) as f64,
-        coverage.most_suspended
-    );
-    out += &format!("SIM {} failures, {} shapes\n", failures.len(), shapes.len());
-    for (shape, seeds) in &shapes {
-        out += &format!(
-            "SIM shape [{shape}]: {} seeds, first {:?}\n",
-            seeds.len(),
-            &seeds[..seeds.len().min(12)]
-        );
-        if shrinking {
-            let workload = Workload::of(seeds[0]);
-            let (keep, failure) = shrink(&workload, shape);
-            out += &format!(
-                "SIM   minimal: seed={} scripts {:?} of {} ({:?}) step={}\n      {}\n",
-                seeds[0],
-                keep,
-                workload.scripts.len(),
-                keep.iter()
-                    .map(|&at| &workload.scripts[at])
-                    .collect::<Vec<_>>(),
-                failure.step,
-                failure.line
-            );
-        }
-    }
-    out
-}
-
-/// A seed's workload and failure, by name: `None` where it runs clean.
-fn replay_seed(seed: u64) -> Vec<Failure> {
-    run(&Workload::of(seed), None).0
-}
-
-/// Shapes the simulation found and the runtime fixed, each seed's
-/// regression test run in the suite; the fast sweep fails on them again.
-const FIXED: [(&str, u64); 35] = [
-    // A bind's guest parts and its tables, rings or adapter each open a
-    // fresh chunk, the refusal quoting the part short alone: served one
-    // chunk, short again, a spin (seeds 1, 46, 4137, 4287). The refusal
-    // asks every chunk the bind opens.
-    ("refused bind program #: spins", 1),
-    // A bind-suspended restore's need ratcheted with each refusal.
-    ("stall restore: its pending bind's need ratcheted", 13),
-    // A bind-suspended restore whose placement stands refused by its
-    // takes, no pick following.
-    ("stall restore: placement stands", 111),
-    // A bind short of a run of two, no placement and no pick.
-    ("stall bind room", 188),
-    // Resident bytes lost at a park: every engine states its value
-    // scratch as scratch, dead between fires, and resident bytes are a
-    // held part, copied down at a park and back at an unpark (program 1
-    // states a chunk of them).
-    ("corrupt instance # of program #: its resident bytes", 1),
-    // A pair taken anew at an unpark is laid fresh: right by the pair
-    // contract (`engine::GuestState`), the check now reads the pair at the
-    // generation its instance is bound on.
-    (
-        "corrupt instance # of program #: its pair, bound throughout, was taken anew",
-        19,
-    ),
-    // A bound pair's slots taken by another: a pair parked with one
-    // holder while another member was on its way.
-    ("corrupt instance # of program #: its pair's", 3364),
-    ("corrupt instance # of program #: its pair's", 3999),
-    // A restore waiting on rebinds beside a park and unpark loop.
-    ("liveness", 1711),
-    // A restore short of runs its own unpark takes: the compaction asked
-    // stands that many more runs than stand now (seeds 111, 93, 3822).
-    ("stall restore: placement short", 111),
-    // A head no move serves (a bind short of chunks only a full disk could
-    // empty, every resident a waiter) held the queue with nothing in
-    // flight: it is passed over for the pass, and a waiter behind it that
-    // can go does (seeds 134, 136, 624, 2235).
-    ("stall bind room", 134),
-    ("stall bind room", 624),
-    // A lone process whose own scattered pages break its bind's run: a
-    // compaction stands it.
-    ("stall bind room", 971),
-    // Two restores each evicted for the other, each held behind the
-    // other, the older restored and evicted again for the younger: a
-    // head moves are made for is held for no one (seeds 774, 155, 213).
-    ("liveness", 774),
-    // A victim's restore went while the bind it was evicted for was
-    // served and not yet taken, took its room, and was evicted again.
-    ("liveness", 361),
-    // ... or while that bind was between its asks, out of the queue.
-    ("liveness", 1610),
-    // A victim restored past a head passed over, evicted for it again
-    // before it fired: restored and able to fire, it is no victim.
-    ("liveness", 4139),
-    // A decoder's one-page ask failed for another's room: no waiter that
-    // fits the pool alone is failed for another.
-    ("refused acquire # pages: KV pool starved", 3243),
-    // Every resident's kv past the room below, the chunks the waiters
-    // need held by guest parts: a victim blocked on one room is blocked on
-    // no other, an eviction whose kv has no room below parks it where it
-    // lies and gives its guest parts back, and a move of parked state down
-    // refused is not tried again on the same room (its take and give-back
-    // ran the pass again for good).
-    ("stall restore", 3392),
-    // The simulation's own: a run of chunks laid at its first chunk's
-    // physical place, its later chunks read by logical id after a
-    // compaction moved chunks.
-    ("corrupt", 3785),
-    // An eviction taken back for a full tier below returned its process
-    // resident before the take-back ran (spawned, after its copies): picked
-    // again at once, the second eviction parked nothing of its items still
-    // moving, the take-back then left its instance bound on the device
-    // beside a process said evicted, and its pair was taken anew under it
-    // at the restore: another program's bind landed on the pair's old run.
-    ("claims a bind of instance # (program #): Instance slots", 1348),
-    // Every tier full, no idle cache, the fleet's state past all three:
-    // a capacity deadlock admission let in. The gate keeps the finisher's
-    // headroom free on every tier together, counting held state once
-    // wherever it lies and the room the guest shapes hold open that no
-    // state fills (small slots' chunks, whole disk chunks of parked parts)
-    // as not free; a bind is weighed by the fresh chunks it opens (seeds
-    // 3243, 3591, 2547, 2771, 2292, 2144).
-    (
-        "stall allocation: placement none, moves some, host_short true, ended \"no room below for the head's own kv",
-        3243,
-    ),
-    (
-        "stall bind room: placement none, moves none, host_short false, ended \"every candidate blocked",
-        3591,
-    ),
-    ("stall bind room: placement none, moves none, host_short true", 3243),
-    (
-        "stall allocation: placement none, moves some, host_short false, ended \"no pick: the policy is asked",
-        2547,
-    ),
-    ("stall allocation", 2771),
-    ("stall restore", 2292),
-    ("liveness", 2144),
-    // Free list slots scattered across partly used list chunks, no whole
-    // chunk free for a bind's or a restore's runs: a list compaction moves
-    // the emptiest chunks' pages into the free slots of the rest, device to
-    // device, its readers fenced, and the chunks stand free whole (a bind
-    // of two single chunks, 4670; a restore of five, 2945; a restore of a
-    // run of two and four singles, its own gathered pages scattered and
-    // taken again the fullest chunks first, 2200; runs of two laid by the
-    // chunk compaction once the chunks stand free, 1610).
-    ("stall bind room", 4670),
-    ("stall restore", 2945),
-    ("stall restore", 2200),
-    ("stall bind room", 1610),
-    ("liveness", 731),
-    ("liveness", 4641),
-    // The one resident with pages to move, its move refused while the disk
-    // tier stood full a step: blocked until the pool moved, with nothing
-    // else in flight to move it, and the finisher's one page unserved. A
-    // pass forced for a head left waiting with nothing in flight lifts the
-    // block.
-    ("liveness", 431),
-];
-
-/// The fast sweep: 200 seeds, none failing. It covers the [`FIXED`] seeds
-/// below 200, so only those past it have a regression test of their own.
-#[test]
-fn the_simulated_fleet_settles_every_step_on_200_seeds() {
-    let (failures, coverage) = sweep(0..200);
-    let report = report(&failures, &coverage, false);
-    eprintln!("{report}");
-    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
-    assert!(
-        coverage.evictions > 0 && coverage.restores > 0,
-        "{coverage:?}"
-    );
-}
-
-/// The fast sweep's seeds under the built-in `default` policy's seat-to-end
-/// holds ([`Workload::default_policy`]).
-#[test]
-fn the_simulated_fleet_settles_every_step_under_the_default_policy() {
-    let (failures, coverage) = sweep_with(0..48, |workload| workload.default_policy = true);
-    let report = report(&failures, &coverage, false);
-    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
-}
-
-/// The fast sweep's seeds with the engine refusing evacuations past its
-/// table swap and putting its table back ([`Workload::late_refuse`]): the
-/// runtime takes each move back, and the tables agree.
-#[test]
-fn the_simulated_fleet_settles_every_step_with_evacuations_refused_late() {
-    let (failures, coverage) = sweep_with(0..48, |workload| workload.late_refuse = true);
-    let report = report(&failures, &coverage, false);
-    assert!(failures.is_empty(), "failures: {failures:?}\n{report}");
-}
-
-/// Seed `seed` runs clean of the shape `prefix` ([`FIXED`]).
-fn regression((prefix, seed): (&str, u64)) {
-    let failures = replay_seed(seed);
-    for failure in &failures {
-        eprintln!(
-            "SIM seed {seed} step {} [{}]: {}",
-            failure.step,
-            shape_of(failure),
-            failure.line
-        );
-    }
-    assert!(
-        !failures
-            .iter()
-            .any(|failure| shape_of(failure).starts_with(prefix)),
-        "seed {seed} still fails as [{prefix}]"
-    );
-}
-
-#[test]
-fn sim_seed_3364_a_bound_pair_s_slots_are_its_own() {
-    regression(FIXED[6]);
-}
-
-#[test]
-fn sim_seed_3999_a_bound_pair_s_slots_are_its_own() {
-    regression(FIXED[7]);
-}
-
-#[test]
-fn sim_seed_1711_every_process_ends() {
-    regression(FIXED[8]);
-}
-
-#[test]
-fn sim_seed_624_a_head_no_move_serves_is_passed_over() {
-    regression(FIXED[11]);
-}
-
-#[test]
-fn sim_seed_971_a_lone_bind_s_run_is_compacted_for() {
-    regression(FIXED[12]);
-}
-
-#[test]
-fn sim_seed_774_two_restores_evicted_for_each_other_end() {
-    regression(FIXED[13]);
-}
-
-#[test]
-fn sim_seed_361_a_served_bind_holds_its_victim_s_restore() {
-    regression(FIXED[14]);
-}
-
-#[test]
-fn sim_seed_1610_a_bind_between_its_asks_holds_its_victim_s_restore() {
-    regression(FIXED[15]);
-}
-
-#[test]
-fn sim_seed_4139_a_victim_restored_past_a_passed_head_fires_first() {
-    regression(FIXED[16]);
-}
-
-#[test]
-fn sim_seed_3243_no_waiter_that_fits_is_failed_for_another() {
-    regression(FIXED[17]);
-}
-
-#[test]
-fn sim_seed_3785_a_run_s_later_chunks_are_read_where_they_lie() {
-    regression(FIXED[19]);
-}
-
-#[test]
-fn sim_seed_3392_a_waiter_s_guest_parts_park_with_its_kv_in_place() {
-    regression(FIXED[18]);
-}
-
-#[test]
-fn sim_seed_3243_every_tier_full_is_no_deadlock() {
-    regression(FIXED[21]);
-    regression(FIXED[23]);
-}
-
-#[test]
-fn sim_seed_3591_residents_past_the_swap_left_are_no_deadlock() {
-    regression(FIXED[22]);
-}
-
-#[test]
-fn sim_seed_2547_residents_a_page_short_are_no_deadlock() {
-    regression(FIXED[24]);
-}
-
-#[test]
-fn sim_seed_2771_guest_chunks_held_open_are_no_free_room() {
-    regression(FIXED[25]);
-}
-
-#[test]
-fn sim_seed_2292_a_restore_beside_full_tiers_is_served() {
-    regression(FIXED[26]);
-}
-
-#[test]
-fn sim_seed_2144_every_process_ends() {
-    regression(FIXED[27]);
-}
-
-#[test]
-fn sim_seed_4670_a_bind_of_whole_chunks_among_scattered_pages_is_compacted_for() {
-    regression(FIXED[28]);
-}
-
-#[test]
-fn sim_seed_2945_a_restore_of_whole_chunks_among_scattered_pages_is_compacted_for() {
-    regression(FIXED[29]);
-}
-
-#[test]
-fn sim_seed_2200_a_restore_s_run_among_scattered_gathered_pages_is_compacted_for() {
-    regression(FIXED[30]);
-}
-
-#[test]
-fn sim_seed_1610_a_bind_s_runs_of_two_are_laid_once_chunks_stand_free() {
-    regression(FIXED[31]);
-}
-
-#[test]
-fn sim_seed_731_every_process_ends() {
-    regression(FIXED[32]);
-}
-
-#[test]
-fn sim_seed_4641_every_process_ends() {
-    regression(FIXED[33]);
-}
-
-#[test]
-fn sim_seed_1348_an_eviction_taken_back_is_back_before_its_process_is_resident() {
-    regression(FIXED[20]);
-}
-
-#[test]
-fn sim_seed_431_a_block_nothing_in_flight_moves_lifts_at_a_forced_pass() {
-    regression(FIXED[34]);
-}
-
-/// Field-mix seed `seed` ([`Workload::field`]) runs clean.
-fn field_regression(seed: u64) {
-    let failures = run(&Workload::field(seed), None).0;
-    for failure in &failures {
-        eprintln!(
-            "SIM field seed {seed} step {} [{}]: {}",
-            failure.step,
-            shape_of(failure),
-            failure.line
-        );
-    }
-    assert!(failures.is_empty(), "field seed {seed}: {} failures", failures.len());
-}
-
-/// A lane restored beside the head it was evicted for went back down for
-/// the head's next page, and again: a victim comes back once its head is
-/// done with its request ([`Progress::moved`]).
-#[test]
-fn sim_field_seed_3_a_lane_is_evicted_once_for_a_head_s_request() {
-    field_regression(3);
-}
-
-/// Seeds 863 and 178 of the field mix: processes still at admission at
-/// the run's bound (863), and the finisher's bind of two adjacent chunks
-/// unserved while two restores went round (178). Both end as lanes run to
-/// the end of their requests.
-#[test]
-fn sim_field_seeds_863_and_178_end() {
-    field_regression(863);
-    field_regression(178);
-}
-
-/// The Metal w17 mix's seeds 2 and 6: newcomers arrive with the device
-/// full of admitted work. Over-demand waits and is served: each newcomer
-/// waits for room as admitted processes move or finish (refused by name
-/// at admission only with the fleet wedged but for it), and every process
-/// ends, finished or failed by name with every tier full.
-#[test]
-fn sim_metal_seeds_2_and_6_every_process_ends() {
-    for seed in [2, 6] {
-        let (failures, _) = run(&Workload::metal(seed), None);
-        for failure in &failures {
-            eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
-        }
-        assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
-    }
-}
-
-/// The Metal mix's seeds 30, 44 and 131: a restore carrying the bind that
-/// suspended its process lays that bind's fresh chunks, new state (seed
-/// 44: a chunk taken with nothing spare, 14 pages short). Every process
-/// ends, finished or failed by name with every tier full.
-#[test]
-fn sim_metal_seeds_30_44_131_a_restores_bind_waits_on_the_gate() {
-    for seed in [30, 44, 131] {
-        let (failures, _) = run(&Workload::metal(seed), None);
-        for failure in &failures {
-            eprintln!("SIM metal seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
-        }
-        assert!(failures.is_empty(), "metal seed {seed}: {} failures", failures.len());
-    }
-}
-
-/// What a run did, as a string two runs of one seed must agree on.
-fn fingerprint(workload: &Workload) -> String {
-    let (failures, coverage) = run(workload, None);
-    let failures: Vec<String> = failures
-        .iter()
-        .map(|failure| format!("{} {} {}", failure.step, failure.kind, failure.line))
-        .collect();
-    format!("{failures:?} {coverage:?}")
-}
-
-/// The seeds of `seeds` whose two runs differ.
-fn unreproduced(seeds: std::ops::Range<u64>) -> Vec<u64> {
-    seeds
-        .filter(|&seed| {
-            let workload = Workload::of(seed);
-            let first = fingerprint(&workload);
-            let second = fingerprint(&workload);
-            if first != second {
-                eprintln!("SIM seed {seed} differs:\n  {first}\n  {second}");
-            }
-            first != second
-        })
-        .collect()
-}
-
-/// A seed runs the same every time: its failures, at the same step with the
-/// same line, and what it exercised.
-#[test]
-fn a_simulated_seed_reproduces_exactly() {
-    let differ = unreproduced(0..24);
-    assert!(differ.is_empty(), "seeds that ran differently: {differ:?}");
-}
-
-/// The Metal mix's seed 103 runs the same twice: a sweep and a parked
-/// move down that take a process's sets in turn until they have what they
-/// want walked them in a hash set's order, which differs between runs, and
-/// moved another beam's pages each time.
-#[test]
-fn a_metal_seed_whose_sweeps_take_sets_in_turn_reproduces_exactly() {
-    let workload = Workload::metal(103);
-    let (first, second) = (fingerprint(&workload), fingerprint(&workload));
-    assert_eq!(first, second, "Metal seed 103 ran differently");
-}
-
-/// [`a_simulated_seed_reproduces_exactly`] over `PIE_SIM_SEEDS` seeds (500).
-#[test]
-#[ignore]
-fn simulated_seeds_reproduce_exactly_on_500_seeds() {
-    let seeds = std::env::var("PIE_SIM_SEEDS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(500);
-    let differ = unreproduced(0..seeds);
-    assert!(
-        differ.is_empty(),
-        "{} seeds ran differently: {differ:?}",
-        differ.len()
-    );
-}
-
-/// The long sweep: `PIE_SIM_SEEDS` seeds (5000 by default) from
-/// `PIE_SIM_FROM` (0), the distinct failure shapes shrunk to their minimal
-/// reproductions. Run with `--ignored --nocapture`.
-#[test]
-#[ignore]
-fn the_simulated_fleet_settles_every_step_on_5000_seeds() {
-    let env = |name: &str, default: u64| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default)
-    };
-    let from = env("PIE_SIM_FROM", 0);
-    let seeds = env("PIE_SIM_SEEDS", 5000);
-    let (failures, coverage) = sweep(from..from + seeds);
-    let shrinking = std::env::var_os("PIE_SIM_NO_SHRINK").is_none();
-    let report = report(&failures, &coverage, shrinking);
-    eprintln!("{report}");
-    assert!(failures.is_empty(), "{report}");
-}
-
-/// One seed, by `PIE_SIM_SEED`, its failure said in full.
-#[test]
-#[ignore]
-fn replay_one_simulated_seed() {
-    let seed = std::env::var("PIE_SIM_SEED")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    if std::env::var_os("PIE_SIM_LOG").is_some() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_env("PIE_SIM_LOG"))
-            .with_writer(std::io::stderr)
-            .try_init();
-    }
-    let workload = Workload::of(seed);
-    eprintln!("SIM workload {workload:#?}");
-    // `PIE_SIM_REPEAT` runs of it, each said apart: two runs' logs diff to
-    // nothing where the seed reproduces.
-    let repeat = std::env::var("PIE_SIM_REPEAT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1);
-    let mut failures = Vec::new();
-    for run in 0..repeat {
-        eprintln!("SIM RUN {run}");
-        failures = replay_seed(seed);
-        for failure in &failures {
-            eprintln!(
-                "SIM seed {seed} step {} [{}]: {}",
-                failure.step,
-                shape_of(failure),
-                failure.line
-            );
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "seed {seed}: {} failures",
-        failures.len()
-    );
-}
-
-/// [`replay_one_simulated_seed`] under the built-in `default` policy's
-/// seat-to-end holds ([`Workload::default_policy`]).
-#[test]
-#[ignore]
-fn replay_one_simulated_seed_under_the_default_policy() {
-    let seed = std::env::var("PIE_SIM_SEED")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let mut workload = Workload::of(seed);
-    workload.default_policy = true;
-    let failures = run(&workload, None).0;
-    for failure in &failures {
-        eprintln!("SIM seed {seed} step {} [{}]: {}", failure.step, shape_of(failure), failure.line);
-    }
-    assert!(failures.is_empty(), "seed {seed}: {} failures", failures.len());
+    assert!(failures.is_empty(), "failures: {failures:?}\n{coverage:?}");
+    assert!(coverage.evictions > 0 && coverage.restores > 0, "{coverage:?}");
 }
 
 /// A pool of `total` chunks in segments of `segment`, a bind of `run`
@@ -4286,8 +3403,7 @@ fn run_need_workload(seed: u64, total: u32, segment: u32, run: u32, governed: bo
 }
 
 /// [`run_need_workload`] with a bind of `pieces` runs of `run` chunks
-/// beside its single chunks (the M1's run 4b: a restore's bind of two runs
-/// of 28 and two single chunks, 104 chunks free).
+/// beside its single chunks.
 fn run_pieces_workload(
     seed: u64,
     total: u32,
@@ -4368,85 +3484,6 @@ fn run_pieces_workload(
     }
 }
 
-/// A bind of a run of five adjacent chunks, the pool's free chunks enough
-/// for it but scattered under decoders' pages (the M5 at beam w32: a
-/// restore of three runs of 57 with 99 chunks free and no run of 57, the
-/// planner finding no step 0.5 M times): the run is opened, by moves the
-/// pool makes, and every process ends.
-#[test]
-fn a_run_the_pool_can_open_is_opened() {
-    let mut waited = 0;
-    for seed in 0..40 {
-        for governed in [false, true] {
-            let (failures, coverage) = run(&run_need_workload(seed, 18, 6, 5, governed), None);
-            for failure in &failures {
-                eprintln!(
-                    "SIM run need seed {seed} (governed {governed}) step {}: [{}] {}",
-                    failure.step, failure.kind, failure.line
-                );
-            }
-            assert!(failures.is_empty(), "seed {seed} governed {governed}: {} failures", failures.len());
-            waited += coverage.bind_waits;
-        }
-    }
-    assert!(waited > 0, "no run waited for room: the shape scatters nothing");
-}
-
-/// `PIE_SIM_PIECES`: binds of two runs beside their single chunks, among
-/// decoders scattering their pages, many arriving at once so binds suspend
-/// their processes and restores carry the bind's room (the M1's run 4b);
-/// every process ends, no restore's placement and takes disagree.
-#[test]
-#[ignore]
-fn binds_of_two_runs_beside_singles_restore_and_end() {
-    let seeds = std::env::var("PIE_SIM_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
-    let mut failed = 0;
-    let mut coverage = Coverage::default();
-    for seed in 0..seeds {
-        for (total, segment, length, pieces) in [
-            (30, 6, 5, 2),
-            (36, 6, 6, 2),
-            (40, 8, 6, 2),
-            (48, 8, 8, 2),
-            // Three runs and the singles beside them (the M1's run 10: a
-            // restore of three runs of 30 and two single chunks).
-            (42, 6, 5, 3),
-            (48, 8, 6, 3),
-        ] {
-            let mut workload = run_pieces_workload(seed, total, segment, length, pieces, seed % 2 == 0);
-            // Many binds, arriving close together.
-            // The run program's state is resident (held across parks, as a
-            // beam group's): a parked process's restore lays its runs again.
-            if let Some(program) = workload.pool.programs.last_mut() {
-                program.resident = program.scratch;
-            }
-            let mut bind = workload.scripts.last().cloned().expect("a bind");
-            bind.decode = 30;
-            bind.grow_every = 1;
-            let mut rng = Rng(seed ^ 0xb1d5);
-            for _ in 0..rng.range(2, 6) {
-                let mut more = bind.clone();
-                more.at = rng.range(0, 30);
-                more.decode = rng.range(10, 40);
-                workload.scripts.push(more);
-            }
-            let (failures, covered) = run(&workload, None);
-            coverage.add(&covered);
-            for failure in &failures {
-                failed += 1;
-                eprintln!(
-                    "SIM pieces seed={seed} total={total} segment={segment} run={length}x{pieces} step={} kind={} {}",
-                    failure.step,
-                    failure.kind,
-                    failure.line.chars().take(600).collect::<String>()
-                );
-            }
-        }
-    }
-    eprintln!("SIM pieces: {failed} failures, binds {}, bind waits {}, suspends {}, restores {}", coverage.binds, coverage.bind_waits, coverage.bind_suspends, coverage.restores);
-    assert_eq!(failed, 0);
-}
-
 /// A pool that holds a bind beside the pair it joins in place (one run of
 /// five for its scratch, the pair's run already laid) but not beside a
 /// fresh pair as well: the bind is served, never refused as never fitting
@@ -4482,9 +3519,8 @@ fn a_bind_beside_a_pair_in_place_is_served_where_a_fresh_pair_would_not_fit() {
 /// A pool of 18 chunks with rungs of 1 and 5 activation chunks (12 for
 /// kv and state below the widest rung's span), its segment walk moving
 /// the rung, and `scripts`: kv past the 12 is held while the rung is
-/// down, a frame then owed the raise back to the widest rung (the L40S's
-/// sweeper at kv_device_tokens 16384: a prompt that fills the pool, then
-/// its raise).
+/// down, a frame then owed the raise back to the widest rung (a prompt
+/// that fills the pool, then its raise).
 fn raise_beside_own_workload(scripts: Vec<Script>) -> Workload {
     let pool = PoolShape {
         total: 18,
@@ -4586,4 +3622,69 @@ fn a_run_no_arrangement_opens_is_refused_by_name() {
         "only its refusal, by name: {failures:?}"
     );
     assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
+}
+
+/// A pool with no tier below the device, few segments mapped and the
+/// governor's target above them: a first ask past the pages open now is
+/// admitted, and the walk's commits serve it. One past what the target
+/// lets open is refused at admission.
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_ask_takes_room_the_walk_can_open() {
+    use super::pool::PoolPort;
+    use crate::governor::PoolTarget;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let shape = PoolShape {
+        total: 36,
+        segment: 4,
+        host_chunks: 0,
+        disk_chunks: 0,
+        programs: Vec::new(),
+        governed: true,
+        span_on_demand: false,
+        act: vec![(256, 2)],
+    };
+    let (model, stores) = shape.register();
+    let shared = stores.shared.clone().expect("a shared pool");
+    let mut grow = crate::store::shared::SharedGrow::new(model, 0, shared).with_lane(|_| Ok(()));
+    let _ = grow.retarget(3);
+    grow.walk().await;
+    let port = Arc::new(RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()));
+    let planner = Arc::new(ResidencyPlanner::new(port.clone() as Arc<dyn PoolPort>));
+    super::global::set_test_planner(model, 0, Some(planner.clone()));
+    let (open, _) = port.device_stats();
+    assert_eq!(port.commit_room(), 0, "nothing opens at the target");
+    let ask = |pages: u32| {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let p = planner.clone();
+        crate::rt::spawn(async move {
+            let demand = Demand {
+                kv_pages: pages,
+                rs: Default::default(),
+            };
+            p.acquire(pid, pid, demand).await
+        })
+    };
+    let refused = ask(open + 1).await.unwrap();
+    assert!(matches!(refused, Err(PlannerError::AdmissionRefused { .. })));
+
+    let _ = grow.retarget(6);
+    let more = port.commit_room();
+    assert_eq!(more, 3 * shape.segment * PAGES_PER_CHUNK, "three segments of chunks");
+    let refused = ask(open + more + 1).await.unwrap();
+    assert!(matches!(refused, Err(PlannerError::AdmissionRefused { .. })));
+    let served = ask(open + more);
+    for _ in 0..100 {
+        crate::rt::yield_now().await;
+        grow.walk().await;
+        planner.pages_freed();
+        if served.is_finished() {
+            break;
+        }
+    }
+    assert!(served.is_finished(), "the walk opens its room");
+    assert!(matches!(served.await.unwrap(), Ok(Acquired::Granted(_))));
+    assert_eq!(port.commit_room(), 0, "the target reached");
+    super::global::set_test_planner(model, 0, None);
 }

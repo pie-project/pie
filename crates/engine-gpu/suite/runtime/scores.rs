@@ -115,14 +115,23 @@ fn apart(got: &[f32], want: &[f32]) -> f32 {
     (diff / norm.max(f32::MIN_POSITIVE)).sqrt()
 }
 
+/// Where a moved room goes.
+#[derive(Clone, Copy, PartialEq)]
+enum Moved {
+    /// One room's run down its segment.
+    Down,
+    /// Another segment of the pool.
+    Segment,
+}
+
 fn served(context: u32, pattern: &[Reads]) {
     served_with(context, pattern, None);
 }
 
 /// [`served`]; where `moved` is given, the load arms its bodies and serves
-/// from them, and before that step its room moves one room's run down the
-/// pool (its bytes with it, as an unpark or an evacuation moves them).
-fn served_with(context: u32, pattern: &[Reads], moved: Option<usize>) {
+/// from them, and before that step its room moves where [`Moved`] says (its
+/// bytes with it, as an unpark or an evacuation moves them).
+fn served_with(context: u32, pattern: &[Reads], moved: Option<(usize, Moved)>) {
     let fixture = fixture(MODEL, None);
     let trace = &fixture.trace;
     assert!(
@@ -179,14 +188,38 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<usize>) {
     };
     let mut held = vec![0u32; n];
     for step in 0..=DECODE.len() {
-        if moved == Some(step) {
-            // One room's run down: whole chunks in the same segment.
-            let chunk = shell.pools().layout().chunk_bytes;
-            let run = first.bytes.div_ceil(chunk) * chunk;
-            assert!(first.at >= run, "a room's run lies below the first in its segment");
-            let to = DeviceCell {
-                at: first.at - run,
-                ..first.clone()
+        if let Some((_, to)) = moved.filter(|&(at, _)| at == step) {
+            let layout = *shell.pools().layout();
+            let chunk = layout.chunk_bytes;
+            let run = first.bytes.div_ceil(chunk);
+            let to = match to {
+                // One room's run down: whole chunks in the same segment.
+                Moved::Down => {
+                    assert!(
+                        first.at >= run * chunk,
+                        "a room's run lies below the first in its segment"
+                    );
+                    DeviceCell {
+                        at: first.at - run * chunk,
+                        ..first.clone()
+                    }
+                }
+                // The last run of the pool's first segment.
+                Moved::Segment => {
+                    let at = layout.segment_chunks - u32::try_from(run).expect("a run of chunks");
+                    let (buffer, at) = shell.pools().chunk_place(at).expect("the first segment");
+                    let buffer = buffer.clone();
+                    assert_ne!(
+                        engine_gpu::backend::Buffer::slab_id(&buffer),
+                        engine_gpu::backend::Buffer::slab_id(&first.buffer),
+                        "the pool's first segment is not the room's"
+                    );
+                    DeviceCell {
+                        buffer,
+                        at,
+                        ..first.clone()
+                    }
+                }
             };
             let mut frame = engine_gpu::backend::Context::frame(shell.device()).expect("a frame");
             engine_gpu::backend::Frame::copy(
@@ -281,17 +314,100 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<usize>) {
                 0,
                 "a fire after ready walked with no armed body: the moved room is the fire's"
             );
+            assert_eq!(
+                shell.eager_serving(),
+                DECODE.len() as u64 + 1,
+                "a capturing fire runs eager, as the load stated, wherever its room lies"
+            );
         }
     }
 }
 
-/// A pair's room moved (an unpark, an evacuation) between two replays of
-/// one armed body: the replay after reads the rows where the room now lies,
-/// the oracle's, and nothing records or walks unarmed.
+/// A pair's room moved (an unpark, an evacuation) between two capturing
+/// fires: the one after reads the rows where the room now lies, the
+/// oracle's, each fire eager as the load stated, nothing recorded and none
+/// walked unstated.
 #[test]
-fn an_armed_body_reads_its_room_where_it_moved() {
+fn a_capturing_fire_reads_its_room_where_it_moved() {
     use Reads::{Keys, Nothing, Pages};
-    served_with(256, &[Nothing, Pages, Nothing, Keys], Some(DECODE.len()));
+    served_with(256, &[Nothing, Pages, Nothing, Keys], Some((DECODE.len(), Moved::Down)));
+}
+
+/// [`a_capturing_fire_reads_its_room_where_it_moved`], the room moved into
+/// another segment of the pool.
+#[test]
+fn a_capturing_fire_reads_its_room_in_another_segment() {
+    use Reads::{Keys, Nothing, Pages};
+    served_with(
+        256,
+        &[Nothing, Pages, Nothing, Keys],
+        Some((DECODE.len(), Moved::Segment)),
+    );
+}
+
+/// On a load that captures, a fire none of whose lanes captures fires
+/// whatever chunk the run under the span names: the chunk there moved into
+/// another segment (a compaction's move), and that segment given back.
+#[test]
+fn an_idle_capture_needs_no_chunk() {
+    let fixture = fixture(MODEL, None);
+    let trace = &fixture.trace;
+    let Some(mut shell) = load(&fixture, 256) else {
+        return;
+    };
+    let first = {
+        let bytes = shell.score_room([(KEYS, 0u32)]);
+        let layout = shell.pools().layout();
+        let run = u32::try_from(bytes.div_ceil(layout.chunk_bytes)).expect("a run of chunks");
+        layout.total_chunks - shell.pools().span_chunks() - run
+    };
+    shell.record_bodies(None, None).expect("the load arms its bodies");
+    shell.recorded_serving();
+    shell.unkept_serving();
+    shell.eager_serving();
+    shell.filled_serving();
+    shell.serving = true;
+    let segment = shell.pools().layout().segment_chunks;
+    let committed = shell
+        .chunk_facts()
+        .expect("the pool states its chunks")
+        .segments
+        .committed;
+    let mut held = 0u32;
+    let mut fire = |shell: &mut Shell, tokens: &[u32]| {
+        shell
+            .fire_seated(&[Seated {
+                held: Some(held),
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: word(trace, tokens.len() as u32, false),
+                    tokens,
+                })
+            }])
+            .expect("a lane that captures nothing fires");
+        held += tokens.len() as u32;
+    };
+    fire(&mut shell, &[5, 9, 2, 7]);
+    shell.commit_segments(committed + 1).expect("a segment commits");
+    shell
+        .evacuate(&engine::chunk::Evacuation {
+            moves: vec![(first, committed * segment)],
+        })
+        .expect("the chunk moves");
+    shell.release_segments(committed).expect("its segment goes back");
+    fire(&mut shell, &[3]);
+    if <crate::backend::Api as engine_gpu::serve::Serve>::RECORDS {
+        assert_eq!(
+            (
+                shell.recorded_serving(),
+                shell.unkept_serving(),
+                shell.eager_serving(),
+                shell.filled_serving()
+            ),
+            (0, 0, 0, 0),
+            "an idle capture replays its armed body"
+        );
+    }
 }
 
 /// Two capturing lanes among four, one reading pages, at two contexts.

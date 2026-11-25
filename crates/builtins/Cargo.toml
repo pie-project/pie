@@ -17,5 +17,8 @@ test-policies = []
 # wasm32-unknown-unknown); the version wit-bindgen 0.58 embeds for.
 wit-component = "0.251"
 
+[dev-dependencies]
+plex-host = { path = "../plex-host" }
+
 [lints]
 workspace = true

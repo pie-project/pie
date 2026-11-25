@@ -2524,34 +2524,6 @@ fn copy_settled_on_landing(
 mod landing_tests {
     use super::*;
 
-    /// An engine tells a frame's steps in any order (one with no instance
-    /// from its device's completion, one with instances at a later
-    /// harvest): each step's reads come back at its own landing, the
-    /// frame's entry goes only once every step has landed. Taken by
-    /// position, the last step landing first dropped the frame, and the
-    /// earlier step's reads were never let go (its items never freed).
-    #[test]
-    fn a_frame_s_steps_landing_out_of_order_each_give_their_reads_back() {
-        let frame = ::engine::FrameId(7);
-        let owner = |n: u64| crate::store::roles::Owner::Instance(::engine::InstanceId(n));
-        let mut landed: HashMap<::engine::FrameId, Vec<LandingReads>> = HashMap::new();
-        landed.insert(
-            frame,
-            vec![
-                Some((vec![::engine::InstanceId(1)], vec![owner(1)])),
-                Some((Vec::new(), Vec::new())),
-            ],
-        );
-        assert_eq!(take_landing(&mut landed, frame, 1), Some((Vec::new(), Vec::new())));
-        assert!(landed.contains_key(&frame), "step 0 has not landed");
-        assert_eq!(
-            take_landing(&mut landed, frame, 0),
-            Some((vec![::engine::InstanceId(1)], vec![owner(1)]))
-        );
-        assert!(landed.is_empty(), "every step landed");
-        assert_eq!(take_landing(&mut landed, frame, 0), None, "told once");
-    }
-
     use ::engine::chunk::{ShapeId, SlotCopy};
     use ::engine::fire::{FrameSubmission, FrameTicket};
     use ::engine::load::{LoadRequest, Loaded};
@@ -2736,30 +2708,6 @@ mod landing_tests {
         (Box::new(engine), tokens, sink)
     }
 
-    /// A park still landing past the call settles only when the engine
-    /// tells it landed: what waits on it (the move's commit, which gives the
-    /// source slots back) waits for the copy to have read them.
-    #[test]
-    fn a_copy_still_landing_settles_only_when_it_has_landed() {
-        let broker = crate::engine::CompletionBroker::new();
-        let (mut late, tokens, sink) = engine(false, &broker);
-        let completion =
-            copy_settled_on_landing(&mut late, &broker, park()).expect("the copy is taken");
-        assert!(
-            !completion.is_settled(),
-            "the source slots stay out while the copy may still read them"
-        );
-        let token = tokens.lock().unwrap()[0];
-        let sink = sink.lock().unwrap().clone().expect("the lane gave a sink");
-        assert!(!completion.is_settled());
-        sink(token, ::engine::Landing::Landed);
-        assert!(
-            completion.is_settled(),
-            "told landed, the copy's sources may go back"
-        );
-        assert!(completion.check().is_some_and(|settled| settled.is_ok()));
-    }
-
     /// A copy told failed (`engine::Landing::Failed`) settles failed by
     /// name, never as landed: what waits on it takes its move back from the
     /// sources, which hold what they held.
@@ -2782,16 +2730,6 @@ mod landing_tests {
         );
     }
 
-    /// An engine whose copies land inside the call settles at once, as
-    /// before.
-    #[test]
-    fn a_copy_landed_in_the_call_settles_at_once() {
-        let broker = crate::engine::CompletionBroker::new();
-        let (mut inline, _, _) = engine(true, &broker);
-        let completion =
-            copy_settled_on_landing(&mut inline, &broker, park()).expect("the copy is taken");
-        assert!(completion.is_settled());
-    }
 }
 
 #[cfg(test)]

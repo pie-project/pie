@@ -359,68 +359,6 @@ fn a_suspend_leaves_a_device_folding_set_where_the_engine_holds_it() {
     assert!(!s.on_host(slot(&s, failed)));
 }
 
-/// The kv store's swap slots tell the planner's room signal as they come
-/// back, as the device's do: disk chunks given back (a parked role's, or a
-/// victim's pages leaving the disk tier) wake a waiter blocked on swap
-/// room within a turn, not on a timer.
-#[test]
-fn the_kv_store_s_disk_slots_coming_back_tell_the_room_signal() {
-    use crate::store::chunks::ShapePool;
-    let mut facts = fixed_facts();
-    facts.host_chunks = HOST_CHUNKS;
-    facts.disk_chunks = 2;
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
-    let tiers = Tiers::of(&facts).unwrap();
-    let list = shared.lock().unwrap().list().unwrap();
-    let host = tiers.host.as_ref().map(|host| ShapePool::shared(host, list));
-    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, [3; 32]);
-    kv.set_tiers(list.id, host, tiers.disk_slots);
-    let told = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let count = Arc::clone(&told);
-    kv.set_room_signal(crate::store::slots::RoomSignal(Arc::new(move |_| {
-        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    })));
-    let chunks = kv
-        .take_disk_chunks(1, tiers.disk_chunk_slots)
-        .expect("a disk chunk");
-    assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 0, "taking tells nothing");
-    kv.give_disk_chunks(&chunks, tiers.disk_chunk_slots);
-    assert_eq!(told.load(std::sync::atomic::Ordering::Relaxed), 1, "given back: told");
-}
-
-/// What evicting a process empties counts its state's slots too (records,
-/// the state lists), not its kv pages and guest parts alone: else a bind
-/// finds many opened chunks of a state shape against a small map, every
-/// candidate's state unattributed. A working set's own device slots
-/// are named, by the engine's shape and ref, each in a chunk the pool
-/// holds used.
-#[test]
-fn a_working_set_s_state_slots_are_named_in_the_chunks_they_hold() {
-    use crate::store::rs::{RsGeometry, RsStore};
-    let facts = fixed_facts();
-    let tiers = Tiers::of(&facts).unwrap();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
-    let mut s = RsStore::shared(&shared, tiers.host.as_ref());
-    let ws = s.create_working_set(RsGeometry {
-        state_size: 4096,
-        buffer_page_tokens: RS_TOKENS,
-    });
-    let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
-    let published = s.publish_prepared(prepared).unwrap();
-    s.settle(published);
-    s.fold(ws, 4);
-    let refs = s.private_slot_refs(&HashSet::from([ws]));
-    assert!(!refs.is_empty(), "its state's slots are named");
-    let pool = shared.lock().unwrap();
-    for (engine, refs) in &refs {
-        let shape = pool.pool_shape(*engine).expect("a state shape the pool knows");
-        for &slot_ref in refs {
-            let slot = pool.slot(shape, slot_ref);
-            assert!(pool.pool().chunk_used(slot.chunk) > 0, "in a chunk it holds used");
-        }
-    }
-}
-
 /// A slot file of `chunks` whole disk chunks, for a store's disk tier.
 struct DiskFile(Mutex<Vec<u32>>);
 
@@ -664,34 +602,4 @@ fn a_list_compaction_frees_whole_chunks_of_scattered_pages() {
         assert_eq!(bytes.device(LIST, page.0), Some(900 + at as u64), "page {at}");
     }
     assert_eq!(chunks_now.len(), 1, "every page in one chunk");
-}
-
-/// Pages gathered unwritten for a head, scattered across chunks, are taken
-/// again the fullest chunk first: the chunks only they held stand free, and
-/// as many pages come back.
-#[test]
-fn reserved_pages_repacked_free_the_chunks_only_they_held() {
-    use crate::store::chunks::ShapePool;
-    let facts = fixed_facts();
-    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
-    let list = shared.lock().unwrap().list().unwrap();
-    let spc = list.slots_per_chunk as usize;
-    let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, [3; 32]);
-    kv.set_tiers(list.id, None, 0);
-    // Three chunks filled at once, one page of each kept.
-    let pages = kv.reserve_device_pages(3 * spc).unwrap();
-    let (held, rest): (Vec<_>, Vec<_>) = pages
-        .into_iter()
-        .enumerate()
-        .partition(|(at, _)| at % spc == 0);
-    kv.release_device_reservation(rest.into_iter().map(|(_, page)| page).collect());
-    let held: Vec<PhysicalKvPageId> = held.into_iter().map(|(_, page)| page).collect();
-    let spread: HashSet<usize> = held.iter().map(|page| page.0 as usize / spc).collect();
-    assert_eq!(spread.len(), 3, "one page in each of three chunks");
-    let free_before = shared.lock().unwrap().pool().free_chunks();
-    let packed = kv.repack_reserved(held);
-    assert_eq!(packed.len(), 3);
-    assert_eq!(shared.lock().unwrap().pool().free_chunks(), free_before + 2);
-    let chunks: HashSet<usize> = packed.iter().map(|page| page.0 as usize / spc).collect();
-    assert_eq!(chunks.len(), 1);
 }

@@ -148,6 +148,20 @@ impl Room {
         self.free.saturating_sub(self.reserve)
     }
 
+    /// A filesystem without holes lays a slot file whole as it is made, so
+    /// an unstated tier would take every byte at once: all of `free` is
+    /// kept back, and only a stated budget is laid there.
+    #[must_use]
+    pub fn laid_whole(free: u64) -> Self {
+        Self {
+            free,
+            reserve: free,
+            reserve_is: "all of it (this filesystem keeps no holes: a slot file takes its whole \
+                         length as it is made, so only a stated budget_disk is laid here)"
+                .to_string(),
+        }
+    }
+
     /// No figure: the filesystem states no free space, so an unstated tier
     /// comes to nothing.
     #[must_use]

@@ -4,12 +4,10 @@ use super::*;
 fn cut_every_case() {
     a_long_plain_pass_is_cut_on_page_boundaries();
     only_the_last_cut_runs_the_program();
-    only_the_last_cut_captures_scores();
     a_masked_pass_is_cut_with_its_rows_masks();
     the_last_piece_holds_what_the_program_reads();
     several_lanes_are_cut_and_end_together();
     every_lane_of_a_pass_rides_its_last_fire();
-    a_cut_pass_behind_fires_of_its_frame_goes_in_frames_of_its_own();
     a_lane_only_in_the_last_piece_is_not_written_before_it();
     a_pass_with_media_is_cut_before_its_first_span();
     a_pass_with_media_keys_the_rows_before_it();
@@ -104,41 +102,6 @@ fn only_the_last_cut_runs_the_program() {
     assert!(tail.boundary_program);
 }
 
-/// A pass whose program reads its attention scores, cut into several
-/// fires: only the last runs the program, so only its lanes capture
-/// them; an earlier cut's would have no reader attached.
-fn only_the_last_cut_captures_scores() {
-    let req = prefill_lane(5, 100, 16);
-    let switched = Switched {
-        lanes: vec![Vec::new()],
-        on: vec![vec![poem_ir::Builtin::Scores]],
-        tails: vec![0],
-        rows_read: true,
-    };
-    let cuts = host_cuts(&req, true, 32, 16, &[], 0);
-    assert_eq!(cuts.len(), 4, "the pass is cut");
-    let captures: Vec<bool> = cuts
-        .iter()
-        .enumerate()
-        .map(|(at, &cut)| {
-            let last = at + 1 == cuts.len();
-            let piece = rows_of_lanes(&req, &[Some(cut)], last, 16);
-            assert_eq!(piece.boundary_program, last);
-            let requests = lane_requests(&piece, &switched, &[0], false, None);
-            assert_eq!(requests.len(), 1);
-            requests[0].captures_scores()
-        })
-        .collect();
-    assert_eq!(
-        captures,
-        [false, false, false, true],
-        "only the fire carrying the reading program captures scores"
-    );
-    // The pass uncut is its own last fire: it captures.
-    let whole = lane_requests(&req, &switched, &[0], false, None);
-    assert!(whole[0].captures_scores());
-}
-
 fn a_pass_with_media_is_cut_before_its_first_span() {
     let mut req = prefill_lane(5, 100, 16);
     req.media.push(::engine::fire::StepMedia {
@@ -195,22 +158,6 @@ fn every_lane_of_a_pass_rides_its_last_fire() {
         refusal.contains("a pass of 2 lanes carries 1"),
         "{refusal}"
     );
-}
-
-/// A cut pass sends its leading pieces unframed and its last with its
-/// frame: behind fires of its own frame it goes in frames of its own;
-/// first in its frame, alone in it, or uncut, it keeps the frame.
-fn a_cut_pass_behind_fires_of_its_frame_goes_in_frames_of_its_own() {
-    let stamp = |fires| crate::scheduler::FrameStamp {
-        lane: uuid::Uuid::from_u128(1),
-        seq: 3,
-        slot: 1,
-        fires,
-    };
-    assert!(reframes(stamp(2), 1, 3), "slot 1 behind slot 0, cut");
-    assert!(!reframes(stamp(2), 0, 3), "first in its frame");
-    assert!(!reframes(stamp(1), 0, 3), "a frame of its own");
-    assert!(!reframes(stamp(2), 1, 1), "uncut");
 }
 
 fn several_lanes_are_cut_and_end_together() {

@@ -1,6 +1,7 @@
 //! The shell's pipelines: the cover fingerprint, the pipeline cache keys and
 //! archive, and the load's walk that warms every step shape's pipelines.
 
+use super::stage::Form;
 use super::*;
 
 impl Shell {
@@ -320,6 +321,20 @@ impl Shell {
         // where the profile's `kernel.dense` changes its pick): a shape's
         // rows, and its readouts, reach every band its span holds.
         let bands = kernels_metal::linear::gemm::row_bands(&self.tuning);
+        // A fire the Neural Engine shares leaves the rows past a whole
+        // procedure to the GPU: their kernels turn on the tail's rows alone,
+        // so one tail in each band, and at each few-rows top, builds them. A
+        // later procedure's tail takes the same ones while a 32-row tile fits
+        // past it: a rung wider than a tile is a whole number of tiles (the
+        // ladder's powers of two, or a halving of `FIRE_CEILING`'s tokens).
+        let tails: Vec<u32> = self.ane.as_ref().map_or_else(Vec::new, |ane| {
+            bands
+                .iter()
+                .copied()
+                .chain([2, 4, 8, 32])
+                .filter_map(|tail| ane.with_tail(tail))
+                .collect()
+        });
         let inside = |span: engine::shapes::Span, extra: &[u32]| -> Vec<u32> {
             let mut at: Vec<u32> = bands
                 .iter()
@@ -355,6 +370,10 @@ impl Shell {
                 .find(|&r| r >= shape.rung)
                 .or_else(|| rungs.last().copied())
                 .unwrap_or(shape.rung);
+            debug_assert!(
+                self.ane.is_none() || rung < 32 || rung.is_multiple_of(32),
+                "a rung of {rung} rows leaves a split's tail no whole tile"
+            );
             let top = rung.min(self.budgets.tokens.max_tokens).min(context).max(1);
             let mut fires: Vec<(u32, u32)> = Vec::new();
             // A step's rows: one (the decode forms), and as a prompt each
@@ -365,6 +384,7 @@ impl Shell {
             fires.extend(
                 inside(shape.rows, &[2, 4, 8])
                     .into_iter()
+                    .chain(tails.iter().copied().filter(|&rows| rows >= shape.rows.lo && rows <= shape.rows.hi))
                     .filter(|&rows| rows > 1)
                     .map(|rows| (rows, 1)),
             );
@@ -435,7 +455,12 @@ impl Shell {
                         },
                         None,
                     )?;
-                    drop(self.walk(&prepared, true)?);
+                    drop(self.walk(&prepared, Form::DryShared)?);
+                    // A fire the Neural Engine shares runs on the GPU alone
+                    // once the split is retired: both forms are built.
+                    if self.ane.as_ref().is_some_and(|ane| ane.shares(rows)) {
+                        drop(self.walk(&prepared, Form::DryAlone)?);
+                    }
                     Ok(())
                 })?;
                 fires += 1;
@@ -445,10 +470,12 @@ impl Shell {
         self.warming = false;
         let shapes = kernels_metal::linear::gemm::record_shapes(false);
         let fires = walked?;
-        // What the walk backed goes back, and the rung stands where it
-        // stood.
+        // What the walk mapped goes back, and the rung stands where it
+        // stood, its staged regions zeroed as the load laid them.
         if self.rung != standing {
             self.set_rung(self.rung, standing)?;
+        } else {
+            self.rehost(self.arena.current());
         }
         // Every dense matmul kernel a fire's rows can reach is built: each
         // shape the walk dispatched, at every row count up to the most it

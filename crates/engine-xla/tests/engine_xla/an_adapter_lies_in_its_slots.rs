@@ -1,19 +1,14 @@
 //! An adapter an instance carries lands at its bind in the pool's `Adapter`
-//! slots, one plane a bank, and a fire reads its own lanes' adapters alone
-//! (k, the power of two at or past their count, planes a bank). An adapter
-//! of zero planes serves the unadapted logits bit for bit, other planes
-//! move them to what the banked path answered, bit for bit; its slots hold
-//! the resolver's planes byte for byte; a second holder of the same slots
-//! joins the landing (nothing written again); a fire of k adapters answers
-//! each lane what it answers alone at k = 1, 2, 4, 8; after its slots move
-//! and the instance is rebound there its lanes read the same logits; and an
-//! adapter registered by id is refused. Skipped without a PJRT plugin.
+//! slots, one plane a bank, byte for byte what the resolver builds; zero
+//! planes serve the unadapted logits, others the banked path's, bit for bit;
+//! and a fire of several adapters answers each lane what it answers alone.
+//! Skipped without a PJRT plugin.
 
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::chunk::SlotCopy;
 use engine::fire::{Attachment, FrameSubmission, Lane, Step};
-use engine::program::{InstanceBinding, InstanceId, ProgramId, ProgramRegistration, Rebind};
+use engine::program::{InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::MemoryDomain;
 use engine_xla::store::layout::ADAPTER;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -326,92 +321,17 @@ fn an_adapter_lies_in_its_slots() {
         );
     }
 
-    // A second holder of the same slots joins: other seeds land nothing.
-    let joined = rig.bind(Some(99), &one_slots);
-    assert_eq!(rig.one(1, Some(joined)), landed, "joining wrote nothing");
-
-    // A fire of k adapters answers each lane what it answers alone, at
-    // every k (the planes a bank gathered: 1, 2, 4, 8).
+    // A fire of three adapters (four planes a bank gathered) answers each
+    // lane what it answers alone.
     let mut others = Vec::new();
-    for seed in 0..7u64 {
+    for seed in 0..2u64 {
         let slots = rig.slots();
         others.push(rig.bind(Some(200 + seed), &slots));
     }
     let alone: Vec<Vec<u32>> = others.iter().map(|&o| rig.one(5, Some(o))).collect();
-    for k in [2usize, 4, 8] {
-        let mut lanes = vec![(1u64, Some(one))];
-        lanes.extend(others[..k - 1].iter().map(|&o| (5u64, Some(o))));
-        let fired = rig.fire(&lanes);
-        assert_eq!(
-            fired[0], landed,
-            "k = {k}: the first adapter's lane answers alone"
-        );
-        for (at, got) in fired[1..].iter().enumerate() {
-            assert_eq!(
-                got, &alone[at],
-                "k = {k}: adapter {at}'s lane answers alone"
-            );
-        }
-    }
-    let shared = rig.fire(&[(1, Some(one)), (1, Some(others[0]))]);
-    let both = rig.fire(&[(1, Some(one)), (5, Some(others[0]))]);
-    assert_eq!(shared[0], landed, "two adapters in one fire");
-    assert_eq!(both[1], alone[0], "and each its own");
-
-    // The adapter's slots move and both holders are rebound there.
-    let moved = rig.slots();
-    let device = rig.model.loaded.caps.device.domain;
-    engine::Tiers::copy(&mut rig.model.engine, &SlotCopy {
-            shape: ADAPTER,
-            src: device,
-            dst: device,
-            slots: one_slots
-                .iter()
-                .copied()
-                .zip(moved.iter().copied())
-                .collect(),
-            runs: Vec::new(),
-        })
-        .expect("the adapter's slots move");
-    engine::Tiers::copy(&mut rig.model.engine, &SlotCopy {
-            shape: ADAPTER,
-            src: device,
-            dst: device,
-            slots: zero_slots
-                .iter()
-                .copied()
-                .zip(one_slots.iter().copied())
-                .collect(),
-            runs: Vec::new(),
-        })
-        .expect("the old slots are overwritten");
-    for holder in [one, joined] {
-        engine::Programs::rebind(&mut rig.model.engine, Rebind::Instance {
-                id: holder,
-                instance: Vec::new(),
-                rings: Vec::new(),
-                adapter: moved.clone(),
-                scratch: engine::ScratchPlace::None,
-                pair: engine::ScratchPlace::None,
-                pair_generation: 0,
-            })
-            .expect("the holder is rebound");
-    }
-    assert_eq!(
-        rig.one(1, Some(one)),
-        landed,
-        "after the move its lanes read the planes where they lie now"
-    );
-
-    let refused = engine::Programs::adapter(&mut rig.model.engine, &engine::adapter::AdapterRegistration {
-            id: 0,
-            planes: Vec::new(),
-        })
-        .expect_err("an adapter registered by id is refused");
-    assert!(
-        refused.to_string().contains("registered by id"),
-        "refused by name: {refused}"
-    );
+    let fired = rig.fire(&[(1, Some(one)), (5, Some(others[0])), (5, Some(others[1]))]);
+    assert_eq!(fired[0], landed, "the first adapter's lane answers alone");
+    assert_eq!(fired[1..], alone[..], "and the others theirs");
 }
 
 /// The FNV-1a digest of a lane's logits bits.

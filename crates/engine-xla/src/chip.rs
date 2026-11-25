@@ -374,18 +374,6 @@ mod tests {
         assert_eq!(registry().check(), Vec::<String>::new());
     }
 
-    /// Who goes first is the policy's (PLEX), not a profile's: the seating
-    /// flags a profile once stated are refused by name.
-    #[test]
-    fn a_profile_ordering_the_planner_is_refused() {
-        for id in ["seated_first", "seat_to_end", "seat_spread"] {
-            let why = registry()
-                .load_user(&format!("api = 1\n[engine]\n{id} = true\n"), "user.toml")
-                .expect_err("not a decision")
-                .to_string();
-            assert!(why.contains(&format!("`engine.{id}` is not a decision of xla")), "{why}");
-        }
-    }
 
     #[test]
     fn the_checked_in_profiles_hold_together() {

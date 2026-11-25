@@ -125,9 +125,10 @@ impl ResidencyPlanner {
         if let Some(error) = self.with_inner(|inner| inner.failed.get(&pid).copied()) {
             return Err(error);
         }
-        // A newcomer's first ask fits now on the device, or there by the
-        // evictions it would force with room to land below (the swap
-        // room, with the idle cache its keys let go): else it is refused
+        // A newcomer's first ask fits now on the device (what stands free,
+        // what the pool can still open, the idle cache there, which yields
+        // to it whatever its key), or there by the evictions it would force
+        // with room to land below (the swap room): else it is refused
         // by name at admission ([`PlannerError::AdmissionRefused`]),
         // whoever still runs, and its client retries. Admitted processes
         // wait and move instead (contention: suspend, or fail by name
@@ -139,7 +140,14 @@ impl ResidencyPlanner {
         if newcomer && demand.kv_pages > 0 && demand.kv_pages <= self.device_pages_most() {
             let (device, host, disk) = (self.port.device_stats(), self.port.host_stats(), self.port.disk_stats());
             let room = u64::from(device.0) + u64::from(self.swap_stats().0);
-            if u64::from(demand.kv_pages) > room {
+            // Free room read first: counting the rest walks the cache.
+            let need = u64::from(demand.kv_pages);
+            let mut fits = need <= room;
+            if !fits {
+                let room = room + u64::from(self.port.commit_room());
+                fits = need <= room || need <= room + u64::from(self.port.idle_room());
+            }
+            if !fits {
                 let error = PlannerError::AdmissionRefused {
                     need: demand.kv_pages,
                     device,

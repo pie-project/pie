@@ -1826,7 +1826,7 @@ impl PreparedLoad<'_> {
                 readout.place(arena.store().clone(), readout_at);
             }
         }
-        host_rung(&pools, &mut inputs, &mut readout, arena.current(), true)?;
+        host_rung(&pools, &mut inputs, &mut readout, arena.current(), true, true)?;
         // The kernel scratch plane in the pool's buffer: the arena counts in
         // the span's view, and ends below a windowed load's own-row pages.
         pools.zero_span(pools.span().0 + (arena.scratch_at() - span_at), scratch.bytes())?;
@@ -3441,6 +3441,7 @@ fn host_rung(
     readout: &mut [Vec<crate::inputs::Region>],
     index: usize,
     on: bool,
+    zeroed: bool,
 ) -> Result<()> {
     for region in inputs[index]
         .iter_mut()
@@ -3453,7 +3454,11 @@ fn host_rung(
         } else {
             Vec::new()
         };
-        region.rehost(host)?;
+        if zeroed {
+            region.rehost(host)?;
+        } else {
+            region.host_at(host);
+        }
     }
     Ok(())
 }

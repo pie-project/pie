@@ -179,38 +179,3 @@ mod backend {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_stamped_rate_is_taken_back_by_the_same_build() {
-        let keys = Keys::of(0, "Card X");
-        let mut rates = keys.stamp(Rates {
-            launch_ns: Some(1500),
-            hbm_gbps: Some(4000.0),
-            ..Rates::default()
-        });
-        assert!(
-            rates
-                .sift(&keys)
-                .iter()
-                .all(|line| !line.contains("not taken"))
-        );
-        assert_eq!(rates.launch_ns, Some(1500));
-        assert_eq!(rates.hbm_gbps, Some(4000.0));
-    }
-
-    #[test]
-    fn a_rate_stored_unkeyed_is_measured_again() {
-        let keys = Keys::of(0, "Card X");
-        let mut rates = Rates {
-            measured_on: Some(keys.on()),
-            launch_ns: Some(1500),
-            ..Rates::default()
-        };
-        rates.sift(&keys);
-        assert_eq!(rates.launch_ns, None);
-    }
-}

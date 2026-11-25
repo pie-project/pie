@@ -197,11 +197,6 @@ pub struct Fire {
     pub groups: [u32; 3],
 
     pub group: [u32; 3],
-
-    /// A zero count on any axis launches no workgroup at all (its fire
-    /// has nothing to do: a capture with no capturing lane), where a zero
-    /// axis is otherwise taken as one.
-    pub idle: bool,
 }
 
 impl Fire {
@@ -213,23 +208,7 @@ impl Fire {
             tier: Tier::Baseline,
             groups: [1, 1, 1],
             group: [1, 1, 1],
-            idle: false,
         }
-    }
-
-    /// A zero count on any axis launches none ([`Fire::idle`]).
-    #[must_use]
-    pub const fn idle(mut self) -> Self {
-        self.idle = true;
-        self
-    }
-
-    /// Its workgroup counts as a backend launches them: none where
-    /// [`Fire::idle`] and an axis counts zero, the counts as they are
-    /// otherwise.
-    #[must_use]
-    pub fn launched(&self) -> Option<[u32; 3]> {
-        (self.idle && self.groups.contains(&0)).then_some([0, 0, 0])
     }
 
     #[must_use]

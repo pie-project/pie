@@ -383,8 +383,8 @@ pub struct Lane {
     /// + 1) * T)` (`T` its shape's tokens), every entry a real slot
     /// (CONTRACT-BC 19, 21).
     ///
-    /// Window lists' tables: removed by the windowed-state change; do not
-    /// use in new code. A window list's table is in its own token order,
+    /// A window list's table (none from a runtime that serves windowed
+    /// layers as ring + buffer) is in its own token order,
     /// entry `i` its rows `[i * T_w, (i + 1) * T_w)` (`T_w` its shape's
     /// tokens), a slot trimmed behind its window ref 0.
     #[serde(default)]
@@ -420,10 +420,7 @@ pub struct Lane {
     /// `RsVerb::Buffer::pages` already name `dst`), and the window buffer,
     /// where a lane writes rows into a partly filled slot it shares with a
     /// fork or a prefix-cache entry (CONTRACT-BC 21; its table already
-    /// names `dst`). A window list's copies (where a lane writes rows into
-    /// a window-list slot it shares): removed by the windowed-state change;
-    /// do not use in new code. Every lane's copies of
-    /// a fire land before any lane of it reads or writes; no two name the
+    /// names `dst`). Every lane's copies of a fire land before any lane of it reads or writes; no two name the
     /// same `dst`.
     #[serde(default)]
     pub slot_copies: Vec<(ShapeId, Vec<[u32; 2]>)>,

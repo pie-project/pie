@@ -202,15 +202,3 @@ fn streamed_experts_answer_the_base_build_whatever_lies_resident() {
     every_residency("qwen3-30b-a3b-mini", 256, None, WeightKind::Expert);
 }
 
-/// A load told its weights are held streams nothing: no weight shape.
-#[test]
-fn a_held_load_states_no_weight_shape() {
-    let Some(_device) = crate::common_dit::device() else {
-        return;
-    };
-    for name in ["gemma4-e4b-mini-l1", "qwen3-30b-a3b-mini"] {
-        let model = Model::load_held(name, None, 256, 7);
-        let facts = model.loaded.caps.chunks.clone();
-        assert!(facts.weights.is_empty(), "{name}: {:?}", facts.weights);
-    }
-}

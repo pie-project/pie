@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 plex = { path = "../../../plex-sdk" }
+cluster-defaults = { path = "../cluster-defaults" }

@@ -177,7 +177,7 @@ pub struct Pools {
     )>,
     /// Each streamed bank's miss copy in pinned host memory: `(param, pool
     /// rows an expert's plane takes, root, buffer)`.
-    host_banks: Vec<(u32, u32, Tensor, Buffer)>,
+    host_banks: Vec<(u32, u32, Tensor, Option<Buffer>)>,
     /// The staging slab: its first pool row and its rows (none on a shell
     /// the load did not size).
     slab: (u32, u32),
@@ -759,21 +759,27 @@ impl Pools {
     }
 
     /// Lands each streamed bank's miss copy in pinned host memory
-    /// (`Streamed::host_banks`), a root each (before the handles seal).
+    /// (`Streamed::host_banks`), a root each (before the handles seal). A
+    /// dry device holds no weights: its roots stand with no bytes behind.
     pub fn land_host_banks(
         &mut self,
         device: &Device,
         handles: &Handles,
         streamed: &streamed::Streamed,
     ) -> Result<()> {
-        for (param, rows, bytes) in streamed.host_banks()? {
-            let all =
-                u32::try_from(bytes.len() as u64 / ROW_BYTES).map_err(|_| Fault::Ceiling {
-                    what: "rows of a host bank",
-                    need: bytes.len() as u64 / ROW_BYTES,
-                    have: u64::from(u32::MAX),
-                })?;
-            let buffer = device.upload_host(Dtype::U32, all, 128, &bytes)?;
+        for (param, rows, experts) in streamed.host_bank_rows() {
+            let need = u64::from(rows) * u64::from(experts);
+            let all = u32::try_from(need).map_err(|_| Fault::Ceiling {
+                what: "rows of a host bank",
+                need,
+                have: u64::from(u32::MAX),
+            })?;
+            let buffer = if device.is_dry() {
+                None
+            } else {
+                let bytes = streamed.host_bank(param)?;
+                Some(device.upload_host(Dtype::U32, all, 128, &bytes)?)
+            };
             let p = u32::try_from(param).unwrap_or(u32::MAX);
             let tensor = handles.root(Root {
                 source: Source::HostBank { param: p },
@@ -789,7 +795,7 @@ impl Pools {
     /// The miss copy of streamed bank `param`: its buffer.
     #[must_use]
     pub fn host_bank(&self, param: u32) -> Option<&Buffer> {
-        self.host_banks.iter().find(|b| b.0 == param).map(|b| &b.3)
+        self.host_banks.iter().find(|b| b.0 == param).and_then(|b| b.3.as_ref())
     }
 
     /// The miss copy of streamed bank `param`: its root and the pool rows an
@@ -946,8 +952,8 @@ impl Pools {
             .iter()
             .find(|b| b.0 == param)
             .map_or(0, |b| {
-                b.3.dims()
-                    .ok()
+                b.3.as_ref()
+                    .and_then(|buffer| buffer.dims().ok())
                     .and_then(|d| d.first().copied())
                     .unwrap_or(0)
             });

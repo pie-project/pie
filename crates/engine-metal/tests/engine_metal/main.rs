@@ -17,6 +17,7 @@ mod a_scattered_pool_serves_the_same_logits;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
+mod a_walked_split_shares_with_the_neural_engine;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
 mod an_operator_declared_adapter_is_refused;
 mod an_airborne_pass_samples_its_own_row;

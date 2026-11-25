@@ -303,15 +303,6 @@ pub(crate) fn set_fire_cap_for_test(engine: usize, tokens: u32) {
     set_fire_cap(engine, tokens);
 }
 
-/// Publishes the rows of the rung `engine` holds as a steering pool
-/// would: for a test of what the lane refuses.
-#[cfg(test)]
-pub(crate) fn set_engine_rows_for_test(engine: usize, rows: u32) {
-    rung_gate(engine)
-        .held
-        .store(rows, std::sync::atomic::Ordering::Release);
-}
-
 fn set_fire_cap(engine: usize, tokens: u32) {
     let was = rung_gate(engine)
         .cap
@@ -2862,6 +2853,21 @@ impl SharedPool {
             return true;
         };
         target.load(std::sync::atomic::Ordering::Acquire) > self.mapped_segments()
+    }
+
+    /// The kv list slots the walk can still open for a waiter, past those
+    /// free now: what the segments up to the governor's target back. 0
+    /// while a refused commit waits ([`Self::block_commit`]).
+    #[must_use]
+    pub fn commit_room_slots(&self) -> u64 {
+        if self.commit_blocked.is_some() {
+            return 0;
+        }
+        let target = self.walk_target.as_ref().map_or(u32::MAX, |target| {
+            target.load(std::sync::atomic::Ordering::Acquire)
+        });
+        let segments = target.saturating_sub(self.mapped_segments());
+        self.list_slots_for_chunks(self.pool.commit_room(segments))
     }
 
     /// The chunks the governor's target holds back from state: segments

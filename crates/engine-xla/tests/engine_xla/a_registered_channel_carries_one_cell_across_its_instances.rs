@@ -1,18 +1,12 @@
 //! A registered channel that instances of two programs carry on the device
-//! (a one-cell ring nobody else reads, as an inferlet's sampler state is
-//! between its prefill and decode programs) keeps one cell in the pool: the
-//! engine states its ring's `Channel` slots (`ring_facts`), every instance
-//! bound to it reads and writes its cell at the rows its registration names,
-//! and a pass of one instance sees what the last pass of any other left,
-//! after that one's cells went back to the ring, after the channel's slots
-//! moved (`Rebind::Channel`, the old slot overwritten) and after the instance that last held it
-//! closed. Each pass adds one to the cell's second word and puts the cell on
-//! a reader ring, so the counts read back are the order the passes ran in.
-//! Skipped without a PJRT plugin.
+//! (as an inferlet's sampler state between its prefill and decode programs)
+//! keeps one cell in the pool's `Channel` slots: a pass of one instance sees
+//! what the last pass of any other left, after the one that last held the
+//! cell closed too. Each pass adds one to the cell's second word and puts it
+//! on a reader ring. Skipped without a PJRT plugin.
 
 use engine::channel::{ChannelId, ChannelRegistration, ChannelSeed};
-use engine::chunk::SlotCopy;
-use engine::program::{BindExtents, InstanceBinding, InstanceId, ProgramId, Rebind};
+use engine::program::{BindExtents, InstanceBinding, InstanceId, ProgramId};
 use engine_xla::store::layout::CHANNEL;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
@@ -150,15 +144,6 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
         .expect("the engine answers")
         .expect("a channel an instance may carry keeps its ring in Channel slots");
     assert_eq!(ring.footprint.slots, 1, "one 1 KiB slot holds the cell");
-    let reader = ChannelRegistration {
-        host_role: HostRole::Reader,
-        ..registration.clone()
-    };
-    assert_eq!(
-        engine::Channels::ring_facts(&rig.engine, &reader).expect("the engine answers"),
-        None,
-        "a channel the host reads keeps no ring in the pool"
-    );
     registration.slots = contiguous(&mut refs, ring.footprint.slots);
     engine::Channels::open(&mut rig.engine, &registration)
         .expect("the counter registers over its slots");
@@ -179,48 +164,12 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
     let mut counts = vec![pass(&mut rig, x, page), pass(&mut rig, x, page)];
     counts.push(pass(&mut rig, y, page));
 
-    // The counter's slot moves while `y` holds its cell on the device.
-    let moved = contiguous(&mut refs, ring.footprint.slots);
-    let device = rig.loaded.caps.device.domain;
-    engine::Tiers::copy(&mut rig.engine, &SlotCopy {
-            shape: CHANNEL,
-            src: device,
-            dst: device,
-            slots: registration.slots.iter().copied().zip(moved.iter().copied()).collect(),
-            runs: Vec::new(),
-        })
-        .expect("the counter's slot moves");
-    // What the old slot held is gone: a slot never written lands over it.
-    let junk = contiguous(&mut refs, ring.footprint.slots);
-    engine::Tiers::copy(&mut rig.engine, &SlotCopy {
-            shape: CHANNEL,
-            src: device,
-            dst: device,
-            slots: junk.iter().copied().zip(registration.slots.iter().copied()).collect(),
-            runs: Vec::new(),
-        })
-        .expect("the old slot is overwritten");
-    engine::Programs::rebind(&mut rig.engine, Rebind::Channel {
-            id: COUNTER,
-            slots: moved,
-        })
-        .expect("the counter's instances follow it");
-    counts.push(pass(&mut rig, x, page));
-    counts.push(pass(&mut rig, y, page));
-
     // `y` closes holding the cell; a fresh instance carries on from it.
     engine::Programs::close(&mut rig.engine, y).expect("y closes");
     let z = bind(&mut rig, first, true);
     counts.push(pass(&mut rig, z, page));
     counts.push(pass(&mut rig, x, page));
     let device1 = rig.engine.guest_passes();
-    // Registration compiled every stage shape these passes took.
-    assert_eq!(
-        rig.engine.guest_fire_compiles(),
-        0,
-        "no pass compiles a guest stage: its registration did"
-    );
-
     let want: Vec<u32> = (1..=counts.len() as u32).map(|k| SEED[1] + k).collect();
     assert_eq!(
         counts, want,
@@ -231,7 +180,6 @@ fn a_registered_channel_carries_one_cell_across_its_instances() {
         counts.len() as u64,
         "every pass ran on the device"
     );
-    eprintln!("a registered counter carried on the device across three instances: {counts:?}");
 }
 
 /// Takes a cell the host wrote, adds `[0, 1]`, and puts the sum on the

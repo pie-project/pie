@@ -152,6 +152,56 @@ pub mod address {
         Ok(info.pti_virtual_size)
     }
 
+    /// A mapping of this task (the shared region is one).
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, Copy)]
+    pub struct Mapping {
+        pub address: u64,
+        pub size: u64,
+    }
+
+    /// This task's first mapping that ends above `address`
+    /// (`mach_vm_region_recurse`, its top level), `None` past the last, or
+    /// the kernel's code where it did not answer.
+    #[cfg(target_os = "macos")]
+    pub fn mapping_from(address: u64) -> Result<Option<Mapping>, i32> {
+        /// `VM_REGION_SUBMAP_SHORT_INFO_COUNT_64`: the kernel's words of
+        /// `vm_region_submap_short_info_64`.
+        const WORDS: u32 = 12;
+        const KERN_INVALID_ADDRESS: i32 = 1;
+        unsafe extern "C" {
+            fn mach_vm_region_recurse(
+                task: libc::mach_port_t,
+                address: *mut u64,
+                size: *mut u64,
+                depth: *mut u32,
+                info: *mut i32,
+                words: *mut u32,
+            ) -> i32;
+        }
+        let (mut at, mut size, mut depth, mut words) = (address, 0u64, 0u32, WORDS);
+        let mut info = [0i32; WORDS as usize];
+        // SAFETY: every pointer is to a live local; `words` states `info`'s
+        // length and the kernel writes no more; it reads this task's map.
+        let status = unsafe {
+            #[allow(deprecated, reason = "the mach crate is not a dependency for one call")]
+            let task = libc::mach_task_self();
+            mach_vm_region_recurse(
+                task,
+                &raw mut at,
+                &raw mut size,
+                &raw mut depth,
+                info.as_mut_ptr(),
+                &raw mut words,
+            )
+        };
+        match status {
+            0 => Ok(Some(Mapping { address: at, size })),
+            KERN_INVALID_ADDRESS => Ok(None),
+            code => Err(code),
+        }
+    }
+
     /// Whether an address-only reservation of `bytes` is taken now: reserved
     /// without access or backing at an address the system picks, and let go
     /// at once.

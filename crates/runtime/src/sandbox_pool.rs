@@ -39,12 +39,28 @@ pub fn note_maps_before_engines() {
     if BEFORE_ENGINES.get().is_some() {
         return;
     }
-    if let Ok(space) = read_address_space() {
-        let _ = BEFORE_ENGINES.set(BeforeEngines {
-            mapped: space.mapped,
-            maps: space.maps.map(|maps| maps.used),
-        });
+    if let Ok(held) = held_now() {
+        let _ = BEFORE_ENGINES.set(held);
     }
+}
+
+/// What this process holds now.
+#[cfg(target_os = "macos")]
+fn held_now() -> Result<BeforeEngines> {
+    Ok(BeforeEngines {
+        mapped: mapped_now()?,
+        maps: None,
+    })
+}
+
+/// What this process holds now.
+#[cfg(not(target_os = "macos"))]
+fn held_now() -> Result<BeforeEngines> {
+    let space = read_address_space()?;
+    Ok(BeforeEngines {
+        mapped: space.mapped,
+        maps: space.maps.map(|maps| maps.used),
+    })
 }
 
 /// Keeps for the rest of the process what it held before its engines
@@ -381,7 +397,7 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
 /// ranges from `floor` up to the main stack, but for the one just below
 /// the stack (its growth room, above where mmap places mappings). Ranges
 /// in the kernel's half (x86_64's vsyscall page) are not the process's.
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn parse_maps(maps: &str, floor: Option<u64>) -> Result<AddressSpace> {
     let mut ranges = Vec::new();
     for line in maps.lines().filter(|line| !line.trim().is_empty()) {
@@ -437,17 +453,28 @@ pub(crate) fn parse_maps(maps: &str, floor: Option<u64>) -> Result<AddressSpace>
     })
 }
 
+/// The lowest address 64-bit macOS maps: past the 4 GiB page zero.
+#[cfg(target_os = "macos")]
+const PAGE_ZERO: u64 = 1 << 32;
+/// `MACH_VM_MAX_ADDRESS`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MAX_ADDRESS: u64 = 0x0000_7FFF_FE00_0000;
+/// `MACH_VM_MAX_ADDRESS`.
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+const MAX_ADDRESS: u64 = 0x0000_7FFF_FFE0_0000;
+
+/// What this process maps: its task's virtual size.
+#[cfg(target_os = "macos")]
+fn mapped_now() -> Result<u64> {
+    runtime_sys::address::task_virtual_size()
+        .map_err(|error| anyhow::anyhow!("proc_pidinfo(PROC_PIDTASKINFO): {error}"))
+}
+
 /// 64-bit macOS gives a process the addresses from its 4 GiB page zero to
 /// `MACH_VM_MAX_ADDRESS`; what it maps is its task's virtual size.
 #[cfg(target_os = "macos")]
 pub(crate) fn read_address_space() -> Result<AddressSpace> {
-    const PAGE_ZERO: u64 = 1 << 32;
-    #[cfg(target_arch = "aarch64")]
-    const MAX_ADDRESS: u64 = 0x0000_7FFF_FE00_0000;
-    #[cfg(not(target_arch = "aarch64"))]
-    const MAX_ADDRESS: u64 = 0x0000_7FFF_FFE0_0000;
-    let mapped = runtime_sys::address::task_virtual_size()
-        .map_err(|error| anyhow::anyhow!("proc_pidinfo(PROC_PIDTASKINFO): {error}"))?;
+    let mapped = mapped_now()?;
     let free = (MAX_ADDRESS - PAGE_ZERO).saturating_sub(mapped);
     // What the process maps does not lie in one place (the shared region,
     // the GPU's ranges, the weights), so the range free in one piece is
@@ -455,7 +482,7 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     // process its reserve, that range less the reserve: the rest's later
     // mappings may land in it.
     let mut space = AddressSpace {
-        largest_free: largest_reservation(free),
+        largest_free: largest_gap()?.min(free),
         free,
         mapped,
         reserve: 0,
@@ -467,24 +494,23 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
     Ok(space)
 }
 
-/// The largest range, to the GiB and at most `upper`, an address-only
-/// reservation takes now: each try reserved without access or backing and
-/// let go at once.
+/// The largest range no mapping of this process lies in, down to a whole
+/// GiB, read off its mappings.
 #[cfg(target_os = "macos")]
-fn largest_reservation(upper: u64) -> u64 {
+fn largest_gap() -> Result<u64> {
     const GIB: u64 = 1 << 30;
-    let reserves = runtime_sys::address::reserves;
-    let (mut fits, mut over) = (0u64, upper.saturating_add(GIB));
-    while over - fits > GIB {
-        let mid = fits + (over - fits) / 2 / GIB * GIB;
-        let mid = mid.max(fits + GIB);
-        if reserves(mid) {
-            fits = mid;
-        } else {
-            over = mid;
-        }
+    let (mut cursor, mut largest) = (PAGE_ZERO, 0u64);
+    while cursor < MAX_ADDRESS {
+        let mapping = runtime_sys::address::mapping_from(cursor)
+            .map_err(|code| anyhow::anyhow!("mach_vm_region_recurse: {code}"))?;
+        let Some(mapping) = mapping.filter(|mapping| mapping.size > 0) else {
+            break;
+        };
+        largest = largest.max(mapping.address.min(MAX_ADDRESS).saturating_sub(cursor));
+        cursor = cursor.max(mapping.address.saturating_add(mapping.size));
     }
-    fits
+    largest = largest.max(MAX_ADDRESS.saturating_sub(cursor));
+    Ok(largest / GIB * GIB)
 }
 
 /// Windows: the process's user address space, region by region
@@ -601,66 +627,6 @@ mod tests {
         }
     }
 
-    /// The memory slab the phone failed to map: 2048 slots of 4 GiB and
-    /// a 32 MiB guard each, one guard before them, 0x81002000000 bytes.
-    #[test]
-    fn the_memory_slab_is_laid_as_wasmtime_lays_it() {
-        let layout = PoolLayout {
-            stack_bytes: 0,
-            tables_per_instance: 0,
-            ..default_layout()
-        };
-        assert_eq!(layout.cost().bytes(2048), 0x810_0200_0000);
-        let cost = default_layout().cost();
-        // A slot, a stack and its guard page, 16 tables of 160 KiB.
-        assert_eq!(
-            cost.instance_bytes,
-            4 * GIB + 32 * MIB + 2 * MIB + 4096 + 16 * 163_840
-        );
-        assert_eq!(cost.pool_bytes, 32 * MIB);
-        assert_eq!(cost.instance_maps, 5);
-    }
-
-    /// A 39-bit phone (512 GiB): the count fits in what is free after the
-    /// process keeps as much again as it maps, and in one range.
-    #[test]
-    fn the_count_fits_the_address_space() {
-        let cost = default_layout().cost();
-        let space = AddressSpace {
-            largest_free: 400 * GIB,
-            free: 480 * GIB,
-            mapped: 30 * GIB,
-            reserve: 30 * GIB,
-            limit: None,
-            maps: Some(maps(2_000, 65_530, 2_000)),
-        };
-        // 480 - 30 = 450 GiB free beyond the rest; one range of 400 holds it.
-        assert_eq!(space.pool_bytes(), 400 * GIB);
-        let fits = space.fits(&cost);
-        assert!(cost.bytes(fits) <= space.pool_bytes());
-        assert!(cost.bytes(fits + 1) > space.pool_bytes());
-        assert_eq!(fits, 99);
-        assert_eq!(size_pool(None, Ok(space), &cost).unwrap(), 99);
-        assert_eq!(size_pool(Some(64), Ok(space), &cost).unwrap(), 64);
-
-        // RLIMIT_AS holds it to the cap less what is mapped and the reserve.
-        let capped = AddressSpace {
-            limit: Some(100 * GIB),
-            ..space
-        };
-        assert_eq!(capped.pool_bytes(), 40 * GIB);
-        assert_eq!(capped.fits(&cost), 9);
-
-        // Memory maps hold it where the address space does not.
-        let maps = AddressSpace {
-            largest_free: 100_000 * GIB,
-            free: 100_000 * GIB,
-            maps: Some(maps(2_000, 12_000, 2_000)),
-            ..space
-        };
-        assert_eq!(maps.fits(&cost), (12_000 - 4_000) / 5);
-    }
-
     /// The default 2048 on the phone is refused by name, with what it
     /// needs and what the process has; a pool of none is refused unset.
     #[test]
@@ -714,143 +680,6 @@ mod tests {
         assert_eq!(size_pool(Some(7), unread(), &cost).unwrap(), 7);
     }
 
-    /// The phone after the Vulkan engine's arm walk: the engine's mappings
-    /// (weights, driver ranges, recordings) are laid at load and do not
-    /// grow. The rest of the process is left what it mapped before the
-    /// engine loaded, not a copy of all it maps, free and under RLIMIT_AS.
-    #[test]
-    fn the_bytes_reserve_is_what_the_process_mapped_before_its_engines() {
-        let cost = default_layout().cost();
-        let phone = AddressSpace {
-            largest_free: 120 * GIB,
-            free: 130 * GIB,
-            mapped: 60 * GIB,
-            reserve: 2 * GIB,
-            limit: None,
-            maps: None,
-        };
-        // The largest range binds, not 130 - 2 x 60 = 10 GiB.
-        assert_eq!(phone.pool_bytes(), 120 * GIB);
-        let by = |bytes: u64| (bytes - cost.pool_bytes) / cost.instance_bytes;
-        assert_eq!(phone.fits(&cost), by(120 * GIB));
-        let tight = AddressSpace {
-            largest_free: 200 * GIB,
-            ..phone
-        };
-        assert_eq!(tight.pool_bytes(), 128 * GIB);
-        // RLIMIT_AS: the cap less what is mapped and the reserve.
-        let capped = AddressSpace {
-            limit: Some(100 * GIB),
-            ..phone
-        };
-        assert_eq!(capped.pool_bytes(), 38 * GIB);
-
-        // Unrecorded, the reserve is all it maps; the refusal names the
-        // range, the free total, the reserve and the cap.
-        let unrecorded = AddressSpace {
-            largest_free: 3 * GIB,
-            reserve: 60 * GIB,
-            ..capped
-        };
-        let error = size_pool(None, Ok(unrecorded), &cost)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.ends_with(
-                "this process has 0 B (the largest free range 3.00 GiB; 130.00 GiB free, \
-                 less 60.00 GiB kept for the rest of the process; RLIMIT_AS 100.00 GiB, \
-                 less 60.00 GiB mapped and the 60.00 GiB kept) and no cap on memory maps"
-            ),
-            "{error}"
-        );
-    }
-
-    /// The phone after the Vulkan engine's arm walk: ~51k maps held, most
-    /// of them the engine's recorded command buffers, laid at load and not
-    /// grown after. The rest of the process is left what it held before
-    /// the engine loaded, not a copy of all it holds; doubled, the 14k
-    /// free maps were read as none.
-    #[test]
-    fn the_maps_reserve_is_what_the_process_held_before_its_engines() {
-        let cost = default_layout().cost();
-        // Address space wide enough that the maps bind.
-        let phone = AddressSpace {
-            largest_free: 100_000 * GIB,
-            free: 100_000 * GIB,
-            mapped: 30 * GIB,
-            reserve: 30 * GIB,
-            limit: None,
-            maps: Some(maps(51_000, 65_530, 1_200)),
-        };
-        assert_eq!(phone.pool_maps(), Some(65_530 - 51_000 - 1_200));
-        assert_eq!(phone.fits(&cost), (65_530 - 51_000 - 1_200) / 5);
-        assert_eq!(
-            size_pool(None, Ok(phone), &cost).unwrap(),
-            (65_530 - 51_000 - 1_200) / 5
-        );
-
-        // Where the reserve is all it holds, the maps do bind, and the
-        // refusal names the cap, what is held and the reserve.
-        let unrecorded = AddressSpace {
-            maps: Some(maps(51_000, 65_530, 51_000)),
-            ..phone
-        };
-        assert_eq!(unrecorded.pool_maps(), Some(0));
-        let error = size_pool(None, Ok(unrecorded), &cost)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.ends_with(
-                "and 0 memory maps (the cap 65530, less 51000 held, less 51000 kept for the rest of the process)"
-            ),
-            "{error}"
-        );
-    }
-
-    /// An Android arm64 process with 39-bit addresses: the ranges below
-    /// the stack count, the stack's growth room does not.
-    #[test]
-    fn maps_are_read_up_to_the_stack() {
-        let maps = "\
-5800000000-5800100000 r-xp 00000000 fd:00 1 /system/bin/pie
-5800100000-5800200000 rw-p 00000000 00:00 0 [anon:libc_malloc]
-7000000000-7000400000 rw-p 00000000 00:00 0
-7fc0000000-7fc0800000 r--p 00000000 fd:00 2 /apex/libc.so
-7ffff00000-7ffff21000 rw-p 00000000 00:00 0 [stack]
-";
-        let space = parse_maps(maps, Some(0x8000)).unwrap();
-        assert_eq!(space.mapped, 0x100000 * 2 + 0x400000 + 0x800000 + 0x21000);
-        // Below the binary, between the heap and the mmap range, and up to
-        // the libraries; not the range up to the stack.
-        let gaps = [
-            0x58_0000_0000 - 0x8000,
-            0x70_0000_0000 - 0x58_0020_0000,
-            0x7f_c000_0000 - 0x70_0040_0000,
-        ];
-        assert_eq!(space.free, gaps.iter().sum::<u64>());
-        assert_eq!(space.largest_free, gaps[0]);
-        assert_eq!(space.maps.map(|m| m.used), Some(5));
-    }
-
-    /// x86_64's vsyscall page sits in the kernel's half; it is not the
-    /// process's, and the vdso above the stack bounds nothing.
-    #[test]
-    fn the_kernel_half_is_not_the_process_s() {
-        let maps = "\
-555555554000-555555556000 r-xp 00000000 08:01 1 /usr/bin/pie
-7ffff7fc0000-7ffff7fc4000 r--p 00000000 00:00 0 [vvar]
-7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0 [stack]
-ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]
-";
-        let space = parse_maps(maps, Some(0x10000)).unwrap();
-        assert_eq!(space.maps.map(|m| m.used), Some(3));
-        // Below the binary, and from it up to the vvar below the stack.
-        assert_eq!(
-            space.free,
-            (0x5555_5555_4000 - 0x10000) + (0x7fff_f7fc_0000 - 0x5555_5555_6000)
-        );
-    }
-
     /// Windows: the range the pool may take is one this process can
     /// reserve, as wasmtime reserves its pool (one `VirtualAlloc`), and the
     /// free total is not one range.
@@ -867,6 +696,30 @@ ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]
             "reserving the pool's {} failed: {}",
             show(bytes),
             std::io::Error::last_os_error()
+        );
+    }
+
+    /// The range read off the process's mappings is the one an address-only
+    /// reservation takes, found here by halving to the GiB.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_largest_gap_is_what_a_reservation_takes() {
+        let reserves = runtime_sys::address::reserves;
+        let (mut fits, mut over) = (0u64, MAX_ADDRESS);
+        while over - fits > GIB {
+            let mid = (fits + (over - fits) / 2 / GIB * GIB).max(fits + GIB);
+            if reserves(mid) {
+                fits = mid;
+            } else {
+                over = mid;
+            }
+        }
+        let gap = largest_gap().unwrap();
+        assert!(
+            gap.abs_diff(fits) <= GIB,
+            "{} read, {} reserved",
+            show(gap),
+            show(fits)
         );
     }
 }

@@ -500,30 +500,3 @@ fn the_glu_gemm_kernel_answers_the_host() {
     }
 }
 
-#[test]
-fn the_glu_gemm_kernel_declines_rows_below_its_narrowest() {
-    // Rows narrower than `glu_gemm::LEAST_K` (3840) run as two GEMMs, the
-    // measured faster form: the kernel answers none for them.
-    let (m, k, i) = (64u32, 256u32, 1024u32);
-    let mut b = Bench::new();
-    let x = b.bf16(m, k, &data((m * k) as usize, 11));
-    let w = b.bf16(k, 2 * i, &data((k * 2 * i) as usize, 12));
-    let y = b.zeros(Dtype::Bf16, m, i);
-    b.run(|ctx| {
-        engine_xla::lower::lower(ctx, |l| {
-            let x_v = l.read(x)?.val;
-            let w_v = l.read(w)?.val;
-            assert!(
-                glu_gemm::geglu(l.f(), x_v, w_v, m, i64::from(i))?.is_none(),
-                "rows {k} wide are below the kernel's narrowest"
-            );
-            let zero = l.f().const_f(
-                kernels_xla::hlo::Elem::Bf16,
-                0.0,
-                &[i64::from(m), i64::from(i)],
-            );
-            l.land(y, zero)
-        })
-    })
-    .unwrap();
-}

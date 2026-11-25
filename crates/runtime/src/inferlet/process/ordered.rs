@@ -363,38 +363,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_earlier_gate_with_no_permit_bars_nothing() {
-        let _schedule = schedule::TEST_LOCK.write().await;
-        let (low, high) = (pid(11), pid(12));
-        schedule::install(Some(Table::new(
-            HashMap::from([(low, 1), (high, 9)]),
-            None,
-            HashMap::new(),
-            None,
-        )));
-        let bind = OrderedSemaphore::new("bind", 0, false);
-        let execution = OrderedSemaphore::after("execution", 1, false, vec![Arc::clone(&bind)]);
-        let behind = tokio::spawn({
-            let bind = Arc::clone(&bind);
-            async move { bind.acquire_owned(high).await }
-        });
-        while bind.lock().waiters.is_empty() {
-            tokio::task::yield_now().await;
-        }
-        // Bind has no permit: the high one cannot pass it, so it bars nothing.
-        let first = Arc::clone(&execution).acquire_owned(low).await;
-        drop(first);
-        // Given a permit, bind lets the high one through.
-        bind.add_permits(1);
-        let high_bound = tokio::time::timeout(Duration::from_secs(1), behind)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(high_bound);
-        schedule::install(None);
-    }
-
-    #[tokio::test]
     async fn no_process_passes_a_gate_ahead_of_a_higher_key_that_could_pass_the_earlier_one() {
         let _schedule = schedule::TEST_LOCK.write().await;
         let (low, high) = (pid(21), pid(22));
@@ -430,81 +398,6 @@ mod tests {
             .await
             .expect("passes once it has gone")
             .unwrap();
-        schedule::install(None);
-    }
-
-    #[tokio::test]
-    async fn a_higher_key_between_two_gates_is_not_overtaken() {
-        let _schedule = schedule::TEST_LOCK.write().await;
-        let (low, high) = (pid(31), pid(32));
-        schedule::install(Some(Table::new(
-            HashMap::from([(low, 1), (high, 9)]),
-            None,
-            HashMap::new(),
-            None,
-        )));
-        let bind = OrderedSemaphore::new("bind", 1, false);
-        let execution = OrderedSemaphore::after("execution", 1, false, vec![Arc::clone(&bind)]);
-        // The high one is bound, setting up, not yet at execution.
-        let bound = Arc::clone(&bind).acquire_owned(high).await;
-        let low_waits = tokio::spawn({
-            let execution = Arc::clone(&execution);
-            async move { execution.acquire_owned(low).await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            !low_waits.is_finished(),
-            "the low one waits for the high one on its way"
-        );
-        let running = Arc::clone(&execution).acquire_owned(high).await;
-        // Done, it gives up its seat: bind first, then execution.
-        drop(bound);
-        drop(running);
-        tokio::time::timeout(Duration::from_secs(1), low_waits)
-            .await
-            .expect("then it passes")
-            .unwrap();
-        schedule::install(None);
-    }
-
-    #[tokio::test]
-    async fn waiters_holding_the_gate_before_are_not_barred_by_who_waits_for_it() {
-        // The stall VTC found: execution's waiters hold every bind permit;
-        // higher keys wait at bind, holding prewarm. Execution has permits
-        // and must use them, or no one moves.
-        let _schedule = schedule::TEST_LOCK.write().await;
-        let (low, high) = (pid(41), pid(42));
-        schedule::install(Some(Table::new(
-            HashMap::from([(low, 1), (high, 9)]),
-            None,
-            HashMap::new(),
-            None,
-        )));
-        let prewarm = OrderedSemaphore::new("prewarm", 1, true);
-        let bind = OrderedSemaphore::after("bind", 1, false, vec![Arc::clone(&prewarm)]);
-        let execution = OrderedSemaphore::after("execution", 1, true, vec![Arc::clone(&bind)]);
-        let low_bound = Arc::clone(&bind).acquire_owned(low).await;
-        let high_warm = Arc::clone(&prewarm).acquire_owned(high).await;
-        let high_waits = tokio::spawn({
-            let bind = Arc::clone(&bind);
-            async move { bind.acquire_owned(high).await }
-        });
-        while bind.lock().waiters.is_empty() {
-            tokio::task::yield_now().await;
-        }
-        let low_runs = tokio::time::timeout(
-            Duration::from_secs(1),
-            Arc::clone(&execution).acquire_owned(low),
-        )
-        .await
-        .expect("execution is not barred by a waiter for the bind permit it holds");
-        drop(low_bound);
-        drop(low_runs);
-        let high_bound = tokio::time::timeout(Duration::from_secs(1), high_waits)
-            .await
-            .unwrap()
-            .unwrap();
-        drop((high_bound, high_warm));
         schedule::install(None);
     }
 

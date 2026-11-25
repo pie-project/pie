@@ -296,9 +296,10 @@ impl<B: Backend> Run<'_, B> {
                 if self.run_index() != 0 {
                     return Ok(());
                 }
-                // No capturing lane: its kernels launch no workgroup, the
-                // same commands as a fire whose lanes capture.
                 let capturing = self.scored().rows();
+                if capturing == 0 {
+                    return Ok(());
+                }
                 let (table, stats) = self.capture_seats("attn.score_capture")?;
                 let scores = self.tensor(*scores);
                 if let Some(into) = into {
@@ -335,7 +336,7 @@ impl<B: Backend> Run<'_, B> {
                 )
             }
             Attn::ScorePages { keys, pages } => {
-                if self.run_index() != 0 {
+                if self.run_index() != 0 || self.scored().page_rows() == 0 {
                     return Ok(());
                 }
                 let (table, _) = self.capture_seats("attn.score_pages")?;

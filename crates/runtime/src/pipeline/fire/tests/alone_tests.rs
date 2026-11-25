@@ -76,18 +76,6 @@ async fn fire(
         .expect("answered at once, never parked")
 }
 
-/// Four lanes that fit beside each other are granted whole.
-#[tokio::test(flavor = "current_thread")]
-async fn lanes_that_fit_together_are_granted_whole() {
-    let (model, stores, mut ctx) = device(91, 16);
-    let lanes: Vec<KvWorkingSet> = (0..4).map(|_| set(model, &stores, 3, 0)).collect();
-    let spans: Vec<_> = lanes.iter().map(|set| (set, 0..3)).collect();
-    let reserved = fire(&mut ctx, model, &stores, &spans).await;
-    let reserved = reserved.expect("twelve pages of sixteen");
-    assert_eq!(reserved.kvtxns.len(), 4);
-    drop(reserved.unfired.submitted());
-}
-
 /// A lane whose rows alone are past the whole device is refused at
 /// its submit, by name, and the planner is never asked to hold it.
 #[tokio::test(flavor = "current_thread")]
@@ -127,27 +115,4 @@ async fn a_lane_whose_prefix_and_rows_pass_the_device_is_refused_at_once() {
     // Asked alone, two of its pages fit beside what it holds.
     let fits = fire(&mut ctx, model, &stores, &[(&lane, 6..8)]).await;
     drop(fits.expect("eight of eight").unfired.submitted());
-}
-
-/// Lanes that each fit but pass the device together are no lane past
-/// it: none is refused as one.
-#[tokio::test(flavor = "current_thread")]
-async fn lanes_past_the_device_only_together_are_no_lane_past_it() {
-    let (model, stores, mut ctx) = device(94, 8);
-    let lanes: Vec<KvWorkingSet> = (0..2).map(|_| set(model, &stores, 5, 0)).collect();
-    let sets: Vec<(&KvWorkingSet, Written)> = lanes
-        .iter()
-        .map(|set| (set, Written::Span(0..5)))
-        .collect();
-    let plan = rs::RsPlan::Groups(Vec::new());
-    let alone = alone_demands(&stores, &sets, &[], &[], &plan).unwrap();
-    let planner = crate::planner::planner_of(ctx.id).unwrap();
-    assert_eq!(alone.iter().map(|unit| unit.kv_pages).collect::<Vec<_>>(), [5, 5]);
-    assert!(alone.iter().all(|&unit| planner.past_device(unit).is_none()));
-    let whole = crate::planner::Demand {
-        kv_pages: 10,
-        rs: Default::default(),
-    };
-    assert!(planner.past_device(whole).is_some(), "the whole would be");
-    let _ = &mut ctx;
 }

@@ -685,6 +685,18 @@ pub trait PoolPort: Send + Sync + 'static {
     fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim;
     /// Called until it frees nothing, without freeing them.
     fn reclaimable_idle(&self) -> u32;
+    /// The device room a reclaim could make now as kv pages, counted now:
+    /// what the kv cache alone holds, and on a shared pool the chunks
+    /// checkpoints alone hold (their slots' whole chunks).
+    fn idle_room(&self) -> u32 {
+        self.reclaimable_idle()
+    }
+    /// The kv pages the pool can still open for a waiter past those
+    /// `device_stats` counts free ([`Self::grow`] opens them). 0 where the
+    /// pool never grows.
+    fn commit_room(&self) -> u32 {
+        0
+    }
     /// The host and disk slots only idle cache holds, `(host, disk)`: below
     /// the device what the next demand may take by dropping them (keys only
     /// order what goes), so the pressure report counts them as room, as [`Self::reclaimable_idle`]
@@ -2051,6 +2063,25 @@ impl PoolPort for RegistryPool {
         });
         *last = Some((crate::rt::Instant::now(), pages));
         pages
+    }
+
+    fn idle_room(&self) -> u32 {
+        let pages = self.with_kv_tagged("planner-idle-room", |kv| kv.reclaimable_cache_pages_now());
+        let state = self.with_rs(|rs| rs.cache_only());
+        pages.saturating_add(self.rs_as_pages(state))
+    }
+
+    fn commit_room(&self) -> u32 {
+        // No walk, no commit.
+        if self.shared.is_none() {
+            return 0;
+        }
+        crate::store::registry::try_get(self.model, self.engine)
+            .and_then(|stores| stores.shared)
+            .map_or(0, |shared| {
+                let slots = shared.lock().unwrap().commit_room_slots();
+                u32::try_from(slots).unwrap_or(u32::MAX)
+            })
     }
 
     fn idle_below_device(&self) -> (u32, u32) {

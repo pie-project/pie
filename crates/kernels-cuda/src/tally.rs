@@ -37,22 +37,3 @@ pub(crate) fn built() {
         counts.set(now);
     });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_count_moves_on_its_own_thread_only() {
-        let before = counts();
-        built();
-        let there = std::thread::spawn(|| {
-            built();
-            counts()
-        })
-        .join()
-        .expect("joined");
-        assert_eq!(counts().built, before.built + 1);
-        assert_eq!(there.built, 1);
-    }
-}

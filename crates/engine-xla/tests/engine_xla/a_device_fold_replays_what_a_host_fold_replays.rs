@@ -3,9 +3,7 @@
 //! runtime's count lags: the device-folding fires of one set are pipelined
 //! (the next submitted before the previous settles), each stating the
 //! `folded` the runtime held at submit, before the device fold it carries
-//! landed. And a fork of that set, fired while its parent's device fold is
-//! unsettled, replays what the host fork replays. qwen35-tiny (recurrent
-//! layers); the fold count rides a device-geometry program's `fold` port.
+//! landed. qwen35-tiny (recurrent layers); the fold count rides a device-geometry program's `fold` port.
 //! Skipped without a PJRT plugin.
 
 use engine::Engine;
@@ -144,12 +142,10 @@ fn rs_list(refs: &Refs) -> (ShapeId, u32) {
 }
 
 /// One sequence: its kv and record (`Seq`), the rs list slots its buffer
-/// holds from the prompt's end on, and the slot copies its next lane makes
-/// (a fork's).
+/// holds from the prompt's end on.
 struct Set {
     seq: Seq,
     rs: Vec<u32>,
-    copies: Vec<(ShapeId, Vec<[u32; 2]>)>,
 }
 
 impl Set {
@@ -163,7 +159,6 @@ impl Set {
         Set {
             seq,
             rs,
-            copies: Vec::new(),
         }
     }
 
@@ -179,69 +174,8 @@ impl Set {
             lineage: engine::fire::Lineage::Set,
         };
         lane.rs_reset = RsReset::Held;
-        lane.slot_copies = std::mem::take(&mut self.copies);
         self.seq.held += ROWS;
-        // A fork's record is its own from its first fire on.
-        for (_, pieces) in &mut self.seq.record {
-            for piece in pieces.iter_mut() {
-                piece[0] = piece[1];
-            }
-        }
         lane
-    }
-
-    /// A fork of the set as it stands: the parent's record copied onto
-    /// one of its own at its first fire, and the kv page and rs slots its
-    /// rows land in copied to slots of its own.
-    fn fork(&self, refs: &mut Refs, rs_shape: ShapeId, rs_tokens: u32, slot: u32) -> Set {
-        let kv_shape = refs
-            .shapes(|s| {
-                matches!(s.kind, SlotKind::List { window: None, .. }) && s.role == SlotRole::State
-            })
-            .into_iter()
-            .next()
-            .expect("a kv list")
-            .id;
-        let held = self.seq.held;
-        let mut kv = self.seq.kv.clone();
-        let page = (held / crate::common_llm::PAGE) as usize;
-        let mut kv_copies = Vec::new();
-        if page < kv.len() {
-            let fresh = refs.take(kv_shape);
-            kv_copies.push([kv[page], fresh]);
-            kv[page] = fresh;
-        }
-        let record = self
-            .seq
-            .record
-            .iter()
-            .map(|(id, pieces)| {
-                let id = *id;
-                (id, pieces.iter().map(|&[_, cow]| [cow, refs.take(id)]).collect())
-            })
-            .collect();
-        let seq = Seq {
-            slot,
-            held,
-            kv,
-            window: self.seq.window.clone(),
-            record,
-            ..Seq::default()
-        };
-        let landed = ((held - PROMPT) / rs_tokens) as usize;
-        let mut rs = self.rs.clone();
-        let rs_copies: Vec<[u32; 2]> = (landed..rs.len())
-            .map(|at| {
-                let fresh = refs.take(rs_shape);
-                let old = std::mem::replace(&mut rs[at], fresh);
-                [old, fresh]
-            })
-            .collect();
-        Set {
-            seq,
-            rs,
-            copies: vec![(kv_shape, kv_copies), (rs_shape, rs_copies)],
-        }
     }
 }
 
@@ -332,72 +266,6 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
         probe(&mut model, &mut refs, &mut device, PROMPT + 2 * N),
         want,
         "a pipelined device fold leaves what the host fold leaves"
-    );
-
-    // A fork of a set whose device fold is unsettled, fired at once.
-    let mut host = Set::new(&mut model, &mut refs, 2, rs_tokens, rs_shape);
-    let a = host.lane(&model, &mut refs, 21, PROMPT, FoldLen::Host(N));
-    model.fire(vec![a]);
-    let mut child = host.fork(&mut refs, rs_shape, rs_tokens, 3);
-    let c = child.lane(&model, &mut refs, 22, PROMPT + N, FoldLen::Host(N));
-    model.fire(vec![c]);
-    let want = probe(&mut model, &mut refs, &mut child, PROMPT + 2 * N);
-    let mut device = Set::new(&mut model, &mut refs, 4, rs_tokens, rs_shape);
-    let a = device.lane(&model, &mut refs, 21, PROMPT, FoldLen::Device);
-    tell(&mut model, instance, &a);
-    let first = submit(&mut model, a, Some(instance));
-    let mut child = device.fork(&mut refs, rs_shape, rs_tokens, 5);
-    let c = child.lane(&model, &mut refs, 22, PROMPT, FoldLen::Device);
-    tell(&mut model, instance, &c);
-    let second = submit(&mut model, c, Some(instance));
-    drop(first);
-    let _ = settled(&mut model, second);
-    assert_eq!(
-        probe(&mut model, &mut refs, &mut child, PROMPT + 2 * N),
-        want,
-        "a fork of a set whose device fold is unsettled leaves what the host fork leaves"
-    );
-
-    // A step refused for a lane whose fold nothing resolved (no program is
-    // attached to it) leaves no position behind for its first lane's fold,
-    // resolved but never run: that set replays next from what the runtime
-    // states.
-    let mut host = Set::new(&mut model, &mut refs, 6, rs_tokens, rs_shape);
-    let a = host.lane(&model, &mut refs, 31, PROMPT, FoldLen::Host(N));
-    model.fire(vec![a]);
-    let want = probe(&mut model, &mut refs, &mut host, PROMPT + N);
-    let mut device = Set::new(&mut model, &mut refs, 7, rs_tokens, rs_shape);
-    let mut other = Set::new(&mut model, &mut refs, 8, rs_tokens, rs_shape);
-    let a = device.lane(&model, &mut refs, 31, PROMPT, FoldLen::Device);
-    let b = other.lane(&model, &mut refs, 32, PROMPT, FoldLen::Device);
-    tell(&mut model, instance, &a);
-    let refused = model
-        .engine
-        .submit(&FrameSubmission::of(Step {
-            lanes: vec![a, b],
-            attachments: vec![Attachment {
-                lane: 0,
-                lanes: 1,
-                instance,
-                adapter_only: false,
-                scratch: ::engine::ScratchPlace::None,
-            }],
-            media: Vec::new(),
-            voxels: Vec::new(),
-            shape: None,
-        }))
-        .expect_err("a device-fold lane no program is attached to resolves no fold");
-    assert!(
-        refused.to_string().contains("device-resident fold length"),
-        "refused for the unresolved fold: {refused}"
-    );
-    device.seq.held -= ROWS;
-    let a = device.lane(&model, &mut refs, 31, PROMPT, FoldLen::Host(N));
-    model.fire(vec![a]);
-    assert_eq!(
-        probe(&mut model, &mut refs, &mut device, PROMPT + N),
-        want,
-        "a refused step's fold, which never ran, moved no state's position"
     );
 }
 

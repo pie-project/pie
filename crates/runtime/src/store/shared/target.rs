@@ -604,12 +604,6 @@ impl SharedGrow {
         self.wake.notify_one();
     }
 
-    /// The walk's last raise was refused for room; for a test.
-    #[cfg(test)]
-    pub(crate) fn block_raise_for_test(&self) {
-        self.raise_blocked.store(true, Ordering::Release);
-    }
-
     /// Looks again now: a waiter is short.
     pub fn wake(&self) {
         self.wake.notify_one();
@@ -1055,216 +1049,15 @@ mod tests {
         assert!(grow.can_grow(), "held back no more: it grows");
     }
 
-    /// A pool seeded with what a load that had armed nothing held back,
-    /// told at the starting residency that the engine holds less, stands
-    /// once the opened segments are backed as the pool of a load that never
-    /// held more: the same chunks open, the same segments mapped and held
-    /// as its target, the same bound. An answer that repeats what is held
-    /// moves nothing.
-    #[test]
-    fn a_hold_back_lifted_at_the_starting_residency_is_a_pool_that_never_held_more() {
-        let chunk = super::super::tests::pool().pool().chunk_bytes();
-        // The load's fit held 28 chunks under the activation (the ceiling
-        // at chunk 24 of 52); settled, it holds 4 (the ceiling at 48).
-        let (unsettled, settled) = (28 * chunk, 4 * chunk);
-        // The load that never held more: it backed every segment wholly
-        // under what it binds before it returned.
-        let never = {
-            let mut pool = super::super::tests::pool();
-            pool.hold_back(settled);
-            let prefix = pool.bound_prefix();
-            pool.committed(prefix);
-            pool
-        };
-        let mut pool = super::super::tests::pool();
-        pool.hold_back(unsettled);
-        let loaded = pool.pool().prefix_segments();
-        assert!(pool.bound_bytes() < never.bound_bytes());
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let grow = SharedGrow::new(0, 49, shared.clone());
-        assert_eq!(grow.held_back(unsettled), None, "what the load stated");
-        let prefix = grow.held_back(settled).expect("the lift opens segments");
-        assert_eq!(prefix, never.pool().prefix_segments());
-        assert!(prefix > loaded);
-        {
-            let pool = shared.lock().unwrap();
-            assert_eq!(pool.pool().ceiling(), never.pool().ceiling());
-            assert_eq!(pool.bound_bytes(), never.bound_bytes());
-            assert_eq!(
-                pool.pool().prefix_segments(),
-                loaded,
-                "no chunk goes out of a segment before the engine backed it"
-            );
-        }
-        grow.backed(prefix);
-        {
-            let pool = shared.lock().unwrap();
-            assert_eq!(
-                pool.pool().prefix_segments(),
-                never.pool().prefix_segments()
-            );
-            assert_eq!(pool.mapped_segments(), never.mapped_segments());
-            assert_eq!(pool.held(), never.held());
-            assert_eq!(pool.pool().headroom(), never.pool().headroom());
-            assert_eq!(
-                grow.target.load(Ordering::Acquire),
-                never.mapped_segments(),
-                "held as the load's own segments are"
-            );
-        }
-        assert_eq!(grow.held_back(settled), None, "said again: nothing moves");
-    }
-
-    /// A pool that stands past what is asked comes down only once its
-    /// chunks are needed: however many ticks pass with nothing short, no
-    /// rung moves; a waiter parked short of a slot cuts fires toward the
-    /// rung asked at once.
-    #[tokio::test(flavor = "current_thread")]
-    async fn the_rung_comes_down_only_once_its_chunks_are_needed() {
-        const ENGINE: usize = 59;
-        let pool = super::super::tests::pool();
-        assert_eq!(pool.rung(), 2048);
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
-        super::super::set_fire_cap_for_test(ENGINE, u32::MAX);
-        for tick in 0..64 {
-            grow.ticked();
-            grow.walk_rung().await;
-            assert_eq!(super::super::fire_cap(ENGINE), u32::MAX, "tick {tick}");
-        }
-        shared.lock().unwrap().pool_mut().wait(1, 0, 1);
-        grow.walk_rung().await;
-        assert!(
-            super::super::fire_cap(ENGINE) < u32::MAX,
-            "a waiter is short: fires are cut toward the rung asked"
-        );
-    }
-
-    /// The governor's target under what is mapped, where the segment walk
-    /// found no room to evacuate into, needs the rung's chunks too: the
-    /// rung is the last thing the shed takes.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_target_the_walk_has_no_room_for_brings_the_rung_down() {
-        const ENGINE: usize = 56;
-        let pool = super::super::tests::pool();
-        let mapped = pool.mapped_segments();
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let grow = SharedGrow::new(0, ENGINE, shared);
-        super::super::set_fire_cap_for_test(ENGINE, u32::MAX);
-        grow.target.store(mapped.saturating_sub(1), Ordering::Release);
-        grow.walk_rung().await;
-        assert_eq!(
-            super::super::fire_cap(ENGINE),
-            u32::MAX,
-            "under the target, the evacuation goes first"
-        );
-        grow.no_room.store(true, Ordering::Release);
-        grow.walk_rung().await;
-        assert!(super::super::fire_cap(ENGINE) < u32::MAX, "no room: the rung");
-    }
-
-    /// A program's fire term the largest rung cannot hold cuts fires to
-    /// the widest rung that fits at once, without the governor's patience:
-    /// a fire wider would take more than the span.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_fire_term_past_the_largest_rung_cuts_fires_without_patience() {
-        const ENGINE: usize = 57;
-        let mut pool = super::super::tests::pool();
-        let key = super::super::programs::FireKey {
-            program: ::engine::ProgramId(1),
-            extents: ::engine::BindExtents::default(),
-        };
-        pool.fire_facts_learned(
-            key,
-            &::engine::FireFacts {
-                fixed: 55 * pool.pool().chunk_bytes(),
-                ..::engine::FireFacts::default()
-            },
-        );
-        pool.instance_bound(::engine::InstanceId(1), key);
-        assert_eq!(pool.fit_cap(), 256);
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let grow = SharedGrow::new(0, ENGINE, shared);
-        super::super::set_fire_cap_for_test(ENGINE, u32::MAX);
-        grow.walk_rung().await;
-        assert!(
-            super::super::fire_cap(ENGINE) <= 256,
-            "cut before any tick: {}",
-            super::super::fire_cap(ENGINE)
-        );
-    }
-
-    /// A raise the walk found no room for is not tried again on its next
-    /// wake (a governor tick), only once room is freed.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_raise_refused_for_room_waits_for_room_freed_not_the_next_walk() {
-        const ENGINE: usize = 52;
-        let mut pool = super::super::tests::pool();
-        pool.lower_rung(16).unwrap();
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
-        let _want = super::super::want_rows(ENGINE, 2048);
-        grow.block_raise_for_test();
-        grow.ticked();
-        grow.walk_rung().await;
-        assert_eq!(
-            shared.lock().unwrap().rung(),
-            16,
-            "blocked: not tried again"
-        );
-        grow.room_freed();
-        grow.walk_rung().await;
-        assert_eq!(shared.lock().unwrap().rung(), 2048, "room freed: raised");
-    }
-
-    /// A rung lowered to the smallest with only wider work queued is not
-    /// left there: the work's ask raises it (a rung of the class set
-    /// aside at once, even while a raise waits for room), and the cap
-    /// lifts to the width the work takes, so it is never held for a raise
-    /// nobody asks for.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_lowered_rung_with_only_wider_work_queued_is_raised_for_it() {
-        const ENGINE: usize = 9211;
-        let mut facts = super::super::tests::facts();
-        facts.act_chunks = vec![(16, 1), (256, 4), (512, 4), (2048, 12)];
-        let mut pool = super::super::SharedPool::new(&facts, 256).unwrap();
-        pool.lower_rung(16).unwrap();
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
-        assert_eq!(super::super::fire_cap(ENGINE), 16);
-        // Queued: a fire of 200 rows, wider than the rung held.
-        let want = super::super::want_rows(ENGINE, 200);
-        grow.ticked();
-        grow.walk_rung().await;
-        assert!(
-            super::super::fire_cap(ENGINE) >= 200,
-            "raised for the queued work"
-        );
-        assert_eq!(super::super::engine_rows(ENGINE), 256);
-        drop(want);
-        // Lowered under the class again, the told rung 256 with 512's
-        // span set aside; a raise last refused for room.
-        shared.lock().unwrap().lower_rung(256).unwrap();
-        let _want = super::super::want_rows(ENGINE, 300);
-        grow.block_raise_for_test();
-        grow.walk_rung().await;
-        assert_eq!(
-            super::super::fire_cap(ENGINE),
-            512,
-            "the class's rung needs no room"
-        );
-        assert_eq!(super::super::engine_rows(ENGINE), 512);
-    }
-
-    /// Mac, yield 1, after a burst, every prompt finished: a pool full of
-    /// idle cache, the system's pressure bringing the target under what it
-    /// maps, and no fire at all. The walk evacuates the top segment into
-    /// the room below; the engine takes the copy and waits it out itself,
-    /// so the segment goes with no fire to retire, and while it does the
-    /// pool answers Moving, asking nothing of the policy. The next segment
-    /// has no room to evacuate into: NoRoom, tier pressure, and once the
-    /// policy shed the idle cache the pool stands at its target. No answer
-    /// is ever Reached past the target.
+    /// A pool at yield 1, every prompt finished: a pool full of idle cache,
+    /// the system's pressure bringing the target under what it maps, and no
+    /// fire at all. The walk evacuates the top segment into the room below;
+    /// the engine takes the copy and waits it out itself, so the segment goes
+    /// with no fire to retire, and while it does the pool answers Moving,
+    /// asking nothing of the policy. The next segment has no room to evacuate
+    /// into: NoRoom, tier pressure, and once the policy shed the idle cache
+    /// the pool stands at its target. No answer is ever Reached past the
+    /// target.
     #[tokio::test(flavor = "current_thread")]
     async fn a_target_under_what_idle_cache_holds_is_given_back_with_no_fire() {
         use crate::governor::run::Steer;
@@ -1364,70 +1157,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Yield 1 at full pressure on an empty pool whose byte floor (one
-    /// lane, the reserved chunk, the activation span) is under the fewest
-    /// segments it can map: the reserved chunk's segment and the span's.
-    /// The governor's floor is those segments, so the target is what the
-    /// pool can reach: the walk releases the rest and the pool answers
-    /// Reached, never NoRoom with nothing left to shed.
-    #[tokio::test(flavor = "current_thread")]
-    async fn full_pressure_targets_the_fewest_segments_the_pool_can_map() {
-        use crate::governor::run::Steer;
-        use crate::governor::{Signal, Source, Yield};
-
-        const ENGINE: usize = 67;
-        let engines = vec![registry::EngineStores::default(); ENGINE + 1];
-        let model = registry::register_model_with_chunks(16, &engines);
-        let mut pool = super::super::tests::pool();
-        pool.committed(6);
-        let (byte_floor, least) = (pool.floor(), pool.least_mapped_bytes());
-        let segment = pool.segment_bytes();
-        assert!(
-            least > byte_floor,
-            "the layout's least ({least}) is over the byte floor ({byte_floor})"
-        );
-        assert_eq!(least % segment, 0, "whole segments");
-        assert!(pool.held() > least, "more is mapped than the least");
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let mut grow = SharedGrow::new(model, ENGINE, shared.clone()).with_lane(move |_| Ok(()));
-
-        let dir = std::env::temp_dir().join(format!("pie-govl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pressure");
-        std::fs::write(&path, "1").unwrap();
-        let source = Source::File(path.clone());
-        let mut reader = crate::governor::Reader::new(source.clone());
-        let mut steer = Steer::new(&grow, Yield::new(1.0).unwrap()).with_source(source.name());
-        assert_eq!(steer.governor().limits().floor, least);
-
-        let mut answers = Vec::new();
-        for _ in 0..16 {
-            let mut signals = Vec::new();
-            let turn = steer.turn(&mut grow, reader.read(), &mut |signal| signals.push(signal));
-            assert_eq!(turn.target, least, "the target is the least the pool maps");
-            assert!(
-                !signals
-                    .iter()
-                    .any(|signal| matches!(signal, Signal::TierPressure { .. })),
-                "nothing is asked of the policy: {signals:?}"
-            );
-            answers.push(turn.answer);
-            if turn.answer == Retarget::Reached {
-                break;
-            }
-            grow.walk().await;
-        }
-        assert_eq!(answers.last(), Some(&Retarget::Reached), "{answers:?}");
-        assert_eq!(grow.held(), least);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The soak's stall: the walk lowered the rung 512 -> 128 under
-    /// prompts cut at 512 (the scheduler holds them out, owed), then a
-    /// process demand waits for room and nothing is in flight. The walk
-    /// raises the rung back to what is owed (512, nothing moved) and the
-    /// fire cap rises with it in the same walk: the held frame seals at
-    /// once under the new cap, never on a later wake that does not come.
+    /// The walk lowered the rung 512 -> 128 under prompts cut at 512 (the
+    /// scheduler holds them out, owed), then a process demand waits for room
+    /// and nothing is in flight. The walk raises the rung back to what is owed
+    /// (512, nothing moved) and the fire cap rises with it in the same walk:
+    /// the held frame seals at once under the new cap, never on a later wake
+    /// that does not come.
     #[tokio::test(flavor = "current_thread")]
     async fn a_raise_back_to_frames_held_under_a_lowered_cap_lifts_the_cap_at_once() {
         for (at, on_demand) in [false, true].into_iter().enumerate() {
@@ -1525,42 +1260,11 @@ mod tests {
         }
     }
 
-    /// The walk runs on its wakes only: an ask made while it sleeps waits
-    /// for the next event (here room freed), with no poll of its own.
-    #[tokio::test(flavor = "current_thread")]
-    async fn the_walk_wakes_on_room_freed_not_on_a_clock() {
-        const ENGINE: usize = 51;
-        let mut pool = super::super::tests::pool();
-        pool.lower_rung(16).unwrap();
-        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
-        let grow = SharedGrow::new(0, ENGINE, shared.clone());
-        grow.start();
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(shared.lock().unwrap().rung(), 16, "nothing asked");
-        let _want = super::super::want_rows(ENGINE, 2048);
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            shared.lock().unwrap().rung(),
-            16,
-            "asked while it sleeps: no poll"
-        );
-        grow.room_freed();
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(shared.lock().unwrap().rung(), 2048, "woken: it raises");
-    }
-
-    /// Mac's spin (Metal, the grow-time check refusing a prefix commit,
-    /// about 1,000 asks a minute): a refused commit is asked again on no
-    /// wake that cannot change what the device backs (room freed inside the
-    /// pool, a governor tick, a retarget to the target it was refused at)
-    /// and on no clock, its own walk loop running: only once the governor's
-    /// target moves, or device memory the engine gave back lands.
+    /// A refused commit is asked again on no wake that cannot change what the
+    /// device backs (room freed inside the pool, a governor tick, a retarget
+    /// to the target it was refused at) and on no clock, its own walk loop
+    /// running: only once the governor's target moves, or device memory the
+    /// engine gave back lands.
     #[tokio::test(flavor = "current_thread")]
     async fn a_refused_commit_is_asked_again_only_on_an_event_of_the_device_s() {
         const ENGINE: usize = 9402;

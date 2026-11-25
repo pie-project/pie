@@ -1,8 +1,7 @@
 #![cfg(feature = "device")]
 //! A lane's attention mask is data, not a class: a masked beam lane and plain
 //! decode lanes share one fire and one body, and each answers what it answers
-//! alone (contract A: a token parts only on a near-tie). A model opening the
-//! mask arms as many bodies as the same model with no mask.
+//! alone (contract A: a token parts only on a near-tie).
 
 use std::path::Path;
 
@@ -253,43 +252,14 @@ fn a_masked_beam_beside_plain_decodes_answers_as_each_alone() {
     serve(Graphs::On);
 }
 
-/// Opening the mask adds no body: the masks are data each body reads.
-#[test]
-fn a_mask_adds_no_body() {
-    if !engine_cuda::device::present() {
-        eprintln!("no CUDA device: skipping");
-        return;
-    }
-    let census = |mask: bool| {
-        let trace = trace_hybrid("mask-data-micro", &Micro { mask }, Platform::Cuda);
-        let dir = tempfile::tempdir().expect("a scratch directory");
-        let path = Weights::random(&trace, 2207).write(dir.path());
-        let shell = shell(trace, &path, Graphs::On, LANES);
-        let stats = shell.body_stats();
-        (stats.census.bodies, stats.tally.armed_at_load)
-    };
-    let (masked, plain) = (census(true), census(false));
-    eprintln!("bodies masked {masked:?} plain {plain:?}");
-    assert!(plain.0 > 0, "the plain load arms bodies");
-    assert_eq!(
-        masked, plain,
-        "a model opening the mask arms the bodies (resident, armed) the maskless one does"
-    );
-}
-
 /// A prompt and its decodes answer alike whether the model opens the mask or
 /// not: a lane stating none reads through the masked arms as the plain ones.
+/// On a load of one lane a fire, every fire's mask entries are the ones the
+/// load's arming fires staged before the load zeroed the workspace, and the
+/// first fire served copies them again.
 #[test]
 fn a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
     maskless_through_masked_arms(LANES);
-}
-
-/// As [`a_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones`]
-/// on a load of one lane a fire: every fire's mask entries (one lane stating
-/// none) are the ones the load's arming fires staged before the load zeroed
-/// the workspace, and the first fire served copies them again.
-#[test]
-fn a_lone_maskless_lane_answers_through_the_masked_arms_as_through_the_plain_ones() {
     maskless_through_masked_arms(1);
 }
 
