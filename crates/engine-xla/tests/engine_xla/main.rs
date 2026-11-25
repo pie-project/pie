@@ -2,6 +2,7 @@
 
 mod a_batched_decode_answers_what_each_lane_answers_alone;
 mod a_device_fold_replays_what_a_host_fold_replays;
+mod a_fire_the_load_did_not_prepare_is_counted;
 mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
 mod a_registered_channel_carries_one_cell_across_its_instances;
 mod an_adapter_lies_in_its_slots;
