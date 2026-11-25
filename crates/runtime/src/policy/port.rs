@@ -418,10 +418,15 @@ impl Port {
                 );
             }
             Event::PropsChanged(pid, props, names) => {
-                let id = schedule::plex_id(pid).to_string();
+                let id = schedule::plex_id(pid);
+                // A process the policy never heard of, or whose exit it
+                // has, has no props to change.
+                if !self.procs.contains_key(&id) {
+                    return;
+                }
                 for name in names {
                     let value = props.get(&name).and_then(hint_value);
-                    host.hint(Subject::Process(id.clone()), &name, value);
+                    host.hint(Subject::Process(id.to_string()), &name, value);
                 }
             }
             Event::Fired(pid, rows, readouts) => {
