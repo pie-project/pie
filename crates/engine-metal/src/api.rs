@@ -31,7 +31,6 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceBoot {
-    pub adapter_dir: Option<std::path::PathBuf>,
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<std::path::PathBuf>,
 }
@@ -171,7 +170,6 @@ fn fault(fault: Fault) -> Error {
             available: 0,
         },
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
-        Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
@@ -277,63 +275,23 @@ fn bf16_bits(value: f32) -> u16 {
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
-    instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
 ) -> EngineResult<Option<crate::adapter::Binding>> {
-    if let Some(channel) = shell.program_adapter_bundle(program).map_err(fault)? {
-        let wire = seeds
-            .iter()
-            .find(|(seeded, _)| *seeded == channel)
-            .map(|(_, bytes)| bytes.as_slice())
-            .ok_or_else(|| {
-                Error::Load(format!(
-                    "this program's `adapter` sink reads its bundle out of channel \
-                     {channel} and this bind seeded nothing into it"
-                ))
-            })?;
-        let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
-        return shell
-            .bind_adapter(crate::adapter::Source::Bundle { bundle: &bundle })
-            .map(Some)
-            .map_err(fault);
-    }
-    let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
+    let Some(channel) = shell.program_adapter_bundle(program).map_err(fault)? else {
         return Ok(None);
     };
-    let seats = shell.bank_seats();
-    let site = sink.site().map_err(fault)?;
-    let mut built: Vec<(String, Vec<u8>)> = Vec::new();
-    for (role, channel) in &sink.planes {
-        let wire = seeds
-            .iter()
-            .find(|(seeded, _)| seeded == channel)
-            .map(|(_, bytes)| bytes.as_slice())
-            .ok_or_else(|| {
-                Error::Load(format!(
-                    "this program's `lora` sink reads its `{}` plane out of channel \
-                     {channel} and this bind seeded nothing into it; an adapter's \
-                     weights are the seed, because the fire path never reads the cell, \
-                     so an unseeded plane is a correction of zero \
-                     that nobody asked for",
-                    role.bank()
-                ))
-            })?;
-        built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
-    }
-    let planes: Vec<AdapterPlane<'_>> = built
+    let wire = seeds
         .iter()
-        .map(|(bank, bytes)| AdapterPlane {
-            bank: bank.as_str(),
-            bytes,
-        })
-        .collect();
-    shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
-        .map(Some)
-        .map_err(fault)
+        .find(|(seeded, _)| *seeded == channel)
+        .map(|(_, bytes)| bytes.as_slice())
+        .ok_or_else(|| {
+            Error::Load(format!(
+                "this program's `adapter` sink reads its bundle out of channel \
+                 {channel} and this bind seeded nothing into it"
+            ))
+        })?;
+    let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
+    shell.bind_adapter(&bundle).map(Some).map_err(fault)
 }
 
 impl Engine for Metal {
@@ -520,7 +478,6 @@ impl Engine for Metal {
         prepared.set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
         let mut shell = prepared.load().map_err(fault)?;
 
-        shell.mount_adapters(self.boot.adapter_dir.clone());
         // The device pool already is host memory, so a host tier would only
         // move kv and rs slots within the same DRAM: one is seated only
         // where its budget is stated (it frees room in the pool's heap, not
@@ -791,7 +748,7 @@ impl Programs for Metal {
                 &binding.channels,
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let landed = adapter_of(shell, binding.program, &seeds);
         let bound = match landed {
             Ok(bound) => bound,
             Err(why) => {

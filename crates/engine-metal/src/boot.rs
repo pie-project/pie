@@ -7,23 +7,7 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         .map_err(|error| format!("the metal boot config is not TOML: {error}"))?;
     let profiles = profiles(&doc)?;
     crate::diag::publish(&diagnostics(&doc)?);
-    Ok(Metal::new(
-        DeviceBoot {
-            adapter_dir: adapter_dir(&doc),
-            profiles,
-        },
-        contract_for,
-    ))
-}
-
-fn adapter_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
-    doc.get("model")
-        .and_then(toml::Value::as_table)
-        .and_then(|model| model.get("adapter_dir"))
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-        .map(std::path::PathBuf::from)
+    Ok(Metal::new(DeviceBoot { profiles }, contract_for))
 }
 
 fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
@@ -70,7 +54,6 @@ mod tests {
         a_boot_document_that_says_nothing_about_this_engine_still_opens();
         a_boot_document_that_is_not_toml_is_refused_at_the_door();
         the_diagnostics_word_list_is_read_or_refused_by_name();
-        the_shared_adapter_directory_is_read_and_an_empty_one_is_off();
         the_profiles_directory_is_read_or_refused_by_name();
     }
 
@@ -99,17 +82,6 @@ mod tests {
         let why = of("[metal]\ndiagnostics = 3\n").expect_err("a number is not a word list");
         assert!(why.contains("word list"), "{why}");
         assert!(open(b"[metal]\ndiagnostics = \"teir-trace\"\n", nothing).is_err());
-    }
-
-    fn the_shared_adapter_directory_is_read_and_an_empty_one_is_off() {
-        let read = |text: &str| adapter_dir(&text.parse::<toml::Table>().expect("valid TOML"));
-        assert_eq!(
-            read("[model]\nadapter_dir = \"/srv/pie/shared\""),
-            Some(std::path::PathBuf::from("/srv/pie/shared"))
-        );
-        assert_eq!(read("[model]\nadapter_dir = \"  \""), None, "empty is off");
-        assert_eq!(read("[model]"), None, "and so is absent");
-        assert_eq!(read(""), None);
     }
 
     fn the_profiles_directory_is_read_or_refused_by_name() {
