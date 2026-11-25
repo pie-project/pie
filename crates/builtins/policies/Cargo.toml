@@ -9,6 +9,7 @@
 resolver = "2"
 members = [
     "cluster-defaults",
+    "deadline",
     "default",
     "default-cluster",
     "noop",

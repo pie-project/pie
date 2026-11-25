@@ -22,6 +22,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadline"
+version = "0.1.0"
+dependencies = [
+ "plex",
+ "worker-defaults",
+]
+
+[[package]]
 name = "default"
 version = "0.1.0"
 dependencies = [
