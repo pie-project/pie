@@ -80,6 +80,8 @@ pub struct RingSeen {
     pub own: u64,
     /// Ring pages a fire both read and then folded rows onto.
     pub read_then_folded: u64,
+    /// Snapshots of a lane's rings landed inside its fire.
+    pub snapshots: u64,
 }
 
 pub struct Shell {

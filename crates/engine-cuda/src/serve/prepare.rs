@@ -1825,6 +1825,7 @@ impl Shell {
                 // The group's fold is its first lane's; the others read.
                 if first_fold {
                     ring_work.add(&composed, &planes);
+                    self.ring_seen.snapshots += snapshots.len() as u64;
                 } else {
                     ring_work.fills.extend_from_slice(&composed.fills);
                 }

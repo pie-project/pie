@@ -206,3 +206,90 @@ fn a_masked_lane_reads_its_ring_as_its_full_rows() {
     let got = served_masked(trace, &path, &prompt, 48);
     agree(&got, &want, DEPLOYMENT);
 }
+
+/// The decode after `rows` rows of the prompt's last chunk, its windowed
+/// rows read from the record a snapshot inside that chunk's fire landed
+/// (`from`: the whole chunk's fire lands it at `rows`, and the decode runs
+/// on it; else the record is left as it was), or (`None`) from the lane's
+/// own record, its last fire having stopped at `rows`.
+fn decoded(
+    trace: &Trace,
+    path: &Path,
+    prompt: &[u32],
+    rows: u32,
+    from: Option<bool>,
+) -> (Vec<f32>, engine_cuda::serve::RingSeen) {
+    use engine::fire::{Readout, RsSnapshot};
+    use engine_cuda::serve::Seated;
+    let deployment = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the mini");
+    let contract = contract_for(trace, path).expect("the random planes fit the trace");
+    let mut shell = Shell::load(Boot {
+        knobs: engine_cuda::Knobs {
+            pin: Some((engine_cuda::Graphs::Off, None)),
+            ..engine_cuda::Knobs::default()
+        },
+        ..crate::common::boot(trace.clone(), &contract, path, Budget::new(1, CHUNK), 1024, 2)
+    })
+    .expect("the shell loads");
+    shell.open(0).expect("the slot opens");
+    let facts = deployment.trace(Platform::Cuda).facts;
+    let lane = |tokens| Lane {
+        slot: 0,
+        word: facts.word(&Request::new(u32::try_from(tokens).unwrap_or(0), false)),
+        tokens: &[],
+    };
+    let (head, last) = prompt.split_at(prompt.len() - CHUNK as usize);
+    let mut fire = |seated: Seated<'_>| {
+        shell
+            .fire_rows(&[seated], &[Readout::Last])
+            .expect("the fire runs")
+            .into_iter()
+            .next()
+            .expect("one readout")
+    };
+    for chunk in head.chunks(CHUNK as usize) {
+        fire(Seated::of(Lane { tokens: chunk, ..lane(chunk.len()) }));
+    }
+    let snaps = [RsSnapshot { row: rows, slot: 1, pieces: Vec::new(), fixed: Vec::new() }];
+    let last = if from.is_some() { last } else { &last[..rows as usize] };
+    fire(Seated {
+        rs_snapshots: if from == Some(true) { &snaps } else { &[] },
+        ..Seated::of(Lane { tokens: last, ..lane(last.len()) })
+    });
+    let token = [77u32];
+    let logits = fire(Seated {
+        held: Some(head.len() as u32 + rows),
+        rs_slot: from.map(|_| 1),
+        ..Seated::of(Lane { tokens: &token, ..lane(1) })
+    });
+    drop(fire);
+    (logits, shell.ring_seen())
+}
+
+// A snapshot landed inside a windowed fire holds its lane's rings after the
+// snapshot's rows, not the fire's: a decode on it answers what a lane whose
+// fire stopped there answers, past the point where the ring has wrapped.
+// The record without the snapshot answers otherwise.
+#[test]
+fn a_ring_snapshot_holds_the_rows_before_it() {
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
+        .expect("the mini gemma")
+        .trace(Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 705).write(dir.path());
+    let prompt: Vec<u32> = (0..3 * CHUNK).map(|at| (at * 31 + 5) % 4096).collect();
+    for rows in [100, CHUNK] {
+        let (want, _) = decoded(&trace, &path, &prompt, rows, None);
+        let (got, seen) = decoded(&trace, &path, &prompt, rows, Some(true));
+        assert_eq!(seen.snapshots, 1, "row {rows}: the fire lands one");
+        agree(&[got], &[want.clone()], &format!("a snapshot at row {rows}"));
+        let (bare, seen) = decoded(&trace, &path, &prompt, rows, Some(false));
+        assert_eq!(seen.snapshots, 0);
+        let apart = bare.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(apart > 1e-3, "row {rows}: a record with no snapshot answers the same");
+    }
+}
