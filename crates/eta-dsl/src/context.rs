@@ -144,6 +144,14 @@ pub(crate) fn release_channel_state(gid: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Releases this thread's channels of gid `first` on.
+pub(crate) fn release_channels_from(first: u64) {
+    let released = CHANNELS_BY_GID.try_with(|map| {
+        map.try_borrow_mut().ok().map(|mut map| map.split_off(&first))
+    });
+    drop(released);
+}
+
 pub(crate) fn is_tracing() -> bool {
     SESSION.with_borrow(|s| s.as_ref().map(|s| s.current.is_some()).unwrap_or(false))
 }

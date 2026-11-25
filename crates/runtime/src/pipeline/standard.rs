@@ -196,15 +196,17 @@ pub fn traces(
     outputs: &[OutputDecl],
     capacity: u32,
 ) -> Result<Vec<(String, Traced)>, String> {
-    let mut all = Vec::new();
-    for (name, shape) in &sampler::standard() {
-        let [prefill, decode] = passes(vocab, page_size, outputs, capacity, shape, &PREWARM)
-            .map_err(|error| format!("the standard sampler `{name}`: {error}"))?;
-        all.push((format!("{name} (prompt)"), prefill));
-        all.push((format!("{name} (decode)"), decode));
-    }
-    all.push(("the built-in `prefill`".to_owned(), builtin_prefill(vocab, page_size, outputs)?));
-    Ok(all)
+    Channel::released(|| {
+        let mut all = Vec::new();
+        for (name, shape) in &sampler::standard() {
+            let [prefill, decode] = passes(vocab, page_size, outputs, capacity, shape, &PREWARM)
+                .map_err(|error| format!("the standard sampler `{name}`: {error}"))?;
+            all.push((format!("{name} (prompt)"), prefill));
+            all.push((format!("{name} (decode)"), decode));
+        }
+        all.push(("the built-in `prefill`".to_owned(), builtin_prefill(vocab, page_size, outputs)?));
+        Ok(all)
+    })
 }
 
 /// The built-in `prefill` program's one pass (`builtins/inferlets/prefill`):

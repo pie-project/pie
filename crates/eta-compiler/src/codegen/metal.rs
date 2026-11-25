@@ -3,7 +3,6 @@ pub mod fused;
 pub mod intrinsics;
 pub mod nucleus;
 pub mod preamble;
-pub mod singleton;
 pub mod streamed;
 pub mod streamed_topk;
 pub mod topk;
@@ -20,7 +19,6 @@ pub use intrinsics::{
 };
 pub use nucleus::emit_grouped_nucleus;
 pub use preamble::RUNTIME_TEMPLATE;
-pub use singleton::emit_singleton_region;
 pub use streamed::{
     M4_STEP_CONSTANT, STEP_NODE, STEP_NODES, STEP_VIEW, StepKind, StepNodes, emit_streamed_region,
     is_streamed_select, reduce_dispatch_levels, reduce_levels, step_kind, step_node_table,
@@ -39,7 +37,7 @@ pub const LIBRARY_FORMS: crate::plan::LibraryForms = crate::plan::LibraryForms {
     bf16_cut: false,
 };
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 81;
+pub const METAL_M1_EMITTER_VERSION: u16 = 82;
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 

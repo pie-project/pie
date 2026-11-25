@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::codegen::error::{EmitError, EmitterKind};
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
@@ -27,7 +28,9 @@ pub struct EmittedKernel {
     pub stage_index: u32,
     pub region_index: u32,
     pub entry_name: String,
-    pub source: String,
+    /// The text, shared by every copy of the kernel (its program's, a
+    /// registration's, an engine's compile).
+    pub source: Arc<str>,
     pub error: String,
     #[serde(default)]
     pub steps: Vec<u32>,
@@ -41,9 +44,9 @@ impl EmittedKernel {
         entry_name: String,
         emitted: Result<String, EmitError>,
     ) -> Self {
-        let (source, error) = match emitted {
-            Ok(source) => (source, String::new()),
-            Err(error) => (String::new(), error.to_string()),
+        let (source, error): (Arc<str>, String) = match emitted {
+            Ok(source) => (Arc::from(source), String::new()),
+            Err(error) => (Arc::default(), error.to_string()),
         };
         Self {
             kind,
@@ -168,94 +171,87 @@ fn emit_simt_stage(
     }
 }
 
-fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
-    let signature = signature(stage);
+/// The entry a Metal kernel is emitted under, until its text names it
+/// ([`push_metal`]).
+const METAL_UNNAMED: &str = "ptir_metal_unnamed_entry";
 
-    match crate::codegen::metal::validate_singleton_plan(stage) {
-        Ok(operations) => {
-            for (region_index, meta) in operations.iter().enumerate() {
-                let entry = format!("ptir_m1_{signature}_r{region_index}");
-                let source = crate::codegen::metal::emit_singleton_region(&entry, meta.op.tag);
-                out.push(EmittedKernel::new(
-                    KernelKind::Singleton,
-                    stage_index,
-                    region_index,
-                    entry,
-                    Ok(source),
-                ));
-            }
+/// Takes a Metal kernel emitted under [`METAL_UNNAMED`], its entry named by
+/// a hash of that text: macOS keeps a compiled library by its source, so
+/// regions of one text are one source whatever program, stage or region
+/// they are of.
+fn push_metal(
+    out: &mut Vec<EmittedKernel>,
+    kind: KernelKind,
+    stage_index: usize,
+    region_index: usize,
+    prefix: &str,
+    emitted: Result<String, EmitError>,
+) {
+    let (entry, emitted) = match emitted {
+        Ok(source) => {
+            let hash = eta_ir::fnv1a64(source.as_bytes());
+            let entry = format!("ptir_{prefix}_{hash:016x}");
+            let source = source.replace(METAL_UNNAMED, &entry);
+            (entry, Ok(source))
         }
-        Err(error) => {
-            out.push(EmittedKernel::new(
-                KernelKind::Singleton,
-                stage_index,
-                0,
-                String::new(),
-                Err(error),
-            ));
-        }
-    }
+        Err(error) => (String::new(), Err(error)),
+    };
+    out.push(EmittedKernel::new(kind, stage_index, region_index, entry, emitted));
+}
+
+fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
+    let entry = METAL_UNNAMED;
 
     let fused_supported = stage.normalized.channel_bindings.len()
         <= crate::codegen::metal::METAL_M2_MAX_FUSED_CHANNELS;
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
-        let entry = format!("ptir_m2_{signature}_r{region_index}");
         let emitted = if fused_supported {
-            crate::codegen::metal::emit_fused_region(&entry, stage, region)
+            crate::codegen::metal::emit_fused_region(entry, stage, region)
         } else {
             Err(EmitError::ChannelLimitExceeded {
                 emitter: EmitterKind::MetalFused,
                 limit: crate::codegen::metal::METAL_M2_MAX_FUSED_CHANNELS,
             })
         };
-        out.push(EmittedKernel::new(
+        push_metal(
+            out,
             KernelKind::Fused,
             stage_index,
             region_index,
-            entry,
+            "m2",
             emitted,
-        ));
+        );
     }
 
-    for (region_index, region) in stage.singleton.regions.iter().enumerate() {
-        let entry = format!("ptir_m3s_{signature}_r{region_index}");
-        let emitted = crate::codegen::metal::emit_grouped_fused_region(&entry, stage, region);
-        out.push(EmittedKernel::new(
-            KernelKind::Grouped,
-            stage_index,
-            region_index,
-            entry,
-            emitted,
-        ));
-    }
+    // Past the singleton partition's slots, which hold no kernel: the
+    // engine asks a region's grouped form at that offset.
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
-        let entry = format!("ptir_m3_{signature}_r{region_index}");
         let emitted = match grouped_library(stage, region) {
             Some(LibraryOp::NucleusSample) => {
-                crate::codegen::metal::emit_grouped_nucleus(&entry, stage, region)
+                crate::codegen::metal::emit_grouped_nucleus(entry, stage, region)
             }
             Some(LibraryOp::TopK) => {
-                crate::codegen::metal::emit_grouped_topk(&entry, stage, region)
+                crate::codegen::metal::emit_grouped_topk(entry, stage, region)
             }
-            _ => crate::codegen::metal::emit_grouped_fused_region(&entry, stage, region),
+            _ => crate::codegen::metal::emit_grouped_fused_region(entry, stage, region),
         };
-        out.push(EmittedKernel::new(
+        push_metal(
+            out,
             KernelKind::Grouped,
             stage_index,
             stage.singleton.regions.len() + region_index,
-            entry,
+            "m3",
             emitted,
-        ));
+        );
     }
 
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
-        let entry = format!("ptir_m4_{signature}_r{region_index}");
         let answer = match grouped_library(stage, region) {
             Some(LibraryOp::TopK) => {
-                crate::codegen::metal::emit_streamed_topk(&entry, stage, region)
+                crate::codegen::metal::emit_streamed_topk(entry, stage, region)
             }
             Some(LibraryOp::NucleusSample) | None => {
-                crate::codegen::metal::emit_streamed_region(&entry, stage, region)
+                crate::codegen::metal::emit_streamed_region(entry, stage, region)
             }
             Some(_) => Err(crate::codegen::error::EmitError::LibraryRegionAbiInvalid(
                 crate::codegen::error::RegionForm::GroupedFused,
@@ -265,15 +261,17 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             Ok((source, steps)) => (Ok(source), steps),
             Err(error) => (Err(error), Vec::new()),
         };
-        let mut kernel = EmittedKernel::new(
+        push_metal(
+            out,
             KernelKind::Streamed,
             stage_index,
             region_index,
-            entry,
+            "m4",
             emitted,
         );
-        kernel.steps = steps;
-        out.push(kernel);
+        if let Some(kernel) = out.last_mut() {
+            kernel.steps = steps;
+        }
     }
 
     let version = crate::codegen::metal::METAL_M1_EMITTER_VERSION;
@@ -299,19 +297,20 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
 
 fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) {
     let effects = crate::codegen::metal::channel_effects(bound);
-    let signature = format!("{:016x}", bound.hash);
-    let ready = format!("ptir_m1_{signature}_ready");
-    let source = crate::codegen::metal::emit_readiness(&ready, &effects);
-    out.push(EmittedKernel::new(
-        KernelKind::Readiness,
-        0,
-        1,
-        ready,
-        source,
-    ));
-    let commit = format!("ptir_m1_{signature}_commit");
-    let source = crate::codegen::metal::emit_commit(&commit, &effects);
-    out.push(EmittedKernel::new(KernelKind::Commit, 0, 1, commit, source));
+    for (kind, prefix, source) in [
+        (
+            KernelKind::Readiness,
+            "m1_ready",
+            crate::codegen::metal::emit_readiness(METAL_UNNAMED, &effects),
+        ),
+        (
+            KernelKind::Commit,
+            "m1_commit",
+            crate::codegen::metal::emit_commit(METAL_UNNAMED, &effects),
+        ),
+    ] {
+        push_metal(out, kind, 0, 1, prefix, source);
+    }
 }
 
 fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> {
@@ -337,6 +336,8 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::{String, ToString};
+    use alloc::vec;
     use alloc::vec::Vec;
 
     fn walk() -> Vec<Backend> {
@@ -353,6 +354,16 @@ mod tests {
         out
     }
 
+    /// A kernel's copies share its text.
+    #[test]
+    fn a_kernels_copies_share_its_text() {
+        let kernel = EmittedKernel {
+            source: Arc::from("text"),
+            ..EmittedKernel::default()
+        };
+        assert!(Arc::ptr_eq(&kernel.source, &kernel.clone().source));
+    }
+
     #[test]
     fn all_is_the_whole_enum_and_round_trips() {
         assert_eq!(Backend::ALL, walk().as_slice());
@@ -360,5 +371,105 @@ mod tests {
             assert_eq!(Backend::parse(backend.name()), Some(*backend));
         }
         assert_eq!(Backend::parse("vulkan"), None);
+    }
+
+    /// Programs whose regions are one text emit one source, whatever else
+    /// their stages sign: a channel's capacity, a literal (an op param). A
+    /// different op is a different text, named apart.
+    #[test]
+    fn a_metal_region_is_named_by_its_text() {
+        use crate::plan::compile_bound;
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+        use eta_ir::op::Op;
+        use eta_ir::registry::{EngineCaps, Stage};
+        use eta_ir::types::{Dtype, Literal, Shape};
+        let emit = |op: Op, scale: f32, capacity: u32| {
+            let decl = |host_role, capacity| ChannelDecl {
+                shape: Shape::vector(64),
+                dtype: ChanDType::Concrete(Dtype::F32),
+                capacity,
+                host_role,
+                seeded: false,
+            };
+            let container = TraceContainer {
+                channels: vec![decl(HostRole::Writer, 1), decl(HostRole::Reader, capacity)],
+                stages: vec![StageProgram {
+                    stage: Stage::Epilogue,
+                    ops: vec![
+                        Op::ChanTake(0),
+                        Op::Const(Literal::F32(scale)),
+                        op,
+                        Op::ChanPut { chan: 1, value: 2 },
+                    ],
+                }],
+                ..TraceContainer::default()
+            };
+            let bound = eta_ir::validate::bind(container, vec![Vec::new()], EngineCaps::default())
+                .expect("binds");
+            let stages = compile_bound(&bound);
+            let regions: Vec<(String, String)> = emit_program(Backend::Metal, &stages, &bound)
+                .into_iter()
+                .filter(|kernel| !matches!(kernel.kind, KernelKind::Readiness | KernelKind::Commit))
+                .map(|kernel| (kernel.entry_name.to_string(), kernel.source.to_string()))
+                .collect();
+            (stages[0].signature.hash, regions)
+        };
+        let (signed, regions) = emit(Op::Mul(0, 1), 0.5, 1);
+        assert!(!regions.is_empty());
+        for (other, scale, capacity) in [("capacity", 0.5, 4), ("literal", 0.25, 1)] {
+            let (apart, same) = emit(Op::Mul(0, 1), scale, capacity);
+            assert_ne!(signed, apart, "{other}");
+            assert_eq!(regions, same, "{other}");
+        }
+        let (_, added) = emit(Op::Add(0, 1), 0.5, 1);
+        for (at, (entry, source)) in added.iter().enumerate() {
+            let (was, text) = &regions[at];
+            assert_eq!(entry == was, source == text, "region {at}");
+        }
+        assert_ne!(regions, added);
+    }
+
+    /// Metal emits what its engine asks: no singleton kernel, and a grouped
+    /// one only at a fused region's slot, past the singleton partition's.
+    #[test]
+    fn metal_emits_no_singleton_kernel() {
+        use crate::plan::compile_bound;
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+        use eta_ir::op::Op;
+        use eta_ir::registry::{EngineCaps, Stage};
+        use eta_ir::types::{Dtype, Shape};
+        let decl = |host_role| ChannelDecl {
+            shape: Shape::vector(64),
+            dtype: ChanDType::Concrete(Dtype::F32),
+            capacity: 1,
+            host_role,
+            seeded: false,
+        };
+        let container = TraceContainer {
+            channels: vec![decl(HostRole::Writer), decl(HostRole::Reader)],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::Exp(0),
+                    Op::Neg(1),
+                    Op::ChanPut { chan: 1, value: 2 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        let bound = eta_ir::validate::bind(container, vec![Vec::new()], EngineCaps::default())
+            .expect("binds");
+        let stages = compile_bound(&bound);
+        let singles = stages[0].singleton.regions.len() as u32;
+        let kernels = emit_program(Backend::Metal, &stages, &bound);
+        assert!(kernels.iter().all(|kernel| kernel.kind != KernelKind::Singleton));
+        let grouped: Vec<u32> = kernels
+            .iter()
+            .filter(|kernel| kernel.kind == KernelKind::Grouped)
+            .map(|kernel| kernel.region_index)
+            .collect();
+        let regions = stages[0].fused.regions.len() as u32;
+        assert_eq!(grouped, (singles..singles + regions).collect::<Vec<_>>());
     }
 }
