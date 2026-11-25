@@ -347,7 +347,6 @@ async fn assemble_distributed<C: ControlLink>(
         model,
         engine,
         addr,
-        pid: Some(std::process::id()),
         prior: None,
     };
     let worker_id = ControlLink::register_worker(&control, info.clone())

@@ -13,7 +13,7 @@ const LENGTHS: [u32; 4] = [17, 19, 23, 27];
 
 /// Each length's prompt in its own seat, then one decode of each: every
 /// logit row, in order.
-fn serve(shell: &mut Shell, trace: &poem_ir::Trace) -> Vec<Vec<f32>> {
+pub fn serve(shell: &mut Shell, trace: &poem_ir::Trace) -> Vec<Vec<f32>> {
     let mut rows = Vec::new();
     for (seat, &length) in LENGTHS.iter().enumerate() {
         let tokens: Vec<u32> = (0..length).map(|at| (at * 37 + 11 + seat as u32) % 256).collect();

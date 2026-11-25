@@ -11,8 +11,6 @@ pub struct Worker {
     /// Its engine kind, as its config spells it.
     pub engine: String,
     pub addr: String,
-    /// Its process id, as it told it.
-    pub pid: Option<u32>,
     pub last_hb: Instant,
     pub load: WorkerStatus,
     /// Unreachable once its heartbeats have lagged for half the eviction
@@ -81,7 +79,6 @@ impl Cluster {
                 model,
                 engine: String::new(),
                 addr,
-                pid: None,
                 last_hb: now,
                 health: Health::Healthy,
                 load: WorkerStatus::default(),

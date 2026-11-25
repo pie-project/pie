@@ -406,29 +406,6 @@ pub fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-/// A boot config that states `[model] adapter_dir`, refused by name: an
-/// adapter comes to this engine only through a program's lora sink at bind,
-/// never as a directory the operator declares.
-///
-/// # Errors
-///
-/// `doc` states a non-empty `[model] adapter_dir`.
-pub fn refuse_adapter_dir(doc: &toml::Table, backend: &str) -> std::result::Result<(), String> {
-    let stated = doc
-        .get("model")
-        .and_then(toml::Value::as_table)
-        .and_then(|model| model.get("adapter_dir"))
-        .and_then(toml::Value::as_str)
-        .is_some_and(|dir| !dir.trim().is_empty());
-    if stated {
-        return Err(format!(
-            "[model] adapter_dir is refused on {backend}: an adapter comes only through a \
-             program's lora sink at bind"
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub slot: u32,
@@ -511,22 +488,5 @@ impl Slots {
         if drop {
             self.held.remove(key);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::refuse_adapter_dir;
-
-    /// A stated adapter directory is refused by name; none, or an empty one,
-    /// boots.
-    #[test]
-    fn a_stated_adapter_dir_is_refused_by_name() {
-        let doc = |text: &str| text.parse::<toml::Table>().expect("valid TOML");
-        let why = refuse_adapter_dir(&doc("[model]\nadapter_dir = \"/srv/a\""), "vulkan")
-            .expect_err("refused");
-        assert!(why.contains("[model] adapter_dir is refused on vulkan"), "{why}");
-        assert!(refuse_adapter_dir(&doc("[model]\nadapter_dir = \"\""), "wgpu").is_ok());
-        assert!(refuse_adapter_dir(&doc("[vulkan]\ndevice_index = 0"), "vulkan").is_ok());
     }
 }
