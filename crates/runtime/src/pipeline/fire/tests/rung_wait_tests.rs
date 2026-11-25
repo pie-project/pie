@@ -168,6 +168,47 @@ async fn a_rise_short_of_lent_room_fires_at_the_held_rung_and_rises_once_kv_free
     drop(ask);
 }
 
+/// The walk looks again as the last waiter is served, not only at the
+/// landing that woke the pass: a raise waits behind every demand, and the
+/// walk woken by the landing finds it waiting.
+#[tokio::test(flavor = "current_thread")]
+async fn the_walk_is_told_as_the_last_waiter_is_served() {
+    const ENGINE: usize = 78;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let (model, stores) = super::unfolded_tests::pool_with_rungs_of(vec![(1, 2), (512, 8)]);
+    let shared = stores.shared.clone().expect("a shared pool");
+    let list = shared.lock().unwrap().list().expect("a kv list").pool;
+    let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone());
+    let planner = std::sync::Arc::new(crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
+        crate::planner::RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
+    )));
+    planner.arm_drain_task();
+    let held = {
+        let mut pool = shared.lock().unwrap();
+        let free = pool.pool().available(list);
+        pool.take_refs(list, free).expect("free slots")
+    };
+    let pid = uuid::Uuid::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let bind = {
+        let planner = planner.clone();
+        crate::rt::spawn(async move { planner.wait_bind_room(pid, 1, 1, 0).await })
+    };
+    while !planner.demand_waits() {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    shared.lock().unwrap().give_refs(list, &held);
+    planner.pages_freed();
+    assert!(grow.told(), "the landing's");
+    assert!(planner.demand_waits(), "its pass comes after");
+    bind.await.expect("its task ends").expect("served");
+    assert!(grow.told(), "the last waiter's");
+}
+
 /// The stack wedge through the planner (500 processes at once): the rung
 /// rose for a pass while nothing waited; a guest bind short of a run of
 /// chunks then waits in the planner's queue. The walk comes down at once

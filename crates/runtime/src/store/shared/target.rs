@@ -607,7 +607,14 @@ impl SharedGrow {
         self.wake.notify_one();
     }
 
-    /// Looks again now: a waiter is short.
+    /// Told to look since this was last asked.
+    #[cfg(test)]
+    pub(crate) fn told(&self) -> bool {
+        use futures::FutureExt;
+        self.wake.notified().now_or_never().is_some()
+    }
+
+    /// Looks again now: a waiter is short, or none is any more.
     pub fn wake(&self) {
         self.wake.notify_one();
     }

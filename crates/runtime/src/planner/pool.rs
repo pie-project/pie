@@ -693,6 +693,9 @@ pub trait PoolPort: Send + Sync + 'static {
     fn holds_idle(&self) -> bool {
         self.reclaimable_idle() > 0
     }
+    /// No demand waits for room any more: what waited behind every demand
+    /// (a rung raised for throughput) is looked at now.
+    fn demand_over(&self) {}
     /// Whether kv slots below the device are in use: cache may lie there.
     fn holds_below_device(&self) -> bool {
         true
@@ -2113,6 +2116,12 @@ impl PoolPort for RegistryPool {
 
     fn readers_hold(&self) -> bool {
         self.with_kv_tagged("planner-readers", |kv| kv.readers_hold())
+    }
+
+    fn demand_over(&self) {
+        if let Some(shared) = &self.shared {
+            shared.wake();
+        }
     }
 
     fn idle_out(&self) {

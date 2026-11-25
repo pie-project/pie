@@ -70,6 +70,8 @@ pub struct ResidencyPlanner {
     /// off it (the policy port's thread) runs.
     runtime: Option<tokio::runtime::Handle>,
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
+    /// A demand waited as the last pass ended ([`Self::demand_waits`]).
+    pub(super) waited: std::sync::atomic::AtomicBool,
     /// One reclaim at a time: one under way on another thread is not idle
     /// cache found out.
     idle_reclaim: parking_lot::Mutex<()>,
@@ -163,6 +165,7 @@ impl ResidencyPlanner {
             returns,
             runtime: tokio::runtime::Handle::try_current().ok(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
+            waited: std::sync::atomic::AtomicBool::new(false),
             idle_reclaim: parking_lot::Mutex::new(()),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),

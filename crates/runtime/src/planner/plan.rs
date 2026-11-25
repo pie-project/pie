@@ -133,6 +133,7 @@ impl ResidencyPlanner {
             return;
         }
         self.stats.plan_passes.fetch_add(1, Ordering::Relaxed);
+        self.waited.fetch_or(self.demand_waits(), Ordering::AcqRel);
         self.pass_landed.store(
             self.stats.fires_landed.load(Ordering::Acquire),
             Ordering::Release,
@@ -189,6 +190,13 @@ impl ResidencyPlanner {
         if passed {
             self.with_inner(|inner| inner.passed.clear());
             self.publish_wants();
+        }
+        // A landing wakes the walk before the pass that serves its waiters:
+        // looked at then alone, a raise that waits behind every demand would
+        // find one waiting each time.
+        let waits = self.demand_waits();
+        if self.waited.swap(waits, Ordering::AcqRel) && !waits {
+            self.port.demand_over();
         }
         let rest = crate::rt::Instant::now();
         // The waiters parked behind a grow the walk was promised, now.
