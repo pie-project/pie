@@ -22,7 +22,7 @@ fn every_laid_or_derived_fill_is_the_fires_own_walks() {
     let Some(mut shell) = load_on(&fixture, PAGE, CONTEXT, &device, residency, runahead) else {
         return;
     };
-    shell.record_bodies(None, None).expect("the load arms its bodies");
+    shell.record_bodies(None).expect("the load arms its bodies");
     let armed = shell.shelf.verified();
     eprintln!("the arm walk verified {armed:?}");
     assert!(armed.laid > 0, "the arm walk held no laid fill to a walk");

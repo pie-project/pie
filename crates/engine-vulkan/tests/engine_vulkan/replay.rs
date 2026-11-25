@@ -19,7 +19,7 @@ fn a_decode_whose_keys_grow_past_its_pages_replays_its_recording() {
             tokens: &tokens[..rows],
         })
     };
-    shell.record_bodies(None, None).expect("the load arms its bodies");
+    shell.record_bodies(None).expect("the load arms its bodies");
     shell.serving = true;
     let prompt = 20u32;
     shell.fire_seated(&[lane(0, prompt as usize)]).expect("the prompt fires");

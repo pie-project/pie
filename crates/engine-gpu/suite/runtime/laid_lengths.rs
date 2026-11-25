@@ -58,7 +58,7 @@ fn an_unwalked_length_replays_its_family_with_a_laid_fill() {
     let Some(mut shell) = load(&fixture, CONTEXT) else {
         return;
     };
-    shell.record_bodies(None, None).expect("the load arms its bodies");
+    shell.record_bodies(None).expect("the load arms its bodies");
     shell.recorded_serving();
     shell.unkept_serving();
     shell.eager_serving();
