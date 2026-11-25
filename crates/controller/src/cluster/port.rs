@@ -201,6 +201,8 @@ impl Host {
             supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
             deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             // The port's thread keeps the time and runs the rounds.
+            // plex-host documents `manual` for scenario tests; a port that
+            // keeps the time is the same mode.
             manual: true,
             ..Config::default()
         };

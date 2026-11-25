@@ -59,6 +59,8 @@ fn host() -> Host {
     Host::new(Config {
         supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
         // The port's thread keeps the time and runs the rounds.
+        // plex-host documents `manual` for scenario tests; a port that
+        // keeps the time is the same mode.
         manual: true,
         ..Config::default()
     })
