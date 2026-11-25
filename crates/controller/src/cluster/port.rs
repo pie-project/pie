@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client_api::props::{PROMPT_BLOCK_BYTES, TOKENS_PER_BYTE};
 use controller_api::{
@@ -50,10 +50,6 @@ pub fn call_deadline() -> Duration {
 /// How often the policies hear what the directory and the routing table
 /// hold.
 const STATE_TICK: Duration = Duration::from_secs(1);
-
-/// How often the port looks at the host while no event comes: the host
-/// commits off this thread.
-const LOOK: Duration = Duration::from_millis(2);
 
 /// Why the policies did not load.
 #[derive(Debug, thiserror::Error)]
@@ -204,9 +200,11 @@ impl Host {
         let config = Config {
             supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
             deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            // The port's thread keeps the time and runs the rounds.
+            manual: true,
             ..Config::default()
         };
-        let mut host = PlexHost::new(config.clone());
+        let host = PlexHost::new(config.clone());
         let mut names = Vec::new();
         let mut gating = 0;
         for (spec, component) in &policies {
@@ -214,7 +212,6 @@ impl Host {
             gating += usize::from(gates(&host.load(&name, component).map_err(LoadError)?));
             names.push(name);
         }
-        host.start();
         let shared = Arc::new(Shared {
             tables: RwLock::default(),
             heard: Mutex::default(),
@@ -543,12 +540,31 @@ fn run(
         sets: HashMap::new(),
         version: 0,
     };
+    let start = Instant::now();
+    let clock = |host: &PlexHost| {
+        let now = start.elapsed().as_nanos() as u64;
+        host.set_now(now);
+        now
+    };
     loop {
-        let first = match events.recv_timeout(LOOK) {
+        // The next event, or the next call a policy asked for. A round runs
+        // here, so nothing it commits waits to be noticed.
+        let now = clock(&port.host);
+        let wait = match port.host.alarm() {
+            _ if port.host.due() => Some(Duration::ZERO),
+            Some(at) => Some(Duration::from_nanos(at.saturating_sub(now))),
+            None => None,
+        };
+        let first = match wait {
+            None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(wait) => events.recv_timeout(wait),
+        };
+        let first = match first {
             Ok(event) => Some(event),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        clock(&port.host);
         let mut changed = false;
         for event in first.into_iter().chain(events.try_iter()) {
             match event {
@@ -560,9 +576,7 @@ fn run(
                 }
             }
         }
-        if port.host.due() {
-            port.host.tick(Vec::new());
-        }
+        port.host.run(false);
         // What the host has heard is read before its rows: every row a round
         // committed is in force before a gate that round opens.
         let heard = port.host.heard();
@@ -1131,6 +1145,47 @@ mod tests {
         }
         let view = decisions.borrow().clone();
         assert_eq!(view.placements[0].1.workers, Some(vec![WorkerId(1)]));
+    }
+
+    /// A launch at an idle gateway is heard, and its row in force, with the
+    /// round its arrival wakes: the port waits on events and alarms alone,
+    /// and the runtime's thread is kept from every task that sends another.
+    #[tokio::test]
+    async fn a_gate_opens_with_the_round_its_launch_wakes() {
+        let table = RoutingTable {
+            epoch: 1,
+            author: None,
+            workers: vec![controller_api::RoutableWorker {
+                id: WorkerId(1),
+                addr: String::new(),
+                role: Role::Decode,
+                model: "m".into(),
+                engine: String::new(),
+                health: Health::Healthy,
+                coarse_load: Default::default(),
+            }],
+        };
+        let host = Host::start(
+            vec![("test-route".into(), component("test-route"))],
+            CALL,
+            watch::channel(table).1,
+            watch::channel(DirectoryView::default()).1,
+        )
+        .unwrap();
+        let decisions = host.decisions(GatewayId(0));
+        for nth in [1, 2] {
+            let mut launch = arrived(nth, &[("to", "\"1\"")], None);
+            if let ProcessEvent::Arrived { seq, .. } = &mut launch {
+                *seq = nth;
+            }
+            host.events(GatewayId(0), vec![launch]);
+            while decisions.borrow().heard < nth {
+                std::thread::yield_now();
+            }
+            let view = decisions.borrow().clone();
+            let row = view.placements.iter().find(|(req, _)| *req == nth);
+            assert_eq!(row.unwrap().1.workers, Some(vec![WorkerId(1)]));
+        }
     }
 
     /// A worker's policy writes columns no cluster enacts: it does not load
