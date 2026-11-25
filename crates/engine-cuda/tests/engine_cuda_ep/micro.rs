@@ -233,6 +233,24 @@ pub fn diagnostics() -> engine_cuda::Diagnostics {
     )
 }
 
+/// The registry's defaults under stated rates, so a load weighs its rungs
+/// the same on any card, one without a profile too, and times nothing. The
+/// answers are checked, not the speed: round figures of an L40S's order.
+pub fn chip() -> profile::Profile {
+    engine_cuda::chip::profile(
+        "[rates]\n\
+         launch_ns = 904\n\
+         gemm_tflops_by_rows = [[1024, [[256, 50.0], [8192, 200.0]]], \
+         [4096, [[256, 140.0], [8192, 200.0]]]]\n\
+         attn_tflops_by_keys = [[512, 95.0], [8192, 360.0]]\n\
+         hbm_gbps = 650.0\n\
+         elementwise_gbps = 650.0\n\
+         scan_gelems = 2700.0\n\
+         few_row_tflops = 12.0\n\
+         workgroups_per_core = 2.0\n",
+    )
+}
+
 /// A rank's boot on `ordinal`, or a one-rank engine's.
 pub fn boot(ordinal: i32) -> engine_cuda::DeviceBoot {
     let mut boot = engine_cuda::DeviceBoot {
@@ -241,9 +259,7 @@ pub fn boot(ordinal: i32) -> engine_cuda::DeviceBoot {
     };
     boot.knobs.diagnostics = diagnostics();
     boot.knobs.work_queues = Some(work_queues());
-    // No rates timed: the answers are checked, not the speed, and a card
-    // without a profile would need room to time them past these budgets.
-    boot.knobs.measuring = engine::rates::Measuring::Skip;
+    boot.knobs.chip = Some(chip());
     boot
 }
 
