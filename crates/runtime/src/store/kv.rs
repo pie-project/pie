@@ -344,7 +344,7 @@ struct Persisted {
     by_key: HashMap<Hash256, DiskKvSlotId>,
     /// The copies pages are backed by now, with how many places each backs.
     backing: HashMap<DiskKvSlotId, u32>,
-    /// The cluster retention key each copy is kept under: swap takes the
+    /// The retention key each copy's page was demoted under: swap takes the
     /// lowest first.
     retention: HashMap<DiskKvSlotId, i64>,
 }
@@ -368,20 +368,6 @@ impl Persisted {
         }
         true
     }
-}
-
-/// Persisting a run: its resident pages, each copied to a fresh disk slot
-/// while it stays where it is.
-#[cfg(test)]
-#[derive(Debug)]
-pub struct KvPersistTxn {
-    pages: Vec<(
-        TriePageLocation,
-        PhysicalKvPageId,
-        DiskKvSlotId,
-        journal::PageRecord,
-    )>,
-    pinned: NodeId,
 }
 
 type HeldPage = (DiskKvSlotId, journal::PageRecord);
@@ -3908,153 +3894,6 @@ impl KvStore {
             self.drop_entries(vec![id], By::Host, self.current_epoch());
         }
         tracing::debug!(target: "pie::kv", wanted, freed = freed(self), "disk copies given up for swap");
-    }
-
-    /// Persists the sealed run `keys` (from token 0) as far as its pages
-    /// are found here, in a row, held on the device or copied already: a
-    /// copy of each resident page goes to a fresh disk slot while the page
-    /// stays where it is. `None` when nothing is left to copy, or the disk
-    /// tier is not kept or full; never at swap's cost.
-    #[cfg(test)]
-    pub fn prepare_persist(&mut self, keys: &[Hash256], retention: i64) -> Option<KvPersistTxn> {
-        let run = self.table.sealed_run(keys, false);
-        self.raise_retention(keys, &run, retention);
-        let persisted = self.persisted.as_ref()?;
-        let mut wanted = Vec::new();
-        for (i, location) in run.iter().enumerate() {
-            if persisted.by_key.contains_key(&keys[i]) {
-                continue;
-            }
-            match self.table.backing_at(location) {
-                Ok(KvPageBacking::Resident(gpu)) if !self.table.page_location_pinned(*location) => {
-                    let tokens = self.table.token_hashes_at(location)?.to_vec();
-                    wanted.push((
-                        *location,
-                        gpu,
-                        journal::PageRecord {
-                            page: keys[i],
-                            parent: i.checked_sub(1).map(|p| keys[p]),
-                            tokens,
-                            retention,
-                        },
-                    ));
-                }
-                // A copy is made from the device: the run ends at a page
-                // that is not there.
-                _ => break,
-            }
-        }
-        wanted.truncate(self.disk_pool.available());
-        if wanted.is_empty() {
-            return None;
-        }
-        let slots = self.disk_pool.try_alloc_n(wanted.len())?;
-        // The last page's node holds the whole run while it is copied.
-        let pinned = wanted.last()?.0.node;
-        self.table.pin(pinned);
-        self.table
-            .pin_swap_locations(wanted.iter().map(|(location, ..)| *location));
-        Some(KvPersistTxn {
-            pages: wanted
-                .into_iter()
-                .zip(slots)
-                .map(|((location, gpu, record), slot)| (location, gpu, slot, record))
-                .collect(),
-            pinned,
-        })
-    }
-
-    /// Keeps the copies `run` already has under `retention` where that is
-    /// higher than the key they were kept under, in the journal too.
-    #[cfg(test)]
-    fn raise_retention(&mut self, keys: &[Hash256], run: &[TriePageLocation], retention: i64) {
-        let Some(persisted) = &mut self.persisted else {
-            return;
-        };
-        let mut raised = Vec::new();
-        for (i, location) in run.iter().enumerate() {
-            let Some(&slot) = persisted.by_key.get(&keys[i]) else {
-                continue;
-            };
-            if persisted
-                .retention
-                .get(&slot)
-                .is_some_and(|&kept| kept >= retention)
-            {
-                continue;
-            }
-            let Some(tokens) = self.table.token_hashes_at(location) else {
-                continue;
-            };
-            persisted.retention.insert(slot, retention);
-            raised.push((
-                slot,
-                journal::PageRecord {
-                    page: keys[i],
-                    parent: i.checked_sub(1).map(|p| keys[p]),
-                    tokens: tokens.to_vec(),
-                    retention,
-                },
-            ));
-        }
-        if raised.is_empty() {
-            return;
-        }
-        let written = raised
-            .iter()
-            .try_for_each(|(slot, record)| persisted.journal.put(slot.0, record))
-            .and_then(|()| persisted.journal.sync());
-        if let Err(error) = written {
-            tracing::error!(target: "pie::kv", %error, "disk kv journal not written; the tier is kept no longer");
-            self.abandon_persisted();
-        }
-    }
-
-    /// The copies landed: the journal names them, durably. Answers the pages
-    /// persisted.
-    #[cfg(test)]
-    pub fn commit_persist(&mut self, txn: KvPersistTxn) -> usize {
-        self.unpin_persist(&txn);
-        let Some(persisted) = &mut self.persisted else {
-            self.disk_pool
-                .release_reserved(txn.pages.into_iter().map(|(.., slot, _)| slot).collect());
-            return 0;
-        };
-        let written = txn
-            .pages
-            .iter()
-            .try_for_each(|(_, _, slot, record)| persisted.journal.put(slot.0, record))
-            .and_then(|()| persisted.journal.sync());
-        if let Err(error) = written {
-            tracing::error!(target: "pie::kv", %error, "disk kv journal not written; the tier is kept no longer");
-            self.disk_pool
-                .release_reserved(txn.pages.into_iter().map(|(.., slot, _)| slot).collect());
-            self.abandon_persisted();
-            return 0;
-        }
-        let count = txn.pages.len();
-        for (_, _, slot, record) in txn.pages {
-            persisted.slots.insert(slot, record.page);
-            persisted.by_key.insert(record.page, slot);
-            persisted.retention.insert(slot, record.retention);
-        }
-        // A page dropped while it was copied leaves its copy to no one.
-        self.forget_lost_copies();
-        // The prefix persisted is a run of its own: the cluster sees it as a
-        // group on disk.
-        self.split_persisted();
-        tracing::debug!(target: "pie::kv", pages = count, "persisted");
-        count
-    }
-
-    #[cfg(test)]
-    fn unpin_persist(&mut self, txn: &KvPersistTxn) {
-        let mut freed = self.table.unpin(txn.pinned);
-        freed.extend(
-            self.table
-                .unpin_swap_locations(txn.pages.iter().map(|(location, ..)| *location)),
-        );
-        self.end_move(freed);
     }
 
     /// The pages the disk tier keeps a copy of, by key.
