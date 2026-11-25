@@ -280,7 +280,7 @@ pub struct KvStore {
     by_owner: HashMap<NodeId, Vec<u64>>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
-    owners: HashMap<ProcessId, usize>,
+    owners: HashMap<ProcessId, Vec<u64>>,
     /// Not on a model with recurrent state, whose KV alone resumes nothing.
     keeps: bool,
     /// The readers outside the fleet, and who is told as one ends.
@@ -316,9 +316,9 @@ pub struct KvStore {
     droppable_below: std::cell::Cell<Option<(Instant, std::time::Duration, u64, (u32, u32))>>,
     /// The reclaim order the last reclaim left: see [`Self::kept_order`].
     order: Option<KeptOrder>,
-    /// Bumped as an entry joins or leaves the cache, or is used: what a kept
-    /// order read of the entries stands until it moves.
-    entries_rev: u64,
+    /// The owners (an entry of none, by its id) whose entries joined or left
+    /// the cache, or were used, since the kept order read them.
+    reorder: HashSet<Result<ProcessId, u64>>,
     /// Device pages a reclaim freed that wait on a fire's retirement: they
     /// are returning, and count toward what a waiter is short of, so a
     /// reclaim for the same shortfall frees none past them
@@ -458,7 +458,6 @@ struct IdleChunk {
 #[derive(Debug)]
 struct KeptOrder {
     table: u64,
-    entries: u64,
     keys: u64,
     groups: Vec<(i64, Vec<u64>)>,
 }
@@ -479,10 +478,6 @@ pub struct CachedWorkingSet {
     pub entries: usize,
     pub pages: u64,
     pub last_use: Instant,
-    /// Whether any of its pages sits on the device, or on the host: what
-    /// discarding it can free there.
-    pub on_device: bool,
-    pub on_host: bool,
 }
 
 impl KvStore {
@@ -572,7 +567,7 @@ impl KvStore {
             below_cached: std::cell::Cell::new(None),
             droppable_below: std::cell::Cell::new(None),
             order: None,
-            entries_rev: 0,
+            reorder: HashSet::new(),
             returning: HashSet::new(),
             reclaiming: None,
             guest_disk_slots: 0,
@@ -943,13 +938,13 @@ impl KvStore {
         count
     }
 
-    fn disown(&mut self, entry: &KeptEntry, by: By) {
+    fn disown(&mut self, id: u64, entry: &KeptEntry, by: By) {
         let Some(owner) = entry.owner else {
             return;
         };
-        if let Some(count) = self.owners.get_mut(&owner) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(ids) = self.owners.get_mut(&owner) {
+            ids.retain(|&owned| owned != id);
+            if ids.is_empty() {
                 self.owners.remove(&owner);
                 crate::policy::report(Event::CacheEmptied(owner, by));
             }
@@ -979,23 +974,17 @@ impl KvStore {
                 continue;
             };
             let pages = entry.path.pages;
-            let on_device = self.table.holds_resident(entry.path.terminal);
-            let on_host = self.table.holds_on_host(entry.path.terminal);
             sets.entry(owner)
                 .and_modify(|set| {
                     set.entries += 1;
                     set.pages = set.pages.max(pages);
                     set.last_use = set.last_use.max(entry.last_use);
-                    set.on_device |= on_device;
-                    set.on_host |= on_host;
                 })
                 .or_insert(CachedWorkingSet {
                     owner,
                     entries: 1,
                     pages,
                     last_use: entry.last_use,
-                    on_device,
-                    on_host,
                 });
         }
         sets.into_values().collect()
@@ -1047,10 +1036,11 @@ impl KvStore {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.cache.remove(&key) {
+                self.note_order(entry.owner.ok_or(key));
                 self.note_change(entry.path.terminal, false);
                 self.unlist(key, entry.path.terminal);
                 self.splits.retain(|&(split, _)| split != key);
-                self.disown(&entry, by);
+                self.disown(key, &entry, by);
                 freed += self.release_entry(entry);
             }
         }
@@ -1284,29 +1274,79 @@ impl KvStore {
         self.returning.len()
     }
 
-    /// Every entry in [`Self::order_of`]'s groups, walked again (and the
-    /// entries split at their steps and persisted heads first) only when an
-    /// entry or a key changed since the last reclaim left it: a reclaim
-    /// short of a page at a time walked every cached entry under the lock
-    /// every guest's fire waits on, each time. What is in use or off the
-    /// device is read as the reclaim reaches it, so a decode's appends and
-    /// a fork move the order not at all. A split joins entries, so it moves the order;
-    /// what would split again moves one of the revisions too.
+    /// Every entry in [`Self::order_of`]'s groups. Kept between reclaims, and
+    /// of what changed since (an owner's entries, its rows) only that owner's
+    /// groups are read again and put where they stand now, its entries split
+    /// at their steps first: a reclaim short of a page at a time walked every
+    /// cached entry under the lock every guest's fire waits on, each time.
+    /// What is in use or off the device is read as the reclaim reaches it, so
+    /// a decode's appends and a fork move the order not at all. All of it is
+    /// walked where a column's default changed, or where pages of persisted
+    /// heads, which split entries too, moved.
     fn kept_order(&mut self, keys: &impl Keys) -> Vec<(i64, Vec<u64>)> {
-        // What splits at a persisted head moves with the table's pages.
         let copies = self.persisted.as_ref().is_some_and(|p| !p.by_key.is_empty());
-        let table = self.table.revision();
-        let (entries, revision) = (self.entries_rev, keys.revision());
-        if let Some(kept) = self.order.take().filter(|kept| {
-            (kept.table == table || !copies)
-                && kept.entries == entries
-                && Some(kept.keys) == revision
-        }) {
-            return kept.groups;
+        if let Some(kept) = self.order.take()
+            && (!copies || (kept.table == self.table.revision() && self.reorder.is_empty()))
+            && let Some(rows) = keys.changed_since(kept.keys)
+        {
+            let mut changed = std::mem::take(&mut self.reorder);
+            changed.extend(rows.into_iter().map(Ok));
+            return self.reordered(kept.groups, changed, keys);
         }
-        self.split_at_steps(keys);
+        self.split_at_steps(keys, self.cache.keys().copied().collect());
         self.split_persisted();
-        self.order_of(keys, |_| true)
+        self.reorder.clear();
+        self.order_of(keys, self.cache.keys().copied())
+    }
+
+    /// The entries of an owner (or one of none, by its id) changed: the kept
+    /// order reads them again.
+    fn note_order(&mut self, of: Result<ProcessId, u64>) {
+        if self.order.is_some() || self.reclaiming.is_some() {
+            self.reorder.insert(of);
+        }
+    }
+
+    /// `groups` with those of the owners `changed` read again.
+    fn reordered(
+        &mut self,
+        mut groups: Vec<(i64, Vec<u64>)>,
+        changed: HashSet<Result<ProcessId, u64>>,
+        keys: &impl Keys,
+    ) -> Vec<(i64, Vec<u64>)> {
+        if changed.is_empty() {
+            return groups;
+        }
+        groups.retain(|(_, ids)| {
+            ids.iter()
+                .find_map(|id| Some((id, self.cache.get(id)?)))
+                .is_some_and(|(&id, entry)| !changed.contains(&entry.owner.ok_or(id)))
+        });
+        let owned = |store: &Self| -> Vec<u64> {
+            changed
+                .iter()
+                .flat_map(|of| match of {
+                    Ok(owner) => store.owners.get(owner).cloned().unwrap_or_default(),
+                    Err(id) => vec![*id],
+                })
+                .filter(|id| store.cache.contains_key(id))
+                .collect()
+        };
+        self.split_at_steps(keys, owned(self));
+        self.reorder.clear();
+        for group in self.order_of(keys, owned(self).into_iter()) {
+            let place = self.place_of(&group);
+            let at = groups.partition_point(|other| self.place_of(other) < place);
+            groups.insert(at, group);
+        }
+        groups
+    }
+
+    /// Where a group stands in the order: the lowest retention key first, the
+    /// least recently used, the oldest entry.
+    fn place_of(&self, (key, ids): &(i64, Vec<u64>)) -> (i64, Option<Instant>, Option<u64>) {
+        let used = ids.iter().filter_map(|id| Some(self.cache.get(id)?.last_use)).max();
+        (*key, used, ids.first().copied())
     }
 
     /// Of a kept order's group, what no live set reads, at rest on the
@@ -1334,7 +1374,6 @@ impl KvStore {
         };
         self.order = Some(KeptOrder {
             table: self.table.revision(),
-            entries: self.entries_rev,
             keys: revision,
             groups,
         });
@@ -1426,13 +1465,13 @@ impl KvStore {
 
     /// Keeps the head of each entry its owner's keys step down within, as an
     /// entry of its own, so the tail past it can go alone.
-    fn split_at_steps(&mut self, keys: &impl Keys) {
+    fn split_at_steps(&mut self, keys: &impl Keys, ids: Vec<u64>) {
         let page = u64::from(self.page_size.max(1));
         if !self.keeps {
             return;
         }
         let mut heads = Vec::new();
-        for (&id, entry) in &self.cache {
+        for (id, entry) in ids.into_iter().filter_map(|id| Some((id, self.cache.get(&id)?))) {
             let Some(owner) = entry.owner else {
                 continue;
             };
@@ -1479,12 +1518,13 @@ impl KvStore {
             self.splits.insert((id, pages));
             let path = self.table.keep_prefix_of(entry.path, pages);
             self.table.lease_cache_root(path.terminal);
-            if let Some(owner) = entry.owner {
-                *self.owners.entry(owner).or_insert(0) += 1;
-            }
             self.kept += 1;
+            if let Some(owner) = entry.owner {
+                self.owners.entry(owner).or_default().push(self.kept);
+            }
             self.list(self.kept, path.terminal);
             retention::idle_cache_appeared();
+            self.note_order(entry.owner.ok_or(self.kept));
             self.cache.insert(self.kept, KeptEntry { path, ..entry });
             self.note_change(path.terminal, true);
         }
@@ -1501,27 +1541,27 @@ impl KvStore {
         if unused.is_empty() {
             return Vec::new();
         }
-        self.order_of(keys, |root| {
+        let ids = self.cache.iter().filter(|(_, entry)| {
+            let root = entry.path.terminal;
             unused.contains(&root) && !self.table.in_move_at(root) && held(&self.table, root)
-        })
+        });
+        self.order_of(keys, ids.map(|(&id, _)| id))
     }
 
-    /// The entries whose terminal `of` takes, in groups: the lowest retention
+    /// The entries `ids` (each in the cache), in groups: the lowest retention
     /// key first, least recently used among equals.
     fn order_of(
         &self,
         keys: &impl Keys,
-        of: impl Fn(NodeId) -> bool,
+        ids: impl Iterator<Item = u64>,
     ) -> Vec<(i64, Vec<u64>)> {
         type Group = (Vec<u64>, Instant);
         // An owner's entries group by their row's key; an entry no process
         // owns (a sealed prefix an exited set left) is a group of its own,
         // never pooled with every other exited set's.
         let mut groups: HashMap<(Result<ProcessId, u64>, i64), Group> = HashMap::new();
-        for (&id, entry) in &self.cache {
-            if !of(entry.path.terminal) {
-                continue;
-            }
+        for id in ids {
+            let entry = &self.cache[&id];
             let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
             let group = groups
                 .entry((entry.owner.ok_or(id), key))
@@ -1590,7 +1630,7 @@ impl KvStore {
     /// the host, a row without the host; on disk, a row without the disk),
     /// dropped now. How many entries.
     pub fn drop_disallowed(&mut self, keys: impl Keys) -> usize {
-        self.split_at_steps(&keys);
+        self.split_at_steps(&keys, self.cache.keys().copied().collect());
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
         let gone: Vec<u64> = self
             .cache
@@ -1828,7 +1868,7 @@ impl KvStore {
     pub fn prepare_spill(&mut self, wanted: usize, keys: impl Keys) -> Option<KvSpillTxn> {
         let shape = self.shape?;
         let mut room = self.disk_pool.available();
-        self.split_at_steps(&keys);
+        self.split_at_steps(&keys, self.cache.keys().copied().collect());
         self.split_persisted();
         let mut pages: Vec<(TriePageLocation, HostKvSlotId)> = Vec::new();
         let mut taken: HashSet<TriePageLocation> = HashSet::new();
@@ -2613,6 +2653,7 @@ impl KvStore {
         self.list(self.kept, node);
         tracing::debug!(target: "pie::kv", pages, "imported");
         retention::idle_cache_appeared();
+        self.note_order(Err(self.kept));
         self.cache.insert(
             self.kept,
             KeptEntry {
@@ -2739,7 +2780,6 @@ impl KvStore {
     /// (before its pages are released): while a prompt waits, its path's
     /// page keys are kept for [`Self::take_changes`].
     fn note_change(&mut self, terminal: NodeId, joined: bool) {
-        self.entries_rev += 1;
         if crate::store::waiting::watched() {
             let keys = self
                 .table
@@ -2896,14 +2936,15 @@ impl KvStore {
             return;
         };
         self.table.lease_cache_root(path.terminal);
-        if let Some(owner) = owner {
-            *self.owners.entry(owner).or_insert(0) += 1;
-        }
         self.kept += 1;
+        if let Some(owner) = owner {
+            self.owners.entry(owner).or_default().push(self.kept);
+        }
         self.list(self.kept, path.terminal);
         tracing::debug!(target: "pie::kv", pages, "kept");
         retention::idle_cache_appeared();
         let terminal = path.terminal;
+        self.note_order(owner.ok_or(self.kept));
         self.cache.insert(
             self.kept,
             KeptEntry {
@@ -3155,6 +3196,7 @@ impl KvStore {
         // The cache's entries that were used whole go last; one that holds
         // more than was used ages by what it holds alone.
         let now = Instant::now();
+        let mut changed = Vec::new();
         for node in self.table.lineage(last.node) {
             for id in self.by_owner.get(&node).into_iter().flatten() {
                 if let Some(entry) = self.cache.get_mut(id)
@@ -3163,10 +3205,11 @@ impl KvStore {
                         .within(entry.path.terminal, last, run.len() as u64)
                 {
                     entry.last_use = now;
-                    self.entries_rev += 1;
+                    changed.push(entry.owner.ok_or(*id));
                 }
             }
         }
+        changed.into_iter().for_each(|of| self.note_order(of));
         Ok(pages)
     }
 

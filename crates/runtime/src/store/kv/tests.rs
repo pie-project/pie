@@ -2055,6 +2055,84 @@ fn idle_cache_read_under_a_fire_waits_for_it() {
     assert_eq!(table.release_cache_root(end).len(), 4, "all but page 0");
 }
 
+/// The reclaim order kept between reclaims, as entries join, are used and
+/// go, rows come, and a split at a row's step adds a head, is the one all
+/// the entries are read into: at random, on fixed seeds.
+#[test]
+fn the_kept_order_is_the_whole_orders() {
+    #[derive(Default)]
+    struct Rows {
+        keys: std::collections::HashMap<ProcessId, Vec<(Option<u64>, i64)>>,
+        changes: Vec<ProcessId>,
+    }
+    impl Keys for &Rows {
+        fn key_at(&self, owner: Option<ProcessId>, at: u64) -> i64 {
+            owner
+                .and_then(|owner| self.keys.get(&owner))
+                .and_then(|rows| {
+                    rows.iter()
+                        .filter(|(upto, _)| upto.is_none_or(|upto| at < upto))
+                        .map(|&(_, key)| key)
+                        .max()
+                })
+                .unwrap_or(0)
+        }
+        fn steps(&self, owner: ProcessId) -> Vec<u64> {
+            self.keys.get(&owner).into_iter().flatten().filter_map(|&(upto, _)| upto).collect()
+        }
+        fn revision(&self) -> Option<u64> {
+            Some(self.changes.len() as u64)
+        }
+        fn changed_since(&self, revision: u64) -> Option<Vec<ProcessId>> {
+            Some(self.changes[revision as usize..].to_vec())
+        }
+    }
+    for seed in 1..=8u64 {
+        let mut at = seed;
+        let mut below = move |n: usize| {
+            at = at.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (at >> 33) as usize % n
+        };
+        let mut store = KvStore::new(256, h(63));
+        store.set_keeps(true);
+        let mut rows = Rows::default();
+        let mut prompts: Vec<Vec<u32>> = Vec::new();
+        for op in 0..200u32 {
+            let owner = ProcessId::from_u128(1 + below(8) as u128);
+            match below(4) {
+                0 if store.available_pages() > 8 => {
+                    let pages = 2 + below(3) as u64;
+                    prompts.push(kept_and_gone(&mut store, 1000 + 8 * op, pages, owner));
+                }
+                1 if !prompts.is_empty() => {
+                    let tokens = prompts[below(prompts.len())].clone();
+                    let ws = store.create_shared_working_set();
+                    let keys = keys_ahead(&store, ws, 0, &tokens);
+                    let run = store.cached_run(&keys);
+                    if !run.is_empty() {
+                        store.attach_run(ws, &run, 1 + below(run.len()) as u64).unwrap();
+                    }
+                    store.release_working_set(ws, store.current_epoch());
+                }
+                2 => {
+                    let upto = (below(2) == 0).then(|| 1 + below(2) as u64);
+                    rows.keys.entry(owner).or_default().push((upto, below(5) as i64 - 2));
+                    rows.changes.push(owner);
+                }
+                _ => {
+                    store.reclaim_cache(1 + below(4), &rows);
+                }
+            }
+            let keys = &rows;
+            let kept = store.kept_order(&keys);
+            let whole = store.order_of(&keys, store.cache.keys().copied().collect::<Vec<_>>().into_iter());
+            assert_eq!(kept, whole, "seed {seed} op {op}");
+            store.keep_order(kept, &keys);
+        }
+        assert!(!store.cache.is_empty());
+    }
+}
+
 /// Sets fork, attach, grow, rewrite, are cut back and let go under fires in
 /// flight, cache is kept, pinned, imported and reclaimed, at random: no page
 /// is free while a fire that reads it is in flight (the model keeps each
@@ -2070,6 +2148,9 @@ fn no_page_is_free_while_a_fire_that_reads_it_is_in_flight() {
         // Keys that never change: the order is kept between reclaims.
         fn revision(&self) -> Option<u64> {
             Some(1)
+        }
+        fn changed_since(&self, _revision: u64) -> Option<Vec<ProcessId>> {
+            Some(Vec::new())
         }
     }
     struct Fire {

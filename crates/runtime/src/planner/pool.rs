@@ -693,6 +693,9 @@ pub trait PoolPort: Send + Sync + 'static {
     fn holds_idle(&self) -> bool {
         self.reclaimable_idle() > 0
     }
+    /// No demand waits for room any more: what waited behind every demand
+    /// (a rung raised for throughput) is looked at now.
+    fn demand_over(&self) {}
     /// Whether kv slots below the device are in use: cache may lie there.
     fn holds_below_device(&self) -> bool {
         true
@@ -2115,6 +2118,12 @@ impl PoolPort for RegistryPool {
         self.with_kv_tagged("planner-readers", |kv| kv.readers_hold())
     }
 
+    fn demand_over(&self) {
+        if let Some(shared) = &self.shared {
+            shared.wake();
+        }
+    }
+
     fn idle_out(&self) {
         if let Some(shared) = &self.shared {
             shared.wake();
@@ -2158,23 +2167,15 @@ impl PoolPort for RegistryPool {
         &self,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
-        let pages = self.with_kv_tagged("planner-reserve", |kv| {
+        self.with_kv_tagged("planner-reserve", |kv| {
             let pages = kv.reserve_device_pages(count as usize);
-            if self.shared.is_some() {
-                if pages.is_none() {
-                    kv.note_short(count);
-                } else {
-                    kv.clear_short();
-                }
+            // Short is marked once the asker is queued ([`Self::grow`]): the
+            // rung comes down for a mark no one is queued for.
+            if self.shared.is_some() && pages.is_some() {
+                kv.clear_short();
             }
             pages
-        });
-        if pages.is_none()
-            && let Some(shared) = &self.shared
-        {
-            shared.wake();
-        }
-        pages
+        })
     }
 
     fn freed(&self) {
