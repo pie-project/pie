@@ -1198,8 +1198,17 @@ mod tests {
         CACHED.lock().unwrap().retain(|(owner, _)| *owner != gone);
         port.apply(Event::CacheEmptied(gone, By::Host));
         let saw = seen(&mut port);
-        assert!(has(&saw, &format!("evicted {gone} by By::Host")), "{saw:?}");
+        let evicted = format!("evicted {gone} by By::Host");
+        assert_eq!(saw.iter().filter(|l| **l == evicted).count(), 1, "once: {saw:?}");
+        let listed = |id| saw.iter().any(|l| l.starts_with(&format!("working-set {id}")));
+        assert!(!listed(gone) && listed(live), "the live one's stands: {saw:?}");
+        // It ends with its owner, once.
+        port.apply(Event::Exited(live, Outcome::Completed));
+        let saw = seen(&mut port);
+        let evicted = saw.iter().filter(|l| l.starts_with("evicted ")).count();
+        assert_eq!(evicted, 1, "{saw:?}");
         assert!(!saw.iter().any(|l| l.starts_with("working-set ")), "{saw:?}");
+        assert!(!seen(&mut port).iter().any(|l| l.starts_with("evicted ")), "said once");
         CACHED.lock().unwrap().clear();
     }
 
