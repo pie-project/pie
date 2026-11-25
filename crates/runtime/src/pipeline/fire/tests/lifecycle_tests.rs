@@ -484,6 +484,73 @@ async fn a_retract_over_a_final_fire_is_refused_by_name() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Rows a recurrent state folded past the cut, or the run-ahead bound
+/// accepted, are not taken back: the pipeline fails by that name, and
+/// its set is refused where it is used next. A
+/// retract on an open pipeline, or past what it submitted, is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn what_cannot_be_taken_back_is_refused_by_name() -> anyhow::Result<()> {
+    let mut run = run_ahead(4, Some(20))?;
+    for completion in &run.completions {
+        resolve_test_completion(completion, false);
+    }
+    let pipeline = run.pipeline;
+    let past = pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 5).await?;
+    assert!(past.unwrap_err().contains("past the 4 it can take back"));
+    // No more than the run-ahead window is kept, however long the
+    // pipeline runs.
+    let window = crate::scheduler::run_ahead_window();
+    let long = run_ahead(u32::try_from(window).unwrap() + 3, None)?;
+    let borrowed: Resource<Pipeline> = Resource::new_borrow(long.pipeline);
+    assert_eq!(
+        long.context
+            .resources
+            .get(&borrowed)?
+            .written
+            .lock()
+            .unwrap()
+            .len(),
+        window
+    );
+    // A state folded past the cut is not taken back: the pipeline fails
+    // by that name, and its set is refused where it is used next.
+    let mut run = run_ahead(4, Some(23))?;
+    for completion in &run.completions {
+        resolve_test_completion(completion, false);
+    }
+    let pipeline = run.pipeline;
+    pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    let failure = run.failure().expect("the pipeline fails");
+    assert!(failure.contains("a fold is not taken back"), "{failure}");
+    assert_eq!(run.length().1, 24, "nothing taken back");
+    let next = crate::store::PipelineScope::failing_as(Default::default(), || true);
+    let refused = run.ws.claim_pipeline_scope(&next).unwrap_err().to_string();
+    assert!(refused.contains("could not be taken back"), "{refused}");
+    // Nor are rows the run-ahead bound accepted unread.
+    let mut run = run_ahead(4, Some(20))?;
+    run.cursor.lock().unwrap().bound_accepted = 23;
+    for completion in &run.completions {
+        resolve_test_completion(completion, false);
+    }
+    let pipeline = run.pipeline;
+    pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    let failure = run.failure().expect("the pipeline fails");
+    assert!(failure.contains("run-ahead bound"), "{failure}");
+
+    let mut context = TestContext {
+        id: uuid::Uuid::new_v4(),
+        resources: ResourceTable::new(),
+    };
+    let open = context.resources.push(Pipeline::new())?.rep();
+    let refused = pipeline_retract(&mut context, Resource::new_borrow(open), 1).await?;
+    assert!(refused.unwrap_err().contains("open pipeline"));
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<()> {
     let mut context = TestContext {

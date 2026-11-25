@@ -640,6 +640,51 @@ mod pricing_tests {
         assert_eq!(price(&TraceContainer::default()).unwrap().rows, 1);
     }
 
+    #[test]
+    fn a_channel_past_the_pricing_arithmetic_is_refused_by_name() {
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole};
+        let huge = Shape::new(&[u32::MAX, u32::MAX]).unwrap();
+        let container = TraceContainer {
+            channels: vec![ChannelDecl {
+                shape: huge,
+                dtype: ChanDType::Concrete(Dtype::F32),
+                capacity: u32::MAX,
+                host_role: HostRole::None,
+                seeded: false,
+            }],
+            ..TraceContainer::default()
+        };
+        let refused = price(&container).unwrap_err();
+        assert!(
+            matches!(refused, super::RegisterError::Overflow("a channel's bytes")),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_port_longer_than_a_u32_is_refused_by_name() {
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, PortSource};
+        use eta_ir::registry::Port;
+        let container = TraceContainer {
+            channels: vec![ChannelDecl {
+                shape: Shape::new(&[1 << 20, 1 << 20]).unwrap(),
+                dtype: ChanDType::Concrete(Dtype::Bool),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: false,
+            }],
+            ports: vec![PortBinding {
+                port: Port::Readout,
+                source: PortSource::Channel(0),
+            }],
+            ..TraceContainer::default()
+        };
+        let refused = price(&container).unwrap_err();
+        assert!(
+            matches!(refused, super::RegisterError::Overflow("a port's length")),
+            "{refused}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -846,11 +891,13 @@ mod register_tests {
 
 #[cfg(test)]
 mod row_extent_tests {
-    
-    
-    
-    
-    
+    use super::Registry;
+    use eta_ir::container::{
+        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
+    use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
+    use eta_ir::validate::Budget;
     
 
 }

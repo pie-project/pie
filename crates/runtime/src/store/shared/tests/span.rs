@@ -118,6 +118,57 @@ fn a_refused_commit_span_lends_nothing() {
     assert_eq!(pool.pool().span_committed(), 1);
 }
 
+/// A raise whose copy the engine refuses is taken back: the state where it
+/// lay (the engine's table unchanged), the activation the rung in hand's,
+/// no fence left, and a later raise succeeds.
+#[test]
+fn a_refused_raise_is_taken_back() {
+    let (mut pool, mut engine) = on_demand_pool();
+    assert_eq!(
+        walk_segments(&mut pool, 6, 0, &mut engine),
+        Retarget::Reached
+    );
+    pool.lower_rung(256).unwrap();
+    assert_eq!(
+        walk_segments(&mut pool, 7, 0, &mut engine),
+        Retarget::Reached
+    );
+    let all = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
+    pool.give_records(&all[..all.len() / 2]);
+    pool.pool_mut().retire_through(u64::MAX);
+    let kept = &all[all.len() / 2..];
+    let before = state_chunks(&pool, kept);
+    let evacuation = pool.plan_raise(2048).unwrap();
+    assert!(!evacuation.moves.is_empty());
+    pool.raise_applied(&evacuation).unwrap();
+    assert_eq!(pool.copying(), Some(256));
+    engine.refuse = true;
+    assert!(
+        engine
+            .evacuate(&SharedPool::rung_moves(&evacuation))
+            .is_err()
+    );
+    pool.raise_refused(&evacuation);
+    assert_eq!(pool.rung(), 256, "the rung in hand");
+    assert_eq!(pool.pool().act_reserved(), 4);
+    assert!(pool.copying().is_none());
+    assert_eq!(state_chunks(&pool, kept), before, "the state where it lay");
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+    pool.pool().check();
+    // Tried again with the engine willing: it lands.
+    engine.refuse = false;
+    let evacuation = pool.plan_raise(2048).unwrap();
+    pool.raise_applied(&evacuation).unwrap();
+    engine
+        .evacuate(&SharedPool::rung_moves(&evacuation))
+        .unwrap();
+    pool.raise_copied(1);
+    assert_eq!(pool.rung(), 2048);
+    assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+}
+
 /// Fires cut under a wide rung are still queued when the walk lowers the
 /// rung and its notice lands; a pass then asks a width of a rung that
 /// shares the lowered rung's chunk class. No queued fire reaches the

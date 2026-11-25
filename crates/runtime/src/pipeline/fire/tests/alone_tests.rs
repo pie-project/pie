@@ -94,3 +94,25 @@ async fn a_lane_past_the_device_alone_is_refused_at_submit() {
     let planner = crate::planner::planner_of(ctx.id).unwrap();
     assert!(!planner.demand_waits(), "nothing parked");
 }
+
+/// A lane is all it reads beside what it writes: one holding six pages
+/// that asks three more of an eight-page device could never fire
+/// alone, though its new rows fit what is free. It is refused at once
+/// by name, where it parked until the planner failed its process as a
+/// hog.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lane_whose_prefix_and_rows_pass_the_device_is_refused_at_once() {
+    let (model, stores, mut ctx) = device(93, 8);
+    let lane = set(model, &stores, 9, 6);
+    let refused = fire(&mut ctx, model, &stores, &[(&lane, 6..9)])
+        .await
+        .err()
+        .expect("six held and three asked of eight");
+    assert!(
+        refused.contains("device memory can never hold this need: 9 pages"),
+        "{refused}"
+    );
+    // Asked alone, two of its pages fit beside what it holds.
+    let fits = fire(&mut ctx, model, &stores, &[(&lane, 6..8)]).await;
+    drop(fits.expect("eight of eight").unfired.submitted());
+}

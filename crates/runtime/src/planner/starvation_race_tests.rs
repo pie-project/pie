@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::proc::{Proc, Residency};
+use super::proc::{PendingBind, Proc, Residency};
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind};
 
@@ -2152,6 +2152,88 @@ async fn requests_past_the_pool_together_are_all_served_none_refused() {
     assert_eq!(pool.free.lock().len(), 16, "every page back");
 }
 
+/// Only a need that could never fit alone is refused, by name and at once:
+/// a first frame past the whole pool, a bind whose runs are past it, and a
+/// restore whose kv and runs together are past it. A need of the whole
+/// pool is no refusal.
+#[tokio::test(flavor = "current_thread")]
+async fn a_need_past_the_whole_pool_is_refused_by_name_at_once() {
+    use futures::FutureExt;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let pool = Arc::new(RacePool::new(16));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let demand = |kv_pages| Demand {
+        kv_pages,
+        rs: RsUnits::default(),
+    };
+    let refused = planner
+        .acquire(pid, pid, demand(17))
+        .now_or_never()
+        .expect("refused at once, no wait");
+    assert!(
+        matches!(refused, Err(PlannerError::Impossible { need: 17, total: 16 })),
+        "{:?}",
+        refused.err()
+    );
+    pool.free.lock().extend((0..16).map(PhysicalKvPageId));
+    assert!(
+        matches!(
+            planner.acquire(pid, pid, demand(16)).now_or_never(),
+            Some(Ok(Acquired::Granted(_)))
+        ),
+        "the whole pool fits alone: it is served"
+    );
+
+    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let refused = planner
+        .wait_bind_room(pid, 3, 3, 0)
+        .now_or_never()
+        .expect("refused at once, no wait");
+    match refused {
+        Err(error @ PlannerError::PastDevice { need: 9, total: 8, runs: Some((3, 3)) }) => {
+            assert!(error.to_string().contains("3 runs of 3 adjacent chunks"), "{error}");
+        }
+        other => panic!("refused by name: {other:?}"),
+    }
+    assert!(
+        planner.wait_bind_room(pid, 4, 2, 0).now_or_never().is_none(),
+        "two runs of four fit eight chunks: it waits"
+    );
+    let other = ProcessId::new_v4();
+    planner.register(other);
+    planner.note_admitted(other);
+    planner.with_inner(|inner| {
+        let proc = inner.procs.get_mut(&other).unwrap();
+        proc.state = Residency::Evicted;
+        proc.roles_short = Some(super::proc::PendingBind {
+            singles: 0,
+            run: 3,
+            pieces: 2,
+            pages: 6,
+        });
+        inner.enqueue(
+            other,
+            WaitKind::Restore {
+                demand: demand(3),
+            },
+        );
+    });
+    let refused = planner
+        .wait_resident(other)
+        .now_or_never()
+        .expect("refused at once, no wait");
+    assert!(
+        matches!(refused, Err(PlannerError::PastDevice { need: 9, total: 8, .. })),
+        "its kv beside its runs is past the pool: {refused:?}"
+    );
+}
+
 
 
 /// `pid`, a newcomer, asks `pages` with no room for them now (not on the
@@ -2298,6 +2380,7 @@ async fn a_grant_dropped_under_the_planner_lock_does_not_deadlock() {
         served_at_once(head_task, std::time::Instant::now()).await;
     }
 }
+
 
 /// A restore whose guest state and runs pass what the state limit leaves,
 /// waiting with nothing evictable: a head whose whole step takes more chunks than state
@@ -2513,6 +2596,28 @@ async fn the_test_pause_policy_parks_a_set_in_its_window_and_resumes_it_after() 
     );
     assert_eq!(host.stats().traps, 0, "no call traps");
     crate::policy::schedule::install(None);
+}
+
+/// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy refused untouched by
+/// the engine (state the runtime placed inside its carve) failed the
+/// process: a beam lost. A copy refused untouched takes the eviction back
+/// and keeps the process, no victim again until the pool moves.
+#[test]
+fn an_eviction_copy_refused_untouched_keeps_its_process() {
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
+    let pid = ProcessId::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    planner.with_inner(|inner| {
+        let _ = inner.begin_eviction(pid, Reclaim::default());
+    });
+    planner.eviction_copy_refused(pid, "kv to LocalDisk copy: impossible submission: ...");
+    planner.with_inner(|inner| {
+        assert_eq!(inner.procs[&pid].state, Residency::Resident, "kept, resident");
+        assert!(!inner.killing.contains(&pid), "not failed");
+        assert!(inner.prepare_blocked.contains(&pid), "no victim until the pool moves");
+        assert!(inner.evicting.is_empty(), "its eviction is settled");
+    });
 }
 
 /// ENOSPC on an eviction's write (the disk tier's slot file full): nothing

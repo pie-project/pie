@@ -21,6 +21,83 @@ const DEVICE: MemoryDomain = MemoryDomain::Device {
 };
 const HOST_CHUNKS: u32 = 8;
 
+/// A host or disk tier with more slots than a `u32` slot ref names is
+/// refused by name at load, as the device pool is: its refs are never
+/// clamped or saturated onto another slot's.
+#[test]
+fn a_tier_past_a_u32_of_slot_refs_is_refused_by_name() {
+    let facts = fixed_facts();
+    let list = facts
+        .shapes
+        .iter()
+        .find(|shape| {
+            shape.role == SlotRole::State
+                && matches!(shape.kind, SlotKind::List { window: None, .. })
+        })
+        .unwrap();
+    assert!(list.slots_per_chunk >= 2, "the kv list packs a chunk");
+    // The widest count the device pool itself would pass is not the
+    // tier's: the tier's own chunks are checked.
+    let chunks = u32::MAX;
+    let wide = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.slots_per_chunk >= 2)
+        .unwrap();
+    assert_eq!(
+        SharedPool::tier(&facts, chunks).unwrap_err(),
+        SharedError::Tier {
+            tier: "host",
+            shape: wide.id.0,
+            chunks,
+            slots_per_chunk: wide.slots_per_chunk,
+        }
+    );
+    let mut host = facts.clone();
+    host.host_chunks = chunks;
+    assert!(matches!(
+        Tiers::of(&host),
+        Err(SharedError::Tier { tier: "host", .. })
+    ));
+    let mut disk = facts.clone();
+    disk.disk_chunks = chunks;
+    let refused = Tiers::of(&disk).unwrap_err();
+    assert_eq!(
+        refused,
+        SharedError::Tier {
+            tier: "disk",
+            shape: list.id.0,
+            chunks,
+            slots_per_chunk: list.slots_per_chunk,
+        }
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("more slots than a u32 slot ref names"),
+        "{refused}"
+    );
+    // The most a `u32` names is taken whole on disk.
+    let mut most = facts.clone();
+    most.disk_chunks = u32::MAX / list.slots_per_chunk;
+    assert_eq!(
+        Tiers::of(&most).unwrap().disk_slots,
+        most.disk_chunks * list.slots_per_chunk
+    );
+}
+
+/// A tier of facts that do not hang together is refused as the device pool
+/// of them is.
+#[test]
+fn a_tier_of_invalid_facts_is_refused() {
+    let mut facts = fixed_facts();
+    facts.shapes[0].slots_per_chunk = 0;
+    assert!(matches!(
+        SharedPool::tier(&facts, HOST_CHUNKS),
+        Err(SharedError::Facts(_))
+    ));
+}
+
 /// Each tier's slots and the value each holds: what an engine's copies move.
 #[derive(Default)]
 struct Bytes(HashMap<(MemoryDomain, EngineShape, u32), u64>);
@@ -299,6 +376,81 @@ fn with_no_host_tier_an_evicted_set_s_state_parks_on_disk_and_frees_the_device()
     assert_eq!(s.disk_rows(), 0, "no disk row held");
     assert_eq!(crate::store::roles::DiskSlots::free_chunks(&*file), 8, "its disk chunks given back");
     assert_eq!(s.suspendable(&sets), held, "on the device again");
+}
+
+/// Lock order for the disk tier's slot file (the kv store's disk chunks):
+/// the rs store and the roles take chunks under their own lock (rs or
+/// roles, then kv); nothing takes the rs store's or the roles' lock under
+/// the kv store's. An rs suspend and restore through the file, a holder of
+/// another lock (as the roles park) taking and giving chunks, and the kv
+/// store's own disk takes run together, round after round, and end.
+#[test]
+fn rs_and_role_disk_takes_and_kv_run_together_without_deadlock() {
+    use crate::store::rs::RsGeometry;
+    let mut facts = fixed_facts();
+    facts.disk_chunks = 64;
+    let tiers = Tiers::of(&facts).unwrap();
+    assert!(tiers.host.is_none() && tiers.disk_slots > 0);
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let stores = crate::store::registry::shared_stores(&shared, &tiers, 16, 4096);
+    let disk = stores.rs.lock().unwrap().disk_slots().expect("the rs store parks on disk");
+    let ws = {
+        let mut s = stores.rs.lock().unwrap();
+        let ws = s.create_working_set(RsGeometry {
+            state_size: 4096,
+            buffer_page_tokens: RS_TOKENS,
+        });
+        let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
+        let published = s.publish_prepared(prepared).unwrap();
+        s.settle(published);
+        s.fold(ws, 4);
+        ws
+    };
+    let sets = HashSet::from([ws]);
+    let roles_lock = Mutex::new(());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let (rs, kv, sets, disk, roles_lock) = (&stores.rs, &stores.kv, &sets, &disk, &roles_lock);
+        let d = done.clone();
+        scope.spawn(move || {
+            for _ in 0..200 {
+                let mut s = rs.lock().unwrap();
+                let txn = s.prepare_suspend(sets).expect("it parks on disk");
+                s.commit_suspend(txn);
+                let swapped = s.swapped_units(sets);
+                let mut grant = s.reserve(swapped).expect("room to come back");
+                let txn = s.prepare_restore(sets, &mut grant).expect("it comes back");
+                s.commit_restore(txn);
+            }
+            d.send(()).unwrap();
+        });
+        let d = done.clone();
+        scope.spawn(move || {
+            for _ in 0..200 {
+                let _roles = roles_lock.lock().unwrap();
+                if let Some(chunks) = disk.take_chunks(2) {
+                    disk.give_chunks(&chunks);
+                }
+            }
+            d.send(()).unwrap();
+        });
+        let d = done.clone();
+        scope.spawn(move || {
+            for _ in 0..200 {
+                crate::store::registry::with_kv_lock(kv, "test", |kv| {
+                    if let Some(chunks) = kv.take_disk_chunks(1, tiers.disk_chunk_slots) {
+                        kv.give_disk_chunks(&chunks, tiers.disk_chunk_slots);
+                    }
+                });
+            }
+            d.send(()).unwrap();
+        });
+        for _ in 0..3 {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("every thread ends: no lock taken in opposite orders");
+        }
+    });
 }
 
 /// A list compaction: kv pages scattered across partly used list chunks

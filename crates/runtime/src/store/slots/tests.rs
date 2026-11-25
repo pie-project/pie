@@ -267,6 +267,72 @@ fn random_runs_keep_every_invariant() {
     }
 }
 
+/// Whoever plans them, moves that would split a run are refused by
+/// name: one of its chunks without the rest, or the rest not following
+/// its first. A run moved whole is applied.
+#[test]
+fn moves_that_split_a_run_are_refused_whoever_planned_them() {
+    let fixed = [(ShapeKind::Fixed, 4)];
+    let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+    let holder = Holder::WorkingSet(1);
+    let filler = pool.acquire_chunk_runs(holder, 0, 1, 4).unwrap();
+    let run = pool.acquire_chunk_runs(holder, 0, 2, 1).unwrap();
+    let at = |pool: &SlotPool, chunk: u32| pool.chunk_table()[chunk as usize];
+    let low = filler
+        .iter()
+        .map(|slot| at(&pool, slot.chunk))
+        .min()
+        .unwrap();
+    pool.release(holder, &filler, 0);
+    pool.retire_through(u64::MAX);
+    let mut chunks: Vec<u32> = run.iter().map(|slot| slot.chunk).collect();
+    chunks.dedup();
+    chunks.sort_by_key(|&chunk| at(&pool, chunk));
+    let (head, second) = (chunks[0], chunks[1]);
+    let (from, next) = (at(&pool, head), at(&pool, second));
+    assert_eq!(next, from + 1);
+    let alone = [ChunkMove {
+        logical: second,
+        from: next,
+        to: low,
+    }];
+    assert!(matches!(
+        pool.apply_compaction(&alone, 3),
+        Err(SlotError::SplitsRun { .. })
+    ));
+    let apart = [
+        ChunkMove {
+            logical: head,
+            from,
+            to: low,
+        },
+        ChunkMove {
+            logical: second,
+            from: next,
+            to: low + 2,
+        },
+    ];
+    assert!(matches!(
+        pool.apply_compaction(&apart, 3),
+        Err(SlotError::SplitsRun { .. })
+    ));
+    let whole = [
+        ChunkMove {
+            logical: head,
+            from,
+            to: low,
+        },
+        ChunkMove {
+            logical: second,
+            from: next,
+            to: low + 1,
+        },
+    ];
+    pool.apply_compaction(&whole, 3).unwrap();
+    pool.retire_through(u64::MAX);
+    pool.check();
+}
+
 /// Under park and restore churn, guest epilogues must not find "no
 /// status at all" or rows read apart. A move's
 /// destination is fenced with its source until the copy lands: a chunk

@@ -9,11 +9,11 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ::engine::{FireFacts, ProgramId};
+use ::engine::{FireFacts, InstanceId, ProgramId};
 use tokio::sync::Notify;
 
 use super::*;
-use crate::store::shared::programs::{FireKey, Funder, Mover, ProgramOpen, fund_span};
+use crate::store::shared::programs::{FireKey, Funder, Mover, ProgramOpen, fit_fire, fund_span};
 
 const PROGRAM: ProgramId = ProgramId(7);
 const LANES: u32 = 64;
@@ -301,7 +301,75 @@ async fn a_bind_whose_room_is_refused_fails_its_wait() {
     pool.pool().check();
 }
 
+/// One program at two extents is two pairs, and a fire that carries both
+/// pays both `fixed`: 256 rows take 8 MiB fixed, 4096 rows 16x that.
+fn rows_facts(rows: u32) -> FireFacts {
+    FireFacts {
+        fixed: u64::from(rows) * (32 << 10),
+        ..FireFacts::default()
+    }
+}
+
+/// A bind the engine refuses (`Error::Exhausted`: on an on-demand pool it
+/// backs the newly opened pair's region at that bind, and the OS may refuse
+/// it) is a refused bind. The binder's guard is all that counted the pair
+/// (`SchedulerHandle::register_channels_bind` holds it across the bind and
+/// returns the lane's error, dropping it; the lane counts an instance only
+/// on a bind that succeeded): the term closes as if the bind never
+/// happened, nothing is left counted, and a later bind of the same extents
+/// opens it anew. That the widened chunks are free of state when the bind
+/// reaches the engine is `a_larger_extent_bind_widens_the_span_before_it_is_sent`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
+    struct Granting;
+    impl Funder for Granting {
+        async fn fund(&self, _pages: u32) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+    let (mut pool, engine) = pool_at_256();
+    pool.fire_facts_learned(at(PROGRAM, 4096), &rows_facts(4096));
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let engine = Arc::new(Mutex::new(engine));
+
+    // The bind: its pair opened and funded, then the engine refuses it.
+    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096), 0).unwrap();
+    fund_span(&shared, || 256, &Granting, &Lane(engine.clone()))
+        .await
+        .unwrap();
+    assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 4 + 8);
+    let refused: Result<(), ::engine::Error> = Err(::engine::Error::Exhausted {
+        resource: "placement heap",
+        wanted: 128 << 20,
+        available: 0,
+    });
+    // No instance is bound; the binder's error drops its guard.
+    let error = refused.expect_err("the engine refused the bind");
+    assert!(error.is_retryable());
+    drop(open);
+    {
+        let pool = shared.lock().unwrap();
+        assert_eq!(pool.pool().act_chunks(256), 4, "the term closed");
+        assert!(pool.pool().fire().is_zero(), "no term left counted");
+        assert!(pool.knows_fire(&at(PROGRAM, 4096)), "its facts are kept");
+        pool.pool().check();
+    }
+    // A later bind of the same extents opens the pair anew, and its close
+    // leaves nothing behind either.
+    let open = ProgramOpen::new(&shared, at(PROGRAM, 4096), 0).unwrap();
+    shared
+        .lock()
+        .unwrap()
+        .instance_bound(InstanceId(7), at(PROGRAM, 4096));
+    drop(open);
+    assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 4 + 8);
+    shared.lock().unwrap().instance_closed(InstanceId(7));
+    fit_fire(&shared);
+    assert!(shared.lock().unwrap().pool().fire().is_zero());
+}
+
 // ---- ruling 2: the rung the engine holds, and the span it states ----
+
 
 /// `program` bound with lanes that read out `rows` rows each.
 fn reading(program: ProgramId, rows: u32) -> FireKey {

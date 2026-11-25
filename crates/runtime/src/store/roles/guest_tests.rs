@@ -847,6 +847,45 @@ async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() 
     assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
 }
 
+/// A failed process's teardown (else pairs of dead processes are left on
+/// the device and the host): the engine refuses its instances' closes
+/// (a failed fire left them unusable), and the lane closes their books all
+/// the same. Its slots go back once no step on its way names them (a step
+/// still reads one when the close comes, and lands after), and the pair
+/// whose last holders they were is freed: the pool holds exactly what it
+/// held before the process bound.
+#[test]
+fn a_close_the_engine_refuses_still_frees_the_instance_and_its_pair() {
+    let Pools { device, roles } = pools(64);
+    let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
+    let before = held(&device);
+    let first = bind(&roles, &mut engine, 1).unwrap();
+    let second = bind(&roles, &mut engine, 1).unwrap();
+    // A step naming the first is still on its way when the closes come.
+    let reads = roles.lock().unwrap().reading([first]);
+    let mut channels = crate::engine::channel::ChannelJoin::new();
+    for id in [first, second] {
+        crate::scheduler::lane::close_books(
+            id,
+            Err(anyhow::anyhow!("the backend refused a dispatch")),
+            &mut channels,
+            Some(&roles),
+            None,
+        );
+    }
+    assert!(
+        held(&device) - before >= 2 * CHUNK + slots(PAIR) * SLOT,
+        "the first's scratch and the pair wait for the step that names them"
+    );
+    roles.lock().unwrap().landed(&reads);
+    assert_eq!(
+        held(&device),
+        before,
+        "every slot back, the pair freed with its last holder"
+    );
+    assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
+}
+
 /// A guest bind's run at the pool's limit (every segment committed, nothing left
 /// to evict for it): free chunks scattered by the binds before it, enough
 /// for its run of 4 but none adjacent. It is short (`BindShort`, to the
