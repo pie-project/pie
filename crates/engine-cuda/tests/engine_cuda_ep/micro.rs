@@ -241,6 +241,9 @@ pub fn boot(ordinal: i32) -> engine_cuda::DeviceBoot {
     };
     boot.knobs.diagnostics = diagnostics();
     boot.knobs.work_queues = Some(work_queues());
+    // No rates timed: the answers are checked, not the speed, and a card
+    // without a profile would need room to time them past these budgets.
+    boot.knobs.measuring = engine::rates::Measuring::Skip;
     boot
 }
 
