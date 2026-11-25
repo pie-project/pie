@@ -3958,7 +3958,13 @@ impl KvStore {
         if free < wanted {
             self.yield_disk(wanted - free, keys);
         }
-        self.host_pool.available() + self.disk_pool.available()
+        let free = self.host_pool.available() + self.disk_pool.available();
+        if free < wanted {
+            // What idle cache below the device was counted to give is gone.
+            self.below_cached.set(None);
+            self.droppable_below.set(None);
+        }
+        free
     }
 
     /// Copies whose pages are held on the device or the host, lowest
@@ -3969,7 +3975,7 @@ impl KvStore {
     /// tier), and dropping an entry gives up all its copies.
     fn disk_yield_plan(&self, keys: &impl Keys) -> (Vec<DiskKvSlotId>, Vec<(Instant, u64)>) {
         let Some(persisted) = &self.persisted else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), self.unkept_on_disk(keys));
         };
         let key = |slot: &DiskKvSlotId| persisted.retention.get(slot).copied().unwrap_or(0);
         let mut spare: Vec<DiskKvSlotId> = persisted
@@ -4019,6 +4025,34 @@ impl KvStore {
             spare,
             whole.into_iter().map(|(_, _, at, id)| (at, id)).collect(),
         )
+    }
+
+    /// The unused entries holding pages on a disk tier that keeps no copies,
+    /// as [`Self::disk_yield_plan`] orders entries; one with pages on the
+    /// device too goes after those with none.
+    fn unkept_on_disk(&self, keys: &impl Keys) -> Vec<(Instant, u64)> {
+        if self.disk_pool.capacity() == 0 || self.cache.is_empty() {
+            return Vec::new();
+        }
+        let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
+        let mut entries: Vec<(bool, bool, i64, Instant, u64)> = self
+            .cache
+            .iter()
+            .filter(|(_, entry)| {
+                let root = entry.path.terminal;
+                unused.contains(&root)
+                    && !self.table.in_move_at(root)
+                    && self.table.holds_on_disk(root)
+            })
+            .map(|(&id, entry)| {
+                let resident = self.table.holds_resident(entry.path.terminal);
+                let kept = self.tiers_of(id, keys) & retention::DISK != 0;
+                let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
+                (resident, kept, key, entry.last_use, id)
+            })
+            .collect();
+        entries.sort_unstable();
+        entries.into_iter().map(|(.., at, id)| (at, id)).collect()
     }
 
     /// Gives up the disk tier's copies until `wanted` slots are free:
@@ -4394,6 +4428,14 @@ impl KvStore {
 
     fn disk_swap_free(&self, keys: &impl Keys) -> usize {
         let (spare, whole) = self.disk_yield_plan(keys);
+        if self.persisted.is_none() {
+            let roots: Vec<NodeId> = whole
+                .iter()
+                .filter_map(|(_, id)| Some(self.cache.get(id)?.path.terminal))
+                .collect();
+            let idle = self.table.cache_only_below_device(&roots, &[]).1;
+            return self.disk_pool.available() + idle as usize;
+        }
         let mut backing: HashSet<DiskKvSlotId> = HashSet::new();
         if let Some(persisted) = &self.persisted {
             for (_, id) in &whole {

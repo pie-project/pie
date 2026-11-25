@@ -1235,6 +1235,15 @@ struct Script {
     /// of program `.0` bound beside the beam group's (its pair shared),
     /// fired once and closed, as a beam's verify groups are.
     verify: Option<(u32, u32)>,
+    /// Its sets share: what they sealed stays as idle cache at its end.
+    shares: bool,
+    /// Before decode fire `.0` (past its prompt, where it decodes none),
+    /// `.1` pages read from a peer: the planner's grant, filed as idle cache
+    /// in one entry, no fire of its own reading them.
+    import: Option<(u32, u32)>,
+    /// Then (as `import`) a reader pins one cached run (the longest, where
+    /// it decodes none), for `.1` steps (its own end does not end it).
+    pin: Option<(u32, u32)>,
 }
 
 impl Script {
@@ -1279,9 +1288,78 @@ struct Workload {
     /// time in four, and puts its table back: the runtime takes the move
     /// back too.
     late_refuse: bool,
+    /// Sets keep what they sealed as idle cache ([`Workload::with_idle_cache`]).
+    idle_cache: bool,
 }
 
 impl Workload {
+    /// The seed's fleet with idle cache beside it: sets that share, pages
+    /// filed from a peer, readers that pin cached runs, pressure that moves
+    /// cache below the device, and, on a pool of segments, the walk's
+    /// rungs, so a waiter's room is idle cache's or the rung's.
+    fn with_idle_cache(seed: u64) -> Self {
+        let mut workload = Self::of(seed);
+        workload.idle_cache = true;
+        let mut rng = Rng(seed ^ 0x1d1e_cac4);
+        if workload.pool.segments() >= 3 {
+            workload.pool.governed = true;
+            workload.pool.act = vec![(16, 1), (256, 8)];
+        }
+        let most = workload.pool.most_pages();
+        for script in &mut workload.scripts {
+            script.shares = rng.chance(2, 3);
+            let at = |rng: &mut Rng| rng.below(u64::from(script.decode.max(1))) as u32;
+            if rng.chance(1, 3) {
+                script.import = Some((at(&mut rng), rng.range(1, 2 * PAGES_PER_CHUNK)));
+            }
+            if rng.chance(1, 3) {
+                script.pin = Some((at(&mut rng), rng.range(1, 40)));
+            }
+            while script.pages() > most && script.decode > 0 {
+                script.decode -= 1;
+            }
+            while script.pages() > most && script.prompt > 1 {
+                script.prompt -= 1;
+            }
+            while script.pages() > most && script.beams > 1 {
+                script.beams -= 1;
+            }
+        }
+        let state = workload.pool.state_chunks() * PAGES_PER_CHUNK;
+        let mut script = workload.scripts[0].clone();
+        script.prompt = 1;
+        script.decode = 0;
+        script.grow_every = 1;
+        script.beams = 1;
+        script.bind.clear();
+        (script.idle, script.rescore, script.raise, script.pin) = (None, None, None, None);
+        // More than leaves the fleet's largest process its room.
+        let crowds = (state - most + 2 * PAGES_PER_CHUNK).min(state - 2 * PAGES_PER_CHUNK);
+        script.import = Some((0, crowds));
+        // A reader holds that for as long as it reads: the largest process
+        // is served at a lower rung meanwhile.
+        if workload.pool.governed {
+            workload.target.clear();
+            let mut reader = script.clone();
+            reader.at = 0;
+            reader.pin = Some((0, rng.range(60, 120)));
+            workload.scripts.push(reader);
+        }
+        // Filed with no fire to come after it, then asked for: again and
+        // again, until the tiers below hold as much cache as they take.
+        let cached = script.clone();
+        let mut after = workload.scripts.iter().map(|script| script.at).max().unwrap_or(0) + 300;
+        let below = workload.pool.host_chunks + workload.pool.disk_chunks;
+        for _ in 0..below.div_ceil(2).min(24) {
+            let mut asker = cached.clone();
+            (script.at, asker.at) = (after, after + 10);
+            (asker.prompt, asker.import) = (most, None);
+            workload.scripts.extend([script.clone(), asker]);
+            after += 20;
+        }
+        workload
+    }
+
     fn of(seed: u64) -> Self {
         let mut rng = Rng(seed);
         let pool = PoolShape::of(&mut rng);
@@ -1308,6 +1386,9 @@ impl Workload {
                 rescore: None,
                 raise: None,
                 verify: None,
+                shares: false,
+                import: None,
+                pin: None,
             };
             match kind {
                 // A plain decode: a short prompt, long growth.
@@ -1383,6 +1464,9 @@ impl Workload {
                     rescore: None,
                     raise: None,
                     verify: None,
+                    shares: false,
+                    import: None,
+                    pin: None,
                 };
                 while script.pages() > most && script.decode > 0 {
                     script.decode -= 1;
@@ -1435,6 +1519,7 @@ impl Workload {
             landing_fails,
             default_policy: false,
             late_refuse: false,
+            idle_cache: false,
         }
     }
 
@@ -1493,6 +1578,9 @@ struct Coverage {
     idles: u64,
     rescores: u64,
     cache_left: u64,
+    /// Pages filed from a peer, and cached runs a reader pinned.
+    imports: u64,
+    pins: u64,
     integrity_checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
@@ -1542,6 +1630,8 @@ impl Coverage {
         self.idles += other.idles;
         self.rescores += other.rescores;
         self.cache_left += other.cache_left;
+        self.imports += other.imports;
+        self.pins += other.pins;
         self.integrity_checks += other.integrity_checks;
         self.pages_checked += other.pages_checked;
         self.guest_slots_checked += other.guest_slots_checked;
@@ -1718,6 +1808,20 @@ struct Ctx {
     engine_view: Option<Arc<Mutex<EngineView>>>,
     /// `default`'s seat-to-end holds, where the workload runs it.
     seats: Option<Mutex<SeatHolds>>,
+    /// The sets keep what they sealed ([`Workload::idle_cache`]).
+    idle_cache: bool,
+    /// Each sealed page's pattern by its key.
+    sealed: Mutex<BTreeMap<crate::store::kv::hash::Hash256, u64>>,
+    /// The cached runs pinned, each until its step.
+    pinned: Mutex<Vec<Pinned>>,
+}
+
+/// A reader of a cached run.
+struct Pinned {
+    until: u64,
+    pin: crate::store::kv::ReaderPin,
+    /// Its device pages, and the pattern each holds until it ends.
+    pages: Vec<(u32, u64)>,
 }
 
 /// The `schedule/hold` rows the built-in `default` policy writes for
@@ -1759,6 +1863,8 @@ struct Log {
     checks: u64,
     pages_checked: u64,
     guest_slots_checked: u64,
+    imports: u64,
+    pins: u64,
     /// Processes that ended their work.
     finished: u64,
     /// Processes back from their client with a new request, in order.
@@ -2103,11 +2209,14 @@ async fn fire(
                 let prepared = kv.prepare_write_reserved(set.handle.id, at, grant.lend_kv())?;
                 let commits: Vec<_> = at
                     .iter()
-                    .map(|_| {
+                    .map(|&index| {
                         let mut hash = [0u8; 32];
                         let mut rng = ctx.rng.lock().unwrap();
                         for chunk in hash.chunks_mut(8) {
                             chunk.copy_from_slice(&rng.next().to_le_bytes());
+                        }
+                        if ctx.idle_cache {
+                            ctx.sealed.lock().unwrap().insert(hash, pattern(5, set.tag, index));
                         }
                         crate::store::kv::write::PageCommit {
                             token_hashes: Vec::new(),
@@ -2346,10 +2455,12 @@ fn new_set(
     pid: ProcessId,
     residency: &Mutex<ProcessResidency>,
     from: Option<&Set>,
+    shares: bool,
 ) -> Result<Set, String> {
     let (id, written) = with_kv_lock(&ctx.stores.kv, "sim-set", |kv| {
         let (id, written) = match from {
             Some(parent) => (kv.fork(parent.handle.id)?, parent.written),
+            None if shares => (kv.create_shared_working_set(), 0),
             None => (kv.create_working_set(), 0),
         };
         kv.reserve(id, MOST_PAGES)?;
@@ -2379,6 +2490,119 @@ fn new_set(
         patterns,
         tag,
     })
+}
+
+/// Pages read from a peer filed as idle cache, as the runtime files them
+/// (`crate::offload::prefill`): the planner's grant, the bytes written,
+/// then one entry.
+async fn import(ctx: &Ctx, pid: ProcessId, pages: u32) -> Result<(), String> {
+    use crate::store::kv::hash::{Hash256, chain_slots, page_hash};
+    use crate::store::kv::page_table::KvPageBacking;
+    ctx.at(pid, "import");
+    let demand = Demand {
+        kv_pages: pages,
+        rs: crate::store::rs::RsUnits::default(),
+    };
+    let mut grant = loop {
+        match ctx.planner.acquire(pid, pid, demand).await {
+            Ok(Acquired::Granted(grant)) => break grant,
+            Ok(Acquired::Yield) => wait_resident(ctx, pid).await?,
+            Ok(Acquired::Requote) => {}
+            Err(PlannerError::Cancelled) if ctx.planner.registered(pid) => {}
+            Err(error) => return Err(format!("import {pages} pages: {error}")),
+        }
+    };
+    let local: Vec<_> = grant.lend_kv().drain(..pages as usize).collect();
+    drop(grant);
+    // The peer's bytes land.
+    ctx.next_step().await;
+    let first = {
+        let mut next = ctx.next_tag.lock().unwrap();
+        *next += 1;
+        *next
+    };
+    let rows: Vec<u32> = (0..pages * 16).map(|row| row ^ (first as u32) << 16).collect();
+    let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&[7; 32], None, 0, &rows)
+        .chunks(16)
+        .map(|page| page.iter().map(|hash| Some(*hash)).collect())
+        .collect();
+    let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+    for (index, (key, page)) in keys.iter().zip(&local).enumerate() {
+        let value = pattern(5, first, index as u64);
+        ctx.bytes.lock().unwrap().write(TIER_DEVICE, LIST, page.0, value);
+        ctx.sealed.lock().unwrap().insert(*key, value);
+    }
+    let backings = local.into_iter().map(KvPageBacking::Resident).collect();
+    let filed = with_kv_lock(&ctx.stores.kv, "sim-import", |kv| {
+        kv.import_cached_at(&[], tokens, keys, backings)
+    });
+    assert!(filed, "a run from token 0 files");
+    ctx.log.lock().unwrap().imports += 1;
+    ctx.act();
+    Ok(())
+}
+
+/// Pins one cached run (the `longest`), for `steps`, where it is whole on the
+/// device, its pages as their writer left them.
+fn pin(ctx: &Ctx, steps: u32, longest: bool) -> Result<(), String> {
+    let pinned = with_kv_lock(&ctx.stores.kv, "sim-pin", |kv| {
+        let mut runs = kv.cached_runs();
+        runs.sort_by_key(|run| (run.len(), run.clone()));
+        let at = match longest {
+            true => runs.len().checked_sub(1)?,
+            false if runs.is_empty() => return None,
+            false => ctx.rng.lock().unwrap().below(runs.len() as u64) as usize,
+        };
+        let keys = runs.swap_remove(at);
+        let run = kv.cached_run(&keys);
+        let (pin, ids) = kv.pin_resident(&run)?;
+        Some((pin, ids, keys))
+    });
+    let Some((pin, ids, keys)) = pinned else {
+        return Ok(());
+    };
+    let sealed = ctx.sealed.lock().unwrap();
+    let pages: Vec<_> = ids
+        .iter()
+        .zip(&keys)
+        .map(|(page, key)| (page.0, sealed[key]))
+        .collect();
+    drop(sealed);
+    ctx.log.lock().unwrap().pins += 1;
+    let until = ctx.step.load(Ordering::Relaxed) + u64::from(steps);
+    let pinned = Pinned { until, pin, pages };
+    let read = read_pinned(ctx, &pinned);
+    ctx.pinned.lock().unwrap().push(pinned);
+    read
+}
+
+fn read_pinned(ctx: &Ctx, pinned: &Pinned) -> Result<(), String> {
+    let bytes = ctx.bytes.lock().unwrap();
+    ctx.log.lock().unwrap().pages_checked += pinned.pages.len() as u64;
+    for &(page, want) in &pinned.pages {
+        let got = bytes.read(TIER_DEVICE, LIST, page);
+        if got != Some(want) {
+            return Err(format!("a pinned cached page at device page {page}: {got:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Ends the readers whose step has come (`every`: all of them).
+fn unpin(ctx: &Ctx, step: u64, every: bool) {
+    let mut pinned = ctx.pinned.lock().unwrap();
+    let (ended, stay): (Vec<_>, Vec<_>) =
+        pinned.drain(..).partition(|pinned| every || pinned.until <= step);
+    *pinned = stay;
+    drop(pinned);
+    for ended in ended {
+        if let Err(what) = read_pinned(ctx, &ended) {
+            let nobody = ProcessId::from_u128(0);
+            ctx.log.lock().unwrap().corrupt.push((nobody, what));
+        }
+        with_kv_lock(&ctx.stores.kv, "sim-unpin", |kv| kv.release_reader(ended.pin));
+        ctx.act();
+    }
 }
 
 /// `pid`'s frame is cut wider than the activation rung's cap: it owes the
@@ -2483,13 +2707,13 @@ async fn run_once(ctx: Arc<Ctx>, pid: ProcessId, script: Script) -> bool {
     let mut sets: Vec<Set> = Vec::new();
     let mut instances: Vec<InstanceId> = Vec::new();
     let lived = async {
-        sets.push(new_set(&ctx, pid, &residency, None)?);
+        sets.push(new_set(&ctx, pid, &residency, None, script.shares)?);
         for &(program, _) in script.bind.iter().filter(|(_, late)| !late) {
             instances.push(bind(&ctx, pid, program).await?);
         }
         fire(&ctx, pid, &mut sets, &instances, u64::from(script.prompt)).await?;
         for _ in 1..script.beams {
-            let set = new_set(&ctx, pid, &residency, Some(&sets[0]))?;
+            let set = new_set(&ctx, pid, &residency, Some(&sets[0]), script.shares)?;
             let mut log = ctx.log.lock().unwrap();
             log.forks += 1;
             log.shared_pages += set.written;
@@ -2535,6 +2759,16 @@ async fn run_once(ctx: Arc<Ctx>, pid: ProcessId, script: Script) -> bool {
                 close(&ctx, verifier);
                 fired?;
             }
+            if let Some((when, pages)) = script.import
+                && when == at
+            {
+                import(&ctx, pid, pages).await?;
+            }
+            if let Some((when, steps)) = script.pin
+                && when == at
+            {
+                pin(&ctx, steps, false)?;
+            }
             let pages = u64::from((at + 1) % script.grow_every == 0);
             if script.raise == Some(at) {
                 owe_raise(&ctx, pid).await?;
@@ -2542,6 +2776,14 @@ async fn run_once(ctx: Arc<Ctx>, pid: ProcessId, script: Script) -> bool {
             fire(&ctx, pid, &mut sets, &instances, pages).await?;
             if script.raise == Some(at) {
                 crate::store::shared::owe_cut_rows(0, 0, None);
+            }
+        }
+        if script.decode == 0 {
+            if let Some((_, pages)) = script.import {
+                import(&ctx, pid, pages).await?;
+            }
+            if let Some((_, steps)) = script.pin {
+                pin(&ctx, steps, true)?;
             }
         }
         Ok::<(), String>(())
@@ -3107,7 +3349,17 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         walks: grow.is_some(),
         engine_view,
         seats: workload.default_policy.then(|| Mutex::new(SeatHolds::default())),
+        idle_cache: workload.idle_cache,
+        sealed: Mutex::default(),
+        pinned: Mutex::default(),
     });
+    if workload.idle_cache {
+        with_kv_lock(&ctx.stores.kv, "sim-keeps", |kv| {
+            kv.set_page_size(16);
+            kv.set_keeps(true);
+        });
+    }
+    let mut idle_rng = Rng(workload.seed ^ 0xde_307e);
     let mut pid_rng = Rng(workload.seed.wrapping_mul(31).wrapping_add(7));
     let mut fires_before = 0u64;
     let mut rung = ctx.stores.shared.as_ref().map_or(0, |shared| shared.lock().unwrap().rung());
@@ -3200,6 +3452,13 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             }
             None => {
                 walk(&ctx);
+            }
+        }
+        // Readers end, and the host's pressure asks idle cache now and then.
+        if workload.idle_cache {
+            unpin(&ctx, u64::from(step), false);
+            if idle_rng.chance(1, 12) {
+                planner.yield_idle(idle_rng.range(1, 2 * PAGES_PER_CHUNK));
             }
         }
         // The lanes live: the fires the last step took, as a scheduler's
@@ -3364,6 +3623,12 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     coverage.cache_left = u64::from(with_kv_lock(&ctx.stores.kv, "sim-cache", |kv| {
         kv.reclaimable_cache_pages()
     }));
+    unpin(&ctx, 0, true);
+    {
+        let log = ctx.log.lock().unwrap();
+        coverage.imports = log.imports;
+        coverage.pins = log.pins;
+    }
     // What is left: the tasks stopped, their copies landed so nothing waits
     // on them, then the planner and the lane let go.
     for task in &tasks {
@@ -3405,6 +3670,25 @@ fn the_simulated_fleet_settles_every_step_on_its_seeds() {
     }
     assert!(failures.is_empty(), "failures: {failures:?}\n{coverage:?}");
     assert!(coverage.evictions > 0 && coverage.restores > 0, "{coverage:?}");
+}
+
+/// The same with idle cache beside the fleet: no waiter is left to cache a
+/// reader pins, to filed pages no fire comes after, to a rung held for cache
+/// that gives nothing, or to a tier full of cache ([`Workload::with_idle_cache`]).
+#[test]
+fn the_simulated_fleet_settles_beside_idle_cache_on_its_seeds() {
+    let mut failures = Vec::new();
+    let mut coverage = Coverage::default();
+    for seed in SEEDS {
+        let (found, covered) = run(&Workload::with_idle_cache(seed), None);
+        coverage.add(&covered);
+        failures.extend(found.into_iter().map(|failure| (seed, failure)));
+    }
+    assert!(failures.is_empty(), "failures: {failures:?}\n{coverage:?}");
+    assert!(
+        coverage.imports > 0 && coverage.pins > 0 && coverage.rung_lowers > 0,
+        "{coverage:?}"
+    );
 }
 
 /// A pool of `total` chunks in segments of `segment`, a bind of `run`
@@ -3463,6 +3747,9 @@ fn run_pieces_workload(
             rescore: None,
             raise: None,
             verify: None,
+            shares: false,
+            import: None,
+            pin: None,
         })
         .collect();
     for script in &mut scripts {
@@ -3481,6 +3768,9 @@ fn run_pieces_workload(
         rescore: None,
         raise: None,
         verify: None,
+        shares: false,
+        import: None,
+        pin: None,
     });
     Workload {
         seed,
@@ -3493,6 +3783,7 @@ fn run_pieces_workload(
         landing_fails: None,
         default_policy: false,
         late_refuse: false,
+        idle_cache: false,
     }
 }
 
@@ -3563,6 +3854,7 @@ fn raise_beside_own_workload(scripts: Vec<Script>) -> Workload {
         landing_fails: None,
         default_policy: false,
         late_refuse: false,
+        idle_cache: false,
     }
 }
 
@@ -3580,6 +3872,9 @@ fn raise_script(at: u32, prompt: u32, decode: u32, raise: Option<u32>, bound: bo
         rescore: None,
         raise,
         verify: None,
+        shares: false,
+        import: None,
+        pin: None,
     }
 }
 

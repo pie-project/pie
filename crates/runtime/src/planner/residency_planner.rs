@@ -251,7 +251,7 @@ impl ResidencyPlanner {
         // cannot come).
         let (model, engine) = self.port.locus();
         resting
-            || self.port.reclaimable_idle() > 0
+            || self.port.idle_room() > 0
             || crate::store::registry::try_get(model, engine)
                 .is_some_and(|stores| stores.rs.lock().unwrap().holds_checkpoints())
     }
