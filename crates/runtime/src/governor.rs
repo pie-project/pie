@@ -25,6 +25,7 @@ pub mod psi;
 pub mod run;
 pub mod steered;
 
+use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,7 @@ pub fn system() -> Box<dyn System> {
 /// sets. Whether one axis is enough is unproven.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum Tolerance {
     /// The machine is this process's: the loop never lowers the target and
     /// growth is unlimited. What a server has always done.
@@ -104,6 +106,16 @@ pub enum Tolerance {
 }
 
 impl Tolerance {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Dedicated,
+            1 => Self::Aggressive,
+            2 => Self::Balanced,
+            3 => Self::Polite,
+            _ => unreachable!("invalid memory tolerance {value}"),
+        }
+    }
+
     /// The share of the target kept on a congested tick, and the ticks of
     /// congestion in a row it takes to act.
     const fn backoff(self) -> (f64, u32) {
@@ -114,6 +126,35 @@ impl Tolerance {
             Self::Polite => (0.7, 1),
         }
     }
+}
+
+static TOLERANCE: AtomicU8 = AtomicU8::new(Tolerance::Dedicated as u8);
+
+fn configured_tolerance() -> Tolerance {
+    Tolerance::from_u8(TOLERANCE.load(Relaxed))
+}
+
+pub(crate) fn init(tolerance: Tolerance) {
+    TOLERANCE.store(tolerance as u8, Relaxed);
+}
+
+/// Changes the running governors' tolerance and returns the previous level.
+///
+/// # Errors
+/// Switching to or from dedicated requires a restart.
+pub fn set_tolerance(tolerance: Tolerance) -> Result<Tolerance, Tolerance> {
+    replace_live(&TOLERANCE, tolerance)
+}
+
+fn replace_live(tolerance: &AtomicU8, requested: Tolerance) -> Result<Tolerance, Tolerance> {
+    let dedicated = Tolerance::Dedicated as u8;
+    let requested = requested as u8;
+    tolerance
+        .try_update(Relaxed, Relaxed, |current| {
+            ((current == dedicated) == (requested == dedicated)).then_some(requested)
+        })
+        .map(Tolerance::from_u8)
+        .map_err(Tolerance::from_u8)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -473,6 +514,16 @@ mod tests {
         for _ in 0..ticks {
             governor.tick(Pressure::Calm, all(demand));
         }
+    }
+
+    #[test]
+    fn live_tolerance_cannot_cross_dedicated() {
+        use Tolerance::{Balanced, Dedicated, Polite};
+
+        let tolerance = AtomicU8::new(Balanced as u8);
+        assert_eq!(replace_live(&tolerance, Dedicated), Err(Balanced));
+        assert_eq!(tolerance.load(Relaxed), Balanced as u8);
+        assert_eq!(replace_live(&tolerance, Polite), Ok(Balanced));
     }
 
     #[test]

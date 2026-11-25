@@ -180,8 +180,7 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
         "pie standalone serving",
     );
     println!("✓ Server ready at ws://{}", handle.listen_addr);
-    // SIGHUP swaps both planes' policies for the file's; nothing else in it
-    // is read again.
+    // SIGHUP reloads both planes' policies and memory tolerance.
     let reload = handle.policy_reload();
     ctx.on_hangup(move |config| {
         let reload = reload.clone();
@@ -189,14 +188,20 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
             let config = match worker::standalone::derive_standalone(&config) {
                 Ok((_, _, worker)) => worker,
                 Err(e) => {
-                    tracing::error!(
-                        "SIGHUP: the config does not parse, so the policies stand: {e:#}"
-                    );
+                    tracing::error!("SIGHUP: the config does not parse: {e:#}");
                     return;
                 }
             };
             if let Err(e) = reload.reload(&config).await {
                 tracing::error!("SIGHUP: {e:#}");
+            }
+            let new = config.model.memory_tolerance;
+            match runtime::governor::set_tolerance(new) {
+                Ok(old) if old != new => tracing::info!("SIGHUP: memory tolerance {old:?} -> {new:?}"),
+                Ok(_) => {}
+                Err(current) => tracing::error!(
+                    "SIGHUP: cannot change memory tolerance from {current:?} to {new:?} while running"
+                ),
             }
         }
     });
