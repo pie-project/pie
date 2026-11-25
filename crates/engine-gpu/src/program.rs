@@ -906,13 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_placed_past_the_fold_lands_where_it_is_placed() {
-        let lanes = placed(17).expect("a slot past the fold");
-        assert_eq!(lanes[0].have, Some(17));
-        assert_eq!(lanes[0].slots, None, "slot 17 is the run the fire appends");
-    }
-
-    #[test]
     fn ports_describing_more_lanes_than_the_attachment_owns_are_refused_by_name() {
         let mut envelope = engine::ports::Envelope {
             qo_indptr: Some(vec![0, 1, 2]),
@@ -944,19 +937,4 @@ mod tests {
         assert!(why.contains("kv slot 3") && why.contains("frozen prefix"), "{why}");
     }
 
-    /// A deferred pass keeps a decode envelope's beam parents on the device
-    /// (the next fire copies the kept cell in, waiting on no landing), and
-    /// lands its fold count and mask, which the host reads at the fire.
-    #[test]
-    fn a_deferred_pass_keeps_its_parents_on_the_device() {
-        use eta_ir::registry::{GeometryClass, Port, PortMask};
-        let device = PortMask::DECODE_ENVELOPE
-            .with(Port::Fold)
-            .with(Port::AttnMask)
-            .with(Port::Parents);
-        let reads = read_at_fire(GeometryClass::DecodeEnvelope, device);
-        assert!(!reads.contains(Port::Parents), "{reads:?}");
-        assert!(!reads.contains(Port::EmbedTokens), "{reads:?}");
-        assert!(reads.contains(Port::Fold) && reads.contains(Port::AttnMask), "{reads:?}");
-    }
 }

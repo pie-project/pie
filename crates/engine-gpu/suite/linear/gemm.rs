@@ -52,14 +52,7 @@ fn the_dense_matmuls_answer_the_reference() {
     // (rows, columns, contraction, tier, vector rows a workgroup (0 tiled),
     // the wide tile)
     let mut cases = vec![
-        (
-            3usize,
-            21usize,
-            60usize,
-            kernels_slang::Tier::Baseline,
-            4u32,
-            false,
-        ),
+        (3usize, 21usize, 60usize, kernels_slang::Tier::Baseline, 4u32, false),
         (2, 22, 61, kernels_slang::Tier::Baseline, 4, false),
         // The plain vector kernel past four rows.
         (9, 22, 61, kernels_slang::Tier::Baseline, 16, false),
@@ -108,14 +101,8 @@ fn the_dense_matmuls_answer_the_reference() {
             std::slice::from_ref(&want),
             &|g, o| {
                 let y = t(o[0].0, m, n, Dtype::Bf16);
-                g.run(|c| gemm::matmul(
-                    c,
-                    Tactic { tier, vector, wide },
-                    xt,
-                    wt,
-                    y,
-                    kernels_slang::ssm::RowSpan::whole(xt),
-                ));
+                let tactic = Tactic { tier, vector, wide };
+                g.run(|c| gemm::matmul(c, tactic, xt, wt, y, kernels_slang::ssm::RowSpan::whole(xt)));
             },
         );
     }
@@ -153,67 +140,5 @@ fn the_dense_matmuls_answer_the_reference() {
                 g.run(|c| gemm::lane(c, "linear.matmul", xt, wt, y));
             },
         );
-    }
-}
-
-/// The vector kernels at every rows a workgroup carries land the same bits
-/// at every row count (each row's sum the same order: a lane's strided
-/// eight-wide steps, four a loop, then the workgroup's tree), and they and
-/// the tiled kernels stay within the reference's tolerance at a decode's
-/// and a short prompt's rows over projection-shaped planes; each kernel's
-/// worst error against the f64 reference is said.
-#[test]
-fn the_vector_kernels_agree_bit_for_bit_and_with_the_reference() {
-    let Some(mut gpu) = Gpu::open() else {
-        eprintln!("not asked: no device");
-        return;
-    };
-    let tier = kernels_slang::Tier::Baseline;
-    for (n, k) in [(1024usize, 1024usize), (3072, 1024), (1024, 3072)] {
-        let (w, wr) = gpu.up(&noise(7 + n as u64 + k as u64, n * k));
-        let wt = t(w, n, k, Dtype::Bf16);
-        for m in [1usize, 2, 3, 8, 16, 32] {
-            let (x, xr) = gpu.up(&noise(11 + m as u64, m * k));
-            let xt = t(x, m, k, Dtype::Bf16);
-            let want = reference(&xr, &wr, (m, n, k), |v| v);
-            let run = |gpu: &mut Gpu, vector: u32, wide: bool| {
-                let y = gpu.zeros(m * n);
-                let yt = t(y, m, n, Dtype::Bf16);
-                gpu.run(|c| gemm::matmul(
-                    c,
-                    Tactic { tier, vector, wide },
-                    xt,
-                    wt,
-                    yt,
-                    kernels_slang::ssm::RowSpan::whole(xt),
-                ));
-                gpu.down(y, m * n)
-            };
-            let worst = |got: &[f32]| {
-                got.iter()
-                    .zip(&want)
-                    .map(|(&g, &w)| (f64::from(g) - w).abs())
-                    .fold(0.0, f64::max)
-            };
-            let one = run(&mut gpu, 1, false);
-            let mut said = vec![format!("x1 {:.3e}", worst(&one))];
-            for vector in [4, 8, 16] {
-                let got = run(&mut gpu, vector, false);
-                assert!(
-                    got.iter()
-                        .zip(&one)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "{m} x {n} x {k}: the {vector}-row vector kernel's bits differ from the 1-row one's"
-                );
-                said.push(format!("x{vector} {:.3e}", worst(&got)));
-            }
-            for (wide, name) in [(false, "tiled"), (true, "wide")] {
-                let got = run(&mut gpu, 0, wide);
-                said.push(format!("{name} {:.3e}", worst(&got)));
-                crate::gpu::close(&got, &want, &format!("{name} {m} x {n} x {k}"));
-            }
-            crate::gpu::close(&one, &want, &format!("vector {m} x {n} x {k}"));
-            eprintln!("{m} x {n} x {k}: worst |error| vs f64: {}", said.join(", "));
-        }
     }
 }

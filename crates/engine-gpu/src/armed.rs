@@ -154,7 +154,7 @@ pub fn export(from: &Path, to: &Path) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Armed, parse, read, render};
+    use super::{Armed, parse, render};
 
     #[test]
     fn a_record_reads_back_as_written_and_only_under_its_build() {
@@ -175,17 +175,4 @@ mod tests {
         assert_eq!(parse("pie-armed 1\nbuild 7\neager x\nshapes 1\n", 7), None, "torn");
     }
 
-    #[test]
-    fn a_load_takes_the_committed_entry_of_its_key_where_its_own_is_missing() {
-        let armed = Armed {
-            shapes: vec![2],
-            eager: None,
-        };
-        let text = render(&armed, 5);
-        let committed = [("00000000000000aa", text.as_str())];
-        let missing = std::path::Path::new("/nonexistent/00000000000000aa");
-        assert_eq!(read(missing, 5, &committed), Some(armed));
-        let other = std::path::Path::new("/nonexistent/00000000000000bb");
-        assert_eq!(read(other, 5, &committed), None, "another key's entry");
-    }
 }

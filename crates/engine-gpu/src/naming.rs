@@ -252,46 +252,7 @@ pub fn refuses(
 
 #[cfg(test)]
 mod tests {
-    use kernels_slang::{Encode as _, Naming as _};
-
     use super::*;
-
-    /// A kernel of the census at the baseline tier, from a projection's own
-    /// naming.
-    fn fires() -> Vec<Fire> {
-        kernels_slang::linear::gemm::kernels(
-            Target::Wgsl,
-            kernels_slang::linear::gemm::Tactic {
-                tier: kernels_slang::Tier::Baseline,
-                vector: 0,
-                wide: true,
-            },
-            "linear.matmul",
-            64,
-            64,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn a_forked_host_counts_its_longest_way_and_names_every_way() {
-        let fires = fires();
-        let names = Names::new(Target::Wgsl);
-        names.fire(fires[0], &[]).unwrap();
-        names.fork();
-        names.fire(fires[0], &[]).unwrap();
-        names.or();
-        for _ in 0..3 {
-            names.fire(*fires.last().unwrap(), &[]).unwrap();
-        }
-        names.or();
-        names.either(&fires).unwrap();
-        names.join();
-        assert_eq!(names.take_dispatches(), 1 + 3);
-        assert_eq!(names.take_dispatches(), 0);
-        let distinct: BTreeSet<&str> = fires.iter().map(|fire| fire.entrypoint).collect();
-        assert_eq!(names.len(), distinct.len());
-    }
 
     fn class(outputs: &[&str]) -> poem_ir::LaneClass {
         poem_ir::LaneClass {

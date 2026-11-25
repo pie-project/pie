@@ -118,7 +118,7 @@ fn one_program_driving_eight_lanes_settles_every_step() {
         trace,
         planes,
         dir,
-    }) = loaded_flight("one-owner", &Rows, LANES, boot, 2)
+    }) = loaded_flight("one-owner", &Rows, LANES, None, boot, 2)
     else {
         return;
     };

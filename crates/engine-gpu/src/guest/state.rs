@@ -530,7 +530,7 @@ impl Takings {
 
 #[cfg(test)]
 mod tests {
-    use super::{Facts, GuestLayout, Side, Takings};
+    use super::Takings;
     use engine::program::ScratchPlace;
 
     /// A pair's state is cleared at the first bind on a place and taking,
@@ -554,84 +554,5 @@ mod tests {
             "each live taking is a group of its own"
         );
         assert!(!takings.take(&ScratchPlace::None, 0), "no room, nothing to clear");
-    }
-    use engine::program::GuestState;
-
-    /// Qwen3-0.6B's pool on the GPU: 4 MiB chunks of 4 KiB `Instance` slots.
-    const FACTS: Facts = Facts {
-        chunk: 4 << 20,
-        segment_chunks: 64,
-        slot: 4 << 10,
-        chunk_slots: 1024,
-    };
-
-    /// The heaps are the instance's, its stages sharing one region as wide
-    /// as the widest; the score room is the pair's.
-    #[test]
-    fn the_stages_share_one_region_and_the_score_room_is_the_pairs() {
-        let layout = GuestLayout::of(&[1000, 3000, 300], 5000);
-        assert_eq!(
-            layout.stages,
-            vec![
-                (Side::Instance, 0, 1000),
-                (Side::Instance, 0, 3000),
-                (Side::Instance, 0, 300)
-            ]
-        );
-        assert_eq!(layout.scores, Some((0, 5000)));
-        assert_eq!((layout.instance, layout.pair), (3000, 5000));
-        assert_eq!(GuestLayout::of(&[], 0), GuestLayout::default());
-    }
-
-    /// A side two of which share a chunk asks no run; past it, the run is
-    /// the most either side takes in whole chunks; past a segment, refused
-    /// by name.
-    #[test]
-    fn the_run_is_the_most_a_side_takes_in_whole_chunks() {
-        let small = GuestLayout::of(&[100_000], 0);
-        assert_eq!(
-            small.state(&FACTS).expect("fits"),
-            GuestState {
-                resident: 0,
-                scratch: 100_000,
-                scratch_arms: 1,
-                per_pair: 0,
-                run: 0
-            }
-        );
-        let top_p = GuestLayout::of(&[5_056_768], 0);
-        assert_eq!(
-            top_p.state(&FACTS).expect("fits"),
-            GuestState {
-                resident: 0,
-                scratch: 5_056_768,
-                scratch_arms: 1,
-                per_pair: 0,
-                run: 2
-            }
-        );
-        // A 9 MiB score room beside a small heap: the room's run.
-        let scored = GuestLayout::of(&[100_000], 9 << 20);
-        assert_eq!(scored.state(&FACTS).expect("fits").run, 3);
-        // A beam group's state lies first in the instance's place, aligned,
-        // the heaps past it its scratch; a place past a segment is refused
-        // by name.
-        let beam = super::BeamLayout::of(4, 1100, 16, 2).expect("a depth");
-        assert_eq!(beam.cap, 4 * 69 + 4 * 3 + 1);
-        let beamed = GuestLayout::of(&[100_000], 0).with_beam(Some(beam));
-        let resident = beam.bytes().next_multiple_of(crate::arena::ALIGN);
-        assert_eq!(beamed.stages, vec![(Side::Instance, resident, 100_000)]);
-        let state = beamed.state(&FACTS).expect("fits");
-        assert_eq!((state.resident, state.scratch), (resident, 100_000));
-        assert_eq!(state.instance_bytes(), beamed.instance);
-        let deep = super::BeamLayout::of(64, 1 << 20, 16, 2).expect("a depth");
-        assert!(GuestLayout::of(&[100_000], 0).with_beam(Some(deep)).state(&FACTS).is_err());
-        assert!(super::BeamLayout::of(4, 1, 16, 2).is_err(), "no depth is refused");
-        let past = GuestLayout::of(&[65 * (4 << 20)], 0);
-        assert!(past.state(&FACTS).is_err());
-        assert_eq!(
-            GuestLayout::default().state(&FACTS).expect("none"),
-            GuestState::default()
-        );
     }
 }

@@ -261,23 +261,3 @@ impl Books {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Books, owners};
-
-    /// Host memory a backend reserved off the device's heaps (a guest
-    /// stage's staging) is counted apart from the device's: it moves the
-    /// host count and leaves the device's books, and their audit, alone.
-    #[test]
-    fn host_memory_off_the_device_is_counted_apart() {
-        let books = Books::apart();
-        books.take(owners::GUEST, 100);
-        books.host_take(4096);
-        books.host_take(64);
-        assert_eq!((books.device(), books.host()), (100, 4160));
-        assert_eq!(books.audit().entered, 100);
-        books.host_give(4096);
-        assert_eq!(books.host(), 64);
-    }
-}

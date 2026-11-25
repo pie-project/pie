@@ -231,17 +231,6 @@ fn take(alone: bool, free: impl Fn(&Holders) -> bool) {
     });
 }
 
-/// The calling test holds the device alone until it ends: it waits until no
-/// other test holds a share, and no test takes one meanwhile. For a test
-/// that times the device's answers against its own host work (a lane's
-/// fires against a compile on another thread), which a model test beside it
-/// would stretch by its own fires and loads. The test's loads still take
-/// its share ([`share`]); call this before them.
-pub fn alone() {
-    open(false);
-    take(true, |holders| holders.count == 0);
-}
-
 /// The bytes of one share: a [`SHARES`]th of what the device states it has
 /// to a load that states no budget (read once, as the first share is
 /// taken, before any model stands), no more than the harness states a
@@ -381,52 +370,6 @@ impl Gpu {
             f(&sink).expect("the kernel fires");
         }
         frame.commit().expect("the frame lands");
-    }
-
-    /// `f` in a frame of its own, timed: the device's time across its work
-    /// where it writes timestamps (a spanned frame), else the host's clock
-    /// around the submit and the wait (never shorter), ns.
-    pub fn timed(&self, f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_slang::Error>) -> f64 {
-        let started = std::time::Instant::now();
-        let frame = self.device.spanned().expect("a frame");
-        {
-            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
-            f(&sink).expect("the kernel fires");
-        }
-        let span = frame.commit_spanned().expect("the frame lands");
-        let host = started.elapsed().as_nanos() as f64;
-        span.map_or(host, |ns| ns as f64)
-    }
-
-    /// One arm's timestamps, laid as a load under a stated submit bound
-    /// lays them (`Serve::lay_stamps`).
-    pub fn stamps(&self) -> <crate::backend::Api as engine_gpu::serve::Serve>::Stamps {
-        <crate::backend::Api as engine_gpu::serve::Serve>::lay_stamps(&self.device, 1)
-            .expect("the timestamps lay")
-    }
-
-    /// `f` walked into a step's timed frame writing `stamps`, as a serving
-    /// step walks under a stated submit bound (`Serve::walk_frame`), kept
-    /// to replay where `keep`, committed as a step is, and its device time
-    /// as the backend reads it once it lands (`crate::backend::fired_time`),
-    /// ns: `None` where the backend reads none.
-    pub fn fired(
-        &self,
-        stamps: &<crate::backend::Api as engine_gpu::serve::Serve>::Stamps,
-        keep: bool,
-        f: impl FnOnce(&Sink<'_>) -> Result<(), kernels_slang::Error>,
-    ) -> Option<u64> {
-        let frame = <crate::backend::Api as engine_gpu::serve::Serve>::walk_frame(
-            &self.device,
-            keep,
-            Some(stamps),
-        )
-        .expect("a timed frame");
-        {
-            let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
-            f(&sink).expect("the kernel fires");
-        }
-        crate::backend::fired_time(frame, keep)
     }
 
     pub fn down(&self, handle: u32, n: usize) -> Vec<f32> {

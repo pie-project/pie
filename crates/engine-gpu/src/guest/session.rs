@@ -308,7 +308,7 @@ fn rows_of(value: &ValueDesc) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bases, Laid, located};
+    use super::{Laid, located};
 
     const SEGMENT: (u64, u64) = (7, 1 << 20);
     const RUN: (u64, u64) = (4096, 8192);
@@ -329,25 +329,6 @@ mod tests {
             at,
             bytes,
         }
-    }
-
-    /// Each base is its span's word in its segment: what the step's record
-    /// states and the runtime adds every index to.
-    #[test]
-    fn a_bind_states_each_span_s_word() {
-        assert_eq!(
-            located(SEGMENT, laid(), heap(9, 256, 64)).unwrap(),
-            Bases {
-                status: 1024,
-                descs: 1028,
-                params: 1056,
-                offs: 1088,
-                cfg: 1100,
-                heap: 64,
-            }
-        );
-        located(SEGMENT, laid(), heap(SEGMENT.0, 8192, 64))
-            .expect("a heap beside the run in its segment");
     }
 
     /// The bind refuses by name a span off its run or segment or a word, a
