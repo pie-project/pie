@@ -318,3 +318,44 @@ fn a_lane_parked_to_disk_serves_the_never_parked_logits() {
         assert!(parked.contains(&kind), "no model here parks {kind:?} slots");
     }
 }
+
+/// On a load that lays rings, a lane addressed by slot refs that states
+/// neither its ring nor a window fold is refused by name, outside the
+/// load's own pipeline walk.
+#[test]
+fn a_ref_lane_stating_no_ring_is_refused() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let fixture = fixture_of("gemma4-e4b-mini-l1", None);
+    let mut shell = load_with(&fixture, CONTEXT);
+    assert!(shell.pool_ring().is_some(), "a windowed load lays rings");
+    let layout = shell.pool_layout();
+    let per = shell.pool_chunk_facts().shape(FIXED).map(|s| s.slots_per_chunk.max(1));
+    let low = layout.free_chunk();
+    let record: Vec<u32> = per.map_or_else(Vec::new, |per| {
+        (0..layout.pieces).map(|piece| (low + piece) * per).collect()
+    });
+    let segment = shell.pool_chunk_facts().segment_chunks;
+    shell
+        .commit_segments((low + layout.pieces + 1).div_ceil(segment))
+        .expect("the segments commit");
+    let why = shell
+        .fire_seated(&[Seated {
+            held: Some(0),
+            refs: true,
+            record: (!record.is_empty()).then_some(record.as_slice()),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, 4),
+                tokens: &[1, 2, 3, 4],
+            })
+        }])
+        .expect_err("no page it would read is its own")
+        .to_string();
+    assert!(why.contains("states no ring pieces and no window fold"), "{why}");
+    shell
+        .warm_pipelines()
+        .expect("the pipeline walk, whose fires are dropped, states neither");
+}
