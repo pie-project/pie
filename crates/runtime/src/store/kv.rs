@@ -307,10 +307,6 @@ pub struct KvStore {
     left: HashSet<Hash256>,
     /// A persistent disk tier's journal, and the slots it names.
     persisted: Option<Persisted>,
-    /// How many leading tokens each owner's props ask to keep on disk
-    /// (`persist-prefix-tokens`, `persist-system`): told to the cluster with
-    /// the runs it leaves, until it owns none.
-    hints: HashMap<ProcessId, u64>,
     /// The last count of reclaimable cache pages, when it was taken and what
     /// the walk took: see [`Self::reclaimable_cache_pages`].
     reclaimable: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
@@ -590,7 +586,6 @@ impl KvStore {
             joined: HashSet::new(),
             left: HashSet::new(),
             persisted: None,
-            hints: HashMap::new(),
             reclaimable: std::cell::Cell::new(None),
             below_cached: std::cell::Cell::new(None),
             droppable_below: std::cell::Cell::new(None),
@@ -986,7 +981,6 @@ impl KvStore {
             *count -= 1;
             if *count == 0 {
                 self.owners.remove(&owner);
-                self.hints.remove(&owner);
                 crate::policy::report(Event::CacheEmptied(owner, by));
             }
         }
@@ -2733,13 +2727,6 @@ impl KvStore {
             }
             self.keep_sealed_prefix(ws);
         }
-        // A hint is for what its owner leaves in the cache: one that left
-        // nothing needs none.
-        if let Some(owner) = self.owner_of(ws)
-            && !self.owners.contains_key(&owner)
-        {
-            self.hints.remove(&owner);
-        }
         let freed = self.table.release_working_set_backings(ws);
         tracing::debug!(target: "runtime::store::kv", ?ws, ?freed, "a set released");
         self.recycle_backings(freed, epoch);
@@ -4087,35 +4074,6 @@ impl KvStore {
                 .unpin_swap_locations(txn.pages.iter().map(|(location, ..)| *location)),
         );
         self.end_move(freed);
-    }
-
-    /// `owner`'s props ask `tokens` leading tokens kept on disk, or none.
-    pub fn set_persist_hint(&mut self, owner: ProcessId, tokens: Option<u64>) {
-        match tokens {
-            Some(tokens) if tokens > 0 => {
-                self.hints.insert(owner, tokens);
-            }
-            _ => {
-                self.hints.remove(&owner);
-            }
-        }
-    }
-
-    /// The runs whose owner asked a prefix of them kept on disk, by the
-    /// run's last key, with the tokens asked.
-    pub fn persist_hints(&self) -> Vec<(Hash256, u64)> {
-        if self.hints.is_empty() {
-            return Vec::new();
-        }
-        self.cache
-            .values()
-            .filter_map(|entry| {
-                let tokens = *self.hints.get(&entry.owner?)?;
-                let keys = self.table.path_keys(entry.path.terminal)?;
-                let last = *keys.get(usize::try_from(entry.path.pages).ok()?.checked_sub(1)?)?;
-                Some((last, tokens))
-            })
-            .collect()
     }
 
     /// The pages the disk tier keeps a copy of, by key.

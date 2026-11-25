@@ -48,7 +48,7 @@ struct Acted {
     /// Moves asked of the sessions: (process, target).
     moves: HashSet<(u64, WorkerId)>,
     /// Copies asked of workers, and when.
-    asked: HashMap<(String, WorkerId, bool), Instant>,
+    asked: HashMap<(String, WorkerId), Instant>,
     /// The helpers each running process was last given.
     helpers: HashMap<u64, Vec<WorkerId>>,
 }
@@ -583,14 +583,14 @@ fn retell_helpers(shared: &Shared, acted: &mut Acted, fleet: &crate::worker::Wor
 }
 
 fn carry(
-    asked: &mut HashMap<(String, WorkerId, bool), Instant>,
+    asked: &mut HashMap<(String, WorkerId), Instant>,
     orders: Vec<ReplicateOrder>,
     fleet: &crate::worker::WorkerRegistry,
 ) {
     let now = Instant::now();
     asked.retain(|_, at| now.duration_since(*at) < REPLICATE_RETRY);
     for order in orders {
-        let key = (order.group.clone(), order.worker, order.disk);
+        let key = (order.group.clone(), order.worker);
         if asked.contains_key(&key) {
             continue;
         }
@@ -607,16 +607,15 @@ fn carry(
                 keys,
                 from,
                 retention,
-                disk,
                 table,
             } = order;
-            match client.replicate(ctx, keys, from, retention, disk).await {
-                Ok(Ok(pages)) => tracing::info!(%group, %worker, table, pages, disk, "replicated"),
+            match client.replicate(ctx, keys, from, retention).await {
+                Ok(Ok(pages)) => tracing::info!(%group, %worker, table, pages, "replicated"),
                 Ok(Err(why)) => {
-                    tracing::warn!(%group, %worker, table, %why, disk, "replication refused")
+                    tracing::warn!(%group, %worker, table, %why, "replication refused")
                 }
                 Err(error) => {
-                    tracing::warn!(%group, %worker, table, %error, disk, "replication not delivered")
+                    tracing::warn!(%group, %worker, table, %error, "replication not delivered")
                 }
             }
         });

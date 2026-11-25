@@ -292,14 +292,8 @@ impl WorkerControl for WorkerControlServer {
         _: tarpc::context::Context,
         keys: Vec<[u8; 32]>,
         from: String,
-        retention: i64,
-        disk: bool,
+        _retention: i64,
     ) -> Result<u32, String> {
-        if disk {
-            let pages = runtime::planner::persist_run(keys, retention).await?;
-            tracing::info!(target: "pie::offload", pages, "kept a run on the persistent disk tier");
-            return Ok(u32::try_from(pages).unwrap_or(u32::MAX));
-        }
         let pages = runtime::offload::prefill::replicate(keys, from.clone())
             .await
             .map_err(|e| format!("{e:#}"))?;

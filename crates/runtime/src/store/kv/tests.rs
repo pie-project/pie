@@ -2028,10 +2028,8 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
 }
 
 #[test]
-/// An owner's ask to keep a prefix on disk goes out with the runs it left,
-/// a prefix persisted is a run of its own, and the ask goes with the last
-/// of its owner's entries.
-fn a_persist_hint_rides_its_owner_s_runs_and_a_persisted_prefix_is_a_run() {
+/// A prefix persisted is a run of its own, and its copies go with its pages.
+fn a_persisted_prefix_is_a_run() {
     use super::hash::{chain_slots, page_hash};
     let seed = h(53);
     let tokens: Vec<Vec<Option<Hash256>>> =
@@ -2054,16 +2052,6 @@ fn a_persist_hint_rides_its_owner_s_runs_and_a_persisted_prefix_is_a_run() {
         keys.clone(),
         gpu.into_iter().map(KvPageBacking::Resident).collect(),
     ));
-    let owner = ProcessId::from_u128(7);
-    for entry in store.cache.values_mut() {
-        entry.owner = Some(owner);
-    }
-    store.owners.insert(owner, store.cache.len());
-
-    assert!(store.persist_hints().is_empty());
-    store.set_persist_hint(owner, Some(8));
-    assert_eq!(store.persist_hints(), vec![(keys[2], 8)]);
-
     let txn = store
         .prepare_persist(&keys[..2], 0)
         .expect("two pages to copy");
@@ -2084,10 +2072,6 @@ fn a_persist_hint_rides_its_owner_s_runs_and_a_persisted_prefix_is_a_run() {
     let ids: Vec<u64> = store.cache.keys().copied().collect();
     let epoch = store.current_epoch();
     store.drop_entries(ids, crate::policy::By::Host, epoch);
-    assert!(
-        store.hints.is_empty(),
-        "the ask goes with its owner's last entry"
-    );
     assert_eq!(
         store.persisted_pages(),
         0,
@@ -2161,26 +2145,6 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
     };
     assert_eq!(retention(&low.1), [20, 20]);
     assert_eq!(retention(&high.1), [30, 30], "raised in the journal");
-}
-
-#[test]
-/// A process that maps in a run another left, and asks a prefix of it kept
-/// on disk, has that ask go out once it is gone.
-fn a_persist_hint_of_a_process_that_mapped_in_a_cached_run_goes_out() {
-    let mut store = KvStore::new(16, h(54));
-    let tokens: Vec<u32> = (0..64).map(|t| 600 + t).collect();
-    sealed_and_gone(&mut store, &tokens, ProcessId::from_u128(1));
-
-    let asker = ProcessId::from_u128(2);
-    let ws = store.create_shared_working_set();
-    store.set_owner(ws, asker).unwrap();
-    store.set_persist_hint(asker, Some(32));
-    store.reserve(ws, 4).unwrap();
-    let keys = keys_ahead(&store, ws, 0, &tokens);
-    let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(ws, &run, 4).unwrap(), 4);
-    store.release_working_set(ws, store.current_epoch());
-    assert_eq!(store.persist_hints(), vec![(keys[3], 32)]);
 }
 
 /// A peer's eviction moves pages under a parked set, and a peer's restore puts

@@ -201,7 +201,6 @@ impl ControllerHandle {
             && report.published.is_none()
             && report.disk_added.is_empty()
             && report.disk_removed.is_empty()
-            && report.persist_hints.is_none()
             && report.disk_tier.is_none()
             && report.link.is_none();
         self.directory.report_state(worker, report);
@@ -520,14 +519,14 @@ mod tests {
             listen = "127.0.0.1:9000"
             heartbeat_timeout = "12s"
             tick_interval = "500ms"
-            cluster_policies = ["persist-prefix"]
+            cluster_policies = ["my-policy"]
             "#,
         )
         .expect("valid config parses");
         assert_eq!(cfg.listen, "127.0.0.1:9000");
         assert_eq!(cfg.heartbeat_timeout, Duration::from_secs(12));
         assert_eq!(cfg.tick_interval, Duration::from_millis(500));
-        assert_eq!(cfg.cluster_policies, ["persist-prefix"]);
+        assert_eq!(cfg.cluster_policies, ["my-policy"]);
         assert!(
             Config::parse("heartbeat_timeout = 12").is_err(),
             "a duration is written with its unit"

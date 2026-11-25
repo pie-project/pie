@@ -56,13 +56,11 @@ pub trait WorkerControl {
     /// Take the run `keys` (from token 0) from the worker whose bulk address
     /// is `from`, and keep it: the cluster policy's replication. `retention`
     /// is the group's cluster retention key (0 when none names it): a pool
-    /// lets lower keys go first. `disk`: keep it on this worker's persistent
-    /// disk tier, from the run it holds itself. Answers how many pages came.
+    /// lets lower keys go first. Answers how many pages came.
     async fn replicate(
         keys: Vec<[u8; 32]>,
         from: String,
         retention: i64,
-        disk: bool,
     ) -> Result<u32, String>;
 
     /// `changes` is a JSON object whose `null`s remove names; none closes the

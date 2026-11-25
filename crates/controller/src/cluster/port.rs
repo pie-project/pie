@@ -467,7 +467,6 @@ fn orders(shared: &Shared) -> Vec<ReplicateOrder> {
                 keys: group.keys[..pages].to_vec(),
                 from,
                 retention: 0,
-                disk: false,
                 table: tables::REPLICATION_WORKERS.to_string(),
             })
         })
@@ -1071,7 +1070,6 @@ mod tests {
                     sites: vec![WorkerId(1)],
                     site_tiers: Vec::new(),
                     disk_sites: Vec::new(),
-                    persist_tokens: None,
                 },
             )],
             peers: vec![(WorkerId(1), "w1".into())],
@@ -1206,7 +1204,6 @@ mod tests {
             sites: vec![WorkerId(0)],
             site_tiers: Vec::new(),
             disk_sites: Vec::new(),
-            persist_tokens: None,
         };
         let id = hex(&[3; 32]);
         let directory = DirectoryView {

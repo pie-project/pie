@@ -55,14 +55,10 @@ pub struct WorkerInfo {
     pub role: Role,
     pub model: String,
     /// The engine kind it serves on, as its config spells it (`[engine]
-    /// type`): with the model, the shape a scale table counts it under.
+    /// type`).
     #[serde(default)]
     pub engine: String,
     pub addr: String,
-    /// Its process id, so a controller that did not spawn it, restarted
-    /// after the one that did, can still signal a launch it adopts.
-    #[serde(default)]
-    pub pid: Option<u32>,
     /// The id this worker had, registering again (a controller restarted,
     /// or one that timed it out): granted back if no one holds it, so the
     /// worker keeps its links and its turns.
@@ -166,10 +162,6 @@ pub struct StateReport {
     pub disk_added: Vec<[u8; 32]>,
     #[serde(default)]
     pub disk_removed: Vec<[u8; 32]>,
-    /// The runs whose owner asked a prefix of them kept on disk: each run's
-    /// last key and the tokens asked; all of it, whenever any changes.
-    #[serde(default)]
-    pub persist_hints: Option<Vec<([u8; 32], u64)>>,
     /// The tokens one kv page holds, and whether the disk tier is kept
     /// across runs; sent with a full report.
     #[serde(default)]
@@ -184,8 +176,7 @@ pub struct StateReport {
 pub type Key = [u8; 32];
 
 /// A run some worker keeps whole, by its last key: the workers (pools among
-/// them) that hold every page of it, those whose persistent disk tier does,
-/// and the most leading tokens of it some owner asked kept on disk.
+/// them) that hold every page of it, and those whose persistent disk tier does.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupView {
     pub keys: Vec<Key>,
@@ -195,7 +186,6 @@ pub struct GroupView {
     #[serde(default)]
     pub site_tiers: Vec<(WorkerId, OffDevice)>,
     pub disk_sites: Vec<WorkerId>,
-    pub persist_tokens: Option<u64>,
 }
 
 /// Where a held page is, off the device.
@@ -309,11 +299,9 @@ pub struct ReplicateOrder {
     pub group: String,
     pub worker: WorkerId,
     pub keys: Vec<Key>,
-    /// Where a worker that holds it serves its pages; none for a copy the
-    /// worker makes from its own (`disk`).
+    /// Where a worker that holds it serves its pages.
     pub from: String,
     pub retention: i64,
-    pub disk: bool,
     /// The table that wants it, for the log.
     pub table: String,
 }
