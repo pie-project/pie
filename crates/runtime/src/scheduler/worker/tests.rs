@@ -142,8 +142,256 @@ impl ::engine::Tiers for PanickingEngine {
 }
 
 
+/// Fire `fire`'s request: one decode lane in slot `fire`, a page of its own.
+fn refused_request(fire: u64) -> Box<PendingRequest> {
+    let slot = u32::try_from(fire).expect("a test fire id");
+    Box::new(PendingRequest {
+        queued: std::time::Instant::now(),
+        lora_program: false,
+        logical_fire_id: fire,
+        request: crate::engine::FireRequest::one(crate::engine::fire::lane_of(
+            slot,
+            vec![100 + slot],
+            3,
+            vec![slot],
+        )),
+        instance_id: ::engine::InstanceId(1),
+        completion: crate::engine::WorkItemCompletion::new(1, 0),
+        process_id: None,
+        pipeline_id: Some(ProcessId::from_u128(u128::from(fire))),
+        prelaunch_copy: None,
+        prelaunch_state_copy: None,
+        frame: Some(FrameStamp {
+            lane: ProcessId::from_u128(u128::from(fire)),
+            seq: 0,
+            slot: 0,
+            fires: 1,
+        }),
+    })
+}
+
+fn refused_limits() -> SchedulerLimits {
+    SchedulerLimits {
+        max_forward_requests: 8,
+        max_forward_tokens: 64,
+        max_page_refs: 64,
+        max_context: 0,
+        prefill_rows: 0,
+        prefill_lanes: 0,
+        max_readouts: 0,
+        readout_store: 0,
+        max_replayed_rows: 0,
+        shapes: None,
+    }
+}
+
+/// `requests` built into a frame the engine refused for where `chunks`
+/// lie before any step ran: its steps come back with the refusal, as
+/// the lane hands them (`LaunchRefusal::unfired`).
+fn refused_frame(requests: Vec<Box<PendingRequest>>, chunks: &[u32]) -> PendingLaunchBatch {
+    let fires = requests.len();
+    let (frame, requests) = batch::build_frame_submission(
+        vec![requests],
+        refused_limits(),
+        16,
+        &SchedulerStats::default(),
+    );
+    PendingLaunchBatch {
+        state: LaunchState::Failed(
+            "impossible submission: state chunk 2057 lies inside the carve".into(),
+        ),
+        requests,
+        started: Instant::now(),
+        batch_size: fires as u64,
+        total_tokens: fires,
+        rung_rows: fires,
+        placement: chunks.to_vec(),
+        unfired: frame.steps,
+    }
+}
+
+fn refused_batch(fires: &[u64], chunks: &[u32]) -> PendingLaunchBatch {
+    refused_frame(fires.iter().map(|&fire| refused_request(fire)).collect(), chunks)
+}
+
+/// A frame refused for where state lies must not go again from requests
+/// the build moved its lanes out of: the engine refuses it whole, "a
+/// fire carries no lanes", poisoning a rescore pipeline's channel. A
+/// fire refused for placement goes again
+/// with every lane, page and token it was built with; one a refused
+/// lane took out of the frame (failed alone) does not go again; and a
+/// fire with no lanes is never posted, failing alone by name.
+fn a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with() {
+    let engine = 9_998;
+    let stats = Arc::new(SchedulerStats::default());
+    let mut policy = FramePolicy::new(1, 64, 4096, None);
+    let (mut held, mut refused_once) = (Vec::new(), HashSet::new());
+    let built: Vec<_> = [7, 8, 9].map(refused_request).into_iter().collect();
+    // What the build stamps (the fires after it in its frame) aside.
+    let lanes_of = |request: &PendingRequest| {
+        let mut lanes = request.request.lanes.clone();
+        for lane in &mut lanes {
+            lane.fires_after = None;
+        }
+        lanes
+    };
+    let before: Vec<_> = built.iter().map(|request| lanes_of(request)).collect();
+    // Fire 9 rode the frame, but a refused lane took it out (failed
+    // alone) before the placement refusal: it is in no step.
+    let gone = refused_request(9);
+    gone.completion.reject_unsubmitted("engine: lane 2 refused".to_string());
+    let mut batch = refused_frame(built.into_iter().take(2).collect(), &[2057]);
+    assert!(
+        batch.requests.iter().all(|request| request.request.lanes.iter().all(|lane| lane.tokens.is_empty())),
+        "the build moved the lanes into the steps"
+    );
+    batch.requests.push(gone);
+    let mut flight = VecDeque::from([batch]);
+    assert!(BatchScheduler::retire_ready_launches(
+        &mut flight,
+        &mut HashMap::new(),
+        &stats,
+        &mut policy,
+        &mut held,
+        &mut refused_once,
+        engine,
+    ));
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].requests.len(), 2, "the fire failed alone goes nowhere again");
+    let mut pending = PendingQueue::default();
+    assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+    let again: Vec<Box<PendingRequest>> = std::mem::take(&mut pending.items)
+        .into_iter()
+        .map(|item| match item {
+            QueuedItem::Launch(launch) => launch.into_request(),
+            _ => panic!("only launches go again"),
+        })
+        .collect();
+    for (request, lanes) in again.iter().zip(&before) {
+        assert!(!request.completion.is_settled(), "none failed");
+        assert_eq!(&lanes_of(request), lanes, "every lane, page and token it was built with");
+    }
+    let (frame, _) =
+        batch::build_frame_submission(vec![again], refused_limits(), 16, &SchedulerStats::default());
+    assert!(!frame.steps.is_empty());
+    assert!(
+        frame.steps.iter().all(|step| step.submission.validate().is_ok()),
+        "the engine takes the fire it goes again as"
+    );
+
+    // A request with no lanes reaching the post fails alone, by name,
+    // and what rides beside it is posted.
+    let mut laneless = refused_request(11);
+    laneless.request.lanes.clear();
+    laneless.frame = None;
+    let laneless_completion = laneless.completion.clone();
+    let mut beside = refused_request(12);
+    beside.frame = None;
+    let instance = ::engine::InstanceId(1);
+    let bound = crate::engine::BoundInstance::new(
+        &::engine::BoundInstance {
+            id: instance,
+            program: ::engine::ProgramId::default(),
+            geometry: eta_ir::registry::GeometryClass::default(),
+            standing_guest_bytes: 0,
+        },
+        0,
+    );
+    let mut instances = HashMap::from([(instance, TrackedInstance::from_bound(&bound))]);
+    let mut pending = PendingQueue::default();
+    pending.push_back(QueuedItem::Launch(QueuedLaunch::new(laneless)));
+    pending.push_back(QueuedItem::Launch(QueuedLaunch::new(beside)));
+    let mut lane = Lane::spawn(9_997, None, Arc::clone(&stats));
+    let mut replies = LaneReplies::default();
+    let mut posted = VecDeque::new();
+    let (progress, fired) = BatchScheduler::post_frame(
+        &mut SlotBuffer::new(),
+        &mut FramePolicy::new(1, 64, 4096, None),
+        &lane,
+        &mut replies,
+        &mut instances,
+        &mut pending,
+        &mut posted,
+        16,
+        refused_limits(),
+        &stats,
+        &[vec![11, 12]],
+    );
+    assert!(progress && fired);
+    assert!(laneless_completion.is_settled(), "the fire with no lanes fails alone");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].requests.len(), 1, "only the fire beside it is posted");
+    lane.shutdown();
+}
+
+/// One launch refused "impossible submission: state chunk ... inside the
+/// activation span's backed carve" must not fail every lane of its frame
+/// and poison their channels. A batch the engine refuses for where state lies is held, nothing
+/// failed, while the pool moves that state down, then fired again as
+/// fires of their own; refused again for a chunk already moved, its
+/// fires go again one by one, and only one the engine still refuses
+/// alone fails.
+fn a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none() {
+    let engine = 9_999;
+    let stats = Arc::new(SchedulerStats::default());
+    let mut policy = FramePolicy::new(1, 64, 4096, None);
+    let (mut held, mut refused_once) = (Vec::new(), HashSet::new());
+    let mut pending = PendingQueue::default();
+    let mut flight = VecDeque::from([refused_batch(&[1, 2, 3], &[2057])]);
+    let mut retire = |flight: &mut VecDeque<PendingLaunchBatch>,
+                      held: &mut Vec<HeldForPlacement>,
+                      refused_once: &mut HashSet<u32>| {
+        BatchScheduler::retire_ready_launches(
+            flight,
+            &mut HashMap::new(),
+            &stats,
+            &mut policy,
+            held,
+            refused_once,
+            engine,
+        )
+    };
+    assert!(retire(&mut flight, &mut held, &mut refused_once));
+    assert_eq!(held.len(), 1, "held for its state's move");
+    assert!(!held[0].solo);
+    let unsettled = |pending: &PendingQueue| {
+        pending.items.iter().all(|item| match item {
+            QueuedItem::Launch(launch) => !launch.request.completion.is_settled(),
+            _ => true,
+        })
+    };
+    // No pool here: nothing is pending its move, so they go again.
+    assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+    assert_eq!(pending.len(), 3, "fired again");
+    assert!(unsettled(&pending), "none failed");
+    assert!(
+        pending.items.iter().all(|item| matches!(
+            item,
+            QueuedItem::Launch(launch) if !launch.framed && !launch.solo
+        )),
+        "as fires of their own, riding together"
+    );
+    // Refused again for the chunk already moved: one by one.
+    let mut flight = VecDeque::from([refused_batch(&[4, 5], &[2057])]);
+    assert!(retire(&mut flight, &mut held, &mut refused_once));
+    assert!(held[0].solo, "a runtime bug: its fires go again alone");
+    let mut pending = PendingQueue::default();
+    BatchScheduler::release_held(&mut held, &mut pending, engine);
+    assert!(pending.items.iter().all(|item| matches!(item, QueuedItem::Launch(launch) if launch.solo)));
+    assert!(unsettled(&pending));
+    // One refused alone again fails, alone.
+    let alone = refused_batch(&[4], &[2057]);
+    let completion = alone.requests[0].completion.clone();
+    let mut flight = VecDeque::from([alone]);
+    retire(&mut flight, &mut held, &mut refused_once);
+    assert!(held.is_empty());
+    assert!(completion.is_settled(), "the one the engine still refuses alone fails");
+}
+
 #[test]
 fn worker_every_case() {
+    a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none();
+    a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with();
     a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
     a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
     a_launch_waits_for_the_copy_queued_ahead_of_it();
