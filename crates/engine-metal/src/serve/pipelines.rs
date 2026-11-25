@@ -65,10 +65,11 @@ impl Shell {
     /// the pipelines built.
     /// What decides the pipelines this load builds: the device, its OS
     /// build, this binary, the model's graph, the rungs, the token and lane
-    /// budgets, the paging and the kernels' tuning. A later boot with the
-    /// same key builds the same keys; any change and it walks again.
+    /// budgets, the paging, the step set the walk fires and what routes
+    /// among the kernels ([`routing`]). A later boot with the same key
+    /// builds the same keys; any change and it walks again.
     #[must_use]
-    pub fn pipeline_cache_key(&self) -> String {
+    pub fn pipeline_cache_key(&self, steps: &engine::StepShapes) -> String {
         let fnv = |bytes: &[u8]| {
             bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
         };
@@ -91,29 +92,17 @@ impl Shell {
             .unwrap_or_default();
         let trace = fnv(format!("{:?}", self.trace).as_bytes());
         let paging = self.paging();
-        // Every decision the profile resolves, rung by rung: the tuning's
-        // own Debug names the profile's source alone, so a decision that
-        // changed under the same source (kernel.dense measured anew at
-        // load, a user file edited) kept the key and built an earlier
-        // boot's keys, and a fire met a kernel that list did not hold.
-        let decisions: String = self
-            .tuning
-            .profile()
-            .entries()
-            .map(|(spec, rungs, _)| format!("{}={rungs:?};", spec.id))
-            .collect();
         let shape = format!(
-            "{:?}|{:?}|{}:{}:{}|{:?}|{:016x}",
+            "{:?}|{:?}|{}:{}:{}|{steps:?}|{}",
             self.arena.rung_tokens(),
             self.budgets.tokens,
             paging.page_size,
             paging.pages_per_slot,
             paging.context(),
-            self.tuning,
-            fnv(decisions.as_bytes())
+            routing(&self.tuning, self.device.family()),
         );
         format!(
-            "metal-pipelines-1|{}|{os}|{binary}|{trace:016x}|{:016x}",
+            "metal-pipelines-2|{}|{os}|{binary}|{trace:016x}|{:016x}",
             self.device.name(),
             fnv(shape.as_bytes())
         )
@@ -516,5 +505,48 @@ impl Shell {
             });
         }
         Ok((fires, self.pipelines.compiled() - before))
+    }
+}
+
+/// What routes a load's fires among the kernels, as text: every decision the
+/// profile resolves, rung by rung (a source's name does not tell a decision
+/// that changed under it), and the facts that route beside them. Not the
+/// tuning's Debug: it holds the dense picks read so far, in no order.
+fn routing(tuning: &kernels_metal::Tuning, family: u32) -> String {
+    let decisions: String = tuning
+        .profile()
+        .entries()
+        .map(|(spec, rungs, _)| format!("{}={rungs:?};", spec.id))
+        .collect();
+    format!(
+        "wide {} cores {:?} family {family} {decisions}",
+        tuning.wide_range(),
+        tuning.cores()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::routing;
+
+    /// A load's routing text is its decisions', whatever dense picks its
+    /// fires have read; a changed decision or fact is another text.
+    #[test]
+    fn the_routing_text_is_the_decisions_alone() {
+        let told = |overrides: &str, wide: bool, reads: &[(u32, u32, u32)]| {
+            let tuning = crate::chip::tuning(overrides, wide);
+            for &(rows, n, k) in reads {
+                let _ = tuning.dense(rows, n, k);
+            }
+            routing(&tuning, 9)
+        };
+        let reads: Vec<(u32, u32, u32)> = (1..40).map(|rows| (rows, 1024, 1024)).collect();
+        let backwards: Vec<_> = reads.iter().rev().copied().collect();
+        let plain = told("", false, &[]);
+        assert_eq!(plain, told("", false, &reads));
+        assert_eq!(plain, told("", false, &backwards));
+        assert_ne!(plain, told("", true, &[]));
+        assert_ne!(plain, told("[kernel]\nmoe.path = \"mpp\"", false, &[]));
+        assert_ne!(plain, routing(&crate::chip::tuning("", false), 10));
     }
 }
