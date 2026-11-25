@@ -23,7 +23,7 @@ fn served(parked: bool) -> (Vec<Vec<f32>>, u64, u64, u64) {
         .engine
         .shell_mut()
         .expect("a loaded model has its shell")
-        .wait_loaded();
+        .load_parked_programs();
     let live = model.engine.live();
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);

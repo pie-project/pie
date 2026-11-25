@@ -47,7 +47,7 @@ fn loaded_only() -> u64 {
         .engine
         .shell_mut()
         .expect("a loaded model has its shell");
-    shell.wait_loaded();
+    shell.load_parked_programs();
     shell.trace_records().2
 }
 

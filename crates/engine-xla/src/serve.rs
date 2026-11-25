@@ -311,6 +311,7 @@ pub(crate) struct LoadWidth {
 pub(crate) struct Behind {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    begun: bool,
 }
 
 impl Drop for Behind {

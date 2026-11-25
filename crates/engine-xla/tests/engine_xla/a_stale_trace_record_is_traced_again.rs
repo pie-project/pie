@@ -24,7 +24,7 @@ pub(crate) fn served(
         .engine
         .shell_mut()
         .expect("a loaded model has its shell")
-        .wait_loaded();
+        .load_parked_programs();
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let mut seq = Seq::new(0);
