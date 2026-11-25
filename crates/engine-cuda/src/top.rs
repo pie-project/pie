@@ -229,9 +229,8 @@ pub fn choose(
     ) -> std::result::Result<engine::roofline::Constants, &'static str>,
     device: &str,
     counts: &Counts,
-) -> Result<(TopRung, engine::load::FireEstimate)> {
+) -> std::result::Result<(TopRung, engine::load::FireEstimate), engine::load::Refused> {
     engine::load::choose_shaped(rungs, live, context, rates, device, counts, shape)
-        .map_err(|refused| Fault::Card(refused.to_string()))
 }
 
 #[cfg(test)]
