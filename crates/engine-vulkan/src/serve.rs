@@ -280,7 +280,7 @@ impl Serve for Api {
             device,
             tuning,
             boot.profiles.as_deref(),
-            crate::rates::stated_submit_bound(),
+            <Self as Serve>::submit_bound(boot),
             shapes,
             model_bytes,
             top_rows,

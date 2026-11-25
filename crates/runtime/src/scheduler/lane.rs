@@ -958,6 +958,10 @@ pub(crate) fn open_behind() {
         lanes = lanes.len(),
         "behind serving: ready; each engine lane turned once to take up its behind work"
     );
+    drop(lanes);
+    // A pipeline that closed before ready (the load's warm run) turned no
+    // lane, and its grace may still hold the turn above off.
+    turn_behind_after();
 }
 
 /// The times an engine lane found nothing queued and stayed awake: a fire
@@ -1266,8 +1270,8 @@ impl Lane {
             if !BEHIND_SAID_LIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::info!(
                     engine_idx,
-                    "behind serving: waiting: a process has work outstanding (behind work runs \
-                     only once none has)"
+                    "behind serving: waiting: a process has work outstanding, the last one's grace \
+                     is not spent, or a waiter is short of a slot"
                 );
             }
             return None;
@@ -2893,6 +2897,28 @@ mod behind_tests {
         assert!(sliced.is_none(), "no slice while a process has work outstanding");
         assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 0);
         drop(live);
+    }
+
+    /// A pipeline that closed just before ready (the load's warm run) turned
+    /// no lane: ready turns each lane again once its grace is spent, so an
+    /// idle server takes up its behind work.
+    #[test]
+    fn ready_turns_the_lanes_again_after_the_warm_run_s_grace() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        BEHIND_OPEN.store(false, Relaxed);
+        BEHIND_PENDING.store(true, Relaxed);
+        note_step(60_000_000);
+        drop(crate::pipeline::Pipeline::new());
+        let (tx, rx) = crate::rt::channel::unbounded();
+        LANES.lock().unwrap().push(tx);
+        let opened = crate::pipeline::opened();
+        open_behind();
+        assert!(matches!(rx.try_recv(), Ok(LaneRequest::Behind)), "ready's own turn");
+        let again = rx.recv_timeout(std::time::Duration::from_secs(30));
+        if crate::pipeline::none_active() && crate::pipeline::opened() == opened {
+            assert!(matches!(again, Ok(LaneRequest::Behind)), "the turn after the grace");
+        }
     }
 
     /// After the last pipeline closes, behind work waits a grace of the

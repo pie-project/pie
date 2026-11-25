@@ -912,6 +912,9 @@ struct Trial {
     idle_before: bool,
     /// The longest fire of the range so far, ns (the warm round's too).
     seen_ns: Option<f64>,
+    /// One decode step of the load timed, nothing weighed: what bounds the
+    /// other points where the 1-row range was decided by an earlier load.
+    reference: bool,
 }
 
 /// What a range's weighing found to open ([`Shell::open_trial`]).
@@ -3863,6 +3866,13 @@ impl<B: Serve> Shell<B> {
         seats: Option<&[engine::BehindSeat]>,
     ) -> Result<bool> {
         let Some(mut trial) = behind.trial.take() else {
+            // No point past one row fires before one decode step of this
+            // load is known: where the 1-row range needs no weighing (an
+            // earlier load decided it), that step is timed alone.
+            if behind.decode_ns.is_none() && behind.left.front().is_some_and(|&(_, top)| top > 1) {
+                behind.trial = Some(self.reference_trial(&behind.standing));
+                return Ok(true);
+            }
             let Some((bottom, top)) = behind.left.pop_front() else {
                 return Ok(false);
             };
@@ -3886,6 +3896,11 @@ impl<B: Serve> Shell<B> {
                 discarded = ?behind.discarded,
                 "dense settle behind serving: a point discarded ({why}); fired again later"
             );
+        }
+        if trial.reference && let Some(&ns) = trial.samples[0].last() {
+            behind.decode_ns = Some(ns);
+            behind.last_range = Some((1, ns));
+            return Ok(!behind.left.is_empty());
         }
         if trial.round <= trial.limit {
             behind.trial = Some(trial);
@@ -4064,7 +4079,33 @@ impl<B: Serve> Shell<B> {
             built_before: B::compiled(&self.pipelines),
             idle_before: crate::backend::Context::idle(&self.device),
             seen_ns: None,
+            reference: false,
         }))
+    }
+
+    /// One decode step of the load as it serves, timed once
+    /// ([`Trial::reference`]).
+    fn reference_trial(&self, standing: &crate::dense::Dense) -> Trial {
+        Trial {
+            bottom: 1,
+            top: 1,
+            samples: vec![Vec::new()],
+            options: vec![standing.clone()],
+            taking: vec![None],
+            estimates: Vec::new(),
+            fire_lanes: 1,
+            per_lane: 1,
+            round: 0,
+            limit: crate::rates::REPEATS,
+            last_spread: f64::INFINITY,
+            next: 0,
+            clock: None,
+            host_clock: false,
+            built_before: B::compiled(&self.pipelines),
+            idle_before: crate::backend::Context::idle(&self.device),
+            seen_ns: None,
+            reference: true,
+        }
     }
 
     /// One fire of `trial`'s next option, on fresh seats and timed to its
