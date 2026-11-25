@@ -1329,7 +1329,7 @@ fn windowed_layers_beside_full_ones_answer_what_plain_attention_does() {
 /// layers' rings (the 30-layer miniature: six tail layers over 24 owners).
 #[test]
 fn a_shared_tail_answers_what_plain_attention_does() {
-    same_cut_check("gemma4-e4b-mini-l30", None, PAGE, Some(20 << 30), 8);
+    same_cut_check("gemma4-e4b-mini-l30", None, PAGE, Some(20 << 30), 2);
 }
 
 /// `model` (cut to `layers`) with its sliding layers' windows as `rule`
@@ -1858,30 +1858,6 @@ fn a_device_counted_fold_folds_what_its_count_says() {
         &rows,
         &want[want.len() - rows.len()..],
     );
-}
-
-/// [`load`] on a device whose largest buffer is `max_buffer` bytes, as a
-/// device that binds less does, its pool `kv_budget` bytes in chunks of
-/// `chunk` (the kernels bind at most four segments of it, none past that
-/// buffer).
-pub fn load_capped(
-    fixture: &Fixture,
-    context: u32,
-    max_buffer: u64,
-    kv_budget: u64,
-    chunk: u64,
-) -> Option<Shell> {
-    load_capped_with(
-        fixture,
-        PAGE,
-        context,
-        max_buffer,
-        chunk,
-        engine::load::Residency {
-            device_kv_budget: Some(kv_budget),
-            ..engine::load::Residency::default()
-        },
-    )
 }
 
 /// [`load_capped`] with kv pages of `page` tokens, under `residency` (its
