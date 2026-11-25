@@ -81,6 +81,8 @@ pub struct Context {
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     cublas: *mut c_void,
     ctx: Ctx,
+    /// Where the ranks of a tensor-parallel group agree (`Comm::quiet`).
+    quiet: Option<&'static crate::ep::Quiet>,
     side: Vec<Side>,
     conditional: Option<Side>,
     events: Vec<crate::device::graph::Event>,
@@ -233,6 +235,7 @@ impl Context {
                     swap,
                     cublas,
                     ctx,
+                    quiet: comm.and_then(crate::comm::Comm::quiet),
                     slabs,
                     side: Vec::new(),
                     conditional: None,
@@ -259,6 +262,11 @@ impl Context {
     #[must_use]
     pub fn ctx(&self) -> &Ctx {
         &self.ctx
+    }
+
+    #[must_use]
+    pub fn quiet(&self) -> Option<&'static crate::ep::Quiet> {
+        self.quiet
     }
 
     #[must_use]
