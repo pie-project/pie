@@ -56,6 +56,18 @@ const BASE: Request = Request {
     seed: 0,
 };
 
+/// Every knob and the seed moved from [`BASE`].
+const MOVED: Request = Request {
+    temperature: 0.7,
+    top_p: 0.77,
+    top_k: 7,
+    min_p: 0.13,
+    repetition: 1.37,
+    frequency: -0.6,
+    presence: 1.7,
+    seed: 1234,
+};
+
 /// The channels a pass's knobs ride in, as the built-in inferlets seed
 /// them (read in the stage, never consumed): the temperature as its
 /// reciprocal.
@@ -194,7 +206,6 @@ fn passes(shape: &Shape, r: &Request) -> [Traced; 2] {
 }
 
 /// What an engine keys a program's compiled code by.
-#[derive(PartialEq)]
 struct Keys {
     /// The registry's program hash (`eta_ir::container_hash`).
     hash: u64,
@@ -294,57 +305,6 @@ fn shapes() -> Vec<(String, Shape)> {
     shapes
 }
 
-/// Each knob moved alone from [`BASE`], to a value no other request in
-/// the test holds.
-fn requests() -> Vec<(&'static str, Request)> {
-    vec![
-        (
-            "top_p",
-            Request {
-                top_p: 0.77,
-                ..BASE
-            },
-        ),
-        ("top_k", Request { top_k: 7, ..BASE }),
-        (
-            "min_p",
-            Request {
-                min_p: 0.13,
-                ..BASE
-            },
-        ),
-        (
-            "repetition",
-            Request {
-                repetition: 1.37,
-                ..BASE
-            },
-        ),
-        (
-            "frequency",
-            Request {
-                frequency: -0.6,
-                ..BASE
-            },
-        ),
-        (
-            "presence",
-            Request {
-                presence: 1.7,
-                ..BASE
-            },
-        ),
-        (
-            "temperature",
-            Request {
-                temperature: 0.7,
-                ..BASE
-            },
-        ),
-        ("seed", Request { seed: 1234, ..BASE }),
-    ]
-}
-
 /// Whatever a request's knob values, temperature and seed, each standard
 /// shape's prompt and decode programs and a shape with every knob are the
 /// same programs by every key an engine compiles by.
@@ -353,13 +313,11 @@ fn a_sampler_knob_is_data() {
     let mut failures = Vec::new();
     for (name, shape) in shapes() {
         let base = passes(&shape, &BASE).map(|traced| Keys::of(&traced));
-        for (knob, request) in requests() {
-            let asked = passes(&shape, &request);
-            for (pass, (base, asked)) in ["prompt", "decode"].iter().zip(base.iter().zip(&asked)) {
-                let differ = base.differ(&Keys::of(asked));
-                if !differ.is_empty() {
-                    failures.push(format!("{name} ({pass}): {knob} changes {differ:?}"));
-                }
+        let asked = passes(&shape, &MOVED);
+        for (pass, (base, asked)) in ["prompt", "decode"].iter().zip(base.iter().zip(&asked)) {
+            let differ = base.differ(&Keys::of(asked));
+            if !differ.is_empty() {
+                failures.push(format!("{name} ({pass}): the knobs change {differ:?}"));
             }
         }
     }

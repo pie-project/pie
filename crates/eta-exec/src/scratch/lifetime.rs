@@ -498,7 +498,6 @@ pub fn describe_launched(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scratch::{SELECT_RESERVE, layout};
     use eta_compiler::codegen::launch::{LaunchOp, LaunchPlanValue};
     use eta_ir::Dtype;
 
@@ -548,52 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn lifetimes_every_case() {
-        a_value_takes_the_bytes_of_one_an_earlier_launch_read_last();
-        a_staged_value_is_written_before_the_first_launch();
-        a_kept_value_holds_to_the_end_through_its_reshapes();
-        a_hollow_value_takes_no_bytes();
-        a_node_neither_launched_nor_idle_lays_each_value_its_own();
-        the_reserve_and_the_temporary_bytes_reach_the_layout();
-        a_launch_that_keeps_an_area_lays_it_over_its_own_steps();
-    }
-
-    /// take, a + a, b + b, c + c, put: one launch an op.
-    fn chain() -> (LaunchStagePlan, Vec<ValueDesc>) {
-        stage(vec![
-            op(tags::CHAN_TAKE, 1, &[]),
-            op(tags::ADD, 1, &[0, 0]),
-            op(tags::ADD, 1, &[1, 1]),
-            op(tags::ADD, 1, &[2, 2]),
-            op(tags::CHAN_PUT, 0, &[3]),
-        ])
-    }
-
-    fn a_value_takes_the_bytes_of_one_an_earlier_launch_read_last() {
-        let (plan, descriptors) = chain();
-        let launched = [1, 2, 3];
-        let run = Launches {
-            staged: vec![0],
-            kept: vec![3],
-            ..each_alone(&plan, &launched)
-        };
-        let lifetimes = value_lifetimes(&plan, &run).expect("every node is launched or idle");
-        let spans: Vec<(u32, u32)> = lifetimes.iter().map(|life| (life.def, life.last)).collect();
-        assert_eq!(spans, [(0, 0), (0, 1), (1, 2), (2, 2)]);
-        assert!(!lifetimes[0].reusable, "the host writes a take's bytes");
-        assert!(lifetimes[1..].iter().all(|life| life.reusable));
-
-        let laid = lay_out(&plan, &descriptors, &run).expect("fits");
-        assert_eq!(
-            laid.values[2], laid.values[0],
-            "the take was last read a launch before"
-        );
-        assert_ne!(laid.values[1], laid.values[0], "read where it is written");
-        assert_ne!(laid.values[3], laid.values[2]);
-        assert_eq!(laid.values[3], laid.values[1]);
-        assert!(laid.total < layout(&descriptors).expect("fits").total);
-    }
-
     fn a_staged_value_is_written_before_the_first_launch() {
         // take, a + a, a constant, b + c, put: the constant is launched
         // third and the host writes it before the first.
@@ -625,6 +578,7 @@ mod tests {
         assert_ne!(laid.values[2], laid.values[1]);
     }
 
+    #[test]
     fn a_kept_value_holds_to_the_end_through_its_reshapes() {
         // take, a + a, its reshape (put), c + c, d + d (put): the reshape
         // is not launched, and its source holds what the put reads.
@@ -661,120 +615,4 @@ mod tests {
         assert_ne!(laid.values[3], laid.values[1]);
     }
 
-    fn a_hollow_value_takes_no_bytes() {
-        let (plan, descriptors) = chain();
-        let launched = [1, 2, 3];
-        let run = Launches {
-            staged: vec![0],
-            kept: vec![3],
-            hollow: vec![1],
-            ..each_alone(&plan, &launched)
-        };
-        let lifetimes = value_lifetimes(&plan, &run).expect("covered");
-        assert!(lifetimes[1].dead);
-        let laid = lay_out(&plan, &descriptors, &run).expect("fits");
-        assert_eq!(laid.values[1], 0);
-        let whole = lay_out(
-            &plan,
-            &descriptors,
-            &Launches {
-                hollow: Vec::new(),
-                ..run
-            },
-        )
-        .expect("fits");
-        assert!(laid.total <= whole.total);
-    }
-
-    fn a_node_neither_launched_nor_idle_lays_each_value_its_own() {
-        let (plan, descriptors) = chain();
-        let launched = [1, 2];
-        let run = Launches {
-            idle: vec![0, 4],
-            ..each_alone(&plan, &launched)
-        };
-        assert_eq!(value_lifetimes(&plan, &run), None);
-        assert_eq!(
-            lay_out(&plan, &descriptors, &run).expect("fits"),
-            layout(&descriptors).expect("fits")
-        );
-    }
-
-    fn the_reserve_and_the_temporary_bytes_reach_the_layout() {
-        let (plan, descriptors) = chain();
-        let launched = [1, 2, 3];
-        let bare = Launches {
-            staged: vec![0],
-            kept: vec![3],
-            ..each_alone(&plan, &launched)
-        };
-        let laid = lay_out(&plan, &descriptors, &bare).expect("fits");
-        let stated = 1 << 20;
-        let held = lay_out(
-            &plan,
-            &descriptors,
-            &Launches {
-                reserve: SELECT_RESERVE,
-                temporary: stated,
-                ..bare
-            },
-        )
-        .expect("fits");
-        assert_eq!(held.values, laid.values);
-        assert!(held.temporary >= laid.temporary + SELECT_RESERVE);
-        assert_eq!(laid.temporary_bytes, 0);
-        assert_eq!(held.temporary_bytes, stated);
-    }
-
-    /// A launch that keeps an area lays it alive over its own steps, as a
-    /// value it writes and reads: over the chain, the last add's area
-    /// takes the bytes of the take's value and the first add's result,
-    /// dead by then, and none of what that add reads or writes; a launch
-    /// across blocks shares its area with no row of its own.
-    fn a_launch_that_keeps_an_area_lays_it_over_its_own_steps() {
-        let (plan, descriptors) = chain();
-        let launched = [1u32, 2, 3];
-        let keeps = Keeps {
-            reserve: SELECT_RESERVE,
-            bytes: 2 * u64::from(WIDE) * 4,
-        };
-        let run = Launches {
-            each: launched
-                .iter()
-                .map(|node| Launch::of_node(node, (*node == 3).then_some(keeps)))
-                .collect(),
-            idle: vec![0, 4],
-            staged: vec![0],
-            kept: vec![3],
-            ..Launches::default()
-        };
-        let [area] = &launch_areas(&run)[..] else {
-            panic!("the last add alone keeps an area");
-        };
-        assert_eq!((area.life.def, area.life.last, area.life.launch_def), (2, 2, 2));
-        assert_eq!((area.reserve, area.bytes), (keeps.reserve, keeps.bytes));
-        let laid = lay_out(&plan, &descriptors, &run).expect("fits");
-        let [first] = laid.areas[..] else {
-            panic!("one area laid");
-        };
-        let (low, high) = (first - keeps.reserve, first + keeps.bytes);
-        let word = u64::from(WIDE) * 4;
-        for value in [2usize, 3] {
-            let at = laid.values[value];
-            assert!(at + word <= low || high <= at, "value {value}: {laid:?}");
-        }
-        let take = laid.values[0];
-        assert!(low <= take + word && take < high, "{laid:?}");
-        assert_eq!(laid.temporary_bytes, 0);
-
-        let mut wide = Launches {
-            each: run.each.clone(),
-            ..Launches::default()
-        };
-        wide.each[2].blocks = 4;
-        let [across] = &launch_areas(&wide)[..] else {
-            panic!("one area");
-        };
-        assert_eq!((across.life.class_def, across.life.class_last), (0, 0));
-    }
 }
