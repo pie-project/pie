@@ -662,13 +662,6 @@ impl Shell {
             "xla warm ladder compiled"
         );
         self.laddered = fired > 0;
-        // The parked programs load now, before ready, in the order serving
-        // meets them, while the host holds them beside the guest compiles'
-        // room; those past it stay parked, each loaded by its shape's first
-        // fire. Loading them behind serving instead put every early fire on
-        // a load (v6e Qwen3.5 c64 at ready: 3.4k tok/s, 11.2k two minutes on).
-        self.load_behind();
-        self.wait_loaded();
         Ok(fired)
     }
 
@@ -911,9 +904,19 @@ impl Shell {
         }
     }
 
-    /// Waits for the programs loading behind serving: every parked program
-    /// the host holds room for is loaded once it returns.
-    pub fn wait_loaded(&mut self) {
+    /// Loads the parked programs the host holds room for, in the order
+    /// serving meets them; the rest stay parked, each loaded by its shape's
+    /// first fire. Before ready, and after the standard samplers' guest
+    /// stages are built (`Programs::prewarm`): the host's free memory then
+    /// has them in it, and their largest measured peak is what stays free
+    /// for a later registration's (v6e Qwen3.5 on a fresh cache, the load
+    /// first: 370 programs took the host, then the stages' compiles took the
+    /// process past its cgroup's cap before ready).
+    pub fn load_parked_programs(&mut self) {
+        if !self.behind.begun {
+            self.behind.begun = true;
+            self.load_behind();
+        }
         if let Some(handle) = self.behind.handle.take() {
             let _ = handle.join();
         }

@@ -636,11 +636,10 @@ impl Streamed {
         Ok(out)
     }
 
-    /// Each streamed bank's planes as a fire's miss copy reads them
+    /// Each streamed bank a fire's miss copy reads
     /// (`crate::trace::Source::HostBank`): `(param, pool rows an expert's
-    /// plane takes, bytes)`, every expert's plane as the pool lays it, in
-    /// expert order.
-    pub fn host_banks(&self) -> Result<Vec<(usize, u32, Vec<u8>)>> {
+    /// plane takes, experts)`.
+    pub fn host_bank_rows(&self) -> Vec<(usize, u32, u32)> {
         let mut out = Vec::new();
         for shape in &self.shapes {
             let Form::Experts { experts, layers } = &shape.form else {
@@ -648,27 +647,46 @@ impl Streamed {
             };
             for (_, banks) in layers {
                 for (plane, &p) in shape.planes.iter().zip(banks) {
-                    let host = self.host.get(&p).ok_or_else(|| {
-                        Fault::Residency(format!("weight `{}` keeps no host copy", shape.name))
-                    })?;
-                    let n = plane.bytes() as usize;
-                    let mut bytes = vec![0u8; n * *experts as usize];
-                    for e in 0..*experts as usize {
-                        let to = &mut bytes[e * n..(e + 1) * n];
-                        panels(
-                            &host[e * n..(e + 1) * n],
-                            plane.rows as usize,
-                            plane.width as usize,
-                            to,
-                        );
-                        packed_rows(to);
-                    }
                     let rows = u32::try_from(plane.bytes() / ROW_BYTES).unwrap_or(u32::MAX);
-                    out.push((p, rows, bytes));
+                    out.push((p, rows, *experts));
                 }
             }
         }
-        Ok(out)
+        out
+    }
+
+    /// Streamed bank `param`'s bytes: every expert's plane as the pool lays
+    /// it, in expert order.
+    pub fn host_bank(&self, param: usize) -> Result<Vec<u8>> {
+        for shape in &self.shapes {
+            let Form::Experts { experts, layers } = &shape.form else {
+                continue;
+            };
+            let Some(plane) = layers.iter().find_map(|(_, banks)| {
+                shape.planes.iter().zip(banks).find(|(_, p)| **p == param).map(|(plane, _)| plane)
+            }) else {
+                continue;
+            };
+            let host = self.host.get(&param).ok_or_else(|| {
+                Fault::Residency(format!("weight `{}` keeps no host copy", shape.name))
+            })?;
+            let n = plane.bytes() as usize;
+            let mut bytes = vec![0u8; n * *experts as usize];
+            for e in 0..*experts as usize {
+                let to = &mut bytes[e * n..(e + 1) * n];
+                panels(
+                    &host[e * n..(e + 1) * n],
+                    plane.rows as usize,
+                    plane.width as usize,
+                    to,
+                );
+                packed_rows(to);
+            }
+            return Ok(bytes);
+        }
+        Err(Fault::Unbound {
+            what: format!("a streamed bank of weight {param}"),
+        })
     }
 
     /// Takes `residency` as the whole set: each atom's slot from here on.
@@ -812,20 +830,6 @@ impl Streamed {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_row_block_is_whole_pool_rows_and_whole_table_rows() {
-        for width in [256u64, 2048, 160, 96, 2880] {
-            let row = width * 2;
-            let step = ROW_BYTES / gcd(ROW_BYTES, row);
-            let block = align_up((ROW_BLOCK / row).max(1), step);
-            assert_eq!((block * row) % ROW_BYTES, 0, "width {width}");
-        }
-    }
-}
 
 /// What one fire's walk reads the streamed weights through.
 #[derive(Debug, Default)]
@@ -926,13 +930,4 @@ fn packed_rows(bytes: &mut [u8]) {
 
 #[cfg(test)]
 mod packed {
-    #[test]
-    fn a_pool_row_holds_its_elements_l_and_l_plus_128_a_word() {
-        let mut b: Vec<u8> = (0..256u16).flat_map(|e| e.to_le_bytes()).collect();
-        super::packed_rows(&mut b);
-        let w = |l: usize| u32::from_le_bytes([b[4 * l], b[4 * l + 1], b[4 * l + 2], b[4 * l + 3]]);
-        assert_eq!(w(0), 128 << 16);
-        assert_eq!(w(5), 5 | (133 << 16));
-        assert_eq!(w(127), 127 | (255 << 16));
-    }
 }

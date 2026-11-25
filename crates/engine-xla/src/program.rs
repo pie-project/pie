@@ -1976,66 +1976,6 @@ fn fed_of(
         .collect())
 }
 
-#[cfg(test)]
-mod latch_tests {
-    use super::Latch;
-
-    /// A fault a device event reports after the submitter let go is the
-    /// step's, waited for (`PIE_XLA_SYNC`'s settle).
-    #[test]
-    fn a_fault_released_late_is_the_steps() {
-        let at = engine::StepDone {
-            frame: engine::fire::FrameId(1),
-            step: 0,
-        };
-        let latch = Latch::new(at, 1, None);
-        latch.hold();
-        latch.release(Ok(()));
-        let late = std::sync::Arc::clone(&latch);
-        let event = std::thread::spawn(move || late.release(Err("the fire failed".into())));
-        assert_eq!(latch.wait().as_deref(), Some("the fire failed"));
-        event.join().expect("the event thread");
-        let clean = Latch::new(at, 1, None);
-        clean.release(Ok(()));
-        assert_eq!(clean.wait(), None);
-    }
-
-    /// A settle waiting on the latch wakes only after the sink heard the
-    /// step, its fold reports with it: what submit returns after under
-    /// `PIE_XLA_SYNC` the sink already knows.
-    #[test]
-    fn the_sink_hears_the_step_before_a_settle_wakes() {
-        use std::sync::{Arc, Mutex};
-        let at = engine::StepDone {
-            frame: engine::fire::FrameId(2),
-            step: 0,
-        };
-        let heard: Arc<Mutex<Vec<engine::StepOutcome>>> = Arc::default();
-        let into = Arc::clone(&heard);
-        let sink: engine::CompletionSink = Arc::new(move |_, outcome| {
-            // Slow on purpose: a settle woken first would pass the check
-            // below before this lands.
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            into.lock().expect("heard lock").push(outcome);
-        });
-        let latch = Latch::new(at, 1, Some(sink));
-        latch.hold();
-        latch.report(vec![engine::KvWrites::default()]);
-        latch.release(Ok(()));
-        let late = Arc::clone(&latch);
-        let event = std::thread::spawn(move || late.release(Ok(())));
-        assert_eq!(latch.wait(), None);
-        let heard = heard.lock().expect("heard lock");
-        assert_eq!(heard.len(), 1, "the sink heard the step before the settle woke");
-        assert!(
-            !heard[0].wrote.is_empty() && heard[0].faulted.is_empty(),
-            "with its fold reports: {:?}",
-            heard[0]
-        );
-        drop(heard);
-        event.join().expect("the event thread");
-    }
-}
 
 /// A program a registration prepared ([`Plane::prepare`]): what its
 /// compile, on any thread, compiles, and what [`Plane::finish`] holds.

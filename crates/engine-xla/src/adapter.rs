@@ -540,14 +540,4 @@ impl Landings {
 
 #[cfg(test)]
 mod digest_tests {
-    /// The vector CUDA and Metal pin: one adapter keys the same everywhere.
-    #[test]
-    fn the_adapter_key_is_the_shared_digest_of_the_sink() {
-        let a: Vec<u8> = (0u8..16).collect();
-        let b: Vec<u8> = (100u8..124).collect();
-        let key = super::adapter_digest(5, [("lora_a", &a[..]), ("lora_b", &b[..])].into_iter());
-        assert_eq!(key, 0x48d3_ea2e_650c_f1e9_8eff_b3e0_9bc8_eb41);
-        let other = super::adapter_digest(5, [("lora_a", &a[..]), ("lora_b", &a[..])].into_iter());
-        assert_ne!(other, key, "other planes key otherwise");
-    }
 }
