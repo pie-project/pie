@@ -924,6 +924,11 @@ impl engine::Programs for Xla {
             s = started.elapsed().as_secs_f64(),
             "xla standard samplers' guest stages compiled before ready"
         );
+        // and now the programs: what the stages hold and the most one took
+        // to compile are known
+        if let Some(shell) = self.shell.as_mut() {
+            shell.load_parked_programs();
+        }
         Ok(())
     }
 
