@@ -865,6 +865,18 @@ mod tests {
         rig.router.placement(req).0
     }
 
+    /// The row it is given: past the gate's bound a launch goes without one.
+    async fn row_of(rig: &Rig, req: &Request) -> Vec<WorkerId> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(row) = placed_on(rig, req) {
+                return row;
+            }
+            assert!(Instant::now() < deadline, "no row");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     async fn until_placed(rig: &Rig, req: &Request, want: Option<Vec<WorkerId>>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while placed_on(rig, req) != want {
@@ -941,7 +953,7 @@ mod tests {
         let first = async |req: u64, connection: u64, named: Option<&str>| {
             let (turn, facts) = turn(req, connection, named);
             rig.router.admit(&turn, facts, &rig.routing).await.unwrap();
-            let row = placed_on(&rig, &turn).expect("a row");
+            let row = row_of(&rig, &turn).await;
             rig.router.exited(&turn, Outcome::Completed);
             row[0]
         };
@@ -1010,12 +1022,13 @@ mod tests {
             .await
             .expect("not held")
             .unwrap();
-            assert_eq!(placed_on(&rig, &turn), Some(vec![WorkerId(2)]));
+            until_placed(&rig, &turn, Some(vec![WorkerId(2)])).await;
         }
 
         let rig = self::rig(0).await;
         let turn = launch(1, serde_json::json!({"to": "1"}));
         rig.router.admit(&turn, tied, &rig.routing).await.unwrap();
+        until_placed(&rig, &turn, Some(vec![WorkerId(1)])).await;
         let backend = crate::RouteBackend {
             routing: rig.routing.clone(),
             workers: crate::worker::WorkerRegistry::new(),

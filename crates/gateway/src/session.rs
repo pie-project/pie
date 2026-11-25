@@ -355,17 +355,18 @@ impl Inner {
         }
     }
 
-    /// A chunk of an upload, to every worker of `to`: a program is launched
-    /// on whichever worker a launch is placed on, so each of them takes it.
-    /// The client is answered once, when each worker still there has: one
-    /// lost meanwhile is left out, and one that refuses the program fails
-    /// the upload, by name. `to` is left with the workers that have the
-    /// upload whole so far.
+    /// A frame about a program (a chunk of its upload, or whether it is
+    /// installed), to every worker of `to`: a program is launched on
+    /// whichever worker a launch is placed on, so it is there when each of
+    /// them has it. The client is answered once, when each worker still
+    /// there has: one lost meanwhile is left out, one that refuses an upload
+    /// fails it, by name, and one without the program answers for all. `to`
+    /// is left with the workers that took the frame.
     #[allow(
         clippy::too_many_arguments,
         reason = "one turn's whole context, as its session has it"
     )]
-    async fn upload(
+    async fn everywhere(
         self: &Arc<Self>,
         session: SessionId,
         tenant: &TenantId,
@@ -431,6 +432,7 @@ impl Inner {
         let reqs = taken.iter().map(|(_, req_id, _)| *req_id).collect();
         let (tx, rx) = mpsc::channel(self.pipe_cap);
         let several = workers.len() > 1;
+        let upload = upload_of(&input.message).is_some();
         tokio::spawn(async move {
             let mut accepted = None;
             let mut refused = None;
@@ -438,13 +440,17 @@ impl Inner {
             for (worker, _, rx) in taken {
                 match answer_of(rx).await {
                     Ok(Some((false, why))) if refused.is_none() => {
-                        refused = Some(if several {
+                        refused = Some(if several && upload {
                             format!("worker {} refused the program: {why}", worker.0)
                         } else {
                             why
                         });
                     }
-                    Ok(Some((true, result))) => accepted = Some(result),
+                    // One worker without it: not installed.
+                    Ok(Some((true, result))) if upload || result != "true" => {
+                        accepted = Some(result);
+                    }
+                    Ok(Some((true, result))) => accepted = accepted.or(Some(result)),
                     Ok(_) => kept = true,
                     Err(()) => to.lock().unwrap().retain(|w| *w != worker),
                 }
@@ -873,20 +879,11 @@ impl SessionHandle {
                 to
             }
             .unwrap_or_else(|| Arc::new(Mutex::new(self.inner.router.eligible())));
-            let (reqs, rx) = self
-                .inner
-                .upload(
-                    self.session,
-                    &self.tenant,
-                    &self.user,
-                    next,
-                    corr_id,
-                    to,
-                    &self.open,
-                )
-                .await?;
-            self.current.lock().unwrap().extend(reqs);
-            return Ok(rx);
+            return self.everywhere(next, corr_id, to).await;
+        }
+        if let ClientMessage::CheckProgram { corr_id, .. } = next.message {
+            let to = Arc::new(Mutex::new(self.inner.router.eligible()));
+            return self.everywhere(next, corr_id, to).await;
         }
         let handles = next.message.uses_handles();
         let pinned = if handles {
@@ -910,6 +907,28 @@ impl SessionHandle {
             *self.holds_handles.lock().unwrap() = Some(worker);
         }
         self.current.lock().unwrap().push(req_id);
+        Ok(rx)
+    }
+
+    async fn everywhere(
+        &self,
+        input: TurnInput,
+        corr_id: u32,
+        to: Arc<Mutex<Vec<WorkerId>>>,
+    ) -> Result<TokenRx, SessionError> {
+        let (reqs, rx) = self
+            .inner
+            .everywhere(
+                self.session,
+                &self.tenant,
+                &self.user,
+                input,
+                corr_id,
+                to,
+                &self.open,
+            )
+            .await?;
+        self.current.lock().unwrap().extend(reqs);
         Ok(rx)
     }
 
@@ -1545,6 +1564,45 @@ mod tests {
             }
             assert!(matches!(rx.recv().await, Some(Tokens::Eos)));
             assert_eq!(router.dispatched.lock().unwrap().len(), 6, "run once each");
+        }
+    }
+
+    /// A program is installed when every worker a launch may run on has it.
+    #[tokio::test]
+    async fn a_program_one_worker_lacks_is_not_installed() {
+        for (answers, installed) in [
+            (["true", "false"], "false"),
+            (["false", "true"], "false"),
+            (["true", "true"], "true"),
+        ] {
+            let router = MockRouter::new(Some(WorkerId(1)));
+            *router.eligible.lock().unwrap() = vec![WorkerId(1), WorkerId(2)];
+            let sessions = Sessions::new(router.clone());
+            let check = TurnInput {
+                message: ClientMessage::CheckProgram {
+                    corr_id: 9,
+                    inferlet: "p".into(),
+                },
+                ..input()
+            };
+            let (_h, mut rx) = sessions.connect(ident(), check).await.unwrap();
+            let reqs = router.dispatched.lock().unwrap().clone();
+            assert_eq!(reqs.len(), 2);
+            for (req, result) in reqs.into_iter().zip(answers) {
+                let said = Tokens::Chunk(ServerMessage::Response {
+                    corr_id: 9,
+                    ok: true,
+                    result: result.into(),
+                });
+                sessions.feed(req, said).await;
+                sessions.feed(req, Tokens::Eos).await;
+            }
+            let Some(Tokens::Chunk(ServerMessage::Response { result, .. })) = rx.recv().await
+            else {
+                panic!("an answer");
+            };
+            assert_eq!(result, installed);
+            assert!(matches!(rx.recv().await, Some(Tokens::Eos)));
         }
     }
 
