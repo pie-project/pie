@@ -1174,6 +1174,17 @@ fn a_record_in_pieces_serves_the_same_logits() {
     );
 }
 
+/// A model with a compressed kv pool: its compressor state, rows of the list
+/// slots it describes, moves with the slots an evacuation moves.
+/// Ignored: dsv4-flash-mini does not serve here, before the pool as after
+/// (before it, its side planes overran a binding; now its index top-k
+/// refuses the index pool's pitch).
+#[test]
+#[ignore = "dsv4-flash-mini does not serve on this backend"]
+fn a_scattered_compressed_pool_serves_the_same_logits() {
+    scattered("dsv4-flash-mini");
+}
+
 /// A lane folding every row it brings this fire (`Lane::window` of a
 /// windowed load; `None` elsewhere): its buffer table starts at the folded
 /// index after the fire, and the fire leaves no row in it.
