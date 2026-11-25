@@ -71,6 +71,15 @@ fn session_of(process: &snapshot::Process) -> Option<String> {
     })
 }
 
+/// The worker a process's client names (hint `worker`, its number).
+pub fn named(process: &snapshot::Process) -> Option<WorkerId> {
+    match hint(&process.id, "worker")? {
+        Value::Int(number) => Some(number.to_string()),
+        Value::Text(name) => Some(name),
+        _ => None,
+    }
+}
+
 /// Where `session` ranks `worker` (rendezvous hashing: FNV-1a over both,
 /// mixed): the highest is its worker. One that joins or leaves moves only
 /// the sessions it ranks first for.

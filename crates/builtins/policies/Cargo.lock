@@ -138,6 +138,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin"
+version = "0.1.0"
+dependencies = [
+ "cluster-defaults",
+ "plex",
+]
+
+[[package]]
 name = "plex"
 version = "1.1.0"
 dependencies = [

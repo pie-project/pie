@@ -4,5 +4,6 @@ mod deadline;
 mod defaults;
 mod fair;
 mod keep_session;
+mod pin;
 mod priority;
 mod rig;

@@ -15,6 +15,7 @@ members = [
     "fair",
     "keep-session",
     "noop",
+    "pin",
     "priority",
     "test-pause",
     "test-route",
