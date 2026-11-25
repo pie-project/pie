@@ -199,31 +199,6 @@ fn push_metal(
 fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
     let entry = METAL_UNNAMED;
 
-    match crate::codegen::metal::validate_singleton_plan(stage) {
-        Ok(operations) => {
-            for (region_index, meta) in operations.iter().enumerate() {
-                let source = crate::codegen::metal::emit_singleton_region(entry, meta.op.tag);
-                push_metal(
-                    out,
-                    KernelKind::Singleton,
-                    stage_index,
-                    region_index,
-                    "m1",
-                    Ok(source),
-                );
-            }
-        }
-        Err(error) => {
-            out.push(EmittedKernel::new(
-                KernelKind::Singleton,
-                stage_index,
-                0,
-                String::new(),
-                Err(error),
-            ));
-        }
-    }
-
     let fused_supported = stage.normalized.channel_bindings.len()
         <= crate::codegen::metal::METAL_M2_MAX_FUSED_CHANNELS;
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
@@ -245,17 +220,8 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         );
     }
 
-    for (region_index, region) in stage.singleton.regions.iter().enumerate() {
-        let emitted = crate::codegen::metal::emit_grouped_fused_region(entry, stage, region);
-        push_metal(
-            out,
-            KernelKind::Grouped,
-            stage_index,
-            region_index,
-            "m3s",
-            emitted,
-        );
-    }
+    // Past the singleton partition's slots, which hold no kernel: the
+    // engine asks a region's grouped form at that offset.
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
         let emitted = match grouped_library(stage, region) {
             Some(LibraryOp::NucleusSample) => {
@@ -448,5 +414,49 @@ mod tests {
             assert_eq!(entry == was, source == text, "region {at}");
         }
         assert_ne!(regions, added);
+    }
+
+    /// Metal emits what its engine asks: no singleton kernel, and a grouped
+    /// one only at a fused region's slot, past the singleton partition's.
+    #[test]
+    fn metal_emits_no_singleton_kernel() {
+        use crate::plan::compile_bound;
+        use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+        use eta_ir::op::Op;
+        use eta_ir::registry::{EngineCaps, Stage};
+        use eta_ir::types::{Dtype, Shape};
+        let decl = |host_role| ChannelDecl {
+            shape: Shape::vector(64),
+            dtype: ChanDType::Concrete(Dtype::F32),
+            capacity: 1,
+            host_role,
+            seeded: false,
+        };
+        let container = TraceContainer {
+            channels: vec![decl(HostRole::Writer), decl(HostRole::Reader)],
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::Exp(0),
+                    Op::Neg(1),
+                    Op::ChanPut { chan: 1, value: 2 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        let bound = eta_ir::validate::bind(container, vec![Vec::new()], EngineCaps::default())
+            .expect("binds");
+        let stages = compile_bound(&bound);
+        let singles = stages[0].singleton.regions.len() as u32;
+        let kernels = emit_program(Backend::Metal, &stages, &bound);
+        assert!(kernels.iter().all(|kernel| kernel.kind != KernelKind::Singleton));
+        let grouped: Vec<u32> = kernels
+            .iter()
+            .filter(|kernel| kernel.kind == KernelKind::Grouped)
+            .map(|kernel| kernel.region_index)
+            .collect();
+        let regions = stages[0].fused.regions.len() as u32;
+        assert_eq!(grouped, (singles..singles + regions).collect::<Vec<_>>());
     }
 }
