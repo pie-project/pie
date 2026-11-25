@@ -147,6 +147,9 @@ impl TurnRouter for RouteBackend {
         let worker = match preferred {
             // A placement's list: the first of it that takes the process.
             Some(Placed::List(list)) => {
+                if let Some(tied) = pinned.filter(|worker| !list.contains(worker)) {
+                    return Err(DispatchFail::Excluded(tied));
+                }
                 let mut taken = None;
                 for worker in list {
                     if pinned.is_some_and(|p| p != worker) {
@@ -161,20 +164,20 @@ impl TurnRouter for RouteBackend {
                         break;
                     }
                 }
-                taken.ok_or(DispatchFail)?
+                taken.ok_or(DispatchFail::NoWorker)?
             }
             Some(Placed::Located(at)) => {
                 self.routing
                     .dispatch_with_retry(&self.workers, req, Some(at), pinned)
                     .await
-                    .map_err(|_| DispatchFail)?
+                    .map_err(|_| DispatchFail::NoWorker)?
                     .worker_id
             }
             None => {
                 self.routing
                     .dispatch_with_retry(&self.workers, req, None, pinned)
                     .await
-                    .map_err(|_| DispatchFail)?
+                    .map_err(|_| DispatchFail::NoWorker)?
                     .worker_id
             }
         };

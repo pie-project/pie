@@ -283,6 +283,7 @@ impl Cluster {
             props,
             prompt,
             connection: facts.connection.map(|session| session.0),
+            tied: facts.tied,
         };
         if self.active() {
             self.shared
@@ -980,6 +981,54 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             req += 1;
         }
+    }
+
+    /// `default-cluster` gives a launch that can run on one worker alone
+    /// that worker, full or draining as it is; a policy that leaves it off
+    /// fails the launch, by name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tied_launch_goes_to_its_worker_or_fails_by_name() {
+        use crate::session::{DispatchFail, TurnRouter};
+
+        let rig = rig_of(0, &["default-cluster"]).await;
+        let tied = Facts {
+            tied: Some(WorkerId(2)),
+            ..Facts::default()
+        };
+        for (req, full, draining) in [(1, 0, false), (2, 255, false), (3, 0, true)] {
+            let mut now = table(0);
+            now.epoch = 1 + req;
+            now.workers[1].coarse_load.kv_pressure_bucket = full;
+            now.workers[1].coarse_load.draining = draining;
+            rig.table.send_replace(now);
+            // The policy hears the table first.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let turn = launch(req, serde_json::json!({}));
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                rig.router.admit(&turn, tied, &rig.routing),
+            )
+            .await
+            .expect("not held")
+            .unwrap();
+            assert_eq!(placed_on(&rig, &turn), Some(vec![WorkerId(2)]));
+        }
+
+        let rig = self::rig(0).await;
+        let turn = launch(1, serde_json::json!({"to": "1"}));
+        rig.router.admit(&turn, tied, &rig.routing).await.unwrap();
+        let backend = crate::RouteBackend {
+            routing: rig.routing.clone(),
+            workers: crate::worker::WorkerRegistry::new(),
+            located: Default::default(),
+            router: rig.router.clone(),
+        };
+        let failed = backend.dispatch(&turn, tied.tied).await.unwrap_err();
+        assert_eq!(failed, DispatchFail::Excluded(WorkerId(2)));
+        assert_eq!(
+            crate::session::SessionError::Excluded(WorkerId(2)).to_string(),
+            "the policy excluded worker 2, which holds this launch's session"
+        );
     }
 
     /// Under `default-cluster` a launch waits at its gateway while every

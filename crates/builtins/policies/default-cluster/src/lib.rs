@@ -16,7 +16,9 @@
 //!   nothing remembered here. A launch of no session goes least loaded
 //!   first (the worker's kv pressure, `pie/kv-pressure`, then the processes
 //!   it holds, `pie/inflight`, then its id), a process placed this round
-//!   counting on the worker it was placed at the head of. A worker that is draining or
+//!   counting on the worker it was placed at the head of. A launch that can
+//!   run on one worker alone (`pie/tied`: it holds its session's handles)
+//!   gets that one, full or draining, and waits there. Any other worker that is draining or
 //!   full ([`FULL_PRESSURE`], [`FULL_PROCESSES`]) is left off; with none
 //!   left the row is empty, which holds the process at its gateway until a
 //!   round finds room (it looks again each second while one is held). A
@@ -25,7 +27,7 @@
 //!   behind the dispatch gate: a gateway dispatches it once the policy has
 //!   heard it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use plex::prelude::*;
 
@@ -110,6 +112,10 @@ impl DefaultCluster {
     /// A row for each pending process; the rows of the rest go.
     fn place(&mut self, now: Mark) {
         let mut loads = decode_workers();
+        let known: BTreeSet<WorkerId> = snapshot::get_workers()
+            .into_iter()
+            .map(|worker| worker.id)
+            .collect();
         let processes = snapshot::get_processes();
         let mut homes: HashMap<String, WorkerId> = HashMap::new();
         for process in &processes {
@@ -131,7 +137,14 @@ impl DefaultCluster {
                 .filter(|load| !load.full())
                 .map(|load| load.id.clone())
                 .collect();
-            if let Some(session) = session_of(process) {
+            let tied = snapshot::get_attr(&Subject::Process(process.id.clone()), "pie/tied");
+            if let Some(Value::Text(tied)) = tied {
+                // Gone, it has no row: its gateway says its handles went.
+                if !known.contains(&tied) {
+                    continue;
+                }
+                row = vec![tied];
+            } else if let Some(session) = session_of(process) {
                 let home = homes.get(&session);
                 row.sort_by_key(|w| (home != Some(w), std::cmp::Reverse(rank(&session, w))));
             }

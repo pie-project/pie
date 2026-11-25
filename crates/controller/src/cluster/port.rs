@@ -611,6 +611,7 @@ impl Port {
                 props,
                 prompt,
                 connection,
+                tied,
             } => {
                 let id = pid(gateway, req);
                 // Facts of the launch, read with its arrival: stated first.
@@ -618,6 +619,11 @@ impl Port {
                     Subject::Process(id.clone()),
                     "pie/connection",
                     connection.map(|n| Value::Text(format!("{}.{n}", gateway.0))),
+                );
+                host.attr(
+                    Subject::Process(id.clone()),
+                    "pie/tied",
+                    tied.map(|worker| Value::Text(worker.0.to_string())),
                 );
                 // Tokens a text block makes, guessed from its bytes: the
                 // prompt reaches the controller as blocks, not tokens.
@@ -1009,6 +1015,7 @@ mod tests {
                 .collect(),
             prompt: prompt.map(client_api::props::prompt_blocks).map(Into::into),
             connection: None,
+            tied: None,
         }
     }
 

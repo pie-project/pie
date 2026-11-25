@@ -60,6 +60,8 @@ pub enum SessionError {
     Refused(String),
     /// The worker holding the session's handles is gone, and they with it.
     HandlesLost,
+    /// The cluster policy leaves off the worker holding them.
+    Excluded(WorkerId),
 }
 
 impl std::fmt::Display for SessionError {
@@ -73,6 +75,11 @@ impl std::fmt::Display for SessionError {
             SessionError::HandlesLost => {
                 f.write_str("dead: the worker holding this session's handles is gone")
             }
+            SessionError::Excluded(worker) => write!(
+                f,
+                "the policy excluded worker {}, which holds this launch's session",
+                worker.0
+            ),
         }
     }
 }
@@ -110,8 +117,13 @@ pub enum AdmitReject {
     Refused(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct DispatchFail;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchFail {
+    /// No worker took it.
+    NoWorker,
+    /// The policy's row leaves off the worker it is tied to.
+    Excluded(WorkerId),
+}
 
 /// What the gateway knows of a turn beyond what its client sent, for the
 /// cluster policies.
@@ -119,6 +131,8 @@ pub struct DispatchFail;
 pub struct Facts {
     /// The client connection it came on.
     pub connection: Option<SessionId>,
+    /// The worker that holds its session's handles.
+    pub tied: Option<WorkerId>,
 }
 
 #[async_trait::async_trait]
@@ -268,7 +282,17 @@ impl Inner {
             executors: Vec::new(),
         };
 
-        if let Err(refusal) = self.router.admit(&request, Facts { connection }).await {
+        if let Err(refusal) = self
+            .router
+            .admit(
+                &request,
+                Facts {
+                    connection,
+                    tied: pinned,
+                },
+            )
+            .await
+         {
             let r = match refusal {
                 AdmitReject::Refused(why) => return Err(SessionError::Refused(why)),
                 AdmitReject::Full(why) => why,
@@ -326,6 +350,7 @@ impl Inner {
             {
                 Err(SessionError::HandlesLost)
             }
+            Ok(Err(DispatchFail::Excluded(worker))) => Err(SessionError::Excluded(worker)),
             _ => Err(SessionError::NoWorker),
         }
     }
@@ -468,9 +493,9 @@ impl Inner {
             .and_then(|turn| turn.pinned);
         let worker = match self.router.dispatch(request, pinned).await {
             Ok(worker) => worker,
-            Err(DispatchFail) => {
+            Err(why) => {
                 self.end(req_id, Outcome::Failed, By::Host);
-                return Err(DispatchFail);
+                return Err(why);
             }
         };
         let bound = {
@@ -1083,10 +1108,10 @@ mod tests {
             }
             match *self.dispatch_worker.lock().unwrap() {
                 Some(_) if !self.eligible.lock().unwrap().is_empty() => {
-                    pinned.ok_or(DispatchFail)
+                    pinned.ok_or(DispatchFail::NoWorker)
                 }
                 Some(w) => Ok(w),
-                None => Err(DispatchFail),
+                None => Err(DispatchFail::NoWorker),
             }
         }
         async fn cancel(&self, worker: WorkerId, req: ReqId) {
