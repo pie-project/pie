@@ -44,6 +44,12 @@ pub struct ImportArgs {
     pub consume_source: bool,
     #[arg(long)]
     pub keep_source: bool,
+    /// The commit to import, by its full sha; the hub must resolve it to itself.
+    #[arg(long, value_name = "COMMIT")]
+    pub revision: Option<String>,
+    /// Exit when standard input closes, so an import never outlives the program that started it.
+    #[arg(long)]
+    pub parent_stdin: bool,
 }
 
 struct Consumed<'a> {
@@ -74,7 +80,20 @@ fn consuming_marker(source: &Path) -> PathBuf {
     }
 }
 
-pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
+pub fn run(
+    mut args: ImportArgs,
+    global: &crate::args::GlobalArgs,
+    json: bool,
+) -> Result<crate::ui::Answer> {
+    if args.parent_stdin {
+        // Stopping here leaves what a kill leaves: the next import resumes
+        // the download, and discards a source a conversion was consuming.
+        std::thread::spawn(|| {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            eprintln!("import: standard input closed; stopping");
+            std::process::exit(1);
+        });
+    }
     let wanted = args.source.to_ascii_lowercase().replace("--", "/");
     let for_target: Vec<&poem::star::Published> = runtime::catalog::catalog()
         .published()
@@ -123,7 +142,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
         runtime::engine::load::deployment(name)
             .map_err(|why| anyhow!("--deployment {name}: {why:#}"))?;
     }
-    let mut source = resolve_source(&args.source)?;
+    let mut source = resolve_source(&args.source, args.revision.as_deref(), json)?;
     if consuming_marker(&source.path).is_file() {
         bail!(
             "{}: a consuming import of this source died partway (`{CONSUMING_MARKER}` is \
@@ -148,7 +167,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
     };
     let mut overlay = match &args.aux {
         Some(spec) => {
-            let head = resolve_source(spec)?;
+            let head = resolve_source(spec, None, json)?;
             source.origin = format!("{} +aux {}", source.origin, head.origin);
             Some(stage_overlay(&head, &out_file)?)
         }
@@ -162,7 +181,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
             .iter()
             .all(|file| file.format == CheckpointFormat::Zt)
     }) {
-        return overlay_onto_artifact(&args, &source, metadata, overlay, global);
+        return overlay_onto_artifact(&args, &source, metadata, overlay, global, json);
     }
 
     let clobbered: Vec<&str> = metadata
@@ -337,7 +356,7 @@ pub fn run(mut args: ImportArgs, global: &crate::args::GlobalArgs) -> Result<cra
     }
 
     let started = std::time::Instant::now();
-    let mut bar = ProgressLine::new();
+    let mut bar = ProgressLine::new(json);
 
     let plan = if split.decode.tensors.is_empty() {
         None
@@ -546,6 +565,7 @@ fn overlay_onto_artifact(
     mut metadata: Metadata,
     overlay: &Overlay,
     global: &crate::args::GlobalArgs,
+    json: bool,
 ) -> Result<crate::ui::Answer> {
     if args.out.is_some() {
         bail!(
@@ -681,7 +701,7 @@ fn overlay_onto_artifact(
     }
 
     let started = std::time::Instant::now();
-    let mut bar = ProgressLine::new();
+    let mut bar = ProgressLine::new(json);
     let base = source.base();
     let mut spool = match &plan {
         Some(plan) if !ordered => {
@@ -1246,19 +1266,26 @@ impl TensorSink for Spool {
 pub(crate) struct ProgressLine {
     bar: crate::ui::Bar,
     current: String,
+    /// Under the global `--json`, progress is JSON lines on stdout instead of the bar.
+    json: Option<crate::ui::JsonProgress>,
 }
 
 impl ProgressLine {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(json: bool) -> Self {
         Self {
             bar: crate::ui::Bar::new(),
             current: String::new(),
+            json: json.then(|| crate::ui::JsonProgress::new("convert")),
         }
     }
 
     pub(crate) fn render(&mut self, progress: &Progress<'_>) {
         if let Some(name) = progress.finalized {
             self.current = name.to_string();
+        }
+        if let Some(json) = &self.json {
+            json.emit(progress.read_bytes, progress.total_read_bytes);
+            return;
         }
         self.bar.draw(
             progress.read_bytes,
@@ -1316,9 +1343,12 @@ impl Source {
     }
 }
 
-pub(crate) fn resolve_source(source: &str) -> Result<Source> {
+pub(crate) fn resolve_source(source: &str, revision: Option<&str>, json: bool) -> Result<Source> {
     let path = Path::new(source);
     if path.exists() {
+        if revision.is_some() {
+            bail!("--revision pins a commit on the hub, and {source} is a path on this machine");
+        }
         let name = if path.is_file() {
             store_archive_name(path).unwrap_or_else(|| {
                 path.file_stem()
@@ -1344,7 +1374,7 @@ pub(crate) fn resolve_source(source: &str) -> Result<Source> {
         });
     }
 
-    let (snapshot, fetched) = resolve_snapshot(source)?;
+    let (snapshot, fetched) = resolve_snapshot(source, revision, json)?;
     Ok(Source {
         path: snapshot,
         name: store_name(source),
@@ -1353,14 +1383,43 @@ pub(crate) fn resolve_source(source: &str) -> Result<Source> {
     })
 }
 
-fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
+fn resolve_snapshot(repo_id: &str, revision: Option<&str>, json: bool) -> Result<(PathBuf, bool)> {
+    if let Some(revision) = revision
+        && (revision.len() != 40
+            || !revision
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        bail!(
+            "--revision {revision}: name the commit by its full sha, 40 lowercase hex \
+             digits; a branch or a tag can move"
+        );
+    }
     let repo_dir = crate::local::hf::resolve_cache_dir()
         .join(format!("models--{}", repo_id.replace('/', "--")));
     discard_consumed(&repo_dir)?;
     let snapshots = repo_dir.join("snapshots");
+    if let Some(revision) = revision {
+        let path = snapshots.join(revision);
+        let fetched = !has_weights(&path);
+        if fetched {
+            crate::ops::model::fetch_snapshot(
+                repo_id,
+                Some(revision),
+                &crate::local::hf::runtime_snapshot_allow_patterns(),
+                json,
+            )?;
+        }
+        return Ok((path, fetched));
+    }
     let mut fetched = !snapshots.exists();
     if fetched {
-        crate::ops::model::fetch_snapshot(repo_id)?;
+        crate::ops::model::fetch_snapshot(
+            repo_id,
+            None,
+            &crate::local::hf::runtime_snapshot_allow_patterns(),
+            json,
+        )?;
     }
     let entries = std::fs::read_dir(&snapshots)
         .map_err(|_| anyhow!("{repo_id} is neither a path nor a model any registry has"))?;
@@ -1373,7 +1432,12 @@ fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
     };
     // A snapshot an earlier download left without its weights fetches the rest.
     if !fetched && !has_weights(&path) {
-        crate::ops::model::fetch_snapshot(repo_id)?;
+        crate::ops::model::fetch_snapshot(
+            repo_id,
+            None,
+            &crate::local::hf::runtime_snapshot_allow_patterns(),
+            json,
+        )?;
         fetched = true;
     }
     Ok((path, fetched))
@@ -1393,8 +1457,11 @@ fn discard_consumed(repo_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Every weight file the snapshot names is there: an index whose download
+/// stopped before its shards landed is not a snapshot with weights.
 fn has_weights(snapshot: &Path) -> bool {
-    checkpoint::file::read::discover_safetensors_files(snapshot).is_ok()
+    checkpoint::file::read::discover_safetensors_files(snapshot)
+        .is_ok_and(|files| files.iter().all(|file| file.is_file()))
         || checkpoint::file::read::discover_zt_file(snapshot).is_some()
 }
 
