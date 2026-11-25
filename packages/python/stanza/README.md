@@ -32,6 +32,15 @@ with model.serve(port=18431) as pie:
 
 `examples/stanza-larkspur/train_and_serve.py` is the whole demo program.
 
+The trainer replays the traced program itself, so it trains any model whose
+ops it has a torch forward for: today Qwen3, Llama 3, Gemma 4 (per-layer
+embeddings, shared KV, softcapped logits), Qwen3.5 (Gated DeltaNet) and Qwen3
+MoE. It refuses any other op by name. `forward_backward(batch, loss)` takes
+`cross_entropy`, `dpo` (against the plain arm, so the reference model costs no
+second copy), `importance_sampling` and `ppo` (with `batch.sampler_logp`, the
+log-probs the samples were drawn at), or any function of the per-token
+log-probs and the batch.
+
 | Name | What it is |
 |---|---|
 | `Model(id, weights=None, *, pie_home, models_dir, pie_bin)` | A pie model id, its Hugging Face checkpoint and its PIE_HOME. `weights=None` is enough to mount and check. |

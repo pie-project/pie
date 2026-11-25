@@ -34,7 +34,9 @@ from .loss import FUNCTIONS, REFERENCED
 from .program import Bank, Program
 
 DTYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
+"""The dtypes a trainer runs frozen weights and activations at."""
 SERVED = DTYPES | {"f16": torch.float16}
+"""The trace dtypes a trained param can be served at."""
 
 
 class Trainer:
