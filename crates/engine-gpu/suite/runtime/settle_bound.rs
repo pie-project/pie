@@ -78,10 +78,12 @@ fn the_settle_submits_no_fire_past_the_bound() {
     let tight = (at(1) * at(TOKENS)).sqrt();
     shell.hold_to(tight);
     shell.settle_dense().expect("the settle's picks resolve under the bound");
+    let built = shell.compiled();
     while shell
         .measure_behind(&|| 0, &|| false, None)
         .expect("the settle runs behind serving under the bound")
     {}
+    assert_eq!(shell.compiled(), built, "a trial builds nothing: the load built what it weighs");
     let settled = shell.settled().to_vec();
     assert!(!settled.is_empty(), "the settle walked no range");
     for range in &settled {

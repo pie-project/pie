@@ -16,6 +16,8 @@ use crate::store::rs::RsUnits;
 enum Step {
     Absorb {
         count: u32,
+        /// What the queued allocations lack together, the head included.
+        queued: u32,
         fund_by_eviction: bool,
     },
     ShortRs {
@@ -919,6 +921,7 @@ impl ResidencyPlanner {
                 if missing > 0 {
                     return Step::Absorb {
                         count: missing,
+                        queued: inner.burst_shortfall(),
                         fund_by_eviction: !is_restore || inner.nothing_in_flight(),
                     };
                 }
@@ -1104,6 +1107,9 @@ impl ResidencyPlanner {
                         IdleOutcome::Returning => {
                             self.plan_stopped("bind room: reclaimed pages return as their fires retire");
                             return false;
+                        }
+                        IdleOutcome::Nothing if self.idle_out(key) => {
+                            continue;
                         }
                         IdleOutcome::Nothing => {}
                     }
@@ -1388,6 +1394,7 @@ impl ResidencyPlanner {
                 }
                 Step::Absorb {
                     count,
+                    queued,
                     fund_by_eviction,
                 } => {
                     if self.absorb_free(count) {
@@ -1410,8 +1417,10 @@ impl ResidencyPlanner {
                         self.plan_stopped("short of kv: idle cache moves down");
                         return false;
                     }
+                    // For the allocations behind the head too: one pass
+                    // reclaims for a fleet that asked together.
                     let short = IdleShort {
-                        kv_pages: count,
+                        kv_pages: count.max(queued),
                         rs: false,
                     };
                     match self.reclaim_idle_once(short) {

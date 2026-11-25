@@ -2026,9 +2026,7 @@ impl PoolPort for RegistryPool {
     fn reclaim_idle(&self, short: IdleShort) -> IdleReclaim {
         let (pages, returning) = if short.kv_pages > 0 {
             self.with_kv_tagged("planner-reclaim-idle", |kv| {
-                let epoch = kv.current_epoch();
                 let pages = kv.reclaim_cache(
-                    epoch,
                     short.kv_pages as usize,
                     crate::policy::retention::Installed,
                 );

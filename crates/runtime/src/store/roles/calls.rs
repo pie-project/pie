@@ -257,16 +257,20 @@ pub fn bind_taken(
 /// they do at any other wait of the process's ([`crate::inferlet::process::gate`]).
 /// Waiting with them unsettled, the process was held between an eviction
 /// that waits for those leases and a bind that waits on that eviction.
+/// Short of room with guest state of its own on the device, it waits first
+/// for what idle cache gives (`idle`), running on: it is suspended only once
+/// that is out ([`crate::planner::BindRoomWait::IdleOut`]).
 /// A wait for room its own eviction withdrew
 /// ([`crate::planner::BindRoomWait::Withdrawn`]) waits for its restore.
 #[allow(clippy::too_many_arguments)]
-pub async fn bind_when_resident<T, E, B, W, G, P, S>(
+pub async fn bind_when_resident<T, E, B, W, G, I, P, S>(
     pid: Holder,
     mut bind: impl FnMut() -> B,
     resident: impl Fn() -> W,
     grown: impl Fn(u32, u32) -> G,
     room: impl Fn() -> Option<RoomWatch>,
     fits: impl Fn(u32, u32, u32) -> bool,
+    idle: impl Fn(u32, u32, u32) -> I,
     suspend: impl Fn(u32, u32, u32) -> bool,
     planned: impl Fn(u32, u32, u32) -> P,
     leave: impl Fn(),
@@ -278,6 +282,7 @@ where
     B: std::future::Future<Output = anyhow::Result<T>>,
     W: std::future::Future<Output = Result<(), E>>,
     G: std::future::Future<Output = Result<(), String>>,
+    I: std::future::Future<Output = Result<crate::planner::BindRoomWait, String>>,
     P: std::future::Future<Output = Result<crate::planner::BindRoomWait, String>>,
     S: std::future::Future<Output = ()>,
 {
@@ -305,6 +310,8 @@ where
     // again (mx-2: suspend, evict, restore, short, every ~25 ms, 222,924
     // evictions and no serve).
     let mut restored_for_room = false;
+    // Idle cache gives this bind no more room.
+    let mut idle_out = false;
     loop {
         // Taken before the bind: room given back meanwhile is not lost.
         let watch = room();
@@ -344,6 +351,29 @@ where
             .downcast_ref::<RolesError>()
             .and_then(RolesError::room_runs)
         {
+            if !restored_for_room && !idle_out {
+                waits();
+                match idle(run, pieces, singles).await {
+                    Err(why) => {
+                        return Err(error.context(format!("its wait for room ended: {why}")));
+                    }
+                    Ok(crate::planner::BindRoomWait::Served) => continue,
+                    Ok(crate::planner::BindRoomWait::IdleOut) => {
+                        idle_out = true;
+                        waiting(false);
+                    }
+                    Ok(crate::planner::BindRoomWait::Withdrawn) => {
+                        leave();
+                        waiting(false);
+                        if let Err(why) = resident().await {
+                            return Err(error.context(format!(
+                                "its process was evicted and is not resident again: {why}"
+                            )));
+                        }
+                        continue;
+                    }
+                }
+            }
             // Holding guest state of its own, it would wait on itself: it is
             // suspended, its state given back, and binds once restored with
             // room for this bind (`run`, `pieces`) beside its own.
@@ -394,7 +424,7 @@ where
                     Err(why) => {
                         return Err(error.context(format!("its wait for room ended: {why}")));
                     }
-                    Ok(crate::planner::BindRoomWait::Served) => {}
+                    Ok(crate::planner::BindRoomWait::Served | crate::planner::BindRoomWait::IdleOut) => {}
                     Ok(crate::planner::BindRoomWait::Withdrawn) => {
                         tracing::debug!(%pid, "a bind's wait for room ends with its eviction");
                         leave();
@@ -455,7 +485,7 @@ where
                     Err(why) => {
                         return Err(error.context(format!("its wait for room ended: {why}")));
                     }
-                    Ok(crate::planner::BindRoomWait::Served) => {}
+                    Ok(crate::planner::BindRoomWait::Served | crate::planner::BindRoomWait::IdleOut) => {}
                     Ok(crate::planner::BindRoomWait::Withdrawn) => {
                         leave();
                         waiting(false);

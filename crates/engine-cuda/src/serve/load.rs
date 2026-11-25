@@ -550,6 +550,21 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             Some(super::EveryRung::To(_)) => widest,
         }
     };
+    // Every rank of a tensor-parallel group fires one sequence of steps over
+    // one lattice: ranks that each measured their own device can choose
+    // different tops, so all take the least.
+    // SAFETY: the boot's communicator is held by the engine for the life of
+    // the shell it loads.
+    let tokens = match unsafe { boot.comm.as_ref() }.and_then(crate::comm::Comm::quiet) {
+        Some(quiet) => {
+            let agreed = quiet.least(tokens)?;
+            if agreed != tokens {
+                tracing::info!("the group's ranks agree on a fire top of {agreed}: this rank's own was {tokens}");
+            }
+            agreed
+        }
+        None => tokens,
+    };
     // The derived voxel rung's room is still the configured share of the
     // card past the weights (`engine.working_set_percent`).
     let share = after_weights / 100 * u64::from(engine.working_set_percent);
@@ -1369,8 +1384,26 @@ impl Shell {
         let kv_taps = (boot.world.size <= 1)
             .then(|| crate::tap::row_layers(&boot.trace).and_then(|rows| pools.tap_groups(&rows)))
             .flatten();
+        let ring_runs = pools
+            .ring()
+            .map(|(_, ring)| ring.pages)
+            .map(|pages| {
+                let lanes = engine.fire_lanes_of(boot.budget.max_lanes);
+                crate::serve::ring_table::RingTable::new(
+                    crate::serve::ring_table::fold_runs(lanes, pages, pools.ring_planes().len()),
+                    usize::from(boot.runahead.frames_in_flight),
+                )
+            })
+            .transpose()?;
+        if let Some(table) = &ring_runs {
+            tracing::info!(
+                "ring runs: a {} KiB table laid at load, staged from {} KiB of pinned host memory",
+                table.bytes() >> 10,
+                table.host_bytes() >> 10
+            );
+        }
         let mut shell = Shell {
-            ring_runs: None,
+            ring_runs,
             ring_seen: crate::serve::RingSeen::default(),
             weighed,
             device,
@@ -1548,8 +1581,17 @@ impl Shell {
             let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
             #[cfg(not(feature = "rocm"))]
             let copies = String::new();
-            let record =
-                super::measured::path(dir, &format!("{bodies_shape}|{:?}{copies}", shell.budget));
+            // A rank of a group holds what its own card's bodies took, beside
+            // its peers' (each writing the same file, the last rename wins).
+            let rank = if boot.world.size > 1 {
+                format!("|rank {}", boot.world.rank)
+            } else {
+                String::new()
+            };
+            let record = super::measured::path(
+                dir,
+                &format!("{bodies_shape}|{:?}{copies}{rank}", shell.budget),
+            );
             if let Some(measured) = super::measured::read(&record) {
                 recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
@@ -1711,8 +1753,9 @@ impl Shell {
     /// of, in the order they lie from `inputs_at`: the staged inputs' slab,
     /// the readout rows' table, the voxel store, the rs fold predicates and
     /// the host-resident experts' staging, the guests' samplers' lane
-    /// arenas and the capture rows' tables, each to [`INPUTS_ALIGN`].
-    fn staged_runs(&self) -> [u64; 7] {
+    /// arenas, the capture rows' tables and a windowed load's ring runs,
+    /// each to [`INPUTS_ALIGN`].
+    fn staged_runs(&self) -> [u64; 8] {
         [
             self.inputs.bytes(),
             self.readout_rows.bytes() as u64,
@@ -1723,6 +1766,9 @@ impl Shell {
             self.capture
                 .as_ref()
                 .map_or(0, |layout| layout.table_bytes() as u64),
+            self.ring_runs
+                .as_ref()
+                .map_or(0, super::ring_table::RingTable::bytes),
         ]
         .map(|bytes| bytes.next_multiple_of(INPUTS_ALIGN))
     }
@@ -1750,8 +1796,10 @@ impl Shell {
             experts,
             arenas,
             scores,
+            rings,
         ] = self.staged_runs();
-        let staged = inputs + readouts + voxels + predicates + experts + arenas + scores;
+        let staged =
+            inputs + readouts + voxels + predicates + experts + arenas + scores + rings;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;
@@ -1772,10 +1820,21 @@ impl Shell {
         if let Some(layout) = self.capture.as_mut() {
             layout.lay(base + inputs + readouts + voxels + predicates + experts + arenas);
         }
+        if let Some(table) = self.ring_runs.as_mut() {
+            table.lay(base + inputs + readouts + voxels + predicates + experts + arenas + scores);
+        }
         // The kernels a guest's wave fires are the engine's, not the
         // program's: loaded here, before ready, so no first fire builds them.
         kernels_cuda::runtime::channel::load_wave_kernels()?;
         kernels_cuda::runtime::channel::load_gather_kernels()?;
+        // A load of guest inputs (or voxels) casts their cells ahead of a body.
+        if !self.inputs().is_empty() || self.voxels.is_some() {
+            kernels_cuda::linear::cast::load_input_casts()?;
+        }
+        // A load of windowed layers moves ring rows around its fires' bodies.
+        if !self.windowed_layers().is_empty() {
+            kernels_cuda::runtime::channel::load_ring_kernels()?;
+        }
         tracing::info!(
             "guests' samplers meet in {} KiB of lane arenas laid at load ({} \
              lanes a flight on {} units), no lane's",

@@ -21,9 +21,43 @@ pub struct Outcome {
     pub seconds: f64,
 }
 
+/// The user's file of `device` under `profiles`, less what this pie no
+/// longer reads: where loads store what they measure, each under its key.
+fn user_file(profiles: Option<&Path>, device: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::chip::SHELF.user_path(profiles?, device)).ok()?;
+    Some(crate::chip::registry().prune(&text).0)
+}
+
+/// The tuned decisions `file` with the keyed measurements `existing` (the
+/// user's file it replaces) stores in place of its own unkeyed rates: a
+/// tune times decisions, and what loads measured of the device still stands.
+fn keeping_stored(file: String, existing: Option<&str>) -> String {
+    let Some(stored) = existing.and_then(|text| {
+        crate::chip::registry()
+            .parse(text, "the user's file", profile::Strict::User)
+            .ok()
+    }) else {
+        return file;
+    };
+    let rates = stored.tuned.rates;
+    if rates.measured_on.is_none() {
+        return file;
+    }
+    let how = stored
+        .provenance
+        .into_iter()
+        .find(|(key, _)| key == "rates")
+        .map_or_else(
+            || "\"stored by loads, kept by pie tune\"".to_string(),
+            |(_, how)| how,
+        );
+    engine::rates::saved_text(Some(&file), &rates, &("rates", how))
+}
+
 /// `pie tune cuda --rates`: GPU 0's roofline constants measured at
-/// `engine::rates`' shapes ([`crate::rates::measure`]), laid over the
-/// profile it runs.
+/// `engine::rates`' shapes ([`crate::rates::measure`]), keyed and saved over
+/// the user's file as a load saves what it measures
+/// (`engine::rates::saved_text`).
 pub fn rates(
     profiles: Option<&Path>,
     say: &mut dyn FnMut(&str),
@@ -36,7 +70,7 @@ pub fn rates(
         .and_then(Path::parent)
         .map(|home| home.join("cache"));
     let measured = crate::rates::measure(0, &base, cache.as_deref())?;
-    let r = measured.rates;
+    let r = crate::stored::Keys::of(0, &name).stamp(measured.rates);
     let curve = |c: &Option<Vec<(u32, f64)>>| {
         c.iter()
             .flatten()
@@ -68,15 +102,8 @@ pub fn rates(
     ));
     let tuned = engine::rates::tuned(&r);
     let provenance = crate::rates::provenance(&name);
-    let file = search::assemble(
-        crate::chip::registry(),
-        &base,
-        &name,
-        &facts,
-        &tuned,
-        std::slice::from_ref(&provenance),
-        &[crate::chip::ARCH],
-    )?;
+    let file =
+        engine::rates::saved_text(user_file(profiles, &name).as_deref(), &r, &provenance);
     let block = format!(
         "{tuned}\n[provenance]\n{} = {}\n",
         provenance.0, provenance.1
@@ -468,6 +495,7 @@ pub fn run(
         &provenance,
         &[crate::chip::ARCH],
     )?;
+    let file = keeping_stored(file, user_file(profiles, &name).as_deref());
     Ok(Outcome {
         device: name,
         file,
@@ -519,5 +547,79 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} = {label}: {e}", k.id));
             }
         }
+    }
+
+    /// Keyed rates a load stored are still taken by the next load after a
+    /// tune, and a rates step keeps the tuned decisions beside its own rates.
+    #[test]
+    fn a_tune_keeps_the_stored_rates_and_a_rates_step_the_tuned_decisions() {
+        const DECISION: &str = "kernel.moe.mxfp4_grouped";
+        let (gpu, major, minor, sms, _) = GPU;
+        let facts = crate::chip::facts(major, minor, sms);
+        let keys = crate::stored::Keys::stated("a device, a driver");
+        let home = tempfile::tempdir().expect("a home");
+        let path = crate::chip::SHELF.user_path(home.path(), gpu);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the user's directory");
+        let rates = |launch, scan| {
+            keys.stamp(profile::rates::Rates {
+                launch_ns: Some(launch),
+                scan_gelems: Some(scan),
+                ..Default::default()
+            })
+        };
+        let how = crate::rates::provenance(gpu);
+        let load = || crate::chip::resolve_keyed(gpu, &facts, Some(home.path()), &keys);
+        let takes = |launch: u64, scan: f64, said: &str| {
+            let (_, report) = load();
+            let user = profile::Source::User(path.display().to_string());
+            assert_eq!(report.used, user, "{said}: {:?}", report.rejected);
+            for key in ["launch_ns", "scan_gelems"] {
+                assert!(
+                    report
+                        .stored
+                        .iter()
+                        .any(|line| line.starts_with(&format!("`{key}`: stored (user"))),
+                    "{said}: `{key}` is not taken: {:#?}",
+                    report.stored
+                );
+            }
+            let file = crate::chip::registry()
+                .parse(&user_file(Some(home.path()), gpu).unwrap(), said, profile::Strict::User)
+                .unwrap();
+            assert_eq!(file.tuned.rates.launch_ns, Some(launch), "{said}");
+            assert_eq!(file.tuned.rates.scan_gelems, Some(scan), "{said}");
+            file.entries.contains_key(DECISION)
+        };
+
+        // A load stored its measurements.
+        std::fs::write(&path, engine::rates::saved_text(None, &rates(4321, 7.5), &how)).unwrap();
+        assert!(!takes(4321, 7.5, "a load's own save"));
+
+        // A tune's file over it.
+        let (base, _) = crate::chip::resolve(gpu, &facts, Some(home.path()));
+        let knob = search::knobs(&base, SEARCH_SKIPS, "")
+            .into_iter()
+            .find(|knob| knob.id == DECISION)
+            .expect("the decision is searched");
+        let entries = vec![(DECISION.to_string(), knob.candidates[0].0.clone())];
+        let tuned = search::assemble(
+            crate::chip::registry(),
+            &base,
+            gpu,
+            &facts,
+            &search::render_overrides(&entries),
+            &[("source", "\"a test\"".to_string())],
+            &[crate::chip::ARCH],
+        )
+        .expect("the tuned file");
+        let kept = keeping_stored(tuned, user_file(Some(home.path()), gpu).as_deref());
+        std::fs::write(&path, kept).unwrap();
+        assert!(takes(4321, 7.5, "a tune"), "the tuned decision is there");
+
+        // A rates step over the tuned file.
+        let existing = user_file(Some(home.path()), gpu);
+        let rated = engine::rates::saved_text(existing.as_deref(), &rates(1234, 8.5), &how);
+        std::fs::write(&path, rated).unwrap();
+        assert!(takes(1234, 8.5, "a rates step"), "the tuned decision stands");
     }
 }

@@ -107,6 +107,10 @@ pub struct PublishedPage {
     pub page_hash: Option<Hash256>,
 }
 
+/// Per node, what live sets and pins read of it: some of its pages, or
+/// (`None`) every one.
+pub(super) type LiveReads = FxHashMap<NodeId, Option<Vec<Range<u32>>>>;
+
 enum Pages {
     Owned {
         backings: Vec<KvPageBacking>,
@@ -250,6 +254,13 @@ pub struct KvPageTable {
     /// or moves (a working set's log and fold counts move it not): what was
     /// read of those under one revision stands until the next.
     rev: u64,
+    /// Per trie node, the epoch through which a fire may read its pages past
+    /// what its live readers hold ([`Self::stamp_path`]): only those not
+    /// yet retired.
+    read_through: HashMap<NodeId, u64>,
+    /// The last epoch handed out, and the last retired ([`Self::epochs`]).
+    handed: u64,
+    retired: u64,
 }
 
 /// Pages sealed apart are copies, and one may be off the device.
@@ -1170,6 +1181,7 @@ impl KvPageTable {
         if !let_go(&mut self.pins, node) {
             return Vec::new();
         }
+        self.stamp_path(node, None, self.handed);
         self.remove_anchor(node)
     }
 
@@ -1280,6 +1292,69 @@ impl KvPageTable {
         Ok(self.resolve_owner(seg.node, (index as i64 - seg.start) as u64))
     }
 
+    /// The epoch through which a fire may read the pages that go with the
+    /// one anchor at `terminal`: 0 where none may. Above the first node
+    /// another anchor holds nothing goes, and the fires that read there are
+    /// no fires of these pages.
+    pub fn read_through(&self, terminal: NodeId) -> u64 {
+        let mut through = 0;
+        let mut cursor = Some(terminal);
+        while let Some(node) = cursor {
+            let Some(entry) = self.nodes.get(node) else {
+                break;
+            };
+            let goes = entry.path_anchors <= 1;
+            // The first that stays too: its child gone, the pages no
+            // selection takes of it may go ([`Self::compact_owner`]).
+            through = through.max(self.node_read_through(node));
+            if !goes {
+                break;
+            }
+            cursor = entry.parent;
+        }
+        through
+    }
+
+    /// The epoch through which a fire may read `node`'s own pages.
+    pub fn node_read_through(&self, node: NodeId) -> u64 {
+        self.read_through.get(&node).copied().unwrap_or(0)
+    }
+
+    /// A fire handed out through `epoch` may read the pages on `node`'s
+    /// path, down from what `held` (a path its reader stays on) holds.
+    pub fn stamp_path(&mut self, node: NodeId, held: Option<NodeId>, epoch: u64) {
+        if epoch <= self.retired {
+            return;
+        }
+        // An owner its selection alone is held through is held in part.
+        let mut whole = FxHashSet::default();
+        let mut in_part = false;
+        for node in held.map_or_else(Vec::new, |held| self.lineage(held)) {
+            if !in_part {
+                whole.insert(node);
+            }
+            in_part = self.node_is_selection(node);
+        }
+        for node in self.lineage(node) {
+            if whole.contains(&node) {
+                break;
+            }
+            let stamp = self.read_through.entry(node).or_insert(0);
+            *stamp = (*stamp).max(epoch);
+        }
+    }
+
+    /// Fires are handed out through `handed` and retired through `retired`.
+    pub fn epochs(&mut self, handed: u64, retired: u64) {
+        self.handed = handed;
+        if retired > self.retired {
+            self.retired = retired;
+            if !self.read_through.is_empty() {
+                self.read_through.retain(|_, stamp| *stamp > retired);
+            }
+        }
+    }
+
     fn move_terminal(
         &mut self,
         ws: WorkingSetId,
@@ -1293,6 +1368,10 @@ impl KvPageTable {
             self.add_anchor(node);
         }
         self.entry_mut(ws)?.terminal = terminal;
+        // The set's fires in flight read what it leaves.
+        if let Some(left) = previous {
+            self.stamp_path(left, terminal, self.handed);
+        }
         Ok(previous.map_or_else(Vec::new, |node| self.remove_anchor(node)))
     }
 
@@ -1516,13 +1595,13 @@ impl KvPageTable {
     }
 
     /// `None` for all of it, else the runs their selections take of it.
-    fn live_reads(&self) -> HashMap<NodeId, Option<Vec<Range<u32>>>> {
+    pub(super) fn live_reads(&self) -> LiveReads {
         let anchors = self
             .working_sets
             .iter()
             .filter_map(|(_, e)| e.terminal)
             .chain(self.pins.keys().copied());
-        let mut reads: HashMap<NodeId, Option<Vec<Range<u32>>>> = HashMap::new();
+        let mut reads = LiveReads::default();
         for anchor in anchors {
             let (mut cursor, mut read) = (anchor, None);
             loop {
@@ -1562,21 +1641,25 @@ impl KvPageTable {
         self.cache_roots
             .keys()
             .copied()
-            .filter(|&root| {
-                let node = self.nodes.get(root).expect("live node");
-                let (source, runs) = match &node.pages {
-                    Pages::ParentSelection { runs } => {
-                        (node.parent.expect("selection has owner"), runs.clone())
-                    }
-                    Pages::Owned { backings, .. } => (root, smallvec![0..backings.len() as u32]),
-                };
-                match reads.get(&source) {
-                    None => true,
-                    Some(None) => false,
-                    Some(Some(read)) => !covers(read, &runs),
-                }
-            })
+            .filter(|&root| self.unused_under(&reads, root))
             .collect()
+    }
+
+    /// Whether cache root `root` holds a page `reads` ([`Self::live_reads`])
+    /// do not.
+    pub(super) fn unused_under(&self, reads: &LiveReads, root: NodeId) -> bool {
+        let node = self.nodes.get(root).expect("live node");
+        let (source, runs) = match &node.pages {
+            Pages::ParentSelection { runs } => {
+                (node.parent.expect("selection has owner"), runs.clone())
+            }
+            Pages::Owned { backings, .. } => (root, smallvec![0..backings.len() as u32]),
+        };
+        match reads.get(&source) {
+            None => true,
+            Some(None) => false,
+            Some(Some(read)) => !covers(read, &runs),
+        }
     }
 
     pub fn unused_cache_lease_pages(&self) -> u32 {

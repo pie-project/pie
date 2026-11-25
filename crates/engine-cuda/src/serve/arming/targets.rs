@@ -511,11 +511,6 @@ impl Shell {
             .filter(|&tokens| tokens < max_tokens)
             .collect();
         rungs.push(max_tokens);
-        let state_rows = self
-            .trace
-            .caches
-            .iter()
-            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
         let facts = engine::StepFacts {
             rungs,
             max_lanes: self.fire_lanes(),
@@ -528,7 +523,7 @@ impl Shell {
             attachments: engine::Attachments::served(
                 true,
                 !self.inputs().is_empty(),
-                state_rows && self.lands_snapshots(),
+                self.rs_snapshots() > 0,
             ),
             // (CUDA lays every mixed step within its limits)
             mixed: engine::MixedLanes::Any,

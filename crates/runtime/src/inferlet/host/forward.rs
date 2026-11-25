@@ -30,6 +30,20 @@ const UNSHARED_CHECKPOINT: &str =
 const FINAL_BEAMS: &str = "final rows: a beam search's rows are not final; a pass binding \
      `parents` states no final rows";
 
+/// A beam group on a model with windowed layers: its page lists name the
+/// beams' full-context pages alone, and a beam's windowed rows, which its
+/// parents cut, lie in a ring and buffer no list names. `None` where a pass
+/// binding `parents` (or not) may bind.
+const fn windowed_beams(binds_parents: bool, window_state: bool) -> Option<&'static str> {
+    if binds_parents && window_state {
+        return Some(
+            "forward pass state binds parents on a model with windowed layers; a beam group's \
+             page lists hold full-context rows alone. Give each beam a working set of its own",
+        );
+    }
+    None
+}
+
 type Anyhow<T> = anyhow::Result<T>;
 
 /// The rows or clip a channel bound to `input` carries, once its shape and dtype match it.
@@ -525,6 +539,10 @@ impl ProcessCtx {
         }
         for lane in &lanes {
             let _ = self.ctx().table.get(lane)?;
+        }
+        let window_state = crate::model::registered().is_some_and(|m| m.rs_caps().window_state);
+        if let Some(why) = windowed_beams(parents.is_some(), window_state) {
+            return Ok(Err(why.to_string()));
         }
         if parents.is_some() {
             if lanes.windows(2).any(|pair| pair[0].rep() != pair[1].rep()) {
@@ -1962,6 +1980,16 @@ mod tests {
         let disagree = [bound("latents", Some(256)), bound("positions", Some(128))];
         assert!(input_rows(&disagree).unwrap_err().contains("`positions`"));
         assert_eq!(input_rows(&[bound("timestep", None)]), Ok(None));
+    }
+
+    /// Only a beam group on a windowed model is refused at its bind: a
+    /// group on a full-context one, and any other pass, binds.
+    #[test]
+    fn a_beam_group_on_a_windowed_model_is_refused_at_the_bind() {
+        use super::windowed_beams;
+        assert!(windowed_beams(true, true).is_some_and(|why| why.contains("windowed layers")));
+        assert!(windowed_beams(true, false).is_none());
+        assert!(windowed_beams(false, true).is_none());
     }
 
     /// An asked checkpoint on a set that shares nothing is refused by name,

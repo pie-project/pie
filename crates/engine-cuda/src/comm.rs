@@ -58,6 +58,7 @@ pub struct Comm {
     rank: u32,
     size: u32,
     peers: Option<kernels_cuda::collective::Peers>,
+    quiet: Option<&'static crate::ep::Quiet>,
 }
 
 // SAFETY: an NCCL communicator may be used from any thread as long as calls
@@ -96,6 +97,7 @@ impl Comm {
                 rank,
                 size,
                 peers: None,
+                quiet: None,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -136,6 +138,17 @@ impl Comm {
     #[must_use]
     pub fn rank(&self) -> u32 {
         self.rank
+    }
+
+    /// Where the group's ranks agree on what each would decide by its own
+    /// measurements.
+    #[must_use]
+    pub fn quiet(&self) -> Option<&'static crate::ep::Quiet> {
+        self.quiet
+    }
+
+    pub fn set_quiet(&mut self, quiet: &'static crate::ep::Quiet) {
+        self.quiet = Some(quiet);
     }
 }
 

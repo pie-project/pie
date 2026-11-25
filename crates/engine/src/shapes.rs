@@ -855,6 +855,32 @@ impl StepShapes {
         by.into_iter().take(n).cloned().collect()
     }
 
+    /// Where this set and `other` part: how many shapes each has that the
+    /// other lacks, and the first of each, every field shown (two sets of
+    /// one census can part in what a shape's lanes carry). `None`: the same
+    /// shapes in the same order.
+    #[must_use]
+    pub fn apart(&self, other: &StepShapes) -> Option<String> {
+        if self == other {
+            return None;
+        }
+        let only = |a: &StepShapes, b: &StepShapes| {
+            let mut lacked = a.shapes.iter().filter(|shape| !b.shapes.contains(shape));
+            let first = lacked.next().map(|shape| format!("{shape:?}"));
+            (lacked.count() + usize::from(first.is_some()), first)
+        };
+        let (ours, theirs) = (only(self, other), only(other, self));
+        Some(match (ours, theirs) {
+            ((0, _), (0, _)) => "the same shapes in another order".to_string(),
+            ((n, a), (m, b)) => format!(
+                "{n} of the first's shapes are not the second's, first {}; {m} of the second's \
+                 are not the first's, first {}",
+                a.as_deref().unwrap_or("none"),
+                b.as_deref().unwrap_or("none")
+            ),
+        })
+    }
+
     /// The shapes' count by kind and treatment, for a load's line.
     #[must_use]
     pub fn census(&self) -> String {
@@ -1048,6 +1074,26 @@ mod tests {
             attachments: Attachments::served(true, true, true),
             mixed: crate::MixedLanes::Any,
         }
+    }
+
+    /// Two sets of one census that part only in what their lanes may carry
+    /// are told apart by the shape and the field.
+    #[test]
+    fn sets_parting_in_attachments_alone_are_named() {
+        let with = |snapshots| {
+            StepShapes::of(
+                &StepRules::runtime(),
+                &StepFacts {
+                    attachments: Attachments::served(true, false, snapshots),
+                    ..facts(&[8, 64], false)
+                },
+            )
+        };
+        let (stated, walked) = (with(true), with(false));
+        assert_eq!(stated.census(), walked.census());
+        let apart = stated.apart(&walked).expect("the sets part");
+        assert!(apart.contains("snapshots: true") && apart.contains("snapshots: false"), "{apart}");
+        assert_eq!(stated.apart(&stated.clone()), None);
     }
 
     fn lane(rows: usize, buffered: bool) -> Lane {

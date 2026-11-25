@@ -189,31 +189,48 @@ const _: () = assert!(
     "channel::Rings: a registry is four addresses, a slot count and its padding",
 );
 
-/// Loads the kernels a guest program's wave fires (pull, bump, publish,
-/// settle) on the current device now: every load fires them once a program
-/// binds, and nothing builds after ready.
-pub fn load_wave_kernels() -> Result<(), Error> {
-    for name in ["pull_validate", "commit_bump", "scatter_publish", "settle"] {
+/// The kernels a guest's wave fires: every load fires them once a program
+/// binds.
+const WAVE: [&str; 4] = ["pull_validate", "commit_bump", "scatter_publish", "settle"];
+
+/// The kernels a fire's staging fires: a tap's words, a lane's
+/// device-carried mask bits, a table of them, and a beam group's step and
+/// copies.
+const STAGING: [&str; 6] = [
+    "gather_words",
+    "gather_bits",
+    "gather_bit_runs",
+    "beam_step",
+    "copy_pages",
+    "copy_rs_rows",
+];
+
+/// The kernel a windowed fire moves its ring's rows with (its pages' fills,
+/// its snapshots and its fold).
+const RING: [&str; 1] = ["copy_runs"];
+
+fn load_all(names: &[&str]) -> Result<(), Error> {
+    for name in names {
         kernel(FILE, &format!("::pie::channel::{name}")).load()?;
     }
     Ok(())
 }
 
-/// Loads the kernels a fire's staging gathers with (a tap's words, a lane's
-/// device-carried mask bits, a table of them) on the current device now:
-/// a serving fire fires them, and nothing builds after ready.
+/// Loads [`WAVE`] on the current device now: the host fires them, so no
+/// walk resolves them, and nothing builds after ready.
+pub fn load_wave_kernels() -> Result<(), Error> {
+    load_all(&WAVE)
+}
+
+/// Loads [`STAGING`], as [`load_wave_kernels`] does its own.
 pub fn load_gather_kernels() -> Result<(), Error> {
-    for name in [
-        "gather_words",
-        "gather_bits",
-        "gather_bit_runs",
-        "beam_step",
-        "copy_pages",
-        "copy_rs_rows",
-    ] {
-        kernel(FILE, &format!("::pie::channel::{name}")).load()?;
-    }
-    Ok(())
+    load_all(&STAGING)
+}
+
+/// Loads [`RING`], as [`load_wave_kernels`] does its own: for a load of
+/// windowed layers.
+pub fn load_ring_kernels() -> Result<(), Error> {
+    load_all(&RING)
 }
 
 pub fn pull_validate(
@@ -957,4 +974,29 @@ pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32, width: u32) -> Resu
         ),
         &[ArgValue::Ptr(runs), ArgValue::U32(run_count), ArgValue::U32(width)],
     )
+}
+
+#[cfg(test)]
+mod preloads {
+    /// Each kernel a wrapper here fires is either on a list a load resolves
+    /// before ready (the host fires it, around a body) or dispatched inside
+    /// a body, which the load's walk resolves. One on neither list is built
+    /// by the first serving fire that reaches it.
+    #[test]
+    fn every_fired_kernel_is_preloaded_or_walked() {
+        const WALKED: [&str; 5] =
+            ["mask_from_commit", "rs_scatter", "rs_ext_csr", "rs_ext_gather", "rs_ext_land"];
+        let held: Vec<&str> =
+            [&super::WAVE[..], &super::STAGING, &super::RING, &WALKED].concat();
+        let mut fired: Vec<&str> = include_str!("channel.rs")
+            .split("kernel(FILE, \"::pie::channel::")
+            .skip(1)
+            .filter_map(|rest| rest.split(['"', '<']).next())
+            .collect();
+        fired.sort_unstable();
+        fired.dedup();
+        let mut listed = held.clone();
+        listed.sort_unstable();
+        assert_eq!(fired, listed);
+    }
 }

@@ -1795,6 +1795,7 @@ async fn a_bind_by_a_suspended_process_waits_for_its_restore() {
         |_, _| std::future::ready(Err::<(), String>("no guest state here".into())),
         || None,
         |_, _, _| false,
+        |_, _, _| std::future::ready(Ok(crate::planner::BindRoomWait::IdleOut)),
         |_, _, _| false,
         |_, _, _| {
             std::future::ready(Err::<crate::planner::BindRoomWait, String>(
@@ -4065,6 +4066,7 @@ async fn a_bind_waiting_for_room_yields_to_its_own_eviction_and_binds_after_the_
         |_, _| std::future::ready(Err::<(), String>("no grow here".into())),
         || None,
         |_, _, _| false,
+        |_, _, _| std::future::ready(Ok(crate::planner::BindRoomWait::IdleOut)),
         |_, _, _| false,
         move |run, pieces, singles| {
             let p = p.clone();
@@ -5053,6 +5055,7 @@ async fn a_blocked_victim_is_a_candidate_again_once_the_pool_moves() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
         inner.host_swap_blocked.insert(resident);
@@ -5927,6 +5930,7 @@ async fn a_stuck_state_is_said_once_and_costs_no_pass_until_an_event() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
     });
@@ -6617,6 +6621,7 @@ fn a_process_evicted_while_queued_is_restored_only_behind_the_queue_ahead_of_it(
         served: false,
         withdrawn: false,
         rise: None,
+        idle: None,
     };
     let youngest = pids[3];
     let keys = planner.with_inner(|inner| {
@@ -7448,6 +7453,7 @@ fn with_nothing_in_flight_a_process_not_yet_admitted_is_a_victim() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
     });
@@ -7489,6 +7495,7 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
                 served: false,
                 withdrawn: false,
                 rise: None,
+                idle: None,
             },
         );
     });
@@ -7903,12 +7910,12 @@ async fn replay(snap: &StallSnapshot) -> Result<(), String> {
 /// 4, one slot, two refs each), the restore head among them short of a
 /// thirteenth single chunk with twelve free, the forks no candidates and
 /// nothing in flight.
-fn stall_d41e15f24() -> StallSnapshot {
+fn stall_shared_prefix_page_left() -> StallSnapshot {
     let mut procs = vec![SnapProc::evicted_restore(); 7];
     procs[0].refused = Some((1, 1));
     procs[0].refused_free = Some(12);
     StallSnapshot {
-        name: "d41e15f24 serve-Y3_3s-1",
+        name: "a shared prefix page left by evicted forks",
         chunks: 22,
         free: (5..17).collect(),
         headroom: Some(12),
@@ -7926,9 +7933,9 @@ fn stall_d41e15f24() -> StallSnapshot {
 /// it, one free run left and its placement standing in that room, nothing in
 /// flight and no event coming. Beside it a resident candidate holding slots
 /// across fifteen chunks, ten processes' prompt prefix sharing chunk 1.
-fn stall_c201812ea() -> StallSnapshot {
-    // 0: 37b23987 (resident, the candidate); 1: 26e5834e (the head);
-    // 2: 66751556; 3..=9: the prefix's other sharers.
+fn stall_head_beside_a_resident_candidate() -> StallSnapshot {
+    // 0: resident, the candidate; 1: the head; 2: an evicted process
+    // holding slots beside them; 3..=9: the prefix's other sharers.
     let mut procs = vec![SnapProc::resident()];
     procs.push(SnapProc {
         refused: Some((1, 1)),
@@ -7940,7 +7947,7 @@ fn stall_c201812ea() -> StallSnapshot {
     let mut chunk3: Vec<(usize, u32)> = (0..10).map(|at| (at, 1)).collect();
     chunk3[1].1 = 2;
     StallSnapshot {
-        name: "c201812ea serve-Z3_3s-1",
+        name: "a head beside a resident candidate",
         chunks: 22,
         free: vec![19],
         headroom: Some(1),
@@ -7971,15 +7978,15 @@ fn stall_c201812ea() -> StallSnapshot {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn replay_d41e15f24_shared_prefix_page_left_by_evicted_forks() {
+async fn replay_a_shared_prefix_page_left_by_evicted_forks_leaves_no_head_waiting() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_d41e15f24()).await.unwrap();
+    replay(&stall_shared_prefix_page_left()).await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn replay_c201812ea_head_beside_a_resident_candidate() {
+async fn replay_a_refused_head_beside_a_resident_candidate_is_not_left_waiting() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_c201812ea()).await.unwrap();
+    replay(&stall_head_beside_a_resident_candidate()).await.unwrap();
 }
 
 /// A store whose move down of evicted processes' state leaves their kv on the
@@ -7990,7 +7997,7 @@ async fn replay_names_a_head_left_waiting_when_shared_kv_is_not_swept() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let snap = StallSnapshot {
         sweeps_shared: false,
-        ..stall_d41e15f24()
+        ..stall_shared_prefix_page_left()
     };
     let err = replay(&snap).await.expect_err("the head waits with nothing in flight");
     assert!(err.contains("waits with nothing in flight"), "{err}");
@@ -8075,7 +8082,7 @@ async fn a_force_with_something_in_flight_is_no_forced_pass_and_lasts_one_pass()
 /// the first, the rest held whole by residents. `quiet`: refused with nothing
 /// else in flight (the placement's own mismatch) or raced (another head's take
 /// between its serve and its unpark, which the reservation prevents).
-fn stall_macpro_c2018_g2(quiet: bool) -> StallSnapshot {
+fn stall_two_long_runs_refused(quiet: bool) -> StallSnapshot {
     let residents = 18usize;
     let mut procs = vec![SnapProc {
         refused: Some((7, 2)),
@@ -8091,7 +8098,7 @@ fn stall_macpro_c2018_g2(quiet: bool) -> StallSnapshot {
         .map(|(at, chunk)| (chunk, 9, vec![(1 + at % residents, 9)]))
         .collect();
     StallSnapshot {
-        name: "c201812ea Mac Pro g2",
+        name: "two long runs refused",
         chunks: 54,
         free,
         headroom: Some(21),
@@ -8106,15 +8113,15 @@ fn stall_macpro_c2018_g2(quiet: bool) -> StallSnapshot {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn replay_macpro_c2018_g2_raced_refusal() {
+async fn replay_a_raced_refusal_of_two_long_runs_leaves_no_head_waiting() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_macpro_c2018_g2(false)).await.unwrap();
+    replay(&stall_two_long_runs_refused(false)).await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn replay_macpro_c2018_g2_quiet_mismatch() {
+async fn replay_a_quiet_refusal_of_two_long_runs_leaves_no_head_waiting() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_macpro_c2018_g2(true)).await.unwrap();
+    replay(&stall_two_long_runs_refused(true)).await.unwrap();
 }
 
 /// A restore head, need [(3, 1), (2, 2)], its own two runs of two in the
@@ -8122,7 +8129,7 @@ async fn replay_macpro_c2018_g2_quiet_mismatch() {
 /// four-stretch, a three-stretch) left standing, and its refusal's
 /// PendingBindShort { run: 3, pieces: 1, free_runs: 0 } taken on another pool,
 /// nothing in flight. Sixty chunks.
-fn stall_macpro_c2018_mx(quiet: bool) -> StallSnapshot {
+fn stall_one_run_refused(quiet: bool) -> StallSnapshot {
     let residents = 12usize;
     let mut procs = vec![SnapProc {
         refused: Some((3, 1)),
@@ -8138,7 +8145,7 @@ fn stall_macpro_c2018_mx(quiet: bool) -> StallSnapshot {
         .map(|(at, chunk)| (chunk, 9, vec![(1 + at % residents, 9)]))
         .collect();
     StallSnapshot {
-        name: "c201812ea Mac Pro mx",
+        name: "one run refused",
         chunks: 60,
         free,
         headroom: Some(11),
@@ -8153,15 +8160,15 @@ fn stall_macpro_c2018_mx(quiet: bool) -> StallSnapshot {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn replay_macpro_c2018_mx_raced_refusal() {
+async fn replay_a_raced_refusal_of_one_run_leaves_no_head_waiting() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_macpro_c2018_mx(false)).await.unwrap();
+    replay(&stall_one_run_refused(false)).await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn replay_macpro_c2018_mx_quiet_mismatch() {
+async fn replay_a_quiet_refusal_of_one_run_leaves_no_head_waiting() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_macpro_c2018_mx(true)).await.unwrap();
+    replay(&stall_one_run_refused(true)).await.unwrap();
 }
 
 /// A restore is refused (PendingBindShort) on every serve with the room
@@ -8214,9 +8221,9 @@ fn a_fire_held_at_its_bind_is_not_in_flight() {
 /// A restore head refused PendingBindShort (run 1) with nothing else in
 /// flight, one free run left, its placement standing in the same room (the
 /// placement and the takes differ).
-fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
+fn stall_quiet_refusal_in_its_placement() -> StallSnapshot {
     StallSnapshot {
-        name: "bd4f4ffe7 serve-B4_3s-1",
+        name: "a quiet refusal standing in its placement",
         chunks: 22,
         free: vec![9],
         headroom: Some(1),
@@ -8236,9 +8243,9 @@ fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn replay_bd4f4ffe7_quiet_refusal_standing_in_its_placement() {
+async fn replay_a_quiet_refusal_standing_in_its_placement_leaves_no_head_waiting() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    replay(&stall_bd4f4ffe7_quiet_mismatch()).await.unwrap();
+    replay(&stall_quiet_refusal_in_its_placement()).await.unwrap();
 }
 
 /// Every tier full, the head with no move left: the victim (here named,

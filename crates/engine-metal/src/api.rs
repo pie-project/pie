@@ -885,7 +885,7 @@ impl Engine for Metal {
         // earlier boot listed, from its binary archive, without walking; a
         // missing, stale or unreadable cache only costs the walk.
         let cache = self.boot.profiles.as_ref().and_then(|profiles| profiles.parent()).map(|home| {
-            let key = shell.pipeline_cache_key();
+            let key = shell.pipeline_cache_key(&caps.steps.shapes);
             let name = key
                 .bytes()
                 .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
@@ -897,14 +897,23 @@ impl Engine for Metal {
             shell.use_pipeline_archive(archive);
         }
         let listed = cache.as_ref().and_then(|(key, keys, _)| read_pipeline_keys(keys, key));
-        let (fires, built) = match listed {
-            Some(keys) => (0, shell.build_pipelines(&keys).map_err(fault)?),
+        let built = listed.and_then(|keys| {
+            shell
+                .build_pipelines(&keys)
+                .inspect_err(|error| {
+                    tracing::warn!("metal: a listed pipeline did not build, so the load walks: {error}");
+                })
+                .ok()
+        });
+        let (fires, built) = match built {
+            Some(built) => (0, built),
             None => {
                 let walked = shell.warm_pipelines_over(&caps.steps.shapes).map_err(fault)?;
                 if let Some((key, keys, _archive)) = cache.as_ref() {
                     write_pipeline_keys(keys, key, &shell.pipeline_keys());
                     #[cfg(target_vendor = "apple")]
                     let _ = shell.save_pipeline_archive(_archive);
+                    drop_older_pipelines(keys, key);
                 }
                 walked
             }
@@ -1895,8 +1904,9 @@ fn read_pipeline_keys(path: &std::path::Path, key: &str) -> Option<Vec<PipelineK
         .collect()
 }
 
-/// Writes the load `key`'s pipeline keys to `path`; a failed write only
-/// costs the next boot a walk.
+/// Writes the load `key`'s pipeline keys to `path`, whole or not at all (a
+/// list cut short would leave pipelines unbuilt); a failed write only costs
+/// the next boot a walk.
 fn write_pipeline_keys(path: &std::path::Path, key: &str, keys: &[PipelineKeyText]) {
     let mut text = format!("{key}\n");
     for (file, entry, stamp, strides) in keys {
@@ -1906,7 +1916,77 @@ fn write_pipeline_keys(path: &std::path::Path, key: &str, keys: &[PipelineKeyTex
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, text);
+    let partial = path.with_extension(format!("keys.{}", std::process::id()));
+    if std::fs::write(&partial, text).and_then(|()| std::fs::rename(&partial, path)).is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+}
+
+/// The model's graph, by a pipeline cache key (`metal-pipelines-N|device|OS
+/// build|binary|graph|shape`).
+fn pipeline_key_graph(key: &str) -> Option<&str> {
+    key.strip_prefix("metal-pipelines-")?.split('|').nth(4)
+}
+
+/// Removes the lists and archives beside `keep` that an earlier load of
+/// `key`'s graph wrote, and nothing else in that directory.
+fn drop_older_pipelines(keep: &std::path::Path, key: &str) {
+    let Some((dir, graph)) = keep.parent().zip(pipeline_key_graph(key)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut dropped = 0u32;
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path == keep || path.extension().is_none_or(|ext| ext != "keys") {
+            continue;
+        }
+        let older = std::fs::read_to_string(&path)
+            .is_ok_and(|text| text.lines().next().and_then(pipeline_key_graph) == Some(graph));
+        if older && std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(path.with_extension("metalarchive"));
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        tracing::info!(dropped, "metal: this model's older pipeline lists and archives are removed");
+    }
+}
+
+#[cfg(test)]
+mod pipeline_cache {
+    use super::*;
+
+    /// A save keeps its own pair and drops its graph's older ones, whatever
+    /// key version wrote them; another graph's, and any other file, stay.
+    #[test]
+    fn a_save_drops_only_its_graphs_older_pairs() {
+        let dir = std::env::temp_dir().join(format!("pie-pipeline-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = |version: u32, graph: &str, shape: &str| {
+            format!("metal-pipelines-{version}|Apple M5|Version 27|1:2|{graph}|{shape}")
+        };
+        let put = |name: &str, key: &str| {
+            write_pipeline_keys(&dir.join(format!("{name}.keys")), key, &[]);
+            std::fs::write(dir.join(format!("{name}.metalarchive")), b"a").unwrap();
+        };
+        put("old", &key(1, "aa", "s1"));
+        put("new", &key(2, "aa", "s2"));
+        put("other", &key(2, "bb", "s1"));
+        std::fs::write(dir.join("note.keys"), b"aa").unwrap();
+        drop_older_pipelines(&dir.join("new.keys"), &key(2, "aa", "s2"));
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            left,
+            ["new.keys", "new.metalarchive", "note.keys", "other.keys", "other.metalarchive"]
+        );
+    }
 }
 
 #[cfg(test)]

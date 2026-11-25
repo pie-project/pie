@@ -20,6 +20,8 @@ pub use load::Staged;
 pub(crate) mod pages;
 mod prepare;
 mod ring;
+#[doc(hidden)]
+pub mod ring_table;
 mod segments;
 mod settle;
 mod stats;
@@ -78,15 +80,17 @@ pub struct RingSeen {
     pub own: u64,
     /// Ring pages a fire both read and then folded rows onto.
     pub read_then_folded: u64,
+    /// Snapshots of a lane's rings landed inside its fire.
+    pub snapshots: u64,
 }
 
 pub struct Shell {
     /// The rungs the load weighed its top by and the estimate it weighed
     /// them with (`None` where the profile states no rates).
     weighed: Option<crate::top::Weighed>,
-    /// A windowed fire's ring-fold runs as the device reads them, grown to
-    /// the most a fire has folded (`serve::ring`).
-    ring_runs: Option<crate::device::alloc::Buffer>,
+    /// The table a windowed fire's ring runs go out over; `None` where the
+    /// load keeps no ring (`serve::ring_table`).
+    ring_runs: Option<ring_table::RingTable>,
     /// What the windowed fires served have done since load: pages they
     /// wrote on their rings directly, own-row pages they took, and the ring
     /// pages they folded onto that their own reads had read.
@@ -860,6 +864,26 @@ impl Shell {
     #[must_use]
     pub fn lands_snapshots(&self) -> bool {
         self.predicate.lands_snapshots()
+    }
+
+    /// The snapshots a fire lands inside itself, a lane at most
+    /// (`Capabilities::rs_snapshots`; 0: none). A load of rings alone lands
+    /// its snapshots itself (`serve::ring`); one of recurrent state too, as
+    /// its state lands them. Both the caps and the arm walk's step facts
+    /// read it here.
+    #[must_use]
+    pub fn rs_snapshots(&self) -> u32 {
+        let state_rows = self
+            .trace
+            .caches
+            .iter()
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+        let lands = if state_rows {
+            self.lands_snapshots()
+        } else {
+            !self.windowed_layers().is_empty()
+        };
+        if lands { crate::store::rs::SNAPSHOTS } else { 0 }
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {

@@ -1,13 +1,14 @@
 //! The worker's PLEX 1.1 port: the runtime's reports into the PLEX host
 //! (`plex-host`), and the host's committed rows back out.
 //!
-//! Three threads:
+//! Two threads:
 //! - any runtime thread reports an [`Event`] over a channel, as it did to the
 //!   1.0 policy thread (every call site goes through [`super::report`]);
 //! - this port thread turns each event into a host report, keeps the record
-//!   the host cannot see (cached working sets, resting handles), sends the worker's counters when a round waits for them, and
-//!   takes the rows a round committed;
-//! - the host's own thread calls the policies, off every runtime thread.
+//!   the host cannot see (cached working sets, resting handles), runs a round
+//!   where one is due, the policies called here, off every runtime thread,
+//!   with the worker's counters as they are then, and takes the rows it
+//!   committed.
 //!
 //! The worker is `self` to its policies. A process's PLEX id is the id its
 //! client knows (`schedule::plex_id`): one restarted after a KV reclaim keeps
@@ -17,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use client_api::Props;
 use plex_host::host::{Config, Counter, Delta, Host};
@@ -31,11 +32,6 @@ use crate::store::registry as store_registry;
 
 /// The worker, as its own policies see it.
 const WORKER: &str = "self";
-
-/// How often the port looks at the host while no report comes: the host
-/// commits off this thread, so the port reads its version this often, as an
-/// engine reads it once a step.
-const LOOK: Duration = Duration::from_millis(2);
 
 /// The columns the worker enacts (`Config.supported`).
 const SUPPORTED: &[&str] = &[
@@ -62,6 +58,10 @@ impl std::error::Error for LoadError {}
 fn host() -> Host {
     Host::new(Config {
         supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+        // The port's thread keeps the time and runs the rounds.
+        // plex-host documents `manual` for scenario tests; a port that
+        // keeps the time is the same mode.
+        manual: true,
         ..Config::default()
     })
 }
@@ -87,12 +87,11 @@ pub fn start(name: &str, component: &[u8]) -> Result<(), LoadError> {
     spawn(host, (name.to_string(), component.to_vec()))
 }
 
-fn spawn(mut host: Host, loaded: (String, Vec<u8>)) -> Result<(), LoadError> {
+fn spawn(host: Host, loaded: (String, Vec<u8>)) -> Result<(), LoadError> {
     let (tx, rx) = channel();
     if EVENTS.set(tx).is_err() {
         return Err(LoadError("this worker already runs a PLEX port".into()));
     }
-    host.start();
     std::thread::Builder::new()
         .name("pie-plex".into())
         .spawn(move || run(host, loaded, rx))
@@ -316,12 +315,31 @@ fn run(host: Host, loaded: (String, Vec<u8>), events: Receiver<Event>) {
         loaded,
         version: 0,
     };
+    let start = Instant::now();
+    let clock = |host: &Host| {
+        let now = start.elapsed().as_nanos() as u64;
+        host.set_now(now);
+        now
+    };
     loop {
-        let first = match events.recv_timeout(LOOK) {
+        // The next report, or the next call a policy asked for. A round runs
+        // here, so nothing it commits waits to be noticed.
+        let now = clock(&port.host);
+        let wait = match port.host.alarm() {
+            _ if port.host.due() => Some(Duration::ZERO),
+            Some(at) => Some(Duration::from_nanos(at.saturating_sub(now))),
+            None => None,
+        };
+        let first = match wait {
+            None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(wait) => events.recv_timeout(wait),
+        };
+        let first = match first {
             Ok(event) => Some(event),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        clock(&port.host);
         for event in first.into_iter().chain(events.try_iter()) {
             match event {
                 Event::Reload(next, answer) => {
@@ -334,6 +352,7 @@ fn run(host: Host, loaded: (String, Vec<u8>), events: Receiver<Event>) {
             port.put_worker();
             port.put_working_sets();
             port.host.tick(port.counters());
+            port.host.run(false);
         }
         let version = port.host.version();
         if version != port.version {
@@ -863,7 +882,7 @@ pub(crate) mod testing {
     /// [`enact`] on a worker with a device tier and `worker`'s attrs, put
     /// before the first event.
     pub(crate) fn enact_on(name: &str, component: &[u8], worker: &Worker, events: Vec<Event>) {
-        let mut host = host();
+        let host = host();
         host.put_worker(
             WORKER,
             false,
@@ -876,7 +895,6 @@ pub(crate) mod testing {
             host.attr(Subject::Worker(WORKER.to_string()), attr, Some(value.clone()));
         }
         host.load(name, component).expect("the policy loads");
-        host.start();
         let mut port = Port {
             host,
             cache: NO_STORES,
@@ -893,18 +911,14 @@ pub(crate) mod testing {
             port.apply(event);
             // The host's tree has each live working set once it wrote.
             port.put_working_sets();
+            port.host.run(false);
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while port.host.heard() < port.host.reported() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the policy heard every report"
-            );
-            std::thread::sleep(Duration::from_millis(1));
+        // What a round left to the next.
+        while port.host.due() {
+            port.host.run(false);
         }
         let delta = port.host.poll_delta();
         port.enact(delta);
-        port.host.stop();
     }
 }
 
@@ -960,6 +974,37 @@ mod tests {
         };
         seen(&mut port);
         port
+    }
+
+    /// A report's rows are in force with the round that heard it: the port
+    /// waits on reports and alarms alone, and nothing else comes here to
+    /// wake it.
+    #[test]
+    fn a_report_is_enacted_by_the_round_it_wakes() {
+        let _alone = schedule::TEST_LOCK.blocking_write();
+        let host = Host::new(Config {
+            supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            manual: true,
+            deadline_ms: 60 * 60 * 1000,
+            ..Config::default()
+        });
+        host.load("priority", component("priority")).unwrap();
+        let (events, rx) = channel();
+        let port = std::thread::spawn(move || run(host, ("priority".into(), Vec::new()), rx));
+        for (id, key) in [(0x7a1e, 5), (0x7a1f, 6)] {
+            let pid = ProcessId::from_u128(id);
+            let arrival = crate::policy::Arrival {
+                props: serde_json::from_value(serde_json::json!({ "priority": key })).unwrap(),
+                ..Default::default()
+            };
+            events.send(Event::Arrived(pid, arrival)).unwrap();
+            while schedule::key(pid) != key {
+                std::thread::yield_now();
+            }
+        }
+        drop(events);
+        port.join().unwrap();
+        schedule::install(None);
     }
 
     /// What the policy saw in a round run now, a line each.

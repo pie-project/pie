@@ -346,11 +346,26 @@ impl SchedulerHandle {
         };
         // Holding guest state of its own, it is suspended instead: waiting,
         // it would hold room its own bind lacks.
-        let suspend = |run: u32, pieces: u32, singles: u32| {
-            let holds = crate::store::registry::try_get(0, engine)
+        let holds = || {
+            crate::store::registry::try_get(0, engine)
                 .and_then(|stores| stores.roles)
-                .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid));
-            holds
+                .is_some_and(|roles| roles.lock().unwrap().holds_guest_state(pid))
+        };
+        // No process is moved off the device for room idle cache holds.
+        let idle = |run: u32, pieces: u32, singles: u32| async move {
+            let Some(planner) = crate::planner::planner_of(pid).filter(|_| holds()) else {
+                return Ok(crate::planner::BindRoomWait::IdleOut);
+            };
+            crate::inferlet::process::said(
+                "bind: idle cache's room for its guest state",
+                pid,
+                planner.wait_idle_room(pid, run, pieces, singles),
+            )
+            .await
+            .map_err(|why| why.to_string())
+        };
+        let suspend = |run: u32, pieces: u32, singles: u32| {
+            holds()
                 && crate::planner::planner_of(pid)
                     .is_some_and(|planner| planner.suspend_for_room(pid, run, pieces, singles))
         };
@@ -388,7 +403,7 @@ impl SchedulerHandle {
         // this bind.
         let settle = move || crate::pipeline::fire::settle_process_fires(pid);
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, fits, suspend, planned, leave, waiting, settle,
+            pid, lane_bind, resident, grown, room, fits, idle, suspend, planned, leave, waiting, settle,
         )
         .await?;
         Ok((registered, bound))

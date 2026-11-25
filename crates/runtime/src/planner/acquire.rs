@@ -641,6 +641,9 @@ pub enum BindRoomWait {
     Served,
     /// Its process is being evicted: the bind waits for its restore.
     Withdrawn,
+    /// It waited for what idle cache gives alone
+    /// ([`ResidencyPlanner::wait_idle_room`]), and that gives no more.
+    IdleOut,
 }
 
 impl ResidencyPlanner {
@@ -684,7 +687,28 @@ impl ResidencyPlanner {
                 longest,
             });
         }
-        self.wait_room(pid, (run, pieces, singles), pages, None)
+        self.wait_room(pid, (run, pieces, singles), pages, None, false)
+            .await
+            .map(|(wait, _registration)| wait)
+    }
+
+    /// [`Self::wait_bind_room`] for what idle cache gives alone: no process
+    /// is moved for it, and once idle cache gives no more it ends
+    /// ([`BindRoomWait::IdleOut`]).
+    pub async fn wait_idle_room(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        run: u32,
+        pieces: u32,
+        singles: u32,
+    ) -> Result<BindRoomWait, PlannerError> {
+        if self.port.idle_room() == 0 {
+            return Ok(BindRoomWait::IdleOut);
+        }
+        let pages = self
+            .port
+            .chunks_as_pages(run.max(1).saturating_mul(pieces).saturating_add(singles));
+        self.wait_room(pid, (run, pieces, singles), pages, None, true)
             .await
             .map(|(wait, _registration)| wait)
     }
@@ -719,7 +743,9 @@ impl ResidencyPlanner {
             super::pool::RiseRoom::Short { pieces } => pieces,
         };
         let pages = self.port.chunks_as_pages(pieces);
-        let (wait, registration) = self.wait_room(pid, (1, pieces, 0), pages, Some(rung)).await?;
+        let (wait, registration) = self
+            .wait_room(pid, (1, pieces, 0), pages, Some(rung), false)
+            .await?;
         if wait == BindRoomWait::Withdrawn {
             return Ok(None);
         }
@@ -743,6 +769,7 @@ impl ResidencyPlanner {
         (run, pieces, singles): (u32, u32, u32),
         pages: u32,
         rise: Option<u32>,
+        idle: bool,
     ) -> Result<(BindRoomWait, Option<WaitRegistration<'_>>), PlannerError> {
         let notify = Arc::new(Notify::new());
         let key = self
@@ -774,6 +801,7 @@ impl ResidencyPlanner {
                             served: false,
                             withdrawn: false,
                             rise,
+                            idle: idle.then_some(super::wait::IdleWait::Waits),
                         },
                     )
                 }))
@@ -803,12 +831,19 @@ impl ResidencyPlanner {
                 let key = inner.locate(key)?;
                 match inner.queue.get(&key)?.kind {
                     WaitKind::BindRoom {
-                        served, withdrawn, ..
-                    } => Some((served, withdrawn)),
+                        served,
+                        withdrawn,
+                        idle,
+                        ..
+                    } => Some((served, withdrawn, idle)),
                     _ => None,
                 }
             });
-            match served {
+            let out = matches!(served, Some((_, false, Some(super::wait::IdleWait::Out))));
+            if out {
+                return Ok((BindRoomWait::IdleOut, Some(registration)));
+            }
+            match served.map(|(served, withdrawn, _)| (served, withdrawn)) {
                 None => {
                     return Err(self
                         .with_inner(|inner| inner.failed.get(&pid).copied())
@@ -844,6 +879,32 @@ impl ResidencyPlanner {
                 }
             }
         }
+    }
+
+    /// The head bind waits for idle cache's room alone, and idle cache gives
+    /// no more: told so, it leaves the queue. Whether it was one.
+    pub(super) fn idle_out(self: &Arc<Self>, key: EntryKey) -> bool {
+        let notify = self.with_inner(|inner| {
+            let key = inner.locate(key)?;
+            match &mut inner.queue.get_mut(&key)?.kind {
+                WaitKind::BindRoom {
+                    idle: Some(idle),
+                    served,
+                    notify,
+                    withdrawn: false,
+                    ..
+                } => {
+                    *idle = super::wait::IdleWait::Out;
+                    *served = true;
+                    Some(notify.clone())
+                }
+                _ => None,
+            }
+        });
+        if let Some(notify) = &notify {
+            notify.notify_waiters();
+        }
+        notify.is_some()
     }
 
     /// The head bind's runs stand free: it is told, to take them.

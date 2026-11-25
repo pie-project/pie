@@ -316,6 +316,13 @@ pub fn measure(
     cache: Option<&std::path::Path>,
 ) -> Result<Measured, String> {
     kernels_cuda::disk::install(cache);
+    // One at a time in the process: a group's ranks load at once, and each
+    // timing its own device beside the other's launches read as noise, which
+    // the bursts then chase (6 s alone, up to 96 s together on two H100s).
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     #[cfg(feature = "device")]
     {
         let measured = on_device::measure(ordinal, chip);

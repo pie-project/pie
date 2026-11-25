@@ -142,7 +142,12 @@ pub(crate) fn write(path: &Path, measured: Measured) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let partial = path.with_extension("partial");
+    // One a process and thread: two writers of one record never share it.
+    let partial = path.with_extension(format!(
+        "{}.{:?}.partial",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     std::fs::write(
         &partial,
         format!(
