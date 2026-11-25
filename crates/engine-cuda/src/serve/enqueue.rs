@@ -242,32 +242,22 @@ impl Shell {
         self.copy_ring_runs(&work.folds)
     }
 
-    /// `runs` (to, from, bytes) in one launch of `copy_runs` on the fire's
-    /// stream, their table staged ahead of it on the same stream.
+    /// `runs` (to, from, bytes) copied on the fire's stream over the load's
+    /// ring table: one launch of `copy_runs` a table's worth.
     fn copy_ring_runs(&mut self, runs: &[(u64, u64, u64)]) -> Result<()> {
-        if runs.is_empty() {
+        if runs.is_empty() || crate::sizing::active() {
             return Ok(());
         }
-        // `kernels_cuda::runtime::channel::CopyRun`s: three words a run.
-        let raw: Vec<u8> = runs
-            .iter()
-            .flat_map(|&(dst, src, bytes)| [dst, src, bytes])
-            .flat_map(u64::to_le_bytes)
-            .collect();
-        let bytes = raw.len();
-        if self.ring_runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
-            self.ring_runs = Some(crate::device::alloc::Buffer::zeroed(
-                bytes.next_power_of_two(),
-            )?);
-        }
-        let held = self.ring_runs.as_ref().map_or(0, |held| held.ptr());
-        crate::device::alloc::stage_raw(self.device.stream(), held, &raw)?;
-        kernels_cuda::runtime::channel::copy_runs(
-            &self.device.ctx(),
-            held,
-            u32::try_from(runs.len()).unwrap_or(u32::MAX),
-        )
-        .map_err(Fault::from)
+        let device = &self.device;
+        let Some(table) = self.ring_runs.as_mut() else {
+            return Err(Fault::program(
+                "serve::ring",
+                "ring runs on a load that keeps no ring",
+            ));
+        };
+        table.copy(device.stream(), runs, |at, count| {
+            kernels_cuda::runtime::channel::copy_runs(device.ctx(), at, count).map_err(Fault::from)
+        })
     }
 }
 

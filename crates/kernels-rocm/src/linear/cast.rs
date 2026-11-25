@@ -22,6 +22,13 @@ fn route_rows(rows: u32, width: u32) -> Launch {
     )
 }
 
+/// Loads the cast a fire's guest inputs land through (f32 cells into a bf16
+/// rectangle) on the current device now: the host fires it ahead of a body,
+/// so no walk resolves it, and nothing builds after ready.
+pub fn load_input_casts() -> Result<(), Error> {
+    kernel(FILE, "::pie::linear::cast_f32_to<::pie::bf16>").load()
+}
+
 pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.quant_cast_fp32_to";
     debug_assert_eq!(src.dtype, Dtype::F32, "`{OP}` casts an f32 source");
